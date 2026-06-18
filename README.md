@@ -1,5 +1,11 @@
 # Beehive
 
+*Beehive is an self-healing, eventually consistent datastore for Go apps that takes inspiration from the stigmergic cooperation of bees in a beehive.*
+
+<img width="435" alt="beehive" src="https://github.com/user-attachments/assets/f5b845df-6ed0-47f3-b1be-69d3f2286d9f" />
+
+## Introduction
+
 Beehive is an embedded control plane for Go apps, backed by a durable store. With Beehive, you define desired state as objects and register controllers that reconcile actual state toward it. The system is self-healing which means it converges on restart, tolerates missed events, and handles cascading dependencies without controllers calling each other. The architecture is heavily influenced by Kubernetes and takes inspiration from the stigmergic cooperation of bees in a beehive.
 
 ## Quickstart
