@@ -48,55 +48,60 @@ func (gc *GreetingController) Stop(_ context.Context) error {
 }
 
 func (gc *GreetingController) Reconcile(ctx context.Context, obj *beehive.Object[GreetingSpec, GreetingStatus]) (beehive.Result, error) {
-	// Already converged: observed message matches desired name. Nothing to do.
-	if obj.Status != nil && obj.Status.Message == "Hello, "+obj.Spec.Name {
+	want := "Hello, " + obj.Spec.Name
+	if obj.Status != nil && obj.Status.Message == want {
 		return beehive.Result{}, nil
 	}
-	return beehive.Result{}, gc.client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{
-		Message: "Hello, " + obj.Spec.Name,
-	})
+	err := gc.client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{Message: want})
+	return beehive.Result{}, err
+}
+
+func exitOnErr(err error) {
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 }
 
 func main() {
 	store, err := sqlite.OpenMemory()
-	if err != nil {
-		log.Fatalf("open store: %v", err)
-	}
+	exitOnErr(err)
 	defer store.Close()
 
 	bh, err := beehive.New(store)
-	if err != nil {
-		log.Fatalf("new beehive: %v", err)
-	}
-	if err := beehive.Register(bh, GreetingGroupKind, &GreetingController{}); err != nil {
-		log.Fatalf("register: %v", err)
-	}
-	if err := bh.Start(); err != nil {
-		log.Fatalf("start: %v", err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		bh.Stop(ctx)
-	}()
+	exitOnErr(err)
+
+	err = beehive.Register(bh, GreetingGroupKind, &GreetingController{})
+	exitOnErr(err)
+
+	err = bh.Start()
+	exitOnErr(err)
+	defer stopBeehive(bh)
 
 	ctx := context.Background()
 	client := beehive.NewClient[GreetingSpec, GreetingStatus](bh, GreetingGroupKind)
 
 	// Subscribe before creating so we don't miss the controller's UpdateStatus event.
 	watchCh, err := client.WatchList(ctx)
-	if err != nil {
-		log.Fatalf("watch: %v", err)
-	}
+	exitOnErr(err)
 
 	obj, err := client.Create(ctx, GreetingSpec{Name: "world"})
-	if err != nil {
-		log.Fatalf("create: %v", err)
-	}
+	exitOnErr(err)
+
 	fmt.Printf("created Greeting id=%d name=%v\n", obj.ID, obj.Spec.Name)
 
+	waitForConvergence(obj.ID, watchCh)
+}
+
+func stopBeehive(bh *beehive.Beehive) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	bh.Stop(ctx)
+}
+
+// waitForConvergence drains watchCh until it sees a status-bearing event for id.
+func waitForConvergence(id int64, watchCh <-chan beehive.WatchEvent[GreetingSpec, GreetingStatus]) {
 	for evt := range watchCh {
-		if evt.Object.ID != obj.ID || evt.Object.Status == nil {
+		if evt.Object.ID != id || evt.Object.Status == nil {
 			continue
 		}
 		fmt.Printf("converged: %s\n", evt.Object.Status.Message)
