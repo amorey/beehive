@@ -1,6 +1,6 @@
 # Beehive
 
-*Beehive is an self-healing, eventually consistent datastore for Go apps that takes inspiration from the stigmergic cooperation of bees in a beehive.*
+*Beehive is an embedded, self-healing, eventually consistent datastore for Go apps that takes inspiration from the stigmergic cooperation of bees in a beehive.*
 
 <img width="435" alt="beehive" src="https://github.com/user-attachments/assets/f5b845df-6ed0-47f3-b1be-69d3f2286d9f" />
 
@@ -93,8 +93,6 @@ func main() {
 - **Coordination through the store.** Controllers never call each other. They read/write the shared store and wake on change-events; a periodic resync catches anything dropped. Events are a latency optimization, not a correctness dependency.
 
 - **`spec`/`status` separation.** Only controllers may write `status`. This is structural in the API: the user-facing `Client` surface has no status-write path; only the `Controller` surface does.
-
-- **Internal versioning.** `current_version` in the schema tracks Beehive's own serialization format, not user-defined spec versions. Migrations run automatically on `store.OpenSQLite`. User-defined spec types are opaque to Beehive — versioning of `Spec`/`Status` structs is the application's responsibility.
 
 ## API
 

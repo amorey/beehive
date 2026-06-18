@@ -16,12 +16,8 @@ func TestOpenMemoryAppliesMigrations(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
-	// Whitebox: reach the underlying handle to inspect the applied schema.
-	s, ok := store.(*sqliteStore)
-	require.True(t, ok)
-
-	for _, table := range []string{"objects", "conditions", "refs", "schema_migrations"} {
-		assert.True(t, tableExists(t, s.db, table), "table %q should exist after migration", table)
+	for _, table := range []string{"objects", "conditions", "refs", "resource_version_seq", "schema_migrations"} {
+		assert.True(t, tableExists(t, store.db, table), "table %q should exist after migration", table)
 	}
 }
 

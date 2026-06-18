@@ -32,6 +32,37 @@ func (s *fakeStore) Close() error {
 	return nil
 }
 
+// The lifecycle tests never reach the store's read/write surface (no reconcile
+// is dispatched and no client call is made), so these satisfy the interface
+// without behavior. A test that needs real store semantics uses sqlite instead.
+func (s *fakeStore) Within(context.Context, func(context.Context) error) error {
+	panic("not implemented: fakeStore.Within")
+}
+func (s *fakeStore) CreateObject(context.Context, *RawObject) (*RawObject, error) {
+	panic("not implemented: fakeStore.CreateObject")
+}
+func (s *fakeStore) GetObject(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.GetObject")
+}
+func (s *fakeStore) GetObjectByName(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.GetObjectByName")
+}
+func (s *fakeStore) ListObjects(context.Context, GroupKind) ([]*RawObject, error) {
+	panic("not implemented: fakeStore.ListObjects")
+}
+func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, error) {
+	panic("not implemented: fakeStore.UpdateSpec")
+}
+func (s *fakeStore) UpdateStatus(context.Context, ObjectID, []byte, int64) (*RawObject, error) {
+	panic("not implemented: fakeStore.UpdateStatus")
+}
+func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.RequestDeletion")
+}
+func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
+	panic("not implemented: fakeStore.DeleteObject")
+}
+
 // fakeController is a test double for Controller. It counts Start/Stop calls and
 // closes channels when they happen, so tests synchronize on those events
 // instead of sleeping. Reconcile is never dispatched yet, so it's a no-op.

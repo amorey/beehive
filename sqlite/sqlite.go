@@ -6,7 +6,6 @@ import (
 	"embed"
 	"time"
 
-	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/sqlitemigrate"
 	_ "modernc.org/sqlite"
 )
@@ -14,17 +13,9 @@ import (
 //go:embed migrations
 var migrations embed.FS
 
-type sqliteStore struct {
-	db *sql.DB
-}
-
-func (s *sqliteStore) Close() error {
-	return s.db.Close()
-}
-
 // Open opens (or creates) a Beehive SQLite database at path,
 // running any pending schema migrations before returning.
-func Open(path string) (beehive.Store, error) {
+func Open(path string) (*sqliteStore, error) {
 	db, err := sqlitemigrate.OpenPool(path, 1)
 	if err != nil {
 		return nil, err
@@ -34,7 +25,7 @@ func Open(path string) (beehive.Store, error) {
 
 // OpenMemory opens a Beehive SQLite database in memory.
 // Intended for testing; data is lost when the store is closed.
-func OpenMemory() (beehive.Store, error) {
+func OpenMemory() (*sqliteStore, error) {
 	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
 	if err != nil {
 		return nil, err
@@ -44,7 +35,7 @@ func OpenMemory() (beehive.Store, error) {
 	return open(db)
 }
 
-func open(db *sql.DB) (beehive.Store, error) {
+func open(db *sql.DB) (*sqliteStore, error) {
 	if _, err := sqlitemigrate.Apply(context.Background(), db, migrations, "migrations"); err != nil {
 		db.Close()
 		return nil, err

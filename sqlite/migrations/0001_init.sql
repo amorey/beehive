@@ -23,10 +23,6 @@ CREATE TABLE objects (
     -- Unique within (group, kind); SQLite NULL != NULL so multiple NULL names are allowed.
     name TEXT,
 
-    -- Beehive internal serialization version. Bumped by Beehive migrations only;
-    -- opaque to user-defined Spec/Status types.
-    current_version TEXT NOT NULL,
-
     spec   TEXT NOT NULL, -- JSON, user-owned,        HARD / desired state
     status TEXT,          -- JSON, controller-owned,  SOFT / observed state (nullable)
 
@@ -67,10 +63,6 @@ CREATE INDEX idx_objects_deleting
 CREATE INDEX idx_objects_unsettled
     ON objects("group", kind)
     WHERE observed_generation IS NULL OR observed_generation < generation;
-
--- Objects whose serialization version predates the current Beehive version (need migration).
-CREATE INDEX idx_objects_stale_encoding
-    ON objects("group", kind, current_version);
 
 -- ============================================================
 -- conditions
@@ -130,3 +122,19 @@ CREATE TABLE refs (
 
 -- Answers "who points at X?" for cascade-GC and wake-dependents.
 CREATE INDEX idx_refs_to ON refs(to_id, relation);
+
+-- ============================================================
+-- resource_version_seq
+-- Monotonic global write cursor, decoupled from the objects table.
+-- ============================================================
+
+-- Deriving the next resource_version from MAX(objects.resource_version) lets a
+-- version be reused once the highest-versioned row is physically deleted, which
+-- breaks its use as a watch cursor / CAS token. A standalone single-row counter
+-- only ever increments, regardless of row deletions, so versions are never reused.
+CREATE TABLE resource_version_seq (
+    id    INTEGER PRIMARY KEY CHECK (id = 1), -- single row, always id = 1
+    value INTEGER NOT NULL                    -- last resource_version handed out
+);
+
+INSERT INTO resource_version_seq (id, value) VALUES (1, 0);
