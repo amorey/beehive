@@ -2,6 +2,7 @@ package beehive
 
 import "context"
 
+// WatchEventType classifies a WatchEvent.
 type WatchEventType string
 
 const (
@@ -10,11 +11,14 @@ const (
 	WatchEventDeleted  WatchEventType = "Deleted"
 )
 
+// WatchEvent reports a change to a watched object.
 type WatchEvent[Spec, Status any] struct {
 	Type   WatchEventType
 	Object *Object[Spec, Status]
 }
 
+// Client is the user-facing API for a single resource kind: the surface for
+// creating, reading, updating, deleting, and watching objects.
 type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
@@ -26,6 +30,8 @@ type Client[Spec, Status any] interface {
 	WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error)
 }
 
+// NewClient returns a Client for the given resource kind. Spec and Status must
+// match the controller registered for gk.
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status] {
 	return &clientImpl[Spec, Status]{bh: bh, gk: gk}
 }

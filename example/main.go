@@ -38,7 +38,7 @@ type GreetingController struct {
 	client beehive.ControllerClient[GreetingStatus]
 }
 
-func (gc *GreetingController) Start(_ context.Context, client beehive.ControllerClient[GreetingStatus]) error {
+func (gc *GreetingController) Start(client beehive.ControllerClient[GreetingStatus]) error {
 	gc.client = client
 	return nil
 }

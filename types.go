@@ -2,13 +2,18 @@ package beehive
 
 import "time"
 
+// GroupKind identifies a kind of resource. An empty Group denotes the core group.
 type GroupKind struct {
 	Group string
 	Kind  string
 }
 
+// ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = int64
 
+// Object is a single resource: user-owned desired state (Spec) plus
+// controller-owned observed state (Status), along with the metadata Beehive
+// uses to track convergence and deletion.
 type Object[Spec, Status any] struct {
 	ID                  ObjectID
 	Group               string
@@ -16,20 +21,24 @@ type Object[Spec, Status any] struct {
 	Name                *string
 	Spec                Spec
 	Status              *Status
-	Generation          int64
-	ObservedGeneration  *int64
-	ObservedAt          *time.Time
-	ResourceVersion     int64
-	DeletionRequestedAt *time.Time
+	Generation          int64      // bumped on every Spec change
+	ObservedGeneration  *int64     // Generation the controller last reconciled; nil until first reconcile
+	ObservedAt          *time.Time // time of the last successful reconcile
+	ResourceVersion     int64      // bumped on every write, for optimistic concurrency
+	DeletionRequestedAt *time.Time // set when deletion is requested; object lingers until finalizers clear
 	Finalizers          []string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
 
+// Result is returned by a controller's Reconcile to influence requeueing.
 type Result struct {
+	// RequeueAfter requeues the object after the given delay. Zero means no
+	// explicit requeue (the object still resyncs on the periodic timer).
 	RequeueAfter time.Duration
 }
 
+// ConditionStatus is the state of a Condition: True, False, or Unknown.
 type ConditionStatus string
 
 const (
@@ -38,6 +47,8 @@ const (
 	ConditionUnknown ConditionStatus = "Unknown"
 )
 
+// Condition is a standard observation about an object's state, reported by its
+// controller (e.g. type "Ready", status True).
 type Condition struct {
 	Type    string
 	Status  ConditionStatus

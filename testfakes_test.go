@@ -1,0 +1,106 @@
+package beehive
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+// testTimeout is a failsafe only: a select that waits this long has hung, so we
+// fail rather than block forever. Tests never rely on it to pace anything.
+const testTimeout = 2 * time.Second
+
+// tSpec / tStatus are placeholder payload types. The lifecycle tests never
+// inspect them; they exist only to satisfy the generic signatures.
+type (
+	tSpec   struct{}
+	tStatus struct{}
+)
+
+// fakeStore is a no-op Store. New only stashes the store, so Close is never
+// reached by these tests, but we record it anyway for completeness.
+type fakeStore struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *fakeStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+// fakeController is a test double for Controller. It counts Start/Stop calls and
+// closes channels when they happen, so tests synchronize on those events
+// instead of sleeping. Reconcile is never dispatched yet, so it's a no-op.
+type fakeController struct {
+	startErr error // if set, Start fails (to exercise start rollback)
+
+	mu         sync.Mutex
+	startCalls int
+	stopCalls  int
+
+	startedCh chan struct{} // closed after the first successful Start
+	stoppedCh chan struct{} // closed on the first Stop
+}
+
+func newFakeController() *fakeController {
+	return &fakeController{
+		startedCh: make(chan struct{}),
+		stoppedCh: make(chan struct{}),
+	}
+}
+
+func (f *fakeController) Start(_ ControllerClient[tStatus]) error {
+	f.mu.Lock()
+	f.startCalls++
+	first := f.startCalls == 1
+	f.mu.Unlock()
+	if f.startErr != nil {
+		return f.startErr
+	}
+	if first {
+		close(f.startedCh)
+	}
+	return nil
+}
+
+func (f *fakeController) Stop(_ context.Context) error {
+	f.mu.Lock()
+	f.stopCalls++
+	first := f.stopCalls == 1
+	f.mu.Unlock()
+	if first {
+		close(f.stoppedCh)
+	}
+	return nil
+}
+
+func (f *fakeController) Reconcile(_ context.Context, _ *Object[tSpec, tStatus]) (Result, error) {
+	return Result{}, nil
+}
+
+func (f *fakeController) startCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.startCalls
+}
+
+func (f *fakeController) stopCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopCalls
+}
+
+// waitClosed blocks until ch is closed, failing the test if that takes longer
+// than the failsafe timeout (i.e. the expected event never happened).
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(testTimeout):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
