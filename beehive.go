@@ -12,6 +12,14 @@ type Beehive struct {
 	resyncInterval time.Duration
 }
 
+func (bh *Beehive) Start() error {
+	panic("not implemented")
+}
+
+func (bh *Beehive) Stop(ctx context.Context) {
+	panic("not implemented")
+}
+
 func New(s Store, opts ...Option) (*Beehive, error) {
 	bh := &Beehive{
 		store:          s,
@@ -26,13 +34,5 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 }
 
 func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error {
-	panic("not implemented")
-}
-
-func (bh *Beehive) Start() error {
-	panic("not implemented")
-}
-
-func (bh *Beehive) Stop(ctx context.Context) {
 	panic("not implemented")
 }
