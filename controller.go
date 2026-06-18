@@ -39,8 +39,12 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err != nil {
 		return err
 	}
-	_, err = c.bh.store.UpdateStatus(ctx, id, observedGeneration, b)
-	return err
+	raw, err := c.bh.store.UpdateStatus(ctx, id, observedGeneration, b)
+	if err != nil {
+		return err
+	}
+	c.bh.emitOrCollect(ctx, c.gk, rawWatchEvent{Type: WatchEventModified, Object: raw})
+	return nil
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(_ context.Context, _ ObjectID, _ Condition) error {

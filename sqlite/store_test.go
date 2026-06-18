@@ -243,15 +243,17 @@ func TestRepeatRequestDeletionDoesNotBumpResourceVersion(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	first, err := store.RequestDeletion(ctx, created.ID)
+	first, changed, err := store.RequestDeletion(ctx, created.ID)
 	require.NoError(t, err)
+	assert.True(t, changed, "first call is a real change")
 	assert.Greater(t, first.ResourceVersion, created.ResourceVersion,
 		"the first request is a real change and bumps the cursor")
 
 	// A repeat request changes no deletion state, so it must be a no-op: same
 	// resource_version, same updated_at, no spurious watch/CAS churn.
-	second, err := store.RequestDeletion(ctx, created.ID)
+	second, changed, err := store.RequestDeletion(ctx, created.ID)
 	require.NoError(t, err)
+	assert.False(t, changed, "repeat call is an idempotent no-op")
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
 		"an idempotent repeat must not bump resource_version")
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
@@ -272,7 +274,7 @@ func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
 			return err
 		},
 		"RequestDeletion": func() error {
-			_, err := store.RequestDeletion(ctx, missing)
+			_, _, err := store.RequestDeletion(ctx, missing)
 			return err
 		},
 	}
@@ -292,11 +294,11 @@ func TestRequestDeletionIsIdempotent(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	first, err := store.RequestDeletion(ctx, created.ID)
+	first, _, err := store.RequestDeletion(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, first.DeletionRequestedAt)
 
-	second, err := store.RequestDeletion(ctx, created.ID)
+	second, _, err := store.RequestDeletion(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, second.DeletionRequestedAt)
 	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,

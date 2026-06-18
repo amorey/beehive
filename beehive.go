@@ -5,9 +5,41 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/amorey/gochan/broadcast"
 )
 
 const defaultResyncInterval = 30 * time.Second
+
+// rawWatchEvent is the untyped event that flows through a GroupKind's broadcast
+// hub. clientImpl and controllerClientImpl decode it into WatchEvent[Spec,Status].
+type rawWatchEvent struct {
+	Type   WatchEventType
+	Object *RawObject
+}
+
+// watchEventCollector accumulates watch events during a reconcile transaction so
+// they are published after commit, not speculatively inside the transaction. A
+// fresh collector is created per reconcile call and injected via context so
+// concurrent reconcile goroutines each have their own queue.
+type watchEventCollector struct {
+	events []rawWatchEvent
+}
+
+func (c *watchEventCollector) add(ev rawWatchEvent) {
+	c.events = append(c.events, ev)
+}
+
+// watchCollectorKey is the context key for a *watchEventCollector.
+type watchCollectorKey struct{}
+
+type beehiveState uint8
+
+const (
+	beehiveNew     beehiveState = iota // registered, not yet started
+	beehiveRunning                     // Start succeeded, Stop not yet called
+	beehiveStopped                     // Stop was called; instance is permanently unusable
+)
 
 // Beehive is the control plane: it owns the durable store and the set of
 // registered controllers, and drives their reconcile loops between Start and
@@ -19,20 +51,29 @@ type Beehive struct {
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
-	started     bool
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	// watchMu guards watchHubs independently of mu so that publishEvent (called
+	// from reconcile goroutines) never blocks on the same lock that Stop holds
+	// while waiting for those goroutines to drain.
+	watchMu   sync.RWMutex
+	watchHubs map[GroupKind]*broadcast.Hub[rawWatchEvent]
+	state     beehiveState
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 // Start brings the control plane up: it starts every registered controller and
-// launches its reconcile loop. It is an error to start twice.
+// launches its reconcile loop. It is an error to start twice or after Stop.
+// Beehive is a one-shot object: once stopped, create a new instance.
 //
 // Start does not take a context: controller startup is assumed to be fast and
 // non-blocking. Use Stop to tear the control plane down.
 func (bh *Beehive) Start() error {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
-	if bh.started {
+	switch bh.state {
+	case beehiveStopped:
+		return fmt.Errorf("beehive: already stopped; create a new Beehive to restart")
+	case beehiveRunning:
 		return fmt.Errorf("beehive: already started")
 	}
 
@@ -68,7 +109,7 @@ func (bh *Beehive) Start() error {
 		}(r)
 	}
 
-	bh.started = true
+	bh.state = beehiveRunning
 	return nil
 }
 
@@ -77,7 +118,7 @@ func (bh *Beehive) Start() error {
 func (bh *Beehive) Stop(ctx context.Context) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
-	if !bh.started {
+	if bh.state != beehiveRunning {
 		return
 	}
 
@@ -94,11 +135,21 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	case <-ctx.Done():
 	}
 
+	// Close every hub to signal active watchers that the control plane is
+	// stopping. Any reconcile goroutines that outlived the stop deadline will
+	// call publishEvent on a closed hub; Send returns an error that is silently
+	// dropped, so stale events never escape.
+	bh.watchMu.Lock()
+	for _, hub := range bh.watchHubs {
+		hub.Close()
+	}
+	bh.watchMu.Unlock()
+
 	for _, r := range bh.reconcilers {
 		_ = r.adapter.stop(ctx)
 	}
 
-	bh.started = false
+	bh.state = beehiveStopped
 }
 
 // New creates a control plane backed by store s. Register controllers on the
@@ -108,6 +159,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		store:          s,
 		resyncInterval: defaultResyncInterval,
 		reconcilers:    make(map[GroupKind]*reconciler),
+		watchHubs:      make(map[GroupKind]*broadcast.Hub[rawWatchEvent]),
 	}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
@@ -122,7 +174,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
-	if bh.started {
+	if bh.state != beehiveNew {
 		return fmt.Errorf("beehive: cannot register %s/%s after Start", gk.Group, gk.Kind)
 	}
 	if _, exists := bh.reconcilers[gk]; exists {
@@ -148,5 +200,43 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	}
 
 	bh.reconcilers[gk] = r
+	bh.watchMu.Lock()
+	bh.watchHubs[gk] = broadcast.New[rawWatchEvent](256)
+	bh.watchMu.Unlock()
 	return nil
+}
+
+// publishEvent sends ev to the broadcast hub for gk. It is a no-op if no hub
+// exists for gk (e.g. no controller was registered). Send never blocks.
+func (bh *Beehive) publishEvent(gk GroupKind, typ WatchEventType, raw *RawObject) {
+	bh.watchMu.RLock()
+	hub := bh.watchHubs[gk]
+	bh.watchMu.RUnlock()
+	if hub != nil {
+		_ = hub.Sender().Send(rawWatchEvent{Type: typ, Object: raw})
+	}
+}
+
+// emitOrCollect delivers ev to active watchers. If ctx carries a
+// watchEventCollector (i.e. the call is inside a reconcile transaction), the
+// event is queued and published only after commit. Otherwise it is published
+// immediately. All ControllerClient write methods should use this helper so
+// the two-path dispatch never needs to be repeated.
+func (bh *Beehive) emitOrCollect(ctx context.Context, gk GroupKind, ev rawWatchEvent) {
+	if coll, ok := ctx.Value(watchCollectorKey{}).(*watchEventCollector); ok {
+		coll.add(ev)
+	} else {
+		bh.publishEvent(gk, ev.Type, ev.Object)
+	}
+}
+
+// enqueueIfRegistered wakes the reconciler for (gk, id) if one exists.
+// It is a no-op when gk has no registered controller (e.g. a client-only kind).
+func (bh *Beehive) enqueueIfRegistered(gk GroupKind, id ObjectID) {
+	bh.mu.Lock()
+	r, ok := bh.reconcilers[gk]
+	bh.mu.Unlock()
+	if ok {
+		r.enqueue(id)
+	}
 }

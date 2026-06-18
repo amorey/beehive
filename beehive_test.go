@@ -85,13 +85,13 @@ func TestStartStopLifecycle(t *testing.T) {
 
 	require.NoError(t, bh.Start())
 	waitClosed(t, fc.startedCh, "controller Start")
-	assert.True(t, bh.started)
+	assert.Equal(t, beehiveRunning, bh.state)
 
 	bh.Stop(context.Background())
 	waitClosed(t, fc.stoppedCh, "controller Stop")
 	assert.Equal(t, 1, fc.startCount())
 	assert.Equal(t, 1, fc.stopCount())
-	assert.False(t, bh.started)
+	assert.Equal(t, beehiveStopped, bh.state)
 }
 
 func TestStartRejectsSecondStart(t *testing.T) {
@@ -130,7 +130,7 @@ func TestStopReturnsWithExpiredContext(t *testing.T) {
 	bh.Stop(ctx)
 
 	assert.Equal(t, 1, fc.stopCount())
-	assert.False(t, bh.started)
+	assert.Equal(t, beehiveStopped, bh.state)
 }
 
 func TestStartRollsBackOnFailure(t *testing.T) {
@@ -144,7 +144,7 @@ func TestStartRollsBackOnFailure(t *testing.T) {
 	require.NoError(t, Register(bh, GroupKind{Kind: "Bad"}, bad))
 
 	require.ErrorIs(t, bh.Start(), errBoom)
-	assert.False(t, bh.started)
+	assert.Equal(t, beehiveNew, bh.state)
 
 	// Map iteration order is randomized, so we can't say whether `good` started
 	// before `bad` failed. Assert the order-independent invariant instead: any

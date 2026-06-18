@@ -59,7 +59,7 @@ func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, e
 func (s *fakeStore) UpdateStatus(context.Context, ObjectID, int64, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
-func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, error) {
+func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.RequestDeletion")
 }
 func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {

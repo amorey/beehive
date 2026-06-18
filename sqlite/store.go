@@ -186,11 +186,11 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, id storeapi.ObjectID, ob
 	return scanObject(row)
 }
 
-func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	now := toMillis(time.Now().UTC())
 	// Only the first request is a real change: the `IS NULL` guard stamps the
@@ -204,12 +204,15 @@ func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID)
 		now, rv, now, id)
 	obj, err := scanObject(row)
 	if errors.Is(err, storeapi.ErrNotFound) {
-		// Zero rows means either the object is already deleting (the no-op we
-		// just skipped) or the id doesn't exist. GetObject distinguishes them:
-		// it returns the unchanged row, or ErrNotFound.
-		return s.GetObject(ctx, id)
+		// Zero rows: either the object is already deleting (the no-op we just
+		// skipped) or the id doesn't exist. GetObject distinguishes them.
+		obj, err = s.GetObject(ctx, id)
+		return obj, false, err
 	}
-	return obj, err
+	if err != nil {
+		return nil, false, err
+	}
+	return obj, true, nil
 }
 
 func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) error {

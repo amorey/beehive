@@ -83,23 +83,24 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[GreetingSpec, GreetingStatus](bh, GreetingGroupKind)
 
+	// Subscribe before creating so we don't miss the controller's UpdateStatus event.
+	watchCh, err := client.WatchList(ctx)
+	if err != nil {
+		log.Fatalf("watch: %v", err)
+	}
+
 	obj, err := client.Create(ctx, GreetingSpec{Name: "world"})
 	if err != nil {
 		log.Fatalf("create: %v", err)
 	}
 	fmt.Printf("created Greeting id=%d name=%v\n", obj.ID, obj.Spec.Name)
 
-	// Wait for the controller to converge. Level-triggered: we just poll the
-	// observed state until the status appears.
-	for {
-		got, err := client.Get(ctx, obj.ID)
-		if err != nil {
-			log.Fatalf("get: %v", err)
+	for evt := range watchCh {
+		if evt.Object.ID != obj.ID || evt.Object.Status == nil {
+			continue
 		}
-		if got.Status != nil {
-			fmt.Printf("converged: %s\n", got.Status.Message)
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+		fmt.Printf("converged: %s\n", evt.Object.Status.Message)
+		return
 	}
+	log.Fatal("watch channel closed before convergence")
 }

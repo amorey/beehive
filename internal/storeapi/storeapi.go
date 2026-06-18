@@ -87,7 +87,9 @@ type Store interface {
 
 	// RequestDeletion marks an object for deletion by setting
 	// DeletionRequestedAt; the row lingers until its finalizers clear.
-	RequestDeletion(ctx context.Context, id ObjectID) (*RawObject, error)
+	// changed is true only when this call was the one that set the flag;
+	// repeat calls are idempotent and return changed=false.
+	RequestDeletion(ctx context.Context, id ObjectID) (obj *RawObject, changed bool, err error)
 
 	// DeleteObject removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.
