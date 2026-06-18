@@ -130,6 +130,29 @@ func (s *sqliteStore) ListObjects(ctx context.Context, gk storeapi.GroupKind) ([
 	return out, rows.Err()
 }
 
+func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT id FROM objects
+		 WHERE "group" = ? AND kind = ?
+		   AND (observed_generation IS NULL OR observed_generation < generation)
+		 ORDER BY id`,
+		gk.Group, gk.Kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []storeapi.ObjectID
+	for rows.Next() {
+		var id storeapi.ObjectID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (s *sqliteStore) UpdateSpec(ctx context.Context, id storeapi.ObjectID, spec []byte) (*storeapi.RawObject, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)

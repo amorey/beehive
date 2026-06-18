@@ -13,15 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// listOnlyStore is a fakeStore whose ListObjects returns a fixed slice, used
-// to exercise enqueueUnsettled without a real SQLite database.
-type listOnlyStore struct {
+// unsettledIDsStore is a fakeStore whose ListUnsettledIDs returns a fixed slice
+// of IDs, used to exercise enqueueUnsettled without a real SQLite database.
+type unsettledIDsStore struct {
 	fakeStore
-	objs []*RawObject
+	ids []ObjectID
 }
 
-func (s *listOnlyStore) ListObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
-	return s.objs, nil
+func (s *unsettledIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	return s.ids, nil
 }
 
 // runInBackground starts r.run and returns a channel closed when it returns.
@@ -141,6 +141,23 @@ func (c *reconcileCapture) Reconcile(_ context.Context, obj *Object[tSpec, tStat
 	return Result{}, nil
 }
 
+// TestEnqueueUnsettledEnqueuesReturnedIDs verifies that enqueueUnsettled enqueues
+// exactly the IDs returned by ListUnsettledIDs, in order.
+func TestEnqueueUnsettledEnqueuesReturnedIDs(t *testing.T) {
+	r := &reconciler{
+		store:      &unsettledIDsStore{ids: []ObjectID{42, 99}},
+		work:       newWorkQueue(),
+		backoffFor: make(map[ObjectID]time.Duration),
+	}
+
+	r.enqueueUnsettled(context.Background())
+
+	r.work.mu.Lock()
+	items := append([]ObjectID(nil), r.work.items...)
+	r.work.mu.Unlock()
+	assert.Equal(t, []ObjectID{42, 99}, items)
+}
+
 // TestEnqueueUnsettledSkipsInFlight verifies that a resync does not re-enqueue
 // an object whose reconcile is already in progress.
 func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
@@ -160,7 +177,7 @@ func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
 
 	r := &reconciler{
 		adapter:          adapter,
-		store:            &listOnlyStore{objs: []*RawObject{{ID: objID, Generation: 1}}},
+		store:            &unsettledIDsStore{ids: []ObjectID{objID}},
 		work:             newWorkQueue(),
 		resyncInterval:   0,
 		maxRetryInterval: time.Second,

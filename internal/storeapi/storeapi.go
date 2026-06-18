@@ -73,6 +73,10 @@ type Store interface {
 	// ListObjects returns every object of kind gk, ordered by id.
 	ListObjects(ctx context.Context, gk GroupKind) ([]*RawObject, error)
 
+	// ListUnsettledIDs returns the IDs of objects of kind gk whose
+	// observed_generation doesn't match generation (not yet converged).
+	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
 	// change) and ResourceVersion.
 	UpdateSpec(ctx context.Context, id ObjectID, spec []byte) (*RawObject, error)

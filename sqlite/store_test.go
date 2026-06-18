@@ -356,6 +356,47 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "rolled-back write must not persist")
 }
 
+func TestListUnsettledIDs(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
+
+	// settled: ObservedGeneration == Generation — must NOT appear
+	settled, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, err = store.UpdateStatus(ctx, settled.ID, settled.Generation, []byte(`{}`))
+	require.NoError(t, err)
+
+	// unsettled: ObservedGeneration is nil — must appear
+	nilObs, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	// unsettled: ObservedGeneration < Generation (spec changed after reconcile) — must appear
+	stale, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, err = store.UpdateStatus(ctx, stale.ID, stale.Generation, []byte(`{}`))
+	require.NoError(t, err)
+	_, err = store.UpdateSpec(ctx, stale.ID, []byte(`{"updated":true}`))
+	require.NoError(t, err)
+
+	// different kind — must NOT appear
+	_, err = store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	ids, err := store.ListUnsettledIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{nilObs.ID, stale.ID}, ids)
+}
+
 func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

@@ -85,23 +85,20 @@ func (r *reconciler) enqueue(id ObjectID) {
 	}
 }
 
-// enqueueUnsettled lists all objects for the controller's kind and enqueues
-// any whose ObservedGeneration doesn't match Generation (i.e. not yet converged).
-// Objects currently being reconciled are skipped to prevent duplicate or
-// concurrent reconciles for the same ID.
+// enqueueUnsettled asks the store for IDs of objects that haven't converged yet
+// and enqueues them. Objects currently being reconciled are skipped to prevent
+// duplicate or concurrent reconciles for the same ID.
 func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	objs, err := r.store.ListObjects(ctx, r.gk)
+	ids, err := r.store.ListUnsettledIDs(ctx, r.gk)
 	if err != nil {
 		return
 	}
-	for _, obj := range objs {
-		if obj.ObservedGeneration == nil || *obj.ObservedGeneration != obj.Generation {
-			if !r.isInFlight(obj.ID) {
-				r.enqueue(obj.ID)
-			}
+	for _, id := range ids {
+		if !r.isInFlight(id) {
+			r.enqueue(id)
 		}
 	}
 }

@@ -50,6 +50,9 @@ func (s *fakeStore) GetObjectByName(context.Context, GroupKind, string) (*RawObj
 func (s *fakeStore) ListObjects(context.Context, GroupKind) ([]*RawObject, error) {
 	return nil, nil
 }
+func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
 func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }
