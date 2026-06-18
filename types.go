@@ -1,15 +1,16 @@
 package beehive
 
-import "time"
+import (
+	"time"
+
+	"github.com/amorey/beehive/internal/storeapi"
+)
 
 // GroupKind identifies a kind of resource. An empty Group denotes the core group.
-type GroupKind struct {
-	Group string
-	Kind  string
-}
+type GroupKind = storeapi.GroupKind
 
 // ObjectID is the store-assigned unique identifier for an object.
-type ObjectID = int64
+type ObjectID = storeapi.ObjectID
 
 // Object is a single resource: user-owned desired state (Spec) plus
 // controller-owned observed state (Status), along with the metadata Beehive

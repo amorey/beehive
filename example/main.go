@@ -52,7 +52,7 @@ func (gc *GreetingController) Reconcile(ctx context.Context, obj *beehive.Object
 	if obj.Status != nil && obj.Status.Message == "Hello, "+obj.Spec.Name {
 		return beehive.Result{}, nil
 	}
-	return beehive.Result{}, gc.client.UpdateStatus(ctx, obj.ID, GreetingStatus{
+	return beehive.Result{}, gc.client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{
 		Message: "Hello, " + obj.Spec.Name,
 	})
 }

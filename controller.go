@@ -1,6 +1,9 @@
 package beehive
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Controller is the user-supplied reconcile logic for a resource kind. Start
 // receives a ControllerClient for writing status and runs once on registration;
@@ -15,7 +18,7 @@ type Controller[Spec, Status any] interface {
 // ControllerClient is the write surface a controller uses to report observed
 // state. It only writes Status and metadata — never Spec, which the user owns.
 type ControllerClient[Status any] interface {
-	UpdateStatus(ctx context.Context, id ObjectID, status Status) error
+	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
 	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
 	DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
 	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
@@ -31,8 +34,13 @@ type controllerClientImpl[Status any] struct {
 	gk GroupKind
 }
 
-func (c *controllerClientImpl[Status]) UpdateStatus(_ context.Context, _ ObjectID, _ Status) error {
-	panic("not implemented: ControllerClient.UpdateStatus")
+func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
+	b, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	_, err = c.bh.store.UpdateStatus(ctx, id, observedGeneration, b)
+	return err
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(_ context.Context, _ ObjectID, _ Condition) error {

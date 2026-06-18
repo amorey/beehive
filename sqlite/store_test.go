@@ -151,7 +151,7 @@ func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	updated, err := store.UpdateStatus(ctx, created.ID, []byte(`{"msg":"hi"}`), created.Generation)
+	updated, err := store.UpdateStatus(ctx, created.ID, created.Generation, []byte(`{"msg":"hi"}`))
 	require.NoError(t, err)
 
 	require.NotNil(t, updated.ObservedGeneration)
@@ -268,7 +268,7 @@ func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
 			return err
 		},
 		"UpdateStatus": func() error {
-			_, err := store.UpdateStatus(ctx, missing, []byte(`{}`), 1)
+			_, err := store.UpdateStatus(ctx, missing, 1, []byte(`{}`))
 			return err
 		},
 		"RequestDeletion": func() error {

@@ -1,6 +1,6 @@
 # Beehive
 
-*Beehive is an embedded, self-healing, eventually consistent datastore for Go apps that takes inspiration from the stigmergic cooperation of bees in a beehive.*
+*Beehive is an embedded, self-healing, eventually consistent datastore for Go that takes inspiration from the stigmergic cooperation of bees in a beehive.*
 
 <img width="435" alt="beehive" src="https://github.com/user-attachments/assets/f5b845df-6ed0-47f3-b1be-69d3f2286d9f" />
 
@@ -39,7 +39,7 @@ type ClusterController struct {
   client beehive.ControllerClient[ClusterStatus]
 }
 
-func (cc *ClusterController) Start(ctx context.Context, client beehive.ControllerClient[ClusterStatus]) error {
+func (cc *ClusterController) Start(client beehive.ControllerClient[ClusterStatus]) error {
   cc.client = client
   // TODO: start background workers (e.g. connection pool, watchers)
   return nil
@@ -64,7 +64,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[
   // return beehive.Result{RequeueAfter: 5 * time.Second}, nil
 
   // TODO: update observed state
-  // return beehive.Result{}, cc.client.UpdateStatus(ctx, obj.ID, ClusterStatus{})
+  // return beehive.Result{}, cc.client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{})
 
   return beehive.Result{}, nil
 }
@@ -208,7 +208,7 @@ client.Update(ctx, obj.ID, ClusterSpec{...})
 
 ```go
 type ControllerClient[Status any] interface {
-    UpdateStatus(ctx context.Context, id ObjectID, status Status) error
+    UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
     SetCondition(ctx context.Context, id ObjectID, condition Condition) error
     DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
     DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
@@ -221,7 +221,7 @@ type ControllerClient[Status any] interface {
 
 ```go
 type Controller[Spec, Status any] interface {
-    Start(ctx context.Context, client ControllerClient[Status]) error
+    Start(client ControllerClient[Status]) error
     Stop(ctx context.Context) error
     Reconcile(ctx context.Context, obj *Object[Spec, Status]) (Result, error)
 }

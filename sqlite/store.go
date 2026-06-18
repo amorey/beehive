@@ -7,7 +7,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/amorey/beehive"
+	"github.com/amorey/beehive/internal/storeapi"
 )
 
 type sqliteStore struct {
@@ -72,7 +72,7 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	return rv, err
 }
 
-func (s *sqliteStore) CreateObject(ctx context.Context, obj *beehive.RawObject) (*beehive.RawObject, error) {
+func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
 	finalizers, err := marshalFinalizers(obj.Finalizers)
 	if err != nil {
 		return nil, err
@@ -97,20 +97,20 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *beehive.RawObject) 
 	return scanObject(row)
 }
 
-func (s *sqliteStore) GetObject(ctx context.Context, id beehive.ObjectID) (*beehive.RawObject, error) {
+func (s *sqliteStore) GetObject(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE id = ?`, id)
 	return scanObject(row)
 }
 
-func (s *sqliteStore) GetObjectByName(ctx context.Context, gk beehive.GroupKind, name string) (*beehive.RawObject, error) {
+func (s *sqliteStore) GetObjectByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
 		gk.Group, gk.Kind, name)
 	return scanObject(row)
 }
 
-func (s *sqliteStore) ListObjects(ctx context.Context, gk beehive.GroupKind) ([]*beehive.RawObject, error) {
+func (s *sqliteStore) ListObjects(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
 		gk.Group, gk.Kind)
@@ -119,7 +119,7 @@ func (s *sqliteStore) ListObjects(ctx context.Context, gk beehive.GroupKind) ([]
 	}
 	defer rows.Close()
 
-	var out []*beehive.RawObject
+	var out []*storeapi.RawObject
 	for rows.Next() {
 		obj, err := scanObject(rows)
 		if err != nil {
@@ -130,7 +130,7 @@ func (s *sqliteStore) ListObjects(ctx context.Context, gk beehive.GroupKind) ([]
 	return out, rows.Err()
 }
 
-func (s *sqliteStore) UpdateSpec(ctx context.Context, id beehive.ObjectID, spec []byte) (*beehive.RawObject, error) {
+func (s *sqliteStore) UpdateSpec(ctx context.Context, id storeapi.ObjectID, spec []byte) (*storeapi.RawObject, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -146,7 +146,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, id beehive.ObjectID, spec 
 	return scanObject(row)
 }
 
-func (s *sqliteStore) UpdateStatus(ctx context.Context, id beehive.ObjectID, status []byte, observedGeneration int64) (*beehive.RawObject, error) {
+func (s *sqliteStore) UpdateStatus(ctx context.Context, id storeapi.ObjectID, observedGeneration int64, status []byte) (*storeapi.RawObject, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -163,7 +163,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, id beehive.ObjectID, sta
 	return scanObject(row)
 }
 
-func (s *sqliteStore) RequestDeletion(ctx context.Context, id beehive.ObjectID) (*beehive.RawObject, error) {
+func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -180,7 +180,7 @@ func (s *sqliteStore) RequestDeletion(ctx context.Context, id beehive.ObjectID) 
 		RETURNING `+objectColumns,
 		now, rv, now, id)
 	obj, err := scanObject(row)
-	if errors.Is(err, beehive.ErrNotFound) {
+	if errors.Is(err, storeapi.ErrNotFound) {
 		// Zero rows means either the object is already deleting (the no-op we
 		// just skipped) or the id doesn't exist. GetObject distinguishes them:
 		// it returns the unchanged row, or ErrNotFound.
@@ -189,7 +189,7 @@ func (s *sqliteStore) RequestDeletion(ctx context.Context, id beehive.ObjectID) 
 	return obj, err
 }
 
-func (s *sqliteStore) DeleteObject(ctx context.Context, id beehive.ObjectID) error {
+func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) error {
 	res, err := s.conn(ctx).ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -204,7 +204,7 @@ func requireAffected(res sql.Result) error {
 		return err
 	}
 	if n == 0 {
-		return beehive.ErrNotFound
+		return storeapi.ErrNotFound
 	}
 	return nil
 }
@@ -214,9 +214,9 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-func scanObject(sc scanner) (*beehive.RawObject, error) {
+func scanObject(sc scanner) (*storeapi.RawObject, error) {
 	var (
-		obj         beehive.RawObject
+		obj         storeapi.RawObject
 		name        sql.NullString
 		status      []byte
 		observedGen sql.NullInt64
@@ -231,7 +231,7 @@ func scanObject(sc scanner) (*beehive.RawObject, error) {
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
 		&deletionAt, &finalizers, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, beehive.ErrNotFound
+		return nil, storeapi.ErrNotFound
 	}
 	if err != nil {
 		return nil, err

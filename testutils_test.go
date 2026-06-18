@@ -48,12 +48,12 @@ func (s *fakeStore) GetObjectByName(context.Context, GroupKind, string) (*RawObj
 	panic("not implemented: fakeStore.GetObjectByName")
 }
 func (s *fakeStore) ListObjects(context.Context, GroupKind) ([]*RawObject, error) {
-	panic("not implemented: fakeStore.ListObjects")
+	return nil, nil
 }
 func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }
-func (s *fakeStore) UpdateStatus(context.Context, ObjectID, []byte, int64) (*RawObject, error) {
+func (s *fakeStore) UpdateStatus(context.Context, ObjectID, int64, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
 func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, error) {

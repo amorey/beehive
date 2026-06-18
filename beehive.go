@@ -130,8 +130,11 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 
 	r := &reconciler{
 		gk:               gk,
+		store:            bh.store,
+		work:             newWorkQueue(),
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
+		backoffFor:       make(map[ObjectID]time.Duration),
 	}
 	r.adapter = &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}
 
