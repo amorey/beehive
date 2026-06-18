@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// listOnlyStore is a fakeStore whose ListObjects returns a fixed slice, used
+// to exercise enqueueUnsettled without a real SQLite database.
+type listOnlyStore struct {
+	fakeStore
+	objs []*RawObject
+}
+
+func (s *listOnlyStore) ListObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
+	return s.objs, nil
+}
 
 // runInBackground starts r.run and returns a channel closed when it returns.
 func runInBackground(r *reconciler, ctx context.Context) <-chan struct{} {
@@ -127,6 +139,114 @@ func (c *reconcileCapture) Stop(_ context.Context) error            { return nil
 func (c *reconcileCapture) Reconcile(_ context.Context, obj *Object[tSpec, tStatus]) (Result, error) {
 	c.ch <- obj
 	return Result{}, nil
+}
+
+// TestEnqueueUnsettledSkipsInFlight verifies that a resync does not re-enqueue
+// an object whose reconcile is already in progress.
+func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
+	const objID = ObjectID(42)
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	var startOnce sync.Once
+
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) (Result, error) {
+			startOnce.Do(func() { close(started) })
+			<-block
+			return Result{}, nil
+		},
+	}
+
+	r := &reconciler{
+		adapter:          adapter,
+		store:            &listOnlyStore{objs: []*RawObject{{ID: objID, Generation: 1}}},
+		work:             newWorkQueue(),
+		resyncInterval:   0,
+		maxRetryInterval: time.Second,
+		backoffFor:       make(map[ObjectID]time.Duration),
+		concurrency:      2,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(objID)
+	waitClosed(t, started, "reconcile to start")
+
+	// Simulate a resync tick while the reconcile is still in-flight.
+	r.enqueueUnsettled(ctx)
+
+	r.work.mu.Lock()
+	qLen := len(r.work.items)
+	r.work.mu.Unlock()
+	assert.Equal(t, 0, qLen, "in-flight object must not be re-enqueued by resync")
+
+	close(block)
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
+
+func TestReconcilerConcurrency(t *testing.T) {
+	const numObjects = 5
+	const workers = 3
+
+	gate := make(chan struct{})
+	allStarted := make(chan struct{})
+	var closeOnce sync.Once
+
+	var (
+		mu          sync.Mutex
+		inFlight    int
+		maxInFlight int
+	)
+
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) (Result, error) {
+			mu.Lock()
+			inFlight++
+			cur := inFlight
+			if cur > maxInFlight {
+				maxInFlight = cur
+			}
+			mu.Unlock()
+
+			if cur == workers {
+				closeOnce.Do(func() { close(allStarted) })
+			}
+
+			<-gate // block until test releases all workers
+
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			return Result{}, nil
+		},
+	}
+
+	r := &reconciler{
+		adapter:          adapter,
+		work:             newWorkQueue(),
+		resyncInterval:   0,
+		maxRetryInterval: time.Second,
+		backoffFor:       make(map[ObjectID]time.Duration),
+		concurrency:      workers,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	for i := ObjectID(1); i <= numObjects; i++ {
+		r.enqueue(i)
+	}
+
+	waitClosed(t, allStarted, "3 concurrent reconciles to start")
+	close(gate) // release all in-flight reconciles
+
+	cancel()
+	waitClosed(t, done, "run to exit")
+
+	assert.GreaterOrEqual(t, maxInFlight, workers, "expected at least %d concurrent reconciles", workers)
 }
 
 func TestTypedControllerReconcile(t *testing.T) {

@@ -53,3 +53,19 @@ func WithMaxRetryInterval(d time.Duration) Option {
 		return nil
 	}
 }
+
+// WithConcurrency sets the number of concurrent worker goroutines for a
+// controller. When passed to New it becomes the default for all controllers;
+// when passed to Register it overrides that default for a single controller.
+// A value <= 1 means single-threaded (the default).
+func WithConcurrency(n int) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.concurrency = n
+		case *reconciler:
+			t.concurrency = n
+		}
+		return nil
+	}
+}

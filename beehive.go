@@ -15,6 +15,7 @@ const defaultResyncInterval = 30 * time.Second
 type Beehive struct {
 	store          Store
 	resyncInterval time.Duration
+	concurrency    int // default worker count for all controllers; 0/1 = single-threaded
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
@@ -134,6 +135,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		work:             newWorkQueue(),
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
+		concurrency:      bh.concurrency,
 		backoffFor:       make(map[ObjectID]time.Duration),
 	}
 	r.adapter = &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}

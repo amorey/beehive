@@ -30,6 +30,19 @@ func TestWithMaxRetryIntervalDispatch(t *testing.T) {
 	require.NoError(t, WithMaxRetryInterval(9*time.Second)(&Beehive{}))
 }
 
+func TestWithConcurrencyDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithConcurrency(4)(bh))
+	assert.Equal(t, 4, bh.concurrency)
+
+	r := &reconciler{}
+	require.NoError(t, WithConcurrency(2)(r))
+	assert.Equal(t, 2, r.concurrency)
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, WithConcurrency(1)("unrelated"))
+}
+
 // The metadata options are wired into the API but not yet implemented; they
 // should accept any target without erroring.
 func TestStubOptionsAreInert(t *testing.T) {

@@ -2,6 +2,7 @@ package beehive
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -69,10 +70,12 @@ type reconciler struct {
 	resyncInterval    time.Duration
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
+	concurrency       int           // number of concurrent worker goroutines; 0/1 = single-threaded
 
-	// backoffFor tracks the current retry delay per object. Only accessed from
-	// the run goroutine, so no mutex is needed.
+	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
+
+	inFlight sync.Map // keyed by ObjectID; value is struct{}
 }
 
 // enqueue adds id to the work queue if one is configured.
@@ -82,9 +85,39 @@ func (r *reconciler) enqueue(id ObjectID) {
 	}
 }
 
+// enqueueUnsettled lists all objects for the controller's kind and enqueues
+// any whose ObservedGeneration doesn't match Generation (i.e. not yet converged).
+// Objects currently being reconciled are skipped to prevent duplicate or
+// concurrent reconciles for the same ID.
+func (r *reconciler) enqueueUnsettled(ctx context.Context) {
+	if r.store == nil {
+		return
+	}
+	objs, err := r.store.ListObjects(ctx, r.gk)
+	if err != nil {
+		return
+	}
+	for _, obj := range objs {
+		if obj.ObservedGeneration == nil || *obj.ObservedGeneration != obj.Generation {
+			if !r.isInFlight(obj.ID) {
+				r.enqueue(obj.ID)
+			}
+		}
+	}
+}
+
+func (r *reconciler) markInFlight(id ObjectID)   { r.inFlight.Store(id, struct{}{}) }
+func (r *reconciler) unmarkInFlight(id ObjectID) { r.inFlight.Delete(id) }
+func (r *reconciler) isInFlight(id ObjectID) bool {
+	_, ok := r.inFlight.Load(id)
+	return ok
+}
+
 // nextBackoff returns the next retry delay for id and doubles it for next time,
-// capped at maxRetryInterval. Only called from the run goroutine.
+// capped at maxRetryInterval.
 func (r *reconciler) nextBackoff(id ObjectID) time.Duration {
+	r.backoffMu.Lock()
+	defer r.backoffMu.Unlock()
 	cur := r.backoffFor[id]
 	if cur == 0 {
 		cur = r.baseRetryInterval
@@ -102,8 +135,9 @@ func (r *reconciler) nextBackoff(id ObjectID) time.Duration {
 }
 
 // clearBackoff resets the retry delay for id after a successful reconcile.
-// Only called from the run goroutine.
 func (r *reconciler) clearBackoff(id ObjectID) {
+	r.backoffMu.Lock()
+	defer r.backoffMu.Unlock()
 	delete(r.backoffFor, id)
 }
 
@@ -116,15 +150,21 @@ func (r *reconciler) run(ctx context.Context) {
 	// Enqueue any objects that weren't settled before this process started.
 	// Without this, objects persisted by a previous run would never converge
 	// when resync is disabled (WithResyncInterval(0)).
-	if r.store != nil {
-		if objs, err := r.store.ListObjects(ctx, r.gk); err == nil {
-			for _, obj := range objs {
-				if obj.ObservedGeneration == nil || *obj.ObservedGeneration != obj.Generation {
-					r.enqueue(obj.ID)
-				}
-			}
-		}
+	r.enqueueUnsettled(ctx)
+
+	n := r.concurrency
+	if n < 1 {
+		n = 1
 	}
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.runWorker(ctx)
+		}()
+	}
+	defer wg.Wait()
 
 	// time.NewTicker panics on a non-positive interval, so guard it: a disabled
 	// resync means no ticker channel to select on.
@@ -135,6 +175,19 @@ func (r *reconciler) run(ctx context.Context) {
 		resync = ticker.C
 	}
 
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-resync:
+			r.enqueueUnsettled(ctx)
+		}
+	}
+}
+
+// runWorker is the per-goroutine reconcile loop. Multiple instances may run
+// concurrently when concurrency > 1. It exits when ctx is cancelled.
+func (r *reconciler) runWorker(ctx context.Context) {
 	// A nil channel blocks forever in a select, which is the correct no-op
 	// when no work queue is configured.
 	var workReady <-chan struct{}
@@ -148,7 +201,9 @@ func (r *reconciler) run(ctx context.Context) {
 			return
 		case <-workReady:
 			if id, ok := r.work.get(); ok {
+				r.markInFlight(id)
 				result, err := r.adapter.reconcile(ctx, id)
+				r.unmarkInFlight(id)
 				if err != nil {
 					r.work.addAfter(id, r.nextBackoff(id))
 				} else {
@@ -156,16 +211,6 @@ func (r *reconciler) run(ctx context.Context) {
 					if result.RequeueAfter > 0 {
 						r.work.addAfter(id, result.RequeueAfter)
 					}
-				}
-			}
-		case <-resync:
-			objs, err := r.store.ListObjects(ctx, r.gk)
-			if err != nil {
-				continue
-			}
-			for _, obj := range objs {
-				if obj.ObservedGeneration == nil || *obj.ObservedGeneration != obj.Generation {
-					r.enqueue(obj.ID)
 				}
 			}
 		}
