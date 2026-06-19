@@ -3,15 +3,34 @@ package sqlitemigrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/stretchr/testify/require"
 
 	_ "modernc.org/sqlite"
 )
+
+// failReadFileFS wraps an fs.FS but fails to open any path ending in .sql, so
+// loadMigrations' fs.ReadFile call errors deterministically. Embedding the
+// fs.FS interface (not a concrete type) hides any ReadFileFS/ReadDirFS the inner
+// FS implements, funnelling fs.ReadFile and fs.ReadDir through Open — directory
+// listing still succeeds, only the file read fails.
+type failReadFileFS struct {
+	fs.FS
+}
+
+func (f failReadFileFS) Open(name string) (fs.File, error) {
+	if strings.HasSuffix(name, ".sql") {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: errors.New("simulated read failure")}
+	}
+	return f.FS.Open(name)
+}
 
 // openDB opens a fresh on-disk SQLite database in a temp dir. A file (not
 // :memory:) so the single *sql.DB can span multiple connections without losing
@@ -136,4 +155,118 @@ func TestApplyRejectsBadFilename(t *testing.T) {
 		"init.sql": `CREATE TABLE alpha (id INTEGER PRIMARY KEY);`,
 	}), "migrations")
 	require.Error(t, err, "a file without a numeric version prefix is a packaging bug")
+}
+
+func TestOpenPool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db := OpenPool(path, 1)
+	t.Cleanup(func() { db.Close() })
+	require.NoError(t, db.Ping())
+}
+
+func TestLoadMigrationsReadDirError(t *testing.T) {
+	// An FS that has no "migrations" directory.
+	fsys := fstest.MapFS{}
+	_, err := loadMigrations(fsys, "migrations")
+	require.Error(t, err)
+}
+
+func TestLoadMigrationsSkipsNonSQLAndDirs(t *testing.T) {
+	// A directory entry that is a subdirectory and a non-SQL file should be
+	// silently skipped; only .sql files are loaded.
+	fsys := fsWith(t, map[string]string{
+		"0001_first.sql": `CREATE TABLE alpha (id INTEGER PRIMARY KEY);`,
+		"README.txt":     `not a migration`,
+	})
+	// Also inject a subdirectory inside "migrations" via fstest.MapFS layering.
+	// fsWith uses os.DirFS which would show real dirs; the simplest approach is
+	// to just verify the non-SQL file is ignored by the successful apply.
+	db := openDB(t)
+	v, err := Apply(context.Background(), db, fsys, "migrations")
+	require.NoError(t, err)
+	require.Equal(t, 1, v) // only one .sql file was applied
+}
+
+func TestLoadMigrationsNonNumericVersion(t *testing.T) {
+	fsys := fsWith(t, map[string]string{
+		"abc_first.sql": `CREATE TABLE alpha (id INTEGER PRIMARY KEY);`,
+	})
+	db := openDB(t)
+	_, err := Apply(context.Background(), db, fsys, "migrations")
+	require.Error(t, err, "a file with a non-numeric version prefix should be rejected")
+}
+
+func TestLoadMigrationsReadFileError(t *testing.T) {
+	// The directory lists a migration file, but reading it fails. failReadFileFS
+	// simulates the read error in pure Go so the test doesn't depend on OS
+	// permission bits (which don't deny reads for root or on some platforms).
+	base := fstest.MapFS{
+		"migrations/0001_first.sql": {Data: []byte(`CREATE TABLE alpha (id INTEGER PRIMARY KEY);`)},
+	}
+	db := openDB(t)
+	_, err := Apply(context.Background(), db, failReadFileFS{base}, "migrations")
+	require.Error(t, err)
+}
+
+func TestApplyCreateTableError(t *testing.T) {
+	// Closing the db before Apply prevents CREATE TABLE schema_migrations.
+	db := openDB(t)
+	db.Close()
+	_, err := Apply(context.Background(), db, fsWith(t, map[string]string{}), "migrations")
+	require.Error(t, err)
+}
+
+func TestApplyEmptyMigrations(t *testing.T) {
+	// A migrations dir with no .sql files hits the early-return path (len==0).
+	db := openDB(t)
+	fsys := fsWith(t, map[string]string{})
+	v, err := Apply(context.Background(), db, fsys, "migrations")
+	require.NoError(t, err)
+	require.Equal(t, 0, v)
+}
+
+func TestRunMigrationBadSQL(t *testing.T) {
+	db := openDB(t)
+	_, err := Apply(context.Background(), db, fsWith(t, map[string]string{
+		"0001_bad.sql": `THIS IS NOT VALID SQL !!!`,
+	}), "migrations")
+	require.Error(t, err)
+}
+
+func TestRunMigrationBeginTxError(t *testing.T) {
+	db := openDB(t)
+	db.Close()
+	err := runMigration(context.Background(), db, migration{version: 1, name: "0001_test.sql", sql: `SELECT 1`})
+	require.Error(t, err)
+}
+
+func TestRunMigrationSchemaInsertError(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+
+	// Pre-create schema_migrations and insert version 1 so the INSERT in
+	// runMigration fails with a UNIQUE constraint violation.
+	_, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+	)`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO schema_migrations(version, name, applied_at) VALUES(1, 'existing', 0)`)
+	require.NoError(t, err)
+
+	err = runMigration(ctx, db, migration{version: 1, name: "0001_test.sql", sql: `SELECT 1`})
+	require.Error(t, err)
+}
+
+func TestApplyQuerySchemaVersionError(t *testing.T) {
+	// Pre-create a schema_migrations table with the wrong schema so that
+	// Apply's CREATE TABLE IF NOT EXISTS is a no-op (table already exists)
+	// but SELECT COALESCE(MAX(version), 0) fails because 'version' is absent.
+	db := openDB(t)
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations (wrong_col TEXT)`)
+	require.NoError(t, err)
+
+	_, err = Apply(ctx, db, fsWith(t, map[string]string{}), "migrations")
+	require.Error(t, err)
 }

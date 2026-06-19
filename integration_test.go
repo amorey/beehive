@@ -51,14 +51,17 @@ func waitForCh(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-// specEchoController writes cStatus{Val: obj.Spec.Val} on every Reconcile and
-// closes secondCh once after the second call.
+// specEchoController writes cStatus{Val: obj.Spec.Val} on every Reconcile.
+// firstDone closes after the first successful reconcile; secondCh closes once
+// count reaches 2, signalling that a spec update was reconciled.
 type specEchoController struct {
-	mu       sync.Mutex
-	client   beehive.ControllerClient[cStatus]
-	count    int
-	once     sync.Once
-	secondCh chan struct{}
+	mu        sync.Mutex
+	client    beehive.ControllerClient[cStatus]
+	count     int
+	firstOnce sync.Once
+	once      sync.Once
+	firstDone chan struct{}
+	secondCh  chan struct{}
 }
 
 func (c *specEchoController) Start(client beehive.ControllerClient[cStatus]) error {
@@ -77,6 +80,7 @@ func (c *specEchoController) Reconcile(ctx context.Context, obj *beehive.Object[
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: obj.Spec.Val}); err != nil {
 		return beehive.Result{}, err
 	}
+	c.firstOnce.Do(func() { close(c.firstDone) })
 	if n >= 2 {
 		c.once.Do(func() { close(c.secondCh) })
 	}
@@ -185,7 +189,10 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	bh, err := beehive.New(newClientTestStore(t), beehive.WithResyncInterval(0))
 	require.NoError(t, err)
 
-	ctrl := &specEchoController{secondCh: make(chan struct{})}
+	ctrl := &specEchoController{
+		firstDone: make(chan struct{}),
+		secondCh:  make(chan struct{}),
+	}
 	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
 	require.NoError(t, bh.Start())
 	defer bh.Stop(ctx)
@@ -193,6 +200,11 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "v1"})
 	require.NoError(t, err)
+
+	// Wait for the first reconcile to complete before updating. Without this
+	// wait, the reconciler might read Generation=2 and settle in one pass,
+	// leaving secondCh permanently unclosed.
+	waitForCh(t, ctrl.firstDone, "first reconcile")
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)

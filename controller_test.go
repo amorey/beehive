@@ -3,6 +3,7 @@ package beehive_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,31 @@ func (c *capturingController) Stop(_ context.Context) error { return nil }
 
 func (c *capturingController) Reconcile(_ context.Context, _ *beehive.Object[cSpec, cStatus]) (beehive.Result, error) {
 	return beehive.Result{}, nil
+}
+
+func TestControllerClientStubsPanic(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := beehive.New(store)
+	require.NoError(t, err)
+
+	ctrl := newCapturingController()
+	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	var cc beehive.ControllerClient[cStatus]
+	select {
+	case cc = <-ctrl.clientCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller Start was not called")
+	}
+
+	require.Panics(t, func() { _ = cc.SetCondition(ctx, 1, beehive.Condition{}) })
+	require.Panics(t, func() { _ = cc.DeleteCondition(ctx, 1, "Ready") })
+	require.Panics(t, func() { _ = cc.DeleteFinalizer(ctx, 1, "finalizer") })
+	require.Panics(t, func() { _ = cc.AddDependency(ctx, 1, 2) })
+	require.Panics(t, func() { _ = cc.DeleteDependency(ctx, 1, 2) })
 }
 
 func TestControllerClientUpdateStatus(t *testing.T) {

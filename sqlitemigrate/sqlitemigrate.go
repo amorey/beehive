@@ -28,7 +28,7 @@ import (
 // maxConns caps the pool: pass 1 for a writer pool (writes serialize at the
 // pool instead of fighting at the SQLite layer), or a larger value for a WAL
 // reader pool. Callers run Apply against the returned pool to migrate it.
-func OpenPool(path string, maxConns int) (*sql.DB, error) {
+func OpenPool(path string, maxConns int) *sql.DB {
 	// _pragma values are URL-encoded; modernc parses them and applies on each
 	// new connection.
 	dsn := "file:" + path +
@@ -39,11 +39,11 @@ func OpenPool(path string, maxConns int) (*sql.DB, error) {
 		"&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		panic(err) // impossible: modernc sqlite is always registered via blank import
 	}
 	db.SetMaxOpenConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
-	return db, nil
+	return db
 }
 
 // migration is one numbered SQL file. Version comes from the leading digits of

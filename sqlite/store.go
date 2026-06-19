@@ -73,10 +73,7 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 }
 
 func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
-	finalizers, err := marshalFinalizers(obj.Finalizers)
-	if err != nil {
-		return nil, err
-	}
+	finalizers := marshalFinalizers(obj.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -146,7 +143,7 @@ func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKin
 	for rows.Next() {
 		var id storeapi.ObjectID
 		if err := rows.Scan(&id); err != nil {
-			return nil, err
+			panic(err) // INTEGER PRIMARY KEY into int64 never errors
 		}
 		ids = append(ids, id)
 	}
@@ -284,12 +281,16 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 	return &obj, nil
 }
 
-func marshalFinalizers(f []string) ([]byte, error) {
+func marshalFinalizers(f []string) []byte {
 	if f == nil {
 		// The column defaults to '[]'; keep the same shape on explicit insert.
-		return []byte("[]"), nil
+		return []byte("[]")
 	}
-	return json.Marshal(f)
+	b, err := json.Marshal(f)
+	if err != nil {
+		panic(err) // json.Marshal([]string) never errors
+	}
+	return b
 }
 
 func toMillis(t time.Time) int64 { return t.UnixMilli() }

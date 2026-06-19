@@ -51,6 +51,9 @@ type Beehive struct {
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
+	// order preserves registration order so Start brings controllers up — and
+	// rolls them back — deterministically, rather than in random map order.
+	order []*reconciler
 	// watchMu guards watchHubs independently of mu so that publishEvent (called
 	// from reconcile goroutines) never blocks on the same lock that Stop holds
 	// while waiting for those goroutines to drain.
@@ -83,9 +86,10 @@ func (bh *Beehive) Start() error {
 	bh.cancel = cancel
 
 	// Start controllers first so they can stand up background workers before
-	// any reconcile is dispatched.
-	started := make([]*reconciler, 0, len(bh.reconcilers))
-	for _, r := range bh.reconcilers {
+	// any reconcile is dispatched. Iterate in registration order so startup and
+	// rollback are deterministic.
+	started := make([]*reconciler, 0, len(bh.order))
+	for _, r := range bh.order {
 		if err := r.adapter.start(); err != nil {
 			// Roll back the controllers we already started, then abort.
 			// The reconcile loops were never launched, so there's nothing to
@@ -145,7 +149,7 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	}
 	bh.watchMu.Unlock()
 
-	for _, r := range bh.reconcilers {
+	for _, r := range bh.order {
 		_ = r.adapter.stop(ctx)
 	}
 
@@ -200,6 +204,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	}
 
 	bh.reconcilers[gk] = r
+	bh.order = append(bh.order, r)
 	bh.watchMu.Lock()
 	bh.watchHubs[gk] = broadcast.New[rawWatchEvent](256)
 	bh.watchMu.Unlock()

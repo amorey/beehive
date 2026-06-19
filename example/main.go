@@ -1,3 +1,5 @@
+//go:build ignore
+
 // Command example is a dead-simple, self-contained Beehive program used to
 // drive the implementation top-down. It defines a "Greeting" resource whose
 // controller reconciles a desired name into an observed greeting message —

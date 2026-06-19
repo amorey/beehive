@@ -266,6 +266,151 @@ func TestReconcilerConcurrency(t *testing.T) {
 	assert.GreaterOrEqual(t, maxInFlight, workers, "expected at least %d concurrent reconciles", workers)
 }
 
+func TestNextBackoffDefaultBase(t *testing.T) {
+	// When baseRetryInterval is 0, nextBackoff falls back to defaultBaseRetryInterval.
+	r := &reconciler{
+		backoffFor:       make(map[ObjectID]time.Duration),
+		maxRetryInterval: time.Minute,
+		// baseRetryInterval left as zero
+	}
+	d := r.nextBackoff(1)
+	assert.Equal(t, defaultBaseRetryInterval, d)
+}
+
+func TestNextBackoffDoubles(t *testing.T) {
+	r := &reconciler{
+		backoffFor:        make(map[ObjectID]time.Duration),
+		maxRetryInterval:  time.Minute,
+		baseRetryInterval: 10 * time.Millisecond,
+	}
+	first := r.nextBackoff(1)
+	assert.Equal(t, 10*time.Millisecond, first)
+	second := r.nextBackoff(1) // cur != 0, so it doubles
+	assert.Equal(t, 20*time.Millisecond, second)
+}
+
+func TestNextBackoffCaps(t *testing.T) {
+	r := &reconciler{
+		backoffFor:        make(map[ObjectID]time.Duration),
+		maxRetryInterval:  50 * time.Millisecond,
+		baseRetryInterval: 40 * time.Millisecond,
+	}
+	first := r.nextBackoff(1)
+	assert.Equal(t, 40*time.Millisecond, first)
+	// 40ms * 2 = 80ms > 50ms cap → capped at 50ms.
+	second := r.nextBackoff(1)
+	assert.Equal(t, 50*time.Millisecond, second)
+}
+
+// listCallStore signals a channel each time ListUnsettledIDs is called, so the
+// test can wait for the resync tick to fire without using time.Sleep.
+type listCallStore struct {
+	fakeStore
+	callCh chan struct{}
+}
+
+func (s *listCallStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	select {
+	case s.callCh <- struct{}{}:
+	default:
+	}
+	return nil, nil
+}
+
+func TestRunResyncsOnTick(t *testing.T) {
+	store := &listCallStore{callCh: make(chan struct{}, 10)}
+	r := &reconciler{
+		store:          store,
+		work:           newWorkQueue(),
+		resyncInterval: 5 * time.Millisecond,
+		backoffFor:     make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	// Drain the initial startup enqueueUnsettled call.
+	select {
+	case <-store.callCh:
+	case <-time.After(testTimeout):
+		t.Fatal("initial enqueueUnsettled not called")
+	}
+
+	// Wait for at least one resync-tick-driven enqueueUnsettled call.
+	select {
+	case <-store.callCh:
+	case <-time.After(testTimeout):
+		t.Fatal("resync tick did not call enqueueUnsettled")
+	}
+
+	cancel()
+	waitClosed(t, done, "run to return after cancel")
+}
+
+func TestRawToTypedSpecUnmarshalError(t *testing.T) {
+	_, err := rawToTyped[tSpec, tStatus](&RawObject{Spec: []byte("not-json")})
+	require.Error(t, err)
+}
+
+func TestRawToTypedStatusUnmarshalError(t *testing.T) {
+	specJSON, err := json.Marshal(tSpec{})
+	require.NoError(t, err)
+	_, err = rawToTyped[tSpec, tStatus](&RawObject{Spec: specJSON, Status: []byte("not-json")})
+	require.Error(t, err)
+}
+
+// getObjectBadSpecStore is a Store whose Within delegates directly and whose
+// GetObject returns a RawObject with invalid spec JSON, exercising the
+// rawToTyped error path inside typedController.reconcile.
+type getObjectBadSpecStore struct {
+	fakeStore
+}
+
+func (s *getObjectBadSpecStore) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func (s *getObjectBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json")}, nil
+}
+
+func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
+	bh := &Beehive{store: &getObjectBadSpecStore{}}
+	inner := newFakeController()
+	tc := &typedController[tSpec, tStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
+	}
+	_, err := tc.reconcile(context.Background(), 1)
+	require.Error(t, err)
+}
+
+// getObjectErrorStore returns an error from GetObject to exercise path A in
+// typedController.reconcile (the GetObject error before rawToTyped).
+type getObjectErrorStore struct {
+	fakeStore
+}
+
+func (s *getObjectErrorStore) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func (s *getObjectErrorStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
+	return nil, errBoom
+}
+
+func TestTypedControllerReconcileGetObjectError(t *testing.T) {
+	bh := &Beehive{store: &getObjectErrorStore{}}
+	inner := newFakeController()
+	tc := &typedController[tSpec, tStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
+	}
+	_, err := tc.reconcile(context.Background(), 1)
+	require.Error(t, err)
+}
+
 func TestTypedControllerReconcile(t *testing.T) {
 	ctx := context.Background()
 

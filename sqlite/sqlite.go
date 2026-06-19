@@ -16,11 +16,7 @@ var migrations embed.FS
 // Open opens (or creates) a Beehive SQLite database at path,
 // running any pending schema migrations before returning.
 func Open(path string) (*sqliteStore, error) {
-	db, err := sqlitemigrate.OpenPool(path, 1)
-	if err != nil {
-		return nil, err
-	}
-	return open(db)
+	return open(sqlitemigrate.OpenPool(path, 1))
 }
 
 // OpenMemory opens a Beehive SQLite database in memory.
@@ -28,7 +24,7 @@ func Open(path string) (*sqliteStore, error) {
 func OpenMemory() (*sqliteStore, error) {
 	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
 	if err != nil {
-		return nil, err
+		panic(err) // impossible: modernc sqlite is always registered via blank import
 	}
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)

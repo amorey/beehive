@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 
@@ -423,4 +424,171 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	_, err = store.GetObjectByName(ctx, testGK, "nested")
 	assert.ErrorIs(t, err, beehive.ErrNotFound,
 		"nested Within joins the outer tx, so the outer rollback discards its write")
+}
+
+// newRawStore returns a *sqliteStore directly so tests can close store.db to
+// force database errors on subsequent calls.
+func newRawStore(t *testing.T) *sqliteStore {
+	t.Helper()
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() }) // Close is a no-op after db.Close()
+	return store
+}
+
+// insertBadFinalizersRow inserts a row with invalid finalizers JSON directly so
+// scanObject's json.Unmarshal step fails when the row is read back.
+func insertBadFinalizersRow(t *testing.T, store *sqliteStore, gk beehive.GroupKind) beehive.ObjectID {
+	t.Helper()
+	ctx := context.Background()
+	res, err := store.db.ExecContext(ctx, `
+		INSERT INTO objects ("group", kind, spec, finalizers, generation, resource_version, created_at, updated_at)
+		VALUES (?, ?, '{}', 'not-valid-json', 1, 999999, 0, 0)`,
+		gk.Group, gk.Kind)
+	require.NoError(t, err)
+	id, err := res.LastInsertId()
+	require.NoError(t, err)
+	return beehive.ObjectID(id)
+}
+
+func TestWithinBeginTxError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	err := store.Within(context.Background(), func(context.Context) error { return nil })
+	require.Error(t, err)
+}
+
+func TestCreateObjectDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.CreateObject(context.Background(), &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.Error(t, err)
+}
+
+func TestListObjectsQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.ListObjects(context.Background(), testGK)
+	require.Error(t, err)
+}
+
+func TestListObjectsScanError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	// Create a valid object, then corrupt its finalizers so scanObject fails.
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	_, err = store.db.ExecContext(ctx,
+		`UPDATE objects SET finalizers = 'not-valid-json' WHERE id = ?`, created.ID)
+	require.NoError(t, err)
+
+	_, err = store.ListObjects(ctx, testGK)
+	require.Error(t, err)
+}
+
+func TestListUnsettledIDsQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.ListUnsettledIDs(context.Background(), testGK)
+	require.Error(t, err)
+}
+
+func TestUpdateSpecDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.UpdateSpec(context.Background(), 1, []byte(`{}`))
+	require.Error(t, err)
+}
+
+func TestUpdateStatusDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.UpdateStatus(context.Background(), 1, 1, []byte(`{}`))
+	require.Error(t, err)
+}
+
+func TestRequestDeletionDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, _, err := store.RequestDeletion(context.Background(), 1)
+	require.Error(t, err)
+}
+
+func TestRequestDeletionScanError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	// Insert a row with bad finalizers JSON and no deletion_requested_at.
+	// RequestDeletion will UPDATE it (WHERE deletion_requested_at IS NULL matches),
+	// the RETURNING clause gives us the row, and scanObject fails on bad finalizers.
+	id := insertBadFinalizersRow(t, store, testGK)
+
+	_, _, err := store.RequestDeletion(ctx, id)
+	require.Error(t, err)
+}
+
+func TestDeleteObjectDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	err := store.DeleteObject(context.Background(), 1)
+	require.Error(t, err)
+}
+
+func TestScanObjectBadFinalizersJSON(t *testing.T) {
+	store := newRawStore(t)
+	id := insertBadFinalizersRow(t, store, testGK)
+
+	_, err := store.GetObject(context.Background(), id)
+	require.Error(t, err)
+}
+
+// mockSQLResult is a sql.Result that returns a fixed RowsAffected error.
+type mockSQLResult struct{ err error }
+
+func (m mockSQLResult) LastInsertId() (int64, error) { return 0, nil }
+func (m mockSQLResult) RowsAffected() (int64, error) { return 0, m.err }
+
+func TestRequireAffectedRowsAffectedError(t *testing.T) {
+	err := requireAffected(mockSQLResult{err: errors.New("driver error")})
+	require.Error(t, err)
+}
+
+func TestWithinNestedCommitError(t *testing.T) {
+	// A nested Within with a non-nil error from fn propagates through the outer.
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	sentinel := errors.New("inner error")
+	err := store.Within(ctx, func(ctx context.Context) error {
+		return store.Within(ctx, func(context.Context) error {
+			return sentinel
+		})
+	})
+	assert.ErrorIs(t, err, sentinel)
+}
+
+// TestOpenMemoryError covers the sql.Open error path in open() by passing a
+// closed *sql.DB to open so Apply fails and the DB is closed inside open.
+func TestOpenApplyError(t *testing.T) {
+	// Pass a DB that has already been closed — Apply will fail to create tables.
+	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
+	require.NoError(t, err)
+	db.Close()
+
+	_, err = open(db)
+	require.Error(t, err)
 }

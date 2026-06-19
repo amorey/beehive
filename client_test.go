@@ -2,6 +2,8 @@ package beehive_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -21,6 +23,32 @@ func newClientTestStore(t *testing.T) beehive.Store {
 	require.NoError(t, err)
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// errMarshaler is a type whose JSON marshaling always fails, used to exercise
+// the json.Marshal error paths in Create and Update.
+type errMarshaler struct{}
+
+func (errMarshaler) MarshalJSON() ([]byte, error) { return nil, errors.New("cannot marshal") }
+
+func TestClientCreateMarshalError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := beehive.New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := beehive.NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, errMarshaler{})
+	require.Error(t, err)
+}
+
+func TestClientUpdateMarshalError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := beehive.New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := beehive.NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, err = client.Update(ctx, 1, errMarshaler{})
+	require.Error(t, err)
 }
 
 func TestClientCreate(t *testing.T) {
@@ -97,6 +125,64 @@ func TestClientUpdate(t *testing.T) {
 	assert.Equal(t, created.ID, updated.ID)
 	assert.Equal(t, int64(2), updated.Generation)
 	assert.Equal(t, "v2", updated.Spec.Val)
+}
+
+func TestClientGetNotFound(t *testing.T) {
+	ctx := context.Background()
+	bh, err := beehive.New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Get(ctx, 999)
+	require.ErrorIs(t, err, beehive.ErrNotFound)
+}
+
+func TestClientGetByNameFound(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := beehive.New(store)
+	require.NoError(t, err)
+
+	// Create a named object via the store directly (client.Create uses nil name).
+	specJSON, err := json.Marshal(cSpec{Val: "hello"})
+	require.NoError(t, err)
+	raw, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: clientTestGK.Group, Kind: clientTestGK.Kind,
+		Name: new("myobj"), Spec: specJSON,
+	})
+	require.NoError(t, err)
+
+	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	got, err := client.GetByName(ctx, "myobj")
+	require.NoError(t, err)
+	assert.Equal(t, raw.ID, got.ID)
+	assert.Equal(t, "hello", got.Spec.Val)
+}
+
+func TestClientWatchNonExistentID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, client := watchTestBH(t)
+
+	// Watch a non-existent ID: the snapshot loader returns (nil, nil) via the
+	// ErrNotFound path, yielding an empty snapshot and an open channel.
+	ch, err := client.Watch(ctx, 9999)
+	require.NoError(t, err)
+
+	// Cancel ctx — channel must close cleanly (no events, just the cancel).
+	cancel()
+	assertChanClosed(t, ch)
+}
+
+func TestClientDeleteNotFound(t *testing.T) {
+	ctx := context.Background()
+	bh, err := beehive.New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	err = client.Delete(ctx, 999)
+	require.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
 func TestClientDelete(t *testing.T) {
