@@ -2,12 +2,17 @@ package beehive
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
+
+// errBoom is a sentinel error shared by tests that exercise error-propagation
+// paths (option failures, store failures, controller Start rollback).
+var errBoom = errors.New("boom")
 
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
 // fail rather than block forever. Tests never rely on it to pace anything.
@@ -207,4 +212,14 @@ func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	case <-time.After(testTimeout):
 		t.Fatalf("timed out waiting for %s", what)
 	}
+}
+
+// findCondition returns the condition of the given type, or nil.
+func findCondition(conds []Condition, condType string) *Condition {
+	for i := range conds {
+		if conds[i].Type == condType {
+			return &conds[i]
+		}
+	}
+	return nil
 }

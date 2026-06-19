@@ -1,11 +1,10 @@
-package beehive_test
+package beehive
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	"github.com/amorey/beehive"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -13,36 +12,36 @@ import (
 // capturingController saves the ControllerClient it receives in Start so the
 // test can call UpdateStatus directly.
 type capturingController struct {
-	clientCh chan beehive.ControllerClient[cStatus]
+	clientCh chan ControllerClient[cStatus]
 }
 
 func newCapturingController() *capturingController {
-	return &capturingController{clientCh: make(chan beehive.ControllerClient[cStatus], 1)}
+	return &capturingController{clientCh: make(chan ControllerClient[cStatus], 1)}
 }
 
-func (c *capturingController) Start(client beehive.ControllerClient[cStatus]) error {
+func (c *capturingController) Start(client ControllerClient[cStatus]) error {
 	c.clientCh <- client
 	return nil
 }
 
 func (c *capturingController) Stop(_ context.Context) error { return nil }
 
-func (c *capturingController) Reconcile(_ context.Context, _ *beehive.Object[cSpec, cStatus]) (beehive.Result, error) {
-	return beehive.Result{}, nil
+func (c *capturingController) Reconcile(_ context.Context, _ *Object[cSpec, cStatus]) (Result, error) {
+	return Result{}, nil
 }
 
 func TestControllerClientStubsPanic(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := beehive.New(store)
+	bh, err := New(store)
 	require.NoError(t, err)
 
 	ctrl := newCapturingController()
-	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
 	require.NoError(t, bh.Start())
 	defer bh.Stop(ctx)
 
-	var cc beehive.ControllerClient[cStatus]
+	var cc ControllerClient[cStatus]
 	select {
 	case cc = <-ctrl.clientCh:
 	case <-time.After(2 * time.Second):
@@ -57,16 +56,16 @@ func TestControllerClientStubsPanic(t *testing.T) {
 func TestControllerClientUpdateStatus(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := beehive.New(store)
+	bh, err := New(store)
 	require.NoError(t, err)
 
 	ctrl := newCapturingController()
-	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
 	require.NoError(t, bh.Start())
 	defer bh.Stop(ctx)
 
 	// Receive the ControllerClient that was passed to Start.
-	var cc beehive.ControllerClient[cStatus]
+	var cc ControllerClient[cStatus]
 	select {
 	case cc = <-ctrl.clientCh:
 	default:
@@ -74,7 +73,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	}
 
 	// Create an object and update its status via the ControllerClient.
-	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
@@ -93,26 +92,26 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := beehive.New(store)
+	bh, err := New(store)
 	require.NoError(t, err)
 
 	ctrl := newCapturingController()
-	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
 	require.NoError(t, bh.Start())
 	defer bh.Stop(ctx)
 
-	var cc beehive.ControllerClient[cStatus]
+	var cc ControllerClient[cStatus]
 	select {
 	case cc = <-ctrl.clientCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("controller Start was not called")
 	}
 
-	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	require.NoError(t, cc.SetCondition(ctx, obj.ID, beehive.Condition{Type: "Ready", Status: beehive.ConditionTrue}))
+	require.NoError(t, cc.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue}))
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(got.Conditions, "Ready"))
@@ -121,4 +120,37 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	got, err = client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "condition removed via ControllerClient")
+}
+
+// failUpdateStatusStore returns an error from UpdateStatus.
+type failUpdateStatusStore struct {
+	fakeStore
+}
+
+func (s *failUpdateStatusStore) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ ObjectID, _ int64, _ []byte) (*RawObject, error) {
+	return nil, errBoom
+}
+
+// errStatusMarshaler is a Status type whose JSON marshaling always fails.
+type errStatusMarshaler struct{}
+
+func (errStatusMarshaler) MarshalJSON() ([]byte, error) { return nil, errBoom }
+
+func TestControllerClientUpdateStatusMarshalError(t *testing.T) {
+	bh, err := New(&fakeStore{})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[errStatusMarshaler]{bh: bh, gk: GroupKind{Kind: "T"}}
+	err = cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
+	require.Error(t, err)
+}
+
+func TestControllerClientUpdateStatusStoreError(t *testing.T) {
+	bh, err := New(&failUpdateStatusStore{})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+	err = cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
+	require.Error(t, err)
 }

@@ -77,8 +77,8 @@ type fakeAdapter struct {
 	reconcileFn func(ctx context.Context, id ObjectID) (Result, error)
 }
 
-func (f *fakeAdapter) start() error                                        { return nil }
-func (f *fakeAdapter) stop(_ context.Context) error                        { return nil }
+func (f *fakeAdapter) start() error                 { return nil }
+func (f *fakeAdapter) stop(_ context.Context) error { return nil }
 func (f *fakeAdapter) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	return f.reconcileFn(ctx, id)
 }
@@ -526,4 +526,390 @@ func TestTypedControllerReconcile(t *testing.T) {
 	default:
 		t.Fatal("Reconcile was not called")
 	}
+}
+
+// statusSettingController stores the ControllerClient from Start, then on the
+// first Reconcile call writes a fixed status and closes reconciledCh.
+type statusSettingController struct {
+	mu           sync.Mutex
+	client       ControllerClient[cStatus]
+	once         sync.Once
+	reconciledCh chan struct{}
+}
+
+func (c *statusSettingController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *statusSettingController) Stop(_ context.Context) error { return nil }
+
+func (c *statusSettingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
+		return Result{}, err
+	}
+	c.once.Do(func() { close(c.reconciledCh) })
+	return Result{}, nil
+}
+
+// specEchoController writes cStatus{Val: obj.Spec.Val} on every Reconcile.
+// firstDone closes after the first successful reconcile; secondCh closes once
+// count reaches 2, signalling that a spec update was reconciled.
+type specEchoController struct {
+	mu        sync.Mutex
+	client    ControllerClient[cStatus]
+	count     int
+	firstOnce sync.Once
+	once      sync.Once
+	firstDone chan struct{}
+	secondCh  chan struct{}
+}
+
+func (c *specEchoController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *specEchoController) Stop(_ context.Context) error { return nil }
+func (c *specEchoController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.count++
+	n := c.count
+	c.mu.Unlock()
+	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: obj.Spec.Val}); err != nil {
+		return Result{}, err
+	}
+	c.firstOnce.Do(func() { close(c.firstDone) })
+	if n >= 2 {
+		c.once.Do(func() { close(c.secondCh) })
+	}
+	return Result{}, nil
+}
+
+// deletionTrackingController signals reconciled after the first successful
+// reconcile and deleted when the object's DeletionRequestedAt is set.
+type deletionTrackingController struct {
+	mu           sync.Mutex
+	client       ControllerClient[cStatus]
+	reconcileOne sync.Once
+	deleteOne    sync.Once
+	reconciled   chan struct{}
+	deleted      chan struct{}
+}
+
+func (c *deletionTrackingController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *deletionTrackingController) Stop(_ context.Context) error { return nil }
+func (c *deletionTrackingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if obj.DeletionRequestedAt != nil {
+		c.deleteOne.Do(func() { close(c.deleted) })
+		return Result{}, nil
+	}
+	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
+		return Result{}, err
+	}
+	c.reconcileOne.Do(func() { close(c.reconciled) })
+	return Result{}, nil
+}
+
+// rollbackTestController verifies transaction rollback: on the first Reconcile
+// it writes status then returns an error; on the second it records whether the
+// write was rolled back (obj.Status == nil) and closes doneCh.
+type rollbackTestController struct {
+	mu         sync.Mutex
+	client     ControllerClient[cStatus]
+	count      int
+	once       sync.Once
+	sawNilStat bool
+	doneCh     chan struct{}
+}
+
+func (c *rollbackTestController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *rollbackTestController) Stop(_ context.Context) error { return nil }
+func (c *rollbackTestController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.count++
+	n := c.count
+	c.mu.Unlock()
+	if n == 1 {
+		_ = client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "should-be-rolled-back"})
+		return Result{}, errors.New("intentional error")
+	}
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.sawNilStat = (obj.Status == nil)
+		c.mu.Unlock()
+		close(c.doneCh)
+	})
+	return Result{}, nil
+}
+
+func TestIntegrationCreateTriggersReconcile(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+
+	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitClosed(t, ctrl.reconciledCh, "first reconcile")
+
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Status)
+	assert.Equal(t, "done", got.Status.Val)
+	require.NotNil(t, got.ObservedGeneration)
+	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
+}
+
+func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+
+	ctrl := &specEchoController{
+		firstDone: make(chan struct{}),
+		secondCh:  make(chan struct{}),
+	}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "v1"})
+	require.NoError(t, err)
+
+	// Wait for the first reconcile to complete before updating. Without this
+	// wait, the reconciler might read Generation=2 and settle in one pass,
+	// leaving secondCh permanently unclosed.
+	waitClosed(t, ctrl.firstDone, "first reconcile")
+
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
+	require.NoError(t, err)
+
+	waitClosed(t, ctrl.secondCh, "second reconcile after spec update")
+
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Status)
+	assert.Equal(t, "v2", got.Status.Val)
+}
+
+func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+
+	ctrl := &deletionTrackingController{
+		reconciled: make(chan struct{}),
+		deleted:    make(chan struct{}),
+	}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitClosed(t, ctrl.reconciled, "first reconcile")
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	waitClosed(t, ctrl.deleted, "reconcile after deletion requested")
+}
+
+func TestIntegrationTransactionRollback(t *testing.T) {
+	ctx := context.Background()
+
+	// Use a short resync so the second reconcile fires before the 1s backoff.
+	bh, err := New(newClientTestStore(t), WithResyncInterval(10*time.Millisecond))
+	require.NoError(t, err)
+
+	ctrl := &rollbackTestController{doneCh: make(chan struct{})}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitClosed(t, ctrl.doneCh, "second reconcile (after rollback)")
+
+	ctrl.mu.Lock()
+	ok := ctrl.sawNilStat
+	ctrl.mu.Unlock()
+	assert.True(t, ok, "status must have been rolled back when first reconcile errored")
+}
+
+// conditionSettingController sets a Ready=True condition on the first Reconcile,
+// then closes reconciledCh.
+type conditionSettingController struct {
+	mu           sync.Mutex
+	client       ControllerClient[cStatus]
+	once         sync.Once
+	reconciledCh chan struct{}
+}
+
+func (c *conditionSettingController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *conditionSettingController) Stop(_ context.Context) error { return nil }
+func (c *conditionSettingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if err := client.SetCondition(ctx, obj.ID, Condition{
+		Type: "Ready", Status: ConditionTrue, Reason: "Provisioned",
+	}); err != nil {
+		return Result{}, err
+	}
+	c.once.Do(func() { close(c.reconciledCh) })
+	return Result{}, nil
+}
+
+func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+
+	ctrl := &conditionSettingController{reconciledCh: make(chan struct{})}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitClosed(t, ctrl.reconciledCh, "first reconcile")
+
+	// Flows through Get.
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	ready := findCondition(got.Conditions, "Ready")
+	require.NotNil(t, ready, "condition set in Reconcile must be committed")
+	assert.Equal(t, ConditionTrue, ready.Status)
+	assert.Equal(t, "Provisioned", ready.Reason)
+
+	// Flows through List.
+	list, err := client.List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.NotNil(t, findCondition(list[0].Conditions, "Ready"))
+}
+
+// conditionRollbackController sets a condition then errors on the first
+// Reconcile; on the second it records whether the condition was rolled back.
+type conditionRollbackController struct {
+	mu          sync.Mutex
+	client      ControllerClient[cStatus]
+	count       int
+	once        sync.Once
+	sawRollback bool
+	doneCh      chan struct{}
+}
+
+func (c *conditionRollbackController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *conditionRollbackController) Stop(_ context.Context) error { return nil }
+func (c *conditionRollbackController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.count++
+	n := c.count
+	c.mu.Unlock()
+	if n == 1 {
+		_ = client.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
+		return Result{}, errors.New("intentional error")
+	}
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.sawRollback = findCondition(obj.Conditions, "Ready") == nil
+		c.mu.Unlock()
+		close(c.doneCh)
+	})
+	return Result{}, nil
+}
+
+func TestIntegrationSetConditionRollback(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(10*time.Millisecond))
+	require.NoError(t, err)
+
+	ctrl := &conditionRollbackController{doneCh: make(chan struct{})}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitClosed(t, ctrl.doneCh, "second reconcile (after rollback)")
+
+	ctrl.mu.Lock()
+	ok := ctrl.sawRollback
+	ctrl.mu.Unlock()
+	assert.True(t, ok, "condition must have been rolled back when first reconcile errored")
+}
+
+func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+
+	// Insert an object before beehive starts (simulating a previous process run).
+	specJSON, err := json.Marshal(cSpec{Val: "pre-existing"})
+	require.NoError(t, err)
+	_, err = store.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+
+	bh, err := New(store, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	// Without startup enqueue this would time out (resync is disabled).
+	waitClosed(t, ctrl.reconciledCh, "reconcile of pre-existing object at startup")
 }
