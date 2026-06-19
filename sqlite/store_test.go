@@ -261,6 +261,69 @@ func TestRepeatRequestDeletionDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
+func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		Finalizers: []string{"a", "b"},
+	})
+	require.NoError(t, err)
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+
+	// Removing a present finalizer is a real change: only that finalizer drops,
+	// resource_version bumps, and watchers see a Modified event.
+	got, err := store.DeleteFinalizer(ctx, created.ID, "a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, got.Finalizers)
+	assert.Greater(t, got.ResourceVersion, created.ResourceVersion)
+
+	ev := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, []string{"b"}, ev.Object.Finalizers)
+
+	// Persisted, not just reflected in the returned struct.
+	reloaded, err := store.GetObject(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, reloaded.Finalizers)
+}
+
+func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		Finalizers: []string{"a"},
+	})
+	require.NoError(t, err)
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+
+	// Removing a finalizer that isn't present changes nothing: the list is intact,
+	// resource_version is unbumped, and no event fires (a watcher would otherwise
+	// see a spurious diff).
+	got, err := store.DeleteFinalizer(ctx, created.ID, "missing")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a"}, got.Finalizers)
+	assert.Equal(t, created.ResourceVersion, got.ResourceVersion)
+	assertNoEvent(t, w, 100*time.Millisecond)
+}
+
+func TestDeleteFinalizerMissingObject(t *testing.T) {
+	store := newTestStore(t)
+	_, err := store.DeleteFinalizer(context.Background(), 999, "a")
+	assert.ErrorIs(t, err, beehive.ErrNotFound)
+}
+
 func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

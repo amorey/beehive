@@ -30,7 +30,7 @@ func (c *capturingController) Reconcile(_ context.Context, _ *Object[cSpec, cSta
 	return Result{}, nil
 }
 
-func TestControllerClientStubsPanic(t *testing.T) {
+func TestControllerClientDeleteFinalizer(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
@@ -48,7 +48,14 @@ func TestControllerClientStubsPanic(t *testing.T) {
 		t.Fatal("controller Start was not called")
 	}
 
-	require.Panics(t, func() { _ = cc.DeleteFinalizer(ctx, 1, "finalizer") })
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"}, WithFinalizers("a", "b"))
+	require.NoError(t, err)
+
+	require.NoError(t, cc.DeleteFinalizer(ctx, obj.ID, "a"))
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
 }
 
 func TestControllerClientUpdateStatus(t *testing.T) {

@@ -536,6 +536,39 @@ func (s *sqliteStore) DeleteCondition(ctx context.Context, id storeapi.ObjectID,
 	return result, err
 }
 
+func (s *sqliteStore) DeleteFinalizer(ctx context.Context, id storeapi.ObjectID, finalizer string) (*storeapi.RawObject, error) {
+	// Within keeps the read-modify-write of the finalizer list atomic: it opens a
+	// transaction standalone and joins the caller's on the reconcile path, so a
+	// concurrent writer can't slip between the load and the rewrite.
+	var result *storeapi.RawObject
+	err := s.Within(ctx, func(ctx context.Context) error {
+		c := s.conn(ctx)
+		obj, err := s.getObjectRow(ctx, id)
+		if err != nil {
+			return err
+		}
+		remaining, removed := removeFinalizer(obj.Finalizers, finalizer)
+		// Absent finalizer: nothing changed, so don't bump resource_version or emit
+		// — a watcher would otherwise see a spurious diff (mirrors DeleteCondition).
+		if !removed {
+			result, err = s.attachConditions(ctx, obj)
+			return err
+		}
+		rv, err := nextResourceVersion(ctx, c)
+		if err != nil {
+			return err
+		}
+		row := c.QueryRowContext(ctx, `
+			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
+			WHERE id = ?
+			RETURNING `+objectColumns,
+			marshalFinalizers(remaining), rv, toMillis(time.Now().UTC()), id)
+		result, err = s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+		return err
+	})
+	return result, err
+}
+
 func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
@@ -699,6 +732,21 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 	obj.CreatedAt = fromMillis(createdAt)
 	obj.UpdatedAt = fromMillis(updatedAt)
 	return &obj, nil
+}
+
+// removeFinalizer returns f without target and whether target was present. A
+// missing target leaves the slice untouched (removed=false), which the caller
+// treats as a no-op.
+func removeFinalizer(f []string, target string) (remaining []string, removed bool) {
+	remaining = make([]string, 0, len(f))
+	for _, x := range f {
+		if x == target {
+			removed = true
+			continue
+		}
+		remaining = append(remaining, x)
+	}
+	return remaining, removed
 }
 
 func marshalFinalizers(f []string) []byte {

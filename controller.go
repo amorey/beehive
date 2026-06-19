@@ -65,8 +65,9 @@ func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id O
 	return err
 }
 
-func (c *controllerClientImpl[Status]) DeleteFinalizer(_ context.Context, _ ObjectID, _ string) error {
-	panic("not implemented: ControllerClient.DeleteFinalizer")
+func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
+	_, err := c.bh.store.DeleteFinalizer(ctx, id, finalizer)
+	return err
 }
 
 // AddDependency records that fromID depends on toID, so Beehive requeues fromID

@@ -67,6 +67,41 @@ func TestClientCreate(t *testing.T) {
 	assert.Equal(t, "hello", obj.Spec.Val)
 }
 
+func TestClientCreateWithOptions(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// An owner must exist before a child can ref it.
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+
+	child, err := client.Create(ctx, cSpec{Val: "child"},
+		WithName("child-1"),
+		WithFinalizers("cleanup-a", "cleanup-b"),
+		WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	require.NotNil(t, child.Name)
+	assert.Equal(t, "child-1", *child.Name)
+	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, child.Finalizers)
+
+	// Name is persisted and looked up via GetByName.
+	got, err := client.GetByName(ctx, "child-1")
+	require.NoError(t, err)
+	assert.Equal(t, child.ID, got.ID)
+	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
+
+	// The owner ref is recorded child -> owner, so the owner sees the child.
+	refs, err := store.ListReferrers(ctx, owner.ID, RelationOwnedBy)
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	assert.Equal(t, child.ID, refs[0].ID)
+}
+
 func TestClientGet(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))

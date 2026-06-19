@@ -56,10 +56,22 @@ func TestWithStartupReconcileStrategyDispatch(t *testing.T) {
 	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileAll)("unrelated"))
 }
 
-// The metadata options are wired into the API but not yet implemented; they
-// should accept any target without erroring.
-func TestStubOptionsAreInert(t *testing.T) {
-	for _, o := range []Option{WithName("x"), WithFinalizers("a", "b"), WithOwner(42)} {
+// The create-time metadata options apply to a *createOptions target and are
+// inert on anything else (so they're harmless if passed to New/Register).
+func TestCreateOptionsDispatch(t *testing.T) {
+	co := &createOptions{}
+	require.NoError(t, WithName("widget")(co))
+	require.NoError(t, WithFinalizers("a", "b")(co))
+	require.NoError(t, WithOwner(42)(co))
+
+	require.NotNil(t, co.name)
+	assert.Equal(t, "widget", *co.name)
+	assert.Equal(t, []string{"a", "b"}, co.finalizers)
+	require.NotNil(t, co.owner)
+	assert.Equal(t, ObjectID(42), *co.owner)
+
+	// A target the options don't recognize is silently ignored.
+	for _, o := range []Option{WithName("x"), WithFinalizers("a"), WithOwner(7)} {
 		require.NoError(t, o(&Beehive{}))
 	}
 }

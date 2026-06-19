@@ -42,8 +42,11 @@ func (s *fakeStore) Close() error {
 // The lifecycle tests never reach the store's read/write surface (no reconcile
 // is dispatched and no client call is made), so these satisfy the interface
 // without behavior. A test that needs real store semantics uses sqlite instead.
-func (s *fakeStore) Within(context.Context, func(context.Context) error) error {
-	panic("not implemented: fakeStore.Within")
+// Within runs fn inline with the same context: the fake has no real transaction,
+// so "standalone" and "joined" collapse to a direct call. This lets client code
+// that wraps writes in Within reach the overridden mutators below.
+func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
 }
 func (s *fakeStore) CreateObject(context.Context, *RawObject) (*RawObject, error) {
 	panic("not implemented: fakeStore.CreateObject")
@@ -68,6 +71,9 @@ func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, e
 }
 func (s *fakeStore) UpdateStatus(context.Context, ObjectID, int64, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateStatus")
+}
+func (s *fakeStore) DeleteFinalizer(context.Context, ObjectID, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.DeleteFinalizer")
 }
 func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.RequestDeletion")

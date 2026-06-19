@@ -26,25 +26,42 @@ const (
 	StartupReconcileNone
 )
 
-// WithName sets the object's unique name. (stub: not yet wired up)
+// createOptions collects the per-object settings the create-time options apply.
+// Client.Create builds one, runs the options against it, and folds the result
+// into the new row (name/finalizers) and its owner ref.
+type createOptions struct {
+	name       *string
+	finalizers []string
+	owner      *ObjectID
+}
+
+// WithName sets the object's unique name, looked up later via GetByName.
 func WithName(name string) Option {
 	return func(target any) error {
+		if t, ok := target.(*createOptions); ok {
+			t.name = &name
+		}
 		return nil
 	}
 }
 
 // WithFinalizers attaches finalizers that must be cleared before an object is
-// deleted. (stub: not yet wired up)
+// physically deleted.
 func WithFinalizers(f ...string) Option {
 	return func(target any) error {
+		if t, ok := target.(*createOptions); ok {
+			t.finalizers = f
+		}
 		return nil
 	}
 }
 
 // WithOwner records an owning object, so the child is cleaned up with its owner.
-// (stub: not yet wired up)
 func WithOwner(id ObjectID) Option {
 	return func(target any) error {
+		if t, ok := target.(*createOptions); ok {
+			t.owner = &id
+		}
 		return nil
 	}
 }

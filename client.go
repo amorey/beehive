@@ -38,15 +38,38 @@ type clientImpl[Spec, Status any] struct {
 	gk GroupKind
 }
 
-func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, _ ...Option) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := c.bh.store.CreateObject(ctx, &RawObject{
-		Group: c.gk.Group,
-		Kind:  c.gk.Kind,
-		Spec:  b,
+	co := &createOptions{}
+	for _, o := range opts {
+		if err := o(co); err != nil {
+			return nil, err
+		}
+	}
+
+	var raw *RawObject
+	// Within keeps the insert and its owner ref atomic, so a crash between them
+	// can't leave an ownerless child the GC path would never collect.
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		raw, err = c.bh.store.CreateObject(ctx, &RawObject{
+			Group:      c.gk.Group,
+			Kind:       c.gk.Kind,
+			Name:       co.name,
+			Spec:       b,
+			Finalizers: co.finalizers,
+		})
+		if err != nil {
+			return err
+		}
+		// The child owns the edge (child -> owner) so the owner's GC walk finds it
+		// via ListReferrers(owner, RelationOwnedBy).
+		if co.owner != nil {
+			return c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

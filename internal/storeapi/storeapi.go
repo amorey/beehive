@@ -163,6 +163,12 @@ type Store interface {
 	// absent condition is a no-op. Returns the object with its conditions assembled.
 	DeleteCondition(ctx context.Context, id ObjectID, condType string) (*RawObject, error)
 
+	// DeleteFinalizer removes finalizer from id's finalizer list. Removing a
+	// present finalizer bumps ResourceVersion and emits a Modified event; a
+	// finalizer that isn't on the object is a no-op (no bump, no event). Returns
+	// the object with its conditions assembled, or ErrNotFound if id is gone.
+	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) (*RawObject, error)
+
 	// RequestDeletion marks an object for deletion by setting
 	// DeletionRequestedAt; the row lingers until its finalizers clear.
 	// changed is true only when this call was the one that set the flag;
