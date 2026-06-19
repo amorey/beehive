@@ -1,13 +1,13 @@
 //go:build ignore
 
-// Command example is a dead-simple, self-contained Beehive program used to
+// Command greeting is a dead-simple, self-contained Beehive program used to
 // drive the implementation top-down. It defines a "Greeting" resource whose
 // controller reconciles a desired name into an observed greeting message —
 // no external I/O, no finalizers, just the core declarative loop:
 //
 //	Create(spec) -> controller Reconcile -> UpdateStatus -> converged
 //
-// Run it with `go run ./example`. Until the lower layers are implemented the
+// Run it with `go run ./example/greeting/main.go`. Until the lower layers are implemented the
 // stubbed calls panic; each layer we fill in moves this program one step
 // closer to printing "Hello, world".
 package main

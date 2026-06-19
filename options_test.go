@@ -43,6 +43,19 @@ func TestWithConcurrencyDispatch(t *testing.T) {
 	require.NoError(t, WithConcurrency(1)("unrelated"))
 }
 
+func TestWithStartupReconcileStrategyDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileUnsettled)(bh))
+	assert.Equal(t, StartupReconcileUnsettled, bh.startupReconcile)
+
+	r := &reconciler{}
+	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileNone)(r))
+	assert.Equal(t, StartupReconcileNone, r.startupReconcile)
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileAll)("unrelated"))
+}
+
 // The metadata options are wired into the API but not yet implemented; they
 // should accept any target without erroring.
 func TestStubOptionsAreInert(t *testing.T) {

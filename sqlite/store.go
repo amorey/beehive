@@ -597,6 +597,61 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 	return nil
 }
 
+// AddRef inserts a (from_id, to_id, relation) edge. It neither bumps
+// resource_version nor emits — a ref is not a field of the object, so watchers
+// would see no diff — and joins the ambient reconcile transaction via conn.
+func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
+	// Confirm both endpoints exist for a clean ErrNotFound over a raw FK
+	// violation — in one round-trip, and without loading the row blobs.
+	var fromOK, toOK bool
+	if err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM objects WHERE id = ?), EXISTS(SELECT 1 FROM objects WHERE id = ?)`,
+		fromID, toID).Scan(&fromOK, &toOK); err != nil {
+		return err
+	}
+	if !fromOK || !toOK {
+		return storeapi.ErrNotFound
+	}
+	_, err := s.conn(ctx).ExecContext(ctx, `
+		INSERT INTO refs (from_id, to_id, relation) VALUES (?, ?, ?)
+		ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
+		fromID, toID, string(relation))
+	return err
+}
+
+// DeleteRef removes a (from_id, to_id, relation) edge; an absent edge is a
+// silent no-op. Like AddRef it bumps nothing and joins the ambient transaction.
+func (s *sqliteStore) DeleteRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
+	_, err := s.conn(ctx).ExecContext(ctx,
+		`DELETE FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?`,
+		fromID, toID, string(relation))
+	return err
+}
+
+// ListReferrers returns the objects pointing at toID through relation, joining refs
+// to objects so each carries the GroupKind needed to route a requeue.
+func (s *sqliteStore) ListReferrers(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.Referrer, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT o.id, o."group", o.kind
+		FROM refs r JOIN objects o ON o.id = r.from_id
+		WHERE r.to_id = ? AND r.relation = ?
+		ORDER BY o.id`, toID, string(relation))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []storeapi.Referrer
+	for rows.Next() {
+		var d storeapi.Referrer
+		if err := rows.Scan(&d.ID, &d.Group, &d.Kind); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // scanner is satisfied by both *sql.Row and *sql.Rows.
 type scanner interface {
 	Scan(dest ...any) error

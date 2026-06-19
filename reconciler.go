@@ -73,6 +73,8 @@ type reconciler struct {
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
 	concurrency       int           // number of concurrent worker goroutines; 0/1 = single-threaded
+	// startupReconcile selects which objects get an initial reconcile when run starts.
+	startupReconcile StartupReconcileStrategy
 
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
@@ -163,24 +165,27 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 // reconciles only in response to events (once the work queue lands), never on a
 // timer.
 func (r *reconciler) run(ctx context.Context) {
-	// Reconcile every object once at startup — not just unsettled ones. This
-	// re-applies persisted specs that a previous run left settled and gives
-	// controllers a chance to re-confirm process-scoped state (e.g. liveness
-	// conditions, which read as "verifying" until rewritten in this process).
-	// Resync ticks stay unsettled-only; staleness is purely a startup concern.
-	r.enqueueAll(ctx)
-
-	n := r.concurrency
-	if n < 1 {
-		n = 1
+	// Reconcile objects once at startup per the configured strategy. The default
+	// (StartupReconcileAll) re-applies persisted specs that a previous run left
+	// settled and gives controllers a chance to re-confirm process-scoped state
+	// (e.g. liveness conditions, which read as "verifying" until rewritten in this
+	// process). Resync ticks stay unsettled-only; staleness is purely a startup
+	// concern.
+	switch r.startupReconcile {
+	case StartupReconcileNone:
+		// No startup pass; the periodic resync and live events are the only drivers.
+	case StartupReconcileUnsettled:
+		r.enqueueUnsettled(ctx)
+	default: // StartupReconcileAll
+		r.enqueueAll(ctx)
 	}
+
+	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			r.runWorker(ctx)
-		}()
+		})
 	}
 	defer wg.Wait()
 

@@ -24,6 +24,8 @@ type Beehive struct {
 	store          Store
 	resyncInterval time.Duration
 	concurrency    int // default worker count for all controllers; 0/1 = single-threaded
+	// startupReconcile is the default startup strategy copied into each reconciler.
+	startupReconcile StartupReconcileStrategy
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
@@ -74,30 +76,93 @@ func (bh *Beehive) Start() error {
 		started = append(started, r)
 	}
 
-	// Launch reconcile loops only for controllers we started (ranging `started`,
-	// not bh.reconcilers, keeps that invariant structural).
+	// A per-kind dependency waker requeues dependents on each change. Driving it
+	// off change-events (which the store suppresses for no-ops) rather than every
+	// reconcile means a steady state stops waking and cycles settle.
+	//
+	// Subscribe and start consuming every waker BEFORE launching any reconcile
+	// loop: a controller's startup reconcile can modify a target the instant it
+	// runs, and that Modified event must not be published before the relevant
+	// waker is listening — otherwise dependents go unwoken under configurations
+	// that rely on dependency events (e.g. a dependent with StartupReconcileNone
+	// and resync disabled). A subscribe failure is non-fatal: that controller
+	// still resyncs on its own timer.
 	for _, r := range started {
-		bh.wg.Add(1)
-		go func(r *reconciler) {
-			defer bh.wg.Done()
+		w, err := bh.store.WatchEvents(runCtx, r.gk)
+		if err != nil {
+			continue
+		}
+		bh.wg.Go(func() {
+			bh.runDependencyWaker(runCtx, w)
+		})
+	}
+
+	// Now launch the reconcile loops (ranging `started`, not bh.reconcilers,
+	// keeps the "only started controllers run" invariant structural).
+	for _, r := range started {
+		bh.wg.Go(func() {
 			r.run(runCtx)
-		}(r)
+		})
 	}
 
 	bh.state = beehiveRunning
 	return nil
 }
 
+// runDependencyWaker requeues dependents when a target is modified, until ctx is
+// cancelled or the stream ends. The watcher is established by Start (events-only,
+// no snapshot: the reconciler's own startup pass already covers existing objects).
+// The ctx.Done() arm is needed because a watcher's channel may never close on its
+// own.
+func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
+	defer w.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-w.Events():
+			if !ok {
+				return
+			}
+			// Only modifications can change a target's observable state. Skipping
+			// Added avoids replaying the whole snapshot at startup (where the
+			// reconciler's own startup pass already covers every object), and a
+			// brand-new object has no dependents yet anyway.
+			if ev.Type == WatchEventModified {
+				bh.wakeDependents(ctx, ev.Object.ID)
+			}
+		}
+	}
+}
+
+// wakeDependents requeues every object that depends_on targetID, each in its own
+// kind's reconciler. Over-eager wakes are harmless: unregistered kinds are
+// ignored and the work queue coalesces duplicates.
+func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
+	deps, err := bh.store.ListReferrers(ctx, targetID, RelationDependsOn)
+	if err != nil {
+		return
+	}
+	for _, d := range deps {
+		bh.enqueueIfRegistered(GroupKind{Group: d.Group, Kind: d.Kind}, d.ID)
+	}
+}
+
 // Stop tears the control plane down: it cancels the reconcile loops, waits for
 // them to drain (bounded by ctx), then stops every controller.
 func (bh *Beehive) Stop(ctx context.Context) {
 	bh.mu.Lock()
-	defer bh.mu.Unlock()
 	if bh.state != beehiveRunning {
+		bh.mu.Unlock()
 		return
 	}
-
+	// Transition and cancel under the lock, then release it before waiting on wg.
+	// The dependency wakers (counted in wg) acquire bh.mu via enqueueIfRegistered;
+	// holding it across wg.Wait would deadlock a waker mid-event against Stop when
+	// ctx is unbounded. order is frozen after Start, so it's safe to read unlocked.
+	bh.state = beehiveStopped
 	bh.cancel()
+	bh.mu.Unlock()
 
 	// Wait for reconcile loops to exit, but don't block past ctx.
 	done := make(chan struct{})
@@ -116,8 +181,6 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	for _, r := range bh.order {
 		_ = r.adapter.stop(ctx)
 	}
-
-	bh.state = beehiveStopped
 }
 
 // New creates a control plane backed by store s. Register controllers on the
@@ -155,6 +218,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
 		concurrency:      bh.concurrency,
+		startupReconcile: bh.startupReconcile,
 		backoffFor:       make(map[ObjectID]time.Duration),
 	}
 	r.adapter = &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}

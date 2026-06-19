@@ -7,6 +7,25 @@ import "time"
 // targets it understands and ignores the rest.
 type Option func(target any) error
 
+// StartupReconcileStrategy selects which objects a controller reconciles once at
+// startup. The zero value is StartupReconcileAll, so the safe default holds for a
+// controller that never sets it.
+type StartupReconcileStrategy int
+
+const (
+	// StartupReconcileAll reconciles every object at startup, settled or not. The
+	// full pass re-confirms process-scoped state such as liveness conditions,
+	// which read as "verifying" after a restart until a controller rewrites them.
+	StartupReconcileAll StartupReconcileStrategy = iota
+	// StartupReconcileUnsettled reconciles only objects whose spec has not yet
+	// converged — cheaper, but leaves process-scoped state unconfirmed until some
+	// other event wakes the object.
+	StartupReconcileUnsettled
+	// StartupReconcileNone does no startup reconcile at all, leaving the periodic
+	// resync (and live events) as the only drivers.
+	StartupReconcileNone
+)
+
 // WithName sets the object's unique name. (stub: not yet wired up)
 func WithName(name string) Option {
 	return func(target any) error {
@@ -40,6 +59,22 @@ func WithResyncInterval(d time.Duration) Option {
 			t.resyncInterval = d
 		case *reconciler:
 			t.resyncInterval = d
+		}
+		return nil
+	}
+}
+
+// WithStartupReconcileStrategy sets which objects a controller reconciles at
+// startup (see StartupReconcileStrategy). The default is StartupReconcileAll.
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithStartupReconcileStrategy(s StartupReconcileStrategy) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.startupReconcile = s
+		case *reconciler:
+			t.startupReconcile = s
 		}
 		return nil
 	}

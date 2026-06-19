@@ -35,6 +35,18 @@ func TestOpenMemoryAppliesMigrations(t *testing.T) {
 	}
 }
 
+// TestOpenApplyError covers the error path in open() by passing a closed *sql.DB
+// to open so Apply fails and the DB is closed inside open.
+func TestOpenApplyError(t *testing.T) {
+	// Pass a DB that has already been closed — Apply will fail to create tables.
+	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
+	require.NoError(t, err)
+	db.Close()
+
+	_, err = open(db)
+	require.Error(t, err)
+}
+
 func tableExists(t *testing.T, db *sql.DB, name string) bool {
 	t.Helper()
 	var got string

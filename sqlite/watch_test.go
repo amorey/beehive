@@ -236,6 +236,48 @@ func TestWatchAfterCloseErrors(t *testing.T) {
 	require.ErrorIs(t, err, errStoreClosed)
 	_, err = store.Watch(context.Background(), testGK, 1)
 	require.ErrorIs(t, err, errStoreClosed)
+	_, err = store.WatchEvents(context.Background(), testGK)
+	require.ErrorIs(t, err, errStoreClosed)
+}
+
+// TestWatchEventsSkipsSnapshot verifies WatchEvents delivers no initial snapshot
+// for pre-existing objects, but does stream subsequent live changes.
+func TestWatchEventsSkipsSnapshot(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// A pre-existing object: WatchList would replay it as Added; WatchEvents must not.
+	pre, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, err := store.WatchEvents(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+	assertNoEvent(t, w, 200*time.Millisecond)
+
+	// A live change to that object streams through.
+	_, err = store.UpdateSpec(ctx, pre.ID, []byte(`{"x":1}`))
+	require.NoError(t, err)
+	ev := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, pre.ID, ev.Object.ID)
+}
+
+// TestWatchEventsStreamsLiveAdded verifies a newly created object reaches a
+// WatchEvents subscriber as an Added event (only the initial snapshot is skipped).
+func TestWatchEventsStreamsLiveAdded(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchEvents(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	created, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	ev := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventAdded, ev.Type)
+	assert.Equal(t, created.ID, ev.Object.ID)
 }
 
 // TestWatchSnapshotLoadError verifies a snapshot-load failure surfaces as an

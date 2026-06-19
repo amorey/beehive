@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -157,6 +158,212 @@ func (c *reconcileCapture) Reconcile(_ context.Context, obj *Object[tSpec, tStat
 	return Result{}, nil
 }
 
+// TestDependencyRequeue verifies the end-to-end auto-requeue: once D depends_on
+// T, an observable change to T requeues D's reconcile — across the store, with
+// no controller-to-controller call.
+func TestDependencyRequeue(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	reconciled := make(chan *Object[tSpec, tStatus], 16)
+	// Resync disabled so the dependency waker is the only thing that can requeue
+	// an already-settled object — no timer noise.
+	require.NoError(t, Register(bh, gk, &reconcileCapture{ch: reconciled}, WithResyncInterval(0)))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+
+	// Drain the two creation-driven reconciles so the channel is quiet before we
+	// trigger the dependency path.
+	seen := map[ObjectID]bool{}
+	for len(seen) < 2 {
+		select {
+		case obj := <-reconciled:
+			seen[obj.ID] = true
+		case <-time.After(testTimeout):
+			t.Fatal("creation reconciles did not arrive")
+		}
+	}
+
+	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, "depends_on"))
+
+	// An observable change to the target must wake the dependent.
+	_, err = store.SetCondition(ctx, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	select {
+	case obj := <-reconciled:
+		assert.Equal(t, dep.ID, obj.ID, "the dependent is the object requeued by the waker")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was not requeued after the target changed")
+	}
+}
+
+// TestStartToleratesWatchError verifies that a dependency-watch subscription
+// failure is non-fatal: Start (which now establishes the watch synchronously)
+// still succeeds and the controller runs — only the waker is skipped, and the
+// controller still resyncs on its own timer.
+func TestStartToleratesWatchError(t *testing.T) {
+	bh, err := New(&watcherStore{err: errBoom}, WithResyncInterval(0))
+	require.NoError(t, err)
+	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, newFakeController()))
+
+	require.NoError(t, bh.Start())
+	assert.Equal(t, beehiveRunning, bh.state)
+	bh.Stop(context.Background())
+}
+
+// blockingDepsStore parks the dependency waker inside ListReferrers — after it
+// has read a Modified event but before it re-enters Beehive's mutex via
+// enqueueIfRegistered — so a test can drive a precise interleaving with Stop.
+type blockingDepsStore struct {
+	watcherStore
+	entered chan struct{} // closed-by-send when the waker reaches ListReferrers
+	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
+}
+
+func (s *blockingDepsStore) ListReferrers(context.Context, ObjectID, Relation) ([]Referrer, error) {
+	s.entered <- struct{}{}
+	<-s.release
+	// One referrer for an unregistered kind: enough to make the waker re-enter
+	// bh.mu via enqueueIfRegistered (the registration check happens after Lock).
+	return []Referrer{{ID: 1, Kind: "Widget"}}, nil
+}
+
+// TestStopDoesNotDeadlockWithActiveWaker guards the invariant that Stop never
+// holds bh.mu while draining the wakers: a waker that re-enters bh.mu via
+// enqueueIfRegistered mid-event must not deadlock against Stop, even with an
+// unbounded Stop context.
+func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
+	fw := newFakeWatcher()
+	store := &blockingDepsStore{
+		watcherStore: watcherStore{w: fw},
+		entered:      make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	bh := &Beehive{
+		store:       store,
+		reconcilers: map[GroupKind]*reconciler{},
+		state:       beehiveRunning,
+		cancel:      cancel,
+	}
+	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw) })
+
+	// Drive the waker to the point where it has consumed a Modified event and is
+	// parked just before re-entering bh.mu.
+	fw.push(WatchEventModified, &RawObject{ID: 1})
+	<-store.entered
+
+	stopped := make(chan struct{})
+	go func() {
+		bh.Stop(context.Background()) // unbounded: a lock held across the wait would hang forever
+		close(stopped)
+	}()
+
+	// Stop cancels under bh.mu, so ctx.Done means Stop is committed to tearing
+	// down. Releasing the waker only now guarantees it contends for bh.mu against
+	// a Stop that, in the buggy version, still holds it.
+	<-ctx.Done()
+	close(store.release)
+
+	select {
+	case <-stopped:
+	case <-time.After(testTimeout):
+		t.Fatal("Stop deadlocked against an active dependency waker")
+	}
+}
+
+// recordingDepsStore reports ListReferrers calls on a channel and serves a preset
+// watcher (via the embedded watcherStore), so a test can observe exactly which
+// events drive a wake.
+type recordingDepsStore struct {
+	watcherStore
+	calls chan ObjectID
+}
+
+func (s *recordingDepsStore) ListReferrers(_ context.Context, toID ObjectID, _ Relation) ([]Referrer, error) {
+	s.calls <- toID
+	return nil, nil
+}
+
+// TestDependencyWakerIgnoresAddedEvents verifies the waker reacts only to
+// Modified events: an Added event (such as the startup snapshot, which the
+// reconciler's own startup pass already covers) must not trigger a dependents
+// lookup, so startup doesn't replay a wake for every existing object.
+func TestDependencyWakerIgnoresAddedEvents(t *testing.T) {
+	fw := newFakeWatcher()
+	calls := make(chan ObjectID, 1)
+	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{w: fw}, calls: calls}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(ctx, fw)
+		close(done)
+	}()
+
+	fw.push(WatchEventAdded, &RawObject{ID: 1})
+	select {
+	case <-calls:
+		t.Fatal("Added event triggered a dependents wake")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	fw.push(WatchEventModified, &RawObject{ID: 2})
+	select {
+	case id := <-calls:
+		assert.Equal(t, ObjectID(2), id, "Modified event wakes dependents of the changed object")
+	case <-time.After(testTimeout):
+		t.Fatal("Modified event did not trigger a wake")
+	}
+
+	cancel()
+	waitClosed(t, done, "waker to exit")
+}
+
+// errDepsStore returns an error from ListReferrers.
+type errDepsStore struct{ fakeStore }
+
+func (*errDepsStore) ListReferrers(context.Context, ObjectID, Relation) ([]Referrer, error) {
+	return nil, errBoom
+}
+
+// TestWakeDependentsListError verifies a failed dependents lookup is swallowed:
+// the target still reconciled, and the resync backstop will retry the waking.
+func TestWakeDependentsListError(t *testing.T) {
+	bh := &Beehive{store: &errDepsStore{}}
+	bh.wakeDependents(context.Background(), 1)
+}
+
+// TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
+// ends (channel closed), not only on context cancellation.
+func TestDependencyWakerStreamEnd(t *testing.T) {
+	fw := newFakeWatcher()
+	bh := &Beehive{store: &watcherStore{w: fw}}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), fw)
+		close(done)
+	}()
+
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+}
+
 // TestStartupEnqueuesAllNotJustUnsettled verifies that run's startup enqueue
 // reconciles every object, not only unsettled ones. A settled object (empty
 // ListUnsettledIDs) must still be reconciled at startup so a controller can
@@ -196,6 +403,49 @@ func TestStartupEnqueuesAllNotJustUnsettled(t *testing.T) {
 
 	cancel()
 	waitClosed(t, done, "run to return after cancel")
+}
+
+// TestStartupReconcileSkipsSettled verifies that the non-default strategies do
+// not reconcile a settled object at startup. allIDsStore reports the object via
+// ListIDs but not ListUnsettledIDs, so StartupReconcileUnsettled (empty unsettled
+// set) and StartupReconcileNone (no startup pass) both leave it untouched.
+func TestStartupReconcileSkipsSettled(t *testing.T) {
+	for _, strategy := range []StartupReconcileStrategy{StartupReconcileUnsettled, StartupReconcileNone} {
+		t.Run(fmt.Sprintf("strategy=%d", strategy), func(t *testing.T) {
+			reconciled := make(chan ObjectID, 1)
+			adapter := &fakeAdapter{
+				reconcileFn: func(_ context.Context, id ObjectID) (Result, error) {
+					select {
+					case reconciled <- id:
+					default:
+					}
+					return Result{}, nil
+				},
+			}
+			r := &reconciler{
+				adapter:          adapter,
+				store:            &allIDsStore{ids: []ObjectID{7}},
+				work:             newWorkQueue(),
+				resyncInterval:   0,
+				maxRetryInterval: time.Second,
+				startupReconcile: strategy,
+				backoffFor:       make(map[ObjectID]time.Duration),
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := runInBackground(r, ctx)
+
+			select {
+			case got := <-reconciled:
+				t.Fatalf("settled object %d reconciled despite strategy %d", got, strategy)
+			case <-time.After(200 * time.Millisecond):
+			}
+
+			cancel()
+			waitClosed(t, done, "run to return after cancel")
+		})
+	}
 }
 
 // TestEnqueueNilStoreNoop verifies the enqueue helpers are no-ops (no panic)
@@ -558,12 +808,12 @@ func (c *statusSettingController) Reconcile(ctx context.Context, obj *Object[cSp
 }
 
 // specEchoController writes cStatus{Val: obj.Spec.Val} on every Reconcile.
-// firstDone closes after the first successful reconcile; secondCh closes once
-// count reaches 2, signalling that a spec update was reconciled.
+// firstDone closes after the first successful reconcile; secondCh closes once a
+// reconcile observes generation 2, signalling that the spec update — not merely a
+// second reconcile — was seen.
 type specEchoController struct {
 	mu        sync.Mutex
 	client    ControllerClient[cStatus]
-	count     int
 	firstOnce sync.Once
 	once      sync.Once
 	firstDone chan struct{}
@@ -580,14 +830,15 @@ func (c *specEchoController) Stop(_ context.Context) error { return nil }
 func (c *specEchoController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
 	c.mu.Lock()
 	client := c.client
-	c.count++
-	n := c.count
 	c.mu.Unlock()
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: obj.Spec.Val}); err != nil {
 		return Result{}, err
 	}
 	c.firstOnce.Do(func() { close(c.firstDone) })
-	if n >= 2 {
+	// Gate on the observed generation, not a reconcile count: a duplicate startup
+	// reconcile of the original generation (the startup pass can race the Create's
+	// own enqueue) must not be mistaken for the update being reconciled.
+	if obj.Generation >= 2 {
 		c.once.Do(func() { close(c.secondCh) })
 	}
 	return Result{}, nil
@@ -707,9 +958,9 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "v1"})
 	require.NoError(t, err)
 
-	// Wait for the first reconcile to complete before updating. Without this
-	// wait, the reconciler might read Generation=2 and settle in one pass,
-	// leaving secondCh permanently unclosed.
+	// Wait for the first reconcile before updating, so the update is genuinely a
+	// distinct reconcile of generation 2 rather than being coalesced with the
+	// create into a single pass.
 	waitClosed(t, ctrl.firstDone, "first reconcile")
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})

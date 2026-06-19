@@ -81,6 +81,15 @@ func (s *fakeStore) DeleteCondition(context.Context, ObjectID, string) (*RawObje
 func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.DeleteObject")
 }
+func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
+	panic("not implemented: fakeStore.AddRef")
+}
+func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
+	panic("not implemented: fakeStore.DeleteRef")
+}
+func (s *fakeStore) ListReferrers(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+	return nil, nil
+}
 
 // Watch/WatchList default to a noopWatcher (never fires, no-op Close) rather
 // than panicking, so client tests that only exercise the snapshot or
@@ -89,6 +98,9 @@ func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error)
 	return noopWatcher{}, nil
 }
 func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
+	return noopWatcher{}, nil
+}
+func (s *fakeStore) WatchEvents(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
 }
 
@@ -110,6 +122,9 @@ func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, err
 	return s.w, s.err
 }
 func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
+	return s.w, s.err
+}
+func (s *watcherStore) WatchEvents(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
 }
 

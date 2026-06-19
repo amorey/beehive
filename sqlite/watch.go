@@ -107,6 +107,15 @@ func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (sto
 	})
 }
 
+func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
+	// An empty snapshot loader streams live events only: the snapshotRV dedup
+	// degrades to "<= 0", and resource_version is always >= 1, so nothing is
+	// dropped.
+	return s.watch(ctx, gk, nil, func(context.Context) ([]*storeapi.RawObject, error) {
+		return nil, nil
+	})
+}
+
 func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.Watcher, error) {
 	filterID := id
 	return s.watch(ctx, gk, &filterID, func(ctx context.Context) ([]*storeapi.RawObject, error) {

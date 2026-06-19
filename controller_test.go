@@ -49,8 +49,6 @@ func TestControllerClientStubsPanic(t *testing.T) {
 	}
 
 	require.Panics(t, func() { _ = cc.DeleteFinalizer(ctx, 1, "finalizer") })
-	require.Panics(t, func() { _ = cc.AddDependency(ctx, 1, 2) })
-	require.Panics(t, func() { _ = cc.DeleteDependency(ctx, 1, 2) })
 }
 
 func TestControllerClientUpdateStatus(t *testing.T) {
@@ -120,6 +118,58 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	got, err = client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "condition removed via ControllerClient")
+}
+
+func TestControllerClientAddAndDeleteDependency(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	ctrl := newCapturingController()
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	var cc ControllerClient[cStatus]
+	select {
+	case cc = <-ctrl.clientCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller Start was not called")
+	}
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	from, err := client.Create(ctx, cSpec{Val: "from"})
+	require.NoError(t, err)
+	to, err := client.Create(ctx, cSpec{Val: "to"})
+	require.NoError(t, err)
+
+	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID))
+	deps, err := bh.store.ListReferrers(ctx, to.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []Referrer{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
+
+	require.NoError(t, cc.DeleteDependency(ctx, from.ID, to.ID))
+	deps, err = bh.store.ListReferrers(ctx, to.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Empty(t, deps, "edge removed via ControllerClient")
+}
+
+// failAddRefStore returns an error from AddRef.
+type failAddRefStore struct {
+	fakeStore
+}
+
+func (s *failAddRefStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
+	return errBoom
+}
+
+func TestControllerClientAddDependencyStoreError(t *testing.T) {
+	bh, err := New(&failAddRefStore{})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+	err = cc.AddDependency(context.Background(), 1, 2)
+	require.ErrorIs(t, err, errBoom)
 }
 
 // failUpdateStatusStore returns an error from UpdateStatus.

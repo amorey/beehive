@@ -19,6 +19,18 @@ type RawObject = storeapi.RawObject
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
+// Referrer is an object pointing at a target through a ref edge, with the
+// GroupKind needed to route a requeue.
+type Referrer = storeapi.Referrer
+
+// Relation is the kind of edge in the refs table.
+type Relation = storeapi.Relation
+
+const (
+	RelationOwnedBy   = storeapi.RelationOwnedBy
+	RelationDependsOn = storeapi.RelationDependsOn
+)
+
 // Watcher is a closeable subscription to a kind's change stream, returned by the
 // store's Watch/WatchList. The client decodes its raw events into the typed
 // WatchEvent[Spec, Status] surface.

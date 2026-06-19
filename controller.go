@@ -69,10 +69,13 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(_ context.Context, _ Obje
 	panic("not implemented: ControllerClient.DeleteFinalizer")
 }
 
-func (c *controllerClientImpl[Status]) AddDependency(_ context.Context, _ ObjectID, _ ObjectID) error {
-	panic("not implemented: ControllerClient.AddDependency")
+// AddDependency records that fromID depends on toID, so Beehive requeues fromID
+// when toID changes. The relation is always "depends_on" (owner edges come from
+// WithOwner at create time); inside Reconcile the write joins that transaction.
+func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID, toID ObjectID) error {
+	return c.bh.store.AddRef(ctx, fromID, toID, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) DeleteDependency(_ context.Context, _ ObjectID, _ ObjectID) error {
-	panic("not implemented: ControllerClient.DeleteDependency")
+func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fromID, toID ObjectID) error {
+	return c.bh.store.DeleteRef(ctx, fromID, toID, RelationDependsOn)
 }

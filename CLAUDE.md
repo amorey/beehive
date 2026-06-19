@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Work-in-progress. Lower layers are stubbed (methods `panic("not implemented")`); the package is being built top-down, driven by `example/main.go`, which won't fully run until those layers land. `README.md` describes the target API and is ahead of the code — treat it as the spec, the code as the current slice. When code and README disagree on a signature, the code is the current truth.
+Work-in-progress. Lower layers are stubbed (methods `panic("not implemented")`); the package is being built top-down, driven by `example/greeting/main.go`, which won't fully run until those layers land. `README.md` describes the target API and is ahead of the code — treat it as the spec, the code as the current slice. When code and README disagree on a signature, the code is the current truth.
 
 ## Commands
 
 ```sh
 go build ./...
 go vet ./...
-go run ./example          # the end-to-end smoke target
+go run ./example/greeting/main.go   # the end-to-end smoke target
 go test ./...
 go test -run TestName ./  # single test
 ```
@@ -30,6 +30,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 ## Conventions
 
 - **Whitebox tests.** Put tests in `package beehive` (not `beehive_test`) so they can exercise unexported machinery — the reconcile loop, adapter, and options dispatch are the interesting parts and they're unexported.
+- **Tests are organized by origin file, not by topic.** A function defined in `foo.go` is tested in `foo_test.go` — mirror the source filename, regardless of feature. For example, refs and conditions live in `sqlite/store.go`, so their tests belong in `sqlite/store_test.go` (not a `refs_test.go`/`conditions_test.go`); `open`/`Open` live in `sqlite/sqlite.go`, so they're tested in `sqlite/sqlite_test.go`. Shared test helpers and fakes that aren't tied to one source file go in `testutils_test.go`. Not every source file needs a test file (e.g. pure type-alias files).
 - **Assertions: `stretchr/testify`** (`require` for fatal preconditions, `assert` for independent checks) — already the style in `sqlitemigrate/sqlitemigrate_test.go`.
 - **Event-driven, never sleep-paced.** Synchronize on channels (or `ctx.Done()`) that the code/fakes signal; the only use of `time` is a generous failsafe timeout in a `select` that turns a hang into a failure. No `time.Sleep` to "wait for" a goroutine and no polling loops.
 - **Comments are short, idiomatic, and human-centered.** Explain *why* and call out non-obvious invariants (e.g. why `Start` takes no context, why a guard exists); don't restate what the code plainly says. Match the density already in `beehive.go`/`reconciler.go`.

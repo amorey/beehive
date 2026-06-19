@@ -87,6 +87,25 @@ type RawObject struct {
 	UpdatedAt           time.Time
 }
 
+// Relation is the kind of edge in the refs table. The schema's CHECK constraint
+// permits exactly these two values.
+type Relation string
+
+const (
+	// RelationOwnedBy: deleting the target cascade-deletes the dependent.
+	RelationOwnedBy Relation = "owned_by"
+	// RelationDependsOn: a change to the target requeues the dependent.
+	RelationDependsOn Relation = "depends_on"
+)
+
+// Referrer is an object pointing at a target through a ref edge, with the
+// GroupKind needed to route a requeue. ListReferrers returns these.
+type Referrer struct {
+	ID    ObjectID
+	Group string
+	Kind  string
+}
+
 // Store is the durable-store contract Beehive depends on internally. It is
 // non-generic and deals only in raw rows: the generic-to-non-generic boundary
 // lives one layer up, in the typedController adapter.
@@ -154,6 +173,19 @@ type Store interface {
 	// empty first; this is the physical delete the GC path performs.
 	DeleteObject(ctx context.Context, id ObjectID) error
 
+	// AddRef inserts a directed (fromID -> toID) edge with the given relation.
+	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on
+	// the object, so it bumps no version and emits no event.
+	AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+
+	// DeleteRef removes the (fromID, toID, relation) edge; an absent edge is a
+	// no-op. Like AddRef it bumps no version and emits no event.
+	DeleteRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+
+	// ListReferrers returns every object pointing at toID through relation, ordered by
+	// id (e.g. the dependents to requeue, or the owned children to GC).
+	ListReferrers(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
+
 	// Watch returns a Watcher for the single object id of kind gk: its current
 	// state (if any) as an Added snapshot, then live changes filtered to that id.
 	Watch(ctx context.Context, gk GroupKind, id ObjectID) (Watcher, error)
@@ -161,4 +193,10 @@ type Store interface {
 	// WatchList returns a Watcher for every object of kind gk: the current set as
 	// an Added snapshot, then all live changes for the kind.
 	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
+
+	// WatchEvents returns a Watcher for live changes to gk only — no initial
+	// snapshot. Use it when current state is already accounted for elsewhere and
+	// only subsequent changes matter (e.g. the dependency waker), to skip the
+	// snapshot build that WatchList would do on every subscribe.
+	WatchEvents(ctx context.Context, gk GroupKind) (Watcher, error)
 }
