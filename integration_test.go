@@ -42,6 +42,16 @@ func (c *statusSettingController) Reconcile(ctx context.Context, obj *beehive.Ob
 	return beehive.Result{}, nil
 }
 
+// findCondition returns the condition of the given type, or nil.
+func findCondition(conds []beehive.Condition, condType string) *beehive.Condition {
+	for i := range conds {
+		if conds[i].Type == condType {
+			return &conds[i]
+		}
+	}
+	return nil
+}
+
 func waitForCh(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
@@ -263,6 +273,127 @@ func TestIntegrationTransactionRollback(t *testing.T) {
 	ok := ctrl.sawNilStat
 	ctrl.mu.Unlock()
 	assert.True(t, ok, "status must have been rolled back when first reconcile errored")
+}
+
+// conditionSettingController sets a Ready=True condition on the first Reconcile,
+// then closes reconciledCh.
+type conditionSettingController struct {
+	mu           sync.Mutex
+	client       beehive.ControllerClient[cStatus]
+	once         sync.Once
+	reconciledCh chan struct{}
+}
+
+func (c *conditionSettingController) Start(client beehive.ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *conditionSettingController) Stop(_ context.Context) error { return nil }
+func (c *conditionSettingController) Reconcile(ctx context.Context, obj *beehive.Object[cSpec, cStatus]) (beehive.Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
+		Type: "Ready", Status: beehive.ConditionTrue, Reason: "Provisioned",
+	}); err != nil {
+		return beehive.Result{}, err
+	}
+	c.once.Do(func() { close(c.reconciledCh) })
+	return beehive.Result{}, nil
+}
+
+func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := beehive.New(newClientTestStore(t), beehive.WithResyncInterval(0))
+	require.NoError(t, err)
+
+	ctrl := &conditionSettingController{reconciledCh: make(chan struct{})}
+	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitForCh(t, ctrl.reconciledCh, "first reconcile")
+
+	// Flows through Get.
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	ready := findCondition(got.Conditions, "Ready")
+	require.NotNil(t, ready, "condition set in Reconcile must be committed")
+	assert.Equal(t, beehive.ConditionTrue, ready.Status)
+	assert.Equal(t, "Provisioned", ready.Reason)
+
+	// Flows through List.
+	list, err := client.List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.NotNil(t, findCondition(list[0].Conditions, "Ready"))
+}
+
+// conditionRollbackController sets a condition then errors on the first
+// Reconcile; on the second it records whether the condition was rolled back.
+type conditionRollbackController struct {
+	mu          sync.Mutex
+	client      beehive.ControllerClient[cStatus]
+	count       int
+	once        sync.Once
+	sawRollback bool
+	doneCh      chan struct{}
+}
+
+func (c *conditionRollbackController) Start(client beehive.ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *conditionRollbackController) Stop(_ context.Context) error { return nil }
+func (c *conditionRollbackController) Reconcile(ctx context.Context, obj *beehive.Object[cSpec, cStatus]) (beehive.Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.count++
+	n := c.count
+	c.mu.Unlock()
+	if n == 1 {
+		_ = client.SetCondition(ctx, obj.ID, beehive.Condition{Type: "Ready", Status: beehive.ConditionTrue})
+		return beehive.Result{}, errors.New("intentional error")
+	}
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.sawRollback = findCondition(obj.Conditions, "Ready") == nil
+		c.mu.Unlock()
+		close(c.doneCh)
+	})
+	return beehive.Result{}, nil
+}
+
+func TestIntegrationSetConditionRollback(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := beehive.New(newClientTestStore(t), beehive.WithResyncInterval(10*time.Millisecond))
+	require.NoError(t, err)
+
+	ctrl := &conditionRollbackController{doneCh: make(chan struct{})}
+	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	waitForCh(t, ctrl.doneCh, "second reconcile (after rollback)")
+
+	ctrl.mu.Lock()
+	ok := ctrl.sawRollback
+	ctrl.mu.Unlock()
+	assert.True(t, ok, "condition must have been rolled back when first reconcile errored")
 }
 
 func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {

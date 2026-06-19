@@ -28,6 +28,7 @@ type Object[Spec, Status any] struct {
 	ResourceVersion     int64      // bumped on every write, for optimistic concurrency
 	DeletionRequestedAt *time.Time // set when deletion is requested; object lingers until finalizers clear
 	Finalizers          []string
+	Conditions          []Condition // per-type observations reported by controllers
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
@@ -55,4 +56,9 @@ type Condition struct {
 	Status  ConditionStatus
 	Reason  string
 	Message string
+	// Liveness marks a condition derived from a live in-process resource: it is
+	// valid only within the writing process. The store downgrades a liveness
+	// condition written by a prior process to Unknown ("verifying") until a
+	// controller re-confirms it. The default (false) is durable store-truth.
+	Liveness bool
 }

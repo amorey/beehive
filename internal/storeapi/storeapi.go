@@ -49,6 +49,22 @@ type Watcher interface {
 	Close()
 }
 
+// Condition is the untyped form of a single condition row. Status is one of
+// "True"/"False"/"Unknown"; Liveness marks a condition derived from a live
+// in-process resource (valid only within the writing process — see the read
+// path's "verifying" downgrade). The client decodes these into the public,
+// generic-free beehive.Condition; the store-only bookkeeping fields
+// (TransitionedAt, UpdatedAt) stop at that boundary.
+type Condition struct {
+	Type           string
+	Status         string
+	Reason         string
+	Message        string
+	Liveness       bool
+	TransitionedAt time.Time
+	UpdatedAt      time.Time
+}
+
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON bytes; everything else is Beehive-owned metadata that mirrors the
 // objects table. The reconciler and client decode Spec/Status into typed
@@ -66,6 +82,7 @@ type RawObject struct {
 	ResourceVersion     int64
 	DeletionRequestedAt *time.Time
 	Finalizers          []string
+	Conditions          []Condition // assembled on reads; nil when the object has none
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
@@ -103,6 +120,12 @@ type Store interface {
 	// observed_generation doesn't match generation (not yet converged).
 	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
+	// ListIDs returns the IDs of every object of kind gk, ordered by id. The
+	// reconciler uses it to enqueue a full reconcile pass at startup, so
+	// process-scoped state (e.g. liveness conditions) is re-confirmed even on
+	// objects whose spec is already settled.
+	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
 	// change) and ResourceVersion.
 	UpdateSpec(ctx context.Context, id ObjectID, spec []byte) (*RawObject, error)
@@ -110,6 +133,16 @@ type Store interface {
 	// UpdateStatus replaces an object's status and records the generation the
 	// controller observed, bumping ObservedAt and ResourceVersion.
 	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status []byte) (*RawObject, error)
+
+	// SetCondition upserts the condition keyed by (id, cond.Type). A real change
+	// bumps the object's ResourceVersion and emits a Modified event; an identical
+	// write is a no-op. Returns the object with its conditions assembled.
+	SetCondition(ctx context.Context, id ObjectID, cond Condition) (*RawObject, error)
+
+	// DeleteCondition removes the condition of type condType from id. Removing an
+	// existing condition bumps ResourceVersion and emits a Modified event; an
+	// absent condition is a no-op. Returns the object with its conditions assembled.
+	DeleteCondition(ctx context.Context, id ObjectID, condType string) (*RawObject, error)
 
 	// RequestDeletion marks an object for deletion by setting
 	// DeletionRequestedAt; the row lingers until its finalizers clear.

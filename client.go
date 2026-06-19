@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/amorey/beehive/internal/storeapi"
 )
 
 // WatchEvent reports a change to a watched object.
@@ -176,6 +178,26 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 	return out
 }
 
+// conditionsFromRaw maps the store's raw conditions to the public Condition
+// type, dropping the storage-only bookkeeping (last-transition/updated/observed
+// generation) that the user-facing type doesn't carry. Returns nil for none.
+func conditionsFromRaw(raw []storeapi.Condition) []Condition {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]Condition, len(raw))
+	for i, c := range raw {
+		out[i] = Condition{
+			Type:     c.Type,
+			Status:   ConditionStatus(c.Status),
+			Reason:   c.Reason,
+			Message:  c.Message,
+			Liveness: c.Liveness,
+		}
+	}
+	return out
+}
+
 // rawToTyped decodes a RawObject into a typed Object[Spec, Status].
 func rawToTyped[Spec, Status any](raw *RawObject) (*Object[Spec, Status], error) {
 	var spec Spec
@@ -194,6 +216,7 @@ func rawToTyped[Spec, Status any](raw *RawObject) (*Object[Spec, Status], error)
 		ResourceVersion:     raw.ResourceVersion,
 		DeletionRequestedAt: raw.DeletionRequestedAt,
 		Finalizers:          raw.Finalizers,
+		Conditions:          conditionsFromRaw(raw.Conditions),
 		CreatedAt:           raw.CreatedAt,
 		UpdatedAt:           raw.UpdatedAt,
 	}

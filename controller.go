@@ -3,6 +3,8 @@ package beehive
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/amorey/beehive/internal/storeapi"
 )
 
 // Controller is the user-supplied reconcile logic for a resource kind. Start
@@ -47,12 +49,20 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	return nil
 }
 
-func (c *controllerClientImpl[Status]) SetCondition(_ context.Context, _ ObjectID, _ Condition) error {
-	panic("not implemented: ControllerClient.SetCondition")
+func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
+	_, err := c.bh.store.SetCondition(ctx, id, storeapi.Condition{
+		Type:     condition.Type,
+		Status:   string(condition.Status),
+		Reason:   condition.Reason,
+		Message:  condition.Message,
+		Liveness: condition.Liveness,
+	})
+	return err
 }
 
-func (c *controllerClientImpl[Status]) DeleteCondition(_ context.Context, _ ObjectID, _ string) error {
-	panic("not implemented: ControllerClient.DeleteCondition")
+func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
+	_, err := c.bh.store.DeleteCondition(ctx, id, conditionType)
+	return err
 }
 
 func (c *controllerClientImpl[Status]) DeleteFinalizer(_ context.Context, _ ObjectID, _ string) error {

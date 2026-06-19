@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +22,21 @@ type unsettledIDsStore struct {
 }
 
 func (s *unsettledIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	return s.ids, nil
+}
+
+// allIDsStore reports no unsettled objects but a fixed full ID set, modeling a
+// settled object that must still be reconciled at startup (e.g. to re-confirm a
+// liveness condition after a restart).
+type allIDsStore struct {
+	fakeStore
+	ids []ObjectID
+}
+
+func (s *allIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+func (s *allIDsStore) ListIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
@@ -139,6 +155,55 @@ func (c *reconcileCapture) Stop(_ context.Context) error            { return nil
 func (c *reconcileCapture) Reconcile(_ context.Context, obj *Object[tSpec, tStatus]) (Result, error) {
 	c.ch <- obj
 	return Result{}, nil
+}
+
+// TestStartupEnqueuesAllNotJustUnsettled verifies that run's startup enqueue
+// reconciles every object, not only unsettled ones. A settled object (empty
+// ListUnsettledIDs) must still be reconciled at startup so a controller can
+// re-confirm process-scoped state like liveness conditions. With resync
+// disabled, the startup enqueue is the only thing that could drive it.
+func TestStartupEnqueuesAllNotJustUnsettled(t *testing.T) {
+	const objID = ObjectID(7)
+	reconciled := make(chan ObjectID, 1)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) (Result, error) {
+			select {
+			case reconciled <- id:
+			default:
+			}
+			return Result{}, nil
+		},
+	}
+	r := &reconciler{
+		adapter:          adapter,
+		store:            &allIDsStore{ids: []ObjectID{objID}},
+		work:             newWorkQueue(),
+		resyncInterval:   0,
+		maxRetryInterval: time.Second,
+		backoffFor:       make(map[ObjectID]time.Duration),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(r, ctx)
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, objID, got)
+	case <-time.After(testTimeout):
+		t.Fatal("settled object was not reconciled at startup")
+	}
+
+	cancel()
+	waitClosed(t, done, "run to return after cancel")
+}
+
+// TestEnqueueNilStoreNoop verifies the enqueue helpers are no-ops (no panic)
+// when the reconciler has no store, as in the minimal test reconcilers.
+func TestEnqueueNilStoreNoop(t *testing.T) {
+	r := &reconciler{}
+	r.enqueueUnsettled(context.Background())
+	r.enqueueAll(context.Background())
 }
 
 // TestEnqueueUnsettledEnqueuesReturnedIDs verifies that enqueueUnsettled enqueues
@@ -349,6 +414,25 @@ func TestRunResyncsOnTick(t *testing.T) {
 func TestRawToTypedSpecUnmarshalError(t *testing.T) {
 	_, err := rawToTyped[tSpec, tStatus](&RawObject{Spec: []byte("not-json")})
 	require.Error(t, err)
+}
+
+func TestRawToTypedMapsConditions(t *testing.T) {
+	specJSON, err := json.Marshal(tSpec{})
+	require.NoError(t, err)
+	raw := &RawObject{Spec: specJSON, Conditions: []storeapi.Condition{
+		{Type: "Ready", Status: "True", Reason: "Up", Message: "ok", Liveness: true},
+		{Type: "Healthy", Status: "False"},
+	}}
+
+	obj, err := rawToTyped[tSpec, tStatus](raw)
+	require.NoError(t, err)
+	require.Len(t, obj.Conditions, 2)
+	assert.Equal(t, "Ready", obj.Conditions[0].Type)
+	assert.Equal(t, ConditionTrue, obj.Conditions[0].Status)
+	assert.Equal(t, "Up", obj.Conditions[0].Reason)
+	assert.Equal(t, "ok", obj.Conditions[0].Message)
+	assert.True(t, obj.Conditions[0].Liveness)
+	assert.Equal(t, ConditionFalse, obj.Conditions[1].Status)
 }
 
 func TestRawToTypedStatusUnmarshalError(t *testing.T) {

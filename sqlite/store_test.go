@@ -398,6 +398,19 @@ func TestListUnsettledIDs(t *testing.T) {
 	ids, err := store.ListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{nilObs.ID, stale.ID}, ids)
+
+	// ListIDs returns every object of the kind, settled or not, ordered by id.
+	all, err := store.ListIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{settled.ID, nilObs.ID, stale.ID}, all)
+}
+
+func TestListIDsQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.ListIDs(context.Background(), testGK)
+	require.Error(t, err)
 }
 
 func TestNestedWithinJoinsOuterTransaction(t *testing.T) {

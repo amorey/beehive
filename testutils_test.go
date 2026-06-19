@@ -52,6 +52,9 @@ func (s *fakeStore) GetObjectByName(context.Context, GroupKind, string) (*RawObj
 func (s *fakeStore) ListObjects(context.Context, GroupKind) ([]*RawObject, error) {
 	return nil, nil
 }
+func (s *fakeStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
 func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
@@ -63,6 +66,12 @@ func (s *fakeStore) UpdateStatus(context.Context, ObjectID, int64, []byte) (*Raw
 }
 func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.RequestDeletion")
+}
+func (s *fakeStore) SetCondition(context.Context, ObjectID, storeapi.Condition) (*RawObject, error) {
+	panic("not implemented: fakeStore.SetCondition")
+}
+func (s *fakeStore) DeleteCondition(context.Context, ObjectID, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.DeleteCondition")
 }
 func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.DeleteObject")

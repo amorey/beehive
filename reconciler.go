@@ -94,7 +94,24 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	ids, err := r.store.ListUnsettledIDs(ctx, r.gk)
+	r.enqueueFrom(ctx, r.store.ListUnsettledIDs)
+}
+
+// enqueueAll enqueues every object of the kind, including ones whose spec is
+// already settled. Used once at startup so controllers can re-confirm
+// process-scoped state (e.g. liveness conditions, which a prior process's writes
+// leave reading as "verifying") that the unsettled-only resync would never wake.
+func (r *reconciler) enqueueAll(ctx context.Context) {
+	if r.store == nil {
+		return
+	}
+	r.enqueueFrom(ctx, r.store.ListIDs)
+}
+
+// enqueueFrom enqueues the IDs returned by list, skipping any already in flight
+// to avoid duplicate or concurrent reconciles for the same ID.
+func (r *reconciler) enqueueFrom(ctx context.Context, list func(context.Context, GroupKind) ([]ObjectID, error)) {
+	ids, err := list(ctx, r.gk)
 	if err != nil {
 		return
 	}
@@ -146,10 +163,12 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 // reconciles only in response to events (once the work queue lands), never on a
 // timer.
 func (r *reconciler) run(ctx context.Context) {
-	// Enqueue any objects that weren't settled before this process started.
-	// Without this, objects persisted by a previous run would never converge
-	// when resync is disabled (WithResyncInterval(0)).
-	r.enqueueUnsettled(ctx)
+	// Reconcile every object once at startup — not just unsettled ones. This
+	// re-applies persisted specs that a previous run left settled and gives
+	// controllers a chance to re-confirm process-scoped state (e.g. liveness
+	// conditions, which read as "verifying" until rewritten in this process).
+	// Resync ticks stay unsettled-only; staleness is purely a startup concern.
+	r.enqueueAll(ctx)
 
 	n := r.concurrency
 	if n < 1 {

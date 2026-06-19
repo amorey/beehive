@@ -87,9 +87,8 @@ CREATE TABLE conditions (
     -- opt-in by the writer.
     liveness INTEGER NOT NULL DEFAULT 0,
 
-    observed_generation INTEGER,       -- generation this condition was evaluated against
-    last_transition     INTEGER NOT NULL, -- epoch ms when status last CHANGED
-    updated_at          INTEGER NOT NULL, -- epoch ms of last write (also the liveness stamp)
+    transitioned_at INTEGER NOT NULL, -- epoch ms when status last CHANGED
+    updated_at      INTEGER NOT NULL, -- epoch ms of last write (also the liveness stamp)
 
     PRIMARY KEY (object_id, type)
 );

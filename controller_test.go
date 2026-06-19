@@ -49,8 +49,6 @@ func TestControllerClientStubsPanic(t *testing.T) {
 		t.Fatal("controller Start was not called")
 	}
 
-	require.Panics(t, func() { _ = cc.SetCondition(ctx, 1, beehive.Condition{}) })
-	require.Panics(t, func() { _ = cc.DeleteCondition(ctx, 1, "Ready") })
 	require.Panics(t, func() { _ = cc.DeleteFinalizer(ctx, 1, "finalizer") })
 	require.Panics(t, func() { _ = cc.AddDependency(ctx, 1, 2) })
 	require.Panics(t, func() { _ = cc.DeleteDependency(ctx, 1, 2) })
@@ -90,4 +88,37 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	assert.Equal(t, "done", got.Status.Val)
 	require.NotNil(t, got.ObservedGeneration)
 	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
+}
+
+func TestControllerClientSetAndDeleteCondition(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := beehive.New(store)
+	require.NoError(t, err)
+
+	ctrl := newCapturingController()
+	require.NoError(t, beehive.Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	var cc beehive.ControllerClient[cStatus]
+	select {
+	case cc = <-ctrl.clientCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller Start was not called")
+	}
+
+	client := beehive.NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+
+	require.NoError(t, cc.SetCondition(ctx, obj.ID, beehive.Condition{Type: "Ready", Status: beehive.ConditionTrue}))
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, findCondition(got.Conditions, "Ready"))
+
+	require.NoError(t, cc.DeleteCondition(ctx, obj.ID, "Ready"))
+	got, err = client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Nil(t, findCondition(got.Conditions, "Ready"), "condition removed via ControllerClient")
 }

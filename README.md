@@ -126,12 +126,18 @@ const (
 )
 
 type Condition struct {
-    Type    string
-    Status  ConditionStatus
-    Reason  string // machine-readable token, e.g. "DialTimeout"
-    Message string // human-readable detail
+    Type     string
+    Status   ConditionStatus
+    Reason   string // machine-readable token, e.g. "DialTimeout"
+    Message  string // human-readable detail
+    Liveness bool   // see below
 }
 ```
+
+`Liveness` marks a condition derived from a live, in-process resource: it is valid
+only within the process that wrote it. A liveness condition written by a prior
+process is downgraded to `ConditionUnknown` ("verifying") on read until a controller
+re-confirms it. The default (`false`) is durable store-truth that survives restarts.
 
 ### Object
 
@@ -151,6 +157,7 @@ type Object[Spec, Status any] struct {
     ResourceVersion     int64
     DeletionRequestedAt *time.Time
     Finalizers          []string
+    Conditions          []Condition // per-type observations reported by controllers
     CreatedAt           time.Time
     UpdatedAt           time.Time
 }

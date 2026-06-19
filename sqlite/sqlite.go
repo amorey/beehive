@@ -39,8 +39,13 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		return nil, err
 	}
 	return &sqliteStore{
-		db:   db,
-		hubs: make(map[storeapi.GroupKind]*broadcast.Hub[storeapi.RawWatchEvent]),
-		done: make(chan struct{}),
+		db: db,
+		// Truncate to milliseconds to match condition timestamps' precision: the
+		// liveness "verifying" check compares a ms-truncated updated_at against
+		// processStart, so a sub-ms processStart would wrongly flag a condition
+		// written in the same millisecond the process started.
+		processStart: fromMillis(toMillis(time.Now().UTC())),
+		hubs:         make(map[storeapi.GroupKind]*broadcast.Hub[storeapi.RawWatchEvent]),
+		done:         make(chan struct{}),
 	}, nil
 }
