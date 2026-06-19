@@ -5,33 +5,9 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/amorey/gochan/broadcast"
 )
 
 const defaultResyncInterval = 30 * time.Second
-
-// rawWatchEvent is the untyped event that flows through a GroupKind's broadcast
-// hub. clientImpl and controllerClientImpl decode it into WatchEvent[Spec,Status].
-type rawWatchEvent struct {
-	Type   WatchEventType
-	Object *RawObject
-}
-
-// watchEventCollector accumulates watch events during a reconcile transaction so
-// they are published after commit, not speculatively inside the transaction. A
-// fresh collector is created per reconcile call and injected via context so
-// concurrent reconcile goroutines each have their own queue.
-type watchEventCollector struct {
-	events []rawWatchEvent
-}
-
-func (c *watchEventCollector) add(ev rawWatchEvent) {
-	c.events = append(c.events, ev)
-}
-
-// watchCollectorKey is the context key for a *watchEventCollector.
-type watchCollectorKey struct{}
 
 type beehiveState uint8
 
@@ -53,15 +29,10 @@ type Beehive struct {
 	reconcilers map[GroupKind]*reconciler
 	// order preserves registration order so Start brings controllers up — and
 	// rolls them back — deterministically, rather than in random map order.
-	order []*reconciler
-	// watchMu guards watchHubs independently of mu so that publishEvent (called
-	// from reconcile goroutines) never blocks on the same lock that Stop holds
-	// while waiting for those goroutines to drain.
-	watchMu   sync.RWMutex
-	watchHubs map[GroupKind]*broadcast.Hub[rawWatchEvent]
-	state     beehiveState
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	order  []*reconciler
+	state  beehiveState
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // Start brings the control plane up: it starts every registered controller and
@@ -139,16 +110,9 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	case <-ctx.Done():
 	}
 
-	// Close every hub to signal active watchers that the control plane is
-	// stopping. Any reconcile goroutines that outlived the stop deadline will
-	// call publishEvent on a closed hub; Send returns an error that is silently
-	// dropped, so stale events never escape.
-	bh.watchMu.Lock()
-	for _, hub := range bh.watchHubs {
-		hub.Close()
-	}
-	bh.watchMu.Unlock()
-
+	// Watch subscriptions are owned by the store, not the control plane, so Stop
+	// does not terminate them: an active watcher ends when its context is
+	// cancelled or the store is closed.
 	for _, r := range bh.order {
 		_ = r.adapter.stop(ctx)
 	}
@@ -163,7 +127,6 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		store:          s,
 		resyncInterval: defaultResyncInterval,
 		reconcilers:    make(map[GroupKind]*reconciler),
-		watchHubs:      make(map[GroupKind]*broadcast.Hub[rawWatchEvent]),
 	}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
@@ -205,34 +168,17 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 
 	bh.reconcilers[gk] = r
 	bh.order = append(bh.order, r)
-	bh.watchMu.Lock()
-	bh.watchHubs[gk] = broadcast.New[rawWatchEvent](256)
-	bh.watchMu.Unlock()
 	return nil
 }
 
-// publishEvent sends ev to the broadcast hub for gk. It is a no-op if no hub
-// exists for gk (e.g. no controller was registered). Send never blocks.
-func (bh *Beehive) publishEvent(gk GroupKind, typ WatchEventType, raw *RawObject) {
-	bh.watchMu.RLock()
-	hub := bh.watchHubs[gk]
-	bh.watchMu.RUnlock()
-	if hub != nil {
-		_ = hub.Sender().Send(rawWatchEvent{Type: typ, Object: raw})
-	}
-}
-
-// emitOrCollect delivers ev to active watchers. If ctx carries a
-// watchEventCollector (i.e. the call is inside a reconcile transaction), the
-// event is queued and published only after commit. Otherwise it is published
-// immediately. All ControllerClient write methods should use this helper so
-// the two-path dispatch never needs to be repeated.
-func (bh *Beehive) emitOrCollect(ctx context.Context, gk GroupKind, ev rawWatchEvent) {
-	if coll, ok := ctx.Value(watchCollectorKey{}).(*watchEventCollector); ok {
-		coll.add(ev)
-	} else {
-		bh.publishEvent(gk, ev.Type, ev.Object)
-	}
+// isRegistered reports whether a controller is registered for gk. The client
+// watch surface uses it to reject watches on kinds with no controller, a
+// contract the store can't enforce since it doesn't track registrations.
+func (bh *Beehive) isRegistered(gk GroupKind) bool {
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
+	_, ok := bh.reconcilers[gk]
+	return ok
 }
 
 // enqueueIfRegistered wakes the reconciler for (gk, id) if one exists.

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/amorey/beehive/internal/storeapi"
 )
 
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
@@ -65,6 +67,65 @@ func (s *fakeStore) RequestDeletion(context.Context, ObjectID) (*RawObject, bool
 func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.DeleteObject")
 }
+
+// Watch/WatchList default to a noopWatcher (never fires, no-op Close) rather
+// than panicking, so client tests that only exercise the snapshot or
+// registration error paths reach their target without each fake overriding them.
+func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
+	return noopWatcher{}, nil
+}
+func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
+	return noopWatcher{}, nil
+}
+
+// noopWatcher is a Watcher whose event stream never fires; Close is a no-op.
+type noopWatcher struct{}
+
+func (noopWatcher) Events() <-chan storeapi.RawWatchEvent { return nil }
+func (noopWatcher) Close()                                {}
+
+// watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
+// error, so client-layer tests can drive the typed-adapter goroutine directly.
+type watcherStore struct {
+	fakeStore
+	w   Watcher
+	err error
+}
+
+func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
+	return s.w, s.err
+}
+func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
+	return s.w, s.err
+}
+
+// fakeWatcher is a controllable Watcher: push feeds a raw event, endStream ends
+// the stream, and Close signals the adapter goroutine's exit. It backs the
+// client adaptWatcher tests.
+type fakeWatcher struct {
+	ch        chan storeapi.RawWatchEvent
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newFakeWatcher() *fakeWatcher {
+	return &fakeWatcher{ch: make(chan storeapi.RawWatchEvent), closed: make(chan struct{})}
+}
+
+func (w *fakeWatcher) Events() <-chan storeapi.RawWatchEvent { return w.ch }
+
+// Close (called by adaptWatcher's defer on exit) closes closed, letting tests
+// synchronize on goroutine exit instead of reading Events — which could itself
+// satisfy a pending send and race the outcome.
+func (w *fakeWatcher) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
+
+// push delivers a raw event to the adapter goroutine.
+func (w *fakeWatcher) push(typ WatchEventType, obj *RawObject) {
+	w.ch <- storeapi.RawWatchEvent{Type: typ, Object: obj}
+}
+
+// endStream closes the event channel, signalling the stream has ended.
+func (w *fakeWatcher) endStream() { close(w.ch) }
 
 // fakeController is a test double for Controller. It counts Start/Stop calls and
 // closes channels when they happen, so tests synchronize on those events

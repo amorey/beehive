@@ -6,7 +6,9 @@ import (
 	"embed"
 	"time"
 
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlitemigrate"
+	"github.com/amorey/gochan/broadcast"
 	_ "modernc.org/sqlite"
 )
 
@@ -36,5 +38,9 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	return &sqliteStore{db: db}, nil
+	return &sqliteStore{
+		db:   db,
+		hubs: make(map[storeapi.GroupKind]*broadcast.Hub[storeapi.RawWatchEvent]),
+		done: make(chan struct{}),
+	}, nil
 }

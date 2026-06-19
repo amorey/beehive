@@ -23,6 +23,32 @@ type ObjectID = int64
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = errors.New("beehive: object not found")
 
+// WatchEventType classifies a watch event.
+type WatchEventType string
+
+const (
+	WatchEventAdded    WatchEventType = "Added"
+	WatchEventModified WatchEventType = "Modified"
+	WatchEventDeleted  WatchEventType = "Deleted"
+)
+
+// RawWatchEvent is the untyped event a Watcher delivers. The client decodes it
+// into the generic, user-facing WatchEvent[Spec, Status]; the name carries the
+// "Raw" prefix (like RawObject) to avoid colliding with that generic type.
+type RawWatchEvent struct {
+	Type   WatchEventType
+	Object *RawObject
+}
+
+// Watcher is a subscription to a kind's change stream. Events yields the current
+// state as Added events (the snapshot) followed by live changes, until the
+// watcher is closed or its store shuts down, at which point the channel closes.
+// Close releases the subscription and is safe to call more than once.
+type Watcher interface {
+	Events() <-chan RawWatchEvent
+	Close()
+}
+
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON bytes; everything else is Beehive-owned metadata that mirrors the
 // objects table. The reconciler and client decode Spec/Status into typed
@@ -94,4 +120,12 @@ type Store interface {
 	// DeleteObject removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.
 	DeleteObject(ctx context.Context, id ObjectID) error
+
+	// Watch returns a Watcher for the single object id of kind gk: its current
+	// state (if any) as an Added snapshot, then live changes filtered to that id.
+	Watch(ctx context.Context, gk GroupKind, id ObjectID) (Watcher, error)
+
+	// WatchList returns a Watcher for every object of kind gk: the current set as
+	// an Added snapshot, then all live changes for the kind.
+	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
 }

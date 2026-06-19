@@ -3,17 +3,7 @@ package beehive
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-)
-
-// WatchEventType classifies a WatchEvent.
-type WatchEventType string
-
-const (
-	WatchEventAdded    WatchEventType = "Added"
-	WatchEventModified WatchEventType = "Modified"
-	WatchEventDeleted  WatchEventType = "Deleted"
 )
 
 // WatchEvent reports a change to a watched object.
@@ -63,9 +53,8 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, _ ...O
 	if err != nil {
 		return nil, err
 	}
-	// Publish before enqueuing: a fast controller must not produce a Modified
-	// event before watchers see the Added event that preceded it.
-	c.bh.publishEvent(c.gk, WatchEventAdded, raw)
+	// The store emitted the Added event inside CreateObject, before this enqueue,
+	// so a fast controller can't produce a Modified event ahead of the Added.
 	c.bh.enqueueIfRegistered(c.gk, raw.ID)
 	return obj, nil
 }
@@ -83,7 +72,6 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	if err != nil {
 		return nil, err
 	}
-	c.bh.publishEvent(c.gk, WatchEventModified, raw)
 	c.bh.enqueueIfRegistered(c.gk, raw.ID)
 	return obj, nil
 }
@@ -121,14 +109,11 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, St
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	raw, changed, err := c.bh.store.RequestDeletion(ctx, id)
-	if err != nil {
+	// RequestDeletion emits the Modified event itself, and only on a real state
+	// change — an idempotent retry carries the same resource_version, so emitting
+	// would show watchers a spurious diff.
+	if _, _, err := c.bh.store.RequestDeletion(ctx, id); err != nil {
 		return err
-	}
-	// Only emit a watch event for a real state change; idempotent retries
-	// carry the same resource_version so watchers would see a spurious diff.
-	if changed {
-		c.bh.publishEvent(c.gk, WatchEventModified, raw)
 	}
 	// Always enqueue: a retry or post-crash Delete must still hand the
 	// deletion-pending object to the controller to clear finalizers.
@@ -137,102 +122,58 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 }
 
 func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error) {
-	return c.watchFiltered(ctx,
-		func(ctx context.Context) ([]*RawObject, error) {
-			return c.bh.store.ListObjects(ctx, c.gk)
-		},
-		nil)
+	if !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+	}
+	w, err := c.bh.store.WatchList(ctx, c.gk)
+	if err != nil {
+		return nil, err
+	}
+	return c.adaptWatcher(ctx, w), nil
 }
 
 func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error) {
-	return c.watchFiltered(ctx,
-		func(ctx context.Context) ([]*RawObject, error) {
-			raw, err := c.bh.store.GetObject(ctx, id)
-			if errors.Is(err, ErrNotFound) {
-				return nil, nil
-			}
-			if err != nil {
-				return nil, err
-			}
-			return []*RawObject{raw}, nil
-		},
-		func(oid ObjectID) bool { return oid == id })
-}
-
-// watchFiltered creates a watch channel that first emits current store state as
-// Added events (the snapshot), then streams live events from the hub.
-//
-// The hub receiver is created before the snapshot is loaded so that any events
-// published during the load are buffered and not lost. After the snapshot,
-// hub events whose resource version is already covered by the snapshot are
-// dropped to prevent duplicates. filter, if non-nil, is applied to live hub
-// events; snapshot rows are already pre-filtered by loadSnapshot. The channel
-// closes when ctx is cancelled, the hub shuts down, or the receiver lags.
-func (c *clientImpl[Spec, Status]) watchFiltered(
-	ctx context.Context,
-	loadSnapshot func(context.Context) ([]*RawObject, error),
-	filter func(ObjectID) bool,
-) (<-chan WatchEvent[Spec, Status], error) {
-	c.bh.watchMu.RLock()
-	hub := c.bh.watchHubs[c.gk]
-	c.bh.watchMu.RUnlock()
-	if hub == nil {
-		return nil, fmt.Errorf("beehive: no watch hub for %s/%s", c.gk.Group, c.gk.Kind)
+	if !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	// Subscribe before loading the snapshot so live events published during the
-	// load are buffered in the receiver and not silently dropped.
-	rx := hub.Receiver()
-	snapshot, err := loadSnapshot(ctx)
+	w, err := c.bh.store.Watch(ctx, c.gk, id)
 	if err != nil {
-		rx.Close()
 		return nil, err
 	}
-	// Record each snapshot object's resource version. Hub events that committed
-	// during the snapshot load may appear in both the snapshot and the buffer;
-	// any event with rv ≤ the snapshot rv for that object is already covered.
-	snapshotRV := make(map[ObjectID]int64, len(snapshot))
-	for _, raw := range snapshot {
-		snapshotRV[raw.ID] = raw.ResourceVersion
-	}
+	return c.adaptWatcher(ctx, w), nil
+}
+
+// adaptWatcher decodes a store Watcher's raw events (the snapshot's Added events
+// followed by live changes — the store owns snapshotting, dedup, and id
+// filtering) into typed WatchEvents. It forwards on the returned channel until
+// ctx is cancelled, the watcher's stream ends, or an event fails to decode; the
+// channel closes and the watcher is released on exit.
+func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) <-chan WatchEvent[Spec, Status] {
 	out := make(chan WatchEvent[Spec, Status])
 	go func() {
 		defer close(out)
-		defer rx.Close()
-		// Emit snapshot as Added events before streaming live hub events.
-		for _, raw := range snapshot {
-			obj, convErr := rawToTyped[Spec, Status](raw)
-			if convErr != nil {
-				return
-			}
-			select {
-			case out <- WatchEvent[Spec, Status]{Type: WatchEventAdded, Object: obj}:
-			case <-ctx.Done():
-				return
-			}
-		}
+		defer w.Close()
 		for {
-			ev, err := rx.RecvContext(ctx)
-			if err != nil {
-				return
-			}
-			if ev.Object.ResourceVersion <= snapshotRV[ev.Object.ID] {
-				continue // already represented by snapshot
-			}
-			if filter != nil && !filter(ev.Object.ID) {
-				continue
-			}
-			obj, err := rawToTyped[Spec, Status](ev.Object)
-			if err != nil {
-				return
-			}
 			select {
-			case out <- WatchEvent[Spec, Status]{Type: ev.Type, Object: obj}:
+			case ev, ok := <-w.Events():
+				if !ok {
+					return
+				}
+				obj, err := rawToTyped[Spec, Status](ev.Object)
+				if err != nil {
+					return
+				}
+				select {
+				case out <- WatchEvent[Spec, Status]{Type: ev.Type, Object: obj}:
+				case <-ctx.Done():
+					return
+				}
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	return out, nil
+	return out
 }
 
 // rawToTyped decodes a RawObject into a typed Object[Spec, Status].

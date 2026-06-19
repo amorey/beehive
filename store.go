@@ -18,3 +18,17 @@ type RawObject = storeapi.RawObject
 
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
+
+// Watcher is a closeable subscription to a kind's change stream, returned by the
+// store's Watch/WatchList. The client decodes its raw events into the typed
+// WatchEvent[Spec, Status] surface.
+type Watcher = storeapi.Watcher
+
+// WatchEventType classifies a WatchEvent.
+type WatchEventType = storeapi.WatchEventType
+
+const (
+	WatchEventAdded    = storeapi.WatchEventAdded
+	WatchEventModified = storeapi.WatchEventModified
+	WatchEventDeleted  = storeapi.WatchEventDeleted
+)

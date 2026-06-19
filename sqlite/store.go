@@ -5,16 +5,52 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gochan/broadcast"
 )
 
 type sqliteStore struct {
 	db *sql.DB
+
+	// hubs fan watch events out to subscribers, one broadcast hub per GroupKind,
+	// created lazily on first use. hubMu guards the map and the closed flag.
+	hubMu  sync.RWMutex
+	hubs   map[storeapi.GroupKind]*broadcast.Hub[storeapi.RawWatchEvent]
+	closed bool
+	// done is closed by Close to wake watcher goroutines that are parked on a
+	// send (closing the hub only wakes those parked on a receive).
+	done chan struct{}
+
+	// beforeSnapshot, if non-nil, runs after a watcher subscribes to its hub but
+	// before it loads the snapshot. Tests set it to publish an event into that
+	// window to exercise the resource-version dedup; nil in production.
+	beforeSnapshot func()
+
+	// afterStream, if non-nil, runs after a watcher's goroutine has closed its
+	// output channel and exited. Tests use it to await exit without reading the
+	// output (which would race the goroutine's send/cancel selection); nil in
+	// production.
+	afterStream func()
 }
 
+// Close terminates every active watcher — whether parked on a receive (closing
+// the hub wakes it) or on a send (closing done wakes it) — so their Events
+// channels close, then closes the database. It is idempotent; after Close the
+// store is unusable.
 func (s *sqliteStore) Close() error {
+	s.hubMu.Lock()
+	if !s.closed {
+		s.closed = true
+		close(s.done)
+		for _, h := range s.hubs {
+			h.Close()
+		}
+		s.hubs = nil
+	}
+	s.hubMu.Unlock()
 	return s.db.Close()
 }
 
@@ -40,20 +76,37 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 
 // Within runs fn inside a single transaction. A nested Within (ctx already
 // carries a tx) joins the outer transaction rather than opening a new one.
+//
+// Watch events that mutators emit during the transaction are buffered in a
+// tx-scoped collector and published only after Commit — and as the very last
+// step, so "emit before commit" is structurally impossible. A nested Within
+// reuses the outer collector, so there is a single flush at the outermost
+// commit; on rollback (an fn error or a failed Commit) the buffer is discarded
+// and watchers never see the rolled-back writes.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
 	if _, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
-		return fn(ctx)
+		return fn(ctx) // nested: joins the outer tx and its collector
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	coll := &eventCollector{}
+	ctx = context.WithValue(ctx, txKey{}, tx)
+	ctx = context.WithValue(ctx, collectorKey{}, coll)
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
-	if err := fn(context.WithValue(ctx, txKey{}, tx)); err != nil {
-		return err
+	if err := fn(ctx); err != nil {
+		return err // collector discarded, nothing published
 	}
-	return tx.Commit()
+	// Flush only on a clean commit, and as the very last step: a failed commit
+	// discards the buffer, and there is no later step that could fail after a
+	// successful one — so watchers never see writes that didn't land.
+	err = tx.Commit()
+	if err == nil {
+		s.flush(coll)
+	}
+	return err
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.
@@ -70,6 +123,18 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	err := c.QueryRowContext(ctx,
 		`UPDATE resource_version_seq SET value = value + 1 WHERE id = 1 RETURNING value`).Scan(&rv)
 	return rv, err
+}
+
+// scanAndEmit scans a mutator's RETURNING row and, on success, emits a watch
+// event of typ for the written object. The create/update mutators share it
+// since each returns the freshly written row.
+func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.WatchEventType, sc scanner) (*storeapi.RawObject, error) {
+	obj, err := scanObject(sc)
+	if err != nil {
+		return nil, err
+	}
+	s.emit(ctx, typ, obj)
+	return obj, nil
 }
 
 func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
@@ -91,7 +156,7 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject)
 		RETURNING `+objectColumns,
 		obj.Group, obj.Kind, obj.Name, obj.Spec,
 		rv, finalizers, now, now)
-	return scanObject(row)
+	return s.scanAndEmit(ctx, storeapi.WatchEventAdded, row)
 }
 
 func (s *sqliteStore) GetObject(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
@@ -163,7 +228,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, id storeapi.ObjectID, spec
 		WHERE id = ?
 		RETURNING `+objectColumns,
 		spec, rv, toMillis(time.Now().UTC()), id)
-	return scanObject(row)
+	return s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
 }
 
 func (s *sqliteStore) UpdateStatus(ctx context.Context, id storeapi.ObjectID, observedGeneration int64, status []byte) (*storeapi.RawObject, error) {
@@ -180,7 +245,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, id storeapi.ObjectID, ob
 		WHERE id = ?
 		RETURNING `+objectColumns,
 		status, observedGeneration, now, rv, now, id)
-	return scanObject(row)
+	return s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
 }
 
 func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
@@ -202,33 +267,38 @@ func (s *sqliteStore) RequestDeletion(ctx context.Context, id storeapi.ObjectID)
 	obj, err := scanObject(row)
 	if errors.Is(err, storeapi.ErrNotFound) {
 		// Zero rows: either the object is already deleting (the no-op we just
-		// skipped) or the id doesn't exist. GetObject distinguishes them.
+		// skipped) or the id doesn't exist. GetObject distinguishes them. No
+		// event: an idempotent no-op carries the same resource_version, so a
+		// watcher would otherwise see a spurious diff.
 		obj, err = s.GetObject(ctx, id)
 		return obj, false, err
 	}
 	if err != nil {
 		return nil, false, err
 	}
+	s.emit(ctx, storeapi.WatchEventModified, obj)
 	return obj, true, nil
 }
 
 func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) error {
-	res, err := s.conn(ctx).ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
+	c := s.conn(ctx)
+	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
 		return err
 	}
-	return requireAffected(res)
-}
-
-// requireAffected turns a zero-row update/delete into ErrNotFound.
-func requireAffected(res sql.Result) error {
-	n, err := res.RowsAffected()
+	// RETURNING hands back the row being removed so we can publish a Deleted
+	// event for it; a zero-row delete scans to ErrNotFound, as before.
+	row := c.QueryRowContext(ctx,
+		`DELETE FROM objects WHERE id = ? RETURNING `+objectColumns, id)
+	obj, err := scanObject(row)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return storeapi.ErrNotFound
-	}
+	// The row is gone, so stamp the event with a fresh resource_version: watchers
+	// drop events at or below their snapshot's version, and the row's last
+	// version may already sit in a snapshot, which would swallow the Deleted.
+	obj.ResourceVersion = rv
+	s.emit(ctx, storeapi.WatchEventDeleted, obj)
 	return nil
 }
 

@@ -41,12 +41,10 @@ func (t *typedController[Spec, Status]) stop(ctx context.Context) error {
 
 // reconcile runs the controller in a single transaction: load, reconcile, and
 // any controller-client writes (UpdateStatus, …) all commit together, or all
-// roll back if Reconcile returns an error. Watch events accumulated by
-// controller-client calls are published only after the transaction commits, so
+// roll back if Reconcile returns an error. The store's Within publishes the
+// watch events those writes emit only after the transaction commits, so
 // watchers never observe state that was rolled back.
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
-	coll := &watchEventCollector{}
-	ctx = context.WithValue(ctx, watchCollectorKey{}, coll)
 	var result Result
 	err := t.bh.store.Within(ctx, func(ctx context.Context) error {
 		raw, err := t.bh.store.GetObject(ctx, id)
@@ -61,11 +59,6 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		result, reconcileErr = t.inner.Reconcile(ctx, obj)
 		return reconcileErr
 	})
-	if err == nil {
-		for _, ev := range coll.events {
-			t.bh.publishEvent(t.gk, ev.Type, ev.Object)
-		}
-	}
 	return result, err
 }
 

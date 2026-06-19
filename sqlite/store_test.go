@@ -556,17 +556,6 @@ func TestScanObjectBadFinalizersJSON(t *testing.T) {
 	require.Error(t, err)
 }
 
-// mockSQLResult is a sql.Result that returns a fixed RowsAffected error.
-type mockSQLResult struct{ err error }
-
-func (m mockSQLResult) LastInsertId() (int64, error) { return 0, nil }
-func (m mockSQLResult) RowsAffected() (int64, error) { return 0, m.err }
-
-func TestRequireAffectedRowsAffectedError(t *testing.T) {
-	err := requireAffected(mockSQLResult{err: errors.New("driver error")})
-	require.Error(t, err)
-}
-
 func TestWithinNestedCommitError(t *testing.T) {
 	// A nested Within with a non-nil error from fn propagates through the outer.
 	store := newRawStore(t)

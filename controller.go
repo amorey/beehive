@@ -39,11 +39,11 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err != nil {
 		return err
 	}
-	raw, err := c.bh.store.UpdateStatus(ctx, id, observedGeneration, b)
-	if err != nil {
+	// The store's UpdateStatus emits the Modified event into the ambient
+	// transaction's collector, so it's published only after the reconcile commits.
+	if _, err := c.bh.store.UpdateStatus(ctx, id, observedGeneration, b); err != nil {
 		return err
 	}
-	c.bh.emitOrCollect(ctx, c.gk, rawWatchEvent{Type: WatchEventModified, Object: raw})
 	return nil
 }
 

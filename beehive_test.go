@@ -178,16 +178,6 @@ func (s *errorListObjectsStore) ListObjects(_ context.Context, _ GroupKind) ([]*
 	return nil, errBoom
 }
 
-// errorGetObjectWatchStore returns an error from GetObject to exercise Watch's
-// non-ErrNotFound error path.
-type errorGetObjectWatchStore struct {
-	fakeStore
-}
-
-func (s *errorGetObjectWatchStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
-	return nil, errBoom
-}
-
 // failUpdateStatusStore returns an error from UpdateStatus.
 type failUpdateStatusStore struct {
 	fakeStore
@@ -237,15 +227,19 @@ func TestClientUpdateRawToTypedError(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestClientWatchSnapshotGetObjectError(t *testing.T) {
+// TestClientWatchPropagatesStoreError verifies the client surfaces an error
+// returned by the store's Watch/WatchList (e.g. a failed snapshot load).
+func TestClientWatchPropagatesStoreError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&errorGetObjectWatchStore{})
+	bh, err := New(&watcherStore{err: errBoom})
 	require.NoError(t, err)
 	require.NoError(t, Register(bh, gk, newFakeController()))
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	_, err = client.Watch(context.Background(), 1)
-	require.Error(t, err)
+	require.ErrorIs(t, err, errBoom)
+	_, err = client.WatchList(context.Background())
+	require.ErrorIs(t, err, errBoom)
 }
 
 func TestClientListStoreError(t *testing.T) {
@@ -263,257 +257,6 @@ func TestClientListRawToTypedError(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
 	_, err = client.List(context.Background())
-	require.Error(t, err)
-}
-
-// dedupListStore blocks ListObjects until listProceed is closed, so the test
-// can publish live events BEFORE the snapshot is read, triggering the
-// ResourceVersion-dedup continue in watchFiltered's live-event loop.
-type dedupListStore struct {
-	fakeStore
-	listStarted chan struct{}
-	listProceed chan struct{}
-	listResult  []*RawObject
-}
-
-func (s *dedupListStore) ListObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
-	select {
-	case <-s.listStarted: // already closed
-	default:
-		close(s.listStarted)
-	}
-	<-s.listProceed
-	return s.listResult, nil
-}
-
-func TestWatchFilteredDedupContinue(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	const objID ObjectID = 1
-	const rv int64 = 42
-
-	store := &dedupListStore{
-		listStarted: make(chan struct{}),
-		listProceed: make(chan struct{}),
-		listResult:  []*RawObject{{ID: objID, Spec: []byte(`{}`), ResourceVersion: rv}},
-	}
-
-	bh, err := New(store)
-	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// WatchList is called in a background goroutine because loadSnapshot
-	// (which calls store.ListObjects) is synchronous and will block until we
-	// signal listProceed.
-	var ch <-chan WatchEvent[tSpec, tStatus]
-	watchDone := make(chan struct{})
-	go func() {
-		var watchErr error
-		ch, watchErr = client.WatchList(ctx)
-		if watchErr != nil {
-			t.Errorf("WatchList error: %v", watchErr)
-		}
-		close(watchDone)
-	}()
-
-	// Wait for the WatchList goroutine to enter ListObjects.
-	select {
-	case <-store.listStarted:
-	case <-time.After(testTimeout):
-		t.Fatal("ListObjects not called")
-	}
-
-	// Publish a live event with rv=42 into the hub while WatchList is blocked
-	// on snapshot load. The hub receiver (created before ListObjects is called)
-	// captures this event in its buffer.
-	bh.publishEvent(gk, WatchEventAdded, &RawObject{ID: objID, Spec: []byte(`{}`), ResourceVersion: rv})
-
-	// Release snapshot load. Snapshot = [{objID, rv=42}], snapshotRV[objID]=42.
-	// The background goroutine then processes the buffered event:
-	//   rv=42 <= snapshotRV[objID]=42 → dedup → continue.
-	close(store.listProceed)
-
-	// Wait for WatchList to return.
-	select {
-	case <-watchDone:
-	case <-time.After(testTimeout):
-		t.Fatal("WatchList did not return")
-	}
-
-	// Drain the snapshot Added event.
-	select {
-	case evt, ok := <-ch:
-		if !ok {
-			t.Fatal("channel closed unexpectedly before snapshot event")
-		}
-		assert.Equal(t, WatchEventAdded, evt.Type)
-		assert.Equal(t, objID, evt.Object.ID)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for snapshot event")
-	}
-
-	// The buffered event (rv=42) was deduped. Cancel to clean up.
-	cancel()
-	deadline := time.After(testTimeout)
-	for {
-		select {
-		case _, ok := <-ch:
-			if !ok {
-				return
-			}
-		case <-deadline:
-			t.Fatal("channel did not close after cancel")
-		}
-	}
-}
-
-// TestWatchFilteredCtxDoneSnapshotSend covers the case <-ctx.Done() branch in
-// the snapshot item send select. Cancel the context before the snapshot load
-// completes so ctx.Done is already fired when the streaming goroutine tries to
-// send the first snapshot item.
-func TestWatchFilteredCtxDoneSnapshotSend(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-
-	store := &dedupListStore{
-		listStarted: make(chan struct{}),
-		listProceed: make(chan struct{}),
-		listResult:  []*RawObject{{ID: 1, Spec: []byte(`{}`), ResourceVersion: 1}},
-	}
-
-	bh, err := New(store)
-	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	var ch <-chan WatchEvent[tSpec, tStatus]
-	watchDone := make(chan struct{})
-	go func() {
-		var watchErr error
-		ch, watchErr = client.WatchList(ctx)
-		if watchErr != nil {
-			t.Errorf("WatchList error: %v", watchErr)
-		}
-		close(watchDone)
-	}()
-
-	// Wait for ListObjects to be called.
-	select {
-	case <-store.listStarted:
-	case <-time.After(testTimeout):
-		t.Fatal("ListObjects not called")
-	}
-
-	// Cancel BEFORE releasing the snapshot load so that ctx.Done is already
-	// closed when the streaming goroutine tries to send the snapshot item.
-	// No reader on the output channel yet → the only ready arm is ctx.Done.
-	cancel()
-	close(store.listProceed)
-
-	// WatchList returns the channel.
-	select {
-	case <-watchDone:
-	case <-time.After(testTimeout):
-		t.Fatal("WatchList did not return")
-	}
-
-	// Channel must close (goroutine exits via ctx.Done in snapshot send select).
-	deadline := time.After(testTimeout)
-	for {
-		select {
-		case _, ok := <-ch:
-			if !ok {
-				return
-			}
-		case <-deadline:
-			t.Fatal("timed out waiting for channel to close")
-		}
-	}
-}
-
-// TestWatchFilteredCtxDoneLiveEventSend covers the case <-ctx.Done() branch in
-// the live-event send select. The goroutine is in the live-event loop with a
-// buffered event; cancelling ctx before a reader consumes the event makes the
-// goroutine take ctx.Done instead of the send arm.
-func TestWatchFilteredCtxDoneLiveEventSend(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-
-	// dedupListStore with no objects so the snapshot is empty and WatchList
-	// returns synchronously, leaving the goroutine in the live-event loop.
-	store := &dedupListStore{
-		listStarted: make(chan struct{}),
-		listProceed: make(chan struct{}),
-		listResult:  nil, // empty snapshot
-	}
-
-	bh, err := New(store)
-	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	var ch <-chan WatchEvent[tSpec, tStatus]
-	watchDone := make(chan struct{})
-	go func() {
-		var watchErr error
-		ch, watchErr = client.WatchList(ctx)
-		if watchErr != nil {
-			t.Errorf("WatchList error: %v", watchErr)
-		}
-		close(watchDone)
-	}()
-
-	// Wait for ListObjects to start.
-	select {
-	case <-store.listStarted:
-	case <-time.After(testTimeout):
-		t.Fatal("ListObjects not called")
-	}
-
-	// Publish a live event into the hub buffer while WatchList is blocked.
-	// After WatchList returns, the goroutine will pick up this buffered event
-	// and try to send it to the output channel.
-	bh.publishEvent(gk, WatchEventAdded, &RawObject{ID: 1, Spec: []byte(`{}`), ResourceVersion: 1})
-
-	// Cancel ctx BEFORE releasing the snapshot. When the goroutine tries to
-	// send the live event: ctx.Done is already ready, and (before the drain
-	// loop below starts) there is no reader on ch → takes ctx.Done → exits.
-	cancel()
-	close(store.listProceed)
-
-	select {
-	case <-watchDone:
-	case <-time.After(testTimeout):
-		t.Fatal("WatchList did not return")
-	}
-
-	// Drain any items that were sent, then wait for close.
-	deadline := time.After(testTimeout)
-	for {
-		select {
-		case _, ok := <-ch:
-			if !ok {
-				return
-			}
-		case <-deadline:
-			t.Fatal("timed out waiting for channel to close")
-		}
-	}
-}
-
-func TestWatchFilteredSnapshotLoadError(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&errorListObjectsStore{})
-	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	_, err = client.WatchList(context.Background())
 	require.Error(t, err)
 }
 
@@ -563,8 +306,8 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// badJSONStore is a fakeStore whose ListObjects returns a RawObject with
-// invalid spec JSON, used to drive the rawToTyped error path inside watchFiltered.
+// badJSONStore is a fakeStore whose ListObjects returns a RawObject with invalid
+// spec JSON, used to drive the rawToTyped error path inside client.List.
 type badJSONStore struct {
 	fakeStore
 	gk GroupKind
@@ -574,49 +317,113 @@ func (s *badJSONStore) ListObjects(_ context.Context, _ GroupKind) ([]*RawObject
 	return []*RawObject{{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}}, nil
 }
 
-func TestWatchFilteredSnapshotConversionError(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&badJSONStore{gk: gk})
+// newWatchClient registers gk with a fake controller (so the client-side
+// isRegistered check passes) and returns a client backed by store.
+func newWatchClient(t *testing.T, store Store, gk GroupKind) Client[tSpec, tStatus] {
+	t.Helper()
+	bh, err := New(store)
 	require.NoError(t, err)
 	require.NoError(t, Register(bh, gk, newFakeController()))
+	return NewClient[tSpec, tStatus](bh, gk)
+}
 
-	client := NewClient[tSpec, tStatus](bh, gk)
+// TestClientAdaptWatcherConversionError verifies a raw event whose Spec is
+// invalid JSON closes the typed channel rather than emitting a bad WatchEvent.
+func TestClientAdaptWatcherConversionError(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	w := newFakeWatcher()
+	client := newWatchClient(t, &watcherStore{w: w}, gk)
+
 	ch, err := client.WatchList(context.Background())
 	require.NoError(t, err)
 
-	// rawToTyped fails on the snapshot item → goroutine exits → channel closes.
+	w.push(WatchEventModified, &RawObject{ID: 1, Spec: []byte("not-json")})
+
 	select {
 	case _, ok := <-ch:
-		if ok {
-			t.Fatal("expected channel to close due to rawToTyped error in snapshot")
-		}
+		assert.False(t, ok, "channel must close on rawToTyped error")
 	case <-time.After(testTimeout):
 		t.Fatal("timed out waiting for channel to close")
 	}
 }
 
-// TestWatchFilteredLiveEventConversionError covers the rawToTyped error branch
-// in watchFiltered's live-event loop: a hub event carrying invalid Spec JSON
-// must close the channel rather than emit a WatchEvent with a nil Object.
-func TestWatchFilteredLiveEventConversionError(t *testing.T) {
+// TestClientAdaptWatcherForwardsThenClosesOnCancel verifies a decodable event is
+// forwarded as a typed WatchEvent, and cancelling the context closes the channel.
+func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&fakeStore{}) // empty snapshot via fakeStore.ListObjects
-	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
+	w := newFakeWatcher()
+	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
-	client := NewClient[tSpec, tStatus](bh, gk)
-	ch, err := client.WatchList(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	// Publish a live event with bad Spec JSON. resource_version > 0 clears the
-	// snapshot dedup guard, so the goroutine reaches rawToTyped, which fails.
-	bh.publishEvent(gk, WatchEventModified, &RawObject{ID: 1, Spec: []byte("not-json"), ResourceVersion: 1})
+	w.push(WatchEventAdded, &RawObject{ID: 1, Spec: []byte(`{}`)})
+	select {
+	case evt, ok := <-ch:
+		require.True(t, ok)
+		assert.Equal(t, WatchEventAdded, evt.Type)
+		assert.EqualValues(t, 1, evt.Object.ID)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for forwarded event")
+	}
+
+	cancel()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "channel must close on ctx cancel")
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for channel to close")
+	}
+}
+
+// TestClientAdaptWatcherSendParkCtxDone covers the adapter exiting on ctx
+// cancellation while parked sending a typed event: an event is delivered to the
+// adapter but never read downstream, then the context is cancelled.
+func TestClientAdaptWatcherSendParkCtxDone(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	w := newFakeWatcher()
+	client := newWatchClient(t, &watcherStore{w: w}, gk)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	// push returns once the adapter has taken the event; with no reader on ch it
+	// then parks on its inner send. Cancelling makes that send take the ctx.Done
+	// arm. Synchronize on the goroutine's exit (Close) rather than reading ch:
+	// a read here could satisfy the pending send and race the closed-vs-delivered
+	// outcome (notably under -race).
+	w.push(WatchEventAdded, &RawObject{ID: 1, Spec: []byte(`{}`)})
+	cancel()
+	select {
+	case <-w.closed:
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for adapter goroutine to exit")
+	}
 
 	select {
 	case _, ok := <-ch:
-		if ok {
-			t.Fatal("expected channel to close due to rawToTyped error on live event")
-		}
+		assert.False(t, ok, "channel must close when ctx is cancelled mid-send")
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for channel to close")
+	}
+}
+
+// TestClientAdaptWatcherClosesWhenStreamEnds verifies the typed channel closes
+// when the underlying store watcher's stream ends.
+func TestClientAdaptWatcherClosesWhenStreamEnds(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	w := newFakeWatcher()
+	client := newWatchClient(t, &watcherStore{w: w}, gk)
+
+	ch, err := client.WatchList(context.Background())
+	require.NoError(t, err)
+
+	w.endStream()
+	select {
+	case _, ok := <-ch:
+		assert.False(t, ok, "channel must close when the watcher stream ends")
 	case <-time.After(testTimeout):
 		t.Fatal("timed out waiting for channel to close")
 	}
