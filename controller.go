@@ -4,9 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
+
+// ErrWrongKind is returned by a ControllerClient write when the target id names
+// an object of a different kind than the controller's own. A controller may only
+// write status, conditions, and finalizers on objects of its registered kind;
+// passing an id from another kind (a dependency, an owner) is a bug that would
+// otherwise persist this controller's Status JSON into a foreign row and make
+// later typed reads of that kind fail to decode. The guard turns that silent
+// corruption into a loud, retrying reconcile failure.
+var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 
 // Controller is the user-supplied reconcile logic for a resource kind. Start
 // receives a ControllerClient for writing status and runs once on registration;
@@ -43,7 +53,29 @@ type controllerClientImpl[Status any] struct {
 	gk GroupKind
 }
 
+// checkKind confirms id names an object of this controller's kind before a
+// write touches it. A ControllerClient is bound to the single kind it was
+// registered for; an id from another kind (a dependency, an owner) must never
+// receive this controller's status/condition/finalizer writes, or a later typed
+// read of that kind would fail to decode the foreign status. Mirrors the
+// user-facing client's scopedGet. Called from within Reconcile, so the check
+// shares the reconcile transaction (ctx) and can't race a concurrent kind change.
+func (c *controllerClientImpl[Status]) checkKind(ctx context.Context, id ObjectID) error {
+	raw, err := c.bh.store.GetObject(ctx, id)
+	if err != nil {
+		return err
+	}
+	if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+		return fmt.Errorf("%w: controller %s/%s cannot write to %s/%s object %d",
+			ErrWrongKind, c.gk.Group, c.gk.Kind, raw.Group, raw.Kind, id)
+	}
+	return nil
+}
+
 func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
+	if err := c.checkKind(ctx, id); err != nil {
+		return err
+	}
 	b, err := json.Marshal(status)
 	if err != nil {
 		return err
@@ -57,6 +89,9 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
+	if err := c.checkKind(ctx, id); err != nil {
+		return err
+	}
 	_, err := c.bh.store.SetCondition(ctx, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
@@ -68,11 +103,17 @@ func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id Obje
 }
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
+	if err := c.checkKind(ctx, id); err != nil {
+		return err
+	}
 	_, err := c.bh.store.DeleteCondition(ctx, id, conditionType)
 	return err
 }
 
 func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
+	if err := c.checkKind(ctx, id); err != nil {
+		return err
+	}
 	_, err := c.bh.store.DeleteFinalizer(ctx, id, finalizer)
 	return err
 }

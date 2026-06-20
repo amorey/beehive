@@ -195,6 +195,47 @@ func TestControllerClientHasReferrers(t *testing.T) {
 	assert.False(t, has, "nothing references the child")
 }
 
+// TestControllerClientWritesScopedToKind verifies that a ControllerClient's
+// status/condition/finalizer writes refuse an id belonging to another kind: a
+// controller for "Widget" must not be able to persist its Status (or mutate
+// conditions/finalizers) on a "Gadget" row, which would corrupt that kind's
+// rows. AddDependency/HasReferrers are intentionally cross-kind and not guarded.
+func TestControllerClientWritesScopedToKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	ctrl := newCapturingController()
+	require.NoError(t, Register(bh, clientTestGK, ctrl)) // controller for "Widget"
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	var cc ControllerClient[cStatus]
+	select {
+	case cc = <-ctrl.clientCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller Start was not called")
+	}
+
+	// A "Gadget" is a foreign kind to this controller. Give it a finalizer so the
+	// DeleteFinalizer attempt has a target to (fail to) remove.
+	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
+	gadget, err := gadgets.Create(ctx, cSpec{Val: "v1"}, WithFinalizers("f"))
+	require.NoError(t, err)
+
+	require.ErrorIs(t, cc.UpdateStatus(ctx, gadget.ID, 1, cStatus{Val: "hijacked"}), ErrWrongKind)
+	require.ErrorIs(t, cc.SetCondition(ctx, gadget.ID, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
+	require.ErrorIs(t, cc.DeleteCondition(ctx, gadget.ID, "Ready"), ErrWrongKind)
+	require.ErrorIs(t, cc.DeleteFinalizer(ctx, gadget.ID, "f"), ErrWrongKind)
+
+	// The Gadget is untouched: no status, no conditions, finalizer intact.
+	got, err := gadgets.Get(ctx, gadget.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.Status, "foreign status write rejected")
+	assert.Empty(t, got.Conditions, "foreign condition write rejected")
+	assert.Equal(t, []string{"f"}, got.Finalizers, "foreign finalizer write rejected")
+}
+
 // failHasReferrersStore returns an error from HasReferrers.
 type failHasReferrersStore struct {
 	fakeStore
@@ -229,14 +270,25 @@ func TestControllerClientAddDependencyStoreError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// failUpdateStatusStore returns an error from UpdateStatus.
-type failUpdateStatusStore struct {
+// kindTStore answers GetObject with a row of kind "T" and runs Within inline, so
+// a ControllerClient's checkKind guard passes and tests reach the write path
+// under test. Embed it in a double that overrides the specific write.
+type kindTStore struct {
 	fakeStore
 }
 
-func (s *failUpdateStatusStore) Within(ctx context.Context, fn func(context.Context) error) error {
+func (s *kindTStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }
+func (s *kindTStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	return &RawObject{ID: id, Kind: "T"}, nil
+}
+
+// failUpdateStatusStore returns an error from UpdateStatus.
+type failUpdateStatusStore struct {
+	kindTStore
+}
+
 func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ ObjectID, _ int64, _ []byte) (*RawObject, error) {
 	return nil, errBoom
 }
@@ -247,7 +299,7 @@ type errStatusMarshaler struct{}
 func (errStatusMarshaler) MarshalJSON() ([]byte, error) { return nil, errBoom }
 
 func TestControllerClientUpdateStatusMarshalError(t *testing.T) {
-	bh, err := New(&fakeStore{})
+	bh, err := New(&kindTStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[errStatusMarshaler]{bh: bh, gk: GroupKind{Kind: "T"}}
 	err = cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
