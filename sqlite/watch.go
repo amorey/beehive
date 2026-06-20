@@ -103,32 +103,63 @@ func (w *watcherImpl) Events() <-chan storeapi.RawWatchEvent { return w.out }
 func (w *watcherImpl) Close()                                { w.cancel() }
 
 func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
-	return s.watch(ctx, gk, nil, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-		return s.ListObjects(ctx, gk)
+	return s.watch(ctx, gk, nil, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
+		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+			return s.ListObjects(ctx, gk)
+		})
 	})
 }
 
 func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
-	// An empty snapshot loader streams live events only: the snapshotRV dedup
-	// degrades to "<= 0", and resource_version is always >= 1, so nothing is
-	// dropped.
-	return s.watch(ctx, gk, nil, func(context.Context) ([]*storeapi.RawObject, error) {
-		return nil, nil
+	// No snapshot, so the dedup floor is 0: a fresh receiver already starts at
+	// the current write position, and resource_version is always >= 1, so every
+	// event the receiver sees is genuinely post-subscribe and nothing is dropped.
+	return s.watch(ctx, gk, nil, func(context.Context) ([]*storeapi.RawObject, int64, error) {
+		return nil, 0, nil
 	})
 }
 
 func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.Watcher, error) {
 	filterID := id
-	return s.watch(ctx, gk, &filterID, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-		raw, err := s.GetObject(ctx, id)
-		if errors.Is(err, storeapi.ErrNotFound) {
-			return nil, nil // not found yet: empty snapshot, stream the Added when it lands
-		}
-		if err != nil {
-			return nil, err
-		}
-		return []*storeapi.RawObject{raw}, nil
+	return s.watch(ctx, gk, &filterID, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
+		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+			raw, err := s.GetObject(ctx, id)
+			if errors.Is(err, storeapi.ErrNotFound) {
+				return nil, nil // not found yet: empty snapshot, stream the Added when it lands
+			}
+			if err != nil {
+				return nil, err
+			}
+			return []*storeapi.RawObject{raw}, nil
+		})
 	})
+}
+
+// snapshotAt runs load inside one consistent read and returns the listed objects
+// together with the global resource-version cursor as of that read. Because
+// resource_version is a single, globally monotonic cursor, that scalar is a
+// complete dedup floor: every buffered event at or below it is already reflected
+// in the returned objects, every later event is genuinely new. Reading the
+// objects and the cursor in the same transaction is what makes the floor exact —
+// a separate cursor read could span a write the list itself didn't, dropping a
+// real event or replaying a snapshotted one. (A "max RV over the listed objects"
+// shortcut can't substitute: a delete committed just before the snapshot removes
+// its row, so its version is absent from the list yet must still be deduped.)
+func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context) ([]*storeapi.RawObject, error)) ([]*storeapi.RawObject, int64, error) {
+	var objs []*storeapi.RawObject
+	var hw int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if objs, err = load(ctx); err != nil {
+			return err
+		}
+		hw, err = currentResourceVersion(ctx, s.conn(ctx))
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return objs, hw, nil
 }
 
 // watch subscribes to gk's hub, loads a snapshot, and returns a Watcher whose
@@ -137,13 +168,13 @@ func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id store
 // object.
 //
 // The receiver is created BEFORE the snapshot is loaded so events that commit
-// during the load are buffered, not lost; events whose resource version is at
-// or below the snapshot's for the same object are then dropped as duplicates.
+// during the load are buffered, not lost; events whose resource version is at or
+// below the snapshot's global high-water are then dropped as duplicates.
 func (s *sqliteStore) watch(
 	ctx context.Context,
 	gk storeapi.GroupKind,
 	filterID *storeapi.ObjectID,
-	loadSnapshot func(context.Context) ([]*storeapi.RawObject, error),
+	loadSnapshot func(context.Context) ([]*storeapi.RawObject, int64, error),
 ) (storeapi.Watcher, error) {
 	h := s.hubFor(gk)
 	if h == nil {
@@ -153,14 +184,10 @@ func (s *sqliteStore) watch(
 	if s.beforeSnapshot != nil {
 		s.beforeSnapshot() // test seam: inject events into the subscribe→snapshot window
 	}
-	snapshot, err := loadSnapshot(ctx)
+	snapshot, snapshotHighWaterRV, err := loadSnapshot(ctx)
 	if err != nil {
 		rx.Close()
 		return nil, err
-	}
-	snapshotRV := make(map[storeapi.ObjectID]int64, len(snapshot))
-	for _, raw := range snapshot {
-		snapshotRV[raw.ID] = raw.ResourceVersion
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
@@ -191,9 +218,7 @@ func (s *sqliteStore) watch(
 		// can detect which vanished during a lag gap (live − relist) and report a
 		// Deleted for each. We track IDs only, not bodies, so the cost stays bounded
 		// to the live set and cheap. sendTracked keeps it current: a Deleted drops
-		// the id, any other event records it. (snapshotRV can't double as this set:
-		// it must keep a high-water version for deleted ids to dedup stale ring
-		// events, so it is deliberately never pruned — the opposite lifecycle.)
+		// the id, any other event records it.
 		live := make(map[storeapi.ObjectID]struct{}, len(snapshot))
 		sendTracked := func(ev storeapi.RawWatchEvent) bool {
 			if ev.Type == storeapi.WatchEventDeleted {
@@ -208,34 +233,36 @@ func (s *sqliteStore) watch(
 		// list/events watch re-lists the whole kind. It re-reads the store directly
 		// rather than reusing loadSnapshot, because WatchEvents loads an empty
 		// startup snapshot yet still needs the full current set here to re-converge
-		// its consumer (the dependency waker, which acts only on Modified).
-		// snapshotRV is advanced so the buffered events the lag left behind are
-		// deduped as we drain them. Any ID we'd previously seen that is absent from
-		// the relist was deleted during the gap, so we report a Deleted for it —
-		// otherwise a cache-maintaining consumer would retain it forever. The row is
-		// gone, so the event carries a tombstone (id + kind, null spec) rather than
-		// the real last object; a consumer keyed by id can still evict it. Returns
-		// false if a send is abandoned (ctx cancelled / store closed).
+		// its consumer (the dependency waker, which acts only on Modified). The
+		// dedup high-water is advanced to the relist's consistent read point so the
+		// buffered events the lag left behind are deduped as we drain them. Any ID
+		// we'd previously seen that is absent from the relist was deleted during the
+		// gap, so we report a Deleted for it — otherwise a cache-maintaining consumer
+		// would retain it forever. The row is gone, so the event carries a tombstone
+		// (id + kind, null spec) rather than the real last object; a consumer keyed
+		// by id can still evict it. Returns false if a send is abandoned (ctx
+		// cancelled / store closed).
 		relist := func() bool {
-			var objs []*storeapi.RawObject
-			if filterID != nil {
-				raw, err := s.GetObject(wctx, *filterID)
-				if err != nil && !errors.Is(err, storeapi.ErrNotFound) {
-					return false
+			objs, hw, err := s.snapshotAt(wctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+				if filterID != nil {
+					raw, err := s.GetObject(ctx, *filterID)
+					if err != nil && !errors.Is(err, storeapi.ErrNotFound) {
+						return nil, err
+					}
+					if raw == nil {
+						return nil, nil
+					}
+					return []*storeapi.RawObject{raw}, nil
 				}
-				if raw != nil {
-					objs = []*storeapi.RawObject{raw}
-				}
-			} else {
-				var err error
-				if objs, err = s.ListObjects(wctx, gk); err != nil {
-					return false
-				}
+				return s.ListObjects(ctx, gk)
+			})
+			if err != nil {
+				return false
 			}
+			snapshotHighWaterRV = hw
 			present := make(map[storeapi.ObjectID]bool, len(objs))
 			for _, raw := range objs {
 				present[raw.ID] = true
-				snapshotRV[raw.ID] = raw.ResourceVersion
 				if !sendTracked(storeapi.RawWatchEvent{Type: storeapi.WatchEventModified, Object: raw}) {
 					return false
 				}
@@ -277,7 +304,7 @@ func (s *sqliteStore) watch(
 				}
 				return // ctx cancelled, watcher closed, or hub closed
 			}
-			if ev.Object.ResourceVersion <= snapshotRV[ev.Object.ID] {
+			if ev.Object.ResourceVersion <= snapshotHighWaterRV {
 				continue // already represented by the snapshot
 			}
 			if filterID != nil && ev.Object.ID != *filterID {

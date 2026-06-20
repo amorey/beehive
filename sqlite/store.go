@@ -140,6 +140,17 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	return rv, err
 }
 
+// currentResourceVersion reads the global write cursor without advancing it. Read
+// in the same transaction as a snapshot, it is the exact resource version that
+// snapshot reflects: every write committed at or below it is included, every
+// later write is not.
+func currentResourceVersion(ctx context.Context, c dbtx) (int64, error) {
+	var rv int64
+	err := c.QueryRowContext(ctx,
+		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
+	return rv, err
+}
+
 // scanAndEmit scans a mutator's RETURNING row, assembles its conditions, and on
 // success emits a watch event of typ for the written object. Mutators share it,
 // so both the returned object and its watch event carry the full conditions set
