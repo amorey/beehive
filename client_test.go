@@ -232,7 +232,9 @@ func TestClientDelete(t *testing.T) {
 	err = client.Delete(ctx, created.ID)
 	require.NoError(t, err)
 
-	// object still present (no finalizers cleared), but marked for deletion
+	// object still present (no finalizers cleared), but marked for deletion. The
+	// default resync is enabled, so the client-only object isn't collected
+	// synchronously by Delete — the idle sweeper is its backstop.
 	got, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, got.DeletionRequestedAt)

@@ -173,9 +173,12 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	if err != nil {
 		return err
 	}
-	// Always enqueue: a retry or post-crash Delete must still hand the
-	// deletion-pending object to the controller to clear finalizers.
-	c.bh.enqueueIfRegistered(c.gk, id)
+	// Always advance GC: a retry or post-crash Delete must still hand the
+	// deletion-pending object to the controller to clear finalizers. A
+	// client-only kind has no controller, so collect runs synchronously rather
+	// than waiting on the resync sweeper (which a disabled resync would never run
+	// again after startup).
+	c.bh.advanceGC(ctx, c.gk, id)
 	return nil
 }
 

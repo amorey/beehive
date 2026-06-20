@@ -150,7 +150,10 @@ func waitForDeletions(t *testing.T, w <-chan WatchEvent[cSpec, cStatus], want ..
 
 // gcFixture builds a Beehive over a real sqlite store plus a client, so collect
 // tests can exercise real RequestDeletion/DeleteObject/ref semantics. No
-// controller is started: collect is driven directly.
+// controller is started: collect is driven directly. The default resync is left
+// enabled, so collect's post-commit wakes for this client-only kind defer to the
+// (idle) sweeper rather than recursively collecting synchronously — letting these
+// tests observe each intermediate state one collect call at a time.
 func gcFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
 	t.Helper()
 	bh, err := New(newClientTestStore(t))
@@ -505,6 +508,72 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	_, err = owners.Get(ctx, owner.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = children.Get(ctx, child.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled is the resync-off
+// companion to TestIntegrationGCSweepsClientOnlyKind. With resync disabled the
+// global sweeper runs only its single startup pass, so a client-only object
+// deleted afterward has no backstop tick to collect it — it must be collected by
+// the event-driven path (synchronously, since it has no reconcile loop) or it
+// strands forever in deletion-pending state, its owned_by edge RESTRICT-blocking
+// the owner's delete.
+func TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+
+	// Only the owner kind has a controller; the child kind is client-only.
+	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	owners := NewClient[cSpec, cStatus](bh, clientTestGK)
+	children := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnlyChild"})
+
+	owner, err := owners.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	child, err := children.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	// Watch the owner: it can only be physically deleted once the client-only
+	// child's owned_by edge is gone, so the owner's deletion proves the child was
+	// collected without any resync tick.
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wOwner, err := owners.WatchList(wctx)
+	require.NoError(t, err)
+
+	require.NoError(t, owners.Delete(ctx, owner.ID))
+	waitForDeletions(t, wOwner, owner.ID)
+
+	_, err = owners.Get(ctx, owner.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = children.Get(ctx, child.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestIntegrationGCCollectsStandaloneClientOnlyDelete verifies that deleting an
+// unowned, unfinalized object of a client-only kind collects it immediately,
+// even with resync disabled. Nothing else frees it, so the Delete path's own
+// synchronous collect is the only thing that can.
+func TestIntegrationGCCollectsStandaloneClientOnlyDelete(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	// No controller registered for this kind: it is entirely client-only.
+	client := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnly"})
+	obj, err := client.Create(ctx, cSpec{Val: "doomed"})
+	require.NoError(t, err)
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+
+	_, err = client.Get(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 

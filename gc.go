@@ -112,7 +112,37 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		return false, err
 	}
 	for _, w := range toWake {
-		bh.enqueueIfRegistered(GroupKind{Group: w.Group, Kind: w.Kind}, w.ID)
+		bh.advanceGC(ctx, GroupKind{Group: w.Group, Kind: w.Kind}, w.ID)
 	}
 	return deleted, nil
+}
+
+// advanceGC moves (gk, id) forward toward collection after a deletion-related
+// change, picking the mechanism that fits the kind. A registered kind is
+// requeued so its own reconcile loop runs collect.
+//
+// A client-only kind has no reconcile loop. When resync is enabled the global GC
+// sweeper is its backstop, so we leave the object for the next sweep — keeping
+// the "events are a latency optimization, resync is the correctness backstop"
+// model and not running a recursive cascade inline on the caller's goroutine. But
+// a disabled resync reduces the sweeper to a single startup pass, so a
+// client-only object deleted or cascade-freed afterward would strand forever, its
+// owned_by edge RESTRICT-blocking the owner's delete. In that one configuration
+// we collect synchronously here instead. Recursion terminates: each collect that
+// deletes a row shrinks the object graph before waking the targets it freed.
+func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
+	bh.mu.Lock()
+	r, ok := bh.reconcilers[gk]
+	bh.mu.Unlock()
+	if ok {
+		r.enqueue(id)
+		return
+	}
+	if bh.resyncInterval > 0 {
+		return // the GC sweeper's resync tick is this kind's backstop
+	}
+	if _, err := bh.collect(ctx, id); err != nil {
+		bh.log().Warn("gc: synchronous collect of client-only object failed; no resync backstop",
+			"group", gk.Group, "kind", gk.Kind, "id", id, "err", err)
+	}
 }
