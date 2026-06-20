@@ -434,6 +434,46 @@ func TestWatchRecoversFromLag(t *testing.T) {
 	assert.Equal(t, obj.ID, rec.Object.ID)
 }
 
+// TestWatchRelistEmitsDeleteForVanishedObject verifies that when an object is
+// deleted during a lag gap (its Deleted event dropped from the ring), the
+// recovery relist reports a Deleted tombstone for it so a cache-maintaining
+// consumer does not retain the stale object forever. The row is gone, so the
+// tombstone carries id + kind and an empty (decodable) spec, not the last row.
+func TestWatchRelistEmitsDeleteForVanishedObject(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	obj, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Delete the object: snapshot (captured at watch() time) still holds it, but
+	// the live store no longer does. The Deleted event lands in the ring...
+	require.NoError(t, store.DeleteObject(ctx, obj.ID))
+	// ...then a burst > ring capacity drops it, forcing ErrLagged on recovery.
+	filler := &beehive.RawObject{ID: 999999, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1}
+	for range hubBufferSize + 50 {
+		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified, Object: filler})
+	}
+
+	// Drain the snapshot Added so the goroutine enters the receive loop, hits
+	// ErrLagged, and relists.
+	first := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventAdded, first.Type)
+	assert.Equal(t, obj.ID, first.Object.ID)
+
+	// Recovery relist finds the object gone and reports its Deleted tombstone:
+	// id + kind, with an empty-but-decodable spec.
+	rec := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventDeleted, rec.Type)
+	assert.Equal(t, obj.ID, rec.Object.ID)
+	assert.Equal(t, testGK.Kind, rec.Object.Kind)
+	assert.JSONEq(t, "{}", string(rec.Object.Spec))
+}
+
 // TestWatchLiveSendCtxDone covers the live-send path exiting on context
 // cancellation. beforeSnapshot buffers a live event (RecvContext prefers a
 // ready value over a cancelled context), so with an empty snapshot the goroutine

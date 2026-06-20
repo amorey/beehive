@@ -187,6 +187,22 @@ func (s *sqliteStore) watch(
 				return false
 			}
 		}
+		// live is the set of IDs the watcher believes currently exist, so relist
+		// can detect which vanished during a lag gap (live − relist) and report a
+		// Deleted for each. We track IDs only, not bodies, so the cost stays bounded
+		// to the live set and cheap. sendTracked keeps it current: a Deleted drops
+		// the id, any other event records it. (snapshotRV can't double as this set:
+		// it must keep a high-water version for deleted ids to dedup stale ring
+		// events, so it is deliberately never pruned — the opposite lifecycle.)
+		live := make(map[storeapi.ObjectID]struct{}, len(snapshot))
+		sendTracked := func(ev storeapi.RawWatchEvent) bool {
+			if ev.Type == storeapi.WatchEventDeleted {
+				delete(live, ev.Object.ID)
+			} else {
+				live[ev.Object.ID] = struct{}{}
+			}
+			return send(ev)
+		}
 		// relist re-emits current state as Modified after the receiver drops
 		// events (ErrLagged). A single-object watch re-fetches just that row; a
 		// list/events watch re-lists the whole kind. It re-reads the store directly
@@ -194,28 +210,43 @@ func (s *sqliteStore) watch(
 		// startup snapshot yet still needs the full current set here to re-converge
 		// its consumer (the dependency waker, which acts only on Modified).
 		// snapshotRV is advanced so the buffered events the lag left behind are
-		// deduped as we drain them. Returns false if a send is abandoned (ctx
-		// cancelled / store closed).
+		// deduped as we drain them. Any ID we'd previously seen that is absent from
+		// the relist was deleted during the gap, so we report a Deleted for it —
+		// otherwise a cache-maintaining consumer would retain it forever. The row is
+		// gone, so the event carries a tombstone (id + kind, empty spec) rather than
+		// the real last object; a consumer keyed by id can still evict it. Returns
+		// false if a send is abandoned (ctx cancelled / store closed).
 		relist := func() bool {
 			var objs []*storeapi.RawObject
 			if filterID != nil {
 				raw, err := s.GetObject(wctx, *filterID)
-				if errors.Is(err, storeapi.ErrNotFound) {
-					return true // gone during the gap: nothing to re-emit
-				}
-				if err != nil {
+				if err != nil && !errors.Is(err, storeapi.ErrNotFound) {
 					return false
 				}
-				objs = []*storeapi.RawObject{raw}
+				if raw != nil {
+					objs = []*storeapi.RawObject{raw}
+				}
 			} else {
 				var err error
 				if objs, err = s.ListObjects(wctx, gk); err != nil {
 					return false
 				}
 			}
+			present := make(map[storeapi.ObjectID]bool, len(objs))
 			for _, raw := range objs {
+				present[raw.ID] = true
 				snapshotRV[raw.ID] = raw.ResourceVersion
-				if !send(storeapi.RawWatchEvent{Type: storeapi.WatchEventModified, Object: raw}) {
+				if !sendTracked(storeapi.RawWatchEvent{Type: storeapi.WatchEventModified, Object: raw}) {
+					return false
+				}
+			}
+			// Deleting from live mid-range (via sendTracked) is allowed in Go.
+			for id := range live {
+				if present[id] {
+					continue
+				}
+				tombstone := &storeapi.RawObject{ID: id, Group: gk.Group, Kind: gk.Kind, Spec: []byte("{}")}
+				if !sendTracked(storeapi.RawWatchEvent{Type: storeapi.WatchEventDeleted, Object: tombstone}) {
 					return false
 				}
 			}
@@ -223,7 +254,7 @@ func (s *sqliteStore) watch(
 		}
 		// Emit the snapshot as Added events before streaming live events.
 		for _, raw := range snapshot {
-			if !send(storeapi.RawWatchEvent{Type: storeapi.WatchEventAdded, Object: raw}) {
+			if !sendTracked(storeapi.RawWatchEvent{Type: storeapi.WatchEventAdded, Object: raw}) {
 				return
 			}
 		}
@@ -232,9 +263,8 @@ func (s *sqliteStore) watch(
 			if err != nil {
 				// ErrLagged is non-terminal: the receiver fell behind the ring and
 				// dropped events but stays usable. Re-list so consumers don't
-				// silently lose those changes, then keep streaming. A delete that
-				// happened during the gap is not replayed here; the resync backstop
-				// reconciles those.
+				// silently lose those changes (including deletes), then keep
+				// streaming.
 				if _, ok := errors.AsType[gochan.ErrLagged](err); ok {
 					if !relist() {
 						return
@@ -249,7 +279,7 @@ func (s *sqliteStore) watch(
 			if filterID != nil && ev.Object.ID != *filterID {
 				continue
 			}
-			if !send(ev) {
+			if !sendTracked(ev) {
 				return
 			}
 		}
