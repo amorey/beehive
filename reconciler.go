@@ -3,6 +3,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -26,9 +27,19 @@ type controllerAdapter interface {
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
 // controllerAdapter interface.
 type typedController[Spec, Status any] struct {
-	gk    GroupKind
-	bh    *Beehive
-	inner Controller[Spec, Status]
+	gk     GroupKind
+	bh     *Beehive
+	inner  Controller[Spec, Status]
+	logger *slog.Logger // kind-tagged; set by Register (never nil after that)
+}
+
+// log returns a non-nil logger, guarding the rare path where a typedController
+// is built outside Register (e.g. in tests) and logger was never assigned.
+func (t *typedController[Spec, Status]) log() *slog.Logger {
+	if t.logger == nil {
+		return discardLogger
+	}
+	return t.logger
 }
 
 func (t *typedController[Spec, Status]) start() error {
@@ -46,6 +57,7 @@ func (t *typedController[Spec, Status]) stop(ctx context.Context) error {
 // watch events those writes emit only after the transaction commits, so
 // watchers never observe state that was rolled back.
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
+	log := t.log().With("id", id)
 	var result Result
 	var deleting, missing bool
 	// Controller-client calls that free a ref target register it here; we requeue
@@ -75,14 +87,20 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		if err != nil {
 			return err
 		}
+		log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
 		var reconcileErr error
 		result, reconcileErr = t.inner.Reconcile(ctx, obj)
 		return reconcileErr
 	})
 	if missing {
+		log.DebugContext(ctx, "object gone before reconcile; skipping")
 		return Result{}, nil
 	}
 	if err != nil {
+		// The worker turns this into a backoff requeue; logged here where the
+		// error is richest. Warn, not Error: a failed reconcile is expected churn
+		// that the retry loop is designed to absorb.
+		log.WarnContext(ctx, "reconcile failed; will retry", "err", err)
 		return result, err
 	}
 	// Committed: requeue any targets the controller freed via DeleteDependency, so
@@ -97,11 +115,13 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	if deleting {
 		gone, err := t.bh.collect(ctx, id)
 		if err != nil {
+			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", err)
 			return result, err
 		}
 		// The row is gone: drop any RequeueAfter the controller asked for, or the
 		// worker would reschedule a dead id straight into ErrNotFound.
 		if gone {
+			log.DebugContext(ctx, "object collected")
 			return Result{}, nil
 		}
 	}
@@ -121,6 +141,10 @@ type reconciler struct {
 	concurrency       int           // number of concurrent worker goroutines; 0/1 = single-threaded
 	// startupReconcile selects which objects get an initial reconcile when run starts.
 	startupReconcile StartupReconcileStrategy
+	// logger is kind-tagged and resolved (never nil) once Register runs; logLevel
+	// is the raw per-controller override consumed during that resolution.
+	logger   *slog.Logger
+	logLevel slog.Leveler
 
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
@@ -212,6 +236,11 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 // reconciles only in response to events (once the work queue lands), never on a
 // timer.
 func (r *reconciler) run(ctx context.Context) {
+	// A reconciler built outside Register (e.g. in tests) may have no logger;
+	// fall back to discard so the log sites below stay nil-safe.
+	if r.logger == nil {
+		r.logger = discardLogger
+	}
 	// Reconcile objects once at startup per the configured strategy. The default
 	// (StartupReconcileAll) re-applies persisted specs that a previous run left
 	// settled and gives controllers a chance to re-confirm process-scoped state
@@ -239,6 +268,7 @@ func (r *reconciler) run(ctx context.Context) {
 			r.runWorker(ctx)
 		})
 	}
+	r.logger.Info("reconciler started", "workers", n, "resyncInterval", r.resyncInterval)
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
 	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue.
 	defer func() {
@@ -260,8 +290,10 @@ func (r *reconciler) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			r.logger.Info("reconciler stopped")
 			return
 		case <-resync:
+			r.logger.Debug("resync tick")
 			r.enqueueUnsettled(ctx)
 			r.enqueueDeletionPending(ctx)
 		}
@@ -290,11 +322,17 @@ func (r *reconciler) runWorker(ctx context.Context) {
 				// queue guarantees no second worker had the id in the meantime.
 				r.work.done(id)
 				if err != nil {
-					r.work.addAfter(id, r.nextBackoff(id))
+					// The reconcile failure itself is already logged (with the
+					// error) in typedController.reconcile; here we only add the
+					// computed backoff delay at Debug.
+					delay := r.nextBackoff(id)
+					r.work.addAfter(id, delay)
+					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
 				} else {
 					r.clearBackoff(id)
 					if result.RequeueAfter > 0 {
 						r.work.addAfter(id, result.RequeueAfter)
+						r.logger.Debug("requeued", "id", id, "after", result.RequeueAfter)
 					}
 				}
 			}

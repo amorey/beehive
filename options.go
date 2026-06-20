@@ -1,6 +1,9 @@
 package beehive
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 // Option configures a target — a Beehive, a reconciler, or a per-object
 // operation — depending on where it is passed. Each option type-switches on the
@@ -92,6 +95,45 @@ func WithStartupReconcileStrategy(s StartupReconcileStrategy) Option {
 			t.startupReconcile = s
 		case *reconciler:
 			t.startupReconcile = s
+		}
+		return nil
+	}
+}
+
+// WithLogger routes beehive's internal logging through l. Pass a logger whose
+// slog.Handler wraps your logging library — zap, zerolog, logrus, and logr all
+// ship slog bridges — to forward beehive's logs into it. A nil logger disables
+// logging entirely, which is the default.
+//
+// Passed to New it sets the logger for the control plane and the default for all
+// controllers; passed to Register it overrides that default for one controller.
+func WithLogger(l *slog.Logger) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.logger = l
+		case *reconciler:
+			t.logger = l
+		}
+		return nil
+	}
+}
+
+// WithLogLevel sets the minimum level beehive emits, layered on top of whatever
+// the logger's own handler already filters. It is a convenience so callers can
+// quiet beehive down without building a leveled handler; pass a very high level
+// to silence it while keeping the logger wired up. Has no effect without
+// WithLogger (the discard logger emits nothing regardless).
+//
+// Passed to New it applies to the control plane and is the default for all
+// controllers; passed to Register it overrides that default for one controller.
+func WithLogLevel(level slog.Level) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.logLevel = level
+		case *reconciler:
+			t.logLevel = level
 		}
 		return nil
 	}

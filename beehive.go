@@ -3,6 +3,7 @@ package beehive
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -26,6 +27,11 @@ type Beehive struct {
 	concurrency    int // default worker count for all controllers; 0/1 = single-threaded
 	// startupReconcile is the default startup strategy copied into each reconciler.
 	startupReconcile StartupReconcileStrategy
+	// logger and logLevel are the user-supplied logging config (nil logger =
+	// disabled). They stay raw until Start resolves them via resolveLogger; each
+	// reconciler inherits them as its own default (see Register).
+	logger   *slog.Logger
+	logLevel slog.Leveler
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
@@ -35,6 +41,15 @@ type Beehive struct {
 	state  beehiveState
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// log returns a non-nil logger. Start resolves bh.logger, but Stop (and tests
+// that drive state directly) may run before that, so guard against nil.
+func (bh *Beehive) log() *slog.Logger {
+	if bh.logger == nil {
+		return discardLogger
+	}
+	return bh.logger
 }
 
 // Start brings the control plane up: it starts every registered controller and
@@ -52,6 +67,10 @@ func (bh *Beehive) Start() error {
 	case beehiveRunning:
 		return fmt.Errorf("beehive: already started")
 	}
+
+	// Resolve the control plane's own logger once: nil becomes the discard logger
+	// so the goroutines below (GC sweeper, dependency wakers) log unconditionally.
+	bh.logger = resolveLogger(bh.logger, bh.logLevel)
 
 	// runCtx lives for the lifetime of the control plane and drives the
 	// reconcile loops. It is cancelled by Stop.
@@ -71,6 +90,8 @@ func (bh *Beehive) Start() error {
 				_ = s.adapter.stop(context.Background())
 			}
 			cancel()
+			bh.logger.Error("controller start failed; rolled back",
+				"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
 			return fmt.Errorf("beehive: start controller %s/%s: %w", r.gk.Group, r.gk.Kind, err)
 		}
 		started = append(started, r)
@@ -90,6 +111,8 @@ func (bh *Beehive) Start() error {
 	for _, r := range started {
 		w, err := bh.store.WatchEvents(runCtx, r.gk)
 		if err != nil {
+			bh.logger.Warn("dependency waker subscription failed; relying on resync",
+				"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
 			continue
 		}
 		bh.wg.Go(func() {
@@ -113,6 +136,7 @@ func (bh *Beehive) Start() error {
 	})
 
 	bh.state = beehiveRunning
+	bh.logger.Info("control plane started", "controllers", len(started))
 	return nil
 }
 
@@ -148,6 +172,7 @@ func (bh *Beehive) runGCSweeper(ctx context.Context) {
 func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 	ids, err := bh.store.ListAllDeletionPendingIDs(ctx)
 	if err != nil {
+		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return
 	}
 	for _, id := range ids {
@@ -210,6 +235,7 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	// ctx is unbounded. order is frozen after Start, so it's safe to read unlocked.
 	bh.state = beehiveStopped
 	bh.cancel()
+	bh.log().Info("control plane stopping")
 	bh.mu.Unlock()
 
 	// Wait for reconcile loops to exit, but don't block past ctx.
@@ -229,6 +255,7 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	for _, r := range bh.order {
 		_ = r.adapter.stop(ctx)
 	}
+	bh.log().Info("control plane stopped")
 }
 
 // New creates a control plane backed by store s. Register controllers on the
@@ -268,8 +295,13 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		concurrency:      bh.concurrency,
 		startupReconcile: bh.startupReconcile,
 		backoffFor:       make(map[ObjectID]time.Duration),
+		// Inherit the control plane's logging config as the default; the options
+		// below may override it for this controller.
+		logger:   bh.logger,
+		logLevel: bh.logLevel,
 	}
-	r.adapter = &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}
+	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}
+	r.adapter = adapter
 
 	// Per-controller option overrides (e.g. WithResyncInterval, WithMaxRetryInterval).
 	for _, o := range opts {
@@ -277,6 +309,12 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 			return err
 		}
 	}
+
+	// Resolve once now that overrides are applied, and tag every record with the
+	// kind so per-object logs need only add the id. The adapter shares the same
+	// resolved logger for its reconcile-scoped messages.
+	r.logger = resolveLogger(r.logger, r.logLevel).With("group", gk.Group, "kind", gk.Kind)
+	adapter.logger = r.logger
 
 	bh.reconcilers[gk] = r
 	bh.order = append(bh.order, r)

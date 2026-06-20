@@ -1,6 +1,7 @@
 package beehive
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
@@ -54,6 +55,37 @@ func TestWithStartupReconcileStrategyDispatch(t *testing.T) {
 
 	// A target the option doesn't recognize is silently ignored.
 	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileAll)("unrelated"))
+}
+
+func TestWithLoggerDispatch(t *testing.T) {
+	l := slog.New(slog.DiscardHandler)
+
+	bh := &Beehive{}
+	require.NoError(t, WithLogger(l)(bh))
+	assert.Same(t, l, bh.logger)
+
+	r := &reconciler{}
+	require.NoError(t, WithLogger(l)(r))
+	assert.Same(t, l, r.logger)
+
+	// A nil logger is a valid value (disables logging) and a target the option
+	// doesn't recognize is silently ignored.
+	require.NoError(t, WithLogger(nil)(bh))
+	assert.Nil(t, bh.logger)
+	require.NoError(t, WithLogger(l)("unrelated"))
+}
+
+func TestWithLogLevelDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithLogLevel(slog.LevelWarn)(bh))
+	assert.Equal(t, slog.LevelWarn, bh.logLevel)
+
+	r := &reconciler{}
+	require.NoError(t, WithLogLevel(slog.LevelError)(r))
+	assert.Equal(t, slog.LevelError, r.logLevel)
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, WithLogLevel(slog.LevelInfo)("unrelated"))
 }
 
 // The create-time metadata options apply to a *createOptions target and are
