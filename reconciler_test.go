@@ -607,6 +607,75 @@ func TestReconcilerConcurrency(t *testing.T) {
 	assert.GreaterOrEqual(t, maxInFlight, workers, "expected at least %d concurrent reconciles", workers)
 }
 
+// TestReconcilerNoConcurrentReconcileOfSameID hammers a single object with
+// re-enqueues while it is mid-reconcile, under multiple workers. The work
+// queue's processing-hold must keep any second worker from dispatching the same
+// id, so the object is never reconciled by two goroutines at once.
+func TestReconcilerNoConcurrentReconcileOfSameID(t *testing.T) {
+	const workers = 4
+	const objID = ObjectID(1)
+
+	inReconcile := make(chan struct{}) // closed when the first reconcile starts
+	release := make(chan struct{})     // unblocks the first reconcile
+	var startOnce sync.Once
+
+	var (
+		mu        sync.Mutex
+		active    int
+		maxActive int
+	)
+
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) (Result, error) {
+			mu.Lock()
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			first := active == 1 && maxActive == 1
+			mu.Unlock()
+
+			if first {
+				// Hold the object while the test piles on re-adds; without the
+				// processing-hold this is exactly when a second worker would
+				// dispatch the same id.
+				startOnce.Do(func() { close(inReconcile) })
+				<-release
+			}
+
+			mu.Lock()
+			active--
+			mu.Unlock()
+			return Result{}, nil
+		},
+	}
+
+	r := &reconciler{
+		adapter:          adapter,
+		work:             newWorkQueue(),
+		resyncInterval:   0,
+		maxRetryInterval: time.Second,
+		backoffFor:       make(map[ObjectID]time.Duration),
+		concurrency:      workers,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(objID)
+	waitClosed(t, inReconcile, "first reconcile to start")
+
+	for range 50 {
+		r.enqueue(objID)
+	}
+
+	close(release)
+	cancel()
+	waitClosed(t, done, "run to exit")
+
+	assert.Equal(t, 1, maxActive, "the same object must never be reconciled by two workers at once")
+}
+
 func TestNextBackoffDefaultBase(t *testing.T) {
 	// When baseRetryInterval is 0, nextBackoff falls back to defaultBaseRetryInterval.
 	r := &reconciler{

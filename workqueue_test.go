@@ -134,12 +134,45 @@ func TestWorkQueueAddAfterZeroDelay(t *testing.T) {
 	}
 }
 
-func TestWorkQueueReaddAfterGet(t *testing.T) {
+// TestWorkQueueNoConcurrentDispatch verifies that an ID handed out by get() is
+// not dispatchable again until done() is called, even if it is re-added while
+// still being processed. This is what prevents two workers from reconciling the
+// same object concurrently.
+func TestWorkQueueNoConcurrentDispatch(t *testing.T) {
+	q := newWorkQueue()
+	q.add(1)
+
+	id, ok := q.get() // worker A takes 1; it is now "processing"
+	require.True(t, ok)
+	require.Equal(t, ObjectID(1), id)
+
+	// A live event re-enqueues 1 while worker A is still reconciling it.
+	q.add(1)
+
+	// 1 must NOT be dispatchable to a second worker until A calls done.
+	_, ok = q.get()
+	assert.False(t, ok, "id must not be dispatched again while still processing")
+
+	// Once A finishes, the queued re-add becomes dispatchable exactly once.
+	q.done(1)
+	id, ok = q.get()
+	require.True(t, ok)
+	assert.Equal(t, ObjectID(1), id)
+
+	q.done(1)
+	_, ok = q.get()
+	assert.False(t, ok, "no spurious re-dispatch after done")
+}
+
+// TestWorkQueueReaddAfterDone verifies an ID can be queued again once its prior
+// processing has completed via done().
+func TestWorkQueueReaddAfterDone(t *testing.T) {
 	q := newWorkQueue()
 	q.add(7)
-	_, _ = q.get() // item leaves the set
+	_, _ = q.get() // 7 is now processing
+	q.done(7)      // processing complete
 
-	// Same ID can be added again once it's been consumed.
+	// Same ID can be added again once it's been completed.
 	q.add(7)
 	id, ok := q.get()
 	require.True(t, ok)

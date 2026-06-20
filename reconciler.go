@@ -124,8 +124,6 @@ type reconciler struct {
 
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
-
-	inFlight sync.Map // keyed by ObjectID; value is struct{}
 }
 
 // enqueue adds id to the work queue if one is configured.
@@ -167,25 +165,17 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	r.enqueueFrom(ctx, r.store.ListIDs)
 }
 
-// enqueueFrom enqueues the IDs returned by list, skipping any already in flight
-// to avoid duplicate or concurrent reconciles for the same ID.
+// enqueueFrom enqueues the IDs returned by list. The work queue coalesces an ID
+// that is already queued and defers one that is mid-reconcile (re-queuing it via
+// done), so this never triggers a duplicate or concurrent reconcile.
 func (r *reconciler) enqueueFrom(ctx context.Context, list func(context.Context, GroupKind) ([]ObjectID, error)) {
 	ids, err := list(ctx, r.gk)
 	if err != nil {
 		return
 	}
 	for _, id := range ids {
-		if !r.isInFlight(id) {
-			r.enqueue(id)
-		}
+		r.enqueue(id)
 	}
-}
-
-func (r *reconciler) markInFlight(id ObjectID)   { r.inFlight.Store(id, struct{}{}) }
-func (r *reconciler) unmarkInFlight(id ObjectID) { r.inFlight.Delete(id) }
-func (r *reconciler) isInFlight(id ObjectID) bool {
-	_, ok := r.inFlight.Load(id)
-	return ok
 }
 
 // nextBackoff returns the next retry delay for id and doubles it for next time,
@@ -287,9 +277,11 @@ func (r *reconciler) runWorker(ctx context.Context) {
 			return
 		case <-workReady:
 			if id, ok := r.work.get(); ok {
-				r.markInFlight(id)
 				result, err := r.adapter.reconcile(ctx, id)
-				r.unmarkInFlight(id)
+				// done releases the processing hold so a re-add (live event or
+				// resync) that arrived mid-reconcile becomes dispatchable. The
+				// queue guarantees no second worker had the id in the meantime.
+				r.work.done(id)
 				if err != nil {
 					r.work.addAfter(id, r.nextBackoff(id))
 				} else {
