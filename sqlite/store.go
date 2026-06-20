@@ -84,6 +84,15 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // Within runs fn inside a single transaction. A nested Within (ctx already
 // carries a tx) joins the outer transaction rather than opening a new one.
 //
+// Read-modify-write atomicity rests on the DSN's _txlock=immediate: BeginTx
+// issues BEGIN IMMEDIATE, so the transaction holds the sole WAL write lock from
+// BEGIN through Commit — before its first read. No other writer can commit in
+// between, so a compare-then-write (UpdateSpec's no-op suppression, SetCondition,
+// DeleteFinalizer, …) can't act on a stale snapshot. This holds independently of
+// pool size, so it survives a writer pool wider than one connection — but only
+// for compound writes routed through Within; a read then a separate write on the
+// bare pool would not be atomic. Keep multi-statement mutations inside Within.
+//
 // Watch events that mutators emit during the transaction are buffered in a
 // tx-scoped collector and published only after Commit — and as the very last
 // step, so "emit before commit" is structurally impossible. A nested Within
