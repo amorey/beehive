@@ -19,7 +19,7 @@ import (
   "time"
 
   "github.com/amorey/beehive"
-  "github.com/amorey/beehive/store"
+  "github.com/amorey/beehive/sqlite"
 )
 
 var ClusterGroupKind = beehive.GroupKind{
@@ -70,7 +70,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[
 }
 
 func main() {
-  store, _ := store.OpenSQLite("/path/to/beehive.db")
+  store, _ := sqlite.Open("/path/to/beehive.db")
   defer store.Close()
 
   bh, _ := beehive.New(store)
@@ -99,7 +99,7 @@ func main() {
 ### Beehive
 
 ```go
-func New(store store.Store, opts ...Option) (*Beehive, error)
+func New(store Store, opts ...Option) (*Beehive, error)
 func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error
 ```
 
