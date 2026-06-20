@@ -209,7 +209,7 @@ obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithName("prod-cluster"),
 client.Update(ctx, obj.ID, ClusterSpec{...})
 ```
 
-`Watch` and `WatchList` emit the current state as `Added` events on start, then stream subsequent changes. The channel closes when `ctx` is cancelled.
+`Watch` and `WatchList` emit the current state as `Added` events on start, then stream subsequent changes. The channel closes when `ctx` is cancelled. Events are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model.
 
 ### ControllerClient
 

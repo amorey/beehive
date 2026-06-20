@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amorey/beehive/internal/conflate"
 	"github.com/amorey/beehive/internal/storeapi"
-	"github.com/amorey/gochan/broadcast"
 )
 
 type sqliteStore struct {
@@ -22,10 +22,10 @@ type sqliteStore struct {
 	// until a controller re-confirms them in this process.
 	processStart time.Time
 
-	// hubs fan watch events out to subscribers, one broadcast hub per GroupKind,
+	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
 	// created lazily on first use. hubMu guards the map and the closed flag.
 	hubMu  sync.RWMutex
-	hubs   map[storeapi.GroupKind]*broadcast.Hub[storeapi.RawWatchEvent]
+	hubs   map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent]
 	closed bool
 	// done is closed by Close to wake watcher goroutines that are parked on a
 	// send (closing the hub only wakes those parked on a receive).

@@ -352,11 +352,13 @@ func (s *recordingDepsStore) ListReferrers(_ context.Context, toID ObjectID, _ R
 	return nil, nil
 }
 
-// TestDependencyWakerIgnoresAddedEvents verifies the waker reacts only to
-// Modified events: an Added event (such as the startup snapshot, which the
-// reconciler's own startup pass already covers) must not trigger a dependents
-// lookup, so startup doesn't replay a wake for every existing object.
-func TestDependencyWakerIgnoresAddedEvents(t *testing.T) {
+// TestDependencyWakerWakesOnChange verifies the waker reacts to both Added and
+// Modified events. The conflating hub can coalesce a create-then-modify into a
+// single Added, so skipping Added would drop the wake; a brand-new object
+// usually has no dependents (the lookup is then a cheap no-op), making the
+// over-wake harmless. Deleted is still ignored (a gone object has no dependents
+// to requeue).
+func TestDependencyWakerWakesOnChange(t *testing.T) {
 	fw := newFakeWatcher()
 	calls := make(chan ObjectID, 1)
 	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{w: fw}, calls: calls}}
@@ -371,9 +373,10 @@ func TestDependencyWakerIgnoresAddedEvents(t *testing.T) {
 
 	fw.push(WatchEventAdded, &RawObject{ID: 1})
 	select {
-	case <-calls:
-		t.Fatal("Added event triggered a dependents wake")
-	case <-time.After(200 * time.Millisecond):
+	case id := <-calls:
+		assert.Equal(t, ObjectID(1), id, "Added event wakes dependents (a coalesced create+modify)")
+	case <-time.After(testTimeout):
+		t.Fatal("Added event did not trigger a wake")
 	}
 
 	fw.push(WatchEventModified, &RawObject{ID: 2})
@@ -382,6 +385,13 @@ func TestDependencyWakerIgnoresAddedEvents(t *testing.T) {
 		assert.Equal(t, ObjectID(2), id, "Modified event wakes dependents of the changed object")
 	case <-time.After(testTimeout):
 		t.Fatal("Modified event did not trigger a wake")
+	}
+
+	fw.push(WatchEventDeleted, &RawObject{ID: 3})
+	select {
+	case <-calls:
+		t.Fatal("Deleted event triggered a dependents wake")
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	cancel()

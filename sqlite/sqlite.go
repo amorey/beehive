@@ -6,9 +6,9 @@ import (
 	"embed"
 	"time"
 
+	"github.com/amorey/beehive/internal/conflate"
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlitemigrate"
-	"github.com/amorey/gochan/broadcast"
 	_ "modernc.org/sqlite"
 )
 
@@ -45,7 +45,7 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		// processStart, so a sub-ms processStart would wrongly flag a condition
 		// written in the same millisecond the process started.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
-		hubs:         make(map[storeapi.GroupKind]*broadcast.Hub[storeapi.RawWatchEvent]),
+		hubs:         make(map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent]),
 		done:         make(chan struct{}),
 	}, nil
 }

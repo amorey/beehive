@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -395,84 +396,269 @@ func TestWatchSnapshotSendCtxDone(t *testing.T) {
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
 }
 
-// TestWatchRecoversFromLag verifies that when a watcher's receiver falls behind
-// the broadcast ring and drops events, the watcher does NOT terminate. It
-// re-lists current state and re-emits it as Modified so consumers (and the
-// dependency waker, which acts only on Modified) re-converge instead of silently
-// losing the stream.
-//
-// The goroutine parks delivering its snapshot Added (no reader), which keeps it
-// out of the receive loop while we overflow the ring; draining the snapshot then
-// drops it into RecvContext, where it sees ErrLagged.
-func TestWatchRecoversFromLag(t *testing.T) {
+// TestWatchCoalescesRapidUpdates verifies the conflating hub collapses several
+// rapid updates to one object — published while the watcher is still parked
+// delivering the snapshot Added — into a single Modified carrying the latest
+// body. A ring would have delivered every intermediate version.
+func TestWatchCoalescesRapidUpdates(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.CreateObject(ctx, newWatchObject()) // rv1
 	require.NoError(t, err)
 
-	w, err := store.Watch(ctx, testGK, obj.ID)
+	w, err := store.Watch(ctx, testGK, obj.ID) // snapshot high-water = rv1
 	require.NoError(t, err)
 	defer w.Close()
 
-	// Burst > ring capacity of events for an unrelated id; filterID drops them,
-	// so they serve only to lag the receiver while the goroutine is parked.
-	filler := &beehive.RawObject{ID: 999999, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1}
-	for range hubBufferSize + 50 {
-		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified, Object: filler})
+	// Two live updates with rv > high-water, published before the snapshot Added
+	// is drained, so the goroutine is parked and both land in the receiver's slot.
+	mod := func(rv int64, spec string) {
+		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+			Object: &beehive.RawObject{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(spec), ResourceVersion: rv}})
 	}
+	mod(2, `{"v":2}`)
+	mod(3, `{"v":3}`)
 
-	// Draining the snapshot Added lets the goroutine enter the receive loop and
-	// hit ErrLagged.
 	first := recvEvent(t, w)
 	assert.Equal(t, beehive.WatchEventAdded, first.Type)
-	assert.Equal(t, obj.ID, first.Object.ID)
 
-	// Recovery: current state re-emitted as Modified, channel still open.
 	rec := recvEvent(t, w)
 	assert.Equal(t, beehive.WatchEventModified, rec.Type)
 	assert.Equal(t, obj.ID, rec.Object.ID)
+	assert.JSONEq(t, `{"v":3}`, string(rec.Object.Spec))
+
+	// The rv2 update was coalesced away — no second Modified.
+	assertNoEvent(t, w, 100*time.Millisecond)
 }
 
-// TestWatchRelistEmitsDeleteForVanishedObject verifies that when an object is
-// deleted during a lag gap (its Deleted event dropped from the ring), the
-// recovery relist reports a Deleted tombstone for it so a cache-maintaining
-// consumer does not retain the stale object forever. The row is gone, so the
-// tombstone carries id + kind and a null (universally decodable) spec, not the
-// last row.
-func TestWatchRelistEmitsDeleteForVanishedObject(t *testing.T) {
+// TestWatchDeliversRealDeleteBodyWhenSlow verifies that when a lagging watcher's
+// pending update coalesces into a delete, it receives a single Deleted carrying
+// the object's real final body — not the null-spec tombstone the old relist
+// synthesized.
+func TestWatchDeliversRealDeleteBodyWhenSlow(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.CreateObject(ctx, newWatchObject()) // rv1
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 
-	// Delete the object: snapshot (captured at watch() time) still holds it, but
-	// the live store no longer does. The Deleted event lands in the ring...
-	require.NoError(t, store.DeleteObject(ctx, obj.ID))
-	// ...then a burst > ring capacity drops it, forcing ErrLagged on recovery.
-	filler := &beehive.RawObject{ID: 999999, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1}
-	for range hubBufferSize + 50 {
-		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified, Object: filler})
-	}
+	// Update then delete while parked on the snapshot Added: the Modified
+	// coalesces into the Deleted, which carries the real last row.
+	store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+		Object: &beehive.RawObject{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"hello":"mutated"}`), ResourceVersion: 2}})
+	store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventDeleted,
+		Object: &beehive.RawObject{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"hello":"final"}`), ResourceVersion: 3}})
 
-	// Drain the snapshot Added so the goroutine enters the receive loop, hits
-	// ErrLagged, and relists.
 	first := recvEvent(t, w)
 	assert.Equal(t, beehive.WatchEventAdded, first.Type)
-	assert.Equal(t, obj.ID, first.Object.ID)
 
-	// Recovery relist finds the object gone and reports its Deleted tombstone:
-	// id + kind, with a null spec that decodes into any Go type.
 	rec := recvEvent(t, w)
 	assert.Equal(t, beehive.WatchEventDeleted, rec.Type)
 	assert.Equal(t, obj.ID, rec.Object.ID)
-	assert.Equal(t, testGK.Kind, rec.Object.Kind)
-	assert.JSONEq(t, "null", string(rec.Object.Spec))
+	assert.JSONEq(t, `{"hello":"final"}`, string(rec.Object.Spec))
+}
+
+// TestWatchSnapshotRaceDeleteNotLost verifies the P1 correctness property: an
+// object created in the subscribe→snapshot race window (its Added is buffered
+// before the snapshot is taken, and the snapshot includes it) must not lose a
+// subsequent delete. The old annihilation in mergeWatchEvent would coalesce the
+// buffered Added+Deleted into nothing, leaving the consumer with a stale object.
+func TestWatchSnapshotRaceDeleteNotLost(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	// Create the object inside beforeSnapshot so its Added is buffered in the
+	// receiver before the snapshot transaction starts. The snapshot includes the
+	// object (it exists in the DB), so the consumer learns about it via the
+	// snapshot Added. Then a Deleted is published while the goroutine is parked
+	// delivering that snapshot Added — it coalesces with the buffered race-window
+	// Added. The consumer must still receive the Deleted.
+	var created *storeapi.RawObject
+	store.beforeSnapshot = func() {
+		var err error
+		created, err = store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+	}
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Publish Deleted before reading any event; goroutine is parked on the
+	// snapshot send, so this lands in the buffer and merges with the buffered
+	// race-window Added.
+	store.publish(testGK, storeapi.RawWatchEvent{
+		Type: beehive.WatchEventDeleted,
+		Object: &storeapi.RawObject{
+			ID: created.ID, Group: testGK.Group, Kind: testGK.Kind,
+			ResourceVersion: created.ResourceVersion + 1,
+		},
+	})
+
+	snap := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventAdded, snap.Type)
+	assert.Equal(t, created.ID, snap.Object.ID)
+
+	del := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventDeleted, del.Type)
+	assert.Equal(t, created.ID, del.Object.ID)
+}
+
+// TestAnnihilatingMergeForList verifies the WatchList memory bound: a coalesced
+// Added→Deleted for an object the snapshot never contained is dropped
+// (keep=false) so a slow consumer never accumulates a tombstone per transient id
+// — while a snapshot-covered object's delete is still preserved.
+func TestAnnihilatingMergeForList(t *testing.T) {
+	var seed atomic.Pointer[snapshotIDs]
+	merge := annihilatingMerge(snapshotPreserve(&seed))
+	const id storeapi.ObjectID = 42
+	added := storeapi.RawWatchEvent{Type: beehive.WatchEventAdded,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 5}}
+	deleted := storeapi.RawWatchEvent{Type: beehive.WatchEventDeleted,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 6}}
+
+	// Snapshot not yet loaded: membership unknown, so keep conservatively.
+	got, keep := merge(added, deleted)
+	require.True(t, keep)
+	assert.Equal(t, beehive.WatchEventDeleted, got.Type)
+
+	// Snapshot loaded without the id: transient object the consumer never saw —
+	// annihilate the pair.
+	empty := snapshotIDs{}
+	seed.Store(&empty)
+	_, keep = merge(added, deleted)
+	assert.False(t, keep)
+
+	// Snapshot contains the id (race-window object): its delete must survive.
+	withID := snapshotIDs{id: {}}
+	seed.Store(&withID)
+	got, keep = merge(added, deleted)
+	require.True(t, keep)
+	assert.Equal(t, beehive.WatchEventDeleted, got.Type)
+}
+
+// TestAnnihilatingMergeForEvents verifies the WatchEvents memory bound: with no
+// snapshot to preserve (preserve == nil), every unobserved Added→Deleted pair is
+// annihilated, while a non-delete coalescence still survives.
+func TestAnnihilatingMergeForEvents(t *testing.T) {
+	merge := annihilatingMerge(nil)
+	const id storeapi.ObjectID = 7
+	added := storeapi.RawWatchEvent{Type: beehive.WatchEventAdded,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 1}}
+	deleted := storeapi.RawWatchEvent{Type: beehive.WatchEventDeleted,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
+	modified := storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
+
+	// Unobserved create→delete: dropped entirely.
+	_, keep := merge(added, deleted)
+	assert.False(t, keep)
+
+	// Create→modify still coalesces and survives (kept as Added, latest body).
+	got, keep := merge(added, modified)
+	require.True(t, keep)
+	assert.Equal(t, beehive.WatchEventAdded, got.Type)
+	assert.EqualValues(t, 2, got.Object.ResourceVersion)
+}
+
+// TestWatchSnapshotRaceModifiedNotAdded verifies that when a race-window Added
+// and a post-snapshot Modified coalesce in the buffer (mergeWatchEvent preserves
+// Added type since prev was Added), the consumer — which already received the
+// object via the snapshot — sees Modified, not a spurious second Added.
+func TestWatchSnapshotRaceModifiedNotAdded(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	var created *storeapi.RawObject
+	store.beforeSnapshot = func() {
+		var err error
+		created, err = store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+	}
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Publish Modified while the goroutine is parked on the snapshot send.
+	// The merge of (buffered Added, incoming Modified) yields Added — but the
+	// consumer already has this object from the snapshot, so it must arrive
+	// as Modified.
+	store.publish(testGK, storeapi.RawWatchEvent{
+		Type: beehive.WatchEventModified,
+		Object: &storeapi.RawObject{
+			ID: created.ID, Group: testGK.Group, Kind: testGK.Kind,
+			Spec:            []byte(`{"v":2}`),
+			ResourceVersion: created.ResourceVersion + 1,
+		},
+	})
+
+	snap := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventAdded, snap.Type)
+	assert.Equal(t, created.ID, snap.Object.ID)
+
+	mod := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventModified, mod.Type) // not a second Added
+	assert.Equal(t, created.ID, mod.Object.ID)
+}
+
+// TestWatchBornAndDiedBeforeSnapshotUnobserved verifies that an object created
+// and deleted entirely within the subscribe→snapshot race window leaves no trace
+// in the stream. Both events' resource versions are ≤ the snapshot's high-water,
+// so the RV filter drops the coalesced tombstone.
+func TestWatchBornAndDiedBeforeSnapshotUnobserved(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	store.beforeSnapshot = func() {
+		obj, err := store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+		// Delete without going through RequestDeletion; the freshly created
+		// object has no finalizers or referrers, so it can be removed directly.
+		require.NoError(t, store.DeleteObject(ctx, obj.ID))
+	}
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Both the Added and the coalesced Deleted have RV ≤ the snapshot's
+	// high-water mark and are filtered; the consumer sees nothing.
+	assertNoEvent(t, w, 200*time.Millisecond)
+}
+
+// TestWatchBornAndDiedAfterSnapshotUnobserved verifies that an object born and
+// deleted entirely in the live stream — after the snapshot, while the consumer
+// never received its Added — does not produce a spurious Deleted. Without the
+// seenIDs guard the coalesced tombstone would pass the RV filter and reach the
+// consumer as a Deleted for an object it never knew about.
+func TestWatchBornAndDiedAfterSnapshotUnobserved(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Inject Added then Deleted before any read — goroutine is alive but the
+	// empty snapshot means it has no snapshot items to send, so it's parked
+	// waiting for a live event. The Added coalesces with the Deleted in the
+	// conflating buffer; the resulting Deleted must be silently dropped.
+	store.publish(testGK, storeapi.RawWatchEvent{
+		Type:   beehive.WatchEventAdded,
+		Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 1},
+	})
+	store.publish(testGK, storeapi.RawWatchEvent{
+		Type:   beehive.WatchEventDeleted,
+		Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 2},
+	})
+
+	assertNoEvent(t, w, 200*time.Millisecond)
 }
 
 // TestWatchLiveSendCtxDone covers the live-send path exiting on context

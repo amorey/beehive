@@ -182,7 +182,7 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 	}
 }
 
-// runDependencyWaker requeues dependents when a target is modified, until ctx is
+// runDependencyWaker requeues dependents when a target changes, until ctx is
 // cancelled or the stream ends. The watcher is established by Start (events-only,
 // no snapshot: the reconciler's own startup pass already covers existing objects).
 // The ctx.Done() arm is needed because a watcher's channel may never close on its
@@ -197,11 +197,13 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
 			if !ok {
 				return
 			}
-			// Only modifications can change a target's observable state. Skipping
-			// Added avoids replaying the whole snapshot at startup (where the
-			// reconciler's own startup pass already covers every object), and a
-			// brand-new object has no dependents yet anyway.
-			if ev.Type == WatchEventModified {
+			// Wake on any present-state change. We must handle Added, not just
+			// Modified: the conflating store hub coalesces a create-then-modify into
+			// a single Added, so skipping it would drop the modify's wake. A
+			// brand-new object usually has no dependents, so the extra lookup is a
+			// cheap no-op — the over-wake is harmless. Deleted carries nothing to
+			// requeue (a gone object has no dependents).
+			if ev.Type == WatchEventAdded || ev.Type == WatchEventModified {
 				bh.wakeDependents(ctx, ev.Object.ID)
 			}
 		}
