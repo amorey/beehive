@@ -2,6 +2,7 @@ package beehive
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -46,11 +47,30 @@ func (t *typedController[Spec, Status]) stop(ctx context.Context) error {
 // watchers never observe state that was rolled back.
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	var result Result
+	var deleting, missing bool
+	// Controller-client calls that free a ref target register it here; we requeue
+	// them once the transaction commits (see DeleteDependency).
+	wakes := &pendingWakes{}
+	ctx = withPendingWakes(ctx, wakes)
 	err := t.bh.store.Within(ctx, func(ctx context.Context) error {
 		raw, err := t.bh.store.GetObject(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			// The queued object is already gone (collected by a prior pass, a
+			// cascade, or the backstop between enqueue and now). Nothing to
+			// reconcile — a no-op success, not a retryable error. Scoped to this
+			// load so a controller's own ErrNotFound (e.g. a dependency on a missing
+			// target) still surfaces and retries.
+			missing = true
+			return nil
+		}
 		if err != nil {
 			return err
 		}
+		// Read from the already-loaded row as a fast path: it lets a non-finalizing
+		// reconcile (the common case) skip collect's separate transaction entirely,
+		// while still running GC on the pass where the controller clears its last
+		// finalizer.
+		deleting = raw.DeletionRequestedAt != nil
 		obj, err := rawToTyped[Spec, Status](raw)
 		if err != nil {
 			return err
@@ -59,7 +79,33 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		result, reconcileErr = t.inner.Reconcile(ctx, obj)
 		return reconcileErr
 	})
-	return result, err
+	if missing {
+		return Result{}, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	// Committed: requeue any targets the controller freed via DeleteDependency, so
+	// a now-unreferenced deletion-pending target is re-examined without waiting on
+	// the resync backstop. Post-commit, so a rolled-back DeleteRef wakes nothing.
+	for _, tgt := range wakes.targets {
+		t.bh.enqueueIfRegistered(GroupKind{Group: tgt.Group, Kind: tgt.Kind}, tgt.ID)
+	}
+	// GC runs in its own transaction after the controller's writes commit, so a
+	// finalizer the controller just cleared is visible and a blocked physical
+	// delete doesn't roll back the controller's work.
+	if deleting {
+		gone, err := t.bh.collect(ctx, id)
+		if err != nil {
+			return result, err
+		}
+		// The row is gone: drop any RequeueAfter the controller asked for, or the
+		// worker would reschedule a dead id straight into ErrNotFound.
+		if gone {
+			return Result{}, nil
+		}
+	}
+	return result, nil
 }
 
 // reconciler drives the reconcile loop for a single registered controller.
@@ -97,6 +143,17 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 		return
 	}
 	r.enqueueFrom(ctx, r.store.ListUnsettledIDs)
+}
+
+// enqueueDeletionPending enqueues objects that are finalizing (deletion
+// requested, row not yet removed). It is the GC backstop: a delete bumps no
+// generation, so the unsettled resync never wakes it, and once an owner is
+// RESTRICT-blocked on a child nothing else re-checks it until the child is gone.
+func (r *reconciler) enqueueDeletionPending(ctx context.Context) {
+	if r.store == nil {
+		return
+	}
+	r.enqueueFrom(ctx, r.store.ListDeletionPendingIDs)
 }
 
 // enqueueAll enqueues every object of the kind, including ones whose spec is
@@ -179,6 +236,11 @@ func (r *reconciler) run(ctx context.Context) {
 	default: // StartupReconcileAll
 		r.enqueueAll(ctx)
 	}
+	// Always resume in-progress deletions at startup, independent of the spec
+	// strategy above: a process that crashed mid-delete must still drive those
+	// rows to removal. Deletion progress is orthogonal to spec convergence; the
+	// work queue's set semantics coalesce any overlap with the pass above.
+	r.enqueueDeletionPending(ctx)
 
 	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup
@@ -204,6 +266,7 @@ func (r *reconciler) run(ctx context.Context) {
 			return
 		case <-resync:
 			r.enqueueUnsettled(ctx)
+			r.enqueueDeletionPending(ctx)
 		}
 	}
 }

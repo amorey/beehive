@@ -162,6 +162,56 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
 
+func TestControllerClientHasReferrers(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	ctrl := newCapturingController()
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	var cc ControllerClient[cStatus]
+	select {
+	case cc = <-ctrl.clientCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller Start was not called")
+	}
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	has, err := cc.HasReferrers(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.True(t, has, "owner is referenced by the child")
+
+	has, err = cc.HasReferrers(ctx, child.ID)
+	require.NoError(t, err)
+	assert.False(t, has, "nothing references the child")
+}
+
+// failHasReferrersStore returns an error from HasReferrers.
+type failHasReferrersStore struct {
+	fakeStore
+}
+
+func (s *failHasReferrersStore) HasReferrers(context.Context, ObjectID) (bool, error) {
+	return false, errBoom
+}
+
+func TestControllerClientHasReferrersStoreError(t *testing.T) {
+	bh, err := New(&failHasReferrersStore{})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+	_, err = cc.HasReferrers(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
 // failAddRefStore returns an error from AddRef.
 type failAddRefStore struct {
 	fakeStore

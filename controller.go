@@ -3,6 +3,7 @@ package beehive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
@@ -26,6 +27,13 @@ type ControllerClient[Status any] interface {
 	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
 	AddDependency(ctx context.Context, fromID, toID ObjectID) error
 	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
+	// HasReferrers reports whether any object with a live claim still points at id:
+	// an owned child, or a dependent that is not itself being deleted. A dependent
+	// that is itself finalizing is excluded — it's going away and no longer has a
+	// claim. A finalizer can gate teardown on this: a controller holding a shared
+	// resource clears its finalizer only once nothing with a live claim references
+	// the object, so the resource outlives its last real user.
+	HasReferrers(ctx context.Context, id ObjectID) (bool, error)
 }
 
 // controllerClientImpl is the status-writing surface handed to a controller's
@@ -78,5 +86,30 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 }
 
 func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fromID, toID ObjectID) error {
-	return c.bh.store.DeleteRef(ctx, fromID, toID, RelationDependsOn)
+	if err := c.bh.store.DeleteRef(ctx, fromID, toID, RelationDependsOn); err != nil {
+		return err
+	}
+	// Removing the edge can unblock toID's physical deletion (refs are RESTRICT).
+	// If toID is finalizing, register it for a post-commit re-check so GC removes
+	// it without waiting on the resync backstop (which may be disabled). Outside a
+	// reconcile there's no collector — nothing to schedule.
+	wakes := pendingWakesFrom(ctx)
+	if wakes == nil {
+		return nil
+	}
+	target, err := c.bh.store.GetObject(ctx, toID)
+	if errors.Is(err, ErrNotFound) {
+		return nil // target already gone
+	}
+	if err != nil {
+		return err
+	}
+	if target.DeletionRequestedAt != nil {
+		wakes.targets = append(wakes.targets, Referrer{ID: toID, Group: target.Group, Kind: target.Kind})
+	}
+	return nil
+}
+
+func (c *controllerClientImpl[Status]) HasReferrers(ctx context.Context, id ObjectID) (bool, error) {
+	return c.bh.store.HasReferrers(ctx, id)
 }

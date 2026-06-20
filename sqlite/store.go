@@ -272,6 +272,19 @@ func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKin
 	return scanIDs(rows)
 }
 
+func (s *sqliteStore) ListDeletionPendingIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+	// Matches the partial index idx ... WHERE deletion_requested_at IS NOT NULL.
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT id FROM objects
+		 WHERE "group" = ? AND kind = ? AND deletion_requested_at IS NOT NULL
+		 ORDER BY id`,
+		gk.Group, gk.Kind)
+	if err != nil {
+		return nil, err
+	}
+	return scanIDs(rows)
+}
+
 func (s *sqliteStore) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
@@ -683,6 +696,66 @@ func (s *sqliteStore) ListReferrers(ctx context.Context, toID storeapi.ObjectID,
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ListReferents returns the distinct objects fromID points at (any relation),
+// the inverse of ListReferrers. DISTINCT collapses an object reached through
+// more than one relation (e.g. both owned_by and depends_on) to a single row.
+func (s *sqliteStore) ListReferents(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.Referrer, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT DISTINCT o.id, o."group", o.kind
+		FROM refs r JOIN objects o ON o.id = r.to_id
+		WHERE r.from_id = ?
+		ORDER BY o.id`, fromID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []storeapi.Referrer
+	for rows.Next() {
+		var d storeapi.Referrer
+		if err := rows.Scan(&d.ID, &d.Group, &d.Kind); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteFinalizingDependsOnRefs removes depends_on edges into toID whose source
+// is itself deletion-pending, breaking the deadlock where mutually dependent (or
+// self-dependent) finalizing objects each hold the other's RESTRICT. Like
+// DeleteRef it bumps no version and emits no event.
+func (s *sqliteStore) DeleteFinalizingDependsOnRefs(ctx context.Context, toID storeapi.ObjectID) error {
+	_, err := s.conn(ctx).ExecContext(ctx, `
+		DELETE FROM refs
+		WHERE to_id = ? AND relation = ?
+		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
+		toID, string(storeapi.RelationDependsOn))
+	return err
+}
+
+// HasReferrers reports whether any object with a live claim points at id: an
+// owned_by edge, or a depends_on edge from a source that is not itself
+// finalizing. A depends_on edge from a deletion-pending source is ignored — that
+// dependent is going away and no longer has a claim, so it must not gate a
+// finalizer (HasReferrers would otherwise never clear when two finalizing
+// objects depend on each other). owned_by always counts: the foreground cascade
+// must wait for the owned child to be physically removed.
+func (s *sqliteStore) HasReferrers(ctx context.Context, id storeapi.ObjectID) (bool, error) {
+	var exists int
+	err := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM refs r
+			WHERE r.to_id = ?
+			  AND NOT (r.relation = ? AND r.from_id IN
+			           (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,
+		id, string(storeapi.RelationDependsOn)).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
 }
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.

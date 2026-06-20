@@ -139,6 +139,12 @@ type Store interface {
 	// observed_generation doesn't match generation (not yet converged).
 	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
+	// ListDeletionPendingIDs returns the IDs of objects of kind gk that have been
+	// marked for deletion (DeletionRequestedAt set) but not yet physically
+	// removed. The GC backstop enqueues these so a delete makes progress without a
+	// spec change to wake it.
+	ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
 	// ListIDs returns the IDs of every object of kind gk, ordered by id. The
 	// reconciler uses it to enqueue a full reconcile pass at startup, so
 	// process-scoped state (e.g. liveness conditions) is re-confirmed even on
@@ -191,6 +197,33 @@ type Store interface {
 	// ListReferrers returns every object pointing at toID through relation, ordered by
 	// id (e.g. the dependents to requeue, or the owned children to GC).
 	ListReferrers(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
+
+	// ListReferents returns the distinct objects that fromID points at through any
+	// relation, ordered by id (the inverse of ListReferrers). GC uses it to wake
+	// the targets a row was holding open before removing it: deleting fromID drops
+	// its outgoing edges (ON DELETE CASCADE), which can unblock a deletion-pending
+	// target that RESTRICT was keeping alive.
+	ListReferents(ctx context.Context, fromID ObjectID) ([]Referrer, error)
+
+	// DeleteFinalizingDependsOnRefs removes the depends_on edges pointing at toID
+	// whose source object is itself marked for deletion. A finalizing dependent is
+	// going away, so its dependency must not keep the target alive: without this,
+	// two deletion-pending objects that depend on each other (or a self-dependency)
+	// would each hold the other's RESTRICT and never be collected. owned_by edges
+	// are left untouched — those clear only when the owned child is physically
+	// removed (the foreground cascade).
+	DeleteFinalizingDependsOnRefs(ctx context.Context, toID ObjectID) error
+
+	// HasReferrers reports whether any object with a live claim points at id: an
+	// owned_by edge, or a depends_on edge from a source that is not itself
+	// finalizing. A depends_on edge from a deletion-pending source is ignored —
+	// that dependent is going away and no longer has a claim, so it must not gate a
+	// finalizer (two mutually dependent finalizing objects would otherwise never
+	// see HasReferrers clear). owned_by always counts: the foreground cascade must
+	// wait for the owned child to be physically removed. GC pairs this with
+	// DeleteFinalizingDependsOnRefs, which physically removes the ignored edges
+	// before DeleteObject so the refs RESTRICT is satisfied.
+	HasReferrers(ctx context.Context, id ObjectID) (bool, error)
 
 	// Watch returns a Watcher for the single object id of kind gk: its current
 	// state (if any) as an Added snapshot, then live changes filtered to that id.

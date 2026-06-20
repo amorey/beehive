@@ -26,6 +26,17 @@ func (s *unsettledIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]
 	return s.ids, nil
 }
 
+// deletionPendingIDsStore is a fakeStore whose ListDeletionPendingIDs returns a
+// fixed slice, used to exercise the GC backstop enqueue without a real database.
+type deletionPendingIDsStore struct {
+	fakeStore
+	ids []ObjectID
+}
+
+func (s *deletionPendingIDsStore) ListDeletionPendingIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	return s.ids, nil
+}
+
 // allIDsStore reports no unsettled objects but a fixed full ID set, modeling a
 // settled object that must still be reconciled at startup (e.g. to re-confirm a
 // liveness condition after a restart).
@@ -473,6 +484,21 @@ func TestEnqueueUnsettledEnqueuesReturnedIDs(t *testing.T) {
 	assert.Equal(t, []ObjectID{42, 99}, items)
 }
 
+func TestEnqueueDeletionPending(t *testing.T) {
+	r := &reconciler{
+		store:      &deletionPendingIDsStore{ids: []ObjectID{7, 13}},
+		work:       newWorkQueue(),
+		backoffFor: make(map[ObjectID]time.Duration),
+	}
+
+	r.enqueueDeletionPending(context.Background())
+
+	r.work.mu.Lock()
+	items := append([]ObjectID(nil), r.work.items...)
+	r.work.mu.Unlock()
+	assert.Equal(t, []ObjectID{7, 13}, items)
+}
+
 // TestEnqueueUnsettledSkipsInFlight verifies that a resync does not re-enqueue
 // an object whose reconcile is already in progress.
 func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
@@ -743,6 +769,107 @@ func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 	}
 	_, err := tc.reconcile(context.Background(), 1)
 	require.Error(t, err)
+}
+
+// notFoundStore returns ErrNotFound from GetObject, modeling an object that was
+// already collected (by a prior pass, a cascade, or the backstop) between its
+// enqueue and this reconcile.
+type notFoundStore struct {
+	fakeStore
+}
+
+func (s *notFoundStore) Within(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+func (s *notFoundStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
+	return nil, ErrNotFound
+}
+
+func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
+	bh := &Beehive{store: &notFoundStore{}}
+	tc := &typedController[tSpec, tStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: newFakeController(),
+	}
+	// A gone object is a no-op success, not a retryable error: returning the error
+	// would retry the missing id forever on backoff.
+	result, err := tc.reconcile(context.Background(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, Result{}, result, "no requeue for a vanished object")
+}
+
+// notFoundReturningController returns ErrNotFound from its own reconcile logic —
+// e.g. an AddDependency to a target that was deleted. That is a real failure to
+// retry, not the "queued object already gone" no-op.
+type notFoundReturningController struct{}
+
+func (notFoundReturningController) Start(ControllerClient[tStatus]) error { return nil }
+func (notFoundReturningController) Stop(context.Context) error            { return nil }
+func (notFoundReturningController) Reconcile(context.Context, *Object[tSpec, tStatus]) (Result, error) {
+	return Result{}, ErrNotFound
+}
+
+func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
+	ctx := context.Background()
+
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	defer s.Close()
+
+	specJSON, err := json.Marshal(tSpec{})
+	require.NoError(t, err)
+	raw, err := s.CreateObject(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
+	require.NoError(t, err)
+
+	tc := &typedController[tSpec, tStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    &Beehive{store: s},
+		inner: notFoundReturningController{},
+	}
+	// The object exists; only the controller returned ErrNotFound. It must surface
+	// so the worker retries, not be swallowed as a vanished-object no-op.
+	_, err = tc.reconcile(ctx, raw.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// requeueController always asks for a periodic requeue, even while its object is
+// finalizing — the pattern that would re-schedule a just-collected id.
+type requeueController struct{}
+
+func (requeueController) Start(ControllerClient[tStatus]) error { return nil }
+func (requeueController) Stop(context.Context) error            { return nil }
+func (requeueController) Reconcile(context.Context, *Object[tSpec, tStatus]) (Result, error) {
+	return Result{RequeueAfter: time.Minute}, nil
+}
+
+func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
+	ctx := context.Background()
+
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	defer s.Close()
+
+	specJSON, err := json.Marshal(tSpec{})
+	require.NoError(t, err)
+	raw, err := s.CreateObject(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
+	require.NoError(t, err)
+	_, _, err = s.RequestDeletion(ctx, raw.ID)
+	require.NoError(t, err)
+
+	tc := &typedController[tSpec, tStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    &Beehive{store: s},
+		inner: requeueController{},
+	}
+	// GC removes the unfinalized, deletion-pending row; the controller's
+	// RequeueAfter must be dropped so the worker doesn't reschedule a dead id.
+	result, err := tc.reconcile(ctx, raw.ID)
+	require.NoError(t, err)
+	assert.Equal(t, Result{}, result, "requeue dropped because the row was collected")
+
+	_, err = s.GetObject(ctx, raw.ID)
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestTypedControllerReconcile(t *testing.T) {

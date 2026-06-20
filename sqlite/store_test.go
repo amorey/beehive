@@ -324,6 +324,153 @@ func TestDeleteFinalizerMissingObject(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
+func TestListDeletionPendingIDs(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// alive: deletion never requested — must NOT appear.
+	_, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	// pendingA and pendingB: deletion requested — must appear, ordered by id.
+	pendingA, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	pendingB, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, _, err = store.RequestDeletion(ctx, pendingA.ID)
+	require.NoError(t, err)
+	_, _, err = store.RequestDeletion(ctx, pendingB.ID)
+	require.NoError(t, err)
+
+	// A deleting object of another kind must not leak into this kind's listing.
+	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
+	other, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, _, err = store.RequestDeletion(ctx, other.ID)
+	require.NoError(t, err)
+
+	ids, err := store.ListDeletionPendingIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{pendingA.ID, pendingB.ID}, ids)
+}
+
+func TestListReferents(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	from := newRefObject(t, store)
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+
+	require.NoError(t, store.AddRef(ctx, from.ID, a.ID, beehive.RelationOwnedBy))
+	require.NoError(t, store.AddRef(ctx, from.ID, b.ID, beehive.RelationDependsOn))
+	// A second edge to the same target via another relation must not duplicate it.
+	require.NoError(t, store.AddRef(ctx, from.ID, a.ID, beehive.RelationDependsOn))
+
+	refs, err := store.ListReferents(ctx, from.ID)
+	require.NoError(t, err)
+	var ids []beehive.ObjectID
+	for _, r := range refs {
+		ids = append(ids, r.ID)
+	}
+	assert.Equal(t, []beehive.ObjectID{a.ID, b.ID}, ids, "distinct targets, ordered by id")
+
+	// An object that points at nothing has no referents.
+	refs, err = store.ListReferents(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Empty(t, refs)
+}
+
+func TestDeleteFinalizingDependsOnRefs(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	deletingDep := newRefObject(t, store)
+	liveDep := newRefObject(t, store)
+	owned := newRefObject(t, store)
+
+	require.NoError(t, store.AddRef(ctx, deletingDep.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, store.AddRef(ctx, liveDep.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, store.AddRef(ctx, owned.ID, target.ID, beehive.RelationOwnedBy))
+	// A self-dependency the GC must also be able to clear.
+	require.NoError(t, store.AddRef(ctx, target.ID, target.ID, beehive.RelationDependsOn))
+
+	// The target and the finalizing dependent and the owned child are deleting;
+	// the live dependent is not.
+	for _, id := range []beehive.ObjectID{target.ID, deletingDep.ID, owned.ID} {
+		_, _, err := store.RequestDeletion(ctx, id)
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, store.DeleteFinalizingDependsOnRefs(ctx, target.ID))
+
+	// depends_on edges from finalizing sources (including the self-edge) are gone.
+	assert.Equal(t, 0, countRefs(t, store, deletingDep.ID, target.ID, "depends_on"))
+	assert.Equal(t, 0, countRefs(t, store, target.ID, target.ID, "depends_on"))
+	// A live dependent's edge is preserved — it still legitimately blocks deletion.
+	assert.Equal(t, 1, countRefs(t, store, liveDep.ID, target.ID, "depends_on"))
+	// owned_by is never touched here; it clears only when the child is removed.
+	assert.Equal(t, 1, countRefs(t, store, owned.ID, target.ID, "owned_by"))
+}
+
+func TestHasReferrers(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	child := newRefObject(t, store)
+
+	has, err := store.HasReferrers(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.False(t, has, "no edges yet")
+
+	require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, beehive.RelationOwnedBy))
+
+	has, err = store.HasReferrers(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.True(t, has, "owner is referenced by the child")
+
+	has, err = store.HasReferrers(ctx, child.ID)
+	require.NoError(t, err)
+	assert.False(t, has, "child is the source, not a target")
+}
+
+func TestHasReferrersIgnoresFinalizingDependent(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newRefObject(t, store)
+	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, beehive.RelationDependsOn))
+
+	// A live dependent has a claim: it counts.
+	has, err := store.HasReferrers(ctx, target.ID)
+	require.NoError(t, err)
+	assert.True(t, has)
+
+	// Once the dependent is itself finalizing, its claim is void — it's going away.
+	_, _, err = store.RequestDeletion(ctx, dep.ID)
+	require.NoError(t, err)
+	has, err = store.HasReferrers(ctx, target.ID)
+	require.NoError(t, err)
+	assert.False(t, has, "a finalizing dependent does not count as a referrer")
+
+	// But a finalizing owned child still counts: the foreground cascade must wait
+	// for it to be physically removed.
+	child := newRefObject(t, store)
+	require.NoError(t, store.AddRef(ctx, child.ID, target.ID, beehive.RelationOwnedBy))
+	_, _, err = store.RequestDeletion(ctx, child.ID)
+	require.NoError(t, err)
+	has, err = store.HasReferrers(ctx, target.ID)
+	require.NoError(t, err)
+	assert.True(t, has, "a finalizing owned child still blocks deletion")
+}
+
 func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

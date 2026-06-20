@@ -66,6 +66,9 @@ func (s *fakeStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
+func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
 func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }
@@ -95,6 +98,15 @@ func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) err
 }
 func (s *fakeStore) ListReferrers(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
 	return nil, nil
+}
+func (s *fakeStore) ListReferents(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+	return nil, nil
+}
+func (s *fakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {
+	return nil
+}
+func (s *fakeStore) HasReferrers(context.Context, ObjectID) (bool, error) {
+	return false, nil
 }
 
 // Watch/WatchList default to a noopWatcher (never fires, no-op Close) rather
