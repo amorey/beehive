@@ -126,6 +126,49 @@ func TestReconcilerRequeuesOnError(t *testing.T) {
 	waitClosed(t, done, "run to exit")
 }
 
+// TestReconcilerClearsBackoffOnSuccess verifies the per-id backoff entry created
+// by a failing reconcile is removed once the object reconciles successfully —
+// including the gone-object case, where reconcile returns nil for a missing row.
+// This keeps backoffFor bounded by the set of currently-failing objects rather
+// than leaking an entry per object that ever failed.
+func TestReconcilerClearsBackoffOnSuccess(t *testing.T) {
+	calls := 0
+	succeeded := make(chan struct{})
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) (Result, error) {
+			calls++
+			if calls == 1 {
+				return Result{}, errors.New("transient") // creates a backoff entry
+			}
+			// Object is now gone: reconcile reports success (mirrors the
+			// ErrNotFound -> nil path), which must clear the backoff entry.
+			close(succeeded)
+			return Result{}, nil
+		},
+	}
+
+	r := &reconciler{
+		adapter:           adapter,
+		work:              newWorkQueue(),
+		resyncInterval:    0,
+		maxRetryInterval:  time.Second,
+		baseRetryInterval: 5 * time.Millisecond,
+		backoffFor:        make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(1)
+	waitClosed(t, succeeded, "retry reconcile to succeed")
+	cancel()
+	waitClosed(t, done, "run to exit") // worker's clearBackoff has run by now
+
+	r.backoffMu.Lock()
+	remaining := len(r.backoffFor)
+	r.backoffMu.Unlock()
+	assert.Equal(t, 0, remaining, "backoff entry must be cleared after a successful reconcile")
+}
+
 func TestReconcilerRequeueAfter(t *testing.T) {
 	calls := 0
 	doneCh := make(chan struct{})

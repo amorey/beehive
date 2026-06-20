@@ -3,12 +3,12 @@ module github.com/amorey/beehive
 go 1.26.4
 
 require (
+	github.com/amorey/gochan v0.1.0
 	github.com/stretchr/testify v1.11.1
 	modernc.org/sqlite v1.52.0
 )
 
 require (
-	github.com/amorey/gochan v0.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect

@@ -152,6 +152,13 @@ type Store interface {
 	// spec change to wake it.
 	ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
+	// ListAllDeletionPendingIDs is ListDeletionPendingIDs across every kind. The
+	// global GC sweeper uses it to collect deletion-pending objects of kinds with
+	// no registered controller (client-only kinds), which the per-controller
+	// backstop never reaches and which could otherwise strand and RESTRICT-block
+	// an owner's delete forever.
+	ListAllDeletionPendingIDs(ctx context.Context) ([]ObjectID, error)
+
 	// ListIDs returns the IDs of every object of kind gk, ordered by id. The
 	// reconciler uses it to enqueue a full reconcile pass at startup, so
 	// process-scoped state (e.g. liveness conditions) is re-confirmed even on

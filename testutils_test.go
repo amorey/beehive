@@ -69,6 +69,9 @@ func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, er
 func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
+func (s *fakeStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
+	return nil, nil
+}
 func (s *fakeStore) UpdateSpec(context.Context, ObjectID, []byte) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }

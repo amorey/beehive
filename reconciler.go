@@ -239,7 +239,14 @@ func (r *reconciler) run(ctx context.Context) {
 			r.runWorker(ctx)
 		})
 	}
-	defer wg.Wait()
+	// Drain the workers, then cancel any retry/RequeueAfter timers they left
+	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue.
+	defer func() {
+		wg.Wait()
+		if r.work != nil {
+			r.work.stop()
+		}
+	}()
 
 	// time.NewTicker panics on a non-positive interval, so guard it: a disabled
 	// resync means no ticker channel to select on.

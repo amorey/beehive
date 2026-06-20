@@ -286,6 +286,17 @@ func (s *sqliteStore) ListDeletionPendingIDs(ctx context.Context, gk storeapi.Gr
 	return scanIDs(rows)
 }
 
+func (s *sqliteStore) ListAllDeletionPendingIDs(ctx context.Context) ([]storeapi.ObjectID, error) {
+	// Kind-agnostic: same partial index as ListDeletionPendingIDs, no group/kind
+	// filter, so the global GC sweeper sees every finalizing object.
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	return scanIDs(rows)
+}
+
 func (s *sqliteStore) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,

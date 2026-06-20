@@ -464,6 +464,50 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+// TestIntegrationGCSweepsClientOnlyKind verifies the global GC sweeper collects
+// a deletion-pending object whose kind has no registered controller. The owner
+// kind has a controller; the child kind is client-only. Deleting the owner
+// cascades to the child, but only the global sweeper can collect that child —
+// without it the child strands and its owned_by edge RESTRICT-blocks the owner
+// forever.
+func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(5*time.Millisecond))
+	require.NoError(t, err)
+
+	// Only the owner kind has a controller; the child kind is client-only.
+	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	require.NoError(t, bh.Start())
+	defer bh.Stop(ctx)
+
+	owners := NewClient[cSpec, cStatus](bh, clientTestGK)
+	childGK := GroupKind{Group: "", Kind: "ClientOnlyChild"}
+	children := NewClient[cSpec, cStatus](bh, childGK)
+
+	owner, err := owners.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	child, err := children.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	// The client rejects watches on unregistered kinds, so watch only the owner.
+	// Its deletion is itself proof the sweeper collected the child: the owner
+	// can't be physically deleted until the child's owned_by edge is gone, and
+	// only the sweeper can collect that client-only child.
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wOwner, err := owners.WatchList(wctx)
+	require.NoError(t, err)
+
+	require.NoError(t, owners.Delete(ctx, owner.ID))
+	waitForDeletions(t, wOwner, owner.ID)
+
+	_, err = owners.Get(ctx, owner.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = children.Get(ctx, child.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

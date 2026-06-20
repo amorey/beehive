@@ -122,6 +122,30 @@ func TestWorkQueueAddAfter(t *testing.T) {
 	assert.Equal(t, ObjectID(1), id)
 }
 
+// TestWorkQueueStopCancelsPendingTimers verifies stop cancels timers scheduled
+// by addAfter so they never fire on a dead queue, and that adds after stop are
+// no-ops — so a stopped reconciler fully quiesces instead of leaking timers that
+// keep calling add (up to a RequeueAfter that could be hours out).
+func TestWorkQueueStopCancelsPendingTimers(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour) // would fire long after the queue is dead
+	q.stop()
+
+	select {
+	case <-q.ready:
+		t.Fatal("ready signaled after stop; timer was not cancelled")
+	default:
+	}
+	_, ok := q.get()
+	assert.False(t, ok, "no item should be queued after stop cancels the timer")
+
+	// Adds after stop must not enqueue.
+	q.add(2)
+	q.addAfter(3, 0)
+	_, ok = q.get()
+	assert.False(t, ok, "add/addAfter after stop must not enqueue")
+}
+
 func TestWorkQueueAddAfterZeroDelay(t *testing.T) {
 	q := newWorkQueue()
 	q.addAfter(1, 0)

@@ -105,8 +105,56 @@ func (bh *Beehive) Start() error {
 		})
 	}
 
+	// The global GC sweeper collects deletion-pending objects of client-only
+	// kinds, which no per-controller backstop reaches. Counted in wg so Stop
+	// drains it.
+	bh.wg.Go(func() {
+		bh.runGCSweeper(runCtx)
+	})
+
 	bh.state = beehiveRunning
 	return nil
+}
+
+// runGCSweeper is the global garbage-collection backstop. The per-controller
+// reconcile loop runs collect for its own kind; this sweeps every kind, so a
+// deletion-pending object of a client-only kind (no registered controller) is
+// still collected — otherwise it would strand and RESTRICT-block its owner's
+// delete forever. It sweeps once at startup and then on the resync cadence; a
+// disabled resync leaves only the startup pass, matching the per-controller
+// backstop.
+func (bh *Beehive) runGCSweeper(ctx context.Context) {
+	bh.sweepDeletionPending(ctx)
+	if bh.resyncInterval <= 0 {
+		<-ctx.Done()
+		return
+	}
+	ticker := time.NewTicker(bh.resyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			bh.sweepDeletionPending(ctx)
+		}
+	}
+}
+
+// sweepDeletionPending collects every deletion-pending object. collect is a
+// no-op while an object still holds finalizers or live referrers, and idempotent
+// if another path already collected it, so re-sweeping the registered kinds that
+// their own controllers handle is harmless.
+func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
+	ids, err := bh.store.ListAllDeletionPendingIDs(ctx)
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		// Best-effort: a benign ErrNotFound (already collected) or a transient
+		// error is retried on the next sweep.
+		_, _ = bh.collect(ctx, id)
+	}
 }
 
 // runDependencyWaker requeues dependents when a target is modified, until ctx is

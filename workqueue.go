@@ -22,7 +22,9 @@ type workQueue struct {
 	dirty      map[ObjectID]struct{} // queued (in items) and awaiting dispatch
 	processing map[ObjectID]struct{} // handed out via get, not yet done
 	items      []ObjectID
-	ready      chan struct{} // pulsed when items are available
+	ready      chan struct{}            // pulsed when items are available
+	stopped    bool                     // set by stop; adds become no-ops
+	timers     map[*time.Timer]struct{} // live addAfter timers, cancelled by stop
 }
 
 func newWorkQueue() *workQueue {
@@ -30,6 +32,7 @@ func newWorkQueue() *workQueue {
 		dirty:      make(map[ObjectID]struct{}),
 		processing: make(map[ObjectID]struct{}),
 		ready:      make(chan struct{}, 1),
+		timers:     make(map[*time.Timer]struct{}),
 	}
 }
 
@@ -43,6 +46,9 @@ func (q *workQueue) add(id ObjectID) {
 }
 
 func (q *workQueue) addLocked(id ObjectID) {
+	if q.stopped {
+		return
+	}
 	if _, ok := q.dirty[id]; ok {
 		return
 	}
@@ -63,13 +69,40 @@ func (q *workQueue) signal() {
 }
 
 // addAfter enqueues id after delay has elapsed. A zero or negative delay
-// enqueues immediately.
+// enqueues immediately. The timer is tracked so stop can cancel it, keeping a
+// torn-down queue from being woken by a retry (or a far-future RequeueAfter)
+// scheduled just before shutdown.
 func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	if delay <= 0 {
 		q.add(id)
 		return
 	}
-	time.AfterFunc(delay, func() { q.add(id) })
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stopped {
+		return
+	}
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
+		q.mu.Lock()
+		delete(q.timers, t) // fired: drop it so the set doesn't grow unbounded
+		q.mu.Unlock()
+		q.add(id) // a no-op if stop ran between firing and here
+	})
+	q.timers[t] = struct{}{}
+}
+
+// stop quiesces the queue: it cancels every pending addAfter timer and makes all
+// further adds no-ops, so no goroutine wakes the queue after the reconcile loop
+// has drained. Idempotent.
+func (q *workQueue) stop() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.stopped = true
+	for t := range q.timers {
+		t.Stop()
+	}
+	q.timers = nil
 }
 
 // get removes and returns the next item, moving it into the processing state
