@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -332,14 +333,31 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, id storeapi.ObjectID, ob
 		return nil, err
 	}
 	now := toMillis(time.Now().UTC())
+	// The generation >= ? guard rejects a future observedGeneration in the same
+	// statement that writes: a controller can only have observed a generation
+	// that exists, and recording a future one would falsely settle the object
+	// once its spec caught up. An older value is fine — that's the normal case
+	// where the spec changed mid-reconcile, leaving the object unsettled.
 	row := c.QueryRowContext(ctx, `
 		UPDATE objects
 		SET status = ?, observed_generation = ?, observed_at = ?,
 		    resource_version = ?, updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND generation >= ?
 		RETURNING `+objectColumns,
-		status, observedGeneration, now, rv, now, id)
-	return s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+		status, observedGeneration, now, rv, now, id, observedGeneration)
+	obj, err := s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+	if errors.Is(err, storeapi.ErrNotFound) {
+		// No row matched: the object is gone, or the guard rejected a future
+		// generation. Re-read to return a precise error instead of a misleading
+		// ErrNotFound for the handshake violation.
+		cur, gerr := s.GetObject(ctx, id)
+		if gerr != nil {
+			return nil, gerr // genuinely gone (ErrNotFound) or a read error
+		}
+		return nil, fmt.Errorf("%w: reported %d, current is %d (object %d)",
+			storeapi.ErrObservedGenerationFuture, observedGeneration, cur.Generation, id)
+	}
+	return obj, err
 }
 
 // conditionColumns is the canonical select list for a condition row; scanCondition

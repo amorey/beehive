@@ -19,6 +19,11 @@ type RawObject = storeapi.RawObject
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
+// ErrObservedGenerationFuture is returned by UpdateStatus when the caller reports
+// a generation greater than the object's current one — a convergence-handshake
+// violation (a controller must pass the generation it received in Reconcile).
+var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
+
 // Referrer is an object pointing at a target through a ref edge, with the
 // GroupKind needed to route a requeue.
 type Referrer = storeapi.Referrer

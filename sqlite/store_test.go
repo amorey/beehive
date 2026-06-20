@@ -164,6 +164,48 @@ func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
 	assert.JSONEq(t, `{"msg":"hi"}`, string(updated.Status))
 }
 
+func TestUpdateStatusRejectsFutureGeneration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	// created.Generation is 1; reporting generation 5 is impossible to have seen.
+	_, err = store.UpdateStatus(ctx, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`))
+	require.ErrorIs(t, err, beehive.ErrObservedGenerationFuture)
+
+	// The rejected write must not have landed.
+	reread, err := store.GetObject(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reread.ObservedGeneration, "rejected status write must not record observed generation")
+	assert.Empty(t, reread.Status, "rejected status write must not store status")
+}
+
+func TestUpdateStatusAcceptsStaleGeneration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	bumped, err := store.UpdateSpec(ctx, created.ID, []byte(`{"x":1}`))
+	require.NoError(t, err)
+	require.EqualValues(t, 2, bumped.Generation)
+
+	// Controller reports it reconciled the now-stale generation 1.
+	updated, err := store.UpdateStatus(ctx, created.ID, created.Generation, []byte(`{}`))
+	require.NoError(t, err)
+	require.NotNil(t, updated.ObservedGeneration)
+	assert.EqualValues(t, created.Generation, *updated.ObservedGeneration)
+	assert.Less(t, *updated.ObservedGeneration, updated.Generation,
+		"stale observed generation must leave the object unsettled")
+}
+
 func TestListObjects(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

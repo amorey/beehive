@@ -23,6 +23,13 @@ type ObjectID = int64
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = errors.New("beehive: object not found")
 
+// ErrObservedGenerationFuture is returned by UpdateStatus when the caller passes
+// an observedGeneration greater than the object's current generation. It signals
+// a broken convergence handshake: a controller can only report a generation it
+// actually observed in Reconcile, so a future value would falsely mark the object
+// settled once its spec later reached that generation.
+var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
+
 // WatchEventType classifies a watch event.
 type WatchEventType string
 
