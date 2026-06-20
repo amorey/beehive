@@ -141,6 +141,16 @@ func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
 	if bh.resyncInterval > 0 {
 		return // the GC sweeper's resync tick is this kind's backstop
 	}
+	// This runs on the caller's ctx, so a Delete (or freed-target wake) whose
+	// caller cancels right after committing RequestDeletion can abandon the collect
+	// mid-flight. With resync disabled this Beehive has no periodic sweeper left to
+	// retry, and Start is one-shot (a stopped Beehive cannot be restarted), so this
+	// instance will not collect the row again. Recovery happens only when the
+	// application constructs and starts a *fresh* Beehive over the same store, whose
+	// unconditional startup GC sweep (runGCSweeper -> sweepDeletionPending) collects
+	// every deletion-pending object of every kind, client-only included. Until then
+	// the row stays deletion-pending — in a long-running process that declines to
+	// detach the caller's cancellation, that strand persists for the process's life.
 	if _, err := bh.collect(ctx, id); err != nil {
 		bh.log().Warn("gc: synchronous collect of client-only object failed; no resync backstop",
 			"group", gk.Group, "kind", gk.Kind, "id", id, "err", err)
