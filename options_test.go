@@ -29,6 +29,14 @@ func TestWithMaxRetryIntervalDispatch(t *testing.T) {
 
 	// Only reconcilers carry a max retry interval; on a Beehive it's a no-op.
 	require.NoError(t, WithMaxRetryInterval(9*time.Second)(&Beehive{}))
+
+	// A non-positive cap is ignored so it can't busy-loop the reconciler; the
+	// existing value (here the default) is left untouched.
+	r = &reconciler{maxRetryInterval: defaultMaxRetryInterval}
+	require.NoError(t, WithMaxRetryInterval(0)(r))
+	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
+	require.NoError(t, WithMaxRetryInterval(-1*time.Second)(r))
+	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
 }
 
 func TestWithConcurrencyDispatch(t *testing.T) {

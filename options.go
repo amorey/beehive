@@ -139,9 +139,14 @@ func WithLogLevel(level slog.Level) Option {
 	}
 }
 
+// WithMaxRetryInterval caps the exponential backoff between failed reconciles
+// for a controller (the default is defaultMaxRetryInterval). A value <= 0 is
+// ignored, keeping the default: a zero or negative cap would clamp every retry
+// delay to it and busy-loop the reconciler the instant it keeps returning an
+// error, which is never what a caller wants.
 func WithMaxRetryInterval(d time.Duration) Option {
 	return func(target any) error {
-		if t, ok := target.(*reconciler); ok {
+		if t, ok := target.(*reconciler); ok && d > 0 {
 			t.maxRetryInterval = d
 		}
 		return nil
