@@ -238,6 +238,37 @@ func TestClientDelete(t *testing.T) {
 	assert.NotNil(t, got.DeletionRequestedAt)
 }
 
+// TestClientIDOpsScopedToKind verifies that ID-based operations on a Client are
+// confined to that client's kind: an id naming an object of another kind is
+// invisible (Get/Update/Delete all report ErrNotFound) and the foreign object is
+// left untouched, never updated or marked for deletion through the wrong client.
+func TestClientIDOpsScopedToKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
+	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
+
+	w, err := widgets.Create(ctx, cSpec{Val: "v1"})
+	require.NoError(t, err)
+
+	// The Gadget client must not see or mutate the Widget by its id.
+	_, err = gadgets.Get(ctx, w.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = gadgets.Update(ctx, w.ID, cSpec{Val: "hijacked"})
+	require.ErrorIs(t, err, ErrNotFound)
+	err = gadgets.Delete(ctx, w.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	// The Widget is unchanged: original spec, no deletion request.
+	got, err := widgets.Get(ctx, w.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "v1", got.Spec.Val)
+	assert.Equal(t, int64(1), got.Generation)
+	assert.Nil(t, got.DeletionRequestedAt)
+}
+
 // createBadJSONStore returns bad JSON from CreateObject so rawToTyped fails.
 type createBadJSONStore struct {
 	fakeStore
@@ -261,6 +292,12 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
+// GetObject satisfies the client's pre-write kind check (scopedGet) with a row of
+// the test's "Widget" kind, so the update reaches UpdateSpec.
+func (s *updateBadJSONStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	return &RawObject{ID: id, Kind: "Widget"}, nil
+}
+
 func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ ObjectID, _ []byte) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
@@ -268,6 +305,11 @@ func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ ObjectID, _ []byte)
 // errorUpdateSpecStore returns an error from UpdateSpec.
 type errorUpdateSpecStore struct {
 	fakeStore
+}
+
+// GetObject lets scopedGet's kind check pass so the update reaches UpdateSpec.
+func (s *errorUpdateSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	return &RawObject{ID: id, Kind: "Widget"}, nil
 }
 
 func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ ObjectID, _ []byte) (*RawObject, error) {

@@ -89,7 +89,16 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	if err != nil {
 		return nil, err
 	}
-	raw, err := c.bh.store.UpdateSpec(ctx, id, b)
+	var raw *RawObject
+	// Within keeps the kind check and the write atomic so a concurrent delete +
+	// recreate-as-another-kind can't slip between them.
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		if _, err := c.scopedGet(ctx, id); err != nil {
+			return err
+		}
+		raw, err = c.bh.store.UpdateSpec(ctx, id, b)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -102,11 +111,27 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 }
 
 func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error) {
-	raw, err := c.bh.store.GetObject(ctx, id)
+	raw, err := c.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	return rawToTyped[Spec, Status](raw)
+}
+
+// scopedGet loads id and confirms it belongs to this client's kind. A Client is
+// the surface for a single resource kind, so an id naming an object of another
+// kind must be invisible here — reads, updates, and deletes through this client
+// must never touch another controller's rows. The store's id-keyed methods don't
+// enforce that, so the client does, reporting ErrNotFound for a foreign id.
+func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
+	raw, err := c.bh.store.GetObject(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+		return nil, ErrNotFound
+	}
+	return raw, nil
 }
 
 func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string) (*Object[Spec, Status], error) {
@@ -136,8 +161,16 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, St
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
 	// RequestDeletion emits the Modified event itself, and only on a real state
 	// change — an idempotent retry carries the same resource_version, so emitting
-	// would show watchers a spurious diff.
-	if _, _, err := c.bh.store.RequestDeletion(ctx, id); err != nil {
+	// would show watchers a spurious diff. The kind check and the request share a
+	// transaction so a foreign id can't be deleted through this client.
+	err := c.bh.store.Within(ctx, func(ctx context.Context) error {
+		if _, err := c.scopedGet(ctx, id); err != nil {
+			return err
+		}
+		_, _, err := c.bh.store.RequestDeletion(ctx, id)
+		return err
+	})
+	if err != nil {
 		return err
 	}
 	// Always enqueue: a retry or post-crash Delete must still hand the
