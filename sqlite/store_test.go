@@ -144,6 +144,39 @@ func TestUpdateSpecBumpsGeneration(t *testing.T) {
 	assert.JSONEq(t, `{"v":2}`, string(updated.Spec))
 }
 
+// TestUpdateSpecIdenticalSpecIsNoOp verifies that re-writing the same spec bytes
+// doesn't bump generation or resource_version: an idempotent update must not
+// falsely unsettle a converged object or churn the watch cursor.
+func TestUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"v":1}`),
+	})
+	require.NoError(t, err)
+
+	// Settle the object so observed_generation == generation; an idempotent
+	// update must leave it settled.
+	settled, err := store.UpdateStatus(ctx, created.ID, created.Generation, []byte(`{}`))
+	require.NoError(t, err)
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+
+	again, err := store.UpdateSpec(ctx, created.ID, []byte(`{"v":1}`))
+	require.NoError(t, err)
+
+	assert.EqualValues(t, created.Generation, again.Generation, "identical spec must not bump generation")
+	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "identical spec must not bump resource_version")
+	require.NotNil(t, again.ObservedGeneration)
+	assert.EqualValues(t, again.Generation, *again.ObservedGeneration, "object stays settled after a no-op update")
+	// No watcher churn: an idempotent update emits no Modified event.
+	assertNoEvent(t, w, 100*time.Millisecond)
+}
+
 func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

@@ -166,7 +166,9 @@ type Store interface {
 	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
-	// change) and ResourceVersion.
+	// change) and ResourceVersion. Writing spec bytes identical to the stored
+	// ones is an idempotent no-op: no Generation/ResourceVersion bump and no
+	// event, so a converged object isn't falsely unsettled.
 	UpdateSpec(ctx context.Context, id ObjectID, spec []byte) (*RawObject, error)
 
 	// UpdateStatus replaces an object's status and records the generation the

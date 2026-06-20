@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -322,19 +323,38 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 }
 
 func (s *sqliteStore) UpdateSpec(ctx context.Context, id storeapi.ObjectID, spec []byte) (*storeapi.RawObject, error) {
-	c := s.conn(ctx)
-	rv, err := nextResourceVersion(ctx, c)
-	if err != nil {
-		return nil, err
-	}
-	// A real spec change bumps generation so the convergence handshake notices.
-	row := c.QueryRowContext(ctx, `
-		UPDATE objects
-		SET spec = ?, generation = generation + 1, resource_version = ?, updated_at = ?
-		WHERE id = ?
-		RETURNING `+objectColumns,
-		spec, rv, toMillis(time.Now().UTC()), id)
-	return s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
+	// between the no-op check and the update.
+	var result *storeapi.RawObject
+	err := s.Within(ctx, func(ctx context.Context) error {
+		c := s.conn(ctx)
+		obj, err := s.getObjectRow(ctx, id)
+		if err != nil {
+			return err
+		}
+		// Identical spec: nothing changed, so don't bump generation/resource_version
+		// or emit — bumping generation would falsely unsettle a converged object and
+		// trigger a needless reconcile, and the event would show watchers a spurious
+		// diff (mirrors RequestDeletion's idempotent no-op).
+		if bytes.Equal(obj.Spec, spec) {
+			result, err = s.attachConditions(ctx, obj)
+			return err
+		}
+		rv, err := nextResourceVersion(ctx, c)
+		if err != nil {
+			return err
+		}
+		// A real spec change bumps generation so the convergence handshake notices.
+		row := c.QueryRowContext(ctx, `
+			UPDATE objects
+			SET spec = ?, generation = generation + 1, resource_version = ?, updated_at = ?
+			WHERE id = ?
+			RETURNING `+objectColumns,
+			spec, rv, toMillis(time.Now().UTC()), id)
+		result, err = s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+		return err
+	})
+	return result, err
 }
 
 func (s *sqliteStore) UpdateStatus(ctx context.Context, id storeapi.ObjectID, observedGeneration int64, status []byte) (*storeapi.RawObject, error) {
