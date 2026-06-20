@@ -395,6 +395,45 @@ func TestWatchSnapshotSendCtxDone(t *testing.T) {
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
 }
 
+// TestWatchRecoversFromLag verifies that when a watcher's receiver falls behind
+// the broadcast ring and drops events, the watcher does NOT terminate. It
+// re-lists current state and re-emits it as Modified so consumers (and the
+// dependency waker, which acts only on Modified) re-converge instead of silently
+// losing the stream.
+//
+// The goroutine parks delivering its snapshot Added (no reader), which keeps it
+// out of the receive loop while we overflow the ring; draining the snapshot then
+// drops it into RecvContext, where it sees ErrLagged.
+func TestWatchRecoversFromLag(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	obj, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, err := store.Watch(ctx, testGK, obj.ID)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Burst > ring capacity of events for an unrelated id; filterID drops them,
+	// so they serve only to lag the receiver while the goroutine is parked.
+	filler := &beehive.RawObject{ID: 999999, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1}
+	for range hubBufferSize + 50 {
+		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified, Object: filler})
+	}
+
+	// Draining the snapshot Added lets the goroutine enter the receive loop and
+	// hit ErrLagged.
+	first := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventAdded, first.Type)
+	assert.Equal(t, obj.ID, first.Object.ID)
+
+	// Recovery: current state re-emitted as Modified, channel still open.
+	rec := recvEvent(t, w)
+	assert.Equal(t, beehive.WatchEventModified, rec.Type)
+	assert.Equal(t, obj.ID, rec.Object.ID)
+}
+
 // TestWatchLiveSendCtxDone covers the live-send path exiting on context
 // cancellation. beforeSnapshot buffers a live event (RecvContext prefers a
 // ready value over a cancelled context), so with an empty snapshot the goroutine

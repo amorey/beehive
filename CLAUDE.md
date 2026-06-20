@@ -37,3 +37,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Event-driven, never sleep-paced.** Synchronize on channels (or `ctx.Done()`) that the code/fakes signal; the only use of `time` is a generous failsafe timeout in a `select` that turns a hang into a failure. No `time.Sleep` to "wait for" a goroutine and no polling loops.
 - **Comments are short, idiomatic, and human-centered.** Explain *why* and call out non-obvious invariants (e.g. why `Start` takes no context, why a guard exists); don't restate what the code plainly says. Match the density already in `beehive.go`/`reconciler.go`.
 - **Stubs are explicit.** Unimplemented methods `panic("not implemented: <name>")`; unimplemented options return `nil` and are marked `(stub: not yet wired up)`.
+
+## Known improvements
+
+- **Filter options for `ListObjects()`.** Several call sites list a whole kind and then filter in Go — e.g. the lag-recovery `relist` in `sqlite/watch.go` (single-object watches already special-case this with a `GetObject`, but other paths don't). Adding filter options to `ListObjects()` (by id set, by deletion-pending, by unsettled, etc.) would push the predicate into SQL: faster (less scanned/marshaled) and more readable (no post-list filtering loops). It would also let related queries like `ListUnsettledIDs`/`ListDeletionPendingIDs` collapse into one filtered list path.

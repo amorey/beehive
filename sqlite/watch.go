@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gochan"
 	"github.com/amorey/gochan/broadcast"
 )
 
@@ -186,6 +187,40 @@ func (s *sqliteStore) watch(
 				return false
 			}
 		}
+		// relist re-emits current state as Modified after the receiver drops
+		// events (ErrLagged). A single-object watch re-fetches just that row; a
+		// list/events watch re-lists the whole kind. It re-reads the store directly
+		// rather than reusing loadSnapshot, because WatchEvents loads an empty
+		// startup snapshot yet still needs the full current set here to re-converge
+		// its consumer (the dependency waker, which acts only on Modified).
+		// snapshotRV is advanced so the buffered events the lag left behind are
+		// deduped as we drain them. Returns false if a send is abandoned (ctx
+		// cancelled / store closed).
+		relist := func() bool {
+			var objs []*storeapi.RawObject
+			if filterID != nil {
+				raw, err := s.GetObject(wctx, *filterID)
+				if errors.Is(err, storeapi.ErrNotFound) {
+					return true // gone during the gap: nothing to re-emit
+				}
+				if err != nil {
+					return false
+				}
+				objs = []*storeapi.RawObject{raw}
+			} else {
+				var err error
+				if objs, err = s.ListObjects(wctx, gk); err != nil {
+					return false
+				}
+			}
+			for _, raw := range objs {
+				snapshotRV[raw.ID] = raw.ResourceVersion
+				if !send(storeapi.RawWatchEvent{Type: storeapi.WatchEventModified, Object: raw}) {
+					return false
+				}
+			}
+			return true
+		}
 		// Emit the snapshot as Added events before streaming live events.
 		for _, raw := range snapshot {
 			if !send(storeapi.RawWatchEvent{Type: storeapi.WatchEventAdded, Object: raw}) {
@@ -195,6 +230,17 @@ func (s *sqliteStore) watch(
 		for {
 			ev, err := rx.RecvContext(wctx)
 			if err != nil {
+				// ErrLagged is non-terminal: the receiver fell behind the ring and
+				// dropped events but stays usable. Re-list so consumers don't
+				// silently lose those changes, then keep streaming. A delete that
+				// happened during the gap is not replayed here; the resync backstop
+				// reconciles those.
+				if _, ok := errors.AsType[gochan.ErrLagged](err); ok {
+					if !relist() {
+						return
+					}
+					continue
+				}
 				return // ctx cancelled, watcher closed, or hub closed
 			}
 			if ev.Object.ResourceVersion <= snapshotRV[ev.Object.ID] {
