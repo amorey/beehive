@@ -37,8 +37,7 @@ type ControllerClient[Status any] interface {
 }
 
 // controllerClientImpl is the status-writing surface handed to a controller's
-// Start. Its methods are only reached from within a Reconcile call, so they
-// remain stubbed until the reconcile + Store-write slice lands.
+// Start. Its methods are only reached from within a Reconcile call.
 type controllerClientImpl[Status any] struct {
 	bh *Beehive
 	gk GroupKind

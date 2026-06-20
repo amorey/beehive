@@ -85,13 +85,12 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // carries a tx) joins the outer transaction rather than opening a new one.
 //
 // Read-modify-write atomicity rests on the DSN's _txlock=immediate: BeginTx
-// issues BEGIN IMMEDIATE, so the transaction holds the sole WAL write lock from
-// BEGIN through Commit — before its first read. No other writer can commit in
+// issues BEGIN IMMEDIATE, so a transaction holds the sole WAL write lock from
+// BEGIN through Commit, before its first read. No other writer can commit in
 // between, so a compare-then-write (UpdateSpec's no-op suppression, SetCondition,
-// DeleteFinalizer, …) can't act on a stale snapshot. This holds independently of
-// pool size, so it survives a writer pool wider than one connection — but only
-// for compound writes routed through Within; a read then a separate write on the
-// bare pool would not be atomic. Keep multi-statement mutations inside Within.
+// DeleteFinalizer, …) can't act on a stale snapshot, independent of pool size.
+// This only covers compound writes routed through Within; a read then a separate
+// write on the bare pool is not atomic, so keep multi-statement mutations here.
 //
 // Watch events that mutators emit during the transaction are buffered in a
 // tx-scoped collector and published only after Commit — and as the very last
@@ -142,10 +141,9 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 }
 
 // scanAndEmit scans a mutator's RETURNING row, assembles its conditions, and on
-// success emits a watch event of typ for the written object. Every mutator that
-// returns the freshly written row shares it, so a returned object — and the watch
-// event — is fully assembled (conditions included) regardless of which column the
-// write touched, matching Get/List.
+// success emits a watch event of typ for the written object. Mutators share it,
+// so both the returned object and its watch event carry the full conditions set
+// regardless of which column the write touched, matching Get/List.
 func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.WatchEventType, sc scanner) (*storeapi.RawObject, error) {
 	obj, err := scanObject(sc)
 	if err != nil {
@@ -342,9 +340,9 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, id storeapi.ObjectID, spec
 			return err
 		}
 		// Identical spec: nothing changed, so don't bump generation/resource_version
-		// or emit — bumping generation would falsely unsettle a converged object and
-		// trigger a needless reconcile, and the event would show watchers a spurious
-		// diff (mirrors RequestDeletion's idempotent no-op).
+		// or emit. A bump would falsely unsettle a converged object and trigger a
+		// needless reconcile, and the event would show watchers a spurious diff
+		// (mirrors RequestDeletion's idempotent no-op).
 		if bytes.Equal(obj.Spec, spec) {
 			result, err = s.attachConditions(ctx, obj)
 			return err

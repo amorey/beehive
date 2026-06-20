@@ -120,10 +120,10 @@ func WithLogger(l *slog.Logger) Option {
 }
 
 // WithLogLevel sets the minimum level beehive emits, layered on top of whatever
-// the logger's own handler already filters. It is a convenience so callers can
-// quiet beehive down without building a leveled handler; pass a very high level
-// to silence it while keeping the logger wired up. Has no effect without
-// WithLogger (the discard logger emits nothing regardless).
+// the logger's own handler already filters. It lets callers quiet beehive down
+// without building a leveled handler; pass a very high level to silence it while
+// keeping the logger wired up. Has no effect without WithLogger (the discard
+// logger emits nothing regardless).
 //
 // Passed to New it applies to the control plane and is the default for all
 // controllers; passed to Register it overrides that default for one controller.

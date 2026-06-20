@@ -14,9 +14,6 @@ import (
 // reconcile the same object concurrently. An add that arrives while the ID is
 // processing is remembered (dirty) and re-queued by done, so no wakeup is lost.
 // This is the standard Kubernetes work-queue discipline.
-//
-// get re-signals ready if more items remain, so callers naturally drain the
-// queue without a separate loop.
 type workQueue struct {
 	mu         sync.Mutex
 	dirty      map[ObjectID]struct{} // queued (in items) and awaiting dispatch
