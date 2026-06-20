@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
@@ -14,9 +13,10 @@ import (
 // write status, conditions, and finalizers on objects of its registered kind;
 // passing an id from another kind (a dependency, an owner) is a bug that would
 // otherwise persist this controller's Status JSON into a foreign row and make
-// later typed reads of that kind fail to decode. The guard turns that silent
-// corruption into a loud, retrying reconcile failure.
-var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
+// later typed reads of that kind fail to decode. The store folds the controller's
+// kind into each write, turning that silent corruption into a loud, retrying
+// reconcile failure. Aliased from storeapi like ErrNotFound.
+var ErrWrongKind = storeapi.ErrWrongKind
 
 // Controller is the user-supplied reconcile logic for a resource kind. Start
 // receives a ControllerClient for writing status and runs once on registration;
@@ -60,78 +60,44 @@ type controllerClientImpl[Status any] struct {
 	gk GroupKind
 }
 
-// checkKind confirms id names an object of this controller's kind before a
-// write touches it. A ControllerClient is bound to the single kind it was
-// registered for; an id from another kind (a dependency, an owner) must never
-// receive this controller's status/condition/finalizer writes, or a later typed
-// read of that kind would fail to decode the foreign status. Mirrors the
-// user-facing client's scopedGet. Called inside withinKind's transaction, so the
-// check shares one snapshot with the write and can't race a concurrent kind change.
-func (c *controllerClientImpl[Status]) checkKind(ctx context.Context, id ObjectID) error {
-	raw, err := c.bh.store.GetObject(ctx, id)
-	if err != nil {
-		return err
-	}
-	if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
-		return fmt.Errorf("%w: controller %s/%s cannot write to %s/%s object %d",
-			ErrWrongKind, c.gk.Group, c.gk.Kind, raw.Group, raw.Kind, id)
-	}
-	return nil
-}
-
-// withinKind runs fn in a short transaction after confirming id belongs to this
-// controller's kind, so the check and fn's write share one snapshot and commit
-// atomically. Every status/condition/finalizer write funnels through here (the
-// ref-edge methods are scoped differently — see AddDependency). Standalone it
-// commits on its own; inside a controller's Within it nests and commits with the
-// group (see Within for the nesting mechanics).
-func (c *controllerClientImpl[Status]) withinKind(ctx context.Context, id ObjectID, fn func(ctx context.Context) error) error {
-	return c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if err := c.checkKind(ctx, id); err != nil {
-			return err
-		}
-		return fn(ctx)
-	})
-}
+// The store folds the controller's kind into each write below: a foreign id
+// (a dependency, an owner) matches no row and is rejected with ErrWrongKind, so
+// this controller's status/condition/finalizer writes can never corrupt another
+// kind's row. There's no separate kind check to keep atomic with the write, so
+// each mutator self-wraps in Within (joining the controller's own Within when
+// nested) — the per-write withinKind transaction this used to need is gone. A
+// missing id surfaces as ErrNotFound (the store distinguishes it from a foreign id).
 
 func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
 	b, err := json.Marshal(status)
 	if err != nil {
 		return err
 	}
-	return c.withinKind(ctx, id, func(ctx context.Context) error {
-		// The store's UpdateStatus emits the Modified event into the transaction's
-		// collector, so it's published only after this write's transaction commits.
-		_, err := c.bh.store.UpdateStatus(ctx, id, observedGeneration, b)
-		return err
-	})
+	// The store's UpdateStatus emits the Modified event into its transaction's
+	// collector, so it's published only after the write commits.
+	_, err = c.bh.store.UpdateStatus(ctx, c.gk, id, observedGeneration, b)
+	return err
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	return c.withinKind(ctx, id, func(ctx context.Context) error {
-		_, err := c.bh.store.SetCondition(ctx, id, storeapi.Condition{
-			Type:     condition.Type,
-			Status:   string(condition.Status),
-			Reason:   condition.Reason,
-			Message:  condition.Message,
-			Liveness: condition.Liveness,
-		})
-		return err
+	_, err := c.bh.store.SetCondition(ctx, c.gk, id, storeapi.Condition{
+		Type:     condition.Type,
+		Status:   string(condition.Status),
+		Reason:   condition.Reason,
+		Message:  condition.Message,
+		Liveness: condition.Liveness,
 	})
+	return err
 }
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	return c.withinKind(ctx, id, func(ctx context.Context) error {
-		_, err := c.bh.store.DeleteCondition(ctx, id, conditionType)
-		return err
-	})
+	_, err := c.bh.store.DeleteCondition(ctx, c.gk, id, conditionType)
+	return err
 }
 
 func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
-	return c.withinKind(ctx, id, func(ctx context.Context) error {
-		_, err := c.bh.store.DeleteFinalizer(ctx, id, finalizer)
-		return err
-	})
+	_, err := c.bh.store.DeleteFinalizer(ctx, c.gk, id, finalizer)
+	return err
 }
 
 // AddDependency records that fromID depends on toID, so Beehive requeues fromID
@@ -190,8 +156,9 @@ func (c *controllerClientImpl[Status]) HasReferrers(ctx context.Context, id Obje
 // Within adds no kind scoping of its own — it takes no id and groups arbitrary
 // writes (a controller may legitimately touch other kinds here, e.g. read a
 // dependency then clear its own finalizer). The kind boundary is still enforced
-// per write: each status/condition/finalizer write re-checks via withinKind, so
-// grouping them in a transaction never widens what this controller can mutate.
+// per write: each status/condition/finalizer write folds the controller's kind
+// into the store mutator, so grouping them in a transaction never widens what
+// this controller can mutate.
 func (c *controllerClientImpl[Status]) Within(ctx context.Context, fn func(ctx context.Context) error) error {
 	return c.bh.store.Within(ctx, fn)
 }

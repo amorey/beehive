@@ -3,6 +3,7 @@ package beehive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/amorey/beehive/internal/storeapi"
@@ -89,17 +90,11 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	if err != nil {
 		return nil, err
 	}
-	var raw *RawObject
-	// Within keeps the kind check and the write atomic so a concurrent delete +
-	// recreate-as-another-kind can't slip between them.
-	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if _, err := c.scopedGet(ctx, id); err != nil {
-			return err
-		}
-		raw, err = c.bh.store.UpdateSpec(ctx, id, b)
-		return err
-	})
-	if err != nil {
+	// UpdateSpec folds this client's kind into the write, so a foreign id is
+	// rejected at the store (no separate read-then-write to keep atomic);
+	// hideWrongKind keeps that foreign id invisible to this single-kind client.
+	raw, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b)
+	if err = c.hideWrongKind(err); err != nil {
 		return nil, err
 	}
 	obj, err := rawToTyped[Spec, Status](raw)
@@ -121,8 +116,8 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID) (*Objec
 // scopedGet loads id and confirms it belongs to this client's kind. A Client is
 // the surface for a single resource kind, so an id naming an object of another
 // kind must be invisible here — reads, updates, and deletes through this client
-// must never touch another controller's rows. The store's id-keyed methods don't
-// enforce that, so the client does, reporting ErrNotFound for a foreign id.
+// must never touch another controller's rows. On the read path GetObject isn't
+// kind-scoped, so the client checks here, reporting ErrNotFound for a foreign id.
 func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
 	raw, err := c.bh.store.GetObject(ctx, id)
 	if err != nil {
@@ -132,6 +127,17 @@ func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (
 		return nil, ErrNotFound
 	}
 	return raw, nil
+}
+
+// hideWrongKind keeps a foreign id invisible through this single-kind client: the
+// scoped store writes reject another kind's object with ErrWrongKind, which the
+// client reports as ErrNotFound (mirrors scopedGet on the read path). Any other
+// error passes through unchanged.
+func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
+	if errors.Is(err, ErrWrongKind) {
+		return ErrNotFound
+	}
+	return err
 }
 
 func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string) (*Object[Spec, Status], error) {
@@ -161,16 +167,11 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, St
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
 	// RequestDeletion emits the Modified event itself, and only on a real state
 	// change — an idempotent retry carries the same resource_version, so emitting
-	// would show watchers a spurious diff. The kind check and the request share a
-	// transaction so a foreign id can't be deleted through this client.
-	err := c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if _, err := c.scopedGet(ctx, id); err != nil {
-			return err
-		}
-		_, _, err := c.bh.store.RequestDeletion(ctx, id)
-		return err
-	})
-	if err != nil {
+	// would show watchers a spurious diff. It folds this client's kind into the
+	// write, so a foreign id can't be deleted through this client; hideWrongKind
+	// keeps that foreign id invisible.
+	_, _, err := c.bh.store.RequestDeletion(ctx, c.gk, id)
+	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
 	// Always advance GC: a retry or post-crash Delete must still hand the

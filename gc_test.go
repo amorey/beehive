@@ -350,7 +350,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
-	_, _, err = store.RequestDeletion(ctx, raw.ID)
+	_, _, err = store.RequestDeletion(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	// A fresh Beehive with no spec-startup pass and resync disabled: the startup

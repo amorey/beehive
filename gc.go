@@ -66,7 +66,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 			return err
 		}
 		for _, c := range children {
-			if _, _, err := bh.store.RequestDeletion(ctx, c.ID); err != nil {
+			if _, _, err := bh.store.RequestDeletion(ctx, GroupKind{Group: c.Group, Kind: c.Kind}, c.ID); err != nil {
 				return err
 			}
 		}

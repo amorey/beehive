@@ -23,6 +23,13 @@ type ObjectID = int64
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = errors.New("beehive: object not found")
 
+// ErrWrongKind is returned by an id-keyed mutator when the target id names an
+// object of a different kind than the gk passed to the call. The store folds the
+// caller's kind into each write so a foreign id is rejected at the source rather
+// than corrupting another kind's row; surfaces translate this as they see fit
+// (the user-facing client hides it as ErrNotFound, a controller surfaces it).
+var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
+
 // ErrObservedGenerationFuture is returned by UpdateStatus when the caller passes
 // an observedGeneration greater than the object's current generation. It signals
 // a broken convergence handshake: a controller can only report a generation it
@@ -168,34 +175,43 @@ type Store interface {
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
 	// change) and ResourceVersion. Writing spec bytes identical to the stored
 	// ones is an idempotent no-op: no Generation/ResourceVersion bump and no
-	// event, so a converged object isn't falsely unsettled.
-	UpdateSpec(ctx context.Context, id ObjectID, spec []byte) (*RawObject, error)
+	// event, so a converged object isn't falsely unsettled. Scoped to gk: an id
+	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
+	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte) (*RawObject, error)
 
 	// UpdateStatus replaces an object's status and records the generation the
-	// controller observed, bumping ObservedAt and ResourceVersion.
-	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status []byte) (*RawObject, error)
+	// controller observed, bumping ObservedAt and ResourceVersion. Scoped to gk:
+	// an id of another kind is rejected with ErrWrongKind, a missing id with
+	// ErrNotFound.
+	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte) (*RawObject, error)
 
 	// SetCondition upserts the condition keyed by (id, cond.Type). A real change
 	// bumps the object's ResourceVersion and emits a Modified event; an identical
-	// write is a no-op. Returns the object with its conditions assembled.
-	SetCondition(ctx context.Context, id ObjectID, cond Condition) (*RawObject, error)
+	// write is a no-op. Returns the object with its conditions assembled. Scoped
+	// to gk: an id of another kind is rejected with ErrWrongKind, a missing id
+	// with ErrNotFound.
+	SetCondition(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) (*RawObject, error)
 
 	// DeleteCondition removes the condition of type condType from id. Removing an
 	// existing condition bumps ResourceVersion and emits a Modified event; an
 	// absent condition is a no-op. Returns the object with its conditions assembled.
-	DeleteCondition(ctx context.Context, id ObjectID, condType string) (*RawObject, error)
+	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
+	// id with ErrNotFound.
+	DeleteCondition(ctx context.Context, gk GroupKind, id ObjectID, condType string) (*RawObject, error)
 
 	// DeleteFinalizer removes finalizer from id's finalizer list. Removing a
 	// present finalizer bumps ResourceVersion and emits a Modified event; a
 	// finalizer that isn't on the object is a no-op (no bump, no event). Returns
 	// the object with its conditions assembled, or ErrNotFound if id is gone.
-	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) (*RawObject, error)
+	// Scoped to gk: an id of another kind is rejected with ErrWrongKind.
+	DeleteFinalizer(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (*RawObject, error)
 
 	// RequestDeletion marks an object for deletion by setting
 	// DeletionRequestedAt; the row lingers until its finalizers clear.
 	// changed is true only when this call was the one that set the flag;
-	// repeat calls are idempotent and return changed=false.
-	RequestDeletion(ctx context.Context, id ObjectID) (obj *RawObject, changed bool, err error)
+	// repeat calls are idempotent and return changed=false. Scoped to gk: an id
+	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
+	RequestDeletion(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
 
 	// DeleteObject removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.

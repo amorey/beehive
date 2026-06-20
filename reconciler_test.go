@@ -253,7 +253,7 @@ func TestDependencyRequeue(t *testing.T) {
 	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
-	_, err = store.SetCondition(ctx, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = store.SetCondition(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	select {
@@ -956,7 +956,7 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	require.NoError(t, err)
 	raw, err := s.CreateObject(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
 	require.NoError(t, err)
-	_, _, err = s.RequestDeletion(ctx, raw.ID)
+	_, _, err = s.RequestDeletion(ctx, GroupKind{Kind: "Widget"}, raw.ID)
 	require.NoError(t, err)
 
 	tc := &typedController[tSpec, tStatus]{
@@ -1091,7 +1091,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		Kind: clientTestGK.Kind, Spec: specJSON, Finalizers: []string{"f"},
 	})
 	require.NoError(t, err)
-	_, _, err = s.RequestDeletion(ctx, raw.ID)
+	_, _, err = s.RequestDeletion(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	tc := &typedController[cSpec, cStatus]{

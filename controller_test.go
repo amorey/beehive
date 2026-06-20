@@ -354,9 +354,9 @@ func TestControllerClientAddDependencyStoreError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// kindTStore answers GetObject with a row of kind "T" and runs Within inline, so
-// a ControllerClient's checkKind guard passes and tests reach the write path
-// under test. Embed it in a double that overrides the specific write.
+// kindTStore runs Within inline and answers GetObject with a row of kind "T", so
+// tests reach the write path under test. Embed it in a double that overrides the
+// specific write.
 type kindTStore struct {
 	fakeStore
 }
@@ -373,7 +373,7 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ ObjectID, _ int64, _ []byte) (*RawObject, error) {
+func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte) (*RawObject, error) {
 	return nil, errBoom
 }
 

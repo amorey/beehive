@@ -316,13 +316,7 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-// GetObject satisfies the client's pre-write kind check (scopedGet) with a row of
-// the test's "Widget" kind, so the update reaches UpdateSpec.
-func (s *updateBadJSONStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
-	return &RawObject{ID: id, Kind: "Widget"}, nil
-}
-
-func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ ObjectID, _ []byte) (*RawObject, error) {
+func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -331,12 +325,7 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-// GetObject lets scopedGet's kind check pass so the update reaches UpdateSpec.
-func (s *errorUpdateSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
-	return &RawObject{ID: id, Kind: "Widget"}, nil
-}
-
-func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ ObjectID, _ []byte) (*RawObject, error) {
+func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte) (*RawObject, error) {
 	return nil, errBoom
 }
 
