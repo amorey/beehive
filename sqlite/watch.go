@@ -213,7 +213,7 @@ func (s *sqliteStore) watch(
 		// deduped as we drain them. Any ID we'd previously seen that is absent from
 		// the relist was deleted during the gap, so we report a Deleted for it —
 		// otherwise a cache-maintaining consumer would retain it forever. The row is
-		// gone, so the event carries a tombstone (id + kind, empty spec) rather than
+		// gone, so the event carries a tombstone (id + kind, null spec) rather than
 		// the real last object; a consumer keyed by id can still evict it. Returns
 		// false if a send is abandoned (ctx cancelled / store closed).
 		relist := func() bool {
@@ -245,7 +245,11 @@ func (s *sqliteStore) watch(
 				if present[id] {
 					continue
 				}
-				tombstone := &storeapi.RawObject{ID: id, Group: gk.Group, Kind: gk.Kind, Spec: []byte("{}")}
+				// Spec is JSON null, not "{}": the typed watch decodes every event's
+				// spec, and null unmarshals into any Go type (scalar, slice, struct)
+				// as the zero value, whereas "{}" fails for non-object specs and would
+				// silently close the watch.
+				tombstone := &storeapi.RawObject{ID: id, Group: gk.Group, Kind: gk.Kind, Spec: []byte("null")}
 				if !sendTracked(storeapi.RawWatchEvent{Type: storeapi.WatchEventDeleted, Object: tombstone}) {
 					return false
 				}

@@ -438,7 +438,8 @@ func TestWatchRecoversFromLag(t *testing.T) {
 // deleted during a lag gap (its Deleted event dropped from the ring), the
 // recovery relist reports a Deleted tombstone for it so a cache-maintaining
 // consumer does not retain the stale object forever. The row is gone, so the
-// tombstone carries id + kind and an empty (decodable) spec, not the last row.
+// tombstone carries id + kind and a null (universally decodable) spec, not the
+// last row.
 func TestWatchRelistEmitsDeleteForVanishedObject(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -466,12 +467,12 @@ func TestWatchRelistEmitsDeleteForVanishedObject(t *testing.T) {
 	assert.Equal(t, obj.ID, first.Object.ID)
 
 	// Recovery relist finds the object gone and reports its Deleted tombstone:
-	// id + kind, with an empty-but-decodable spec.
+	// id + kind, with a null spec that decodes into any Go type.
 	rec := recvEvent(t, w)
 	assert.Equal(t, beehive.WatchEventDeleted, rec.Type)
 	assert.Equal(t, obj.ID, rec.Object.ID)
 	assert.Equal(t, testGK.Kind, rec.Object.Kind)
-	assert.JSONEq(t, "{}", string(rec.Object.Spec))
+	assert.JSONEq(t, "null", string(rec.Object.Spec))
 }
 
 // TestWatchLiveSendCtxDone covers the live-send path exiting on context

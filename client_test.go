@@ -271,6 +271,28 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	assert.Nil(t, got.DeletionRequestedAt)
 }
 
+// TestRawToTypedDecodesNullSpecTombstone pins the contract the lag-recovery
+// tombstone relies on: a Deleted tombstone carries a JSON null spec (see
+// sqlite/watch.go), and the typed watch decodes every event's spec through
+// rawToTyped. null must decode into an arbitrary Spec as the zero value — here a
+// scalar Spec, for which the old "{}" tombstone would fail to unmarshal and
+// silently close the watch.
+func TestRawToTypedDecodesNullSpecTombstone(t *testing.T) {
+	// Scalar (non-object) spec: json.Unmarshal of "{}" into this errors.
+	type scalarSpec = string
+
+	tombstone := &RawObject{ID: 7, Kind: "Widget", Spec: []byte("null")}
+	obj, err := rawToTyped[scalarSpec, cStatus](tombstone)
+	require.NoError(t, err)
+	assert.Equal(t, ObjectID(7), obj.ID)
+	assert.Equal(t, "", obj.Spec) // zero value, no Status to decode
+
+	// Guard the premise: the previous "{}" tombstone would have failed here,
+	// which is exactly the silent-close bug the null spec avoids.
+	_, err = rawToTyped[scalarSpec, cStatus](&RawObject{ID: 7, Kind: "Widget", Spec: []byte("{}")})
+	require.Error(t, err)
+}
+
 // createBadJSONStore returns bad JSON from CreateObject so rawToTyped fails.
 type createBadJSONStore struct {
 	fakeStore
