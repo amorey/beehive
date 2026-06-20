@@ -1,6 +1,7 @@
 package beehive
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -51,85 +52,75 @@ func (t *typedController[Spec, Status]) stop(ctx context.Context) error {
 	return t.inner.Stop(ctx)
 }
 
-// reconcile runs the controller in a single transaction: load, reconcile, and
-// any controller-client writes (UpdateStatus, …) all commit together, or all
-// roll back if Reconcile returns an error. The store's Within publishes the
-// watch events those writes emit only after the transaction commits, so
-// watchers never observe state that was rolled back.
+// reconcile loads the object and runs the controller. There is no enclosing
+// transaction: each ControllerClient write commits on its own (autocommit), so a
+// write that lands before Reconcile returns an error stays committed and the level
+// loop re-derives from it on retry. A controller that needs several writes to be
+// atomic wraps them in ControllerClient.Within. GC runs in its own transaction
+// afterward (see collect).
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	log := t.log().With("id", id)
-	var result Result
-	var deleting, missing bool
 	// Controller-client calls that free a ref target register it here; we requeue
-	// them once the transaction commits (see DeleteDependency).
+	// them after Reconcile returns (see DeleteDependency).
 	wakes := &pendingWakes{}
 	ctx = withPendingWakes(ctx, wakes)
-	err := t.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err := t.bh.store.GetObject(ctx, id)
-		if errors.Is(err, ErrNotFound) {
-			// The queued object is already gone (collected by a prior pass, a
-			// cascade, or the backstop between enqueue and now). Nothing to
-			// reconcile — a no-op success, not a retryable error. Scoped to this
-			// load so a controller's own ErrNotFound (e.g. a dependency on a missing
-			// target) still surfaces and retries.
-			missing = true
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		// Read from the already-loaded row as a fast path: it lets a non-finalizing
-		// reconcile (the common case) skip collect's separate transaction entirely,
-		// while still running GC on the pass where the controller clears its last
-		// finalizer.
-		deleting = raw.DeletionRequestedAt != nil
-		obj, err := rawToTyped[Spec, Status](raw)
-		if err != nil {
-			return err
-		}
-		log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
-		var reconcileErr error
-		result, reconcileErr = t.inner.Reconcile(ctx, obj)
-		return reconcileErr
-	})
-	if missing {
+
+	raw, err := t.bh.store.GetObject(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		// The queued object is already gone (collected by a prior pass, a cascade,
+		// or the backstop between enqueue and now). Nothing to reconcile — a no-op
+		// success, not a retryable error.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
 		return Result{}, nil
 	}
 	if err != nil {
-		// The worker turns this into a backoff requeue; logged here where the
-		// error is richest. Warn, not Error: a failed reconcile is expected churn
-		// that the retry loop is designed to absorb.
-		log.WarnContext(ctx, "reconcile failed; will retry", "err", err)
-		return result, err
+		return Result{}, err
 	}
-	// Committed: advance any targets the controller freed via DeleteDependency, so
-	// a now-unreferenced deletion-pending target is re-examined without waiting on
-	// the resync backstop. Post-commit, so a rolled-back DeleteRef wakes nothing.
-	// advanceGC (not enqueueIfRegistered) routes the wake by kind: a registered
-	// kind enqueues, while a client-only kind with resync disabled — whose freed
-	// target would otherwise strand, RESTRICT-blocking nothing else re-checks it —
-	// collects synchronously.
+	// The already-loaded row's deletion flag is a fast path: it lets a
+	// non-finalizing reconcile (the common case) skip collect's separate
+	// transaction entirely, while still running GC on the pass where the controller
+	// clears its last finalizer.
+	deleting := raw.DeletionRequestedAt != nil
+	obj, err := rawToTyped[Spec, Status](raw)
+	if err != nil {
+		return Result{}, err
+	}
+
+	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
+	result, reconcileErr := t.inner.Reconcile(ctx, obj)
+	if reconcileErr != nil {
+		// Warn, not Error: a failed reconcile is expected churn the retry loop
+		// absorbs. We don't return yet — the controller's committed writes still need
+		// their GC follow-up below (see func doc), or a freed object could strand.
+		log.WarnContext(ctx, "reconcile failed; will retry", "err", reconcileErr)
+	}
+	// Advance any targets the controller freed via DeleteDependency, so a
+	// now-unreferenced deletion-pending target is re-examined without waiting on the
+	// resync backstop. advanceGC (not enqueueIfRegistered) routes the wake by kind: a
+	// registered kind enqueues, while a client-only kind with resync disabled — whose
+	// freed target would otherwise strand, RESTRICT-blocking nothing else re-checks
+	// it — collects synchronously.
 	for _, tgt := range wakes.targets {
 		t.bh.advanceGC(ctx, GroupKind{Group: tgt.Group, Kind: tgt.Kind}, tgt.ID)
 	}
-	// GC runs in its own transaction after the controller's writes commit, so a
-	// finalizer the controller just cleared is visible and a blocked physical
-	// delete doesn't roll back the controller's work.
+	// GC runs in its own transaction over the controller's committed writes, so a
+	// finalizer the controller just cleared is visible.
 	if deleting {
-		gone, err := t.bh.collect(ctx, id)
-		if err != nil {
-			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", err)
-			return result, err
+		gone, gcErr := t.bh.collect(ctx, id)
+		if gcErr != nil {
+			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
+			// Either error makes the worker retry; prefer the reconcile error.
+			return result, cmp.Or(reconcileErr, gcErr)
 		}
-		// The row is gone: drop any RequeueAfter the controller asked for, or the
-		// worker would reschedule a dead id straight into ErrNotFound.
+		// The row is gone: like the ErrNotFound skip above, there's nothing left to
+		// reconcile, so drop any RequeueAfter and the reconcile error rather than
+		// rescheduling a dead id straight into ErrNotFound.
 		if gone {
 			log.DebugContext(ctx, "object collected")
 			return Result{}, nil
 		}
 	}
-	return result, nil
+	return result, reconcileErr
 }
 
 // reconciler drives the reconcile loop for a single registered controller.

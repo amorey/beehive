@@ -2,12 +2,12 @@ package beehive
 
 import "context"
 
-// pendingWakes collects ref targets to requeue after a reconcile transaction
-// commits. A ControllerClient call that frees a target (DeleteDependency)
-// registers it here; typedController.reconcile drains it post-commit. It rides
-// on the context so the long-lived, shared ControllerClient holds no
-// per-reconcile state, and a single reconcile's Reconcile runs on one goroutine,
-// so the slice needs no locking.
+// pendingWakes collects ref targets to requeue after Reconcile returns. A
+// ControllerClient call that frees a target (DeleteDependency) registers it here;
+// typedController.reconcile drains it once Reconcile returns (the freeing write has
+// already committed). It rides on the context so the long-lived, shared
+// ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
+// runs on one goroutine, so the slice needs no locking.
 type pendingWakes struct {
 	targets []Referrer
 }
@@ -27,9 +27,9 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 }
 
 // collect is the garbage-collection step for a single object, run after its
-// controller reconcile commits (see typedController.reconcile) and on the
-// deletion-pending resync backstop. It is a no-op unless the object is
-// finalizing.
+// controller's Reconcile returns (see typedController.reconcile) and on the
+// deletion-pending resync backstop. It runs in its own transaction. It is a no-op
+// unless the object is finalizing.
 //
 // Two things happen for a finalizing object:
 //

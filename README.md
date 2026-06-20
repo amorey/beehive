@@ -222,6 +222,7 @@ type ControllerClient[Status any] interface {
     AddDependency(ctx context.Context, fromID, toID ObjectID) error
     DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
     HasReferrers(ctx context.Context, id ObjectID) (bool, error)
+    Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
 
@@ -237,7 +238,9 @@ type Controller[Spec, Status any] interface {
 }
 ```
 
-Beehive wraps each `Reconcile` call in a transaction, committing on `nil` error and rolling back on non-nil. All `ControllerClient` calls made with the reconcile `ctx` participate in that transaction automatically. Do all external I/O before writing to the store — holding a write transaction open during a network call blocks all other writers.
+`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed — the level loop simply re-derives from the persisted state on the next pass, so make `Reconcile` idempotent. (Each write is still internally atomic, and the `obj` snapshot a concurrent spec change can race is covered by the generation handshake: `UpdateStatus` rejects a future `observedGeneration`, and an older one leaves the object unsettled to reconcile again.)
+
+When several writes must be atomic — all land together or none do — wrap them in `ControllerClient.Within(ctx, func(ctx) error { … })`. Writes made with the inner `ctx` join one transaction that commits on a `nil` return and rolls back on error. That transaction holds the store's single write lock for the whole duration of the function, so keep external I/O outside it — do your I/O first, then open `Within` only around the writes.
 
 A non-nil error triggers an automatic retry with exponential backoff starting at 1s and capped at 30s by default. Configurable per-controller with `WithMaxRetryInterval`.
 
@@ -255,4 +258,4 @@ func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff
 
 `WithOwner` sets an `owned_by` edge in `refs` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
 
-`AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Both calls participate in the reconcile transaction.
+`AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.

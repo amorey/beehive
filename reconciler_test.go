@@ -1007,6 +1007,112 @@ func TestTypedControllerReconcile(t *testing.T) {
 	}
 }
 
+// funcController is a test Controller whose Reconcile delegates to fn (given the
+// ControllerClient captured from Start). If signal is non-nil it is closed once,
+// after fn's first call, so a test can wait for the reconcile to have run.
+type funcController struct {
+	mu     sync.Mutex
+	client ControllerClient[cStatus]
+	once   sync.Once
+	signal chan struct{}
+	fn     func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error)
+}
+
+func (c *funcController) Start(client ControllerClient[cStatus]) error {
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+	return nil
+}
+func (c *funcController) Stop(context.Context) error { return nil }
+func (c *funcController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	res, err := c.fn(ctx, client, obj)
+	if c.signal != nil {
+		c.once.Do(func() { close(c.signal) })
+	}
+	return res, err
+}
+
+// TestReconcilePersistsWritesOnError pins the autocommit model: reconcile no
+// longer runs under an enclosing transaction, so a write that committed before
+// Reconcile returns an error stays committed. The error still surfaces (the worker
+// retries), and the level loop re-derives from the persisted state.
+func TestReconcilePersistsWritesOnError(t *testing.T) {
+	ctx := context.Background()
+
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	defer s.Close()
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	raw, err := s.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+
+	tc := &typedController[cSpec, cStatus]{
+		gk: clientTestGK,
+		bh: &Beehive{store: s},
+		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+			if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "written"}); err != nil {
+				return Result{}, err
+			}
+			return Result{}, errBoom
+		}},
+	}
+	require.NoError(t, tc.start()) // wires the ControllerClient into the controller
+
+	_, rerr := tc.reconcile(ctx, raw.ID)
+	require.ErrorIs(t, rerr, errBoom, "the reconcile error still surfaces for retry")
+
+	got, err := s.GetObject(ctx, raw.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Status, "the status write committed despite the reconcile error")
+	assert.NotNil(t, got.ObservedGeneration)
+}
+
+// TestReconcileRunsGCAfterCommittedWritesOnError guards against stranding: a
+// deleting controller clears its last finalizer (which commits on its own) and
+// then returns an error. Because the write already landed, GC must still run — the
+// now-unblocked deletion-pending row must be collected, not left forever (the
+// resync sweeper is disabled here, so the in-reconcile collect is the only driver).
+func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
+	ctx := context.Background()
+
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	defer s.Close()
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	raw, err := s.CreateObject(ctx, &RawObject{
+		Kind: clientTestGK.Kind, Spec: specJSON, Finalizers: []string{"f"},
+	})
+	require.NoError(t, err)
+	_, _, err = s.RequestDeletion(ctx, raw.ID)
+	require.NoError(t, err)
+
+	tc := &typedController[cSpec, cStatus]{
+		gk: clientTestGK,
+		bh: &Beehive{store: s},
+		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+			if err := cc.DeleteFinalizer(ctx, obj.ID, "f"); err != nil {
+				return Result{}, err
+			}
+			return Result{}, errBoom
+		}},
+	}
+	require.NoError(t, tc.start())
+
+	_, _ = tc.reconcile(ctx, raw.ID)
+
+	_, err = s.GetObject(ctx, raw.ID)
+	require.ErrorIs(t, err, ErrNotFound,
+		"the committed finalizer clear must let GC collect the row even though reconcile errored")
+}
+
 // statusSettingController stores the ControllerClient from Start, then on the
 // first Reconcile call writes a fixed status and closes reconciledCh.
 type statusSettingController struct {
@@ -1106,44 +1212,6 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, obj *Object[
 	return Result{}, nil
 }
 
-// rollbackTestController verifies transaction rollback: on the first Reconcile
-// it writes status then returns an error; on the second it records whether the
-// write was rolled back (obj.Status == nil) and closes doneCh.
-type rollbackTestController struct {
-	mu         sync.Mutex
-	client     ControllerClient[cStatus]
-	count      int
-	once       sync.Once
-	sawNilStat bool
-	doneCh     chan struct{}
-}
-
-func (c *rollbackTestController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *rollbackTestController) Stop(_ context.Context) error { return nil }
-func (c *rollbackTestController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.count++
-	n := c.count
-	c.mu.Unlock()
-	if n == 1 {
-		_ = client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "should-be-rolled-back"})
-		return Result{}, errors.New("intentional error")
-	}
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.sawNilStat = (obj.Status == nil)
-		c.mu.Unlock()
-		close(c.doneCh)
-	})
-	return Result{}, nil
-}
-
 func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
@@ -1227,28 +1295,38 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	waitClosed(t, ctrl.deleted, "reconcile after deletion requested")
 }
 
-func TestIntegrationTransactionRollback(t *testing.T) {
+// TestIntegrationWritePersistsAcrossReconcileError is the end-to-end counterpart
+// of TestReconcilePersistsWritesOnError: a status write made during a reconcile
+// that then returns an error stays committed, because reconcile no longer runs
+// under a transaction. (To make a group of writes atomic, a controller uses
+// ControllerClient.Within — see TestControllerClientWithin.)
+func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	ctx := context.Background()
 
-	// Use a short resync so the second reconcile fires before the 1s backoff.
-	bh, err := New(newClientTestStore(t), WithResyncInterval(10*time.Millisecond))
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
 
-	ctrl := &rollbackTestController{doneCh: make(chan struct{})}
+	ctrl := &funcController{
+		signal: make(chan struct{}),
+		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+			_ = cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "persisted"})
+			return Result{}, errBoom
+		},
+	}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
 	require.NoError(t, bh.Start())
 	defer bh.Stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, cSpec{Val: "hello"})
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.doneCh, "second reconcile (after rollback)")
+	waitClosed(t, ctrl.signal, "reconcile wrote status before erroring")
 
-	ctrl.mu.Lock()
-	ok := ctrl.sawNilStat
-	ctrl.mu.Unlock()
-	assert.True(t, ok, "status must have been rolled back when first reconcile errored")
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Status, "status write commits even though the reconcile returned an error")
+	assert.Equal(t, "persisted", got.Status.Val)
 }
 
 // conditionSettingController sets a Ready=True condition on the first Reconcile,
@@ -1312,64 +1390,37 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	require.NotNil(t, findCondition(list[0].Conditions, "Ready"))
 }
 
-// conditionRollbackController sets a condition then errors on the first
-// Reconcile; on the second it records whether the condition was rolled back.
-type conditionRollbackController struct {
-	mu          sync.Mutex
-	client      ControllerClient[cStatus]
-	count       int
-	once        sync.Once
-	sawRollback bool
-	doneCh      chan struct{}
-}
-
-func (c *conditionRollbackController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *conditionRollbackController) Stop(_ context.Context) error { return nil }
-func (c *conditionRollbackController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.count++
-	n := c.count
-	c.mu.Unlock()
-	if n == 1 {
-		_ = client.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
-		return Result{}, errors.New("intentional error")
-	}
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.sawRollback = findCondition(obj.Conditions, "Ready") == nil
-		c.mu.Unlock()
-		close(c.doneCh)
-	})
-	return Result{}, nil
-}
-
-func TestIntegrationSetConditionRollback(t *testing.T) {
+// TestIntegrationConditionPersistsAcrossReconcileError is the condition counterpart
+// of TestIntegrationWritePersistsAcrossReconcileError: a condition set during a
+// reconcile that then errors stays committed (no enclosing reconcile transaction).
+func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), WithResyncInterval(10*time.Millisecond))
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
 
-	ctrl := &conditionRollbackController{doneCh: make(chan struct{})}
+	ctrl := &funcController{
+		signal: make(chan struct{}),
+		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+			_ = cc.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
+			return Result{}, errBoom
+		},
+	}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
 	require.NoError(t, bh.Start())
 	defer bh.Stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, cSpec{Val: "hello"})
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.doneCh, "second reconcile (after rollback)")
+	waitClosed(t, ctrl.signal, "reconcile set condition before erroring")
 
-	ctrl.mu.Lock()
-	ok := ctrl.sawRollback
-	ctrl.mu.Unlock()
-	assert.True(t, ok, "condition must have been rolled back when first reconcile errored")
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	ready := findCondition(got.Conditions, "Ready")
+	require.NotNil(t, ready, "condition commits even though the reconcile returned an error")
+	assert.Equal(t, ConditionTrue, ready.Status)
 }
 
 func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {

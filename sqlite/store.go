@@ -701,7 +701,7 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 
 // AddRef inserts a (from_id, to_id, relation) edge. It neither bumps
 // resource_version nor emits — a ref is not a field of the object, so watchers
-// would see no diff — and joins the ambient reconcile transaction via conn.
+// would see no diff — and joins the ambient transaction (if any) via conn.
 func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
 	// Confirm both endpoints exist for a clean ErrNotFound over a raw FK
 	// violation — in one round-trip, and without loading the row blobs.
