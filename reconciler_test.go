@@ -830,15 +830,11 @@ func TestRawToTypedStatusUnmarshalError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// getObjectBadSpecStore is a Store whose Within delegates directly and whose
-// GetObject returns a RawObject with invalid spec JSON, exercising the
-// rawToTyped error path inside typedController.reconcile.
+// getObjectBadSpecStore is a Store whose GetObject returns a RawObject with
+// invalid spec JSON, exercising the rawToTyped error path inside
+// typedController.reconcile. Within is inherited from fakeStore (inline passthrough).
 type getObjectBadSpecStore struct {
 	fakeStore
-}
-
-func (s *getObjectBadSpecStore) Within(ctx context.Context, fn func(context.Context) error) error {
-	return fn(ctx)
 }
 
 func (s *getObjectBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
@@ -858,13 +854,10 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 }
 
 // getObjectErrorStore returns an error from GetObject to exercise path A in
-// typedController.reconcile (the GetObject error before rawToTyped).
+// typedController.reconcile (the GetObject error before rawToTyped). Within is
+// inherited from fakeStore (inline passthrough).
 type getObjectErrorStore struct {
 	fakeStore
-}
-
-func (s *getObjectErrorStore) Within(ctx context.Context, fn func(context.Context) error) error {
-	return fn(ctx)
 }
 
 func (s *getObjectErrorStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
@@ -890,9 +883,6 @@ type notFoundStore struct {
 	fakeStore
 }
 
-func (s *notFoundStore) Within(ctx context.Context, fn func(context.Context) error) error {
-	return fn(ctx)
-}
 func (s *notFoundStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
 	return nil, ErrNotFound
 }
