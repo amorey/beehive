@@ -103,11 +103,15 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		log.WarnContext(ctx, "reconcile failed; will retry", "err", err)
 		return result, err
 	}
-	// Committed: requeue any targets the controller freed via DeleteDependency, so
+	// Committed: advance any targets the controller freed via DeleteDependency, so
 	// a now-unreferenced deletion-pending target is re-examined without waiting on
 	// the resync backstop. Post-commit, so a rolled-back DeleteRef wakes nothing.
+	// advanceGC (not enqueueIfRegistered) routes the wake by kind: a registered
+	// kind enqueues, while a client-only kind with resync disabled — whose freed
+	// target would otherwise strand, RESTRICT-blocking nothing else re-checks it —
+	// collects synchronously.
 	for _, tgt := range wakes.targets {
-		t.bh.enqueueIfRegistered(GroupKind{Group: tgt.Group, Kind: tgt.Kind}, tgt.ID)
+		t.bh.advanceGC(ctx, GroupKind{Group: tgt.Group, Kind: tgt.Kind}, tgt.ID)
 	}
 	// GC runs in its own transaction after the controller's writes commit, so a
 	// finalizer the controller just cleared is visible and a blocked physical
