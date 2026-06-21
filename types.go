@@ -19,7 +19,7 @@ type Object[Spec, Status any] struct {
 	ID                  ObjectID
 	Group               string
 	Kind                string
-	Name                *string
+	Slug                *string
 	Spec                Spec
 	Status              *Status
 	Generation          int64      // bumped on every Spec change

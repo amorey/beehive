@@ -20,8 +20,8 @@ CREATE TABLE objects (
 
     -- NULL for internally-generated objects; set for user-named objects (e.g. kubeconfig entries).
     -- Immutable — a rename is delete+recreate.
-    -- Unique within (group, kind); SQLite NULL != NULL so multiple NULL names are allowed.
-    name TEXT,
+    -- Unique within (group, kind); SQLite NULL != NULL so multiple NULL slugs are allowed.
+    slug TEXT,
 
     spec   TEXT NOT NULL, -- JSON, user-owned,        HARD / desired state
     status TEXT,          -- JSON, controller-owned,  SOFT / observed state (nullable)
@@ -49,7 +49,7 @@ CREATE TABLE objects (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
 
-    UNIQUE ("group", kind, name)
+    UNIQUE ("group", kind, slug)
 );
 
 CREATE INDEX idx_objects_kind ON objects("group", kind);    -- list / resync a kind

@@ -80,17 +80,17 @@ func TestClientCreateWithOptions(t *testing.T) {
 	require.NoError(t, err)
 
 	child, err := client.Create(ctx, cSpec{Val: "child"},
-		WithName("child-1"),
+		WithSlug("child-1"),
 		WithFinalizers("cleanup-a", "cleanup-b"),
 		WithOwner(owner.ID))
 	require.NoError(t, err)
 
-	require.NotNil(t, child.Name)
-	assert.Equal(t, "child-1", *child.Name)
+	require.NotNil(t, child.Slug)
+	assert.Equal(t, "child-1", *child.Slug)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, child.Finalizers)
 
-	// Name is persisted and looked up via GetByName.
-	got, err := client.GetByName(ctx, "child-1")
+	// Slug is persisted and looked up via GetBySlug.
+	got, err := client.GetBySlug(ctx, "child-1")
 	require.NoError(t, err)
 	assert.Equal(t, child.ID, got.ID)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
@@ -118,13 +118,13 @@ func TestClientGet(t *testing.T) {
 	assert.Nil(t, got.Status)
 }
 
-func TestClientGetByName(t *testing.T) {
+func TestClientGetBySlug(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.GetByName(ctx, "nonexistent")
+	_, err = client.GetBySlug(ctx, "nonexistent")
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -172,23 +172,23 @@ func TestClientGetNotFound(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestClientGetByNameFound(t *testing.T) {
+func TestClientGetBySlugFound(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
 	require.NoError(t, err)
 
-	// Create a named object via the store directly (client.Create uses nil name).
+	// Create a named object via the store directly (client.Create uses nil slug).
 	specJSON, err := json.Marshal(cSpec{Val: "hello"})
 	require.NoError(t, err)
 	raw, err := store.CreateObject(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind,
-		Name: new("myobj"), Spec: specJSON,
+		Slug: new("myobj"), Spec: specJSON,
 	})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	got, err := client.GetByName(ctx, "myobj")
+	got, err := client.GetBySlug(ctx, "myobj")
 	require.NoError(t, err)
 	assert.Equal(t, raw.ID, got.ID)
 	assert.Equal(t, "hello", got.Spec.Val)

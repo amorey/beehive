@@ -125,7 +125,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.
-const objectColumns = `id, "group", kind, name, spec, status,
+const objectColumns = `id, "group", kind, slug, spec, status,
 	generation, observed_generation, observed_at, resource_version,
 	deletion_requested_at, finalizers, created_at, updated_at`
 
@@ -180,11 +180,11 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject)
 	// in the same statement, so there's no follow-up read.
 	row := c.QueryRowContext(ctx, `
 		INSERT INTO objects
-			("group", kind, name, spec, status,
+			("group", kind, slug, spec, status,
 			 generation, resource_version, finalizers, created_at, updated_at)
 		VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?)
 		RETURNING `+objectColumns,
-		obj.Group, obj.Kind, obj.Name, obj.Spec,
+		obj.Group, obj.Kind, obj.Slug, obj.Spec,
 		rv, finalizers, now, now)
 	return s.scanAndEmit(ctx, storeapi.WatchEventAdded, row)
 }
@@ -228,10 +228,10 @@ func (s *sqliteStore) GetObjectMeta(ctx context.Context, id storeapi.ObjectID) (
 	return s.getObjectRow(ctx, id)
 }
 
-func (s *sqliteStore) GetObjectByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) GetObjectBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
-		gk.Group, gk.Kind, name)
+		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
+		gk.Group, gk.Kind, slug)
 	obj, err := scanObject(row)
 	if err != nil {
 		return nil, err
@@ -942,7 +942,7 @@ type scanner interface {
 func scanObject(sc scanner) (*storeapi.RawObject, error) {
 	var (
 		obj         storeapi.RawObject
-		name        sql.NullString
+		slug        sql.NullString
 		status      []byte
 		observedGen sql.NullInt64
 		observedAt  sql.NullInt64
@@ -952,7 +952,7 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 		updatedAt   int64
 	)
 	err := sc.Scan(
-		&obj.ID, &obj.Group, &obj.Kind, &name, &obj.Spec, &status,
+		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
 		&deletionAt, &finalizers, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -962,8 +962,8 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 		return nil, err
 	}
 
-	if name.Valid {
-		obj.Name = &name.String
+	if slug.Valid {
+		obj.Slug = &slug.String
 	}
 	obj.Status = status // nil for a NULL column; bytes once a status is written
 	if observedGen.Valid {

@@ -29,7 +29,7 @@ func TestCreateObjectAssignsIdentity(t *testing.T) {
 	obj, err := store.CreateObject(ctx, &beehive.RawObject{
 		Group: testGK.Group,
 		Kind:  testGK.Kind,
-		Name:  new("world"),
+		Slug:  new("world"),
 		Spec:  []byte(`{"name":"world"}`),
 	})
 	require.NoError(t, err)
@@ -42,8 +42,8 @@ func TestCreateObjectAssignsIdentity(t *testing.T) {
 	assert.Empty(t, obj.Finalizers)
 	assert.False(t, obj.CreatedAt.IsZero())
 	assert.Equal(t, obj.CreatedAt, obj.UpdatedAt)
-	require.NotNil(t, obj.Name)
-	assert.Equal(t, "world", *obj.Name)
+	require.NotNil(t, obj.Slug)
+	assert.Equal(t, "world", *obj.Slug)
 }
 
 func TestCreateObjectPersistsFinalizers(t *testing.T) {
@@ -52,7 +52,7 @@ func TestCreateObjectPersistsFinalizers(t *testing.T) {
 
 	want := []string{"kstack.sh/cluster", "kstack.sh/dns"}
 	created, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new("guarded"),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("guarded"),
 		Spec: []byte(`{}`), Finalizers: want,
 	})
 	require.NoError(t, err)
@@ -64,12 +64,12 @@ func TestCreateObjectPersistsFinalizers(t *testing.T) {
 	assert.Equal(t, want, reloaded.Finalizers)
 }
 
-func TestGetByIdAndName(t *testing.T) {
+func TestGetByIdAndSlug(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	created, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new("world"),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("world"),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -78,7 +78,7 @@ func TestGetByIdAndName(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, byID.ID)
 
-	byName, err := store.GetObjectByName(ctx, testGK, "world")
+	byName, err := store.GetObjectBySlug(ctx, testGK, "world")
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, byName.ID)
 }
@@ -90,23 +90,23 @@ func TestGetNotFound(t *testing.T) {
 	_, err := store.GetObject(ctx, 999)
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 
-	_, err = store.GetObjectByName(ctx, testGK, "nope")
+	_, err = store.GetObjectBySlug(ctx, testGK, "nope")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
-func TestDuplicateNameRejected(t *testing.T) {
+func TestDuplicateSlugRejected(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	mk := func() error {
 		_, err := store.CreateObject(ctx, &beehive.RawObject{
-			Group: testGK.Group, Kind: testGK.Kind, Name: new("dup"),
+			Group: testGK.Group, Kind: testGK.Kind, Slug: new("dup"),
 			Spec: []byte(`{}`),
 		})
 		return err
 	}
 	require.NoError(t, mk())
-	assert.Error(t, mk(), "second create with same name should violate UNIQUE")
+	assert.Error(t, mk(), "second create with same slug should violate UNIQUE")
 }
 
 func TestUnnamedObjectsCoexist(t *testing.T) {
@@ -115,11 +115,11 @@ func TestUnnamedObjectsCoexist(t *testing.T) {
 
 	mk := func() *beehive.RawObject {
 		obj, err := store.CreateObject(ctx, &beehive.RawObject{
-			Group: testGK.Group, Kind: testGK.Kind, // Name nil
+			Group: testGK.Group, Kind: testGK.Kind, // Slug nil
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
-		assert.Nil(t, obj.Name)
+		assert.Nil(t, obj.Slug)
 		return obj
 	}
 	// SQLite treats NULL != NULL, so multiple unnamed objects are allowed.
@@ -245,7 +245,7 @@ func TestListObjects(t *testing.T) {
 
 	for _, n := range []string{"a", "b", "c"} {
 		_, err := store.CreateObject(ctx, &beehive.RawObject{
-			Group: testGK.Group, Kind: testGK.Kind, Name: new(n),
+			Group: testGK.Group, Kind: testGK.Kind, Slug: new(n),
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
@@ -262,8 +262,8 @@ func TestListObjects(t *testing.T) {
 
 	var names []string
 	for _, o := range list {
-		require.NotNil(t, o.Name)
-		names = append(names, *o.Name)
+		require.NotNil(t, o.Slug)
+		names = append(names, *o.Slug)
 	}
 	assert.Equal(t, []string{"a", "b", "c"}, names, "ordered by id")
 }
@@ -273,11 +273,11 @@ func TestResourceVersionIsMonotonic(t *testing.T) {
 	ctx := context.Background()
 
 	a, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new("a"), Spec: []byte(`{}`),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("a"), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	b, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new("b"), Spec: []byte(`{}`),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("b"), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	assert.Greater(t, b.ResourceVersion, a.ResourceVersion, "each create takes the next cursor value")
@@ -293,11 +293,11 @@ func TestResourceVersionNotReusedAfterDelete(t *testing.T) {
 	ctx := context.Background()
 
 	a, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new("a"), Spec: []byte(`{}`),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("a"), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	b, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new("b"), Spec: []byte(`{}`),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("b"), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -721,7 +721,7 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	var committedID beehive.ObjectID
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
 		obj, err := store.CreateObject(ctx, &beehive.RawObject{
-			Group: testGK.Group, Kind: testGK.Kind, Name: new("committed"),
+			Group: testGK.Group, Kind: testGK.Kind, Slug: new("committed"),
 			Spec: []byte(`{}`),
 		})
 		if err != nil {
@@ -737,14 +737,14 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	sentinel := errors.New("boom")
 	err = store.Within(ctx, func(ctx context.Context) error {
 		_, err := store.CreateObject(ctx, &beehive.RawObject{
-			Group: testGK.Group, Kind: testGK.Kind, Name: new("rolledback"),
+			Group: testGK.Group, Kind: testGK.Kind, Slug: new("rolledback"),
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
 		return sentinel
 	})
 	assert.ErrorIs(t, err, sentinel)
-	_, err = store.GetObjectByName(ctx, testGK, "rolledback")
+	_, err = store.GetObjectBySlug(ctx, testGK, "rolledback")
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "rolled-back write must not persist")
 }
 
@@ -812,7 +812,7 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	err := store.Within(ctx, func(ctx context.Context) error {
 		if err := store.Within(ctx, func(ctx context.Context) error {
 			_, err := store.CreateObject(ctx, &beehive.RawObject{
-				Group: testGK.Group, Kind: testGK.Kind, Name: new("nested"),
+				Group: testGK.Group, Kind: testGK.Kind, Slug: new("nested"),
 				Spec: []byte(`{}`),
 			})
 			return err
@@ -823,7 +823,7 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, sentinel)
 
-	_, err = store.GetObjectByName(ctx, testGK, "nested")
+	_, err = store.GetObjectBySlug(ctx, testGK, "nested")
 	assert.ErrorIs(t, err, beehive.ErrNotFound,
 		"nested Within joins the outer tx, so the outer rollback discards its write")
 }
@@ -1159,7 +1159,7 @@ func TestListIncomingRefsDBError(t *testing.T) {
 func newConditionObject(t *testing.T, store beehive.Store, name string) *beehive.RawObject {
 	t.Helper()
 	obj, err := store.CreateObject(context.Background(), &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Name: new(name), Spec: []byte(`{}`),
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new(name), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	return obj
@@ -1218,7 +1218,7 @@ func TestConditionsSurfaceOnReads(t *testing.T) {
 	require.NoError(t, err)
 	assertBoth(t, byID.Conditions)
 
-	byName, err := store.GetObjectByName(ctx, testGK, "multi-read")
+	byName, err := store.GetObjectBySlug(ctx, testGK, "multi-read")
 	require.NoError(t, err)
 	assertBoth(t, byName.Conditions)
 

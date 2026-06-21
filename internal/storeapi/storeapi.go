@@ -87,7 +87,7 @@ type RawObject struct {
 	ID                  ObjectID
 	Group               string
 	Kind                string
-	Name                *string
+	Slug                *string
 	Spec                []byte // JSON, user-owned
 	Status              []byte // JSON, controller-owned; nil until first status write
 	Generation          int64
@@ -136,7 +136,7 @@ type Store interface {
 
 	// CreateObject inserts a new object. The store assigns ID and
 	// ResourceVersion and sets Generation to 1; the caller supplies the rest
-	// (Group, Kind, Name, Spec, Finalizers).
+	// (Group, Kind, Slug, Spec, Finalizers).
 	CreateObject(ctx context.Context, obj *RawObject) (*RawObject, error)
 
 	// GetObject loads an object by id, or returns ErrNotFound.
@@ -147,9 +147,9 @@ type Store interface {
 	// use it to avoid that extra read. Returns ErrNotFound if no object matches.
 	GetObjectMeta(ctx context.Context, id ObjectID) (*RawObject, error)
 
-	// GetObjectByName loads the object with the given name within gk, or returns
+	// GetObjectBySlug loads the object with the given slug within gk, or returns
 	// ErrNotFound.
-	GetObjectByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
+	GetObjectBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error)
 
 	// ListObjects returns every object of kind gk, ordered by id.
 	ListObjects(ctx context.Context, gk GroupKind) ([]*RawObject, error)

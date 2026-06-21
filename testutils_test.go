@@ -57,8 +57,8 @@ func (s *fakeStore) GetObject(context.Context, ObjectID) (*RawObject, error) {
 func (s *fakeStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
 	panic("not implemented: fakeStore.GetObjectMeta")
 }
-func (s *fakeStore) GetObjectByName(context.Context, GroupKind, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.GetObjectByName")
+func (s *fakeStore) GetObjectBySlug(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.GetObjectBySlug")
 }
 func (s *fakeStore) ListObjects(context.Context, GroupKind) ([]*RawObject, error) {
 	return nil, nil

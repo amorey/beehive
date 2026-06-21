@@ -148,7 +148,7 @@ type Object[Spec, Status any] struct {
     ID                  ObjectID
     Group               string
     Kind                string
-    Name                *string  // nil for internally-generated objects
+    Slug                *string  // nil for internally-generated objects
     Spec                Spec
     Status              *Status
     Generation          int64
@@ -191,7 +191,7 @@ type Client[Spec, Status any] interface {
     Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
     Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
     Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error)
-    GetByName(ctx context.Context, name string) (*Object[Spec, Status], error)
+    GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error)
     List(ctx context.Context) ([]*Object[Spec, Status], error)
     Delete(ctx context.Context, id ObjectID) error
     Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error)
@@ -201,11 +201,11 @@ type Client[Spec, Status any] interface {
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 ```
 
-`Create` generates a name unless `beehive.WithName` is provided. If a name is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
+`Create` generates a slug unless `beehive.WithSlug` is provided. If a slug is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
 
 ```go
 client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithName("prod-cluster"), beehive.WithFinalizers("kstack.sh/cluster"))
+obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithSlug("prod-cluster"), beehive.WithFinalizers("kstack.sh/cluster"))
 client.Update(ctx, obj.ID, ClusterSpec{...})
 ```
 
@@ -249,7 +249,7 @@ A non-nil error triggers an automatic retry with exponential backoff starting at
 ```go
 type Option interface{ apply(any) }
 
-func WithName(name string) Option                  // set a human-readable name; fails if already exists
+func WithSlug(slug string) Option                  // set a human-readable slug; fails if already exists
 func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithResyncInterval(d time.Duration) Option    // override the default resync interval

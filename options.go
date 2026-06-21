@@ -31,18 +31,18 @@ const (
 
 // createOptions collects the per-object settings the create-time options apply.
 // Client.Create builds one, runs the options against it, and folds the result
-// into the new row (name/finalizers) and its owner ref.
+// into the new row (slug/finalizers) and its owner ref.
 type createOptions struct {
-	name       *string
+	slug       *string
 	finalizers []string
 	owner      *ObjectID
 }
 
-// WithName sets the object's unique name, looked up later via GetByName.
-func WithName(name string) Option {
+// WithSlug sets the object's unique slug, looked up later via GetBySlug.
+func WithSlug(slug string) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {
-			t.name = &name
+			t.slug = &slug
 		}
 		return nil
 	}

@@ -21,7 +21,7 @@ type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
 	Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error)
-	GetByName(ctx context.Context, name string) (*Object[Spec, Status], error)
+	GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error)
 	List(ctx context.Context) ([]*Object[Spec, Status], error)
 	Delete(ctx context.Context, id ObjectID) error
 	Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error)
@@ -58,7 +58,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 		raw, err = c.bh.store.CreateObject(ctx, &RawObject{
 			Group:      c.gk.Group,
 			Kind:       c.gk.Kind,
-			Name:       co.name,
+			Slug:       co.slug,
 			Spec:       b,
 			Finalizers: co.finalizers,
 		})
@@ -140,8 +140,8 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	return err
 }
 
-func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string) (*Object[Spec, Status], error) {
-	raw, err := c.bh.store.GetObjectByName(ctx, c.gk, name)
+func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error) {
+	raw, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +268,7 @@ func rawToTyped[Spec, Status any](raw *RawObject) (*Object[Spec, Status], error)
 		ID:                  raw.ID,
 		Group:               raw.Group,
 		Kind:                raw.Kind,
-		Name:                raw.Name,
+		Slug:                raw.Slug,
 		Spec:                spec,
 		Generation:          raw.Generation,
 		ObservedGeneration:  raw.ObservedGeneration,
