@@ -142,6 +142,11 @@ type Store interface {
 	// GetObject loads an object by id, or returns ErrNotFound.
 	GetObject(ctx context.Context, id ObjectID) (*RawObject, error)
 
+	// GetObjectMeta is GetObject without the conditions query: the returned
+	// Conditions is always nil. Metadata-only callers (GC collect, ref bookkeeping)
+	// use it to avoid that extra read. Returns ErrNotFound if no object matches.
+	GetObjectMeta(ctx context.Context, id ObjectID) (*RawObject, error)
+
 	// GetObjectByName loads the object with the given name within gk, or returns
 	// ErrNotFound.
 	GetObjectByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
@@ -216,6 +221,13 @@ type Store interface {
 	// DeleteObject removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.
 	DeleteObject(ctx context.Context, id ObjectID) error
+
+	// MarkOwnedForDeletion is the GC cascade as one command: it marks every object
+	// that owned_by ownerID for deletion and returns them all to requeue. It stamps
+	// (and emits a Modified for) only children not already deletion-pending, so a
+	// re-cascade over an already-deleting subtree is a single read — no per-child
+	// write every sweep.
+	MarkOwnedForDeletion(ctx context.Context, ownerID ObjectID) ([]Referrer, error)
 
 	// AddRef inserts a directed (fromID -> toID) edge with the given relation.
 	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on

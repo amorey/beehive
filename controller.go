@@ -126,7 +126,7 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fro
 		if wakes == nil {
 			return nil
 		}
-		target, err := c.bh.store.GetObject(ctx, toID)
+		target, err := c.bh.store.GetObjectMeta(ctx, toID)
 		if errors.Is(err, ErrNotFound) {
 			return nil // target already gone
 		}

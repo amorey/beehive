@@ -51,7 +51,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 	// matching the dependency waker's post-commit pattern.
 	var toWake []Referrer
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
-		obj, err := bh.store.GetObject(ctx, id)
+		obj, err := bh.store.GetObjectMeta(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -60,15 +60,11 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 			return nil
 		}
 
-		// Cascade deletion to owned children.
-		children, err := bh.store.ListReferrers(ctx, id, RelationOwnedBy)
+		// Cascade deletion to owned children, requeuing them all (see
+		// MarkOwnedForDeletion for the steady-state single-read path).
+		children, err := bh.store.MarkOwnedForDeletion(ctx, id)
 		if err != nil {
 			return err
-		}
-		for _, c := range children {
-			if _, _, err := bh.store.RequestDeletion(ctx, GroupKind{Group: c.Group, Kind: c.Kind}, c.ID); err != nil {
-				return err
-			}
 		}
 		toWake = append(toWake, children...)
 

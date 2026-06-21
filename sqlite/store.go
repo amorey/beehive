@@ -222,6 +222,12 @@ func (s *sqliteStore) GetObject(ctx context.Context, id storeapi.ObjectID) (*sto
 	return s.attachConditions(ctx, obj)
 }
 
+// GetObjectMeta is getObjectRow exposed across the store boundary: id's row with
+// no conditions assembled, for metadata-only callers (GC collect, ref checks).
+func (s *sqliteStore) GetObjectMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+	return s.getObjectRow(ctx, id)
+}
+
 func (s *sqliteStore) GetObjectByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
@@ -684,55 +690,109 @@ func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind
 	return result, err
 }
 
+// markForDeletion stamps id's deletion clock and emits a Modified, once: the
+// `IS NULL` guard makes a repeat a no-op (changed=false, ErrNotFound) so retries
+// don't churn the watch cursor. extraWhere folds an extra guard into the statement
+// (e.g. the kind scope). The row persists (deletion is async via finalizers), so
+// the emitted object still carries its conditions, matching Get/List. Runs on the
+// ambient connection — callers wrap it in Within to make rv-bump/write/emit atomic.
+func (s *sqliteStore) markForDeletion(ctx context.Context, id storeapi.ObjectID, extraWhere string, extraArgs ...any) (*storeapi.RawObject, bool, error) {
+	c := s.conn(ctx)
+	rv, err := nextResourceVersion(ctx, c)
+	if err != nil {
+		return nil, false, err
+	}
+	now := toMillis(time.Now().UTC())
+	args := append([]any{now, rv, now, id}, extraArgs...)
+	row := c.QueryRowContext(ctx, `
+		UPDATE objects
+		SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
+		WHERE id = ? AND deletion_requested_at IS NULL`+extraWhere+`
+		RETURNING `+objectColumns, args...)
+	obj, err := s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+	if err != nil {
+		return nil, false, err // ErrNotFound = no transition (guard/extraWhere/missing)
+	}
+	return obj, true, nil
+}
+
 func (s *sqliteStore) RequestDeletion(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
 	// Within keeps the rv-bump, write, and emit atomic now that callers no longer
 	// always wrap RequestDeletion (mutators self-wrap; nested it joins the caller's
-	// transaction — e.g. the GC cascade).
+	// transaction — e.g. the GC cascade). The kind is folded in so a foreign id
+	// matches no row.
 	var result *storeapi.RawObject
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
-		c := s.conn(ctx)
-		rv, err := nextResourceVersion(ctx, c)
-		if err != nil {
-			return err
-		}
-		now := toMillis(time.Now().UTC())
-		// Only the first request is a real change: the `IS NULL` guard stamps the
-		// deletion clock and bumps resource_version exactly once, so retries and
-		// requeues don't churn the watch cursor for an idempotent no-op. The kind
-		// is folded in so a foreign id matches no row.
-		row := c.QueryRowContext(ctx, `
-			UPDATE objects
-			SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
-			WHERE id = ? AND deletion_requested_at IS NULL AND "group" = ? AND kind = ?
-			RETURNING `+objectColumns,
-			now, rv, now, id, gk.Group, gk.Kind)
-		obj, err := scanObject(row)
+		obj, ch, err := s.markForDeletion(ctx, id, ` AND "group" = ? AND kind = ?`, gk.Group, gk.Kind)
 		if errors.Is(err, storeapi.ErrNotFound) {
-			// Zero rows: the object is already deleting (the no-op we skipped), names
-			// another kind, or doesn't exist. The scoped re-read distinguishes them.
-			// No event: an idempotent no-op carries the same resource_version, so a
-			// watcher would otherwise see a spurious diff.
-			obj, err = s.getObjectRowScoped(ctx, gk, id)
-			if err != nil {
-				return err // ErrNotFound (gone) or ErrWrongKind
+			// Zero rows: already deleting (the no-op), another kind, or gone. The scoped
+			// re-read distinguishes them and returns the current row for the no-op case.
+			cur, rerr := s.getObjectRowScoped(ctx, gk, id)
+			if rerr != nil {
+				return rerr // ErrNotFound (gone) or ErrWrongKind
 			}
-			result, err = s.attachConditions(ctx, obj)
+			result, err = s.attachConditions(ctx, cur)
 			return err
 		}
 		if err != nil {
 			return err
 		}
-		// The row persists (deletion is async via finalizers), so it still has its
-		// conditions: assemble them so the result and event match Get/List.
-		if _, err := s.attachConditions(ctx, obj); err != nil {
-			return err
-		}
-		s.emit(ctx, storeapi.WatchEventModified, obj)
-		result, changed = obj, true
+		result, changed = obj, ch
 		return nil
 	})
 	return result, changed, err
+}
+
+// MarkOwnedForDeletion cascades deletion to ownerID's owned children. One indexed
+// pass over the owned_by edge (idx_refs_to) reads each child's deletion state;
+// markForDeletion then stamps only those not already deleting. So a re-cascade over
+// an already-deleting subtree (the steady-state resync) is a lone SELECT — no
+// writes, no events. It returns every owned child for requeue, deleting or not.
+func (s *sqliteStore) MarkOwnedForDeletion(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.Referrer, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT o.id, o."group", o.kind, o.deletion_requested_at
+		FROM refs r JOIN objects o ON o.id = r.from_id
+		WHERE r.to_id = ? AND r.relation = ?
+		ORDER BY o.id`, ownerID, string(storeapi.RelationOwnedBy))
+	if err != nil {
+		return nil, err
+	}
+	type child struct {
+		ref      storeapi.Referrer
+		deleting bool
+	}
+	var children []child
+	for rows.Next() {
+		var ch child
+		var delAt *int64
+		if err := rows.Scan(&ch.ref.ID, &ch.ref.Group, &ch.ref.Kind, &delAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ch.deleting = delAt != nil
+		children = append(children, ch)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close() // free the single-conn pool before the per-child writes below
+
+	out := make([]storeapi.Referrer, 0, len(children))
+	for _, ch := range children {
+		out = append(out, ch.ref)
+		if ch.deleting {
+			continue // already deletion-pending: nothing to stamp
+		}
+		// A race could have set the flag since the SELECT; markForDeletion's guard
+		// then returns ErrNotFound — benign here.
+		if _, _, err := s.markForDeletion(ctx, ch.ref.ID, ""); err != nil &&
+			!errors.Is(err, storeapi.ErrNotFound) {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) error {

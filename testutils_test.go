@@ -54,6 +54,9 @@ func (s *fakeStore) CreateObject(context.Context, *RawObject) (*RawObject, error
 func (s *fakeStore) GetObject(context.Context, ObjectID) (*RawObject, error) {
 	panic("not implemented: fakeStore.GetObject")
 }
+func (s *fakeStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.GetObjectMeta")
+}
 func (s *fakeStore) GetObjectByName(context.Context, GroupKind, string) (*RawObject, error) {
 	panic("not implemented: fakeStore.GetObjectByName")
 }
@@ -92,6 +95,9 @@ func (s *fakeStore) DeleteCondition(context.Context, GroupKind, ObjectID, string
 }
 func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.DeleteObject")
+}
+func (s *fakeStore) MarkOwnedForDeletion(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+	panic("not implemented: fakeStore.MarkOwnedForDeletion")
 }
 func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
 	panic("not implemented: fakeStore.AddRef")

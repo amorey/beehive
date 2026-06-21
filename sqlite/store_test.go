@@ -336,6 +336,109 @@ func TestRepeatRequestDeletionDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
+// GetObjectMeta returns the same row as GetObject but skips assembling conditions
+// (the over-fetch the GC/ref metadata-only callers used to pay).
+func TestGetObjectMetaSkipsConditions(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, err = store.SetCondition(ctx, testGK, created.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	full, err := store.GetObject(ctx, created.ID)
+	require.NoError(t, err)
+	require.Len(t, full.Conditions, 1, "GetObject assembles conditions")
+
+	meta, err := store.GetObjectMeta(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Nil(t, meta.Conditions, "GetObjectMeta must not assemble conditions")
+	// Otherwise the same row: id and version match the conditions-laden read.
+	assert.Equal(t, full.ID, meta.ID)
+	assert.Equal(t, full.ResourceVersion, meta.ResourceVersion)
+}
+
+// MarkOwnedForDeletion marks every owned child for deletion and returns them all;
+// a re-cascade over already-deleting children writes nothing (the O(1) steady
+// state) yet still returns them for requeue.
+func TestMarkOwnedForDeletionCascadesThenIsNoOp(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	mk := func() storeapi.ObjectID {
+		o, err := store.CreateObject(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		return o.ID
+	}
+	owner, childA, childB := mk(), mk(), mk()
+	require.NoError(t, store.AddRef(ctx, childA, owner, beehive.RelationOwnedBy))
+	require.NoError(t, store.AddRef(ctx, childB, owner, beehive.RelationOwnedBy))
+
+	// Watch live changes only (no snapshot) so each cascade's events are isolated.
+	w, err := store.WatchEvents(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// First cascade marks both children (a Modified each) and returns both.
+	got, err := store.MarkOwnedForDeletion(ctx, owner)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	for i := 0; i < 2; i++ {
+		assert.Equal(t, beehive.WatchEventModified, recvEvent(t, w).Type)
+	}
+	a1, err := store.GetObjectMeta(ctx, childA)
+	require.NoError(t, err)
+	require.NotNil(t, a1.DeletionRequestedAt, "child A marked for deletion")
+	b1, err := store.GetObjectMeta(ctx, childB)
+	require.NoError(t, err)
+	require.NotNil(t, b1.DeletionRequestedAt, "child B marked for deletion")
+
+	// Second cascade over the now-deleting children: still returns both, but writes
+	// nothing and emits nothing — no resource_version churn, no events.
+	got2, err := store.MarkOwnedForDeletion(ctx, owner)
+	require.NoError(t, err)
+	require.Len(t, got2, 2)
+	assertNoEvent(t, w, 100*time.Millisecond)
+	a2, err := store.GetObjectMeta(ctx, childA)
+	require.NoError(t, err)
+	assert.Equal(t, a1.ResourceVersion, a2.ResourceVersion, "no re-mark, no rv churn")
+	b2, err := store.GetObjectMeta(ctx, childB)
+	require.NoError(t, err)
+	assert.Equal(t, b1.ResourceVersion, b2.ResourceVersion)
+}
+
+// MarkOwnedForDeletion's child lookup must ride the idx_refs_to index, not scan
+// the refs table — that index alignment is the point of the single-query cascade.
+func TestMarkOwnedForDeletionUsesRefsIndex(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	ctx := context.Background()
+
+	rows, err := store.db.QueryContext(ctx, `
+		EXPLAIN QUERY PLAN
+		SELECT o.id, o."group", o.kind, o.deletion_requested_at
+		FROM refs r JOIN objects o ON o.id = r.from_id
+		WHERE r.to_id = ? AND r.relation = ?
+		ORDER BY o.id`, int64(1), string(storeapi.RelationOwnedBy))
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notused, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+	assert.Contains(t, plan, "idx_refs_to", "child lookup must use idx_refs_to:\n"+plan)
+}
+
 func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
