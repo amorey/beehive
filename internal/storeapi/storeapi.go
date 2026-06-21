@@ -258,16 +258,16 @@ type Store interface {
 	// removed (the foreground cascade).
 	DeleteFinalizingDependsOnRefs(ctx context.Context, toID ObjectID) error
 
-	// HasReferrers reports whether any object with a live claim points at id: an
+	// HasIncomingRefs reports whether any object with a live claim points at id: an
 	// owned_by edge, or a depends_on edge from a source that is not itself
 	// finalizing. A depends_on edge from a deletion-pending source is ignored —
 	// that dependent is going away and no longer has a claim, so it must not gate a
 	// finalizer (two mutually dependent finalizing objects would otherwise never
-	// see HasReferrers clear). owned_by always counts: the foreground cascade must
+	// see HasIncomingRefs clear). owned_by always counts: the foreground cascade must
 	// wait for the owned child to be physically removed. GC pairs this with
 	// DeleteFinalizingDependsOnRefs, which physically removes the ignored edges
 	// before DeleteObject so the refs RESTRICT is satisfied.
-	HasReferrers(ctx context.Context, id ObjectID) (bool, error)
+	HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
 
 	// Watch returns a Watcher for the single object id of kind gk: its current
 	// state (if any) as an Added snapshot, then live changes filtered to that id.

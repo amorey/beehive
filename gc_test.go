@@ -82,25 +82,25 @@ func (c *finalizerClearingController) Reconcile(ctx context.Context, obj *Object
 	return Result{}, nil
 }
 
-// hasReferrersGatingController models the documented finalizer workflow: an
-// object holding `finalizer` clears it only once HasReferrers reports no live
+// hasIncomingRefsGatingController models the documented finalizer workflow: an
+// object holding `finalizer` clears it only once HasIncomingRefs reports no live
 // claim, so a shared resource outlives its last real user. Objects that don't
 // hold the finalizer are left for GC directly.
-type hasReferrersGatingController struct {
+type hasIncomingRefsGatingController struct {
 	finalizer string
 
 	mu sync.Mutex
 	cc ControllerClient[cStatus]
 }
 
-func (c *hasReferrersGatingController) Start(cc ControllerClient[cStatus]) error {
+func (c *hasIncomingRefsGatingController) Start(cc ControllerClient[cStatus]) error {
 	c.mu.Lock()
 	c.cc = cc
 	c.mu.Unlock()
 	return nil
 }
-func (c *hasReferrersGatingController) Stop(context.Context) error { return nil }
-func (c *hasReferrersGatingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *hasIncomingRefsGatingController) Stop(context.Context) error { return nil }
+func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt == nil {
 		return Result{}, nil
 	}
@@ -116,7 +116,7 @@ func (c *hasReferrersGatingController) Reconcile(ctx context.Context, obj *Objec
 	c.mu.Lock()
 	cc := c.cc
 	c.mu.Unlock()
-	referenced, err := cc.HasReferrers(ctx, obj.ID)
+	referenced, err := cc.HasIncomingRefs(ctx, obj.ID)
 	if err != nil || referenced {
 		return Result{}, err // a live user remains; keep the finalizer
 	}
@@ -317,7 +317,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	// Resync disabled: the finalizer gate must clear purely event-driven.
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, clientTestGK, &hasReferrersGatingController{finalizer: "gate"}))
+	require.NoError(t, Register(bh, clientTestGK, &hasIncomingRefsGatingController{finalizer: "gate"}))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj, err := client.Create(ctx, cSpec{Val: "self"}, WithFinalizers("gate"))

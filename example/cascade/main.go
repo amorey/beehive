@@ -12,7 +12,7 @@
 //	  -> GC requests deletion of every owned ClusterCache (cascade)
 //	  -> each cache flushes, clears its finalizer, and is removed
 //	  -> only once no cache references it does the Cluster close its
-//	     connection (gated on HasReferrers), clear its finalizer, and get removed
+//	     connection (gated on HasIncomingRefs), clear its finalizer, and get removed
 //
 // The Cluster's connection therefore outlives its caches: the owner is the last
 // thing collected. Run it with `go run ./example/cascade/main.go`.
@@ -64,9 +64,9 @@ func (c *ClusterController) Stop(_ context.Context) error { return nil }
 func (c *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		// Hold the connection open while any cache still has a live claim on us.
-		// HasReferrers ignores caches that are themselves finalizing, so this clears
+		// HasIncomingRefs ignores caches that are themselves finalizing, so this clears
 		// once the owned caches are gone — not merely marked for deletion.
-		referenced, err := c.client.HasReferrers(ctx, obj.ID)
+		referenced, err := c.client.HasIncomingRefs(ctx, obj.ID)
 		if err != nil {
 			return beehive.Result{}, err
 		}

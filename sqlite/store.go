@@ -912,14 +912,14 @@ func (s *sqliteStore) DeleteFinalizingDependsOnRefs(ctx context.Context, toID st
 	return err
 }
 
-// HasReferrers reports whether any object with a live claim points at id: an
+// HasIncomingRefs reports whether any object with a live claim points at id: an
 // owned_by edge, or a depends_on edge from a source that is not itself
 // finalizing. A depends_on edge from a deletion-pending source is ignored — that
 // dependent is going away and no longer has a claim, so it must not gate a
-// finalizer (HasReferrers would otherwise never clear when two finalizing
+// finalizer (HasIncomingRefs would otherwise never clear when two finalizing
 // objects depend on each other). owned_by always counts: the foreground cascade
 // must wait for the owned child to be physically removed.
-func (s *sqliteStore) HasReferrers(ctx context.Context, id storeapi.ObjectID) (bool, error) {
+func (s *sqliteStore) HasIncomingRefs(ctx context.Context, id storeapi.ObjectID) (bool, error) {
 	var exists int
 	err := s.conn(ctx).QueryRowContext(ctx, `
 		SELECT EXISTS(

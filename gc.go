@@ -81,7 +81,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		}
 		// Still referenced (owned children or live dependents): RESTRICT forbids the
 		// delete. Leave the row; a referrer's own removal will wake us (below).
-		referenced, err := bh.store.HasReferrers(ctx, id)
+		referenced, err := bh.store.HasIncomingRefs(ctx, id)
 		if err != nil {
 			return err
 		}

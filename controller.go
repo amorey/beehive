@@ -37,13 +37,13 @@ type ControllerClient[Status any] interface {
 	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
 	AddDependency(ctx context.Context, fromID, toID ObjectID) error
 	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
-	// HasReferrers reports whether any object with a live claim still points at id:
+	// HasIncomingRefs reports whether any object with a live claim still points at id:
 	// an owned child, or a dependent that is not itself being deleted. A dependent
 	// that is itself finalizing is excluded — it's going away and no longer has a
 	// claim. A finalizer can gate teardown on this: a controller holding a shared
 	// resource clears its finalizer only once nothing with a live claim references
 	// the object, so the resource outlives its last real user.
-	HasReferrers(ctx context.Context, id ObjectID) (bool, error)
+	HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
 	// Within runs fn inside a single transaction: the ControllerClient writes fn
 	// makes (with the ctx passed to it) all commit together on a nil return, or all
 	// roll back on error. Reconcile itself is not transactional — each write
@@ -140,12 +140,12 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fro
 	})
 }
 
-// HasReferrers reports whether anything still claims id. It is a plain read that
+// HasIncomingRefs reports whether anything still claims id. It is a plain read that
 // commits on its own; to gate a write on it atomically — e.g. clearing a finalizer
 // only if nothing references the object — a controller runs both inside Within, so
 // the read and the write share one transaction snapshot.
-func (c *controllerClientImpl[Status]) HasReferrers(ctx context.Context, id ObjectID) (bool, error) {
-	return c.bh.store.HasReferrers(ctx, id)
+func (c *controllerClientImpl[Status]) HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error) {
+	return c.bh.store.HasIncomingRefs(ctx, id)
 }
 
 // Within opens a transaction and runs fn under it; the ControllerClient writes fn

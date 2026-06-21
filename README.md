@@ -221,12 +221,12 @@ type ControllerClient[Status any] interface {
     DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
     AddDependency(ctx context.Context, fromID, toID ObjectID) error
     DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
-    HasReferrers(ctx context.Context, id ObjectID) (bool, error)
+    HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
 
-`HasReferrers` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
+`HasIncomingRefs` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
 ### Controller
 

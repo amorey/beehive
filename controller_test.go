@@ -246,7 +246,7 @@ func TestControllerClientAddDependencyIsTransactional(t *testing.T) {
 		"AddDependency must wrap its endpoint check + insert in one transaction")
 }
 
-func TestControllerClientHasReferrers(t *testing.T) {
+func TestControllerClientHasIncomingRefs(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
@@ -270,11 +270,11 @@ func TestControllerClientHasReferrers(t *testing.T) {
 	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
 
-	has, err := cc.HasReferrers(ctx, owner.ID)
+	has, err := cc.HasIncomingRefs(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.True(t, has, "owner is referenced by the child")
 
-	has, err = cc.HasReferrers(ctx, child.ID)
+	has, err = cc.HasIncomingRefs(ctx, child.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "nothing references the child")
 }
@@ -283,7 +283,7 @@ func TestControllerClientHasReferrers(t *testing.T) {
 // status/condition/finalizer writes refuse an id belonging to another kind: a
 // controller for "Widget" must not be able to persist its Status (or mutate
 // conditions/finalizers) on a "Gadget" row, which would corrupt that kind's
-// rows. AddDependency/HasReferrers are intentionally cross-kind and not guarded.
+// rows. AddDependency/HasIncomingRefs are intentionally cross-kind and not guarded.
 func TestControllerClientWritesScopedToKind(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -320,20 +320,20 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	assert.Equal(t, []string{"f"}, got.Finalizers, "foreign finalizer write rejected")
 }
 
-// failHasReferrersStore returns an error from HasReferrers.
-type failHasReferrersStore struct {
+// failHasIncomingRefsStore returns an error from HasIncomingRefs.
+type failHasIncomingRefsStore struct {
 	fakeStore
 }
 
-func (s *failHasReferrersStore) HasReferrers(context.Context, ObjectID) (bool, error) {
+func (s *failHasIncomingRefsStore) HasIncomingRefs(context.Context, ObjectID) (bool, error) {
 	return false, errBoom
 }
 
-func TestControllerClientHasReferrersStoreError(t *testing.T) {
-	bh, err := New(&failHasReferrersStore{})
+func TestControllerClientHasIncomingRefsStoreError(t *testing.T) {
+	bh, err := New(&failHasIncomingRefsStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	_, err = cc.HasReferrers(context.Background(), 1)
+	_, err = cc.HasIncomingRefs(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 

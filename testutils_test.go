@@ -114,7 +114,7 @@ func (s *fakeStore) ListOutgoingRefs(context.Context, ObjectID) ([]storeapi.Refe
 func (s *fakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {
 	return nil
 }
-func (s *fakeStore) HasReferrers(context.Context, ObjectID) (bool, error) {
+func (s *fakeStore) HasIncomingRefs(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 

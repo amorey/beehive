@@ -598,28 +598,28 @@ func TestDeleteFinalizingDependsOnRefs(t *testing.T) {
 	assert.Equal(t, 1, countRefs(t, store, owned.ID, target.ID, "owned_by"))
 }
 
-func TestHasReferrers(t *testing.T) {
+func TestHasIncomingRefs(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	owner := newRefObject(t, store)
 	child := newRefObject(t, store)
 
-	has, err := store.HasReferrers(ctx, owner.ID)
+	has, err := store.HasIncomingRefs(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "no edges yet")
 
 	require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, beehive.RelationOwnedBy))
 
-	has, err = store.HasReferrers(ctx, owner.ID)
+	has, err = store.HasIncomingRefs(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.True(t, has, "owner is referenced by the child")
 
-	has, err = store.HasReferrers(ctx, child.ID)
+	has, err = store.HasIncomingRefs(ctx, child.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "child is the source, not a target")
 }
 
-func TestHasReferrersIgnoresFinalizingDependent(t *testing.T) {
+func TestHasIncomingRefsIgnoresFinalizingDependent(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	target := newRefObject(t, store)
@@ -627,14 +627,14 @@ func TestHasReferrersIgnoresFinalizingDependent(t *testing.T) {
 	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, beehive.RelationDependsOn))
 
 	// A live dependent has a claim: it counts.
-	has, err := store.HasReferrers(ctx, target.ID)
+	has, err := store.HasIncomingRefs(ctx, target.ID)
 	require.NoError(t, err)
 	assert.True(t, has)
 
 	// Once the dependent is itself finalizing, its claim is void — it's going away.
 	_, _, err = store.RequestDeletion(ctx, testGK, dep.ID)
 	require.NoError(t, err)
-	has, err = store.HasReferrers(ctx, target.ID)
+	has, err = store.HasIncomingRefs(ctx, target.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "a finalizing dependent does not count as a referrer")
 
@@ -644,7 +644,7 @@ func TestHasReferrersIgnoresFinalizingDependent(t *testing.T) {
 	require.NoError(t, store.AddRef(ctx, child.ID, target.ID, beehive.RelationOwnedBy))
 	_, _, err = store.RequestDeletion(ctx, testGK, child.ID)
 	require.NoError(t, err)
-	has, err = store.HasReferrers(ctx, target.ID)
+	has, err = store.HasIncomingRefs(ctx, target.ID)
 	require.NoError(t, err)
 	assert.True(t, has, "a finalizing owned child still blocks deletion")
 }
