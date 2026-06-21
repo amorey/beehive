@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package beehive is an embedded, Kubernetes-inspired control plane backed by a
+// durable store: users declare desired Spec and controllers reconcile actual
+// state toward it, level-triggered, coordinating only through the shared store.
 package beehive
 
 import (

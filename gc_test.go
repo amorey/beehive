@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -160,6 +161,101 @@ func waitForDeletions(t *testing.T, w <-chan WatchEvent[cSpec, cStatus], want ..
 			t.Fatalf("timed out waiting for deletions; still pending: %v", pending)
 		}
 	}
+}
+
+// collectFakeStore drives collect's transaction body with controllable results
+// so each store-call error branch can be exercised in isolation. GetObjectMeta
+// returns a finalizing object (so collect proceeds past the live-object guard);
+// the per-method hooks default to success and are overridden per test. Within
+// runs fn inline (from the embedded fakeStore), so all of collect runs here.
+type collectFakeStore struct {
+	fakeStore
+	finalizers      []string // on the collected object
+	getMetaErr      error    // GetObjectMeta
+	markErr         error    // MarkOwnedForDeletion
+	dropDependsErr  error    // DeleteFinalizingDependsOnRefs
+	hasRefs         bool     // HasIncomingRefs result
+	hasRefsErr      error    // HasIncomingRefs error
+	outgoingErr     error    // ListOutgoingRefs error
+	deleteObjectErr error    // DeleteObject error
+}
+
+func (s *collectFakeStore) GetObjectMeta(_ context.Context, id ObjectID) (*RawObject, error) {
+	if s.getMetaErr != nil {
+		return nil, s.getMetaErr
+	}
+	now := time.Now()
+	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
+}
+func (s *collectFakeStore) MarkOwnedForDeletion(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+	return nil, s.markErr
+}
+func (s *collectFakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {
+	return s.dropDependsErr
+}
+func (s *collectFakeStore) HasIncomingRefs(context.Context, ObjectID) (bool, error) {
+	return s.hasRefs, s.hasRefsErr
+}
+func (s *collectFakeStore) ListOutgoingRefs(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+	return nil, s.outgoingErr
+}
+func (s *collectFakeStore) DeleteObject(context.Context, ObjectID) error {
+	return s.deleteObjectErr
+}
+
+func TestCollectGetObjectMetaError(t *testing.T) {
+	bh, err := New(&collectFakeStore{getMetaErr: errBoom})
+	require.NoError(t, err)
+	_, err = bh.collect(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectMarkOwnedForDeletionError(t *testing.T) {
+	bh, err := New(&collectFakeStore{markErr: errBoom})
+	require.NoError(t, err)
+	_, err = bh.collect(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectDropDependsRefsError(t *testing.T) {
+	bh, err := New(&collectFakeStore{dropDependsErr: errBoom})
+	require.NoError(t, err)
+	_, err = bh.collect(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectHasIncomingRefsError(t *testing.T) {
+	bh, err := New(&collectFakeStore{hasRefsErr: errBoom})
+	require.NoError(t, err)
+	_, err = bh.collect(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectListOutgoingRefsError(t *testing.T) {
+	// hasRefs false so collect proceeds to the delete prep where ListOutgoingRefs runs.
+	bh, err := New(&collectFakeStore{outgoingErr: errBoom})
+	require.NoError(t, err)
+	_, err = bh.collect(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectDeleteObjectError(t *testing.T) {
+	bh, err := New(&collectFakeStore{deleteObjectErr: errBoom})
+	require.NoError(t, err)
+	_, err = bh.collect(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+// TestAdvanceGCSynchronousCollectFailureLogs covers the advanceGC branch that, for
+// a client-only kind with resync disabled, collects synchronously and logs a
+// warning when that collect fails. No controller is registered for the kind, and
+// resyncInterval is 0, so advanceGC takes the synchronous-collect path.
+func TestAdvanceGCSynchronousCollectFailureLogs(t *testing.T) {
+	bh, err := New(&collectFakeStore{markErr: errBoom}, WithResyncInterval(0))
+	require.NoError(t, err)
+	// advanceGC swallows the error (it only logs); the call must not panic and must
+	// take the synchronous-collect branch (no reconciler, resync disabled).
+	bh.advanceGC(context.Background(), GroupKind{Kind: "ClientOnly"}, 1)
 }
 
 // gcFixture builds a Beehive over a real sqlite store plus a client, so collect

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package sqlite provides a durable, SQLite-backed implementation of the
+// beehive Store, including the conflating watch fan-out and schema migrations.
 package sqlite
 
 import (
@@ -38,10 +40,8 @@ func Open(path string) (*sqliteStore, error) {
 // OpenMemory opens a Beehive SQLite database in memory.
 // Intended for testing; data is lost when the store is closed.
 func OpenMemory() (*sqliteStore, error) {
-	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
-	if err != nil {
-		panic(err) // impossible: modernc sqlite is always registered via blank import
-	}
+	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
+	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return open(db)

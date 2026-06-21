@@ -29,7 +29,7 @@
 //	     connection (gated on HasIncomingRefs), clear its finalizer, and get removed
 //
 // The Cluster's connection therefore outlives its caches: the owner is the last
-// thing collected. Run it with `go run ./example/cascade/main.go`.
+// thing collected. Run it with `go run ./examples/cascade/main.go`.
 package main
 
 import (

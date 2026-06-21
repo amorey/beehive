@@ -26,7 +26,7 @@
 //
 //	Create(spec) -> Reconcile (1/3, Progressing) -> ... -> Reconcile (3/3, Ready) -> converged
 //
-// Run it with `go run ./example/conditions/main.go`. The watch loop prints the
+// Run it with `go run ./examples/conditions/main.go`. The watch loop prints the
 // object's conditions after each change so you can watch them evolve.
 package main
 

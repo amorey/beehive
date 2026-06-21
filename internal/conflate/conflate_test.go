@@ -224,6 +224,9 @@ func TestSenderCloseDrainsThenErrClosed(t *testing.T) {
 	_, err := rx.RecvContext(context.Background())
 	assert.ErrorIs(t, err, ErrClosed)
 	assert.ErrorIs(t, tx.Send(3, 33), ErrClosed)
+	// Second Close is a harmless no-op (idempotent guard), not a re-signal/panic.
+	tx.Close()
+	assert.ErrorIs(t, tx.Send(4, 44), ErrClosed)
 }
 
 func TestCloseRaceBeforeLock(t *testing.T) {

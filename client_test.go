@@ -65,6 +65,26 @@ func TestClientUpdateMarshalError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestClientCreateOptionError verifies Create propagates an error returned by a
+// per-call Option (before any store write), so a bad option fails fast.
+func TestClientCreateOptionError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	// An option that fails when applied to the create-options target.
+	badOpt := func(target any) error {
+		if _, ok := target.(*createOptions); ok {
+			return errBoom
+		}
+		return nil
+	}
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "x"}, badOpt)
+	require.ErrorIs(t, err, errBoom)
+}
+
 func TestClientCreate(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))

@@ -73,3 +73,19 @@ func TestLevelHandlerPreservesAttrs(t *testing.T) {
 	assert.True(t, strings.Contains(out, "kind=Widget"), "attr from With survived the wrapper: %q", out)
 	assert.Contains(t, out, "id=7")
 }
+
+// The level wrapper must also preserve groups attached after resolution, since a
+// group must namespace the record's attrs the same way it would on the inner
+// handler. Mirrors TestLevelHandlerPreservesAttrs but exercises WithGroup.
+func TestLevelHandlerPreservesGroups(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	log := resolveLogger(base, slog.LevelInfo).WithGroup("g")
+	log.Info("hello", "id", 7)
+
+	// The TextHandler prefixes grouped attrs with "g.", proving WithGroup reached
+	// the inner handler through the levelHandler.
+	out := buf.String()
+	assert.Contains(t, out, "g.id=7")
+}

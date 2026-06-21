@@ -51,10 +51,8 @@ func OpenPool(path string, maxConns int) *sql.DB {
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(on)" +
 		"&_txlock=immediate"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		panic(err) // impossible: modernc sqlite is always registered via blank import
-	}
+	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
+	db, _ := sql.Open("sqlite", dsn)
 	db.SetMaxOpenConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return db

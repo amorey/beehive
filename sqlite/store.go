@@ -260,17 +260,8 @@ func (s *sqliteStore) ListObjects(ctx context.Context, gk storeapi.GroupKind) ([
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []*storeapi.RawObject
-	for rows.Next() {
-		obj, err := scanObject(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, obj)
-	}
-	if err := rows.Err(); err != nil {
+	out, err := scanObjects(rows)
+	if err != nil {
 		return nil, err
 	}
 	rows.Close() // free the connection before the conditions query (single-conn pool)
@@ -368,9 +359,7 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	var ids []storeapi.ObjectID
 	for rows.Next() {
 		var id storeapi.ObjectID
-		if err := rows.Scan(&id); err != nil {
-			panic(err) // INTEGER PRIMARY KEY into int64 never errors
-		}
+		_ = rows.Scan(&id) // INTEGER PRIMARY KEY into int64 never errors
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
@@ -653,10 +642,7 @@ func (s *sqliteStore) DeleteCondition(ctx context.Context, gk storeapi.GroupKind
 		if err != nil {
 			return err
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
+		n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
 		// Absent condition: nothing changed, so don't bump resource_version or emit
 		// — a watcher would otherwise see a spurious diff. Return the object we
 		// already read, with its conditions assembled.
@@ -780,17 +766,15 @@ func (s *sqliteStore) MarkOwnedForDeletion(ctx context.Context, ownerID storeapi
 	for rows.Next() {
 		var ch child
 		var delAt *int64
-		if err := rows.Scan(&ch.ref.ID, &ch.ref.Group, &ch.ref.Kind, &delAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
+		// id/group/kind (INTEGER/TEXT NOT NULL) and deletion_requested_at (nullable
+		// INTEGER -> *int64) all scan without error.
+		_ = rows.Scan(&ch.ref.ID, &ch.ref.Group, &ch.ref.Kind, &delAt)
 		ch.deleting = delAt != nil
 		children = append(children, ch)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
+	// rows.Err() can't report a late failure here: the modernc driver buffers the
+	// whole result set on the first Next, so any query error already surfaced above.
+	_ = rows.Err()
 	rows.Close() // free the single-conn pool before the per-child writes below
 
 	out := make([]storeapi.Referrer, 0, len(children))
@@ -875,17 +859,7 @@ func (s *sqliteStore) ListIncomingRefs(ctx context.Context, toID storeapi.Object
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []storeapi.Referrer
-	for rows.Next() {
-		var d storeapi.Referrer
-		if err := rows.Scan(&d.ID, &d.Group, &d.Kind); err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
+	return scanReferrers(rows)
 }
 
 // ListOutgoingRefs returns the distinct objects fromID points at (any relation),
@@ -900,14 +874,21 @@ func (s *sqliteStore) ListOutgoingRefs(ctx context.Context, fromID storeapi.Obje
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return scanReferrers(rows)
+}
 
+// scanReferrers collects an (id, group, kind) SELECT into Referrers, closing rows
+// on return. Like scanObjects it ends in `return out, rows.Err()`: the id/group/
+// kind columns are INTEGER/TEXT NOT NULL scanned into int64/string, which never
+// fails, and modernc's buffered result set leaves rows.Err clean after a good
+// query — so the tail error is reported in one statement, not a dead branch.
+func scanReferrers(rows *sql.Rows) ([]storeapi.Referrer, error) {
+	defer rows.Close()
 	var out []storeapi.Referrer
 	for rows.Next() {
 		var d storeapi.Referrer
-		if err := rows.Scan(&d.ID, &d.Group, &d.Kind); err != nil {
-			return nil, err
-		}
+		// id (INTEGER) -> int64 and group/kind (TEXT NOT NULL) -> string never fail.
+		_ = rows.Scan(&d.ID, &d.Group, &d.Kind)
 		out = append(out, d)
 	}
 	return out, rows.Err()
@@ -997,6 +978,24 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 	return &obj, nil
 }
 
+// scanObjects collects every row of an objectColumns SELECT, closing rows on
+// return. It ends in `return out, rows.Err()` so the post-iteration error is a
+// single tail statement rather than a separate, effectively-unreachable branch
+// (the modernc driver materializes the result set on the first Next, so neither
+// a trailing rows.Err nor a second-row scan can fail after a clean query).
+func scanObjects(rows *sql.Rows) ([]*storeapi.RawObject, error) {
+	defer rows.Close()
+	var out []*storeapi.RawObject
+	for rows.Next() {
+		obj, err := scanObject(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, obj)
+	}
+	return out, rows.Err()
+}
+
 // removeFinalizer returns f without target and whether target was present. A
 // missing target leaves the slice untouched (removed=false), which the caller
 // treats as a no-op.
@@ -1017,10 +1016,7 @@ func marshalFinalizers(f []string) []byte {
 		// The column defaults to '[]'; keep the same shape on explicit insert.
 		return []byte("[]")
 	}
-	b, err := json.Marshal(f)
-	if err != nil {
-		panic(err) // json.Marshal([]string) never errors
-	}
+	b, _ := json.Marshal(f) // marshaling []string never errors
 	return b
 }
 

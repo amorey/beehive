@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-The README spec is implemented end-to-end and the suite is green: `example/greeting/main.go` runs to convergence, and the full Client / ControllerClient / Options surfaces, the reconcile loop (concurrency, backoff, resync), conditions, refs, finalizers, the dependency waker, and GC (cascade + finalizer gating + dangling-delete resume) are all wired and tested. `README.md` remains the authoritative spec; when code and README disagree on a signature, the code is the current truth.
+The README spec is implemented end-to-end and the suite is green: `examples/greeting/main.go` runs to convergence, and the full Client / ControllerClient / Options surfaces, the reconcile loop (concurrency, backoff, resync), conditions, refs, finalizers, the dependency waker, and GC (cascade + finalizer gating + dangling-delete resume) are all wired and tested. `README.md` remains the authoritative spec; when code and README disagree on a signature, the code is the current truth.
 
 One loose end: the `fakeStore` test double in `testutils_test.go` still `panic`s on many methods — they're filled in only as a test needs them, so the real `sqlite` store backs most tests.
 
@@ -13,7 +13,7 @@ One loose end: the `fakeStore` test double in `testutils_test.go` still `panic`s
 ```sh
 go build ./...
 go vet ./...
-go run ./example/greeting/main.go   # the end-to-end smoke target
+go run ./examples/greeting/main.go   # the end-to-end smoke target
 go test ./...
 go test -run TestName ./  # single test
 ```

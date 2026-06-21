@@ -21,7 +21,7 @@
 //
 //	Create(spec) -> controller Reconcile -> UpdateStatus -> converged
 //
-// Run it with `go run ./example/greeting/main.go`.
+// Run it with `go run ./examples/greeting/main.go`.
 package main
 
 import (

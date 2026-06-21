@@ -1,0 +1,100 @@
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+      - name: Run linter
+        run: test -z "$(gofmt -l .)"
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+      - name: Run vetter
+        run: go vet ./...
+
+  staticcheck:
+    name: Staticcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - name: Run staticcheck
+        run: staticcheck -checks=all ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        gomaxprocs: [1, 2, 8]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+      - name: Run tests
+        env:
+          GOMAXPROCS: ${{ matrix.gomaxprocs }}
+        run: go test -race ./...
+
+  coverage:
+    name: Coverage (100%)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+      - name: Run per-package coverage and merge
+        # `go test -coverpkg=X -coverprofile=Y ./...` writes only the last
+        # test binary's profile, so cross-package coverage gets lost. Run
+        # each package separately and union the profiles in `mode: set`.
+        run: |
+          set -euo pipefail
+          PKGS=$(go list ./... | grep -v /examples/)
+          ALL=$(echo "$PKGS" | paste -sd, -)
+          mkdir -p cov
+          for pkg in $PKGS; do
+            name=$(echo "$pkg" | sed 's|/|_|g')
+            go test -count=1 -coverpkg="$ALL" -coverprofile="cov/${name}.out" "$pkg" 2>&1 \
+              | grep -v "no packages being tested depend on" || true
+          done
+          echo "mode: set" > cov.out
+          cat cov/*.out | grep -v "^mode:" | \
+            awk '{ if ($3=="1") seen[$1" "$2]=1; else if (!($1" "$2 in seen)) seen[$1" "$2]=0 } END { for (k in seen) print k, seen[k] }' \
+            >> cov.out
+          go tool cover -func=cov.out | tail -1
+      - name: Enforce 100% coverage on library packages
+        run: |
+          set -euo pipefail
+          uncovered=$(go tool cover -func=cov.out | awk '$3 != "100.0%" && $3 != "" && $1 !~ /examples/ && $1 !~ /^total:/')
+          if [ -n "$uncovered" ]; then
+            echo "Coverage below 100% on library packages:"
+            echo "$uncovered"
+            exit 1
+          fi
+          echo "All library packages at 100.0% coverage."

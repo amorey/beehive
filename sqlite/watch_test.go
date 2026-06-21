@@ -675,6 +675,77 @@ func TestWatchBornAndDiedAfterSnapshotUnobserved(t *testing.T) {
 	assertNoEvent(t, w, 200*time.Millisecond)
 }
 
+// TestMergeWatchEventKeepsHigherResourceVersion verifies an out-of-order merge
+// (prev's resource version exceeds next's) keeps the higher-versioned event as
+// the newer lifecycle state.
+func TestMergeWatchEventKeepsHigherResourceVersion(t *testing.T) {
+	const id storeapi.ObjectID = 3
+	prev := storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 9, Spec: []byte(`{"v":"new"}`)}}
+	next := storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+		Object: &storeapi.RawObject{ID: id, ResourceVersion: 4, Spec: []byte(`{"v":"old"}`)}}
+
+	got, keep := mergeWatchEvent(prev, next)
+	require.True(t, keep)
+	assert.EqualValues(t, 9, got.Object.ResourceVersion, "higher-RV (prev) body wins")
+	assert.Equal(t, []byte(`{"v":"new"}`), got.Object.Spec)
+}
+
+// dropObjectsTable removes the objects table while the connection stays open, so
+// a later read inside an already-open transaction fails (BeginTx still succeeds,
+// unlike closing the db) — exercising the snapshot load's inner error branches.
+func dropObjectsTable(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE objects`)
+	require.NoError(t, err)
+}
+
+// TestSnapshotAtLoadError covers snapshotAt's load-error branch: the transaction
+// opens (BeginTx succeeds) but the snapshot's ListObjects fails because the
+// objects table is gone, so the error surfaces from load, not from BeginTx.
+func TestSnapshotAtLoadError(t *testing.T) {
+	store := newRawStore(t)
+	store.beforeSnapshot = func() { dropObjectsTable(t, store) }
+
+	_, err := store.WatchList(context.Background(), testGK)
+	require.Error(t, err)
+}
+
+// TestWatchGetObjectInnerError covers Watch's snapshot GetObject error branch
+// (the non-ErrNotFound path): the transaction opens, then GetObject fails on the
+// missing objects table — distinct from a closed-db failure that aborts at BeginTx.
+func TestWatchGetObjectInnerError(t *testing.T) {
+	store := newRawStore(t)
+	store.beforeSnapshot = func() { dropObjectsTable(t, store) }
+
+	_, err := store.Watch(context.Background(), testGK, 1)
+	require.Error(t, err)
+}
+
+// TestWatchOrphanTombstoneDropped covers the goroutine's orphan-tombstone guard:
+// a single-object watch uses an id-scoped (non-annihilating) receiver, so a bare
+// Deleted for the watched id reaches the stream loop. The id was never in the
+// snapshot and no Added was delivered, so seenIDs lacks it and the Deleted is
+// dropped rather than surfacing a spurious tombstone.
+func TestWatchOrphanTombstoneDropped(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	const id storeapi.ObjectID = 99
+
+	w, err := store.Watch(ctx, testGK, id) // empty snapshot (id absent), seenIDs empty
+	require.NoError(t, err)
+	defer w.Close()
+
+	// RV 1 clears the empty snapshot's high-water (0) so the event reaches the
+	// seenIDs switch, where the orphan tombstone is dropped.
+	store.publish(testGK, storeapi.RawWatchEvent{
+		Type:   beehive.WatchEventDeleted,
+		Object: &storeapi.RawObject{ID: id, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 1},
+	})
+
+	assertNoEvent(t, w, 200*time.Millisecond)
+}
+
 // TestWatchLiveSendCtxDone covers the live-send path exiting on context
 // cancellation. beforeSnapshot buffers a live event (RecvContext prefers a
 // ready value over a cancelled context), so with an empty snapshot the goroutine

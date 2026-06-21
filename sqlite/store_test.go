@@ -1588,3 +1588,151 @@ func TestGetConditionScanError(t *testing.T) {
 	_, err = store.SetCondition(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
 }
+
+// dropSeq removes the resource_version sequence so the next nextResourceVersion
+// call (an UPDATE ... RETURNING) fails, while ordinary object reads still work —
+// isolating each mutator's version-bump error branch.
+func dropSeq(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE resource_version_seq`)
+	require.NoError(t, err)
+}
+
+// dropConditions removes the conditions table while the connection stays open, so
+// a DELETE/INSERT against it fails inside an already-open transaction.
+func dropConditions(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE conditions`)
+	require.NoError(t, err)
+}
+
+// dropObjects removes the objects table mid-connection so a scoped read inside an
+// open transaction fails (BeginTx still succeeds, unlike closing the db).
+func dropObjects(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE objects`)
+	require.NoError(t, err)
+}
+
+func TestLoadConditionsForKindQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.loadConditionsForKind(context.Background(), testGK)
+	require.Error(t, err)
+}
+
+// TestUpdateSpecResourceVersionError covers UpdateSpec's nextResourceVersion
+// branch: the scoped read succeeds and the spec differs, then the version bump
+// fails because the sequence table is gone.
+func TestUpdateSpecResourceVersionError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	dropSeq(t, store)
+
+	_, err := store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"changed":true}`))
+	require.Error(t, err)
+}
+
+// TestUpdateStatusResourceVersionError covers UpdateStatus's nextResourceVersion
+// branch (its first statement inside Within).
+func TestUpdateStatusResourceVersionError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	dropSeq(t, store)
+
+	_, err := store.UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`))
+	require.Error(t, err)
+}
+
+// TestDeleteConditionScopedReadError covers DeleteCondition's scoped-read error
+// branch: BeginTx succeeds, but the objects table is gone so the read fails.
+func TestDeleteConditionScopedReadError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "del-cond-read")
+	dropObjects(t, store)
+
+	_, err := store.DeleteCondition(ctx, testGK, obj.ID, "Ready")
+	require.Error(t, err)
+}
+
+// TestDeleteConditionDeleteExecError covers DeleteCondition's DELETE-exec error
+// branch: the object read succeeds but the conditions table is gone.
+func TestDeleteConditionDeleteExecError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "del-cond-exec")
+	dropConditions(t, store)
+
+	_, err := store.DeleteCondition(ctx, testGK, obj.ID, "Ready")
+	require.Error(t, err)
+}
+
+// TestDeleteFinalizerResourceVersionError covers DeleteFinalizer's
+// nextResourceVersion branch: a present finalizer is removed (a real change),
+// then the version bump fails.
+func TestDeleteFinalizerResourceVersionError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		Finalizers: []string{"f"},
+	})
+	require.NoError(t, err)
+	dropSeq(t, store)
+
+	_, err = store.DeleteFinalizer(ctx, testGK, obj.ID, "f")
+	require.Error(t, err)
+}
+
+// TestRequestDeletionResourceVersionError covers markForDeletion's
+// nextResourceVersion branch, reached via RequestDeletion on a live object whose
+// version bump fails.
+func TestRequestDeletionResourceVersionError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	dropSeq(t, store)
+
+	_, _, err := store.RequestDeletion(ctx, testGK, obj.ID)
+	require.Error(t, err)
+}
+
+// TestMarkOwnedForDeletionQueryError covers the child-lookup query error.
+func TestMarkOwnedForDeletionQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.MarkOwnedForDeletion(context.Background(), 1)
+	require.Error(t, err)
+}
+
+// TestMarkOwnedForDeletionChildMarkError covers the per-child markForDeletion
+// error branch: an owned, not-yet-deleting child exists, but the version bump in
+// markForDeletion fails (sequence dropped) with a non-ErrNotFound error.
+func TestMarkOwnedForDeletionChildMarkError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	child := newRefObject(t, store)
+	require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy))
+	dropSeq(t, store)
+
+	_, err := store.MarkOwnedForDeletion(ctx, owner.ID)
+	require.Error(t, err)
+}
+
+func TestListOutgoingRefsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.ListOutgoingRefs(context.Background(), 1)
+	require.Error(t, err)
+}
+
+func TestHasIncomingRefsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.HasIncomingRefs(context.Background(), 1)
+	require.Error(t, err)
+}

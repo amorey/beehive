@@ -160,6 +160,20 @@ func TestWorkQueueStopCancelsPendingTimers(t *testing.T) {
 	assert.False(t, ok, "add/addAfter after stop must not enqueue")
 }
 
+// TestWorkQueueAddAfterOnStoppedQueue verifies addAfter is a no-op once the queue
+// is stopped: a positive-delay schedule arriving after stop must not register a
+// timer or enqueue, so a torn-down queue stays quiesced.
+func TestWorkQueueAddAfterOnStoppedQueue(t *testing.T) {
+	q := newWorkQueue()
+	q.stop()
+
+	q.addAfter(1, time.Hour)
+
+	assert.Nil(t, q.timers, "stopped queue must not track a new timer")
+	_, ok := q.get()
+	assert.False(t, ok, "addAfter on a stopped queue must not enqueue")
+}
+
 func TestWorkQueueAddAfterZeroDelay(t *testing.T) {
 	q := newWorkQueue()
 	q.addAfter(1, 0)

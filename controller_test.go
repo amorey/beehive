@@ -411,3 +411,109 @@ func TestControllerClientUpdateStatusStoreError(t *testing.T) {
 	err = cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
 	require.Error(t, err)
 }
+
+// failDeleteRefStore returns an error from DeleteRef (Within runs fn inline).
+type failDeleteRefStore struct {
+	fakeStore
+}
+
+func (s *failDeleteRefStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
+	return errBoom
+}
+
+// TestControllerClientDeleteDependencyDeleteRefError covers the DeleteRef failure
+// branch: the edge removal itself fails, so the whole DeleteDependency errors.
+func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
+	bh, err := New(&failDeleteRefStore{})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+	err = cc.DeleteDependency(context.Background(), 1, 2)
+	require.ErrorIs(t, err, errBoom)
+}
+
+// metaDeleteDepStore lets a DeleteDependency test control what GetObjectMeta
+// returns after the edge is dropped. DeleteRef succeeds; the rest defaults to the
+// fakeStore (Within inline, no-ops).
+type metaDeleteDepStore struct {
+	fakeStore
+	meta    *RawObject
+	metaErr error
+}
+
+func (s *metaDeleteDepStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
+	return nil
+}
+func (s *metaDeleteDepStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
+	return s.meta, s.metaErr
+}
+
+// TestControllerClientDeleteDependencyTargetGone covers the post-edge re-check
+// when the target is already gone: GetObjectMeta reports ErrNotFound, which is
+// swallowed (nothing to wake). The wake collector must be present to reach it.
+func TestControllerClientDeleteDependencyTargetGone(t *testing.T) {
+	bh, err := New(&metaDeleteDepStore{metaErr: ErrNotFound})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+
+	wakes := &pendingWakes{}
+	ctx := withPendingWakes(context.Background(), wakes)
+	require.NoError(t, cc.DeleteDependency(ctx, 1, 2))
+	assert.Empty(t, wakes.targets, "a gone target schedules no wake")
+}
+
+// TestControllerClientDeleteDependencyMetaError covers GetObjectMeta failing with
+// a non-ErrNotFound error after the edge is dropped: it propagates out.
+func TestControllerClientDeleteDependencyMetaError(t *testing.T) {
+	bh, err := New(&metaDeleteDepStore{metaErr: errBoom})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+
+	ctx := withPendingWakes(context.Background(), &pendingWakes{})
+	err = cc.DeleteDependency(ctx, 1, 2)
+	require.ErrorIs(t, err, errBoom)
+}
+
+// TestControllerClientDeleteDependencyWakesFinalizingTarget covers the happy wake
+// path: the freed target is itself finalizing, so it's appended to the collector
+// for a post-commit GC re-check.
+func TestControllerClientDeleteDependencyWakesFinalizingTarget(t *testing.T) {
+	now := time.Now()
+	meta := &RawObject{ID: 2, Group: "g", Kind: "K", DeletionRequestedAt: &now}
+	bh, err := New(&metaDeleteDepStore{meta: meta})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+
+	wakes := &pendingWakes{}
+	ctx := withPendingWakes(context.Background(), wakes)
+	require.NoError(t, cc.DeleteDependency(ctx, 1, 2))
+	assert.Equal(t, []Referrer{{ID: 2, Group: "g", Kind: "K"}}, wakes.targets,
+		"a finalizing freed target is scheduled for a GC re-check")
+}
+
+// TestControllerClientDeleteDependencyTargetAliveNotFinalizing covers the case
+// where the freed target still exists and is not finalizing: nothing is scheduled
+// to wake (it's a live object, GC has no interest in it).
+func TestControllerClientDeleteDependencyTargetAliveNotFinalizing(t *testing.T) {
+	meta := &RawObject{ID: 2, Group: "g", Kind: "K"} // DeletionRequestedAt nil
+	bh, err := New(&metaDeleteDepStore{meta: meta})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+
+	wakes := &pendingWakes{}
+	ctx := withPendingWakes(context.Background(), wakes)
+	require.NoError(t, cc.DeleteDependency(ctx, 1, 2))
+	assert.Empty(t, wakes.targets, "a live, non-finalizing target schedules no wake")
+}
+
+// TestControllerClientDeleteDependencyNoWakesOutsideReconcile covers the early
+// return when there's no collector on the ctx (called outside a reconcile):
+// GetObjectMeta is never reached, so even a panicking GetObjectMeta is fine.
+func TestControllerClientDeleteDependencyNoWakesOutsideReconcile(t *testing.T) {
+	bh, err := New(&metaDeleteDepStore{metaErr: errBoom})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+
+	// No withPendingWakes: pendingWakesFrom(ctx) is nil, so it returns before the
+	// GetObjectMeta call that would otherwise fail.
+	require.NoError(t, cc.DeleteDependency(context.Background(), 1, 2))
+}
