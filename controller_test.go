@@ -193,12 +193,12 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID))
-	deps, err := bh.store.ListReferrers(ctx, to.ID, RelationDependsOn)
+	deps, err := bh.store.ListIncomingRefs(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []Referrer{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
 	require.NoError(t, cc.DeleteDependency(ctx, from.ID, to.ID))
-	deps, err = bh.store.ListReferrers(ctx, to.ID, RelationDependsOn)
+	deps, err = bh.store.ListIncomingRefs(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }

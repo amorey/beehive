@@ -278,16 +278,16 @@ func TestStartToleratesWatchError(t *testing.T) {
 	bh.Stop(context.Background())
 }
 
-// blockingDepsStore parks the dependency waker inside ListReferrers — after it
+// blockingDepsStore parks the dependency waker inside ListIncomingRefs — after it
 // has read a Modified event but before it re-enters Beehive's mutex via
 // enqueueIfRegistered — so a test can drive a precise interleaving with Stop.
 type blockingDepsStore struct {
 	watcherStore
-	entered chan struct{} // closed-by-send when the waker reaches ListReferrers
+	entered chan struct{} // closed-by-send when the waker reaches ListIncomingRefs
 	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
 }
 
-func (s *blockingDepsStore) ListReferrers(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (s *blockingDepsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
 	s.entered <- struct{}{}
 	<-s.release
 	// One referrer for an unregistered kind: enough to make the waker re-enter
@@ -339,7 +339,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 	}
 }
 
-// recordingDepsStore reports ListReferrers calls on a channel and serves a preset
+// recordingDepsStore reports ListIncomingRefs calls on a channel and serves a preset
 // watcher (via the embedded watcherStore), so a test can observe exactly which
 // events drive a wake.
 type recordingDepsStore struct {
@@ -347,7 +347,7 @@ type recordingDepsStore struct {
 	calls chan ObjectID
 }
 
-func (s *recordingDepsStore) ListReferrers(_ context.Context, toID ObjectID, _ Relation) ([]Referrer, error) {
+func (s *recordingDepsStore) ListIncomingRefs(_ context.Context, toID ObjectID, _ Relation) ([]Referrer, error) {
 	s.calls <- toID
 	return nil, nil
 }
@@ -398,10 +398,10 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	waitClosed(t, done, "waker to exit")
 }
 
-// errDepsStore returns an error from ListReferrers.
+// errDepsStore returns an error from ListIncomingRefs.
 type errDepsStore struct{ fakeStore }
 
-func (*errDepsStore) ListReferrers(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (*errDepsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
 	return nil, errBoom
 }
 

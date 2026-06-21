@@ -850,9 +850,9 @@ func (s *sqliteStore) DeleteRef(ctx context.Context, fromID, toID storeapi.Objec
 	return err
 }
 
-// ListReferrers returns the objects pointing at toID through relation, joining refs
+// ListIncomingRefs returns the objects pointing at toID through relation, joining refs
 // to objects so each carries the GroupKind needed to route a requeue.
-func (s *sqliteStore) ListReferrers(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) ListIncomingRefs(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.Referrer, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM refs r JOIN objects o ON o.id = r.from_id
@@ -874,10 +874,10 @@ func (s *sqliteStore) ListReferrers(ctx context.Context, toID storeapi.ObjectID,
 	return out, rows.Err()
 }
 
-// ListReferents returns the distinct objects fromID points at (any relation),
-// the inverse of ListReferrers. DISTINCT collapses an object reached through
+// ListOutgoingRefs returns the distinct objects fromID points at (any relation),
+// the inverse of ListIncomingRefs. DISTINCT collapses an object reached through
 // more than one relation (e.g. both owned_by and depends_on) to a single row.
-func (s *sqliteStore) ListReferents(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) ListOutgoingRefs(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.Referrer, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
 		FROM refs r JOIN objects o ON o.id = r.to_id

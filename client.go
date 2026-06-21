@@ -66,7 +66,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 			return err
 		}
 		// The child owns the edge (child -> owner) so the owner's GC walk finds it
-		// via ListReferrers(owner, RelationOwnedBy).
+		// via ListIncomingRefs(owner, RelationOwnedBy).
 		if co.owner != nil {
 			return c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy)
 		}

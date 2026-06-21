@@ -214,7 +214,7 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
 // kind's reconciler. Over-eager wakes are harmless: unregistered kinds are
 // ignored and the work queue coalesces duplicates.
 func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
-	deps, err := bh.store.ListReferrers(ctx, targetID, RelationDependsOn)
+	deps, err := bh.store.ListIncomingRefs(ctx, targetID, RelationDependsOn)
 	if err != nil {
 		return
 	}

@@ -113,7 +113,7 @@ const (
 )
 
 // Referrer is an object pointing at a target through a ref edge, with the
-// GroupKind needed to route a requeue. ListReferrers returns these.
+// GroupKind needed to route a requeue. ListIncomingRefs returns these.
 type Referrer struct {
 	ID    ObjectID
 	Group string
@@ -238,16 +238,16 @@ type Store interface {
 	// no-op. Like AddRef it bumps no version and emits no event.
 	DeleteRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error
 
-	// ListReferrers returns every object pointing at toID through relation, ordered by
+	// ListIncomingRefs returns every object pointing at toID through relation, ordered by
 	// id (e.g. the dependents to requeue, or the owned children to GC).
-	ListReferrers(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
+	ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
 
-	// ListReferents returns the distinct objects that fromID points at through any
-	// relation, ordered by id (the inverse of ListReferrers). GC uses it to wake
+	// ListOutgoingRefs returns the distinct objects that fromID points at through any
+	// relation, ordered by id (the inverse of ListIncomingRefs). GC uses it to wake
 	// the targets a row was holding open before removing it: deleting fromID drops
 	// its outgoing edges (ON DELETE CASCADE), which can unblock a deletion-pending
 	// target that RESTRICT was keeping alive.
-	ListReferents(ctx context.Context, fromID ObjectID) ([]Referrer, error)
+	ListOutgoingRefs(ctx context.Context, fromID ObjectID) ([]Referrer, error)
 
 	// DeleteFinalizingDependsOnRefs removes the depends_on edges pointing at toID
 	// whose source object is itself marked for deletion. A finalizing dependent is

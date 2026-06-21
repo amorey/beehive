@@ -96,7 +96,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
 
 	// The owner ref is recorded child -> owner, so the owner sees the child.
-	refs, err := store.ListReferrers(ctx, owner.ID, RelationOwnedBy)
+	refs, err := store.ListIncomingRefs(ctx, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	assert.Equal(t, child.ID, refs[0].ID)

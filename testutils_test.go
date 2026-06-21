@@ -105,10 +105,10 @@ func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error 
 func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
 	panic("not implemented: fakeStore.DeleteRef")
 }
-func (s *fakeStore) ListReferrers(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+func (s *fakeStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListReferents(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *fakeStore) ListOutgoingRefs(context.Context, ObjectID) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
 func (s *fakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {

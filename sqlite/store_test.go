@@ -540,7 +540,7 @@ func TestListDeletionPendingIDs(t *testing.T) {
 	assert.Equal(t, []beehive.ObjectID{pendingA.ID, pendingB.ID}, ids)
 }
 
-func TestListReferents(t *testing.T) {
+func TestListOutgoingRefs(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	from := newRefObject(t, store)
@@ -552,7 +552,7 @@ func TestListReferents(t *testing.T) {
 	// A second edge to the same target via another relation must not duplicate it.
 	require.NoError(t, store.AddRef(ctx, from.ID, a.ID, beehive.RelationDependsOn))
 
-	refs, err := store.ListReferents(ctx, from.ID)
+	refs, err := store.ListOutgoingRefs(ctx, from.ID)
 	require.NoError(t, err)
 	var ids []beehive.ObjectID
 	for _, r := range refs {
@@ -561,7 +561,7 @@ func TestListReferents(t *testing.T) {
 	assert.Equal(t, []beehive.ObjectID{a.ID, b.ID}, ids, "distinct targets, ordered by id")
 
 	// An object that points at nothing has no referents.
-	refs, err = store.ListReferents(ctx, a.ID)
+	refs, err = store.ListOutgoingRefs(ctx, a.ID)
 	require.NoError(t, err)
 	assert.Empty(t, refs)
 }
@@ -1112,7 +1112,7 @@ func TestAddRefRollback(t *testing.T) {
 	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"), "the edge rolled back with the transaction")
 }
 
-func TestListReferrers(t *testing.T) {
+func TestListIncomingRefs(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
@@ -1124,14 +1124,14 @@ func TestListReferrers(t *testing.T) {
 	// An owned_by edge to c must not show up under a depends_on query.
 	require.NoError(t, store.AddRef(ctx, a.ID, c.ID, "owned_by"))
 
-	deps, err := store.ListReferrers(ctx, c.ID, "depends_on")
+	deps, err := store.ListIncomingRefs(ctx, c.ID, "depends_on")
 	require.NoError(t, err)
 	require.Equal(t, []beehive.Referrer{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
 	}, deps)
 
-	none, err := store.ListReferrers(ctx, a.ID, "depends_on")
+	none, err := store.ListIncomingRefs(ctx, a.ID, "depends_on")
 	require.NoError(t, err)
 	assert.Empty(t, none, "a target with no dependents returns an empty slice, not an error")
 }
@@ -1148,10 +1148,10 @@ func TestDeleteRefDBError(t *testing.T) {
 	require.Error(t, store.DeleteRef(context.Background(), 1, 2, "depends_on"))
 }
 
-func TestListReferrersDBError(t *testing.T) {
+func TestListIncomingRefsDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.ListReferrers(context.Background(), 1, "depends_on")
+	_, err := store.ListIncomingRefs(context.Background(), 1, "depends_on")
 	require.Error(t, err)
 }
 

@@ -93,7 +93,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		// unblock a deletion-pending target RESTRICT was holding. Capture those
 		// targets before the delete so we can wake them — the event-driven path that
 		// lets a cascade finish without waiting on the resync backstop.
-		referents, err := bh.store.ListReferents(ctx, id)
+		referents, err := bh.store.ListOutgoingRefs(ctx, id)
 		if err != nil {
 			return err
 		}
