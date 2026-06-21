@@ -1,0 +1,168 @@
+// Copyright 2026 Andres Morey
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package beehive
+
+import "context"
+
+// pendingWakes collects ref targets to requeue after Reconcile returns. A
+// ControllerClient call that frees a target (DeleteDependency) registers it here;
+// typedController.reconcile drains it once Reconcile returns (the freeing write has
+// already committed). It rides on the context so the long-lived, shared
+// ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
+// runs on one goroutine, so the slice needs no locking.
+type pendingWakes struct {
+	targets []Referrer
+}
+
+type pendingWakesKey struct{}
+
+// withPendingWakes attaches a fresh collector to ctx for one reconcile.
+func withPendingWakes(ctx context.Context, w *pendingWakes) context.Context {
+	return context.WithValue(ctx, pendingWakesKey{}, w)
+}
+
+// pendingWakesFrom returns the collector for the current reconcile, or nil when
+// called outside one (e.g. a ControllerClient used directly in a test).
+func pendingWakesFrom(ctx context.Context) *pendingWakes {
+	w, _ := ctx.Value(pendingWakesKey{}).(*pendingWakes)
+	return w
+}
+
+// collect is the garbage-collection step for a single object, run after its
+// controller's Reconcile returns (see typedController.reconcile) and on the
+// deletion-pending resync backstop. It runs in its own transaction. It is a no-op
+// unless the object is finalizing.
+//
+// Two things happen for a finalizing object:
+//
+//   - Cascade: every object that owns_by this one is itself marked for deletion
+//     and requeued, so deleting an owner tears its children down with it.
+//   - Physical delete: once the object has no finalizers left AND nothing still
+//     references it, its row is removed. The refs table's ON DELETE RESTRICT
+//     makes that ordering mandatory — an owner cannot be removed while a child
+//     still points at it — and ON DELETE CASCADE on the child side means
+//     removing the last child drops the edge that was blocking the owner. The
+//     freed owner is re-examined by the deletion-pending resync backstop.
+//
+// The whole step runs in one transaction so the cascade writes and the delete
+// commit together; the watch events they emit publish only on commit.
+func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err error) {
+	// toWake accumulates objects to requeue after the transaction commits: the
+	// cascaded children, plus (when the row is removed) the targets it was holding
+	// open. Waking post-commit means a rollback never leaves a phantom enqueue,
+	// matching the dependency waker's post-commit pattern.
+	var toWake []Referrer
+	err = bh.store.Within(ctx, func(ctx context.Context) error {
+		obj, err := bh.store.GetObjectMeta(ctx, id)
+		if err != nil {
+			return err
+		}
+		// Not finalizing: nothing to collect.
+		if obj.DeletionRequestedAt == nil {
+			return nil
+		}
+
+		// Cascade deletion to owned children, requeuing them all (see
+		// MarkOwnedForDeletion for the steady-state single-read path).
+		children, err := bh.store.MarkOwnedForDeletion(ctx, id)
+		if err != nil {
+			return err
+		}
+		toWake = append(toWake, children...)
+
+		// Finalizers still pending: the controller hasn't finished cleanup.
+		if len(obj.Finalizers) > 0 {
+			return nil
+		}
+		// A dependent that's itself finalizing has no claim on us: drop those
+		// depends_on edges before the referrer gate, or two deletion-pending objects
+		// that depend on each other (or a self-dependency) would each hold the
+		// other's RESTRICT forever. owned_by edges are left for the cascade.
+		if err := bh.store.DeleteFinalizingDependsOnRefs(ctx, id); err != nil {
+			return err
+		}
+		// Still referenced (owned children or live dependents): RESTRICT forbids the
+		// delete. Leave the row; a referrer's own removal will wake us (below).
+		referenced, err := bh.store.HasIncomingRefs(ctx, id)
+		if err != nil {
+			return err
+		}
+		if referenced {
+			return nil
+		}
+
+		// Removing this row drops its outgoing edges (ON DELETE CASCADE), which may
+		// unblock a deletion-pending target RESTRICT was holding. Capture those
+		// targets before the delete so we can wake them — the event-driven path that
+		// lets a cascade finish without waiting on the resync backstop.
+		referents, err := bh.store.ListOutgoingRefs(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := bh.store.DeleteObject(ctx, id); err != nil {
+			return err
+		}
+		toWake = append(toWake, referents...)
+		deleted = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, w := range toWake {
+		bh.advanceGC(ctx, GroupKind{Group: w.Group, Kind: w.Kind}, w.ID)
+	}
+	return deleted, nil
+}
+
+// advanceGC moves (gk, id) forward toward collection after a deletion-related
+// change, picking the mechanism that fits the kind. A registered kind is
+// requeued so its own reconcile loop runs collect.
+//
+// A client-only kind has no reconcile loop. When resync is enabled the global GC
+// sweeper is its backstop, so we leave the object for the next sweep — keeping
+// the "events are a latency optimization, resync is the correctness backstop"
+// model and not running a recursive cascade inline on the caller's goroutine. But
+// a disabled resync reduces the sweeper to a single startup pass, so a
+// client-only object deleted or cascade-freed afterward would strand forever, its
+// owned_by edge RESTRICT-blocking the owner's delete. In that one configuration
+// we collect synchronously here instead. Recursion terminates: each collect that
+// deletes a row shrinks the object graph before waking the targets it freed.
+func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
+	bh.mu.Lock()
+	r, ok := bh.reconcilers[gk]
+	bh.mu.Unlock()
+	if ok {
+		r.enqueue(id)
+		return
+	}
+	if bh.resyncInterval > 0 {
+		return // the GC sweeper's resync tick is this kind's backstop
+	}
+	// This runs on the caller's ctx, so a Delete (or freed-target wake) whose
+	// caller cancels right after committing RequestDeletion can abandon the collect
+	// mid-flight. With resync disabled this Beehive has no periodic sweeper left to
+	// retry, and Start is one-shot (a stopped Beehive cannot be restarted), so this
+	// instance will not collect the row again. Recovery happens only when the
+	// application constructs and starts a *fresh* Beehive over the same store, whose
+	// unconditional startup GC sweep (runGCSweeper -> sweepDeletionPending) collects
+	// every deletion-pending object of every kind, client-only included. Until then
+	// the row stays deletion-pending — in a long-running process that declines to
+	// detach the caller's cancellation, that strand persists for the process's life.
+	if _, err := bh.collect(ctx, id); err != nil {
+		bh.log().Warn("gc: synchronous collect of client-only object failed; no resync backstop",
+			"group", gk.Group, "kind", gk.Kind, "id", id, "err", err)
+	}
+}
