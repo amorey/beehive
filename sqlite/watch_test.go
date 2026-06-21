@@ -655,22 +655,26 @@ func TestWatchBornAndDiedAfterSnapshotUnobserved(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
+	// Inject Added then Deleted into the subscribe→snapshot window: the receiver is
+	// registered but the stream goroutine hasn't started draining yet, so both land
+	// in the conflating buffer and coalesce deterministically (publishing after
+	// WatchList returns would race the goroutine draining the Added first). The
+	// empty snapshot means id 99 was never observed, so the resulting lone Deleted
+	// must be silently dropped rather than delivered.
+	store.beforeSnapshot = func() {
+		store.publish(testGK, storeapi.RawWatchEvent{
+			Type:   beehive.WatchEventAdded,
+			Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 1},
+		})
+		store.publish(testGK, storeapi.RawWatchEvent{
+			Type:   beehive.WatchEventDeleted,
+			Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 2},
+		})
+	}
+
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-
-	// Inject Added then Deleted before any read — goroutine is alive but the
-	// empty snapshot means it has no snapshot items to send, so it's parked
-	// waiting for a live event. The Added coalesces with the Deleted in the
-	// conflating buffer; the resulting Deleted must be silently dropped.
-	store.publish(testGK, storeapi.RawWatchEvent{
-		Type:   beehive.WatchEventAdded,
-		Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 1},
-	})
-	store.publish(testGK, storeapi.RawWatchEvent{
-		Type:   beehive.WatchEventDeleted,
-		Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 2},
-	})
 
 	assertNoEvent(t, w, 200*time.Millisecond)
 }
