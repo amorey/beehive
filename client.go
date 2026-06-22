@@ -33,6 +33,7 @@ type WatchEvent[Spec, Status any] struct {
 // creating, reading, updating, deleting, and watching objects.
 type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+	CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
 	Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error)
 	GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error)
@@ -95,6 +96,53 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	}
 	// The store emitted the Added event inside CreateObject, before this enqueue,
 	// so a fast controller can't produce a Modified event ahead of the Added.
+	c.bh.enqueueIfRegistered(c.gk, raw.ID)
+	return obj, nil
+}
+
+// CreateOrUpdate idempotently reconciles the object named by slug to spec: it
+// updates the existing object carrying that slug, or creates one with that slug
+// if none exists. Wrapping the read-then-write in Within makes the upsert atomic,
+// so concurrent callers can't both insert the same slug — the second sees the
+// first's row and updates instead. Re-applying the same spec is a no-op (UpdateSpec
+// suppresses the generation bump on equal bytes).
+//
+// It drives the store mutators directly rather than composing Create/Update so the
+// reconciler is woken only after Within commits and flushes the spec watch event:
+// those methods enqueue internally, which inside the outer transaction would wake
+// a reconciler that could publish a status event ahead of the still-buffered spec
+// event. Here the single enqueue runs after Within returns, preserving the
+// spec-event-before-wake ordering Create and Update keep on their own.
+func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return nil, err
+	}
+	var raw *RawObject
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		switch {
+		case err == nil:
+			raw, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b)
+		case errors.Is(err, ErrNotFound):
+			raw, err = c.bh.store.CreateObject(ctx, &RawObject{
+				Group: c.gk.Group,
+				Kind:  c.gk.Kind,
+				Slug:  &slug,
+				Spec:  b,
+			})
+		}
+		// A non-NotFound read error falls through both cases with raw unset; err
+		// still carries it. Both write branches reassign err.
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	obj, err := rawToTyped[Spec, Status](raw)
+	if err != nil {
+		return nil, err
+	}
 	c.bh.enqueueIfRegistered(c.gk, raw.ID)
 	return obj, nil
 }
