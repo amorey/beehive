@@ -61,8 +61,9 @@ func TestRegisterRejectsDuplicate(t *testing.T) {
 func TestRegisterRejectedAfterStart(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
-	require.NoError(t, bh.Start())
-	defer bh.Stop(context.Background())
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	defer stop(context.Background())
 
 	require.Error(t, Register(bh, GroupKind{Kind: "Widget"}, newFakeController()))
 }
@@ -94,11 +95,12 @@ func TestStartStopLifecycle(t *testing.T) {
 	fc := newFakeController()
 	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, fc))
 
-	require.NoError(t, bh.Start())
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
 	waitClosed(t, fc.startedCh, "controller Start")
 	assert.Equal(t, beehiveRunning, bh.state)
 
-	bh.Stop(context.Background())
+	require.NoError(t, stop(context.Background()))
 	waitClosed(t, fc.stoppedCh, "controller Stop")
 	assert.Equal(t, 1, fc.startCount())
 	assert.Equal(t, 1, fc.stopCount())
@@ -109,9 +111,11 @@ func TestStartRejectsSecondStart(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
 
-	require.NoError(t, bh.Start())
-	defer bh.Stop(context.Background())
-	require.Error(t, bh.Start())
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	defer stop(context.Background())
+	_, err = bh.Start(context.Background())
+	require.Error(t, err)
 }
 
 func TestStopWithoutStartIsNoOp(t *testing.T) {
@@ -121,7 +125,8 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 	fc := newFakeController()
 	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, fc))
 
-	bh.Stop(context.Background()) // never started: must not panic or stop controllers
+	// never started: must not panic or stop controllers, and reports no error.
+	require.NoError(t, bh.stop(context.Background()))
 	assert.Equal(t, 0, fc.stopCount())
 }
 
@@ -131,14 +136,16 @@ func TestStopReturnsWithExpiredContext(t *testing.T) {
 
 	fc := newFakeController()
 	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, fc))
-	require.NoError(t, bh.Start())
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
 	waitClosed(t, fc.startedCh, "controller Start")
 
-	// An already-expired ctx caps the drain wait. Stop must still return (the
-	// test completing proves no hang) and still stop the controllers.
+	// An already-expired ctx caps the drain wait. stop must still return (the
+	// test completing proves no hang), still stop the controllers, and report the
+	// expired context so the caller can tell the drain didn't complete in time.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bh.Stop(ctx)
+	assert.ErrorIs(t, stop(ctx), context.Canceled)
 
 	assert.Equal(t, 1, fc.stopCount())
 	assert.Equal(t, beehiveStopped, bh.state)
@@ -158,13 +165,40 @@ func TestStartRollsBackStartedController(t *testing.T) {
 	require.NoError(t, Register(bh, GroupKind{Kind: "Good"}, good))
 	require.NoError(t, Register(bh, GroupKind{Kind: "Bad"}, bad))
 
-	require.ErrorIs(t, bh.Start(), errBoom)
+	_, err = bh.Start(context.Background())
+	require.ErrorIs(t, err, errBoom)
 
 	// good started before bad failed, so it must have been rolled back.
 	assert.Equal(t, 1, good.startCount())
 	assert.Equal(t, 1, good.stopCount(), "a started controller must be rolled back")
 	// bad's Start failed, so it is never added to the started set and not stopped.
 	assert.Equal(t, 0, bad.stopCount())
+}
+
+// TestStartAbortsOnCancelledContext exercises the startCtx.Err() abort path in
+// Start: the first controller cancels the start context as it starts, so the
+// loop bails before the second controller and rolls back the first. Start
+// iterates in registration order, so this is deterministic.
+func TestStartAbortsOnCancelledContext(t *testing.T) {
+	bh, err := New(&fakeStore{})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := newFakeController()
+	first.onStart = cancel // cancel the start context once the first controller starts
+	second := newFakeController()
+	require.NoError(t, Register(bh, GroupKind{Kind: "First"}, first))
+	require.NoError(t, Register(bh, GroupKind{Kind: "Second"}, second))
+
+	stop, err := bh.Start(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, stop, "no stop function on a failed Start")
+
+	// first started, then got rolled back; second was never reached.
+	assert.Equal(t, 1, first.startCount())
+	assert.Equal(t, 1, first.stopCount(), "a started controller must be rolled back")
+	assert.Equal(t, 0, second.startCount())
+	assert.Equal(t, beehiveNew, bh.state)
 }
 
 func TestRegisterPropagatesOptionError(t *testing.T) {
@@ -184,7 +218,8 @@ func TestStartRollsBackOnFailure(t *testing.T) {
 	require.NoError(t, Register(bh, GroupKind{Kind: "Good"}, good))
 	require.NoError(t, Register(bh, GroupKind{Kind: "Bad"}, bad))
 
-	require.ErrorIs(t, bh.Start(), errBoom)
+	_, err = bh.Start(context.Background())
+	require.ErrorIs(t, err, errBoom)
 	assert.Equal(t, beehiveNew, bh.state)
 
 	// Map iteration order is randomized, so we can't say whether `good` started

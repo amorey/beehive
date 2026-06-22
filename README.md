@@ -1,6 +1,6 @@
 # Beehive
 
-*Beehive is an embedded, self-healing, eventually consistent datastore for Go that takes inspiration from the stigmergic cooperation of bees in a beehive.*
+*Beehive is an embedded, durable, self-healing, control-plane for Go apps that takes inspiration from Kubernetes and the stigmergic cooperation of bees in a beehive.*
 
 <img width="435" alt="beehive" src="https://github.com/user-attachments/assets/f5b845df-6ed0-47f3-b1be-69d3f2286d9f" />
 
@@ -76,13 +76,16 @@ func main() {
   bh, _ := beehive.New(store)
   beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 
-  if err := bh.Start(); err != nil {
+  stop, err := bh.Start(context.Background())
+  if err != nil {
     log.Fatal(err)
   }
 
   ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
   defer cancel()
-  bh.Stop(ctx)
+  if err := stop(ctx); err != nil {
+    log.Printf("beehive: shutdown did not drain cleanly: %v", err)
+  }
 }
 ```
 

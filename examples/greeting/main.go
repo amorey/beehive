@@ -87,9 +87,9 @@ func main() {
 	err = beehive.Register(bh, GreetingGroupKind, &GreetingController{})
 	exitOnErr(err)
 
-	err = bh.Start()
+	stop, err := bh.Start(context.Background())
 	exitOnErr(err)
-	defer stopBeehive(bh)
+	defer stopBeehive(stop)
 
 	ctx := context.Background()
 	client := beehive.NewClient[GreetingSpec, GreetingStatus](bh, GreetingGroupKind)
@@ -106,10 +106,12 @@ func main() {
 	waitForConvergence(obj.ID, watchCh)
 }
 
-func stopBeehive(bh *beehive.Beehive) {
+func stopBeehive(stop func(context.Context) error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	bh.Stop(ctx)
+	if err := stop(ctx); err != nil {
+		fmt.Printf("beehive: shutdown did not drain cleanly: %v\n", err)
+	}
 }
 
 // waitForConvergence drains watchCh until it sees a status-bearing event for id.

@@ -70,19 +70,23 @@ func (bh *Beehive) log() *slog.Logger {
 }
 
 // Start brings the control plane up: it starts every registered controller and
-// launches its reconcile loop. It is an error to start twice or after Stop.
-// Beehive is a one-shot object: once stopped, create a new instance.
+// launches its reconcile loop. On success it returns a stop function that tears
+// the control plane back down (see stop). It is an error to start twice or after
+// stop; on error the returned stop is nil. Beehive is a one-shot object: once
+// stopped, create a new instance.
 //
-// Start does not take a context: controller startup is assumed to be fast and
-// non-blocking. Use Stop to tear the control plane down.
-func (bh *Beehive) Start() error {
+// startCtx bounds the startup phase only — controller startup is assumed fast
+// and non-blocking, but a startCtx that's already cancelled aborts startup. The
+// long-lived reconcile loops do not derive from startCtx; the run lifetime ends
+// only when the returned stop is called.
+func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
 	switch bh.state {
 	case beehiveStopped:
-		return fmt.Errorf("beehive: already stopped; create a new Beehive to restart")
+		return nil, fmt.Errorf("beehive: already stopped; create a new Beehive to restart")
 	case beehiveRunning:
-		return fmt.Errorf("beehive: already started")
+		return nil, fmt.Errorf("beehive: already started")
 	}
 
 	// Resolve the control plane's own logger once: nil becomes the discard logger
@@ -99,17 +103,26 @@ func (bh *Beehive) Start() error {
 	// rollback are deterministic.
 	started := make([]*reconciler, 0, len(bh.order))
 	for _, r := range bh.order {
+		// Abort startup if the caller's context is already done before we reach
+		// this controller, rolling back what we've started so far.
+		if err := startCtx.Err(); err != nil {
+			for _, s := range started {
+				_ = s.adapter.stop(startCtx)
+			}
+			cancel()
+			return nil, fmt.Errorf("beehive: start aborted: %w", err)
+		}
 		if err := r.adapter.start(); err != nil {
 			// Roll back the controllers we already started, then abort.
 			// The reconcile loops were never launched, so there's nothing to
-			// drain; we just stop each controller. Cleanup runs unbounded.
+			// drain; we just stop each controller, bounded by startCtx.
 			for _, s := range started {
-				_ = s.adapter.stop(context.Background())
+				_ = s.adapter.stop(startCtx)
 			}
 			cancel()
 			bh.logger.Error("controller start failed; rolled back",
 				"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
-			return fmt.Errorf("beehive: start controller %s/%s: %w", r.gk.Group, r.gk.Kind, err)
+			return nil, fmt.Errorf("beehive: start controller %s/%s: %w", r.gk.Group, r.gk.Kind, err)
 		}
 		started = append(started, r)
 	}
@@ -154,7 +167,7 @@ func (bh *Beehive) Start() error {
 
 	bh.state = beehiveRunning
 	bh.logger.Info("control plane started", "controllers", len(started))
-	return nil
+	return func(stopCtx context.Context) error { return bh.stop(stopCtx) }, nil
 }
 
 // runGCSweeper is the global garbage-collection backstop. The per-controller
@@ -240,13 +253,17 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 	}
 }
 
-// Stop tears the control plane down: it cancels the reconcile loops, waits for
-// them to drain (bounded by ctx), then stops every controller.
-func (bh *Beehive) Stop(ctx context.Context) {
+// stop tears the control plane down: it cancels the reconcile loops, waits for
+// them to drain (bounded by ctx), then stops every controller. It returns a
+// non-nil error only when the loops did not drain before ctx was cancelled, so
+// callers can detect a shutdown that hit its deadline; per-controller stop
+// errors are logged and dropped. It is the closure returned by Start, and is a
+// no-op (returning nil) if the control plane isn't running.
+func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Lock()
 	if bh.state != beehiveRunning {
 		bh.mu.Unlock()
-		return
+		return nil
 	}
 	// Transition and cancel under the lock, then release it before waiting on wg.
 	// The dependency wakers (counted in wg) acquire bh.mu via enqueueIfRegistered;
@@ -257,24 +274,29 @@ func (bh *Beehive) Stop(ctx context.Context) {
 	bh.log().Info("control plane stopping")
 	bh.mu.Unlock()
 
-	// Wait for reconcile loops to exit, but don't block past ctx.
+	// Wait for reconcile loops to exit, but don't block past ctx. A drain that
+	// loses the race to ctx is reported to the caller, but we still stop the
+	// controllers below before returning.
 	done := make(chan struct{})
 	go func() {
 		bh.wg.Wait()
 		close(done)
 	}()
+	var drainErr error
 	select {
 	case <-done:
 	case <-ctx.Done():
+		drainErr = ctx.Err()
 	}
 
-	// Watch subscriptions are owned by the store, not the control plane, so Stop
+	// Watch subscriptions are owned by the store, not the control plane, so stop
 	// does not terminate them: an active watcher ends when its context is
 	// cancelled or the store is closed.
 	for _, r := range bh.order {
 		_ = r.adapter.stop(ctx)
 	}
 	bh.log().Info("control plane stopped")
+	return drainErr
 }
 
 // New creates a control plane backed by store s. Register controllers on the
