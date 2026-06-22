@@ -196,6 +196,88 @@ func TestClientUpdate(t *testing.T) {
 	assert.Equal(t, "v2", updated.Spec.Val)
 }
 
+func TestClientCreateOrUpdateCreates(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.NotZero(t, obj.ID)
+	require.NotNil(t, obj.Slug)
+	assert.Equal(t, "w1", *obj.Slug)
+	assert.Equal(t, int64(1), obj.Generation)
+	assert.Equal(t, "a", obj.Spec.Val)
+
+	got, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, got.ID)
+}
+
+func TestClientCreateOrUpdateUpdates(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	updated, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.Equal(t, created.ID, updated.ID)
+	assert.Equal(t, int64(2), updated.Generation)
+	assert.Equal(t, "b", updated.Spec.Val)
+}
+
+func TestClientCreateOrUpdateIdempotent(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), first.Generation)
+
+	// Re-applying the same spec is a no-op: no generation bump.
+	second, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.Equal(t, first.ID, second.ID)
+	assert.Equal(t, int64(1), second.Generation)
+}
+
+func TestClientCreateOrUpdateMarshalError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, err = client.CreateOrUpdate(ctx, "w1", errMarshaler{})
+	require.Error(t, err)
+}
+
+func TestClientCreateOrUpdateStoreError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&slugErrorStore{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestClientCreateOrUpdateRawToTypedError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&createOrUpdateBadJSONStore{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.Error(t, err)
+}
+
 func TestClientGetNotFound(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -361,6 +443,31 @@ type errorUpdateSpecStore struct {
 
 func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte) (*RawObject, error) {
 	return nil, errBoom
+}
+
+// slugErrorStore returns a non-NotFound error from GetObjectBySlug, driving
+// CreateOrUpdate's default (read-error) branch.
+type slugErrorStore struct {
+	fakeStore
+}
+
+func (s *slugErrorStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+	return nil, errBoom
+}
+
+// createOrUpdateBadJSONStore drives CreateOrUpdate's rawToTyped error path: the
+// slug is absent (NotFound) so the create branch runs, and CreateObject returns
+// undecodable spec bytes.
+type createOrUpdateBadJSONStore struct {
+	fakeStore
+}
+
+func (s *createOrUpdateBadJSONStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+	return nil, ErrNotFound
+}
+
+func (s *createOrUpdateBadJSONStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
+	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
 // errorListObjectsStore returns an error from ListObjects.
