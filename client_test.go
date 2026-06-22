@@ -791,11 +791,12 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	require.NoError(t, Register(bh2, clientTestGK, ctrl))
 	client2 := NewClient[cSpec, cStatus](bh2, clientTestGK)
 
-	require.NoError(t, bh2.Start())
+	stop, err := bh2.Start(context.Background())
+	require.NoError(t, err)
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		bh2.Stop(stopCtx)
+		_ = stop(stopCtx)
 	}()
 
 	// Capture the ControllerClient from the Start callback.
@@ -879,12 +880,13 @@ func TestStartAfterStopErrors(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, Register(bh, clientTestGK, newWatchFakeController()))
 
-	require.NoError(t, bh.Start())
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
 	stopCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	bh.Stop(stopCtx)
+	_ = stop(stopCtx)
 	cancel()
 
-	err = bh.Start()
+	_, err = bh.Start(ctx)
 	require.Error(t, err, "Start after Stop must return an error")
 }
 

@@ -53,8 +53,9 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 
 	ctrl := newCapturingController()
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	var cc ControllerClient[cStatus]
 	select {
@@ -81,8 +82,9 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 
 	ctrl := newCapturingController()
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	// Receive the ControllerClient that was passed to Start.
 	var cc ControllerClient[cStatus]
@@ -157,8 +159,9 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 
 	ctrl := newCapturingController()
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	var cc ControllerClient[cStatus]
 	select {
@@ -190,8 +193,9 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 
 	ctrl := newCapturingController()
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	var cc ControllerClient[cStatus]
 	select {
@@ -268,8 +272,9 @@ func TestControllerClientHasIncomingRefs(t *testing.T) {
 
 	ctrl := newCapturingController()
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	var cc ControllerClient[cStatus]
 	select {
@@ -305,8 +310,9 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 
 	ctrl := newCapturingController()
 	require.NoError(t, Register(bh, clientTestGK, ctrl)) // controller for "Widget"
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	var cc ControllerClient[cStatus]
 	select {

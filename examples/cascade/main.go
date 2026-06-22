@@ -139,8 +139,9 @@ func main() {
 	exitOnErr(beehive.Register(bh, ClusterGroupKind, &ClusterController{}))
 	exitOnErr(beehive.Register(bh, ClusterCacheGroupKind, &ClusterCacheController{}))
 
-	exitOnErr(bh.Start())
-	defer stopBeehive(bh)
+	stop, err := bh.Start(context.Background())
+	exitOnErr(err)
+	defer stopBeehive(stop)
 
 	ctx := context.Background()
 	clusterClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
@@ -159,7 +160,7 @@ func main() {
 	exitOnErr(err)
 	fmt.Printf("created Cluster %d (endpoint=%s, finalizers=%v)\n", cluster.ID, cluster.Spec.Endpoint, cluster.Finalizers)
 
-	for i := 0; i < numCaches; i++ {
+	for range numCaches {
 		cache, err := cacheClient.Create(ctx, ClusterCacheSpec{ClusterID: cluster.ID},
 			beehive.WithOwner(cluster.ID), beehive.WithFinalizers(cacheFlushFinalizer))
 		exitOnErr(err)
@@ -169,10 +170,12 @@ func main() {
 	watchCascade(ctx, clusterClient, clusterCh, cacheCh, cluster.ID)
 }
 
-func stopBeehive(bh *beehive.Beehive) {
+func stopBeehive(stop func(context.Context) error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	bh.Stop(ctx)
+	if err := stop(ctx); err != nil {
+		fmt.Printf("beehive: shutdown did not drain cleanly: %v\n", err)
+	}
 }
 
 // watchCascade drives the demo from a single event loop: it waits for the

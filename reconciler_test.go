@@ -243,8 +243,9 @@ func TestDependencyRequeue(t *testing.T) {
 	// Resync disabled so the dependency waker is the only thing that can requeue
 	// an already-settled object — no timer noise.
 	require.NoError(t, Register(bh, gk, &reconcileCapture{ch: reconciled}, WithResyncInterval(0)))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	target, err := client.Create(ctx, tSpec{})
@@ -287,9 +288,10 @@ func TestStartToleratesWatchError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, newFakeController()))
 
-	require.NoError(t, bh.Start())
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
 	assert.Equal(t, beehiveRunning, bh.state)
-	bh.Stop(context.Background())
+	_ = stop(context.Background())
 }
 
 // blockingDepsStore parks the dependency waker inside ListIncomingRefs — after it
@@ -336,7 +338,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 
 	stopped := make(chan struct{})
 	go func() {
-		bh.Stop(context.Background()) // unbounded: a lock held across the wait would hang forever
+		_ = bh.stop(context.Background()) // unbounded: a lock held across the wait would hang forever
 		close(stopped)
 	}()
 
@@ -1244,8 +1246,9 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 
 	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -1272,8 +1275,9 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 		secondCh:  make(chan struct{}),
 	}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "v1"})
@@ -1306,8 +1310,9 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 		deleted:    make(chan struct{}),
 	}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -1338,8 +1343,9 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 		},
 	}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -1390,8 +1396,9 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 
 	ctrl := &conditionSettingController{reconciledCh: make(chan struct{})}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -1431,8 +1438,9 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 		},
 	}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -1462,8 +1470,9 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 
 	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	// Without startup enqueue this would time out (resync is disabled).
 	waitClosed(t, ctrl.reconciledCh, "reconcile of pre-existing object at startup")

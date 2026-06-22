@@ -412,8 +412,9 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	w, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, a.ID))
 	require.NoError(t, client.Delete(ctx, b.ID))
@@ -442,8 +443,9 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	w, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	waitForDeletions(t, w, obj.ID)
@@ -478,8 +480,9 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	w, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	waitForDeletions(t, w, raw.ID)
 
@@ -496,8 +499,9 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"}))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "doomed"}, WithFinalizers("f"))
@@ -526,8 +530,9 @@ func TestIntegrationGCCascadeWithResyncDisabled(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner, err := client.Create(ctx, cSpec{Val: "owner"})
@@ -553,8 +558,9 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner, err := client.Create(ctx, cSpec{Val: "owner"})
@@ -591,8 +597,9 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 
 	// Only the owner kind has a controller; the child kind is client-only.
 	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	owners := NewClient[cSpec, cStatus](bh, clientTestGK)
 	childGK := GroupKind{Group: "", Kind: "ClientOnlyChild"}
@@ -636,8 +643,9 @@ func TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled(t *testing.T) {
 
 	// Only the owner kind has a controller; the child kind is client-only.
 	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	owners := NewClient[cSpec, cStatus](bh, clientTestGK)
 	children := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnlyChild"})
@@ -673,8 +681,9 @@ func TestIntegrationGCCollectsStandaloneClientOnlyDelete(t *testing.T) {
 
 	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	// No controller registered for this kind: it is entirely client-only.
 	client := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnly"})
@@ -719,8 +728,9 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	w, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
-	require.NoError(t, bh.Start())
-	defer bh.Stop(ctx)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
 
 	// Deleting the target wakes the dependent (depends_on waker); the dependent
 	// drops the edge, which must then wake the target so GC removes it.
