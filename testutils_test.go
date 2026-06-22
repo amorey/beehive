@@ -201,7 +201,8 @@ func (w *fakeWatcher) endStream() { close(w.ch) }
 // closes channels when they happen, so tests synchronize on those events
 // instead of sleeping. Reconcile is never dispatched yet, so it's a no-op.
 type fakeController struct {
-	startErr error // if set, Start fails (to exercise start rollback)
+	startErr error  // if set, Start fails (to exercise start rollback)
+	onStart  func() // if set, called on each Start (e.g. to cancel the start context)
 
 	mu         sync.Mutex
 	startCalls int
@@ -223,6 +224,9 @@ func (f *fakeController) Start(_ ControllerClient[tStatus]) error {
 	f.startCalls++
 	first := f.startCalls == 1
 	f.mu.Unlock()
+	if f.onStart != nil {
+		f.onStart()
+	}
 	if f.startErr != nil {
 		return f.startErr
 	}

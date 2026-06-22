@@ -175,6 +175,32 @@ func TestStartRollsBackStartedController(t *testing.T) {
 	assert.Equal(t, 0, bad.stopCount())
 }
 
+// TestStartAbortsOnCancelledContext exercises the startCtx.Err() abort path in
+// Start: the first controller cancels the start context as it starts, so the
+// loop bails before the second controller and rolls back the first. Start
+// iterates in registration order, so this is deterministic.
+func TestStartAbortsOnCancelledContext(t *testing.T) {
+	bh, err := New(&fakeStore{})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := newFakeController()
+	first.onStart = cancel // cancel the start context once the first controller starts
+	second := newFakeController()
+	require.NoError(t, Register(bh, GroupKind{Kind: "First"}, first))
+	require.NoError(t, Register(bh, GroupKind{Kind: "Second"}, second))
+
+	stop, err := bh.Start(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, stop, "no stop function on a failed Start")
+
+	// first started, then got rolled back; second was never reached.
+	assert.Equal(t, 1, first.startCount())
+	assert.Equal(t, 1, first.stopCount(), "a started controller must be rolled back")
+	assert.Equal(t, 0, second.startCount())
+	assert.Equal(t, beehiveNew, bh.state)
+}
+
 func TestRegisterPropagatesOptionError(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
