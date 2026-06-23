@@ -90,6 +90,8 @@ func main() {
 
 - **`spec`/`status` separation.** Only controllers may write `status`. This is structural in the API: the user-facing `Client` surface has no status-write path; only the `Controller` surface does.
 
+- **Schema-version migration.** `Spec` and `Status` are opaque JSON, so reshaping a struct would break decode of older rows. A per-kind `Migrator` converts an old blob up *on read*, before unmarshal. Spec and Status version and convert independently; conversion is lazy — re-stamped only when the blob is next written, never by a bulk rewrite.
+
 ## API
 
 ### Beehive
@@ -242,6 +244,21 @@ When several writes must be atomic — all land together or none do — wrap the
 
 A non-nil error triggers an automatic retry with exponential backoff starting at 1s and capped at 30s by default. Configurable per-controller with `WithMaxRetryInterval`.
 
+### Migrator
+
+```go
+type Migrator interface {
+    SchemaVersionSpec() int                                          // spec version this build writes; 0 = not versioned
+    SchemaVersionStatus() int                                        // status version this build writes; 0 = not versioned
+    ConvertSpec(from int, raw json.RawMessage) (json.RawMessage, error)
+    ConvertStatus(from int, raw json.RawMessage) (json.RawMessage, error)
+}
+```
+
+Attach a `Migrator` per kind with `WithMigrator` passed to `Register`. The store persists the version each blob was written at in two opaque per-row columns (spec and status). On read, a blob below the current version is run through `ConvertSpec`/`ConvertStatus`; an equal version (or a current version of `0`, "not versioned") passes through; a *greater* version is a downgrade and is rejected as a decode error. `from == 0` is the unversioned baseline, so once a migrator is enabled its converters must handle it.
+
+Conversion is lazy and per-column — a blob is re-stamped only when next written, so a status-only write re-stamps just the status version. A blob that fails to convert, fails to unmarshal, or is a downgrade is a decode failure: `List` and live watches skip-and-log it and continue, while `Get`/`GetBySlug` return the error. A kind with no migrator is unchanged — its columns stay `0`. Only `Register`ed kinds can have a migrator; client-only kinds cannot.
+
 ### Options
 
 ```go
@@ -252,6 +269,7 @@ func WithFinalizers(f ...string) Option            // declare finalizers before 
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithResyncInterval(d time.Duration) Option    // override the default resync interval
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
+func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
 ```
 
 `WithOwner` sets an `owned_by` edge in `refs` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
