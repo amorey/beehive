@@ -32,14 +32,13 @@ import (
 // reconcile failure. Aliased from storeapi like ErrNotFound.
 var ErrWrongKind = storeapi.ErrWrongKind
 
-// Controller is the user-supplied reconcile logic for a resource kind. Start
-// receives a ControllerClient for writing status and runs once on registration;
-// Reconcile is called to drive an object toward its desired state; Stop tears
-// down any background work.
+// Controller is the user-supplied reconcile logic for a resource kind.
+// Reconcile is called to drive an object toward its desired state; the client
+// is the status-write surface for this controller's kind. Controllers own no
+// lifecycle in beehive — any background work belongs to the embedding
+// application, which obtains a ControllerClient from Register.
 type Controller[Spec, Status any] interface {
-	Start(client ControllerClient[Status]) error
-	Stop(ctx context.Context) error
-	Reconcile(ctx context.Context, obj *Object[Spec, Status]) (Result, error)
+	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) (Result, error)
 }
 
 // ControllerClient is the write surface a controller uses to report observed
@@ -67,8 +66,9 @@ type ControllerClient[Status any] interface {
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
-// controllerClientImpl is the status-writing surface handed to a controller's
-// Start. Its methods are only reached from within a Reconcile call.
+// controllerClientImpl is the status-writing surface for a controller's kind.
+// It is constructed once at Register, passed into each Reconcile, and returned
+// to the embedding application so it can write status from its own goroutines.
 type controllerClientImpl[Status any] struct {
 	bh *Beehive
 	gk GroupKind

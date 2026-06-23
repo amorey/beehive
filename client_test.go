@@ -496,7 +496,8 @@ func newWatchClient(t *testing.T, store Store, gk GroupKind) Client[tSpec, tStat
 	t.Helper()
 	bh, err := New(store)
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 	return NewClient[tSpec, tStatus](bh, gk)
 }
 
@@ -538,7 +539,8 @@ func TestClientWatchPropagatesStoreError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, err := New(&watcherStore{err: errBoom})
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, gk, newFakeController()))
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	_, err = client.Watch(context.Background(), 1)
@@ -706,29 +708,10 @@ func watchTestBH(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
 	t.Helper()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
-	ctrl := newWatchFakeController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	return bh, client
-}
-
-// watchFakeController is a minimal controller that captures the ControllerClient
-// handed to it during Start, for tests that need to call UpdateStatus directly.
-type watchFakeController struct {
-	clientCh chan ControllerClient[cStatus]
-}
-
-func newWatchFakeController() *watchFakeController {
-	return &watchFakeController{clientCh: make(chan ControllerClient[cStatus], 1)}
-}
-
-func (c *watchFakeController) Start(cc ControllerClient[cStatus]) error {
-	c.clientCh <- cc
-	return nil
-}
-func (c *watchFakeController) Stop(_ context.Context) error { return nil }
-func (c *watchFakeController) Reconcile(_ context.Context, _ *Object[cSpec, cStatus]) (Result, error) {
-	return Result{}, nil
 }
 
 // TestWatchListReceivesAddedOnCreate verifies that WatchList delivers a
@@ -890,12 +873,11 @@ func TestWatchClosesOnCtxCancel(t *testing.T) {
 func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	ctx := context.Background()
 
-	ctrl := newWatchFakeController()
-	// Re-register with our capturing controller.
 	// watchTestBH already registered one; we need a fresh beehive for this test.
 	bh2, err := New(newClientTestStore(t))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh2, clientTestGK, ctrl))
+	cc, err := Register(bh2, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	client2 := NewClient[cSpec, cStatus](bh2, clientTestGK)
 
 	stop, err := bh2.Start(context.Background())
@@ -905,14 +887,6 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 		defer cancel()
 		_ = stop(stopCtx)
 	}()
-
-	// Capture the ControllerClient from the Start callback.
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("controller Start never called")
-	}
 
 	obj, err := client2.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
@@ -985,7 +959,8 @@ func TestStartAfterStopErrors(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, clientTestGK, newWatchFakeController()))
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)

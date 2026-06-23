@@ -34,8 +34,6 @@ const (
 // reconciler, work queue, Store — stays free of type parameters and deals in
 // raw JSON.
 type controllerAdapter interface {
-	start() error
-	stop(ctx context.Context) error
 	reconcile(ctx context.Context, id ObjectID) (Result, error)
 }
 
@@ -45,7 +43,8 @@ type typedController[Spec, Status any] struct {
 	gk     GroupKind
 	bh     *Beehive
 	inner  Controller[Spec, Status]
-	logger *slog.Logger // kind-tagged; set by Register (never nil after that)
+	client ControllerClient[Status] // built once at Register, passed into each Reconcile
+	logger *slog.Logger             // kind-tagged; set by Register (never nil after that)
 }
 
 // log returns a non-nil logger, guarding the rare path where a typedController
@@ -55,15 +54,6 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 		return discardLogger
 	}
 	return t.logger
-}
-
-func (t *typedController[Spec, Status]) start() error {
-	client := &controllerClientImpl[Status]{bh: t.bh, gk: t.gk}
-	return t.inner.Start(client)
-}
-
-func (t *typedController[Spec, Status]) stop(ctx context.Context) error {
-	return t.inner.Stop(ctx)
 }
 
 // reconcile loads the object and runs the controller. There is no enclosing
@@ -101,7 +91,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
-	result, reconcileErr := t.inner.Reconcile(ctx, obj)
+	result, reconcileErr := t.inner.Reconcile(ctx, t.client, obj)
 	if reconcileErr != nil {
 		// Warn, not Error: a failed reconcile is expected churn the retry loop
 		// absorbs. We don't return yet — the controller's committed writes still need

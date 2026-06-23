@@ -38,27 +38,14 @@ type ClusterStatus struct {
   // TODO: define observed state fields
 }
 
-type ClusterController struct {
-  client beehive.ControllerClient[ClusterStatus]
-}
+type ClusterController struct{}
 
-func (cc *ClusterController) Start(client beehive.ControllerClient[ClusterStatus]) error {
-  cc.client = client
-  // TODO: start background workers (e.g. connection pool, watchers)
-  return nil
-}
-
-func (cc *ClusterController) Stop(ctx context.Context) error {
-  // TODO: shut down background workers
-  return nil
-}
-
-func (cc *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
+func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
   // Handle deletion: object is finalizing when DeletionRequestedAt is set.
   // Remove any external resources, then clear the finalizer to allow the row to be deleted.
   if obj.DeletionRequestedAt != nil {
     // TODO: clean up external resources for obj.Spec
-    // TODO: remove finalizer: return beehive.Result{}, cc.client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
+    // TODO: remove finalizer: return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
     return beehive.Result{}, nil
   }
 
@@ -67,7 +54,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, obj *beehive.Object[
   // return beehive.Result{RequeueAfter: 5 * time.Second}, nil
 
   // TODO: update observed state
-  // return beehive.Result{}, cc.client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{})
+  // return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{})
 
   return beehive.Result{}, nil
 }
@@ -77,7 +64,10 @@ func main() {
   defer store.Close()
 
   bh, _ := beehive.New(store)
-  beehive.Register(bh, ClusterGroupKind, &ClusterController{})
+  // Register returns the kind's ControllerClient for out-of-band status writes
+  // from your own goroutines (background work belongs to the app, not beehive);
+  // ignore it if Reconcile is your only writer.
+  _, _ = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 
   stop, err := bh.Start(context.Background())
   if err != nil {
@@ -106,8 +96,10 @@ func main() {
 
 ```go
 func New(store Store, opts ...Option) (*Beehive, error)
-func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error
+func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) (ControllerClient[Status], error)
 ```
+
+`Register` returns the kind's `ControllerClient` — the status-write surface — so the embedding application can write status out-of-band (e.g. from its own goroutines) without beehive handing it over via a callback. A `ControllerClient` is obtainable *only* by registering a controller for that kind, which keeps the "only the owning controller writes its status" boundary intact.
 
 Options are dispatched by caller type — `WithResyncInterval` passed to `New` sets the global default; passed to `Register` it overrides for that controller only. Unrecognised options for a given caller are ignored.
 
@@ -238,11 +230,11 @@ type ControllerClient[Status any] interface {
 
 ```go
 type Controller[Spec, Status any] interface {
-    Start(client ControllerClient[Status]) error
-    Stop(ctx context.Context) error
-    Reconcile(ctx context.Context, obj *Object[Spec, Status]) (Result, error)
+    Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) (Result, error)
 }
 ```
+
+A controller owns **no lifecycle** in beehive — it implements only `Reconcile`, which receives the kind's `ControllerClient` as a parameter. Any background work (timers, subscriptions, engines) belongs to the embedding application, which already owns its own lifecycle and obtains a `ControllerClient` from `Register`. Beehive owns the reconcile lifecycle only: the work queue, backoff, resync, dependency wakers, GC, and drain ordering.
 
 `Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed — the level loop simply re-derives from the persisted state on the next pass, so make `Reconcile` idempotent. (Each write is still internally atomic, and the `obj` snapshot a concurrent spec change can race is covered by the generation handshake: `UpdateStatus` rejects a future `observedGeneration`, and an older one leaves the object unsettled to reconcile again.)
 

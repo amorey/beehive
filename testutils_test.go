@@ -25,7 +25,7 @@ import (
 )
 
 // errBoom is a sentinel error shared by tests that exercise error-propagation
-// paths (option failures, store failures, controller Start rollback).
+// paths (option failures, store failures, controller reconcile errors).
 var errBoom = errors.New("boom")
 
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
@@ -197,70 +197,13 @@ func (w *fakeWatcher) push(typ WatchEventType, obj *RawObject) {
 // endStream closes the event channel, signalling the stream has ended.
 func (w *fakeWatcher) endStream() { close(w.ch) }
 
-// fakeController is a test double for Controller. It counts Start/Stop calls and
-// closes channels when they happen, so tests synchronize on those events
-// instead of sleeping. Reconcile is never dispatched yet, so it's a no-op.
-type fakeController struct {
-	startErr error  // if set, Start fails (to exercise start rollback)
-	onStart  func() // if set, called on each Start (e.g. to cancel the start context)
+// noopController is a no-op test double for Controller, used wherever a test
+// needs a registered controller but never exercises its reconcile behaviour.
+// Tests that need a ControllerClient obtain it from Register's return value.
+type noopController[Spec, Status any] struct{}
 
-	mu         sync.Mutex
-	startCalls int
-	stopCalls  int
-
-	startedCh chan struct{} // closed after the first successful Start
-	stoppedCh chan struct{} // closed on the first Stop
-}
-
-func newFakeController() *fakeController {
-	return &fakeController{
-		startedCh: make(chan struct{}),
-		stoppedCh: make(chan struct{}),
-	}
-}
-
-func (f *fakeController) Start(_ ControllerClient[tStatus]) error {
-	f.mu.Lock()
-	f.startCalls++
-	first := f.startCalls == 1
-	f.mu.Unlock()
-	if f.onStart != nil {
-		f.onStart()
-	}
-	if f.startErr != nil {
-		return f.startErr
-	}
-	if first {
-		close(f.startedCh)
-	}
-	return nil
-}
-
-func (f *fakeController) Stop(_ context.Context) error {
-	f.mu.Lock()
-	f.stopCalls++
-	first := f.stopCalls == 1
-	f.mu.Unlock()
-	if first {
-		close(f.stoppedCh)
-	}
-	return nil
-}
-
-func (f *fakeController) Reconcile(_ context.Context, _ *Object[tSpec, tStatus]) (Result, error) {
+func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) (Result, error) {
 	return Result{}, nil
-}
-
-func (f *fakeController) startCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.startCalls
-}
-
-func (f *fakeController) stopCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.stopCalls
 }
 
 // waitClosed blocks until ch is closed, failing the test if that takes longer
