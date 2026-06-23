@@ -1163,8 +1163,17 @@ func (c *specEchoController) Reconcile(ctx context.Context, client ControllerCli
 	return Result{}, nil
 }
 
+// deletionTrackingFinalizer gates collection of deletionTrackingController's
+// object on the controller. Without it, a finalizer-less object's row is
+// collectible the instant deletion is requested, so the global GC sweeper's
+// startup pass can remove it before the controller's reconcile observes
+// DeletionRequestedAt — the controller is then never woken with deleting=true.
+// (Observing deletion at all requires a finalizer; this mirrors that contract.)
+const deletionTrackingFinalizer = "test.beehive/deletion-tracking"
+
 // deletionTrackingController signals reconciled after the first successful
-// reconcile and deleted when the object's DeletionRequestedAt is set.
+// reconcile and deleted when the object's DeletionRequestedAt is set, then
+// clears its finalizer so the row can finally be collected.
 type deletionTrackingController struct {
 	reconcileOne sync.Once
 	deleteOne    sync.Once
@@ -1175,6 +1184,11 @@ type deletionTrackingController struct {
 func (c *deletionTrackingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		c.deleteOne.Do(func() { close(c.deleted) })
+		// Clear the finalizer so GC can collect the row now that the deletion has
+		// been observed (idempotent: re-clearing a gone finalizer is a no-op).
+		if err := client.DeleteFinalizer(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
+			return Result{}, err
+		}
 		return Result{}, nil
 	}
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
@@ -1264,7 +1278,9 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	// The finalizer keeps the row alive until the controller observes the deletion;
+	// see deletionTrackingFinalizer.
+	obj, err := client.Create(ctx, cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
 	require.NoError(t, err)
 
 	waitClosed(t, ctrl.reconciled, "first reconcile")
