@@ -40,7 +40,8 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	require.NoError(t, err)
 
 	gk := GroupKind{Kind: "Widget"}
-	require.NoError(t, Register(bh, gk, newFakeController()))
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 
 	r, ok := bh.reconcilers[gk]
 	require.True(t, ok, "reconciler should be registered under its GroupKind")
@@ -54,8 +55,10 @@ func TestRegisterRejectsDuplicate(t *testing.T) {
 	require.NoError(t, err)
 
 	gk := GroupKind{Kind: "Widget"}
-	require.NoError(t, Register(bh, gk, newFakeController()))
-	require.Error(t, Register(bh, gk, newFakeController()))
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.Error(t, err)
 }
 
 func TestRegisterRejectedAfterStart(t *testing.T) {
@@ -65,7 +68,8 @@ func TestRegisterRejectedAfterStart(t *testing.T) {
 	require.NoError(t, err)
 	defer stop(context.Background())
 
-	require.Error(t, Register(bh, GroupKind{Kind: "Widget"}, newFakeController()))
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.Error(t, err)
 }
 
 func TestRegisterPerControllerOverride(t *testing.T) {
@@ -75,11 +79,13 @@ func TestRegisterPerControllerOverride(t *testing.T) {
 	assert.Equal(t, 10*time.Second, bh.resyncInterval)
 
 	overridden := GroupKind{Kind: "Overridden"}
-	require.NoError(t, Register(bh, overridden, newFakeController(),
-		WithResyncInterval(2*time.Second), WithMaxRetryInterval(7*time.Second)))
+	_, err = Register(bh, overridden, &noopController[tSpec, tStatus]{},
+		WithResyncInterval(2*time.Second), WithMaxRetryInterval(7*time.Second))
+	require.NoError(t, err)
 
 	inherited := GroupKind{Kind: "Inherited"}
-	require.NoError(t, Register(bh, inherited, newFakeController()))
+	_, err = Register(bh, inherited, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 
 	assert.Equal(t, 2*time.Second, bh.reconcilers[overridden].resyncInterval)
 	assert.Equal(t, 7*time.Second, bh.reconcilers[overridden].maxRetryInterval)
@@ -92,18 +98,14 @@ func TestStartStopLifecycle(t *testing.T) {
 	bh, err := New(&fakeStore{}, WithResyncInterval(0))
 	require.NoError(t, err)
 
-	fc := newFakeController()
-	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, fc))
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	waitClosed(t, fc.startedCh, "controller Start")
 	assert.Equal(t, beehiveRunning, bh.state)
 
 	require.NoError(t, stop(context.Background()))
-	waitClosed(t, fc.stoppedCh, "controller Stop")
-	assert.Equal(t, 1, fc.startCount())
-	assert.Equal(t, 1, fc.stopCount())
 	assert.Equal(t, beehiveStopped, bh.state)
 }
 
@@ -122,113 +124,54 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
 
-	fc := newFakeController()
-	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, fc))
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 
-	// never started: must not panic or stop controllers, and reports no error.
+	// never started: must not panic, and reports no error.
 	require.NoError(t, bh.stop(context.Background()))
-	assert.Equal(t, 0, fc.stopCount())
 }
 
 func TestStopReturnsWithExpiredContext(t *testing.T) {
 	bh, err := New(&fakeStore{}, WithResyncInterval(0))
 	require.NoError(t, err)
 
-	fc := newFakeController()
-	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, fc))
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	waitClosed(t, fc.startedCh, "controller Start")
 
 	// An already-expired ctx caps the drain wait. stop must still return (the
-	// test completing proves no hang), still stop the controllers, and report the
-	// expired context so the caller can tell the drain didn't complete in time.
+	// test completing proves no hang) and report the expired context so the caller
+	// can tell the drain didn't complete in time.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.ErrorIs(t, stop(ctx), context.Canceled)
 
-	assert.Equal(t, 1, fc.stopCount())
 	assert.Equal(t, beehiveStopped, bh.state)
 }
 
-// TestStartRollsBackStartedController exercises the rollback loop body in Start:
-// the good controller, registered first, starts; the bad one then fails, and the
-// good one must be rolled back. Start iterates in registration order, so this is
-// deterministic.
-func TestStartRollsBackStartedController(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
-
-	good := newFakeController()
-	bad := &fakeController{startedCh: make(chan struct{}), stoppedCh: make(chan struct{}), startErr: errBoom}
-
-	require.NoError(t, Register(bh, GroupKind{Kind: "Good"}, good))
-	require.NoError(t, Register(bh, GroupKind{Kind: "Bad"}, bad))
-
-	_, err = bh.Start(context.Background())
-	require.ErrorIs(t, err, errBoom)
-
-	// good started before bad failed, so it must have been rolled back.
-	assert.Equal(t, 1, good.startCount())
-	assert.Equal(t, 1, good.stopCount(), "a started controller must be rolled back")
-	// bad's Start failed, so it is never added to the started set and not stopped.
-	assert.Equal(t, 0, bad.stopCount())
-}
-
 // TestStartAbortsOnCancelledContext exercises the startCtx.Err() abort path in
-// Start: the first controller cancels the start context as it starts, so the
-// loop bails before the second controller and rolls back the first. Start
-// iterates in registration order, so this is deterministic.
+// Start: an already-cancelled start context makes Start bail before launching
+// the reconcile loops, returning an error and no stop function.
 func TestStartAbortsOnCancelledContext(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
 
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
 	ctx, cancel := context.WithCancel(context.Background())
-	first := newFakeController()
-	first.onStart = cancel // cancel the start context once the first controller starts
-	second := newFakeController()
-	require.NoError(t, Register(bh, GroupKind{Kind: "First"}, first))
-	require.NoError(t, Register(bh, GroupKind{Kind: "Second"}, second))
+	cancel() // already cancelled before Start runs
 
 	stop, err := bh.Start(ctx)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, stop, "no stop function on a failed Start")
-
-	// first started, then got rolled back; second was never reached.
-	assert.Equal(t, 1, first.startCount())
-	assert.Equal(t, 1, first.stopCount(), "a started controller must be rolled back")
-	assert.Equal(t, 0, second.startCount())
 	assert.Equal(t, beehiveNew, bh.state)
 }
 
 func TestRegisterPropagatesOptionError(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
-	err = Register(bh, GroupKind{Kind: "Widget"}, newFakeController(), func(any) error { return errBoom })
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
 	require.ErrorIs(t, err, errBoom)
-}
-
-func TestStartRollsBackOnFailure(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
-
-	good := newFakeController()
-	bad := newFakeController()
-	bad.startErr = errBoom
-	require.NoError(t, Register(bh, GroupKind{Kind: "Good"}, good))
-	require.NoError(t, Register(bh, GroupKind{Kind: "Bad"}, bad))
-
-	_, err = bh.Start(context.Background())
-	require.ErrorIs(t, err, errBoom)
-	assert.Equal(t, beehiveNew, bh.state)
-
-	// Map iteration order is randomized, so we can't say whether `good` started
-	// before `bad` failed. Assert the order-independent invariant instead: any
-	// controller that started successfully must have been rolled back (Stopped).
-	if good.startCount() > 0 {
-		assert.Equal(t, 1, good.stopCount(), "a started controller must be rolled back")
-	}
-	// The controller whose Start failed is never added to the started set, so it
-	// is not stopped.
-	assert.Equal(t, 0, bad.stopCount())
 }

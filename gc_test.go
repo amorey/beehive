@@ -32,22 +32,14 @@ import (
 // never deleted.
 type depDroppingController struct {
 	mu       sync.Mutex
-	cc       ControllerClient[cStatus]
 	reader   Client[cSpec, cStatus]
 	depID    ObjectID
 	targetID ObjectID
 }
 
-func (c *depDroppingController) Start(cc ControllerClient[cStatus]) error {
+func (c *depDroppingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	c.mu.Lock()
-	c.cc = cc
-	c.mu.Unlock()
-	return nil
-}
-func (c *depDroppingController) Stop(context.Context) error { return nil }
-func (c *depDroppingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	cc, reader, depID, targetID := c.cc, c.reader, c.depID, c.targetID
+	reader, depID, targetID := c.reader, c.depID, c.targetID
 	c.mu.Unlock()
 	if obj.ID != depID {
 		return Result{}, nil // only the dependent acts
@@ -70,25 +62,12 @@ func (c *depDroppingController) Reconcile(ctx context.Context, obj *Object[cSpec
 // pure no-op reconciler — exactly what a cascade-only owner needs.
 type finalizerClearingController struct {
 	finalizer string // empty => never clears anything
-
-	mu     sync.Mutex
-	client ControllerClient[cStatus]
 }
 
-func (c *finalizerClearingController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *finalizerClearingController) Stop(context.Context) error { return nil }
-func (c *finalizerClearingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *finalizerClearingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt == nil || c.finalizer == "" {
 		return Result{}, nil
 	}
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
 	for _, f := range obj.Finalizers {
 		if f == c.finalizer {
 			return Result{}, client.DeleteFinalizer(ctx, obj.ID, c.finalizer)
@@ -103,19 +82,9 @@ func (c *finalizerClearingController) Reconcile(ctx context.Context, obj *Object
 // hold the finalizer are left for GC directly.
 type hasIncomingRefsGatingController struct {
 	finalizer string
-
-	mu sync.Mutex
-	cc ControllerClient[cStatus]
 }
 
-func (c *hasIncomingRefsGatingController) Start(cc ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.cc = cc
-	c.mu.Unlock()
-	return nil
-}
-func (c *hasIncomingRefsGatingController) Stop(context.Context) error { return nil }
-func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt == nil {
 		return Result{}, nil
 	}
@@ -128,9 +97,6 @@ func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, obj *Ob
 	if !held {
 		return Result{}, nil
 	}
-	c.mu.Lock()
-	cc := c.cc
-	c.mu.Unlock()
 	referenced, err := cc.HasIncomingRefs(ctx, obj.ID)
 	if err != nil || referenced {
 		return Result{}, err // a live user remains; keep the finalizer
@@ -396,7 +362,8 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	// Resync disabled: the cycle must break purely event-driven.
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
+	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a, err := client.Create(ctx, cSpec{Val: "a"})
@@ -428,7 +395,8 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	// Resync disabled: the finalizer gate must clear purely event-driven.
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, clientTestGK, &hasIncomingRefsGatingController{finalizer: "gate"}))
+	_, err = Register(bh, clientTestGK, &hasIncomingRefsGatingController{finalizer: "gate"})
+	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj, err := client.Create(ctx, cSpec{Val: "self"}, WithFinalizers("gate"))
@@ -469,8 +437,9 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// enqueueDeletionPending is the only thing that can drive this row to removal.
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{},
-		WithStartupReconcileStrategy(StartupReconcileNone)))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{},
+		WithStartupReconcileStrategy(StartupReconcileNone))
+	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -498,7 +467,8 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
 
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"}))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -529,7 +499,8 @@ func TestIntegrationGCCascadeWithResyncDisabled(t *testing.T) {
 	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
 
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -557,7 +528,8 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	bh, err := New(newClientTestStore(t), WithResyncInterval(5*time.Millisecond))
 	require.NoError(t, err)
 
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -596,7 +568,8 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	require.NoError(t, err)
 
 	// Only the owner kind has a controller; the child kind is client-only.
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -642,7 +615,8 @@ func TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled(t *testing.T) {
 	require.NoError(t, err)
 
 	// Only the owner kind has a controller; the child kind is client-only.
-	require.NoError(t, Register(bh, clientTestGK, &finalizerClearingController{}))
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -706,7 +680,8 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &depDroppingController{}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	target, err := client.Create(ctx, cSpec{Val: "target"})

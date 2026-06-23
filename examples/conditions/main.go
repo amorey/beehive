@@ -65,22 +65,11 @@ const (
 // Liveness condition: a previous process's claim of readiness is downgraded to
 // "verifying" on restart until this controller re-confirms it.
 type ServerController struct {
-	client beehive.ControllerClient[ServerStatus]
-
 	mu     sync.Mutex
 	online map[beehive.ObjectID]int // replicas this process has brought online
 }
 
-func (c *ServerController) Start(client beehive.ControllerClient[ServerStatus]) error {
-	c.client = client
-	return nil
-}
-
-func (c *ServerController) Stop(_ context.Context) error {
-	return nil
-}
-
-func (c *ServerController) Reconcile(ctx context.Context, obj *beehive.Object[ServerSpec, ServerStatus]) (beehive.Result, error) {
+func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) (beehive.Result, error) {
 	want := obj.Spec.Replicas
 
 	// Bring one more replica online this pass, modeling a pool that warms up
@@ -98,10 +87,10 @@ func (c *ServerController) Reconcile(ctx context.Context, obj *beehive.Object[Se
 
 	if ready {
 		// Pool is full: clear the transient progress condition and mark Ready.
-		if err := c.client.DeleteCondition(ctx, obj.ID, condProgressing); err != nil {
+		if err := client.DeleteCondition(ctx, obj.ID, condProgressing); err != nil {
 			return beehive.Result{}, err
 		}
-		if err := c.client.SetCondition(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:     condReady,
 			Status:   beehive.ConditionTrue,
 			Reason:   "AllReplicasOnline",
@@ -111,7 +100,7 @@ func (c *ServerController) Reconcile(ctx context.Context, obj *beehive.Object[Se
 			return beehive.Result{}, err
 		}
 	} else {
-		if err := c.client.SetCondition(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:    condProgressing,
 			Status:  beehive.ConditionTrue,
 			Reason:  "ScalingUp",
@@ -119,7 +108,7 @@ func (c *ServerController) Reconcile(ctx context.Context, obj *beehive.Object[Se
 		}); err != nil {
 			return beehive.Result{}, err
 		}
-		if err := c.client.SetCondition(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:     condReady,
 			Status:   beehive.ConditionFalse,
 			Reason:   "ScalingUp",
@@ -130,7 +119,7 @@ func (c *ServerController) Reconcile(ctx context.Context, obj *beehive.Object[Se
 		}
 	}
 
-	if err := c.client.UpdateStatus(ctx, obj.ID, obj.Generation, ServerStatus{OnlineReplicas: have}); err != nil {
+	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ServerStatus{OnlineReplicas: have}); err != nil {
 		return beehive.Result{}, err
 	}
 
@@ -155,7 +144,7 @@ func main() {
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
-	err = beehive.Register(bh, ServerGroupKind, &ServerController{online: map[beehive.ObjectID]int{}})
+	_, err = beehive.Register(bh, ServerGroupKind, &ServerController{online: map[beehive.ObjectID]int{}})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

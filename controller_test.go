@@ -24,45 +24,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// capturingController saves the ControllerClient it receives in Start so the
-// test can call UpdateStatus directly.
-type capturingController struct {
-	clientCh chan ControllerClient[cStatus]
-}
-
-func newCapturingController() *capturingController {
-	return &capturingController{clientCh: make(chan ControllerClient[cStatus], 1)}
-}
-
-func (c *capturingController) Start(client ControllerClient[cStatus]) error {
-	c.clientCh <- client
-	return nil
-}
-
-func (c *capturingController) Stop(_ context.Context) error { return nil }
-
-func (c *capturingController) Reconcile(_ context.Context, _ *Object[cSpec, cStatus]) (Result, error) {
-	return Result{}, nil
-}
-
 func TestControllerClientDeleteFinalizer(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
 	require.NoError(t, err)
 
-	ctrl := newCapturingController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
-
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("controller Start was not called")
-	}
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"}, WithFinalizers("a", "b"))
@@ -80,19 +52,11 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 
-	ctrl := newCapturingController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
-
-	// Receive the ControllerClient that was passed to Start.
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	default:
-		t.Fatal("controller Start was not called")
-	}
 
 	// Create an object and update its status via the ControllerClient.
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -157,18 +121,11 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 
-	ctrl := newCapturingController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
-
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("controller Start was not called")
-	}
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -191,18 +148,11 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 
-	ctrl := newCapturingController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
-
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("controller Start was not called")
-	}
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	from, err := client.Create(ctx, cSpec{Val: "from"})
@@ -270,18 +220,11 @@ func TestControllerClientHasIncomingRefs(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 
-	ctrl := newCapturingController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
-
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("controller Start was not called")
-	}
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner, err := client.Create(ctx, cSpec{Val: "owner"})
@@ -308,18 +251,11 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 
-	ctrl := newCapturingController()
-	require.NoError(t, Register(bh, clientTestGK, ctrl)) // controller for "Widget"
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
-
-	var cc ControllerClient[cStatus]
-	select {
-	case cc = <-ctrl.clientCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("controller Start was not called")
-	}
 
 	// A "Gadget" is a foreign kind to this controller. Give it a finalizer so the
 	// DeleteFinalizer attempt has a target to (fail to) remove.

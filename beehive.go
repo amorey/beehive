@@ -52,8 +52,9 @@ type Beehive struct {
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
-	// order preserves registration order so Start brings controllers up — and
-	// rolls them back — deterministically, rather than in random map order.
+	// order preserves registration order so Start subscribes dependency wakers
+	// and launches reconcile loops deterministically, rather than in random map
+	// order.
 	order  []*reconciler
 	state  beehiveState
 	cancel context.CancelFunc
@@ -69,16 +70,15 @@ func (bh *Beehive) log() *slog.Logger {
 	return bh.logger
 }
 
-// Start brings the control plane up: it starts every registered controller and
-// launches its reconcile loop. On success it returns a stop function that tears
-// the control plane back down (see stop). It is an error to start twice or after
-// stop; on error the returned stop is nil. Beehive is a one-shot object: once
-// stopped, create a new instance.
+// Start brings the control plane up: it launches the dependency wakers, the
+// per-controller reconcile loops, and the GC sweeper. On success it returns a
+// stop function that tears the control plane back down (see stop). It is an
+// error to start twice or after stop; on error the returned stop is nil. Beehive
+// is a one-shot object: once stopped, create a new instance.
 //
-// startCtx bounds the startup phase only — controller startup is assumed fast
-// and non-blocking, but a startCtx that's already cancelled aborts startup. The
-// long-lived reconcile loops do not derive from startCtx; the run lifetime ends
-// only when the returned stop is called.
+// startCtx bounds the startup phase only — a startCtx that's already cancelled
+// aborts startup. The long-lived reconcile loops do not derive from startCtx;
+// the run lifetime ends only when the returned stop is called.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
@@ -98,33 +98,12 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	runCtx, cancel := context.WithCancel(context.Background())
 	bh.cancel = cancel
 
-	// Start controllers first so they can stand up background workers before
-	// any reconcile is dispatched. Iterate in registration order so startup and
-	// rollback are deterministic.
-	started := make([]*reconciler, 0, len(bh.order))
-	for _, r := range bh.order {
-		// Abort startup if the caller's context is already done before we reach
-		// this controller, rolling back what we've started so far.
-		if err := startCtx.Err(); err != nil {
-			for _, s := range started {
-				_ = s.adapter.stop(startCtx)
-			}
-			cancel()
-			return nil, fmt.Errorf("beehive: start aborted: %w", err)
-		}
-		if err := r.adapter.start(); err != nil {
-			// Roll back the controllers we already started, then abort.
-			// The reconcile loops were never launched, so there's nothing to
-			// drain; we just stop each controller, bounded by startCtx.
-			for _, s := range started {
-				_ = s.adapter.stop(startCtx)
-			}
-			cancel()
-			bh.logger.Error("controller start failed; rolled back",
-				"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
-			return nil, fmt.Errorf("beehive: start controller %s/%s: %w", r.gk.Group, r.gk.Kind, err)
-		}
-		started = append(started, r)
+	// Controllers own no startup work in beehive — any background work belongs to
+	// the embedding application. Abort only if the caller's context is already
+	// done before we launch the loops.
+	if err := startCtx.Err(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("beehive: start aborted: %w", err)
 	}
 
 	// A per-kind dependency waker requeues dependents on each change. Driving it
@@ -138,7 +117,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// that rely on dependency events (e.g. a dependent with StartupReconcileNone
 	// and resync disabled). A subscribe failure is non-fatal: that controller
 	// still resyncs on its own timer.
-	for _, r := range started {
+	for _, r := range bh.order {
 		w, err := bh.store.WatchEvents(runCtx, r.gk)
 		if err != nil {
 			bh.logger.Warn("dependency waker subscription failed; relying on resync",
@@ -150,9 +129,8 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		})
 	}
 
-	// Now launch the reconcile loops (ranging `started`, not bh.reconcilers,
-	// keeps the "only started controllers run" invariant structural).
-	for _, r := range started {
+	// Now launch the reconcile loops.
+	for _, r := range bh.order {
 		bh.wg.Go(func() {
 			r.run(runCtx)
 		})
@@ -166,7 +144,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	})
 
 	bh.state = beehiveRunning
-	bh.logger.Info("control plane started", "controllers", len(started))
+	bh.logger.Info("control plane started", "controllers", len(bh.order))
 	return func(stopCtx context.Context) error { return bh.stop(stopCtx) }, nil
 }
 
@@ -253,12 +231,14 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 	}
 }
 
-// stop tears the control plane down: it cancels the reconcile loops, waits for
-// them to drain (bounded by ctx), then stops every controller. It returns a
-// non-nil error only when the loops did not drain before ctx was cancelled, so
-// callers can detect a shutdown that hit its deadline; per-controller stop
-// errors are logged and dropped. It is the closure returned by Start, and is a
-// no-op (returning nil) if the control plane isn't running.
+// stop tears the control plane down: it cancels the reconcile loops and waits
+// for them to drain (bounded by ctx). It returns a non-nil error only when the
+// loops did not drain before ctx was cancelled, so callers can detect a shutdown
+// that hit its deadline. It is the closure returned by Start, and is a no-op
+// (returning nil) if the control plane isn't running. Controllers own no
+// teardown in beehive — the embedding application is responsible for its own
+// background work, and may still write status through its ControllerClient until
+// the store is closed.
 func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Lock()
 	if bh.state != beehiveRunning {
@@ -275,8 +255,7 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Unlock()
 
 	// Wait for reconcile loops to exit, but don't block past ctx. A drain that
-	// loses the race to ctx is reported to the caller, but we still stop the
-	// controllers below before returning.
+	// loses the race to ctx is reported to the caller.
 	done := make(chan struct{})
 	go func() {
 		bh.wg.Wait()
@@ -292,9 +271,6 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// Watch subscriptions are owned by the store, not the control plane, so stop
 	// does not terminate them: an active watcher ends when its context is
 	// cancelled or the store is closed.
-	for _, r := range bh.order {
-		_ = r.adapter.stop(ctx)
-	}
 	bh.log().Info("control plane stopped")
 	return drainErr
 }
@@ -315,16 +291,19 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 	return bh, nil
 }
 
-// Register installs controller c for the resource kind gk. It must be called
-// before Start, and only once per kind.
-func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error {
+// Register installs controller c for the resource kind gk and returns the
+// kind's ControllerClient — the status-write surface, which the embedding
+// application can inject into the controller and use from its own goroutines.
+// It must be called before Start, and only once per kind. On any error it
+// returns (nil, err).
+func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) (ControllerClient[Status], error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
 	if bh.state != beehiveNew {
-		return fmt.Errorf("beehive: cannot register %s/%s after Start", gk.Group, gk.Kind)
+		return nil, fmt.Errorf("beehive: cannot register %s/%s after Start", gk.Group, gk.Kind)
 	}
 	if _, exists := bh.reconcilers[gk]; exists {
-		return fmt.Errorf("beehive: controller already registered for %s/%s", gk.Group, gk.Kind)
+		return nil, fmt.Errorf("beehive: controller already registered for %s/%s", gk.Group, gk.Kind)
 	}
 
 	r := &reconciler{
@@ -341,13 +320,16 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		logger:   bh.logger,
 		logLevel: bh.logLevel,
 	}
-	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}
+	// Build the client once here so it's allocated per kind, not per reconcile,
+	// and hand the same instance to both the adapter and the caller.
+	client := &controllerClientImpl[Status]{bh: bh, gk: gk}
+	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c, client: client}
 	r.adapter = adapter
 
 	// Per-controller option overrides (e.g. WithResyncInterval, WithMaxRetryInterval).
 	for _, o := range opts {
 		if err := o(r); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -359,7 +341,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 
 	bh.reconcilers[gk] = r
 	bh.order = append(bh.order, r)
-	return nil
+	return client, nil
 }
 
 // isRegistered reports whether a controller is registered for gk. The client

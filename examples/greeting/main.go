@@ -48,25 +48,14 @@ type GreetingStatus struct {
 }
 
 // GreetingController reconciles a GreetingSpec into a GreetingStatus.
-type GreetingController struct {
-	client beehive.ControllerClient[GreetingStatus]
-}
+type GreetingController struct{}
 
-func (gc *GreetingController) Start(client beehive.ControllerClient[GreetingStatus]) error {
-	gc.client = client
-	return nil
-}
-
-func (gc *GreetingController) Stop(_ context.Context) error {
-	return nil
-}
-
-func (gc *GreetingController) Reconcile(ctx context.Context, obj *beehive.Object[GreetingSpec, GreetingStatus]) (beehive.Result, error) {
+func (gc *GreetingController) Reconcile(ctx context.Context, client beehive.ControllerClient[GreetingStatus], obj *beehive.Object[GreetingSpec, GreetingStatus]) (beehive.Result, error) {
 	want := "Hello, " + obj.Spec.Name
 	if obj.Status != nil && obj.Status.Message == want {
 		return beehive.Result{}, nil
 	}
-	err := gc.client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{Message: want})
+	err := client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{Message: want})
 	return beehive.Result{}, err
 }
 
@@ -84,7 +73,7 @@ func main() {
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
-	err = beehive.Register(bh, GreetingGroupKind, &GreetingController{})
+	_, err = beehive.Register(bh, GreetingGroupKind, &GreetingController{})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

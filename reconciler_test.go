@@ -103,8 +103,6 @@ type fakeAdapter struct {
 	reconcileFn func(ctx context.Context, id ObjectID) (Result, error)
 }
 
-func (f *fakeAdapter) start() error                 { return nil }
-func (f *fakeAdapter) stop(_ context.Context) error { return nil }
 func (f *fakeAdapter) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	return f.reconcileFn(ctx, id)
 }
@@ -219,9 +217,7 @@ type reconcileCapture struct {
 	ch chan *Object[tSpec, tStatus]
 }
 
-func (c *reconcileCapture) Start(_ ControllerClient[tStatus]) error { return nil }
-func (c *reconcileCapture) Stop(_ context.Context) error            { return nil }
-func (c *reconcileCapture) Reconcile(_ context.Context, obj *Object[tSpec, tStatus]) (Result, error) {
+func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
 	c.ch <- obj
 	return Result{}, nil
 }
@@ -242,7 +238,8 @@ func TestDependencyRequeue(t *testing.T) {
 	reconciled := make(chan *Object[tSpec, tStatus], 16)
 	// Resync disabled so the dependency waker is the only thing that can requeue
 	// an already-settled object — no timer noise.
-	require.NoError(t, Register(bh, gk, &reconcileCapture{ch: reconciled}, WithResyncInterval(0)))
+	_, err = Register(bh, gk, &reconcileCapture{ch: reconciled}, WithResyncInterval(0))
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -286,7 +283,8 @@ func TestDependencyRequeue(t *testing.T) {
 func TestStartToleratesWatchError(t *testing.T) {
 	bh, err := New(&watcherStore{err: errBoom}, WithResyncInterval(0))
 	require.NoError(t, err)
-	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, newFakeController()))
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -869,7 +867,7 @@ func (s *getObjectBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawO
 
 func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 	bh := &Beehive{store: &getObjectBadSpecStore{}}
-	inner := newFakeController()
+	inner := &noopController[tSpec, tStatus]{}
 	tc := &typedController[tSpec, tStatus]{
 		gk:    GroupKind{Kind: "Widget"},
 		bh:    bh,
@@ -892,7 +890,7 @@ func (s *getObjectErrorStore) GetObject(_ context.Context, _ ObjectID) (*RawObje
 
 func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 	bh := &Beehive{store: &getObjectErrorStore{}}
-	inner := newFakeController()
+	inner := &noopController[tSpec, tStatus]{}
 	tc := &typedController[tSpec, tStatus]{
 		gk:    GroupKind{Kind: "Widget"},
 		bh:    bh,
@@ -918,7 +916,7 @@ func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 	tc := &typedController[tSpec, tStatus]{
 		gk:    GroupKind{Kind: "Widget"},
 		bh:    bh,
-		inner: newFakeController(),
+		inner: &noopController[tSpec, tStatus]{},
 	}
 	// A gone object is a no-op success, not a retryable error: returning the error
 	// would retry the missing id forever on backoff.
@@ -932,9 +930,7 @@ func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 // retry, not the "queued object already gone" no-op.
 type notFoundReturningController struct{}
 
-func (notFoundReturningController) Start(ControllerClient[tStatus]) error { return nil }
-func (notFoundReturningController) Stop(context.Context) error            { return nil }
-func (notFoundReturningController) Reconcile(context.Context, *Object[tSpec, tStatus]) (Result, error) {
+func (notFoundReturningController) Reconcile(context.Context, ControllerClient[tStatus], *Object[tSpec, tStatus]) (Result, error) {
 	return Result{}, ErrNotFound
 }
 
@@ -965,9 +961,7 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 // finalizing — the pattern that would re-schedule a just-collected id.
 type requeueController struct{}
 
-func (requeueController) Start(ControllerClient[tStatus]) error { return nil }
-func (requeueController) Stop(context.Context) error            { return nil }
-func (requeueController) Reconcile(context.Context, *Object[tSpec, tStatus]) (Result, error) {
+func (requeueController) Reconcile(context.Context, ControllerClient[tStatus], *Object[tSpec, tStatus]) (Result, error) {
 	return Result{RequeueAfter: time.Minute}, nil
 }
 
@@ -1034,27 +1028,15 @@ func TestTypedControllerReconcile(t *testing.T) {
 }
 
 // funcController is a test Controller whose Reconcile delegates to fn (given the
-// ControllerClient captured from Start). If signal is non-nil it is closed once,
-// after fn's first call, so a test can wait for the reconcile to have run.
+// ControllerClient passed into Reconcile). If signal is non-nil it is closed
+// once, after fn's first call, so a test can wait for the reconcile to have run.
 type funcController struct {
-	mu     sync.Mutex
-	client ControllerClient[cStatus]
 	once   sync.Once
 	signal chan struct{}
 	fn     func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error)
 }
 
-func (c *funcController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *funcController) Stop(context.Context) error { return nil }
-func (c *funcController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
+func (c *funcController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	res, err := c.fn(ctx, client, obj)
 	if c.signal != nil {
 		c.once.Do(func() { close(c.signal) })
@@ -1078,9 +1060,11 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	raw, err := s.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
 	require.NoError(t, err)
 
+	bh := &Beehive{store: s}
 	tc := &typedController[cSpec, cStatus]{
-		gk: clientTestGK,
-		bh: &Beehive{store: s},
+		gk:     clientTestGK,
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 			if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "written"}); err != nil {
 				return Result{}, err
@@ -1088,7 +1072,6 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 			return Result{}, errBoom
 		}},
 	}
-	require.NoError(t, tc.start()) // wires the ControllerClient into the controller
 
 	_, rerr := tc.reconcile(ctx, raw.ID)
 	require.ErrorIs(t, rerr, errBoom, "the reconcile error still surfaces for retry")
@@ -1120,9 +1103,11 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 	_, _, err = s.RequestDeletion(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
+	bh := &Beehive{store: s}
 	tc := &typedController[cSpec, cStatus]{
-		gk: clientTestGK,
-		bh: &Beehive{store: s},
+		gk:     clientTestGK,
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 			if err := cc.DeleteFinalizer(ctx, obj.ID, "f"); err != nil {
 				return Result{}, err
@@ -1130,7 +1115,6 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 			return Result{}, errBoom
 		}},
 	}
-	require.NoError(t, tc.start())
 
 	_, _ = tc.reconcile(ctx, raw.ID)
 
@@ -1139,28 +1123,14 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		"the committed finalizer clear must let GC collect the row even though reconcile errored")
 }
 
-// statusSettingController stores the ControllerClient from Start, then on the
-// first Reconcile call writes a fixed status and closes reconciledCh.
+// statusSettingController writes a fixed status on the first Reconcile call and
+// closes reconciledCh.
 type statusSettingController struct {
-	mu           sync.Mutex
-	client       ControllerClient[cStatus]
 	once         sync.Once
 	reconciledCh chan struct{}
 }
 
-func (c *statusSettingController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *statusSettingController) Stop(_ context.Context) error { return nil }
-
-func (c *statusSettingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
+func (c *statusSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
 		return Result{}, err
 	}
@@ -1173,25 +1143,13 @@ func (c *statusSettingController) Reconcile(ctx context.Context, obj *Object[cSp
 // reconcile observes generation 2, signalling that the spec update — not merely a
 // second reconcile — was seen.
 type specEchoController struct {
-	mu        sync.Mutex
-	client    ControllerClient[cStatus]
 	firstOnce sync.Once
 	once      sync.Once
 	firstDone chan struct{}
 	secondCh  chan struct{}
 }
 
-func (c *specEchoController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *specEchoController) Stop(_ context.Context) error { return nil }
-func (c *specEchoController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
+func (c *specEchoController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: obj.Spec.Val}); err != nil {
 		return Result{}, err
 	}
@@ -1208,25 +1166,13 @@ func (c *specEchoController) Reconcile(ctx context.Context, obj *Object[cSpec, c
 // deletionTrackingController signals reconciled after the first successful
 // reconcile and deleted when the object's DeletionRequestedAt is set.
 type deletionTrackingController struct {
-	mu           sync.Mutex
-	client       ControllerClient[cStatus]
 	reconcileOne sync.Once
 	deleteOne    sync.Once
 	reconciled   chan struct{}
 	deleted      chan struct{}
 }
 
-func (c *deletionTrackingController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *deletionTrackingController) Stop(_ context.Context) error { return nil }
-func (c *deletionTrackingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
+func (c *deletionTrackingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		c.deleteOne.Do(func() { close(c.deleted) })
 		return Result{}, nil
@@ -1245,7 +1191,8 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1274,7 +1221,8 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 		firstDone: make(chan struct{}),
 		secondCh:  make(chan struct{}),
 	}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1309,7 +1257,8 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 		reconciled: make(chan struct{}),
 		deleted:    make(chan struct{}),
 	}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1342,7 +1291,8 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 			return Result{}, errBoom
 		},
 	}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1362,23 +1312,11 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 // conditionSettingController sets a Ready=True condition on the first Reconcile,
 // then closes reconciledCh.
 type conditionSettingController struct {
-	mu           sync.Mutex
-	client       ControllerClient[cStatus]
 	once         sync.Once
 	reconciledCh chan struct{}
 }
 
-func (c *conditionSettingController) Start(client ControllerClient[cStatus]) error {
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-	return nil
-}
-func (c *conditionSettingController) Stop(_ context.Context) error { return nil }
-func (c *conditionSettingController) Reconcile(ctx context.Context, obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
+func (c *conditionSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if err := client.SetCondition(ctx, obj.ID, Condition{
 		Type: "Ready", Status: ConditionTrue, Reason: "Provisioned",
 	}); err != nil {
@@ -1395,7 +1333,8 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &conditionSettingController{reconciledCh: make(chan struct{})}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1437,7 +1376,8 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 			return Result{}, errBoom
 		},
 	}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1469,7 +1409,8 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
-	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
