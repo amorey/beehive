@@ -97,6 +97,14 @@ func TestRawToTypedConversion(t *testing.T) {
 			wantErr:  true,
 		},
 		{
+			// Spec decodes fine (unversioned), but the status blob is a downgrade —
+			// exercises the status convert-error path independently of spec.
+			name:     "status downgrade errors after spec decodes",
+			migrator: &fakeMigrator{statusVersion: 2},
+			raw:      &RawObject{Spec: []byte(origSpec), Status: []byte(origStatus), StatusVersion: 3},
+			wantErr:  true,
+		},
+		{
 			name:     "nil migrator is identity",
 			migrator: nil,
 			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 5},
