@@ -52,6 +52,11 @@ type Beehive struct {
 
 	mu          sync.Mutex
 	reconcilers map[GroupKind]*reconciler
+	// migrators holds the per-kind schema-version converters registered via
+	// WithMigrator. It is the single source of truth shared by both decode paths
+	// (the user-facing client and the reconciler), so a migrator can't be wired to
+	// one but not the other. nil entry / missing key means the kind has none.
+	migrators map[GroupKind]Migrator
 	// order preserves registration order so Start subscribes dependency wakers
 	// and launches reconcile loops deterministically, rather than in random map
 	// order.
@@ -282,6 +287,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		store:          s,
 		resyncInterval: defaultResyncInterval,
 		reconcilers:    make(map[GroupKind]*reconciler),
+		migrators:      make(map[GroupKind]Migrator),
 	}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
@@ -339,6 +345,13 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	r.logger = resolveLogger(r.logger, r.logLevel).With("group", gk.Group, "kind", gk.Kind)
 	adapter.logger = r.logger
 
+	// A WithMigrator option sets r.migrator; promote it to the shared registry so
+	// both decode paths (client and reconciler) resolve the same migrator via
+	// migratorFor. Done under bh.mu, already held.
+	if r.migrator != nil {
+		bh.migrators[gk] = r.migrator
+	}
+
 	bh.reconcilers[gk] = r
 	bh.order = append(bh.order, r)
 	return client, nil
@@ -352,6 +365,15 @@ func (bh *Beehive) isRegistered(gk GroupKind) bool {
 	defer bh.mu.Unlock()
 	_, ok := bh.reconcilers[gk]
 	return ok
+}
+
+// migratorFor returns the migrator registered for gk, or nil if the kind opted
+// out. Both decode paths (the user-facing client and the reconciler) call it so
+// they share one migrator per kind.
+func (bh *Beehive) migratorFor(gk GroupKind) Migrator {
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
+	return bh.migrators[gk]
 }
 
 // enqueueIfRegistered wakes the reconciler for (gk, id) if one exists.

@@ -31,6 +31,186 @@ type cStatus struct{ Val string }
 
 var clientTestGK = GroupKind{Kind: "Widget"}
 
+// TestRawToTypedConversion exercises the per-blob schema-version conversion rule
+// rawToTyped applies before unmarshalling. Spec and Status convert independently,
+// each from its own stored version against the migrator's current version.
+func TestRawToTypedConversion(t *testing.T) {
+	const origSpec = `{"Val":"origspec"}`
+	const origStatus = `{"Val":"origstatus"}`
+
+	// poison converters error if called — used to prove a path that should skip
+	// conversion never invokes the converter.
+	poisonSpec := func(int, json.RawMessage) (json.RawMessage, error) { return nil, errBoom }
+	// transform converters rewrite the blob so the decoded Val proves conversion ran.
+	transformTo := func(val string) func(int, json.RawMessage) (json.RawMessage, error) {
+		return func(int, json.RawMessage) (json.RawMessage, error) {
+			return json.RawMessage(`{"Val":"` + val + `"}`), nil
+		}
+	}
+	// convertFromZero only succeeds when invoked with from == 0, so a "converted"
+	// result proves the unversioned baseline reaches the converter as 0.
+	convertFromZero := func(from int, _ json.RawMessage) (json.RawMessage, error) {
+		if from != 0 {
+			return nil, errBoom
+		}
+		return json.RawMessage(`{"Val":"converted"}`), nil
+	}
+
+	tests := []struct {
+		name       string
+		migrator   Migrator
+		raw        *RawObject
+		wantSpec   string
+		wantStatus string // "" => expect nil Status
+		wantErr    bool
+	}{
+		{
+			name:     "current 0 skips conversion even when from != 0",
+			migrator: &fakeMigrator{specVersion: 0, convertSpec: poisonSpec},
+			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 5},
+			wantSpec: "origspec",
+		},
+		{
+			name:     "from == current is identity",
+			migrator: &fakeMigrator{specVersion: 2, convertSpec: poisonSpec},
+			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 2},
+			wantSpec: "origspec",
+		},
+		{
+			name:     "from < current converts and the result is what unmarshals",
+			migrator: &fakeMigrator{specVersion: 2, convertSpec: transformTo("converted")},
+			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 1},
+			wantSpec: "converted",
+		},
+		{
+			// from == 0 (the unversioned baseline: a row written before the kind opted
+			// into versioning) is still < current, so the converter is invoked with 0.
+			name:     "from 0 with current > 0 converts (unversioned baseline)",
+			migrator: &fakeMigrator{specVersion: 2, convertSpec: convertFromZero},
+			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 0},
+			wantSpec: "converted",
+		},
+		{
+			name:     "from > current is a downgrade error",
+			migrator: &fakeMigrator{specVersion: 2, convertSpec: poisonSpec},
+			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 3},
+			wantErr:  true,
+		},
+		{
+			// Spec decodes fine (unversioned), but the status blob is a downgrade —
+			// exercises the status convert-error path independently of spec.
+			name:     "status downgrade errors after spec decodes",
+			migrator: &fakeMigrator{statusVersion: 2},
+			raw:      &RawObject{Spec: []byte(origSpec), Status: []byte(origStatus), StatusVersion: 3},
+			wantErr:  true,
+		},
+		{
+			name:     "nil migrator is identity",
+			migrator: nil,
+			raw:      &RawObject{Spec: []byte(origSpec), SpecVersion: 5},
+			wantSpec: "origspec",
+		},
+		{
+			name: "spec and status convert independently",
+			migrator: &fakeMigrator{
+				specVersion: 2, statusVersion: 2,
+				convertSpec:   transformTo("specconv"),
+				convertStatus: poisonSpec, // status is already current, must not be called
+			},
+			raw: &RawObject{
+				Spec: []byte(origSpec), SpecVersion: 1, // converts
+				Status: []byte(origStatus), StatusVersion: 2, // identity
+			},
+			wantSpec:   "specconv",
+			wantStatus: "origstatus",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			obj, err := rawToTyped[cSpec, cStatus](tc.raw, tc.migrator)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantSpec, obj.Spec.Val)
+			if tc.wantStatus == "" {
+				assert.Nil(t, obj.Status)
+			} else {
+				require.NotNil(t, obj.Status)
+				assert.Equal(t, tc.wantStatus, obj.Status.Val)
+			}
+		})
+	}
+}
+
+// TestListSkipsUndecodableRows verifies quarantine on the List path: a single
+// row whose stored spec bytes don't unmarshal is skipped and logged rather than
+// failing the whole list. The poison row is written first (lower id) so List
+// must skip it before reaching the good one.
+func TestListSkipsUndecodableRows(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
+	// which fails — exactly the shape-mismatch case the migrator seam guards.
+	_, err = store.CreateObject(ctx, &RawObject{
+		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	})
+	require.NoError(t, err)
+	good, err := store.CreateObject(ctx, &RawObject{
+		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
+	})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	objs, err := client.List(ctx)
+	require.NoError(t, err, "a poison row must not fail the whole list")
+	require.Len(t, objs, 1, "only the decodable row is returned")
+	assert.Equal(t, good.ID, objs[0].ID)
+	assert.Equal(t, "good", objs[0].Spec.Val)
+}
+
+// TestWatchListSkipsUndecodableRows verifies quarantine on the watch path: a
+// poison object in the snapshot is skipped and the stream stays alive to deliver
+// the good object, rather than the watcher silently closing on the first decode
+// failure. The poison row is created first so it is processed before the good one.
+func TestWatchListSkipsUndecodableRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	_, err = store.CreateObject(ctx, &RawObject{
+		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	})
+	require.NoError(t, err)
+	good, err := store.CreateObject(ctx, &RawObject{
+		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
+	})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	select {
+	case ev, ok := <-ch:
+		require.True(t, ok, "stream must stay open past the poison row")
+		require.NotNil(t, ev.Object)
+		assert.Equal(t, good.ID, ev.Object.ID, "the good object flows even though the poison one preceded it")
+		assert.Equal(t, "good", ev.Object.Spec.Val)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the good object's event")
+	}
+}
+
 func newClientTestStore(t *testing.T) Store {
 	t.Helper()
 	s, err := sqlite.OpenMemory()
@@ -398,14 +578,14 @@ func TestRawToTypedDecodesNullSpecTombstone(t *testing.T) {
 	type scalarSpec = string
 
 	tombstone := &RawObject{ID: 7, Kind: "Widget", Spec: []byte("null")}
-	obj, err := rawToTyped[scalarSpec, cStatus](tombstone)
+	obj, err := rawToTyped[scalarSpec, cStatus](tombstone, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ObjectID(7), obj.ID)
 	assert.Equal(t, "", obj.Spec) // zero value, no Status to decode
 
 	// Guard the premise: the previous "{}" tombstone would have failed here,
 	// which is exactly the silent-close bug the null spec avoids.
-	_, err = rawToTyped[scalarSpec, cStatus](&RawObject{ID: 7, Kind: "Widget", Spec: []byte("{}")})
+	_, err = rawToTyped[scalarSpec, cStatus](&RawObject{ID: 7, Kind: "Widget", Spec: []byte("{}")}, nil)
 	require.Error(t, err)
 }
 
@@ -432,7 +612,7 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte) (*RawObject, error) {
+func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -441,7 +621,7 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte) (*RawObject, error) {
+func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -558,17 +738,22 @@ func TestClientListStoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestClientListRawToTypedError verifies List quarantines an un-decodable row
+// (skip-and-log) instead of failing the whole list: badJSONStore returns one row
+// whose Spec is invalid JSON, so List returns no error and an empty result.
 func TestClientListRawToTypedError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, err := New(&badJSONStore{gk: gk})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
-	_, err = client.List(context.Background())
-	require.Error(t, err)
+	objs, err := client.List(context.Background())
+	require.NoError(t, err, "a poison row is skipped, not fatal")
+	assert.Empty(t, objs, "the only row was un-decodable, so none are returned")
 }
 
 // TestClientAdaptWatcherConversionError verifies a raw event whose Spec is
-// invalid JSON closes the typed channel rather than emitting a bad WatchEvent.
+// invalid JSON is skipped (quarantined) and the stream stays open, rather than
+// closing the typed channel. A following good event still flows.
 func TestClientAdaptWatcherConversionError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	w := newFakeWatcher()
@@ -578,12 +763,14 @@ func TestClientAdaptWatcherConversionError(t *testing.T) {
 	require.NoError(t, err)
 
 	w.push(WatchEventModified, &RawObject{ID: 1, Spec: []byte("not-json")})
+	w.push(WatchEventAdded, &RawObject{ID: 2, Spec: []byte(`{}`)})
 
 	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "channel must close on rawToTyped error")
+	case evt, ok := <-ch:
+		require.True(t, ok, "stream must stay open past the poison event")
+		assert.EqualValues(t, 2, evt.Object.ID, "the good event flows after the skipped one")
 	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for channel to close")
+		t.Fatal("timed out waiting for the good event")
 	}
 }
 

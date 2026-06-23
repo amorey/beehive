@@ -54,6 +54,13 @@ type clientImpl[Spec, Status any] struct {
 	gk GroupKind
 }
 
+// decode turns a store row into the typed object, applying this kind's migrator
+// (if any) at the decode boundary. Every read path routes through it so the
+// client and the reconciler share one migrator per kind.
+func (c *clientImpl[Spec, Status]) decode(raw *RawObject) (*Object[Spec, Status], error) {
+	return rawToTyped[Spec, Status](raw, c.bh.migratorFor(c.gk))
+}
+
 func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
@@ -71,11 +78,12 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	// can't leave an ownerless child the GC path would never collect.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
 		raw, err = c.bh.store.CreateObject(ctx, &RawObject{
-			Group:      c.gk.Group,
-			Kind:       c.gk.Kind,
-			Slug:       co.slug,
-			Spec:       b,
-			Finalizers: co.finalizers,
+			Group:       c.gk.Group,
+			Kind:        c.gk.Kind,
+			Slug:        co.slug,
+			Spec:        b,
+			SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
+			Finalizers:  co.finalizers,
 		})
 		if err != nil {
 			return err
@@ -90,7 +98,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	if err != nil {
 		return nil, err
 	}
-	obj, err := rawToTyped[Spec, Status](raw)
+	obj, err := c.decode(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -120,16 +128,18 @@ func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug stri
 	}
 	var raw *RawObject
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		specVersion := migratorSpecVersion(c.bh.migratorFor(c.gk))
 		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
 		switch {
 		case err == nil:
-			raw, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b)
+			raw, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b, specVersion)
 		case errors.Is(err, ErrNotFound):
 			raw, err = c.bh.store.CreateObject(ctx, &RawObject{
-				Group: c.gk.Group,
-				Kind:  c.gk.Kind,
-				Slug:  &slug,
-				Spec:  b,
+				Group:       c.gk.Group,
+				Kind:        c.gk.Kind,
+				Slug:        &slug,
+				Spec:        b,
+				SpecVersion: specVersion,
 			})
 		}
 		// A non-NotFound read error falls through both cases with raw unset; err
@@ -139,7 +149,7 @@ func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug stri
 	if err != nil {
 		return nil, err
 	}
-	obj, err := rawToTyped[Spec, Status](raw)
+	obj, err := c.decode(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -155,11 +165,11 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	// UpdateSpec folds this client's kind into the write, so a foreign id is
 	// rejected at the store (no separate read-then-write to keep atomic);
 	// hideWrongKind keeps that foreign id invisible to this single-kind client.
-	raw, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b)
+	raw, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 	if err = c.hideWrongKind(err); err != nil {
 		return nil, err
 	}
-	obj, err := rawToTyped[Spec, Status](raw)
+	obj, err := c.decode(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +182,7 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID) (*Objec
 	if err != nil {
 		return nil, err
 	}
-	return rawToTyped[Spec, Status](raw)
+	return c.decode(raw)
 }
 
 // scopedGet loads id and confirms it belongs to this client's kind. A Client is
@@ -207,7 +217,7 @@ func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string) (
 	if err != nil {
 		return nil, err
 	}
-	return rawToTyped[Spec, Status](raw)
+	return c.decode(raw)
 }
 
 func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, Status], error) {
@@ -215,11 +225,19 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, St
 	if err != nil {
 		return nil, err
 	}
+	// The migrator is invariant for the kind, so resolve it once rather than
+	// re-locking the registry on every row.
+	mig := c.bh.migratorFor(c.gk)
 	objs := make([]*Object[Spec, Status], 0, len(raws))
 	for _, raw := range raws {
-		obj, err := rawToTyped[Spec, Status](raw)
+		obj, err := rawToTyped[Spec, Status](raw, mig)
 		if err != nil {
-			return nil, err
+			// Quarantine, don't abort: one un-decodable row — an un-migratable shape
+			// or a blob written by a newer build (downgrade) — is skipped and logged
+			// so it can't break listing every other object of the kind.
+			c.bh.log().Warn("beehive: skipping undecodable object in List",
+				"group", c.gk.Group, "kind", c.gk.Kind, "id", raw.ID, "err", err)
+			continue
 		}
 		objs = append(objs, obj)
 	}
@@ -274,6 +292,9 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-ch
 // channel closes and the watcher is released on exit.
 func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) <-chan WatchEvent[Spec, Status] {
 	out := make(chan WatchEvent[Spec, Status])
+	// The migrator is invariant for the watcher's lifetime; resolve it once rather
+	// than re-locking the registry on every event.
+	mig := c.bh.migratorFor(c.gk)
 	go func() {
 		defer close(out)
 		defer w.Close()
@@ -283,9 +304,14 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 				if !ok {
 					return
 				}
-				obj, err := rawToTyped[Spec, Status](ev.Object)
+				obj, err := rawToTyped[Spec, Status](ev.Object, mig)
 				if err != nil {
-					return
+					// Quarantine, don't tear down: skip a poison event and keep the
+					// stream alive so one un-decodable object can't silently kill a
+					// live watcher (mirrors List).
+					c.bh.log().Warn("beehive: skipping undecodable object in watch",
+						"group", c.gk.Group, "kind", c.gk.Kind, "id", ev.Object.ID, "err", err)
+					continue
 				}
 				select {
 				case out <- WatchEvent[Spec, Status]{Type: ev.Type, Object: obj}:
@@ -320,10 +346,44 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	return out
 }
 
-// rawToTyped decodes a RawObject into a typed Object[Spec, Status].
-func rawToTyped[Spec, Status any](raw *RawObject) (*Object[Spec, Status], error) {
+// convertBlob upgrades a stored JSON blob from its recorded schema version
+// (from) to the build's current version, returning the bytes to unmarshal. It is
+// the per-blob conversion rule shared by spec and status: a current of 0 (the
+// kind isn't versioned, or there's no migrator) or from == current is identity;
+// from < current runs convert; from > current is a downgrade — an older build
+// reading data a newer one wrote — which we refuse rather than silently truncate,
+// surfacing as a quarantine signal upstream.
+func convertBlob(from, current int, raw []byte, convert func(int, json.RawMessage) (json.RawMessage, error)) ([]byte, error) {
+	switch {
+	case current == 0 || from == current:
+		return raw, nil
+	case from > current:
+		return nil, fmt.Errorf("beehive: stored schema version %d is newer than this build's %d", from, current)
+	default: // from < current
+		return convert(from, raw)
+	}
+}
+
+// rawToTyped decodes a RawObject into a typed Object[Spec, Status], converting
+// each blob up from its stored schema version via m before unmarshalling (see
+// convertBlob). A nil m means the kind has no migrator: both current versions are
+// 0, so every blob is decoded as-is — byte-identical to the pre-migrator path.
+func rawToTyped[Spec, Status any](raw *RawObject, m Migrator) (*Object[Spec, Status], error) {
+	// The current-version "0 if nil" rule is shared with the write paths via these
+	// helpers; the converters are only reached when from < current (never when m is
+	// nil), so guarding them once here suffices.
+	var convertSpec, convertStatus func(int, json.RawMessage) (json.RawMessage, error)
+	if m != nil {
+		convertSpec = m.ConvertSpec
+		convertStatus = m.ConvertStatus
+	}
+
+	specBytes, err := convertBlob(raw.SpecVersion, migratorSpecVersion(m), raw.Spec, convertSpec)
+	if err != nil {
+		return nil, err
+	}
 	var spec Spec
-	if err := json.Unmarshal(raw.Spec, &spec); err != nil {
+	if err := json.Unmarshal(specBytes, &spec); err != nil {
 		return nil, err
 	}
 	obj := &Object[Spec, Status]{
@@ -343,8 +403,12 @@ func rawToTyped[Spec, Status any](raw *RawObject) (*Object[Spec, Status], error)
 		UpdatedAt:           raw.UpdatedAt,
 	}
 	if raw.Status != nil {
+		statusBytes, err := convertBlob(raw.StatusVersion, migratorStatusVersion(m), raw.Status, convertStatus)
+		if err != nil {
+			return nil, err
+		}
 		var status Status
-		if err := json.Unmarshal(raw.Status, &status); err != nil {
+		if err := json.Unmarshal(statusBytes, &status); err != nil {
 			return nil, err
 		}
 		obj.Status = &status

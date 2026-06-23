@@ -140,6 +140,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 
 // objectColumns is the canonical select list; scanObject reads them in order.
 const objectColumns = `id, "group", kind, slug, spec, status,
+	schema_version_spec, schema_version_status,
 	generation, observed_generation, observed_at, resource_version,
 	deletion_requested_at, finalizers, created_at, updated_at`
 
@@ -194,11 +195,11 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject)
 	// in the same statement, so there's no follow-up read.
 	row := c.QueryRowContext(ctx, `
 		INSERT INTO objects
-			("group", kind, slug, spec, status,
+			("group", kind, slug, spec, status, schema_version_spec,
 			 generation, resource_version, finalizers, created_at, updated_at)
-		VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
 		RETURNING `+objectColumns,
-		obj.Group, obj.Kind, obj.Slug, obj.Spec,
+		obj.Group, obj.Kind, obj.Slug, obj.Spec, obj.SpecVersion,
 		rv, finalizers, now, now)
 	return s.scanAndEmit(ctx, storeapi.WatchEventAdded, row)
 }
@@ -365,7 +366,7 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	return ids, rows.Err()
 }
 
-func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte) (*storeapi.RawObject, error) {
+func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
 	var result *storeapi.RawObject
@@ -392,17 +393,18 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		// A real spec change bumps generation so the convergence handshake notices.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
-			SET spec = ?, generation = generation + 1, resource_version = ?, updated_at = ?
+			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
+			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			spec, rv, toMillis(time.Now().UTC()), id)
+			spec, specVersion, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
 		return err
 	})
 	return result, err
 }
 
-func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte) (*storeapi.RawObject, error) {
+func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
 	// Within keeps the rv-bump and the write atomic now that the controller's
 	// retired withinKind no longer provides the transaction (mutators self-wrap).
 	var result *storeapi.RawObject
@@ -421,11 +423,11 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 		// value is fine — the normal case where the spec changed mid-reconcile.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
-			SET status = ?, observed_generation = ?, observed_at = ?,
+			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
 			    resource_version = ?, updated_at = ?
 			WHERE id = ? AND generation >= ? AND "group" = ? AND kind = ?
 			RETURNING `+objectColumns,
-			status, observedGeneration, now, rv, now, id, observedGeneration, gk.Group, gk.Kind)
+			status, statusVersion, observedGeneration, now, rv, now, id, observedGeneration, gk.Group, gk.Kind)
 		obj, err := s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
 		if errors.Is(err, storeapi.ErrNotFound) {
 			// No row matched: the object is gone, names another kind, or the guard
@@ -948,6 +950,7 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 	)
 	err := sc.Scan(
 		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
+		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
 		&deletionAt, &finalizers, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -50,6 +50,31 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
 }
 
+func TestWithMigratorRegisters(t *testing.T) {
+	bh, err := New(&fakeStore{})
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	mig := &fakeMigrator{specVersion: 2, statusVersion: 1}
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
+	require.NoError(t, err)
+
+	assert.Same(t, mig, bh.migratorFor(gk), "the migrator passed to Register is installed for the kind")
+}
+
+func TestMigratorForReturnsNilWhenUnset(t *testing.T) {
+	bh, err := New(&fakeStore{})
+	require.NoError(t, err)
+
+	// Registered without WithMigrator.
+	gk := GroupKind{Kind: "Widget"}
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	assert.Nil(t, bh.migratorFor(gk), "a kind registered without a migrator has none")
+	assert.Nil(t, bh.migratorFor(GroupKind{Kind: "Unknown"}), "an unregistered kind has none")
+}
+
 func TestRegisterRejectsDuplicate(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
