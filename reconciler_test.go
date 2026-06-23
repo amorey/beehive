@@ -824,7 +824,7 @@ func TestRunResyncsOnTick(t *testing.T) {
 }
 
 func TestRawToTypedSpecUnmarshalError(t *testing.T) {
-	_, err := rawToTyped[tSpec, tStatus](&RawObject{Spec: []byte("not-json")})
+	_, err := rawToTyped[tSpec, tStatus](&RawObject{Spec: []byte("not-json")}, nil)
 	require.Error(t, err)
 }
 
@@ -836,7 +836,7 @@ func TestRawToTypedMapsConditions(t *testing.T) {
 		{Type: "Healthy", Status: "False"},
 	}}
 
-	obj, err := rawToTyped[tSpec, tStatus](raw)
+	obj, err := rawToTyped[tSpec, tStatus](raw, nil)
 	require.NoError(t, err)
 	require.Len(t, obj.Conditions, 2)
 	assert.Equal(t, "Ready", obj.Conditions[0].Type)
@@ -850,7 +850,7 @@ func TestRawToTypedMapsConditions(t *testing.T) {
 func TestRawToTypedStatusUnmarshalError(t *testing.T) {
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	_, err = rawToTyped[tSpec, tStatus](&RawObject{Spec: specJSON, Status: []byte("not-json")})
+	_, err = rawToTyped[tSpec, tStatus](&RawObject{Spec: specJSON, Status: []byte("not-json")}, nil)
 	require.Error(t, err)
 }
 

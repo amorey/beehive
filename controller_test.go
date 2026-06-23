@@ -46,6 +46,61 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
 }
 
+// TestWriteStampsSchemaVersions verifies the lazy stamp-on-write half of the
+// migrator model: with a migrator registered, a spec write (Create) stamps the
+// migrator's current spec version and a controller status write stamps its
+// current status version — each column independently. A kind with no migrator
+// stamps 0 for both, the backward-compatible default.
+func TestWriteStampsSchemaVersions(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("registered migrator stamps current versions", func(t *testing.T) {
+		store := newClientTestStore(t)
+		bh, err := New(store)
+		require.NoError(t, err)
+
+		cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{},
+			WithMigrator(&fakeMigrator{specVersion: 4, statusVersion: 9}))
+		require.NoError(t, err)
+
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+		obj, err := client.Create(ctx, cSpec{Val: "hello"})
+		require.NoError(t, err)
+
+		// Spec write (Create) stamped the spec version; status untouched (still 0).
+		raw, err := store.GetObject(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 4, raw.SpecVersion, "Create stamps the migrator's spec version")
+		assert.Equal(t, 0, raw.StatusVersion, "no status written yet")
+
+		// Controller status write stamps the status version, spec unchanged.
+		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+		raw, err = store.GetObject(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 4, raw.SpecVersion, "status write must not touch spec version")
+		assert.Equal(t, 9, raw.StatusVersion, "UpdateStatus stamps the migrator's status version")
+	})
+
+	t.Run("no migrator stamps 0 (backward compatible)", func(t *testing.T) {
+		store := newClientTestStore(t)
+		bh, err := New(store)
+		require.NoError(t, err)
+
+		cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+		require.NoError(t, err)
+
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+		obj, err := client.Create(ctx, cSpec{Val: "hello"})
+		require.NoError(t, err)
+		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+
+		raw, err := store.GetObject(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Zero(t, raw.SpecVersion, "no migrator => spec version stays 0")
+		assert.Zero(t, raw.StatusVersion, "no migrator => status version stays 0")
+	})
+}
+
 func TestControllerClientUpdateStatus(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -329,7 +384,7 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte) (*RawObject, error) {
+func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) (*RawObject, error) {
 	return nil, errBoom
 }
 

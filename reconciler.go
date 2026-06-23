@@ -85,7 +85,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// transaction entirely, while still running GC on the pass where the controller
 	// clears its last finalizer.
 	deleting := raw.DeletionRequestedAt != nil
-	obj, err := rawToTyped[Spec, Status](raw)
+	obj, err := rawToTyped[Spec, Status](raw, t.bh.migratorFor(t.gk))
 	if err != nil {
 		return Result{}, err
 	}
@@ -140,6 +140,10 @@ type reconciler struct {
 	concurrency       int           // number of concurrent worker goroutines; 0/1 = single-threaded
 	// startupReconcile selects which objects get an initial reconcile when run starts.
 	startupReconcile StartupReconcileStrategy
+	// migrator is the per-kind schema-version converter set by WithMigrator at
+	// Register; Register copies it into bh.migrators so the client path shares it.
+	// nil when the kind opted out.
+	migrator Migrator
 	// logger is kind-tagged and resolved (never nil) once Register runs; logLevel
 	// is the raw per-controller override consumed during that resolution.
 	logger   *slog.Logger

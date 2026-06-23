@@ -208,7 +208,7 @@ func TestWatchStreamsLiveAfterSnapshot(t *testing.T) {
 	defer w.Close()
 	recvEvent(t, w) // drain snapshot Added
 
-	_, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"v":2}`))
+	_, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
@@ -232,9 +232,9 @@ func TestWatchFiltersByID(t *testing.T) {
 	snap := recvEvent(t, w) // snapshot Added for obj1 only
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
-	_, err = store.UpdateSpec(ctx, testGK, obj2.ID, []byte(`{"v":2}`)) // filtered out
+	_, err = store.UpdateSpec(ctx, testGK, obj2.ID, []byte(`{"v":2}`), 0) // filtered out
 	require.NoError(t, err)
-	_, err = store.UpdateSpec(ctx, testGK, obj1.ID, []byte(`{"v":2}`)) // delivered
+	_, err = store.UpdateSpec(ctx, testGK, obj1.ID, []byte(`{"v":2}`), 0) // delivered
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
@@ -271,7 +271,7 @@ func TestWatchEventsSkipsSnapshot(t *testing.T) {
 	assertNoEvent(t, w, 200*time.Millisecond)
 
 	// A live change to that object streams through.
-	_, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`))
+	_, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	ev := recvEvent(t, w)
 	assert.Equal(t, beehive.WatchEventModified, ev.Type)

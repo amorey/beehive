@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -27,6 +28,34 @@ import (
 // errBoom is a sentinel error shared by tests that exercise error-propagation
 // paths (option failures, store failures, controller reconcile errors).
 var errBoom = errors.New("boom")
+
+// fakeMigrator is a configurable Migrator test double. The version methods
+// return the configured ints; the converters delegate to the supplied funcs, or
+// act as identity when nil. Shared by the registry, conversion, and stamping
+// tests.
+type fakeMigrator struct {
+	specVersion   int
+	statusVersion int
+	convertSpec   func(from int, raw json.RawMessage) (json.RawMessage, error)
+	convertStatus func(from int, raw json.RawMessage) (json.RawMessage, error)
+}
+
+func (m *fakeMigrator) SchemaVersionSpec() int   { return m.specVersion }
+func (m *fakeMigrator) SchemaVersionStatus() int { return m.statusVersion }
+
+func (m *fakeMigrator) ConvertSpec(from int, raw json.RawMessage) (json.RawMessage, error) {
+	if m.convertSpec != nil {
+		return m.convertSpec(from, raw)
+	}
+	return raw, nil
+}
+
+func (m *fakeMigrator) ConvertStatus(from int, raw json.RawMessage) (json.RawMessage, error) {
+	if m.convertStatus != nil {
+		return m.convertStatus(from, raw)
+	}
+	return raw, nil
+}
 
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
 // fail rather than block forever. Tests never rely on it to pace anything.
@@ -89,10 +118,10 @@ func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]Object
 func (s *fakeStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) UpdateSpec(context.Context, GroupKind, ObjectID, []byte) (*RawObject, error) {
+func (s *fakeStore) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }
-func (s *fakeStore) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte) (*RawObject, error) {
+func (s *fakeStore) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
 func (s *fakeStore) DeleteFinalizer(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {

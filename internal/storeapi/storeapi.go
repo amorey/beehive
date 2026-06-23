@@ -98,12 +98,18 @@ type Condition struct {
 // objects table. The reconciler and client decode Spec/Status into typed
 // Object[Spec, Status] values; the Store never inspects them.
 type RawObject struct {
-	ID                  ObjectID
-	Group               string
-	Kind                string
-	Slug                *string
-	Spec                []byte // JSON, user-owned
-	Status              []byte // JSON, controller-owned; nil until first status write
+	ID     ObjectID
+	Group  string
+	Kind   string
+	Slug   *string
+	Spec   []byte // JSON, user-owned
+	Status []byte // JSON, controller-owned; nil until first status write
+	// SpecVersion and StatusVersion are the per-column schema versions: the
+	// migrator schema version each blob was last written at. The store persists
+	// and returns them but never interprets them (like ResourceVersion); the
+	// generic layer's Migrator converts a blob from its stored version on read.
+	SpecVersion         int
+	StatusVersion       int
 	Generation          int64
 	ObservedGeneration  *int64
 	ObservedAt          *time.Time
@@ -192,17 +198,19 @@ type Store interface {
 	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
-	// change) and ResourceVersion. Writing spec bytes identical to the stored
-	// ones is an idempotent no-op: no Generation/ResourceVersion bump and no
-	// event, so a converged object isn't falsely unsettled. Scoped to gk: an id
+	// change) and ResourceVersion, and stamps specVersion (the migrator schema
+	// version the bytes were written at). Writing spec bytes identical to the
+	// stored ones is an idempotent no-op: no Generation/ResourceVersion bump and
+	// no event, so a converged object isn't falsely unsettled. Scoped to gk: an id
 	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte) (*RawObject, error)
+	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
 
 	// UpdateStatus replaces an object's status and records the generation the
-	// controller observed, bumping ObservedAt and ResourceVersion. Scoped to gk:
-	// an id of another kind is rejected with ErrWrongKind, a missing id with
-	// ErrNotFound.
-	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte) (*RawObject, error)
+	// controller observed, bumping ObservedAt and ResourceVersion, and stamps
+	// statusVersion (the migrator schema version the status bytes were written at).
+	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
+	// id with ErrNotFound.
+	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
 
 	// SetCondition upserts the condition keyed by (id, cond.Type). A real change
 	// bumps the object's ResourceVersion and emits a Modified event; an identical

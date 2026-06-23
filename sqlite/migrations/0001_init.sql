@@ -26,6 +26,13 @@ CREATE TABLE objects (
     spec   TEXT NOT NULL, -- JSON, user-owned,        HARD / desired state
     status TEXT,          -- JSON, controller-owned,  SOFT / observed state (nullable)
 
+    -- Per-column migrator schema versions: the schema version each blob was last
+    -- written at. Opaque to the store (like resource_version) — the generic layer's
+    -- Migrator converts a blob from its stored version on read. 0 = not versioned
+    -- (the kind hasn't opted in), which is why both default to 0.
+    schema_version_spec   INTEGER NOT NULL DEFAULT 0,
+    schema_version_status INTEGER NOT NULL DEFAULT 0,
+
     -- Convergence handshake. generation bumps only on a spec change.
     -- observed_generation is the last generation a reconciler finished;
     -- observed_generation == generation means "applied" (spec progress, not liveness).

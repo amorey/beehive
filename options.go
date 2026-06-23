@@ -98,6 +98,20 @@ func WithResyncInterval(d time.Duration) Option {
 	}
 }
 
+// WithMigrator registers a Migrator for the controller's kind, supplying the
+// schema-version conversion applied to stored Spec/Status JSON on read (see
+// Migrator). It is meaningful only at Register — a migrator is per-kind, and
+// Register installs it into the shared registry that both the user-facing client
+// and the reconciler decode through. Passed anywhere else it is ignored.
+func WithMigrator(m Migrator) Option {
+	return func(target any) error {
+		if t, ok := target.(*reconciler); ok {
+			t.migrator = m
+		}
+		return nil
+	}
+}
+
 // WithStartupReconcileStrategy sets which objects a controller reconciles at
 // startup (see StartupReconcileStrategy). The default is StartupReconcileAll.
 // Passed to New it sets the default for all controllers; passed to Register it
