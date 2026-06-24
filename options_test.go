@@ -129,3 +129,16 @@ func TestCreateOptionsDispatch(t *testing.T) {
 		require.NoError(t, o(&Beehive{}))
 	}
 }
+
+// resolveLoads ORs the selected LoadOptions into a single LoadSet.
+func TestResolveLoads(t *testing.T) {
+	// No options -> nothing loaded.
+	assert.Equal(t, LoadSet(0), resolveLoads(nil))
+
+	// Options OR together.
+	assert.Equal(t, LoadOwnerBit|LoadDependenciesBit,
+		resolveLoads([]LoadOption{LoadOwner(), LoadDependencies()}))
+
+	// A repeated selector is idempotent.
+	assert.Equal(t, LoadOwnerBit, resolveLoads([]LoadOption{LoadOwner(), LoadOwner()}))
+}

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -864,6 +865,71 @@ func (s *sqliteStore) ListIncomingRefs(ctx context.Context, toID storeapi.Object
 	return scanReferrers(rows)
 }
 
+// GroupIncomingRefsByID resolves ListIncomingRefs for many targets at once,
+// bucketed by target id — the incoming twin of GroupOutgoingRefsByID. It routes
+// by r.to_id and joins the source side (r.from_id).
+func (s *sqliteStore) GroupIncomingRefsByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
+	return s.refsByIDs(ctx, toIDs, relation, "to_id", "from_id")
+}
+
+// refsByIDsChunkSize bounds how many ids refsByIDs binds in a single query, kept
+// under SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc) with room for the
+// relation parameter — otherwise a large List eager-load would fail with "too
+// many SQL variables". A var, not a const, so tests can shrink it to exercise the
+// multi-chunk merge without seeding tens of thousands of rows.
+var refsByIDsChunkSize = 30000
+
+// refsByIDs is the shared batched edge lookup behind GroupIncomingRefsByID and
+// GroupOutgoingRefsByID: it filters refs by routeCol IN (ids), joins objects on
+// the opposite endpoint joinCol, and buckets each referrer under its routeCol
+// value. routeCol/joinCol are fixed internal column names (never user input), so
+// concatenating them is injection-safe. The id list is chunked under the bound-
+// parameter limit (see refsByIDsChunkSize); each chunk merges into the same map,
+// and a routeCol value with no matching edge never appears.
+func (s *sqliteStore) refsByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
+	out := make(map[storeapi.ObjectID][]storeapi.Referrer, len(ids))
+	for start := 0; start < len(ids); start += refsByIDsChunkSize {
+		end := start + refsByIDsChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := s.refsByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// refsByIDsChunk runs refsByIDs for one chunk of ids, merging rows into out. It
+// closes its result set before returning so the next chunk's query can run on the
+// single-connection store (which permits one open result set at a time).
+func (s *sqliteStore) refsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.Referrer) error {
+	args := make([]any, 0, len(ids)+1)
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, string(relation))
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT r.`+routeCol+`, o.id, o."group", o.kind
+		FROM refs r JOIN objects o ON o.id = r.`+joinCol+`
+		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
+		ORDER BY r.`+routeCol+`, o.id`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var route storeapi.ObjectID
+		var d storeapi.Referrer
+		// All columns are INTEGER/TEXT NOT NULL; the scan never fails (see scanReferrers).
+		_ = rows.Scan(&route, &d.ID, &d.Group, &d.Kind)
+		out[route] = append(out[route], d)
+	}
+	return rows.Err()
+}
+
 // ListOutgoingRefs returns the distinct objects fromID points at (any relation),
 // the inverse of ListIncomingRefs. DISTINCT collapses an object reached through
 // more than one relation (e.g. both owned_by and depends_on) to a single row.
@@ -877,6 +943,29 @@ func (s *sqliteStore) ListOutgoingRefs(ctx context.Context, fromID storeapi.Obje
 		return nil, err
 	}
 	return scanReferrers(rows)
+}
+
+// ListOutgoingRefsByRelation returns the objects fromID points at through the
+// given relation, ordered by id — the relation-filtered form of
+// ListOutgoingRefs. No DISTINCT is needed: (from_id, to_id, relation) is unique,
+// so a fixed relation can reach each target at most once.
+func (s *sqliteStore) ListOutgoingRefsByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.Referrer, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT o.id, o."group", o.kind
+		FROM refs r JOIN objects o ON o.id = r.to_id
+		WHERE r.from_id = ? AND r.relation = ?
+		ORDER BY o.id`, fromID, string(relation))
+	if err != nil {
+		return nil, err
+	}
+	return scanReferrers(rows)
+}
+
+// GroupOutgoingRefsByID resolves ListOutgoingRefsByRelation for many sources at
+// once, bucketed by source id. It routes by r.from_id and joins the target side
+// (r.to_id).
+func (s *sqliteStore) GroupOutgoingRefsByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
+	return s.refsByIDs(ctx, fromIDs, relation, "from_id", "to_id")
 }
 
 // scanReferrers collects an (id, group, kind) SELECT into Referrers, closing rows

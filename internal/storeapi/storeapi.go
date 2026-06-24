@@ -264,12 +264,30 @@ type Store interface {
 	// id (e.g. the dependents to requeue, or the owned children to GC).
 	ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
 
+	// GroupIncomingRefsByID is the batched form of ListIncomingRefs: the inbound
+	// referrers for many targets through relation, bucketed by target id. The
+	// incoming-edge twin of GroupOutgoingRefsByID (e.g. eager-loading dependents
+	// over a List without an N+1). A target with no referrer is absent.
+	GroupIncomingRefsByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error)
+
 	// ListOutgoingRefs returns the distinct objects that fromID points at through any
 	// relation, ordered by id (the inverse of ListIncomingRefs). GC uses it to wake
 	// the targets a row was holding open before removing it: deleting fromID drops
 	// its outgoing edges (ON DELETE CASCADE), which can unblock a deletion-pending
 	// target that RESTRICT was keeping alive.
 	ListOutgoingRefs(ctx context.Context, fromID ObjectID) ([]Referrer, error)
+
+	// ListOutgoingRefsByRelation is the relation-filtered form of ListOutgoingRefs:
+	// the objects fromID points at through exactly relation, ordered by id (e.g. a
+	// child's owner via RelationOwnedBy, or its dependencies via RelationDependsOn).
+	ListOutgoingRefsByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]Referrer, error)
+
+	// GroupOutgoingRefsByID is the batched form of ListOutgoingRefsByRelation: it
+	// resolves the relation's outgoing targets for many sources, bucketed by source
+	// id. A source with no matching edge is absent from the map (never a nil/empty
+	// entry), so eager loading over a List avoids an N+1. The implementation may
+	// chunk a large id list across several queries; the bucketed result is the same.
+	GroupOutgoingRefsByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error)
 
 	// DeleteFinalizingDependsOnRefs removes the depends_on edges pointing at toID
 	// whose source object is itself marked for deletion. A finalizing dependent is

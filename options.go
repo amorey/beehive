@@ -24,6 +24,36 @@ import (
 // targets it understands and ignores the rest.
 type Option func(target any) error
 
+// LoadOption selects a secondary lookup to fetch alongside an object on a read.
+// It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
+// List), composing into a LoadSet. Lazy fetching is the alternative — omit the
+// selector and call Client.GetOwner/ListDependencies when the data is needed.
+type LoadOption func(*LoadSet)
+
+// LoadOwner selects the object's owner (its outgoing owned_by edge).
+func LoadOwner() LoadOption {
+	return func(s *LoadSet) { *s |= LoadOwnerBit }
+}
+
+// LoadDependencies selects the objects this one depends on (outgoing depends_on).
+func LoadDependencies() LoadOption {
+	return func(s *LoadSet) { *s |= LoadDependenciesBit }
+}
+
+// LoadDependents selects the objects that depend on this one (incoming depends_on).
+func LoadDependents() LoadOption {
+	return func(s *LoadSet) { *s |= LoadDependentsBit }
+}
+
+// resolveLoads folds the per-call selectors into a single LoadSet.
+func resolveLoads(opts []LoadOption) LoadSet {
+	var set LoadSet
+	for _, o := range opts {
+		o(&set)
+	}
+	return set
+}
+
 // StartupReconcileStrategy selects which objects a controller reconciles once at
 // startup. The zero value is StartupReconcileAll, so the safe default holds for a
 // controller that never sets it.
