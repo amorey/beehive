@@ -16,6 +16,7 @@ package conflate
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -70,6 +71,42 @@ func TestRecvWakesParkedReceiver(t *testing.T) {
 		assert.Equal(t, 42, v)
 	case <-time.After(time.Second):
 		t.Fatal("parked receiver was not woken by Send")
+	}
+}
+
+// TestCloseWakesParkedReceiver covers the in-select close path: a receiver
+// already parked in RecvContext's blocking select must wake with ErrClosed when
+// Close fires (distinct from a Close observed by the pre-lock check). We wait for
+// the waiting flag, set just before the parked select, so Close lands in-select.
+func TestCloseWakesParkedReceiver(t *testing.T) {
+	h := New[int, int](latestWins)
+	rx := h.Receiver()
+	got := make(chan error, 1)
+	go func() {
+		_, err := rx.RecvContext(context.Background())
+		got <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		rx.s.mu.Lock()
+		parked := rx.waiting
+		rx.s.mu.Unlock()
+		if parked {
+			break // committed to the bottom select; its only next move is the <-done case
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("receiver never parked")
+		}
+		runtime.Gosched()
+	}
+
+	rx.Close()
+	select {
+	case err := <-got:
+		assert.ErrorIs(t, err, ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("parked receiver was not woken by Close")
 	}
 }
 

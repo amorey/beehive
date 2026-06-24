@@ -623,6 +623,80 @@ func TestListOutgoingRefs(t *testing.T) {
 	assert.Empty(t, refs)
 }
 
+func TestListOutgoingRefsByRelation(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	from := newRefObject(t, store)
+	owner := newRefObject(t, store)
+	dep := newRefObject(t, store)
+
+	require.NoError(t, store.AddRef(ctx, from.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, store.AddRef(ctx, from.ID, dep.ID, beehive.RelationDependsOn))
+
+	owned, err := store.ListOutgoingRefsByRelation(ctx, from.ID, beehive.RelationOwnedBy)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{owner.ID}, refIDs(owned), "only the owned_by target")
+
+	deps, err := store.ListOutgoingRefsByRelation(ctx, from.ID, beehive.RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(deps), "only the depends_on target")
+
+	none, err := store.ListOutgoingRefsByRelation(ctx, owner.ID, beehive.RelationOwnedBy)
+	require.NoError(t, err)
+	assert.Empty(t, none, "no matching edges")
+}
+
+func TestGroupOutgoingRefsByID(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	childA := newRefObject(t, store)
+	childB := newRefObject(t, store)
+	loner := newRefObject(t, store) // owns nothing through owned_by
+
+	require.NoError(t, store.AddRef(ctx, childA.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, store.AddRef(ctx, childB.ID, owner.ID, beehive.RelationOwnedBy))
+	// A depends_on edge the relation filter must exclude.
+	require.NoError(t, store.AddRef(ctx, childA.ID, loner.ID, beehive.RelationDependsOn))
+
+	got, err := store.GroupOutgoingRefsByID(ctx,
+		[]beehive.ObjectID{childA.ID, childB.ID, loner.ID}, beehive.RelationOwnedBy)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{owner.ID}, refIDs(got[childA.ID]))
+	assert.Equal(t, []beehive.ObjectID{owner.ID}, refIDs(got[childB.ID]))
+	_, ok := got[loner.ID]
+	assert.False(t, ok, "a source with no matching edge is absent from the map")
+
+	empty, err := store.GroupOutgoingRefsByID(ctx, nil, beehive.RelationOwnedBy)
+	require.NoError(t, err)
+	assert.Empty(t, empty, "empty input short-circuits to an empty map")
+}
+
+// TestGroupOutgoingRefsByIDChunks shrinks the chunk size so a modest id list
+// spans several queries, proving refsByIDs stays under SQLite's bound-parameter
+// limit and merges every chunk's rows into one map.
+func TestGroupOutgoingRefsByIDChunks(t *testing.T) {
+	defer func(n int) { refsByIDsChunkSize = n }(refsByIDsChunkSize)
+	refsByIDsChunkSize = 2 // 5 ids -> 3 chunks (2, 2, 1)
+
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	var children []beehive.ObjectID
+	for i := 0; i < 5; i++ {
+		c := newRefObject(t, store)
+		require.NoError(t, store.AddRef(ctx, c.ID, owner.ID, beehive.RelationOwnedBy))
+		children = append(children, c.ID)
+	}
+
+	got, err := store.GroupOutgoingRefsByID(ctx, children, beehive.RelationOwnedBy)
+	require.NoError(t, err)
+	require.Len(t, got, len(children), "every id resolved across all chunks")
+	for _, id := range children {
+		assert.Equal(t, []beehive.ObjectID{owner.ID}, refIDs(got[id]))
+	}
+}
+
 func TestDeleteFinalizingDependsOnRefs(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -1038,6 +1112,15 @@ func newRefObject(t *testing.T, store beehive.Store) *beehive.RawObject {
 	})
 	require.NoError(t, err)
 	return obj
+}
+
+// refIDs projects a Referrer slice to its ids for order-sensitive assertions.
+func refIDs(refs []beehive.Referrer) []beehive.ObjectID {
+	var ids []beehive.ObjectID
+	for _, r := range refs {
+		ids = append(ids, r.ID)
+	}
+	return ids
 }
 
 // countRefs reads the refs table directly to assert edge presence.
@@ -1778,4 +1861,81 @@ func TestHasIncomingRefsDBError(t *testing.T) {
 	store.db.Close()
 	_, err := store.HasIncomingRefs(context.Background(), 1)
 	require.Error(t, err)
+}
+
+func TestGroupIncomingRefsByID(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	depA := newRefObject(t, store)
+	depB := newRefObject(t, store)
+	loner := newRefObject(t, store) // points at target via owned_by, not depends_on
+
+	require.NoError(t, store.AddRef(ctx, depA.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, store.AddRef(ctx, depB.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, store.AddRef(ctx, loner.ID, target.ID, beehive.RelationOwnedBy))
+
+	got, err := store.GroupIncomingRefsByID(ctx,
+		[]beehive.ObjectID{target.ID, depA.ID}, beehive.RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{depA.ID, depB.ID}, refIDs(got[target.ID]))
+	_, ok := got[depA.ID]
+	assert.False(t, ok, "a target with no inbound depends_on is absent from the map")
+
+	empty, err := store.GroupIncomingRefsByID(ctx, nil, beehive.RelationDependsOn)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}
+
+func TestRefsByIDsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	ctx := context.Background()
+	_, err := store.GroupOutgoingRefsByID(ctx, []beehive.ObjectID{1}, beehive.RelationOwnedBy)
+	require.Error(t, err)
+	_, err = store.GroupIncomingRefsByID(ctx, []beehive.ObjectID{1}, beehive.RelationDependsOn)
+	require.Error(t, err)
+}
+
+func TestListOutgoingRefsByRelationDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.ListOutgoingRefsByRelation(context.Background(), 1, beehive.RelationOwnedBy)
+	require.Error(t, err)
+}
+
+func TestListAllDeletionPendingIDs(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	_ = newRefObject(t, store) // not deletion-pending
+
+	for _, id := range []beehive.ObjectID{a.ID, b.ID} {
+		_, _, err := store.RequestDeletion(ctx, testGK, id)
+		require.NoError(t, err)
+	}
+
+	ids, err := store.ListAllDeletionPendingIDs(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{a.ID, b.ID}, ids, "every finalizing object, kind-agnostic")
+}
+
+func TestDeletionPendingIDsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	ctx := context.Background()
+	_, err := store.ListDeletionPendingIDs(ctx, testGK)
+	require.Error(t, err)
+	_, err = store.ListAllDeletionPendingIDs(ctx)
+	require.Error(t, err)
+}
+
+func TestScopedMutatorWrongKind(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store) // kind = testGK
+	other := beehive.GroupKind{Kind: "Other"}
+	_, err := store.UpdateStatus(ctx, other, obj.ID, 0, []byte(`{}`), 0)
+	require.ErrorIs(t, err, beehive.ErrWrongKind)
 }

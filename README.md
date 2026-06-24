@@ -160,8 +160,26 @@ type Object[Spec, Status any] struct {
     Conditions          []Condition // per-type observations reported by controllers
     CreatedAt           time.Time
     UpdatedAt           time.Time
+
+    // Secondary lookups, populated only for the relations a read requested (see
+    // Load options). Reach for the accessors, not these fields directly.
+    Owner        *Ref  // the owning object
+    Dependencies []Ref // objects this one depends on
+    Dependents   []Ref // objects that depend on this one
 }
+
+type Ref = storeapi.Referrer // { ID ObjectID; Group, Kind string }
 ```
+
+`Owner`/`Dependencies`/`Dependents` are filled only when the read asked for them. Read them through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty:
+
+```go
+func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) // bool: an owner exists; err: not loaded
+func (o *Object[Spec, Status]) GetDependencies() ([]Ref, error)
+func (o *Object[Spec, Status]) GetDependents() ([]Ref, error)
+```
+
+Once loaded, an empty slice (or `GetOwner`'s `ok == false`) means genuinely none. `ErrNotLoaded` is caller misuse — fetch the relation eagerly with the `Load*()` option, or lazily via the `Client`/`ControllerClient` methods below.
 
 ### Result
 
@@ -190,16 +208,30 @@ type WatchEvent[Spec, Status any] struct {
 type Client[Spec, Status any] interface {
     Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
     Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
-    Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error)
-    GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error)
-    List(ctx context.Context) ([]*Object[Spec, Status], error)
+    Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+    GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+    List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
     Delete(ctx context.Context, id ObjectID) error
     Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error)
     WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error)
+
+    // Lazy secondary lookups — the on-demand counterparts to the Load options.
+    GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
+    ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
+    ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 ```
+
+#### Secondary lookups (owner / dependencies / dependents)
+
+An object's ref edges are fetched on request, two ways:
+
+- **Eager** — pass `LoadOption`s to a read: `Get(ctx, id, LoadOwner())`, `List(ctx, LoadDependencies(), LoadDependents())`. The returned objects carry the data (read via the accessors). On `List` each relation is one batched query, not one per object.
+- **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` when the data is actually needed.
+
+Both issue the same secondary query (edges are a separate indexed lookup, never joined into the object's blob-bearing `SELECT`); eager just attaches the result to the object and batches across a `List`.
 
 `Create` generates a slug unless `beehive.WithSlug` is provided. If a slug is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
 
@@ -222,9 +254,15 @@ type ControllerClient[Status any] interface {
     AddDependency(ctx context.Context, fromID, toID ObjectID) error
     DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
     HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
+    // Lazy secondary lookups, for reading an object's edges during reconcile.
+    GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
+    ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
+    ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
+
+`GetOwner`/`ListDependencies`/`ListDependents` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `GetOwner` returns the owner via `owned_by`; `ListDependents` is the inverse of `ListDependencies` over `depends_on`. Distinct from `HasIncomingRefs`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `ListDependents`.
 
 `HasIncomingRefs` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
@@ -275,3 +313,11 @@ func WithMigrator(m Migrator) Option               // attach a schema-version Mi
 `WithOwner` sets an `owned_by` edge in `refs` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
 
 `AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.
+
+Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents):
+
+```go
+func LoadOwner() LoadOption         // fetch the owner (outgoing owned_by)
+func LoadDependencies() LoadOption  // fetch dependencies (outgoing depends_on)
+func LoadDependents() LoadOption    // fetch dependents (incoming depends_on)
+```

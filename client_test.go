@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -1173,5 +1174,303 @@ func TestWatchListErrForUnregisteredKind(t *testing.T) {
 	require.Error(t, err)
 
 	_, err = client.Watch(ctx, 0)
+	require.Error(t, err)
+}
+
+func TestClientGetOwner(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	got, ok, err := client.GetOwner(ctx, child.ID)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, Ref{ID: owner.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}, got)
+
+	// An ownerless object reports absence, not an error.
+	_, ok, err = client.GetOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	// A foreign/missing id is invisible through this single-kind client.
+	_, _, err = client.GetOwner(ctx, 99999)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestClientListDependenciesAndDependents(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	a, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	b, err := client.Create(ctx, cSpec{Val: "b"})
+	require.NoError(t, err)
+	c, err := client.Create(ctx, cSpec{Val: "c"})
+	require.NoError(t, err)
+
+	// a depends on b and c.
+	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, store.AddRef(ctx, a.ID, c.ID, RelationDependsOn))
+
+	deps, err := client.ListDependencies(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{b.ID, c.ID}, refObjectIDs(deps))
+
+	// b's dependents include a.
+	dependents, err := client.ListDependents(ctx, b.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
+
+	// No edges -> empty, no error.
+	none, err := client.ListDependencies(ctx, b.ID)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
+
+func refObjectIDs(refs []Ref) []ObjectID {
+	var ids []ObjectID
+	for _, r := range refs {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
+func TestClientGetWithLoadOwner(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	// Without the selector the owner is not loaded — accessing it errors.
+	plain, err := client.Get(ctx, child.ID)
+	require.NoError(t, err)
+	_, _, err = plain.GetOwner()
+	assert.ErrorIs(t, err, ErrNotLoaded, "owner not loaded without LoadOwner()")
+
+	// With it, the owner is populated in the same read.
+	got, err := client.Get(ctx, child.ID, LoadOwner())
+	require.NoError(t, err)
+	ref, ok, err := got.GetOwner()
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, owner.ID, ref.ID)
+
+	// GetBySlug honours selectors too.
+	_, err = client.Create(ctx, cSpec{Val: "slugged"}, WithSlug("s1"), WithOwner(owner.ID))
+	require.NoError(t, err)
+	bySlug, err := client.GetBySlug(ctx, "s1", LoadOwner())
+	require.NoError(t, err)
+	ref, ok, err = bySlug.GetOwner()
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, owner.ID, ref.ID)
+}
+
+// countingStore wraps a real store to count the batched owner lookup, proving
+// eager List fans out one store call rather than one per object.
+type countingStore struct {
+	Store
+	outgoingByIDs int
+	incomingByIDs int
+}
+
+func (s *countingStore) GroupOutgoingRefsByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
+	s.outgoingByIDs++
+	return s.Store.GroupOutgoingRefsByID(ctx, ids, rel)
+}
+
+func (s *countingStore) GroupIncomingRefsByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
+	s.incomingByIDs++
+	return s.Store.GroupIncomingRefsByID(ctx, ids, rel)
+}
+
+func TestClientListWithLoadOwnerBatches(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{Store: newClientTestStore(t)}
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	const n = 5
+	for i := 0; i < n; i++ {
+		_, err := client.Create(ctx, cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
+		require.NoError(t, err)
+	}
+
+	objs, err := client.List(ctx, LoadOwner())
+	require.NoError(t, err)
+
+	var withOwner int
+	for _, o := range objs {
+		ref, ok, err := o.GetOwner()
+		require.NoError(t, err)
+		if ok {
+			assert.Equal(t, owner.ID, ref.ID)
+			withOwner++
+		}
+	}
+	assert.Equal(t, n, withOwner, "every child's owner populated")
+	assert.Equal(t, 1, store.outgoingByIDs, "owner load batched into one store call, not N")
+}
+
+func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	a, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	b, err := client.Create(ctx, cSpec{Val: "b"})
+	require.NoError(t, err)
+	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn)) // a depends on b
+
+	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
+	require.NoError(t, err)
+	deps, err := got.GetDependencies()
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
+	dependents, err := got.GetDependents()
+	require.NoError(t, err, "loaded even though empty")
+	assert.Empty(t, dependents)
+
+	got, err = client.Get(ctx, b.ID, LoadDependents())
+	require.NoError(t, err)
+	dependents, err = got.GetDependents()
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
+}
+
+func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{Store: newClientTestStore(t)}
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	a, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	b, err := client.Create(ctx, cSpec{Val: "b"})
+	require.NoError(t, err)
+	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn))
+
+	objs, err := client.List(ctx, LoadDependencies(), LoadDependents())
+	require.NoError(t, err)
+	byID := map[ObjectID]*Object[cSpec, cStatus]{}
+	for _, o := range objs {
+		byID[o.ID] = o
+	}
+
+	deps, err := byID[a.ID].GetDependencies()
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
+	dependents, err := byID[b.ID].GetDependents()
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
+
+	assert.Equal(t, 1, store.outgoingByIDs, "dependencies batched into one call")
+	assert.Equal(t, 1, store.incomingByIDs, "dependents batched into one call")
+}
+
+// refErrorStore wraps a real store but errors on every ref-edge lookup, driving
+// the error branches of the eager loaders (single + batched) and fetchOwnerRef.
+type refErrorStore struct {
+	Store
+}
+
+func (refErrorStore) ListOutgoingRefsByRelation(context.Context, ObjectID, Relation) ([]Referrer, error) {
+	return nil, errBoom
+}
+func (refErrorStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
+	return nil, errBoom
+}
+func (refErrorStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+	return nil, errBoom
+}
+func (refErrorStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+	return nil, errBoom
+}
+
+func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
+	ctx := context.Background()
+	store := &refErrorStore{Store: newClientTestStore(t)}
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	obj, err := client.Create(ctx, cSpec{Val: "x"}, WithSlug("x1"))
+	require.NoError(t, err)
+
+	loads := []LoadOption{LoadOwner(), LoadDependencies(), LoadDependents()}
+	// Single-object path: each relation's store error surfaces through Get/GetBySlug.
+	for _, l := range loads {
+		_, err := client.Get(ctx, obj.ID, l)
+		require.ErrorIs(t, err, errBoom)
+	}
+	_, err = client.GetBySlug(ctx, "x1", LoadOwner())
+	require.ErrorIs(t, err, errBoom)
+
+	// Batched path: each relation's store error surfaces through List.
+	for _, l := range loads {
+		_, err := client.List(ctx, l)
+		require.ErrorIs(t, err, errBoom)
+	}
+}
+
+func TestClientLazyRefsForeignIDInvisible(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// A foreign/missing id is rejected by the scopedGet guard before any ref query.
+	_, err = client.ListDependencies(ctx, 99999)
+	assert.ErrorIs(t, err, ErrNotFound)
+	_, err = client.ListDependents(ctx, 99999)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// getBadJSONStore returns an undecodable spec from the scoped Get/GetBySlug
+// reads, driving the decode-error branch of Client.Get / Client.GetBySlug.
+type getBadJSONStore struct {
+	fakeStore
+	gk GroupKind
+}
+
+func (s *getBadJSONStore) GetObject(context.Context, ObjectID) (*RawObject, error) {
+	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
+}
+func (s *getBadJSONStore) GetObjectBySlug(context.Context, GroupKind, string) (*RawObject, error) {
+	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
+}
+
+func TestGetDecodeError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&getBadJSONStore{gk: clientTestGK})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.Get(ctx, 1)
+	require.Error(t, err)
+	_, err = client.GetBySlug(ctx, "any")
 	require.Error(t, err)
 }

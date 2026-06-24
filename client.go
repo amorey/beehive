@@ -35,12 +35,23 @@ type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
 	CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
-	Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error)
-	GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error)
-	List(ctx context.Context) ([]*Object[Spec, Status], error)
+	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
 	Delete(ctx context.Context, id ObjectID) error
 	Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error)
 	WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error)
+
+	// GetOwner returns id's owner, if any. ok reports presence: false (with a nil
+	// error) when the object simply has no owner. The lazy counterpart to
+	// LoadOwner() — fetch the owner only when it is actually needed.
+	GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
+	// ListDependencies returns the objects id depends on (its outgoing depends_on
+	// edges). The lazy counterpart to LoadDependencies().
+	ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
+	// ListDependents returns the objects that depend on id (incoming depends_on).
+	// The lazy counterpart to LoadDependents().
+	ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -177,12 +188,19 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	return obj, nil
 }
 
-func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error) {
 	raw, err := c.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return c.decode(raw)
+	obj, err := c.decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadObjectRelated(ctx, c.bh.store, obj, resolveLoads(loads)); err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
 
 // scopedGet loads id and confirms it belongs to this client's kind. A Client is
@@ -212,15 +230,69 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	return err
 }
 
-func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
 	raw, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
 	if err != nil {
 		return nil, err
 	}
-	return c.decode(raw)
+	obj, err := c.decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadObjectRelated(ctx, c.bh.store, obj, resolveLoads(loads)); err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
 
-func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, Status], error) {
+// loadObjectRelated populates the related-data fields named by set on one object,
+// recording each fetched lookup in obj.loaded so the accessors can tell loaded
+// from absent. Both client reads and the reconcile decode boundary call it.
+// Batched List has its own path (loadListRelated) to avoid an N+1.
+func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *Object[Spec, Status], set LoadSet) error {
+	if set&LoadOwnerBit != 0 {
+		owner, ok, err := fetchOwnerRef(ctx, store, obj.ID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			obj.Owner = &owner
+		}
+		obj.loaded |= LoadOwnerBit
+	}
+	if set&LoadDependenciesBit != 0 {
+		deps, err := store.ListOutgoingRefsByRelation(ctx, obj.ID, RelationDependsOn)
+		if err != nil {
+			return err
+		}
+		obj.Dependencies = deps
+		obj.loaded |= LoadDependenciesBit
+	}
+	if set&LoadDependentsBit != 0 {
+		dependents, err := store.ListIncomingRefs(ctx, obj.ID, RelationDependsOn)
+		if err != nil {
+			return err
+		}
+		obj.Dependents = dependents
+		obj.loaded |= LoadDependentsBit
+	}
+	return nil
+}
+
+// fetchOwnerRef resolves id's single owned_by edge. Owner is single (WithOwner
+// sets one), so the first row is the owner and ok is false when there is none.
+func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (Ref, bool, error) {
+	owners, err := store.ListOutgoingRefsByRelation(ctx, id, RelationOwnedBy)
+	if err != nil {
+		return Ref{}, false, err
+	}
+	if len(owners) == 0 {
+		return Ref{}, false, nil
+	}
+	return owners[0], true, nil
+}
+
+func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error) {
 	raws, err := c.bh.store.ListObjects(ctx, c.gk)
 	if err != nil {
 		return nil, err
@@ -241,7 +313,80 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context) ([]*Object[Spec, St
 		}
 		objs = append(objs, obj)
 	}
+	if err := c.loadListRelated(ctx, objs, resolveLoads(loads)); err != nil {
+		return nil, err
+	}
 	return objs, nil
+}
+
+// loadListRelated eager-loads the requested secondary lookups for a whole list
+// in one batched store call per relation, scattering results back onto each
+// object — the N+1-free counterpart to loadObjectRelated. A nil set is a no-op.
+func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*Object[Spec, Status], set LoadSet) error {
+	if set == 0 || len(objs) == 0 {
+		return nil
+	}
+	ids := make([]ObjectID, len(objs))
+	for i, o := range objs {
+		ids[i] = o.ID
+	}
+	if set&LoadOwnerBit != 0 {
+		byID, err := c.bh.store.GroupOutgoingRefsByID(ctx, ids, RelationOwnedBy)
+		if err != nil {
+			return err
+		}
+		for _, o := range objs {
+			if owners := byID[o.ID]; len(owners) > 0 {
+				owner := owners[0]
+				o.Owner = &owner
+			}
+			o.loaded |= LoadOwnerBit
+		}
+	}
+	if set&LoadDependenciesBit != 0 {
+		byID, err := c.bh.store.GroupOutgoingRefsByID(ctx, ids, RelationDependsOn)
+		if err != nil {
+			return err
+		}
+		for _, o := range objs {
+			o.Dependencies = byID[o.ID]
+			o.loaded |= LoadDependenciesBit
+		}
+	}
+	if set&LoadDependentsBit != 0 {
+		byID, err := c.bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
+		if err != nil {
+			return err
+		}
+		for _, o := range objs {
+			o.Dependents = byID[o.ID]
+			o.loaded |= LoadDependentsBit
+		}
+	}
+	return nil
+}
+
+func (c *clientImpl[Spec, Status]) GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error) {
+	// scopedGet keeps a foreign/missing id invisible (ErrNotFound) before we
+	// resolve edges, so this single-kind client never reports another kind's owner.
+	if _, err := c.scopedGet(ctx, id); err != nil {
+		return Ref{}, false, err
+	}
+	return fetchOwnerRef(ctx, c.bh.store, id)
+}
+
+func (c *clientImpl[Spec, Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
+	if _, err := c.scopedGet(ctx, id); err != nil {
+		return nil, err
+	}
+	return c.bh.store.ListOutgoingRefsByRelation(ctx, id, RelationDependsOn)
+}
+
+func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
+	if _, err := c.scopedGet(ctx, id); err != nil {
+		return nil, err
+	}
+	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {

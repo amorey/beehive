@@ -514,3 +514,32 @@ func TestControllerClientDeleteDependencyNoWakesOutsideReconcile(t *testing.T) {
 	// GetObjectMeta call that would otherwise fail.
 	require.NoError(t, cc.DeleteDependency(context.Background(), 1, 2))
 }
+
+func TestControllerClientReadRefs(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+	require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, RelationDependsOn))
+
+	ref, ok, err := cc.GetOwner(ctx, child.ID)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, owner.ID, ref.ID)
+
+	deps, err := cc.ListDependencies(ctx, child.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{owner.ID}, refObjectIDs(deps))
+
+	dependents, err := cc.ListDependents(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{child.ID}, refObjectIDs(dependents))
+}

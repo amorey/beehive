@@ -15,6 +15,8 @@
 package beehive
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
@@ -25,6 +27,26 @@ type GroupKind = storeapi.GroupKind
 
 // ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = storeapi.ObjectID
+
+// Ref identifies a related object reached through a ref edge — an owner, a
+// dependency, or a dependent — carrying the GroupKind needed to address it. It
+// is the same shape the store returns for every edge query.
+type Ref = storeapi.Referrer
+
+// LoadSet is a bitset of secondary lookups (owner, dependencies, dependents)
+// to fetch alongside an object. The zero value loads nothing; reads OR in the
+// bits a caller selects, and the populated Object records what was fetched so
+// the accessors can tell "loaded and empty" from "never asked".
+type LoadSet uint8
+
+const (
+	// LoadOwnerBit selects the object's owner (its outgoing owned_by edge).
+	LoadOwnerBit LoadSet = 1 << iota
+	// LoadDependenciesBit selects the object's dependencies (outgoing depends_on).
+	LoadDependenciesBit
+	// LoadDependentsBit selects the objects that depend on it (incoming depends_on).
+	LoadDependentsBit
+)
 
 // Object is a single resource: user-owned desired state (Spec) plus
 // controller-owned observed state (Status), along with the metadata Beehive
@@ -45,6 +67,54 @@ type Object[Spec, Status any] struct {
 	Conditions          []Condition // per-type observations reported by controllers
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+
+	// Related data, populated only for the lookups a read requested (see LoadSet).
+	// A nil/empty field is ambiguous on its own — which loaded records what was
+	// actually fetched, so the GetOwner/GetDependencies/GetDependents accessors
+	// distinguish "loaded and empty" from "never asked". Reach for the accessors
+	// rather than these fields directly.
+	Owner        *Ref  // the owning object, if any
+	Dependencies []Ref // objects this one depends on
+	Dependents   []Ref // objects that depend on this one
+	loaded       LoadSet
+}
+
+// ErrNotLoaded is returned by the secondary-lookup accessors when the requested
+// relation was not fetched on the read that produced the object. It marks caller
+// misuse — forgetting LoadOwner()/LoadDependencies()/LoadDependents() — not a
+// missing object, so it is kept distinct from a present-but-empty result.
+var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
+
+// GetOwner returns the object's owner. It errors with ErrNotLoaded if LoadOwner()
+// was not passed to the read. Otherwise ok reports presence — false when the
+// object has no owner. (Use the lazy Client.GetOwner to fetch on demand instead.)
+func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) {
+	if o.loaded&LoadOwnerBit == 0 {
+		return Ref{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
+	}
+	if o.Owner == nil {
+		return Ref{}, false, nil
+	}
+	return *o.Owner, true, nil
+}
+
+// GetDependencies returns the objects this one depends on, or ErrNotLoaded if
+// LoadDependencies() was not passed to the read. A loaded-but-empty result is an
+// empty slice with a nil error.
+func (o *Object[Spec, Status]) GetDependencies() ([]Ref, error) {
+	if o.loaded&LoadDependenciesBit == 0 {
+		return nil, fmt.Errorf("%w: dependencies (pass LoadDependencies())", ErrNotLoaded)
+	}
+	return o.Dependencies, nil
+}
+
+// GetDependents returns the objects that depend on this one, or ErrNotLoaded if
+// LoadDependents() was not passed to the read.
+func (o *Object[Spec, Status]) GetDependents() ([]Ref, error) {
+	if o.loaded&LoadDependentsBit == 0 {
+		return nil, fmt.Errorf("%w: dependents (pass LoadDependents())", ErrNotLoaded)
+	}
+	return o.Dependents, nil
 }
 
 // Result is returned by a controller's Reconcile to influence requeueing.

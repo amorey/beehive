@@ -151,7 +151,16 @@ func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) err
 func (s *fakeStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
+func (s *fakeStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
+	return nil, nil
+}
 func (s *fakeStore) ListOutgoingRefs(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+	return nil, nil
+}
+func (s *fakeStore) ListOutgoingRefsByRelation(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+	return nil, nil
+}
+func (s *fakeStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
 	return nil, nil
 }
 func (s *fakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {
