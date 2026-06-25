@@ -259,7 +259,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 			return err
 		}
 		if ok {
-			obj.Owner = &owner
+			obj.owner = &owner
 		}
 		obj.loaded |= LoadOwnerBit
 	}
@@ -268,7 +268,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		if err != nil {
 			return err
 		}
-		obj.Dependencies = deps
+		obj.dependencies = deps
 		obj.loaded |= LoadDependenciesBit
 	}
 	if set&LoadDependentsBit != 0 {
@@ -276,7 +276,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		if err != nil {
 			return err
 		}
-		obj.Dependents = dependents
+		obj.dependents = dependents
 		obj.loaded |= LoadDependentsBit
 	}
 	if set&LoadOwnedBit != 0 {
@@ -284,7 +284,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		if err != nil {
 			return err
 		}
-		obj.Owned = owned
+		obj.owned = owned
 		obj.loaded |= LoadOwnedBit
 	}
 	return nil
@@ -349,7 +349,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		for _, o := range objs {
 			if owners := byID[o.ID]; len(owners) > 0 {
 				owner := owners[0]
-				o.Owner = &owner
+				o.owner = &owner
 			}
 			o.loaded |= LoadOwnerBit
 		}
@@ -360,7 +360,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 			return err
 		}
 		for _, o := range objs {
-			o.Dependencies = byID[o.ID]
+			o.dependencies = byID[o.ID]
 			o.loaded |= LoadDependenciesBit
 		}
 	}
@@ -370,7 +370,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 			return err
 		}
 		for _, o := range objs {
-			o.Dependents = byID[o.ID]
+			o.dependents = byID[o.ID]
 			o.loaded |= LoadDependentsBit
 		}
 	}
@@ -380,7 +380,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 			return err
 		}
 		for _, o := range objs {
-			o.Owned = byID[o.ID]
+			o.owned = byID[o.ID]
 			o.loaded |= LoadOwnedBit
 		}
 	}

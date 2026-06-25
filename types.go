@@ -72,13 +72,13 @@ type Object[Spec, Status any] struct {
 
 	// Related data, populated only for the lookups a read requested (see LoadSet).
 	// A nil/empty field is ambiguous on its own — which loaded records what was
-	// actually fetched, so the GetOwner/GetDependencies/GetDependents/GetOwned
-	// accessors distinguish "loaded and empty" from "never asked". Reach for the accessors
-	// rather than these fields directly.
-	Owner        *Ref  // the owning object, if any
-	Dependencies []Ref // objects this one depends on
-	Dependents   []Ref // objects that depend on this one
-	Owned        []Ref // objects this one owns
+	// actually fetched, so the GetOwner/ListDependencies/ListDependents/ListOwned
+	// accessors distinguish "loaded and empty" from "never asked". These fields are
+	// unexported; reach for the accessors, never the backing storage.
+	owner        *Ref  // the owning object, if any
+	dependencies []Ref // objects this one depends on
+	dependents   []Ref // objects that depend on this one
+	owned        []Ref // objects this one owns
 	loaded       LoadSet
 }
 
@@ -95,39 +95,39 @@ func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) {
 	if o.loaded&LoadOwnerBit == 0 {
 		return Ref{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
 	}
-	if o.Owner == nil {
+	if o.owner == nil {
 		return Ref{}, false, nil
 	}
-	return *o.Owner, true, nil
+	return *o.owner, true, nil
 }
 
-// GetDependencies returns the objects this one depends on, or ErrNotLoaded if
+// ListDependencies returns the objects this one depends on, or ErrNotLoaded if
 // LoadDependencies() was not passed to the read. A loaded-but-empty result is an
 // empty slice with a nil error.
-func (o *Object[Spec, Status]) GetDependencies() ([]Ref, error) {
+func (o *Object[Spec, Status]) ListDependencies() ([]Ref, error) {
 	if o.loaded&LoadDependenciesBit == 0 {
 		return nil, fmt.Errorf("%w: dependencies (pass LoadDependencies())", ErrNotLoaded)
 	}
-	return o.Dependencies, nil
+	return o.dependencies, nil
 }
 
-// GetDependents returns the objects that depend on this one, or ErrNotLoaded if
+// ListDependents returns the objects that depend on this one, or ErrNotLoaded if
 // LoadDependents() was not passed to the read.
-func (o *Object[Spec, Status]) GetDependents() ([]Ref, error) {
+func (o *Object[Spec, Status]) ListDependents() ([]Ref, error) {
 	if o.loaded&LoadDependentsBit == 0 {
 		return nil, fmt.Errorf("%w: dependents (pass LoadDependents())", ErrNotLoaded)
 	}
-	return o.Dependents, nil
+	return o.dependents, nil
 }
 
-// GetOwned returns the objects this one owns (its incoming owned_by edges), or
+// ListOwned returns the objects this one owns (its incoming owned_by edges), or
 // ErrNotLoaded if LoadOwned() was not passed to the read. A loaded-but-empty
 // result is an empty slice with a nil error.
-func (o *Object[Spec, Status]) GetOwned() ([]Ref, error) {
+func (o *Object[Spec, Status]) ListOwned() ([]Ref, error) {
 	if o.loaded&LoadOwnedBit == 0 {
 		return nil, fmt.Errorf("%w: owned (pass LoadOwned())", ErrNotLoaded)
 	}
-	return o.Owned, nil
+	return o.owned, nil
 }
 
 // Result is returned by a controller's Reconcile to influence requeueing.

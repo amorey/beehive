@@ -1375,20 +1375,20 @@ func TestClientLoadsOwned(t *testing.T) {
 	// Without the selector the owned set is not loaded — accessing it errors.
 	plain, err := client.Get(ctx, owner.ID)
 	require.NoError(t, err)
-	_, err = plain.GetOwned()
+	_, err = plain.ListOwned()
 	assert.ErrorIs(t, err, ErrNotLoaded, "owned not loaded without LoadOwned()")
 
 	// Single-object path populates the owner's children.
 	got, err := client.Get(ctx, owner.ID, LoadOwned())
 	require.NoError(t, err)
-	owned, err := got.GetOwned()
+	owned, err := got.ListOwned()
 	require.NoError(t, err)
 	assert.Equal(t, childIDs, refObjectIDs(owned))
 
 	// A child owns nothing: loaded but empty.
 	leaf, err := client.Get(ctx, childIDs[0], LoadOwned())
 	require.NoError(t, err)
-	owned, err = leaf.GetOwned()
+	owned, err = leaf.ListOwned()
 	require.NoError(t, err, "loaded even though empty")
 	assert.Empty(t, owned)
 
@@ -1400,7 +1400,7 @@ func TestClientLoadsOwned(t *testing.T) {
 	for _, o := range objs {
 		byID[o.ID] = o
 	}
-	owned, err = byID[owner.ID].GetOwned()
+	owned, err = byID[owner.ID].ListOwned()
 	require.NoError(t, err)
 	assert.Equal(t, childIDs, refObjectIDs(owned))
 	assert.Equal(t, 1, store.incomingByIDs, "owned load batched into one store call, not N")
@@ -1421,16 +1421,16 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 
 	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)
-	deps, err := got.GetDependencies()
+	deps, err := got.ListDependencies()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
-	dependents, err := got.GetDependents()
+	dependents, err := got.ListDependents()
 	require.NoError(t, err, "loaded even though empty")
 	assert.Empty(t, dependents)
 
 	got, err = client.Get(ctx, b.ID, LoadDependents())
 	require.NoError(t, err)
-	dependents, err = got.GetDependents()
+	dependents, err = got.ListDependents()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
 }
@@ -1455,10 +1455,10 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 		byID[o.ID] = o
 	}
 
-	deps, err := byID[a.ID].GetDependencies()
+	deps, err := byID[a.ID].ListDependencies()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
-	dependents, err := byID[b.ID].GetDependents()
+	dependents, err := byID[b.ID].ListDependents()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
 
