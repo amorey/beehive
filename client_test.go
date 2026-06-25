@@ -1237,6 +1237,30 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 	assert.Empty(t, none)
 }
 
+func TestClientListOwned(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	c1, err := client.Create(ctx, cSpec{Val: "c1"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+	c2, err := client.Create(ctx, cSpec{Val: "c2"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	owned, err := client.ListOwned(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{c1.ID, c2.ID}, refObjectIDs(owned))
+
+	// A child owns nothing -> empty, no error.
+	none, err := client.ListOwned(ctx, c1.ID)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
+
 func refObjectIDs(refs []Ref) []ObjectID {
 	var ids []ObjectID
 	for _, r := range refs {
@@ -1331,6 +1355,57 @@ func TestClientListWithLoadOwnerBatches(t *testing.T) {
 	assert.Equal(t, 1, store.outgoingByIDs, "owner load batched into one store call, not N")
 }
 
+func TestClientLoadsOwned(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{Store: newClientTestStore(t)}
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	const n = 3
+	var childIDs []ObjectID
+	for i := 0; i < n; i++ {
+		c, err := client.Create(ctx, cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
+		require.NoError(t, err)
+		childIDs = append(childIDs, c.ID)
+	}
+
+	// Without the selector the owned set is not loaded — accessing it errors.
+	plain, err := client.Get(ctx, owner.ID)
+	require.NoError(t, err)
+	_, err = plain.GetOwned()
+	assert.ErrorIs(t, err, ErrNotLoaded, "owned not loaded without LoadOwned()")
+
+	// Single-object path populates the owner's children.
+	got, err := client.Get(ctx, owner.ID, LoadOwned())
+	require.NoError(t, err)
+	owned, err := got.GetOwned()
+	require.NoError(t, err)
+	assert.Equal(t, childIDs, refObjectIDs(owned))
+
+	// A child owns nothing: loaded but empty.
+	leaf, err := client.Get(ctx, childIDs[0], LoadOwned())
+	require.NoError(t, err)
+	owned, err = leaf.GetOwned()
+	require.NoError(t, err, "loaded even though empty")
+	assert.Empty(t, owned)
+
+	// Batched List path fans out one incoming-edge store call, not one per object.
+	store.incomingByIDs = 0
+	objs, err := client.List(ctx, LoadOwned())
+	require.NoError(t, err)
+	byID := map[ObjectID]*Object[cSpec, cStatus]{}
+	for _, o := range objs {
+		byID[o.ID] = o
+	}
+	owned, err = byID[owner.ID].GetOwned()
+	require.NoError(t, err)
+	assert.Equal(t, childIDs, refObjectIDs(owned))
+	assert.Equal(t, 1, store.incomingByIDs, "owned load batched into one store call, not N")
+}
+
 func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -1420,7 +1495,7 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"}, WithSlug("x1"))
 	require.NoError(t, err)
 
-	loads := []LoadOption{LoadOwner(), LoadDependencies(), LoadDependents()}
+	loads := []LoadOption{LoadOwner(), LoadDependencies(), LoadDependents(), LoadOwned()}
 	// Single-object path: each relation's store error surfaces through Get/GetBySlug.
 	for _, l := range loads {
 		_, err := client.Get(ctx, obj.ID, l)
@@ -1446,6 +1521,8 @@ func TestClientLazyRefsForeignIDInvisible(t *testing.T) {
 	_, err = client.ListDependencies(ctx, 99999)
 	assert.ErrorIs(t, err, ErrNotFound)
 	_, err = client.ListDependents(ctx, 99999)
+	assert.ErrorIs(t, err, ErrNotFound)
+	_, err = client.ListOwned(ctx, 99999)
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 

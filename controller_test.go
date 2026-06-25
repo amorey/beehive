@@ -542,4 +542,8 @@ func TestControllerClientReadRefs(t *testing.T) {
 	dependents, err := cc.ListDependents(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{child.ID}, refObjectIDs(dependents))
+
+	owned, err := cc.ListOwned(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{child.ID}, refObjectIDs(owned))
 }

@@ -33,8 +33,8 @@ type ObjectID = storeapi.ObjectID
 // is the same shape the store returns for every edge query.
 type Ref = storeapi.Referrer
 
-// LoadSet is a bitset of secondary lookups (owner, dependencies, dependents)
-// to fetch alongside an object. The zero value loads nothing; reads OR in the
+// LoadSet is a bitset of secondary lookups (owner, dependencies, dependents,
+// owned) to fetch alongside an object. The zero value loads nothing; reads OR in the
 // bits a caller selects, and the populated Object records what was fetched so
 // the accessors can tell "loaded and empty" from "never asked".
 type LoadSet uint8
@@ -46,6 +46,8 @@ const (
 	LoadDependenciesBit
 	// LoadDependentsBit selects the objects that depend on it (incoming depends_on).
 	LoadDependentsBit
+	// LoadOwnedBit selects the objects this one owns (incoming owned_by edges).
+	LoadOwnedBit
 )
 
 // Object is a single resource: user-owned desired state (Spec) plus
@@ -70,12 +72,13 @@ type Object[Spec, Status any] struct {
 
 	// Related data, populated only for the lookups a read requested (see LoadSet).
 	// A nil/empty field is ambiguous on its own — which loaded records what was
-	// actually fetched, so the GetOwner/GetDependencies/GetDependents accessors
-	// distinguish "loaded and empty" from "never asked". Reach for the accessors
+	// actually fetched, so the GetOwner/GetDependencies/GetDependents/GetOwned
+	// accessors distinguish "loaded and empty" from "never asked". Reach for the accessors
 	// rather than these fields directly.
 	Owner        *Ref  // the owning object, if any
 	Dependencies []Ref // objects this one depends on
 	Dependents   []Ref // objects that depend on this one
+	Owned        []Ref // objects this one owns
 	loaded       LoadSet
 }
 
@@ -115,6 +118,16 @@ func (o *Object[Spec, Status]) GetDependents() ([]Ref, error) {
 		return nil, fmt.Errorf("%w: dependents (pass LoadDependents())", ErrNotLoaded)
 	}
 	return o.Dependents, nil
+}
+
+// GetOwned returns the objects this one owns (its incoming owned_by edges), or
+// ErrNotLoaded if LoadOwned() was not passed to the read. A loaded-but-empty
+// result is an empty slice with a nil error.
+func (o *Object[Spec, Status]) GetOwned() ([]Ref, error) {
+	if o.loaded&LoadOwnedBit == 0 {
+		return nil, fmt.Errorf("%w: owned (pass LoadOwned())", ErrNotLoaded)
+	}
+	return o.Owned, nil
 }
 
 // Result is returned by a controller's Reconcile to influence requeueing.

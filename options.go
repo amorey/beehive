@@ -45,6 +45,11 @@ func LoadDependents() LoadOption {
 	return func(s *LoadSet) { *s |= LoadDependentsBit }
 }
 
+// LoadOwned selects the objects this one owns (its incoming owned_by edges).
+func LoadOwned() LoadOption {
+	return func(s *LoadSet) { *s |= LoadOwnedBit }
+}
+
 // resolveLoads folds the per-call selectors into a single LoadSet.
 func resolveLoads(opts []LoadOption) LoadSet {
 	var set LoadSet

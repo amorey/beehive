@@ -52,6 +52,9 @@ type Client[Spec, Status any] interface {
 	// ListDependents returns the objects that depend on id (incoming depends_on).
 	// The lazy counterpart to LoadDependents().
 	ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
+	// ListOwned returns the objects id owns (its incoming owned_by edges). The
+	// lazy counterpart to LoadOwned().
+	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -276,6 +279,14 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.Dependents = dependents
 		obj.loaded |= LoadDependentsBit
 	}
+	if set&LoadOwnedBit != 0 {
+		owned, err := store.ListIncomingRefs(ctx, obj.ID, RelationOwnedBy)
+		if err != nil {
+			return err
+		}
+		obj.Owned = owned
+		obj.loaded |= LoadOwnedBit
+	}
 	return nil
 }
 
@@ -363,6 +374,16 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 			o.loaded |= LoadDependentsBit
 		}
 	}
+	if set&LoadOwnedBit != 0 {
+		byID, err := c.bh.store.GroupIncomingRefsByID(ctx, ids, RelationOwnedBy)
+		if err != nil {
+			return err
+		}
+		for _, o := range objs {
+			o.Owned = byID[o.ID]
+			o.loaded |= LoadOwnedBit
+		}
+	}
 	return nil
 }
 
@@ -387,6 +408,13 @@ func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id Object
 		return nil, err
 	}
 	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
+}
+
+func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
+	if _, err := c.scopedGet(ctx, id); err != nil {
+		return nil, err
+	}
+	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {

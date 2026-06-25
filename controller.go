@@ -65,6 +65,8 @@ type ControllerClient[Status any] interface {
 	ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
 	// ListDependents returns the objects that depend on id (incoming depends_on).
 	ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
+	// ListOwned returns the objects id owns (its incoming owned_by edges).
+	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 	// Within runs fn inside a single transaction: the ControllerClient writes fn
 	// makes (with the ctx passed to it) all commit together on a nil return, or all
 	// roll back on error. Reconcile itself is not transactional — each write
@@ -166,9 +168,9 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fro
 // commits on its own; to gate a write on it atomically — e.g. clearing a finalizer
 // only if nothing references the object — a controller runs both inside Within, so
 // the read and the write share one transaction snapshot.
-// GetOwner/ListDependencies/ListDependents read ref edges directly, like
-// HasIncomingRefs above — no kind-scoping, since a controller reasons about its
-// own object's relationships.
+// GetOwner/ListDependencies/ListDependents/ListOwned read ref edges directly,
+// like HasIncomingRefs above — no kind-scoping, since a controller reasons about
+// its own object's relationships.
 func (c *controllerClientImpl[Status]) GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
@@ -179,6 +181,10 @@ func (c *controllerClientImpl[Status]) ListDependencies(ctx context.Context, id 
 
 func (c *controllerClientImpl[Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
 	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
+}
+
+func (c *controllerClientImpl[Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
+	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
 }
 
 func (c *controllerClientImpl[Status]) HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error) {
