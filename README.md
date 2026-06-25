@@ -166,17 +166,19 @@ type Object[Spec, Status any] struct {
     Owner        *Ref  // the owning object
     Dependencies []Ref // objects this one depends on
     Dependents   []Ref // objects that depend on this one
+    Owned        []Ref // objects this one owns
 }
 
 type Ref = storeapi.Referrer // { ID ObjectID; Group, Kind string }
 ```
 
-`Owner`/`Dependencies`/`Dependents` are filled only when the read asked for them. Read them through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty:
+`Owner`/`Dependencies`/`Dependents`/`Owned` are filled only when the read asked for them. Read them through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty:
 
 ```go
 func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) // bool: an owner exists; err: not loaded
 func (o *Object[Spec, Status]) GetDependencies() ([]Ref, error)
 func (o *Object[Spec, Status]) GetDependents() ([]Ref, error)
+func (o *Object[Spec, Status]) GetOwned() ([]Ref, error)
 ```
 
 Once loaded, an empty slice (or `GetOwner`'s `ok == false`) means genuinely none. `ErrNotLoaded` is caller misuse — fetch the relation eagerly with the `Load*()` option, or lazily via the `Client`/`ControllerClient` methods below.
@@ -219,17 +221,20 @@ type Client[Spec, Status any] interface {
     GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
     ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
     ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
+    ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 ```
 
-#### Secondary lookups (owner / dependencies / dependents)
+#### Secondary lookups (owner / dependencies / dependents / owned)
 
 An object's ref edges are fetched on request, two ways:
 
 - **Eager** — pass `LoadOption`s to a read: `Get(ctx, id, LoadOwner())`, `List(ctx, LoadDependencies(), LoadDependents())`. The returned objects carry the data (read via the accessors). On `List` each relation is one batched query, not one per object.
-- **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` when the data is actually needed.
+- **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` / `ListOwned` when the data is actually needed.
+
+`ListOwned` (and the eager `LoadOwned()` / `GetOwned()`) is the inverse of `GetOwner` over `owned_by`: it returns the objects a given owner owns, the same way `ListDependents` inverts `ListDependencies` over `depends_on`.
 
 Both issue the same secondary query (edges are a separate indexed lookup, never joined into the object's blob-bearing `SELECT`); eager just attaches the result to the object and batches across a `List`.
 
@@ -258,11 +263,12 @@ type ControllerClient[Status any] interface {
     GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
     ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
     ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
+    ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
 
-`GetOwner`/`ListDependencies`/`ListDependents` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `GetOwner` returns the owner via `owned_by`; `ListDependents` is the inverse of `ListDependencies` over `depends_on`. Distinct from `HasIncomingRefs`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `ListDependents`.
+`GetOwner`/`ListDependencies`/`ListDependents`/`ListOwned` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `GetOwner` returns the owner via `owned_by`, `ListOwned` the inverse (the owner's children); `ListDependents` is the inverse of `ListDependencies` over `depends_on`. Distinct from `HasIncomingRefs`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `ListDependents`.
 
 `HasIncomingRefs` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
@@ -314,10 +320,11 @@ func WithMigrator(m Migrator) Option               // attach a schema-version Mi
 
 `AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.
 
-Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents):
+Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned):
 
 ```go
 func LoadOwner() LoadOption         // fetch the owner (outgoing owned_by)
 func LoadDependencies() LoadOption  // fetch dependencies (outgoing depends_on)
 func LoadDependents() LoadOption    // fetch dependents (incoming depends_on)
+func LoadOwned() LoadOption         // fetch owned children (incoming owned_by)
 ```

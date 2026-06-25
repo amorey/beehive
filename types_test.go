@@ -87,3 +87,21 @@ func TestObjectGetDependents(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, dependents, got)
 }
+
+func TestObjectGetOwned(t *testing.T) {
+	owned := []Ref{{ID: 4}, {ID: 5}}
+
+	var unloaded Object[struct{}, struct{}]
+	_, err := unloaded.GetOwned()
+	assert.ErrorIs(t, err, ErrNotLoaded)
+
+	empty := Object[struct{}, struct{}]{loaded: LoadOwnedBit, Owned: []Ref{}}
+	got, err := empty.GetOwned()
+	require.NoError(t, err, "loaded-empty is not an error")
+	assert.Empty(t, got)
+
+	o := Object[struct{}, struct{}]{loaded: LoadOwnedBit, Owned: owned}
+	got, err = o.GetOwned()
+	require.NoError(t, err)
+	assert.Equal(t, owned, got)
+}
