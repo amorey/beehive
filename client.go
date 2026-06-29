@@ -19,9 +19,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
+
+// ErrNoController is returned by Requeue/NextRequeueAt when the client's
+// kind has no registered controller: there is no reconcile loop to schedule
+// against. A client-only kind is read/write but never reconciled.
+var ErrNoController = errors.New("beehive: no controller registered for kind")
 
 // WatchEvent reports a change to a watched object.
 type WatchEvent[Spec, Status any] struct {
@@ -55,6 +61,25 @@ type Client[Spec, Status any] interface {
 	// ListOwned returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
+
+	// Requeue resets id's retry backoff and requeues it for immediate
+	// reconcile. A latency hint, not a synchronous run; correctness rests on the
+	// periodic resync, not this. Returns ErrNotFound if id does not exist and
+	// ErrNoController if the kind has no registered controller.
+	Requeue(ctx context.Context, id ObjectID) error
+	// NextRequeueAt reports when the reconcile loop has, in advance, scheduled id
+	// to be requeued: a pending backoff retry or RequeueAfter delay, or now if it
+	// is already queued. It returns the zero time when no requeue is scheduled.
+	//
+	// This is the next *scheduled* requeue, not a prediction of the next reconcile.
+	// It does not — and cannot — account for wakes that aren't a per-id timer: the
+	// periodic resync (kind-wide, conditional on being unsettled), dependency-change
+	// wakes, store-write enqueues, or Requeue. So the actual next reconcile
+	// may be earlier than reported, and a zero time means "nothing scheduled", not
+	// "will not reconcile". Treat it as observability, not a guarantee. Returns
+	// ErrNotFound if id does not exist and ErrNoController if the kind has no
+	// registered controller.
+	NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -415,6 +440,43 @@ func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) (
 		return nil, err
 	}
 	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
+}
+
+// reconcilerForObject validates id against this client's kind, then resolves the
+// kind's reconciler — the shared gate for the schedule-control methods. scopedGet
+// runs first so a missing or foreign id surfaces as ErrNotFound regardless of
+// registration; only then is a client-only kind reported as ErrNoController.
+func (c *clientImpl[Spec, Status]) reconcilerForObject(ctx context.Context, id ObjectID) (*reconciler, error) {
+	if _, err := c.scopedGet(ctx, id); err != nil {
+		return nil, err
+	}
+	r, ok := c.bh.reconcilerFor(c.gk)
+	if !ok {
+		return nil, ErrNoController
+	}
+	return r, nil
+}
+
+// Requeue resets id's backoff and requeues it for immediate reconcile.
+func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID) error {
+	r, err := c.reconcilerForObject(ctx, id)
+	if err != nil {
+		return err
+	}
+	r.requeueNow(id)
+	return nil
+}
+
+// NextRequeueAt reports when the loop has scheduled id to be requeued, or the zero
+// time when no requeue is scheduled. See the Client interface for the full
+// contract — notably that it does not account for resync or event-driven wakes.
+func (c *clientImpl[Spec, Status]) NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error) {
+	r, err := c.reconcilerForObject(ctx, id)
+	if err != nil {
+		return time.Time{}, err
+	}
+	at, _ := r.nextRequeueAt(id) // zero time when no requeue is scheduled
+	return at, nil
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {

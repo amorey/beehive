@@ -264,3 +264,12 @@ func findCondition(conds []Condition, condType string) *Condition {
 	}
 	return nil
 }
+
+// drainQueue removes every dispatchable item from q (get + done, so nothing is
+// left holding a processing slot), leaving the queue empty — used by tests that
+// need a clean queue after a create-time enqueue.
+func drainQueue(q *workQueue) {
+	for id, ok := q.get(); ok; id, ok = q.get() {
+		q.done(id)
+	}
+}

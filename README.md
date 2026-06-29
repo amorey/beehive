@@ -219,6 +219,10 @@ type Client[Spec, Status any] interface {
     ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
     ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
     ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
+
+    // Reconcile control.
+    Requeue(ctx context.Context, id ObjectID) error                    // reset backoff, requeue now
+    NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error) // next scheduled requeue
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
@@ -234,6 +238,21 @@ An object's ref edges are fetched on request, two ways:
 `ListOwned` (and the eager `LoadOwned()` / `Object.ListOwned()`) is the inverse of `GetOwner` over `owned_by`: it returns the objects a given owner owns, the same way `ListDependents` inverts `ListDependencies` over `depends_on`.
 
 Both issue the same secondary query (edges are a separate indexed lookup, never joined into the object's blob-bearing `SELECT`); eager just attaches the result to the object and batches across a `List`.
+
+#### Reconcile control
+
+`Requeue` resets an object's retry backoff and requeues it for immediate reconcile — the manual counterpart to the store-write and dependency-change wakes. It is a **latency hint, not a synchronous run**: it returns once the object is enqueued, and a worker reconciles it on its own schedule. Correctness never depends on it — the periodic resync remains the backstop — so a missed or coalesced requeue is harmless. Use it to promptly re-examine an object after out-of-band state the controller reads has changed.
+
+`NextRequeueAt` reports when the reconcile loop has, **in advance, scheduled the object to be requeued**: a pending backoff retry or `RequeueAfter` delay, or now if it is already queued. It returns the **zero time** when no requeue is scheduled.
+
+This is the next *scheduled requeue* — not a prediction of the next reconcile. By design it sees only per-id timers, so it does **not** account for any other wake:
+
+- the **periodic resync** (kind-wide, conditional on the object being unsettled),
+- **dependency-change** wakes, **store-write** enqueues, or a `Requeue`.
+
+So the actual next reconcile can be **earlier** than reported, and a **zero time means "nothing scheduled", not "will not reconcile"** — an unsettled object with no pending timer is still picked up by the next resync tick. Treat it as observability, not a guarantee.
+
+Both validate the id against the client's kind first (`ErrNotFound` for a missing or foreign id), then require a registered controller (`ErrNoController` for a client-only kind, which has no reconcile loop to schedule against). Both are `Client`-only — a controller schedules itself with `Result.RequeueAfter` and influences other objects through the store, never by poking another reconcile loop directly.
 
 `Create` generates a slug unless `beehive.WithSlug` is provided. If a slug is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
 

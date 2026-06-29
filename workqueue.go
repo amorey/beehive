@@ -33,9 +33,17 @@ type workQueue struct {
 	dirty      map[ObjectID]struct{} // queued (in items) and awaiting dispatch
 	processing map[ObjectID]struct{} // handed out via get, not yet done
 	items      []ObjectID
-	ready      chan struct{}            // pulsed when items are available
-	stopped    bool                     // set by stop; adds become no-ops
-	timers     map[*time.Timer]struct{} // live addAfter timers, cancelled by stop
+	ready      chan struct{}       // pulsed when items are available
+	stopped    bool                // set by stop; adds become no-ops
+	alarms     map[ObjectID]*alarm // pending delayed adds (addAfter), keyed by id
+}
+
+// alarm is a pending delayed enqueue: the timer that will enqueue the id and the
+// absolute time it fires, so nextRequeueAt can report when an id is next due
+// without re-deriving it from the timer.
+type alarm struct {
+	timer  *time.Timer
+	fireAt time.Time
 }
 
 func newWorkQueue() *workQueue {
@@ -43,7 +51,7 @@ func newWorkQueue() *workQueue {
 		dirty:      make(map[ObjectID]struct{}),
 		processing: make(map[ObjectID]struct{}),
 		ready:      make(chan struct{}, 1),
-		timers:     make(map[*time.Timer]struct{}),
+		alarms:     make(map[ObjectID]*alarm),
 	}
 }
 
@@ -80,9 +88,11 @@ func (q *workQueue) signal() {
 }
 
 // addAfter enqueues id after delay has elapsed. A zero or negative delay
-// enqueues immediately. The timer is tracked so stop can cancel it, keeping a
-// torn-down queue from being woken by a retry (or a far-future RequeueAfter)
-// scheduled just before shutdown.
+// enqueues immediately. The timer is tracked per id so stop can cancel it (a
+// torn-down queue must not be woken by a retry or a far-future RequeueAfter
+// scheduled just before shutdown) and so requeueNow/nextRequeueAt can reach
+// it. A second addAfter for the same id supersedes the first: the prior timer is
+// cancelled so only the newest schedule fires.
 func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	if delay <= 0 {
 		q.add(id)
@@ -93,14 +103,64 @@ func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	if q.stopped {
 		return
 	}
-	var t *time.Timer
-	t = time.AfterFunc(delay, func() {
-		q.mu.Lock()
-		delete(q.timers, t) // fired: drop it so the set doesn't grow unbounded
-		q.mu.Unlock()
-		q.add(id) // a no-op if stop ran between firing and here
-	})
-	q.timers[t] = struct{}{}
+	if prev := q.alarms[id]; prev != nil {
+		prev.timer.Stop() // newest schedule wins; don't let the stale one fire
+	}
+	a := &alarm{fireAt: time.Now().Add(delay)}
+	a.timer = time.AfterFunc(delay, func() { q.timerFired(id, a) })
+	q.alarms[id] = a
+}
+
+// timerFired runs when an alarm's timer fires. It enqueues id only if a is still
+// the current schedule: a newer addAfter or a requeueNow may have replaced (or
+// cleared) the slot while this already-fired timer was blocked on the lock, and
+// that newer schedule — not this superseded one — owns the enqueue. Adding here
+// regardless would run the work early, ignoring the newer delay.
+func (q *workQueue) timerFired(id ObjectID, a *alarm) {
+	q.mu.Lock()
+	superseded := q.alarms[id] != a
+	if !superseded {
+		delete(q.alarms, id)
+	}
+	q.mu.Unlock()
+	if superseded {
+		return
+	}
+	q.add(id) // a no-op if stop ran between firing and here
+}
+
+// requeueNow cancels any pending delayed add for id and makes it immediately
+// dispatchable, in a single critical section so no schedule can interleave
+// between the two. It is the queue primitive behind reconciler.requeueNow: a stale
+// backoff timer is dropped and the id is requeued for immediate reconcile.
+func (q *workQueue) requeueNow(id ObjectID) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if a := q.alarms[id]; a != nil {
+		a.timer.Stop()
+		delete(q.alarms, id)
+	}
+	q.addLocked(id)
+}
+
+// nextRequeueAt reports when id is next due to be dispatched: an id already
+// queued for immediate dispatch returns now (it is due); otherwise a pending
+// delayed add returns its fire time. Queued-now is checked first because an id
+// can hold both — a future backoff/RequeueAfter timer plus an immediate add from
+// a store change or requeue — and "due now" is the truthful answer then, not the
+// stale future time. ok is false when nothing is firmly scheduled — an id that is
+// only being processed, or one the periodic resync might later pick up, reports
+// nothing, since resync is conditional and not a per-id schedule.
+func (q *workQueue) nextRequeueAt(id ObjectID) (time.Time, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.dirty[id]; ok {
+		return time.Now(), true
+	}
+	if a := q.alarms[id]; a != nil {
+		return a.fireAt, true
+	}
+	return time.Time{}, false
 }
 
 // stop quiesces the queue: it cancels every pending addAfter timer and makes all
@@ -110,10 +170,10 @@ func (q *workQueue) stop() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.stopped = true
-	for t := range q.timers {
-		t.Stop()
+	for _, a := range q.alarms {
+		a.timer.Stop()
 	}
-	q.timers = nil
+	q.alarms = nil
 }
 
 // get removes and returns the next item, moving it into the processing state
