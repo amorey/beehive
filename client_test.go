@@ -1551,3 +1551,118 @@ func TestGetDecodeError(t *testing.T) {
 	_, err = client.GetBySlug(ctx, "any")
 	require.Error(t, err)
 }
+
+// TestClientRequeueNotFound verifies Requeue reports ErrNotFound
+// for an id that does not exist, before reaching any reconciler.
+func TestClientRequeueNotFound(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	err = client.Requeue(ctx, 999)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestClientRequeueNoController verifies Requeue reports
+// ErrNoController for a client-only kind: the object exists but no reconciler is
+// registered to enqueue it on.
+func TestClientRequeueNoController(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	err = client.Requeue(ctx, obj.ID)
+	assert.ErrorIs(t, err, ErrNoController)
+}
+
+// TestClientRequeue verifies Requeue resets backoff and requeues
+// the id on the registered reconciler's work queue.
+func TestClientRequeue(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	r := bh.reconcilers[clientTestGK]
+	// Drain the enqueue Create produced, and seed a backoff entry to prove the
+	// requeue clears it.
+	drainQueue(r.work)
+	r.nextBackoff(obj.ID)
+
+	require.NoError(t, client.Requeue(ctx, obj.ID))
+
+	assert.Zero(t, r.backoffFor[obj.ID], "Requeue must clear backoff")
+	id, ok := r.work.get()
+	require.True(t, ok, "Requeue must enqueue the id")
+	assert.Equal(t, obj.ID, id)
+}
+
+// TestClientNextRequeueAtScheduled verifies NextRequeueAt returns a pending
+// delayed reconcile's fire time.
+func TestClientNextRequeueAtScheduled(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	// Drain the create-time enqueue so only the future schedule remains; otherwise
+	// the id is queued-now and NextRequeueAt correctly reports "due now" instead.
+	r := bh.reconcilers[clientTestGK]
+	drainQueue(r.work)
+	r.work.addAfter(obj.ID, time.Hour)
+
+	at, err := client.NextRequeueAt(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
+}
+
+// TestClientNextRequeueAtUnscheduled verifies NextRequeueAt returns the zero
+// time (and no error) when nothing is firmly scheduled for the id.
+func TestClientNextRequeueAtUnscheduled(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	// Drain the create-time enqueue so nothing is pending.
+	r := bh.reconcilers[clientTestGK]
+	drainQueue(r.work)
+
+	at, err := client.NextRequeueAt(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.True(t, at.IsZero(), "unscheduled id must report the zero time, got %s", at)
+}
+
+// TestClientNextRequeueAtNotFound verifies NextRequeueAt reports ErrNotFound
+// for a missing id.
+func TestClientNextRequeueAtNotFound(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.NextRequeueAt(ctx, 999)
+	assert.ErrorIs(t, err, ErrNotFound)
+}

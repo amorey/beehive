@@ -376,13 +376,20 @@ func (bh *Beehive) migratorFor(gk GroupKind) Migrator {
 	return bh.migrators[gk]
 }
 
+// reconcilerFor returns the reconciler registered for gk, if one exists. The
+// client's Requeue/NextRequeueAt use it to reach the per-kind work
+// queue; a client-only kind (no Register) has none.
+func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
+	r, ok := bh.reconcilers[gk]
+	return r, ok
+}
+
 // enqueueIfRegistered wakes the reconciler for (gk, id) if one exists.
 // It is a no-op when gk has no registered controller (e.g. a client-only kind).
 func (bh *Beehive) enqueueIfRegistered(gk GroupKind, id ObjectID) {
-	bh.mu.Lock()
-	r, ok := bh.reconcilers[gk]
-	bh.mu.Unlock()
-	if ok {
+	if r, ok := bh.reconcilerFor(gk); ok {
 		r.enqueue(id)
 	}
 }

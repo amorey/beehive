@@ -233,6 +233,31 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 	delete(r.backoffFor, id)
 }
 
+// requeueNow requeues id for immediate reconcile and resets its retry backoff,
+// cancelling any pending delayed requeue so the backoff sequence starts fresh. It
+// is the reconciler-layer counterpart of workQueue.requeueNow: same "requeue now"
+// operation, extended to clear the backoff state the queue doesn't own. The engine
+// behind Client.Requeue — a latency hint, not a synchronous run, so a worker
+// picks the id up on its own schedule.
+func (r *reconciler) requeueNow(id ObjectID) {
+	r.clearBackoff(id)
+	if r.work != nil {
+		// Drop any stale backoff timer and make the id dispatchable now, atomically.
+		r.work.requeueNow(id)
+	}
+}
+
+// nextRequeueAt reports when the loop has scheduled id to be requeued (a pending
+// backoff/RequeueAfter delay, or now if already queued). ok is false when no
+// requeue is scheduled; it reports only per-id timers, so it excludes the periodic
+// resync and any event-driven wake — the actual next reconcile may be sooner.
+func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
+	if r.work == nil {
+		return time.Time{}, false
+	}
+	return r.work.nextRequeueAt(id)
+}
+
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
 //
 // A resyncInterval <= 0 disables the periodic resync entirely: the loop then
