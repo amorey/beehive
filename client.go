@@ -24,9 +24,9 @@ import (
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
-// ErrNoController is returned by Requeue/NextRequeueAt when the client's
-// kind has no registered controller: there is no reconcile loop to schedule
-// against. A client-only kind is read/write but never reconciled.
+// ErrNoController is returned by Requeue when the client's kind has no
+// registered controller: there is no reconcile loop to schedule against. A
+// client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
 // WatchEvent reports a change to a watched object.
@@ -79,15 +79,19 @@ type Client[Spec, Status any] interface {
 	// to be requeued: a pending backoff retry or RequeueAfter delay, or now if it
 	// is already queued. It returns the zero time when no requeue is scheduled.
 	//
+	// This is a non-blocking, best-effort read of in-memory schedule state — it
+	// touches no store, so it never reports an error. An id that does not exist (or
+	// belongs to another kind) is simply unscheduled, and a client-only kind has no
+	// reconcile loop at all; both read as the zero time, indistinguishable from a
+	// real object with nothing scheduled.
+	//
 	// This is the next *scheduled* requeue, not a prediction of the next reconcile.
 	// It does not — and cannot — account for wakes that aren't a per-id timer: the
 	// periodic resync (kind-wide, conditional on being unsettled), dependency-change
 	// wakes, store-write enqueues, or Requeue. So the actual next reconcile
 	// may be earlier than reported, and a zero time means "nothing scheduled", not
-	// "will not reconcile". Treat it as observability, not a guarantee. Returns
-	// ErrNotFound if id does not exist and ErrNoController if the kind has no
-	// registered controller.
-	NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error)
+	// "will not reconcile". Treat it as observability, not a guarantee.
+	NextRequeueAt(ctx context.Context, id ObjectID) time.Time
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -479,13 +483,18 @@ func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID, opt
 // NextRequeueAt reports when the loop has scheduled id to be requeued, or the zero
 // time when no requeue is scheduled. See the Client interface for the full
 // contract — notably that it does not account for resync or event-driven wakes.
-func (c *clientImpl[Spec, Status]) NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error) {
-	r, err := c.reconcilerForObject(ctx, id)
-	if err != nil {
-		return time.Time{}, err
+//
+// It reads the in-memory work queue directly, with no store lookup and no kind
+// guard: a foreign or missing id just isn't in this kind's schedule, and a
+// client-only kind has no reconciler — both fold into the zero time. ctx is
+// unused (no I/O); it stays for symmetry with the rest of the Client surface.
+func (c *clientImpl[Spec, Status]) NextRequeueAt(ctx context.Context, id ObjectID) time.Time {
+	r, ok := c.bh.reconcilerFor(c.gk)
+	if !ok {
+		return time.Time{} // client-only kind: nothing is ever scheduled
 	}
 	at, _ := r.nextRequeueAt(id) // zero time when no requeue is scheduled
-	return at, nil
+	return at
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
