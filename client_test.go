@@ -1644,8 +1644,7 @@ func TestClientNextRequeueAtScheduled(t *testing.T) {
 	drainQueue(r.work)
 	r.work.addAfter(obj.ID, time.Hour)
 
-	at, err := client.NextRequeueAt(ctx, obj.ID)
-	require.NoError(t, err)
+	at := client.NextRequeueAt(ctx, obj.ID)
 	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
 }
 
@@ -1666,14 +1665,15 @@ func TestClientNextRequeueAtUnscheduled(t *testing.T) {
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
 
-	at, err := client.NextRequeueAt(ctx, obj.ID)
-	require.NoError(t, err)
+	at := client.NextRequeueAt(ctx, obj.ID)
 	assert.True(t, at.IsZero(), "unscheduled id must report the zero time, got %s", at)
 }
 
-// TestClientNextRequeueAtNotFound verifies NextRequeueAt reports ErrNotFound
-// for a missing id.
-func TestClientNextRequeueAtNotFound(t *testing.T) {
+// TestClientNextRequeueAtUnknownID verifies NextRequeueAt reads in-memory
+// schedule state without a store lookup: an id that does not exist (or belongs
+// to another kind) is simply unscheduled, so it reports the zero time and no
+// error rather than ErrNotFound.
+func TestClientNextRequeueAtUnknownID(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -1681,6 +1681,22 @@ func TestClientNextRequeueAtNotFound(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.NextRequeueAt(ctx, 999)
-	assert.ErrorIs(t, err, ErrNotFound)
+	at := client.NextRequeueAt(ctx, 999)
+	assert.True(t, at.IsZero(), "unknown id must report the zero time, got %s", at)
+}
+
+// TestClientNextRequeueAtNoController verifies a client-only kind (no registered
+// controller, hence no reconcile loop to schedule against) reports the zero time
+// rather than an error.
+func TestClientNextRequeueAtNoController(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	at := client.NextRequeueAt(ctx, obj.ID)
+	assert.True(t, at.IsZero(), "client-only kind must report the zero time, got %s", at)
 }
