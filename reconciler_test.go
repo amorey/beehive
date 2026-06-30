@@ -766,6 +766,31 @@ func TestNextBackoffDoubles(t *testing.T) {
 	assert.Equal(t, 20*time.Millisecond, second)
 }
 
+// TestReconcilerRequeueBackoffLadder verifies the resetBackoff intent on the
+// reconciler's requeue method: requeue(id, false) leaves the ladder so the next
+// failure keeps climbing, while requeue(id, true) (the WithResetBackoff path) restarts
+// it from the base interval.
+func TestReconcilerRequeueBackoffLadder(t *testing.T) {
+	r := &reconciler{
+		work:              newWorkQueue(),
+		backoffFor:        make(map[ObjectID]time.Duration),
+		maxRetryInterval:  time.Minute,
+		baseRetryInterval: 10 * time.Millisecond,
+	}
+	// A failing reconcile climbs the ladder twice: 10ms → 20ms.
+	assert.Equal(t, 10*time.Millisecond, r.nextBackoff(1))
+	assert.Equal(t, 20*time.Millisecond, r.nextBackoff(1))
+
+	// requeue without reset preserves the ladder, so the next failure continues
+	// from where it was: 20ms → 40ms, not back to base.
+	r.requeue(1, false)
+	assert.Equal(t, 40*time.Millisecond, r.nextBackoff(1), "requeue(reset=false) must not reset the ladder")
+
+	// requeue with reset restarts the ladder from base.
+	r.requeue(1, true)
+	assert.Equal(t, 10*time.Millisecond, r.nextBackoff(1), "requeue(reset=true) must restart the ladder from base")
+}
+
 func TestNextBackoffCaps(t *testing.T) {
 	r := &reconciler{
 		backoffFor:        make(map[ObjectID]time.Duration),
@@ -1435,8 +1460,9 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	waitClosed(t, ctrl.reconciledCh, "reconcile of pre-existing object at startup")
 }
 
-// TestReconcilerRequeueNow verifies requeueNow resets an id's backoff, cancels
-// any pending delayed retry timer, and makes the id immediately dispatchable.
+// TestReconcilerRequeueNow verifies requeueNow cancels any pending delayed retry
+// timer and makes the id immediately dispatchable, while preserving the backoff
+// ladder (clearing is the caller's separate clearBackoff step).
 func TestReconcilerRequeueNow(t *testing.T) {
 	r := &reconciler{
 		work:              newWorkQueue(),
@@ -1445,14 +1471,14 @@ func TestReconcilerRequeueNow(t *testing.T) {
 		backoffFor:        make(map[ObjectID]time.Duration),
 	}
 	// Simulate a failed reconcile: a backoff entry and a far-future retry timer.
-	r.nextBackoff(1)
+	seeded := r.nextBackoff(1)
 	r.work.addAfter(1, time.Hour)
 	require.NotZero(t, r.backoffFor[1], "precondition: backoff seeded")
 	require.NotNil(t, r.work.alarms[1], "precondition: retry timer scheduled")
 
 	r.requeueNow(1)
 
-	assert.Zero(t, r.backoffFor[1], "requeueNow must clear the backoff entry")
+	assert.Equal(t, seeded, r.backoffFor[1], "requeueNow must preserve the backoff entry")
 	assert.Nil(t, r.work.alarms[1], "requeueNow must cancel the stale retry timer")
 
 	id, ok := r.work.get()
