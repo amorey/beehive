@@ -1199,9 +1199,11 @@ func TestClientGetOwner(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, ok)
 
-	// A foreign/missing id is invisible through this single-kind client.
-	_, _, err = client.GetOwner(ctx, 99999)
-	assert.ErrorIs(t, err, ErrNotFound)
+	// A missing id is not kind-validated (no scopedGet guard): it reads as
+	// ownerless rather than ErrNotFound — the speed-for-isolation trade.
+	_, ok, err = client.GetOwner(ctx, 99999)
+	require.NoError(t, err)
+	assert.False(t, ok)
 }
 
 func TestClientListDependenciesAndDependents(t *testing.T) {
@@ -1511,19 +1513,23 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	}
 }
 
-func TestClientLazyRefsForeignIDInvisible(t *testing.T) {
+func TestClientLazyRefsMissingIDReadsEmpty(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	// A foreign/missing id is rejected by the scopedGet guard before any ref query.
-	_, err = client.ListDependencies(ctx, 99999)
-	assert.ErrorIs(t, err, ErrNotFound)
-	_, err = client.ListDependents(ctx, 99999)
-	assert.ErrorIs(t, err, ErrNotFound)
-	_, err = client.ListOwned(ctx, 99999)
-	assert.ErrorIs(t, err, ErrNotFound)
+	// The lazy lookups drop the scopedGet kind guard for speed, so a missing id
+	// reads as empty rather than ErrNotFound (matching the ControllerClient quartet).
+	deps, err := client.ListDependencies(ctx, 99999)
+	require.NoError(t, err)
+	assert.Empty(t, deps)
+	dependents, err := client.ListDependents(ctx, 99999)
+	require.NoError(t, err)
+	assert.Empty(t, dependents)
+	owned, err := client.ListOwned(ctx, 99999)
+	require.NoError(t, err)
+	assert.Empty(t, owned)
 }
 
 // getBadJSONStore returns an undecodable spec from the scoped Get/GetBySlug

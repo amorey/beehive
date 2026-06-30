@@ -51,6 +51,11 @@ type Client[Spec, Status any] interface {
 	// GetOwner returns id's owner, if any. ok reports presence: false (with a nil
 	// error) when the object simply has no owner. The lazy counterpart to
 	// LoadOwner() — fetch the owner only when it is actually needed.
+	//
+	// This and the three ListDependencies/ListDependents/ListOwned lookups read
+	// their edge query directly and do not kind-scope id: passing another kind's
+	// id reads that kind's edges, and a missing id reads empty — neither reports
+	// ErrNotFound. Reserve them for ids this client owns.
 	GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
 	// ListDependencies returns the objects id depends on (its outgoing depends_on
 	// edges). The lazy counterpart to LoadDependencies().
@@ -424,33 +429,27 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 	return nil
 }
 
+// The four lazy ref lookups read their edge query directly, with no scopedGet
+// kind guard in front: that guard was a second, blob-bearing store read (the
+// full objects row plus its conditions) issued purely to validate group/kind on
+// a hot path. We trade it for speed, mirroring the ControllerClient quartet,
+// which never checked. The cost of the trade: a foreign id reads that other
+// kind's edges and a missing id reads empty — neither surfaces as ErrNotFound —
+// so passing another kind's id through this single-kind client is silent misuse
+// rather than a clean error.
 func (c *clientImpl[Spec, Status]) GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error) {
-	// scopedGet keeps a foreign/missing id invisible (ErrNotFound) before we
-	// resolve edges, so this single-kind client never reports another kind's owner.
-	if _, err := c.scopedGet(ctx, id); err != nil {
-		return Ref{}, false, err
-	}
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
 func (c *clientImpl[Spec, Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
-	if _, err := c.scopedGet(ctx, id); err != nil {
-		return nil, err
-	}
 	return c.bh.store.ListOutgoingRefsByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
-	if _, err := c.scopedGet(ctx, id); err != nil {
-		return nil, err
-	}
 	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
-	if _, err := c.scopedGet(ctx, id); err != nil {
-		return nil, err
-	}
 	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
 }
 

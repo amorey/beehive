@@ -222,7 +222,7 @@ type Client[Spec, Status any] interface {
 
     // Reconcile control.
     Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
-    NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error)     // next scheduled requeue
+    NextRequeueAt(ctx context.Context, id ObjectID) time.Time              // next scheduled requeue (zero if none)
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
@@ -233,7 +233,7 @@ func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 An object's ref edges are fetched on request, two ways:
 
 - **Eager** — pass `LoadOption`s to a read: `Get(ctx, id, LoadOwner())`, `List(ctx, LoadDependencies(), LoadDependents())`. The returned objects carry the data (read via the accessors). On `List` each relation is one batched query, not one per object.
-- **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` / `ListOwned` when the data is actually needed.
+- **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` / `ListOwned` when the data is actually needed. These hit the edge query directly and do **not** kind-scope `id` (no validating read in front): a foreign id reads that kind's edges and a missing id reads empty, neither as `ErrNotFound`. Reserve them for ids the client owns.
 
 `ListOwned` (and the eager `LoadOwned()` / `Object.ListOwned()`) is the inverse of `GetOwner` over `owned_by`: it returns the objects a given owner owns, the same way `ListDependents` inverts `ListDependencies` over `depends_on`.
 
@@ -254,7 +254,7 @@ This is the next *scheduled requeue* — not a prediction of the next reconcile.
 
 So the actual next reconcile can be **earlier** than reported, and a **zero time means "nothing scheduled", not "will not reconcile"** — an unsettled object with no pending timer is still picked up by the next resync tick. Treat it as observability, not a guarantee.
 
-Both validate the id against the client's kind first (`ErrNotFound` for a missing or foreign id), then require a registered controller (`ErrNoController` for a client-only kind, which has no reconcile loop to schedule against). Both are `Client`-only — a controller schedules itself with `Result.RequeueAfter` and influences other objects through the store, never by poking another reconcile loop directly.
+`Requeue` validates the id against the client's kind first (`ErrNotFound` for a missing or foreign id), then requires a registered controller (`ErrNoController` for a client-only kind, which has no reconcile loop to schedule against). `NextRequeueAt` does neither: it reads in-memory schedule state directly, so it returns no error — a missing, foreign, or client-only id simply reads as the zero time, indistinguishable from a real object with nothing scheduled. Both are `Client`-only — a controller schedules itself with `Result.RequeueAfter` and influences other objects through the store, never by poking another reconcile loop directly.
 
 `Create` generates a slug unless `beehive.WithSlug` is provided. If a slug is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
 
