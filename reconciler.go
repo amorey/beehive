@@ -233,14 +233,25 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 	delete(r.backoffFor, id)
 }
 
-// requeueNow requeues id for immediate reconcile and resets its retry backoff,
-// cancelling any pending delayed requeue so the backoff sequence starts fresh. It
-// is the reconciler-layer counterpart of workQueue.requeueNow: same "requeue now"
-// operation, extended to clear the backoff state the queue doesn't own. The engine
-// behind Client.Requeue — a latency hint, not a synchronous run, so a worker
-// picks the id up on its own schedule.
+// requeue makes id immediately dispatchable, optionally resetting its retry
+// backoff ladder first. It is the engine behind Client.Requeue — a latency hint,
+// not a synchronous run, so a worker picks the id up on its own schedule. The
+// resetBackoff intent lives here, in the layer every client surface shares, so
+// the "WithResetBackoff clears the ladder before dispatch" invariant is enforced once.
+// Backoff is otherwise cleared only by a successful reconcile, never by a plain
+// requeue.
+func (r *reconciler) requeue(id ObjectID, resetBackoff bool) {
+	if resetBackoff {
+		r.clearBackoff(id)
+	}
+	r.requeueNow(id)
+}
+
+// requeueNow makes id immediately dispatchable, cancelling any pending delayed
+// requeue. It is the reconciler-layer counterpart of workQueue.requeueNow and the
+// pure immediate-dispatch step: it deliberately does not touch the backoff ladder
+// (see requeue, which layers the optional reset on top).
 func (r *reconciler) requeueNow(id ObjectID) {
-	r.clearBackoff(id)
 	if r.work != nil {
 		// Drop any stale backoff timer and make the id dispatchable now, atomically.
 		r.work.requeueNow(id)

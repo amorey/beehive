@@ -62,11 +62,19 @@ type Client[Spec, Status any] interface {
 	// lazy counterpart to LoadOwned().
 	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 
-	// Requeue resets id's retry backoff and requeues it for immediate
-	// reconcile. A latency hint, not a synchronous run; correctness rests on the
-	// periodic resync, not this. Returns ErrNotFound if id does not exist and
-	// ErrNoController if the kind has no registered controller.
-	Requeue(ctx context.Context, id ObjectID) error
+	// Requeue requeues id for immediate reconcile. A latency hint, not a
+	// synchronous run; correctness rests on the periodic resync, not this.
+	//
+	// By default it preserves id's retry backoff ladder: a requeue is the common
+	// event-driven nudge (config change, dependency update, manual poke) and
+	// almost never proves the failure condition is resolved. The ladder is cleared
+	// by a successful reconcile or by passing WithResetBackoff(), never by a plain
+	// requeue. Pass WithResetBackoff() only when the caller knows the failure is
+	// resolved and the next retry should start from the base interval.
+	//
+	// Returns ErrNotFound if id does not exist and ErrNoController if the kind has
+	// no registered controller.
+	Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error
 	// NextRequeueAt reports when the reconcile loop has, in advance, scheduled id
 	// to be requeued: a pending backoff retry or RequeueAfter delay, or now if it
 	// is already queued. It returns the zero time when no requeue is scheduled.
@@ -457,13 +465,14 @@ func (c *clientImpl[Spec, Status]) reconcilerForObject(ctx context.Context, id O
 	return r, nil
 }
 
-// Requeue resets id's backoff and requeues it for immediate reconcile.
-func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID) error {
+// Requeue requeues id for immediate reconcile, preserving its backoff ladder
+// unless WithResetBackoff() is passed. See the Client interface for the full contract.
+func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error {
 	r, err := c.reconcilerForObject(ctx, id)
 	if err != nil {
 		return err
 	}
-	r.requeueNow(id)
+	r.requeue(id, resolveRequeue(opts).resetBackoff)
 	return nil
 }
 

@@ -59,6 +59,32 @@ func resolveLoads(opts []LoadOption) LoadSet {
 	return set
 }
 
+// RequeueOption configures a Client.Requeue call. Like LoadOption it is distinct
+// from Option: it applies only to Requeue.
+type RequeueOption func(*requeueOptions)
+
+type requeueOptions struct {
+	resetBackoff bool
+}
+
+// WithResetBackoff makes a Requeue clear the object's retry backoff ladder so its
+// next failure retries from the base interval. Pass it only when the caller has
+// proof the failure condition is resolved. A plain Requeue preserves the ladder:
+// backoff is cleared by a successful reconcile or an explicit WithResetBackoff, never
+// by merely being asked to try again.
+func WithResetBackoff() RequeueOption {
+	return func(o *requeueOptions) { o.resetBackoff = true }
+}
+
+// resolveRequeue folds the per-call options into a single requeueOptions.
+func resolveRequeue(opts []RequeueOption) requeueOptions {
+	var o requeueOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // StartupReconcileStrategy selects which objects a controller reconciles once at
 // startup. The zero value is StartupReconcileAll, so the safe default holds for a
 // controller that never sets it.

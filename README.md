@@ -221,8 +221,8 @@ type Client[Spec, Status any] interface {
     ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 
     // Reconcile control.
-    Requeue(ctx context.Context, id ObjectID) error                    // reset backoff, requeue now
-    NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error) // next scheduled requeue
+    Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
+    NextRequeueAt(ctx context.Context, id ObjectID) (time.Time, error)     // next scheduled requeue
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
@@ -241,7 +241,9 @@ Both issue the same secondary query (edges are a separate indexed lookup, never 
 
 #### Reconcile control
 
-`Requeue` resets an object's retry backoff and requeues it for immediate reconcile — the manual counterpart to the store-write and dependency-change wakes. It is a **latency hint, not a synchronous run**: it returns once the object is enqueued, and a worker reconciles it on its own schedule. Correctness never depends on it — the periodic resync remains the backstop — so a missed or coalesced requeue is harmless. Use it to promptly re-examine an object after out-of-band state the controller reads has changed.
+`Requeue` requeues an object for immediate reconcile — the manual counterpart to the store-write and dependency-change wakes. It is a **latency hint, not a synchronous run**: it returns once the object is enqueued, and a worker reconciles it on its own schedule. Correctness never depends on it — the periodic resync remains the backstop — so a missed or coalesced requeue is harmless. Use it to promptly re-examine an object after out-of-band state the controller reads has changed.
+
+By default `Requeue` **preserves the object's retry backoff ladder**. A requeue is the ordinary event-driven nudge (config change, dependency update, manual poke) and almost never proves the failing condition is resolved; the only event that proves recovery is a successful reconcile, which already clears backoff. The invariant: **backoff is cleared by a successful reconcile or an explicit `WithResetBackoff()`, never by a plain requeue.** Pass `beehive.WithResetBackoff()` only when the caller knows the failure is resolved and the next retry should restart from the base interval — the analog of controller-runtime's `Forget`. (This mirrors controller-runtime's split between `Add`/`AddAfter`, which requeue without resetting, and `Forget`, which explicitly resets.)
 
 `NextRequeueAt` reports when the reconcile loop has, **in advance, scheduled the object to be requeued**: a pending backoff retry or `RequeueAfter` delay, or now if it is already queued. It returns the **zero time** when no requeue is scheduled.
 
@@ -343,4 +345,10 @@ func LoadOwner() LoadOption         // fetch the owner (outgoing owned_by)
 func LoadDependencies() LoadOption  // fetch dependencies (outgoing depends_on)
 func LoadDependents() LoadOption    // fetch dependents (incoming depends_on)
 func LoadOwned() LoadOption         // fetch owned children (incoming owned_by)
+```
+
+`Requeue` takes `RequeueOption`s (also a separate type from `Option`, applying only to `Requeue`) — see [Reconcile control](#reconcile-control):
+
+```go
+func WithResetBackoff() RequeueOption   // clear the retry backoff ladder before requeuing (default: preserve it)
 ```

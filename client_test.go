@@ -1580,31 +1580,49 @@ func TestClientRequeueNoController(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoController)
 }
 
-// TestClientRequeue verifies Requeue resets backoff and requeues
-// the id on the registered reconciler's work queue.
+// TestClientRequeue verifies that Requeue always enqueues the id, that a plain
+// Requeue preserves the backoff ladder, and that Requeue(WithResetBackoff()) clears it.
 func TestClientRequeue(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	tests := []struct {
+		name string
+		opts []RequeueOption
+		// kept reports whether the seeded backoff entry should survive the requeue.
+		kept bool
+	}{
+		{name: "default preserves backoff", opts: nil, kept: true},
+		{name: "WithResetBackoff clears backoff", opts: []RequeueOption{WithResetBackoff()}, kept: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			bh, err := New(newClientTestStore(t))
+			require.NoError(t, err)
+			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+			require.NoError(t, err)
 
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+			obj, err := client.Create(ctx, cSpec{Val: "x"})
+			require.NoError(t, err)
 
-	r := bh.reconcilers[clientTestGK]
-	// Drain the enqueue Create produced, and seed a backoff entry to prove the
-	// requeue clears it.
-	drainQueue(r.work)
-	r.nextBackoff(obj.ID)
+			r := bh.reconcilers[clientTestGK]
+			// Drain the enqueue Create produced, and seed a backoff entry so the
+			// requeue's effect on the ladder is observable.
+			drainQueue(r.work)
+			seeded := r.nextBackoff(obj.ID)
+			require.NotZero(t, seeded, "precondition: backoff seeded")
 
-	require.NoError(t, client.Requeue(ctx, obj.ID))
+			require.NoError(t, client.Requeue(ctx, obj.ID, tt.opts...))
 
-	assert.Zero(t, r.backoffFor[obj.ID], "Requeue must clear backoff")
-	id, ok := r.work.get()
-	require.True(t, ok, "Requeue must enqueue the id")
-	assert.Equal(t, obj.ID, id)
+			if tt.kept {
+				assert.Equal(t, seeded, r.backoffFor[obj.ID], "plain Requeue must preserve the backoff ladder")
+			} else {
+				assert.Zero(t, r.backoffFor[obj.ID], "Requeue with WithResetBackoff must clear backoff")
+			}
+			id, ok := r.work.get()
+			require.True(t, ok, "Requeue must enqueue the id")
+			assert.Equal(t, obj.ID, id)
+		})
+	}
 }
 
 // TestClientNextRequeueAtScheduled verifies NextRequeueAt returns a pending
