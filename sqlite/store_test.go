@@ -422,7 +422,8 @@ func TestRecordEventStoreErrors(t *testing.T) {
 		run, err := store.RecordEvent(ctx, testGK, id, ev)
 		require.NoError(t, err)
 		corruptEventFirstAt(t, store, run.ID)
-		// Same key → EXTEND updates the corrupted run and RETURNINGs it → scan fails.
+		// Same key → the key-only probe still reads the run (it ignores first_at),
+		// so EXTEND updates it and RETURNINGs the corrupted full row → scan fails.
 		_, err = store.RecordEvent(ctx, testGK, id, ev)
 		require.Error(t, err)
 	})

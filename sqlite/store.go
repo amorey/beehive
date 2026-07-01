@@ -702,8 +702,7 @@ func scanEvent(sc scanner) (*storeapi.Event, error) {
 }
 
 // latestEventRun returns the full newest run for (id, category), or nil if that
-// timeline is empty. GetLatestEvent returns it as-is; RecordEvent probes it for the
-// run key (only this run is ever extended, which scopes aggregation per category).
+// timeline is empty. GetLatestEvent returns it as-is.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
@@ -716,6 +715,26 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 		return nil, err
 	}
 	return e, nil
+}
+
+// latestEventKey returns just the run key (id, type, reason) of the newest run
+// for (id, category), or ok=false if that timeline is empty. RecordEvent needs
+// only the key to decide extend-vs-append, so it deliberately does not decode the
+// full row (unlike GetLatestEvent): probing the columns it is about to discard
+// would let a decode fault in an older run mask — rather than surface through —
+// the write RecordEvent is about to make.
+func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
+	row := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`, id, category)
+	err = row.Scan(&evID, &typ, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", "", false, nil
+	}
+	if err != nil {
+		return 0, "", "", false, err
+	}
+	return evID, typ, reason, true, nil
 }
 
 func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
@@ -735,18 +754,18 @@ func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id
 		}
 		now := toMillis(time.Now().UTC())
 
-		latest, err := s.latestEventRun(ctx, id, ev.Category)
+		latestID, latestType, latestReason, hasLatest, err := s.latestEventKey(ctx, id, ev.Category)
 		if err != nil {
 			return err
 		}
 		var row *sql.Row
-		if latest != nil && latest.Type == ev.Type && latest.Reason == ev.Reason {
+		if hasLatest && latestType == ev.Type && latestReason == ev.Reason {
 			// Extend: bump count and window end, re-sample message/detail, advance rv.
 			row = c.QueryRowContext(ctx, `
 				UPDATE events SET count = count + 1, last_at = ?, message = ?,
 					detail = ?, resource_version = ?
 				WHERE id = ?
-				RETURNING `+eventColumns, now, ev.Message, ev.Detail, rv, latest.ID)
+				RETURNING `+eventColumns, now, ev.Message, ev.Detail, rv, latestID)
 		} else {
 			// New run (empty timeline or key changed): count 1, point window.
 			row = c.QueryRowContext(ctx, `
