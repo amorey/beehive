@@ -47,6 +47,11 @@ type ControllerClient[Status any] interface {
 	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
 	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
 	DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
+	// RecordEvent appends an observation to id's event log, aggregating into
+	// contiguous runs (see EventSpec). Like the other writes it is kind-folded and
+	// composes in Within, so a controller can record an event and update a
+	// condition atomically.
+	RecordEvent(ctx context.Context, id ObjectID, event EventSpec) error
 	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
 	AddDependency(ctx context.Context, fromID, toID ObjectID) error
 	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
@@ -116,6 +121,29 @@ func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id Obje
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
 	_, err := c.bh.store.DeleteCondition(ctx, c.gk, id, conditionType)
+	return err
+}
+
+// RecordEvent marshals the event's optional Detail (typed-in, opaque-out, like
+// Spec/Status) and appends the run through the store, which folds in the
+// controller's kind and emits the run into the transaction's collector so it
+// publishes to watchers only after the write commits. A nil Detail stays nil (no
+// payload); the store aggregates by (Category, Type, Reason).
+func (c *controllerClientImpl[Status]) RecordEvent(ctx context.Context, id ObjectID, event EventSpec) error {
+	var detail []byte
+	if event.Detail != nil {
+		var err error
+		if detail, err = json.Marshal(event.Detail); err != nil {
+			return err
+		}
+	}
+	_, err := c.bh.store.RecordEvent(ctx, c.gk, id, storeapi.Event{
+		Category: event.Category,
+		Type:     string(event.Type),
+		Reason:   event.Reason,
+		Message:  event.Message,
+		Detail:   detail,
+	})
 	return err
 }
 

@@ -36,6 +36,454 @@ func newTestStore(t *testing.T) beehive.Store {
 	return store
 }
 
+// newEventObject creates a bare object of testGK and returns its id, for the
+// RecordEvent tests to hang events off.
+func newEventObject(t *testing.T, store beehive.Store) storeapi.ObjectID {
+	t.Helper()
+	obj, err := store.CreateObject(context.Background(), &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	return obj.ID
+}
+
+// A first emission starts a run: count 1, a collapsed window, an assigned id and
+// resource_version.
+func TestRecordEventStartsRun(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	e, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{
+		Category: "connection", Type: "Warning", Reason: "ProbeFailed",
+		Message: "i/o timeout", Detail: []byte(`{"attempt":1}`),
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, e.ID)
+	assert.Equal(t, id, e.ObjectID)
+	assert.Equal(t, "connection", e.Category)
+	assert.Equal(t, "Warning", e.Type)
+	assert.Equal(t, "ProbeFailed", e.Reason)
+	assert.Equal(t, "i/o timeout", e.Message)
+	assert.JSONEq(t, `{"attempt":1}`, string(e.Detail))
+	assert.Equal(t, 1, e.Count)
+	assert.Equal(t, e.FirstAt, e.LastAt, "a fresh run's window is a point")
+	assert.NotZero(t, e.ResourceVersion)
+}
+
+// Re-emitting the same (Category, Type, Reason) extends the latest run in place:
+// same row, Count grows, the window start is preserved while its end advances,
+// and Message/Detail are re-sampled to the latest occurrence.
+func TestRecordEventExtendsRun(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	first, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{
+		Category: "connection", Type: "Warning", Reason: "ProbeFailed",
+		Message: "timeout", Detail: []byte(`{"n":1}`),
+	})
+	require.NoError(t, err)
+	second, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{
+		Category: "connection", Type: "Warning", Reason: "ProbeFailed",
+		Message: "still down", Detail: []byte(`{"n":2}`),
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, first.ID, second.ID, "same run extended, not a new row")
+	assert.Equal(t, 2, second.Count)
+	assert.Equal(t, first.FirstAt, second.FirstAt, "window start preserved")
+	assert.False(t, second.LastAt.Before(first.FirstAt), "window end advances")
+	assert.Equal(t, "still down", second.Message, "message re-sampled")
+	assert.JSONEq(t, `{"n":2}`, string(second.Detail), "detail re-sampled")
+	assert.Greater(t, second.ResourceVersion, first.ResourceVersion)
+}
+
+// A change in Reason or Type (the run key besides Category) appends a fresh run
+// rather than extending — the contiguous-run boundary.
+func TestRecordEventNewRunOnKeyChange(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	base := func(typ, reason string) storeapi.Event {
+		return storeapi.Event{Category: "connection", Type: typ, Reason: reason}
+	}
+
+	a, err := store.RecordEvent(ctx, testGK, id, base("Warning", "ProbeFailed"))
+	require.NoError(t, err)
+
+	b, err := store.RecordEvent(ctx, testGK, id, base("Warning", "TLSHandshake"))
+	require.NoError(t, err)
+	assert.NotEqual(t, a.ID, b.ID, "reason change starts a new run")
+	assert.Equal(t, 1, b.Count)
+
+	c, err := store.RecordEvent(ctx, testGK, id, base("Normal", "TLSHandshake"))
+	require.NoError(t, err)
+	assert.NotEqual(t, b.ID, c.ID, "type change starts a new run")
+	assert.Equal(t, 1, c.Count)
+}
+
+// Aggregation is scoped per (object, category): an emission in one category never
+// breaks a run in another, even when the two are interleaved.
+func TestRecordEventCategoriesIndependent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	conn := storeapi.Event{Category: "connection", Type: "Warning", Reason: "ProbeFailed"}
+	sync := storeapi.Event{Category: "sync", Type: "Normal", Reason: "Synced"}
+
+	conn1, err := store.RecordEvent(ctx, testGK, id, conn)
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, testGK, id, sync) // interleaved other-category event
+	require.NoError(t, err)
+	conn2, err := store.RecordEvent(ctx, testGK, id, conn)
+	require.NoError(t, err)
+
+	assert.Equal(t, conn1.ID, conn2.ID, "interleaved other-category event must not break this run")
+	assert.Equal(t, 2, conn2.Count)
+}
+
+// RecordEvent is kind-scoped like the other id-keyed mutators: a foreign id is
+// ErrWrongKind, a missing id is ErrNotFound, and neither writes a row.
+func TestRecordEventScoped(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	ev := storeapi.Event{Category: "connection", Type: "Normal", Reason: "OK"}
+
+	_, err := store.RecordEvent(ctx, beehive.GroupKind{Kind: "Other"}, id, ev)
+	assert.ErrorIs(t, err, storeapi.ErrWrongKind)
+
+	_, err = store.RecordEvent(ctx, testGK, 999999, ev)
+	assert.ErrorIs(t, err, storeapi.ErrNotFound)
+}
+
+// ListEvents returns an object's runs newest-first (by last_at, then id as the
+// same-millisecond tiebreak).
+func TestListEventsOrdersNewestFirst(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	rec := func(typ, reason string) {
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "connection", Type: typ, Reason: reason})
+		require.NoError(t, err)
+	}
+	rec("Normal", "Connected")     // A
+	rec("Warning", "TLSHandshake") // B
+	rec("Normal", "Connected")     // C (new run: key changed from B)
+	rec("Warning", "ProbeFailed")  // D
+
+	got, err := store.ListEvents(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	require.Len(t, got, 4)
+	assert.Equal(t, "ProbeFailed", got[0].Reason)  // D, newest
+	assert.Equal(t, "Connected", got[1].Reason)    // C
+	assert.Equal(t, "TLSHandshake", got[2].Reason) // B
+	assert.Equal(t, "Connected", got[3].Reason)    // A, oldest
+}
+
+// EventQuery narrows a ListEvents read by category/type/reason/since and caps it
+// by limit; the zero query returns every run for the object.
+func TestListEventsFilters(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	rec := func(cat, typ, reason string) {
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: cat, Type: typ, Reason: reason})
+		require.NoError(t, err)
+	}
+	rec("connection", "Warning", "ProbeFailed")
+	rec("connection", "Normal", "Connected")
+	rec("sync", "Normal", "Synced")
+
+	t.Run("category restricts to one timeline", func(t *testing.T) {
+		cat := "connection"
+		got, err := store.ListEvents(ctx, id, storeapi.EventQuery{Category: &cat})
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		for _, e := range got {
+			assert.Equal(t, "connection", e.Category)
+		}
+	})
+	t.Run("nil category returns all timelines", func(t *testing.T) {
+		got, err := store.ListEvents(ctx, id, storeapi.EventQuery{})
+		require.NoError(t, err)
+		assert.Len(t, got, 3)
+	})
+	t.Run("type", func(t *testing.T) {
+		got, err := store.ListEvents(ctx, id, storeapi.EventQuery{Type: "Warning"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "ProbeFailed", got[0].Reason)
+	})
+	t.Run("reason", func(t *testing.T) {
+		got, err := store.ListEvents(ctx, id, storeapi.EventQuery{Reason: "Synced"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "sync", got[0].Category)
+	})
+	t.Run("limit takes the newest N", func(t *testing.T) {
+		got, err := store.ListEvents(ctx, id, storeapi.EventQuery{Limit: 2})
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+	})
+	t.Run("since bounds by last_at", func(t *testing.T) {
+		got, err := store.ListEvents(ctx, id, storeapi.EventQuery{Since: time.Now().UTC().Add(time.Hour)})
+		require.NoError(t, err)
+		assert.Empty(t, got, "a future lower bound excludes every run")
+
+		got, err = store.ListEvents(ctx, id, storeapi.EventQuery{Since: time.Now().UTC().Add(-time.Hour)})
+		require.NoError(t, err)
+		assert.Len(t, got, 3, "a past lower bound includes every run")
+	})
+}
+
+// GetLatestEvent returns the current run in a category timeline, or nil when that
+// timeline is empty.
+func TestGetLatestEvent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	got, err := store.GetLatestEvent(ctx, id, "connection")
+	require.NoError(t, err)
+	assert.Nil(t, got, "empty timeline is nil, not an error")
+
+	rec := func(cat, typ, reason string) {
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: cat, Type: typ, Reason: reason})
+		require.NoError(t, err)
+	}
+	rec("connection", "Warning", "ProbeFailed")
+	rec("connection", "Normal", "Connected")
+	rec("sync", "Normal", "Synced")
+
+	got, err = store.GetLatestEvent(ctx, id, "connection")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "Connected", got.Reason, "the current (newest) run for the category")
+
+	got, err = store.GetLatestEvent(ctx, id, "sync")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "Synced", got.Reason, "scoped to the category")
+
+	got, err = store.GetLatestEvent(ctx, id, "nope")
+	require.NoError(t, err)
+	assert.Nil(t, got, "unknown category is nil")
+}
+
+// SweepEvents caps each timeline to the newest perObject runs.
+func TestSweepEventsCapN(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for _, r := range []string{"R1", "R2", "R3", "R4"} { // 4 distinct runs
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r})
+		require.NoError(t, err)
+	}
+
+	deleted, err := store.SweepEvents(ctx, 2, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted)
+
+	got, err := store.ListEvents(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "R4", got[0].Reason, "newest kept")
+	assert.Equal(t, "R3", got[1].Reason)
+}
+
+// The cap-N ring partitions by (object, category): a flapping timeline can't
+// evict a quiet one, on the same object or a different one.
+func TestSweepEventsCapNPartitions(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	a := newEventObject(t, store)
+	b := newEventObject(t, store)
+
+	rec := func(id storeapi.ObjectID, cat, reason string) {
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: cat, Type: "Normal", Reason: reason})
+		require.NoError(t, err)
+	}
+	rec(a, "connection", "F1") // object a, connection flaps 3 runs
+	rec(a, "connection", "F2")
+	rec(a, "connection", "F3")
+	rec(a, "sync", "S1")            // object a, sync has 1 run
+	rec(b, "connection", "OtherC1") // object b, its own timeline
+
+	_, err := store.SweepEvents(ctx, 1, 0)
+	require.NoError(t, err)
+
+	conn := "connection"
+	sync := "sync"
+	aConn, err := store.ListEvents(ctx, a, storeapi.EventQuery{Category: &conn})
+	require.NoError(t, err)
+	require.Len(t, aConn, 1)
+	assert.Equal(t, "F3", aConn[0].Reason, "flapping timeline keeps its newest")
+
+	aSync, err := store.ListEvents(ctx, a, storeapi.EventQuery{Category: &sync})
+	require.NoError(t, err)
+	require.Len(t, aSync, 1, "quiet timeline survives the flap on the same object")
+	assert.Equal(t, "S1", aSync[0].Reason)
+
+	bConn, err := store.ListEvents(ctx, b, storeapi.EventQuery{Category: &conn})
+	require.NoError(t, err)
+	require.Len(t, bConn, 1, "another object's timeline is independent")
+	assert.Equal(t, "OtherC1", bConn[0].Reason)
+}
+
+// SweepEvents drops runs whose window ended more than maxAge ago.
+func TestSweepEventsMaxAge(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	old, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Old"})
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "New"})
+	require.NoError(t, err)
+
+	// Age the first run's window into the past directly — no clock injection needed.
+	s := store.(*sqliteStore)
+	_, err = s.db.ExecContext(ctx, `UPDATE events SET last_at = ? WHERE id = ?`,
+		toMillis(time.Now().UTC().Add(-2*time.Hour)), old.ID)
+	require.NoError(t, err)
+
+	deleted, err := store.SweepEvents(ctx, 0, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	got, err := store.ListEvents(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "New", got[0].Reason, "the run within maxAge is kept")
+}
+
+// Deleting an object cascade-deletes its event log (FK ON DELETE CASCADE).
+func TestDeleteObjectCascadesEvents(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "X"})
+	require.NoError(t, err)
+	require.NoError(t, store.DeleteObject(ctx, id))
+
+	got, err := store.ListEvents(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	assert.Empty(t, got, "events cascade-delete with their object")
+}
+
+func dropEventsTable(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE events`)
+	require.NoError(t, err)
+}
+
+// corruptEventFirstAt stores non-numeric text in a run's first_at so a later
+// full-row scan of it fails (INTEGER affinity keeps unconvertible text, which
+// can't scan into int64; the column is NOT NULL, so a NULL is not an option).
+func corruptEventFirstAt(t *testing.T, store *sqliteStore, runID storeapi.EventID) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `UPDATE events SET first_at = 'corrupt' WHERE id = ?`, runID)
+	require.NoError(t, err)
+}
+
+// RecordEvent surfaces store faults from each of its steps.
+func TestRecordEventStoreErrors(t *testing.T) {
+	ctx := context.Background()
+	ev := storeapi.Event{Category: "c", Type: "Normal", Reason: "R"}
+
+	t.Run("resource_version_seq missing", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		dropSeq(t, store)
+		_, err := store.RecordEvent(ctx, testGK, id, ev)
+		require.Error(t, err)
+	})
+
+	t.Run("latest-run probe fails", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		dropEventsTable(t, store)
+		_, err := store.RecordEvent(ctx, testGK, id, ev)
+		require.Error(t, err)
+	})
+
+	t.Run("written row fails to scan", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		run, err := store.RecordEvent(ctx, testGK, id, ev)
+		require.NoError(t, err)
+		corruptEventFirstAt(t, store, run.ID)
+		// Same key → EXTEND updates the corrupted run and RETURNINGs it → scan fails.
+		_, err = store.RecordEvent(ctx, testGK, id, ev)
+		require.Error(t, err)
+	})
+}
+
+// ListEvents surfaces a query fault and a per-row scan fault.
+func TestListEventsStoreErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("query fails", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		dropEventsTable(t, store)
+		_, err := store.ListEvents(ctx, id, storeapi.EventQuery{})
+		require.Error(t, err)
+	})
+
+	t.Run("row fails to scan", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		run, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+		require.NoError(t, err)
+		corruptEventFirstAt(t, store, run.ID)
+		_, err = store.ListEvents(ctx, id, storeapi.EventQuery{})
+		require.Error(t, err)
+	})
+}
+
+// GetLatestEvent surfaces a scan fault on the current run.
+func TestGetLatestEventScanError(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	id := newEventObject(t, store)
+	run, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+	require.NoError(t, err)
+	corruptEventFirstAt(t, store, run.ID)
+	_, err = store.GetLatestEvent(ctx, id, "c")
+	require.Error(t, err)
+}
+
+// SweepEvents surfaces a delete fault from either retention bound.
+func TestSweepEventsExecErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("cap-N delete fails", func(t *testing.T) {
+		store := newRawStore(t)
+		newEventObject(t, store)
+		dropEventsTable(t, store)
+		_, err := store.SweepEvents(ctx, 1, 0)
+		require.Error(t, err)
+	})
+
+	t.Run("max-age delete fails", func(t *testing.T) {
+		store := newRawStore(t)
+		newEventObject(t, store)
+		dropEventsTable(t, store)
+		_, err := store.SweepEvents(ctx, 0, time.Hour)
+		require.Error(t, err)
+	})
+}
+
 func TestCreateObjectAssignsIdentity(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -438,7 +886,7 @@ func TestMarkOwnedForDeletionCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, store.AddRef(ctx, childB, owner, beehive.RelationOwnedBy))
 
 	// Watch live changes only (no snapshot) so each cascade's events are isolated.
-	w, err := store.WatchEvents(ctx, testGK)
+	w, err := store.WatchChanges(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 

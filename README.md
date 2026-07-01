@@ -139,6 +139,61 @@ only within the process that wrote it. A liveness condition written by a prior
 process is downgraded to `ConditionUnknown` ("verifying") on read until a controller
 re-confirms it. The default (`false`) is durable store-truth that survives restarts.
 
+### Event
+
+Events are a per-object, append-only log of observations, aggregated into runs. Consecutive emissions that share `(Category, Type, Reason)` coalesce into a single `Event` whose `Count` grows and whose `[FirstAt, LastAt]` window widens; a change in any of those fields starts a new run. This is *contiguous-run* aggregation, not global dedup — a value that recurs after a different value starts a fresh run, so a flapping object yields a timeline of alternating runs rather than one ever-growing row. An event log is the un-collapsed sibling of a Condition: where a Condition keeps only the current run per type (its `Status`/`Reason` overwritten in place), the event log keeps the whole history.
+
+```go
+type EventType string
+
+const (
+    EventNormal  EventType = "Normal"  // ✓
+    EventWarning EventType = "Warning" // ✗
+)
+
+type EventID = int64
+
+type EventSpec struct {
+    Category string    // independent timeline; "" = default
+    Type     EventType
+    Reason   string    // machine-readable token, e.g. "ProbeFailed"
+    Message  string    // human-readable; sampled, not keyed
+    Detail   any       // optional payload; marshaled on write; nil = none
+}
+
+type Event struct {
+    ID       EventID
+    ObjectID ObjectID        // object this event is about
+    Category string
+    Type     EventType
+    Reason   string
+    Message  string          // latest occurrence's message
+    Detail   json.RawMessage // latest occurrence's payload; nil = none
+    Count    int             // occurrences in this run (>= 1)
+    FirstAt  time.Time       // run start
+    LastAt   time.Time       // run end (latest occurrence)
+}
+
+// EventDetail unmarshals e.Detail into T.
+func EventDetail[T any](e Event) (T, error)
+```
+
+`Category` partitions the aggregation domain: each `(object, category)` is an independent timeline, so unrelated concerns on the same object — say connection probes and config sync — never break each other's runs. Both `Category` and `Reason` are free labels the app chooses per emit (`string`, like `Condition.Reason`); declare typed-string constants for a closed, typo-safe vocabulary if you like. `Message` is *sampled*, not keyed: re-emitting the same `(Category, Type, Reason)` with a new message extends the current run and updates the shown message rather than starting a new one.
+
+`Detail` is the machine-readable companion to `Message` — an optional structured payload (`ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`). It follows the `Spec`/`Status` convention of **typed in, opaque out**: on write it is any JSON-marshalable value (`RecordEvent` marshals it, just as `Create` marshals `Spec`); on read it returns as `json.RawMessage`, decoded on demand with the free generic helper `EventDetail[T](e)` — applied per event with the type its `Reason` implies, so a single timeline can mix reasons carrying different detail shapes without the API becoming generic. Like `Message`, `Detail` is *sampled* (latest occurrence wins) and not part of the run key, so a varying payload never fragments a run — if you need every occurrence's payload retained, that event shouldn't aggregate (use a unique `Reason`). Unlike `Spec`/`Status`, `Detail` is **not** schema-versioned; reshaping it breaks decode of older rows, which is acceptable only because retention ages events out — version inside the payload if you need forward-compatibility.
+
+Only controllers write events — `ControllerClient.RecordEvent` is the sole write path, because events are observations and (like `status`) have no user-facing writer. Reads are on the `Client` (`ListEvents` / `WatchEvents` / `GetLatestEvent`), plus the eager `LoadEvents()` / `Object.ListEvents()` pair that follows the same loaded-gating as the secondary lookups (`ErrNotLoaded` when not requested).
+
+A connection-health panel renders one category's timeline directly — `client.ListEvents(ctx, id, WithEventCategory("connection"))` yields, newest first:
+
+```
+10:08:30  ✓ Connected      ×4    10:08:00–10:08:30
+10:07:50  ✗ ProbeFailed    ×18   10:05:00–10:07:50   "i/o timeout"
+10:04:55  ✓ Connected      ×7    10:03:50–10:04:55
+```
+
+where each row is one `Event`: `LastAt` · `Type` · `Reason` · `Count` · `FirstAt–LastAt` · `Message`.
+
 ### Object
 
 ```go
@@ -220,6 +275,11 @@ type Client[Spec, Status any] interface {
     ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
     ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 
+    // Event log — per-object, category-partitioned, contiguous-run aggregated.
+    ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
+    WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+    GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
+
     // Reconcile control.
     Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
     NextRequeueAt(ctx context.Context, id ObjectID) time.Time              // next scheduled requeue (zero if none)
@@ -266,6 +326,12 @@ client.Update(ctx, obj.ID, ClusterSpec{...})
 
 `Watch` and `WatchList` emit the current state as `Added` events on start, then stream subsequent changes. The channel closes when `ctx` is cancelled. Events are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model.
 
+#### Events
+
+`ListEvents` returns an object's runs most-recent-first (`LastAt` descending); `WithEventCategory` narrows to a single timeline, and the other `EventOption`s filter by type/reason/time or cap the count. `WatchEvents` delivers the current recent runs as a snapshot, then streams extends and new runs — matching `Watch`/`WatchList`'s snapshot-then-live contract — conflated on `EventID`, so a subscriber sees one update per run (a count-bump updates the run in place) rather than one per occurrence. `GetLatestEvent` returns the current run in a category; its `bool` folds away the no-events-yet case, like `GetOwner`.
+
+Retention is bounded per `(object, category)` by `WithEventRetention`: a cap-N ring keeps the newest N runs per timeline — so a flapping timeline can't evict a quiet one on the same object — plus an optional global max-age. The global GC sweeper enforces it, and events cascade-delete with their object.
+
 ### ControllerClient
 
 ```go
@@ -273,6 +339,7 @@ type ControllerClient[Status any] interface {
     UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
     SetCondition(ctx context.Context, id ObjectID, condition Condition) error
     DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
+    RecordEvent(ctx context.Context, id ObjectID, event EventSpec) error
     DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
     AddDependency(ctx context.Context, fromID, toID ObjectID) error
     DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
@@ -289,6 +356,8 @@ type ControllerClient[Status any] interface {
 `GetOwner`/`ListDependencies`/`ListDependents`/`ListOwned` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `GetOwner` returns the owner via `owned_by`, `ListOwned` the inverse (the owner's children); `ListDependents` is the inverse of `ListDependencies` over `depends_on`. Distinct from `HasIncomingRefs`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `ListDependents`.
 
 `HasIncomingRefs` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
+
+`RecordEvent` appends an observation to the object's event log — see [Event](#event). Like `SetCondition` it is a scoped, transactional write (kind-folded; `ErrWrongKind` for a foreign id) and composes inside `Within`, so a controller can record an observation and flip a condition in one atomic step.
 
 ### Controller
 
@@ -332,6 +401,7 @@ func WithOwner(id ObjectID) Option                 // declare owned_by edge; own
 func WithResyncInterval(d time.Duration) Option    // override the default resync interval
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
+func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring + optional age bound (0 = no age bound)
 ```
 
 `WithOwner` sets an `owned_by` edge in `refs` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
@@ -345,10 +415,21 @@ func LoadOwner() LoadOption         // fetch the owner (outgoing owned_by)
 func LoadDependencies() LoadOption  // fetch dependencies (outgoing depends_on)
 func LoadDependents() LoadOption    // fetch dependents (incoming depends_on)
 func LoadOwned() LoadOption         // fetch owned children (incoming owned_by)
+func LoadEvents() LoadOption        // fetch the most-recent events (default N per (object,category))
 ```
 
 `Requeue` takes `RequeueOption`s (also a separate type from `Option`, applying only to `Requeue`) — see [Reconcile control](#reconcile-control):
 
 ```go
 func WithResetBackoff() RequeueOption   // clear the retry backoff ladder before requeuing (default: preserve it)
+```
+
+The event read methods take `EventOption`s (also a separate type from `Option`, applying only to `ListEvents`/`WatchEvents`) — see [Events](#events):
+
+```go
+func WithEventCategory(cat string) EventOption  // restrict to a single timeline
+func WithEventType(t EventType) EventOption      // only Normal or only Warning
+func WithEventReason(reason string) EventOption  // only runs with this reason
+func WithEventLimit(n int) EventOption           // cap the number of runs returned / snapshotted
+func WithEventsSince(t time.Time) EventOption    // only runs active at or after t
 ```

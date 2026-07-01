@@ -170,6 +170,89 @@ func TestControllerClientWithin(t *testing.T) {
 	assert.NotNil(t, findCondition(got.Conditions, "Ready"))
 }
 
+// RecordEvent writes an aggregated run through the store, marshaling EventSpec's
+// Detail; the run reads back with the mapped fields and a decodable payload.
+func TestControllerClientRecordEvent(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	require.NoError(t, cc.RecordEvent(ctx, obj.ID, EventSpec{
+		Category: "connection", Type: EventWarning, Reason: "ProbeFailed",
+		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
+	}))
+
+	run, err := bh.store.GetLatestEvent(ctx, obj.ID, "connection")
+	require.NoError(t, err)
+	require.NotNil(t, run)
+	assert.Equal(t, "Warning", run.Type)
+	assert.Equal(t, "ProbeFailed", run.Reason)
+	assert.Equal(t, "i/o timeout", run.Message)
+	assert.Equal(t, 1, run.Count)
+
+	detail, err := EventDetail[probeDetail](eventFromRaw(*run))
+	require.NoError(t, err)
+	assert.Equal(t, probeDetail{Endpoint: "h:443", LatencyMs: 5000}, detail)
+}
+
+// RecordEvent surfaces a Detail that cannot be JSON-marshaled, before touching
+// the store.
+func TestControllerClientRecordEventMarshalError(t *testing.T) {
+	bh, err := New(&fakeStore{})
+	require.NoError(t, err)
+	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+
+	err = cc.RecordEvent(context.Background(), 1, EventSpec{Detail: make(chan int)})
+	assert.Error(t, err, "an unmarshalable Detail fails the write")
+}
+
+// RecordEvent is kind-folded like the other writes: a controller may not record
+// events on an object of another kind.
+func TestControllerClientRecordEventWrongKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	other := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Other"}}
+	err = other.RecordEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
+	assert.ErrorIs(t, err, ErrWrongKind)
+}
+
+// RecordEvent composes in Within: a run recorded inside a transaction that later
+// errors is rolled back with the rest.
+func TestControllerClientRecordEventWithinRollback(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	sentinel := errors.New("boom")
+	err = cc.Within(ctx, func(ctx context.Context) error {
+		if err := cc.RecordEvent(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	require.ErrorIs(t, err, sentinel)
+
+	run, err := bh.store.GetLatestEvent(ctx, obj.ID, "c")
+	require.NoError(t, err)
+	assert.Nil(t, run, "a RecordEvent inside a rolled-back Within must not persist")
+}
+
 func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

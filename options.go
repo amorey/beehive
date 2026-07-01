@@ -17,6 +17,8 @@ package beehive
 import (
 	"log/slog"
 	"time"
+
+	"github.com/amorey/beehive/internal/storeapi"
 )
 
 // Option configures a target — a Beehive, a reconciler, or a per-object
@@ -48,6 +50,13 @@ func LoadDependents() LoadOption {
 // LoadOwned selects the objects this one owns (its incoming owned_by edges).
 func LoadOwned() LoadOption {
 	return func(s *LoadSet) { *s |= LoadOwnedBit }
+}
+
+// LoadEvents selects the object's event-log runs, read via Object.ListEvents().
+// It loads the object's current runs (bounded by retention); for filtered or
+// bounded reads use the lazy Client.ListEvents with EventOptions instead.
+func LoadEvents() LoadOption {
+	return func(s *LoadSet) { *s |= LoadEventsBit }
 }
 
 // resolveLoads folds the per-call selectors into a single LoadSet.
@@ -83,6 +92,47 @@ func resolveRequeue(opts []RequeueOption) requeueOptions {
 		opt(&o)
 	}
 	return o
+}
+
+// EventOption filters a Client.ListEvents / WatchEvents read. Like LoadOption and
+// RequeueOption it is distinct from Option: it applies only to the event reads,
+// composing into the store's event query.
+type EventOption func(*storeapi.EventQuery)
+
+// WithEventCategory restricts a read to a single timeline. The category "" is the
+// default timeline (distinct from "no filter", which is the absence of this option).
+func WithEventCategory(category string) EventOption {
+	return func(q *storeapi.EventQuery) { q.Category = &category }
+}
+
+// WithEventType restricts a read to one severity (Normal or Warning).
+func WithEventType(t EventType) EventOption {
+	return func(q *storeapi.EventQuery) { q.Type = string(t) }
+}
+
+// WithEventReason restricts a read to runs with the given reason.
+func WithEventReason(reason string) EventOption {
+	return func(q *storeapi.EventQuery) { q.Reason = reason }
+}
+
+// WithEventLimit caps a read to the newest n runs. It bounds only the snapshot of
+// a WatchEvents subscription, not its live stream.
+func WithEventLimit(n int) EventOption {
+	return func(q *storeapi.EventQuery) { q.Limit = n }
+}
+
+// WithEventsSince restricts a read to runs still active at or after t (LastAt >= t).
+func WithEventsSince(t time.Time) EventOption {
+	return func(q *storeapi.EventQuery) { q.Since = t }
+}
+
+// resolveEvents folds the per-call options into a single store event query.
+func resolveEvents(opts []EventOption) storeapi.EventQuery {
+	var q storeapi.EventQuery
+	for _, o := range opts {
+		o(&q)
+	}
+	return q
 }
 
 // StartupReconcileStrategy selects which objects a controller reconciles once at
@@ -154,6 +204,23 @@ func WithResyncInterval(d time.Duration) Option {
 			t.resyncInterval = d
 		case *reconciler:
 			t.resyncInterval = d
+		}
+		return nil
+	}
+}
+
+// WithEventRetention bounds the per-object event log, enforced globally by the GC
+// sweeper on the startup + resync cadence. perObject > 0 caps each
+// (object, category) timeline to its newest perObject runs — a ring, so a flapping
+// timeline can't evict a quiet one; maxAge > 0 drops runs whose window ended more
+// than maxAge ago. A zero bound is skipped, and both zero (the default) leaves the
+// log unbounded. Retention is global, so it is meaningful only at New; passed
+// elsewhere it is ignored.
+func WithEventRetention(perObject int, maxAge time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.eventRetentionPerObject = perObject
+			t.eventRetentionMaxAge = maxAge
 		}
 		return nil
 	}

@@ -45,6 +45,41 @@ func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.Objec
 	return h
 }
 
+// eventHubFor returns the event-log hub for gk, creating it on first use, or nil
+// if the store is closed. Mirrors hubFor.
+func (s *sqliteStore) eventHubFor(gk storeapi.GroupKind) *conflate.Hub[eventKey, storeapi.Event] {
+	s.hubMu.Lock()
+	defer s.hubMu.Unlock()
+	if s.closed {
+		return nil
+	}
+	h := s.eventHubs[gk]
+	if h == nil {
+		h = conflate.New[eventKey](mergeEvent)
+		s.eventHubs[gk] = h
+	}
+	return h
+}
+
+// eventKey identifies a run in an event hub. Keying by run id (EventID) makes a
+// run's count-bumps conflate into one slot while distinct runs stay separate;
+// carrying ObjectID in the key lets a per-object subscriber filter by key alone,
+// so its receiver never buffers other objects' runs.
+type eventKey struct {
+	ObjectID storeapi.ObjectID
+	EventID  storeapi.EventID
+}
+
+// mergeEvent coalesces a run's pending event with a newer one: resource_version
+// is globally monotonic, so the higher-versioned row is the newer run state.
+// There are no tombstones, so it never drops the slot.
+func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
+	if prev.ResourceVersion > next.ResourceVersion {
+		return prev, true
+	}
+	return next, true
+}
+
 // mergeWatchEvent coalesces a receiver's undelivered pending event for an object
 // with a newly published one. The store's resource_version is a global monotonic
 // cursor, so the higher-versioned event is always the newer lifecycle state.
@@ -54,9 +89,9 @@ func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.Objec
 // object that is already covered by the subscriber's snapshot (born in the
 // subscribe→snapshot race window), in which case the consumer must still see the
 // delete. The seenIDs guard in watch() drops tombstones for objects the consumer
-// truly never observed. WatchList/WatchEvents override this with
+// truly never observed. WatchList/WatchChanges override this with
 // annihilatingMerge, which can drop such tombstones early (WatchList preserving
-// snapshot-covered deletes, WatchEvents preserving nothing).
+// snapshot-covered deletes, WatchChanges preserving nothing).
 func mergeWatchEvent(prev, next storeapi.RawWatchEvent) (storeapi.RawWatchEvent, bool) {
 	hi := next
 	if prev.Object.ResourceVersion > next.Object.ResourceVersion {
@@ -86,7 +121,7 @@ type snapshotIDs map[storeapi.ObjectID]struct{}
 // blindly: a snapshot-covered object born in the subscribe→snapshot race window
 // also coalesces Added→Deleted, and its delete MUST survive. preserve reports the
 // ids whose delete must be kept; an Added→Deleted pair is annihilated only when
-// preserve is nil (WatchEvents has no snapshot, so nothing is pre-known) or
+// preserve is nil (WatchChanges has no snapshot, so nothing is pre-known) or
 // preserve returns false for the id.
 func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawWatchEvent] {
 	return func(prev, next storeapi.RawWatchEvent) (storeapi.RawWatchEvent, bool) {
@@ -125,16 +160,29 @@ type pendingEvent struct {
 	ev storeapi.RawWatchEvent
 }
 
+// pendingEventRow is an event-log run awaiting its transaction's commit.
+type pendingEventRow struct {
+	gk storeapi.GroupKind
+	ev storeapi.Event
+}
+
 // eventCollector buffers events emitted during a transaction. The mutex guards
 // against a Within whose fn fans store calls across goroutines on the tx ctx.
 type eventCollector struct {
-	mu     sync.Mutex
-	events []pendingEvent
+	mu      sync.Mutex
+	events  []pendingEvent    // object watch events
+	logRows []pendingEventRow // event-log runs
 }
 
 func (c *eventCollector) add(p pendingEvent) {
 	c.mu.Lock()
 	c.events = append(c.events, p)
+	c.mu.Unlock()
+}
+
+func (c *eventCollector) addEventRow(p pendingEventRow) {
+	c.mu.Lock()
+	c.logRows = append(c.logRows, p)
 	c.mu.Unlock()
 }
 
@@ -163,25 +211,49 @@ func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawWatchEvent) 
 	}
 }
 
-// flush publishes a committed transaction's buffered events.
+// emitEvent delivers a written run to event-log watchers: queued on the tx
+// collector inside a transaction (flushed after commit by Within), published
+// immediately otherwise. Mirrors emit.
+func (s *sqliteStore) emitEvent(ctx context.Context, gk storeapi.GroupKind, ev *storeapi.Event) {
+	if c, ok := ctx.Value(collectorKey{}).(*eventCollector); ok {
+		c.addEventRow(pendingEventRow{gk: gk, ev: *ev})
+		return
+	}
+	s.publishEvent(gk, *ev)
+}
+
+// publishEvent sends a run to gk's event hub, keyed by (object, run) so per-run
+// updates coalesce. Send never blocks; a closed hub drops it.
+func (s *sqliteStore) publishEvent(gk storeapi.GroupKind, ev storeapi.Event) {
+	if h := s.eventHubFor(gk); h != nil {
+		_ = h.Sender().Send(eventKey{ObjectID: ev.ObjectID, EventID: ev.ID}, ev)
+	}
+}
+
+// flush publishes a committed transaction's buffered events (object changes then
+// event-log runs).
 func (s *sqliteStore) flush(coll *eventCollector) {
 	coll.mu.Lock()
 	defer coll.mu.Unlock()
 	for _, p := range coll.events {
 		s.publish(p.gk, p.ev)
 	}
+	for _, p := range coll.logRows {
+		s.publishEvent(p.gk, p.ev)
+	}
 }
 
-// watcherImpl streams a snapshot followed by live events on out. A merge
+// watcherImpl streams a snapshot followed by live items on out. A merge
 // goroutine owns out and the receiver; Close cancels its context, which makes
-// the goroutine exit, close the receiver, and close out.
-type watcherImpl struct {
-	out    chan storeapi.RawWatchEvent
+// the goroutine exit, close the receiver, and close out. V is the streamed item
+// type — RawWatchEvent for object watches, Event for the event log.
+type watcherImpl[V any] struct {
+	out    chan V
 	cancel context.CancelFunc
 }
 
-func (w *watcherImpl) Events() <-chan storeapi.RawWatchEvent { return w.out }
-func (w *watcherImpl) Close()                                { w.cancel() }
+func (w *watcherImpl[V]) Events() <-chan V { return w.out }
+func (w *watcherImpl[V]) Close()           { w.cancel() }
 
 func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
 	return s.watch(ctx, gk, nil, true, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
@@ -191,7 +263,7 @@ func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (sto
 	})
 }
 
-func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
+func (s *sqliteStore) WatchChanges(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
 	// No snapshot, so the dedup floor is 0: a fresh receiver already starts at
 	// the current write position, and resource_version is always >= 1, so every
 	// event the receiver sees is genuinely post-subscribe and nothing is dropped.
@@ -247,7 +319,7 @@ func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context)
 // stream is the snapshot (as Added events) followed by live events not already
 // covered by the snapshot. filterID, if non-nil, restricts live events to that
 // object. hasSnapshot must be true for WatchList/Watch (which take a real
-// snapshot) and false for WatchEvents (which skip the snapshot entirely).
+// snapshot) and false for WatchChanges (which skip the snapshot entirely).
 //
 // The receiver is created BEFORE the snapshot is loaded so events that commit
 // during the load are buffered, not lost; events whose resource version is at or
@@ -278,10 +350,10 @@ func (s *sqliteStore) watch(
 	// would leak as a live hub subscriber that buffers every object forever.
 	//   - Single-object watch: scope the subscription to that id so the receiver
 	//     never buffers unrelated objects (memory bounded by the one id).
-	//   - WatchList/WatchEvents: an annihilating merge so transient objects the
+	//   - WatchList/WatchChanges: an annihilating merge so transient objects the
 	//     consumer never saw are dropped at enqueue (memory bounded by the live
 	//     key set, not by the count of distinct deleted ids a slow consumer falls
-	//     behind on). WatchList must preserve snapshot-covered deletes; WatchEvents
+	//     behind on). WatchList must preserve snapshot-covered deletes; WatchChanges
 	//     has no snapshot, so it annihilates every unobserved Added→Deleted pair.
 	var rx *conflate.Receiver[storeapi.ObjectID, storeapi.RawWatchEvent]
 	var seed atomic.Pointer[snapshotIDs] // published to the merge once the snapshot is known
@@ -315,7 +387,7 @@ func (s *sqliteStore) watch(
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := &watcherImpl{out: make(chan storeapi.RawWatchEvent), cancel: cancel}
+	w := &watcherImpl[storeapi.RawWatchEvent]{out: make(chan storeapi.RawWatchEvent), cancel: cancel}
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -340,7 +412,7 @@ func (s *sqliteStore) watch(
 		}
 		// seenIDs tracks every object ID the consumer has been told about, so
 		// the live stream can correct event types and drop orphan tombstones.
-		// Only used when there is a real snapshot; WatchEvents (hasSnapshot=false)
+		// Only used when there is a real snapshot; WatchChanges (hasSnapshot=false)
 		// streams raw live events and needs no correction.
 		var seenIDs map[storeapi.ObjectID]struct{}
 		if hasSnapshot {
@@ -392,6 +464,122 @@ func (s *sqliteStore) watch(
 					}
 					delete(seenIDs, ev.Object.ID)
 				}
+			}
+			if !send(ev) {
+				return
+			}
+		}
+	}()
+	return w, nil
+}
+
+// eventMatchesQuery reports whether a live run passes q's field filters. Limit
+// bounds only the snapshot, so it is not applied here.
+func eventMatchesQuery(ev storeapi.Event, q storeapi.EventQuery) bool {
+	if q.Category != nil && ev.Category != *q.Category {
+		return false
+	}
+	if q.Type != "" && ev.Type != q.Type {
+		return false
+	}
+	if q.Reason != "" && ev.Reason != q.Reason {
+		return false
+	}
+	// Compare at stored (millisecond) precision, matching ListEvents' toMillis(Since)
+	// bound: a sub-millisecond Since (e.g. time.Now()) must not drop a live run in
+	// that same millisecond that the snapshot query would keep.
+	if !q.Since.IsZero() && toMillis(ev.LastAt) < toMillis(q.Since) {
+		return false
+	}
+	return true
+}
+
+// WatchEvents streams id's event log within gk: the runs matching q as a
+// snapshot, then live runs. The receiver is created before the snapshot loads so
+// runs committed during the load are buffered, not lost; a run already reflected
+// in the snapshot (resource_version at or below its high-water) is then dropped.
+func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, q storeapi.EventQuery) (storeapi.EventWatcher, error) {
+	h := s.eventHubFor(gk)
+	if h == nil {
+		return nil, errStoreClosed
+	}
+	// Key-filter to this object: the run id in the key makes the filter exact
+	// without inspecting values, so the receiver never buffers other objects' runs.
+	rx := h.ReceiverFunc(func(k eventKey) bool { return k.ObjectID == id })
+	if s.beforeSnapshot != nil {
+		s.beforeSnapshot() // test seam: inject runs into the subscribe→snapshot window
+	}
+	// Snapshot the current runs and the global cursor in one read (snapshotAt's
+	// event twin): the scalar high-water dedups any live run already listed.
+	var snapshot []storeapi.Event
+	var hw int64
+	var objectExists bool
+	err := s.Within(ctx, func(ctx context.Context) error {
+		// Scope the snapshot to gk: the live stream is already gk-scoped (its hub),
+		// so an unscoped ListEvents(id) would leak a foreign object's log and
+		// disagree with the live half. A missing or wrong-kind id yields an empty
+		// snapshot — the live stream delivers nothing for it either.
+		var err error
+		if objectExists, err = s.objectInKind(ctx, gk, id); err != nil {
+			return err
+		}
+		if objectExists {
+			if snapshot, err = s.ListEvents(ctx, id, q); err != nil {
+				return err
+			}
+		}
+		hw, err = currentResourceVersion(ctx, s.conn(ctx))
+		return err
+	})
+	if err != nil {
+		rx.Close()
+		return nil, err
+	}
+
+	wctx, cancel := context.WithCancel(ctx)
+	w := &watcherImpl[storeapi.Event]{out: make(chan storeapi.Event), cancel: cancel}
+	go func() {
+		if s.afterStream != nil {
+			defer s.afterStream()
+		}
+		defer close(w.out)
+		defer rx.Close()
+		send := func(ev storeapi.Event) bool {
+			select {
+			case w.out <- ev:
+				return true
+			case <-wctx.Done():
+				return false
+			case <-s.done:
+				return false
+			}
+		}
+		// ListEvents is newest-first; deliver the snapshot oldest-first so the
+		// timeline builds in order. Record which runs it carried, to dedup their
+		// race-window republish below.
+		seen := make(map[storeapi.EventID]struct{}, len(snapshot))
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			seen[snapshot[i].ID] = struct{}{}
+			if !send(snapshot[i]) {
+				return
+			}
+		}
+		snapshot = nil
+		for {
+			ev, err := rx.RecvContext(wctx)
+			if err != nil {
+				return // ctx cancelled, watcher closed, or hub closed
+			}
+			// Drop a run committed at or below the snapshot's high-water when it is
+			// already reflected: either the snapshot delivered it, or the object was
+			// deleted before the snapshot (its log empty by deletion, not Limit
+			// truncation) so the buffered run is stale. A Limit-truncated run of a live
+			// object is NOT dropped — Limit bounds only the snapshot, so it streams live.
+			if _, inSnapshot := seen[ev.ID]; ev.ResourceVersion <= hw && (!objectExists || inSnapshot) {
+				continue
+			}
+			if !eventMatchesQuery(ev, q) {
+				continue // q filters the live stream too, not just the snapshot
 			}
 			if !send(ev) {
 				return
