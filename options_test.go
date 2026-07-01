@@ -36,6 +36,40 @@ func TestWithResyncIntervalDispatch(t *testing.T) {
 	require.NoError(t, WithResyncInterval(time.Second)("unrelated"))
 }
 
+// resolveEvents folds the per-call EventOptions into one EventQuery; the empty
+// set is the zero query (every run for the object).
+func TestResolveEvents(t *testing.T) {
+	since := time.Now()
+	q := resolveEvents([]EventOption{
+		WithEventCategory("connection"),
+		WithEventType(EventWarning),
+		WithEventReason("ProbeFailed"),
+		WithEventLimit(5),
+		WithEventsSince(since),
+	})
+	require.NotNil(t, q.Category)
+	assert.Equal(t, "connection", *q.Category)
+	assert.Equal(t, "Warning", q.Type)
+	assert.Equal(t, "ProbeFailed", q.Reason)
+	assert.Equal(t, 5, q.Limit)
+	assert.Equal(t, since, q.Since)
+
+	empty := resolveEvents(nil)
+	assert.Nil(t, empty.Category, "no category filter unless requested")
+	assert.Zero(t, empty.Limit)
+}
+
+func TestWithEventRetentionDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithEventRetention(50, time.Hour)(bh))
+	assert.Equal(t, 50, bh.eventRetentionPerObject)
+	assert.Equal(t, time.Hour, bh.eventRetentionMaxAge)
+
+	// Retention is global (Beehive-level); other targets ignore it.
+	require.NoError(t, WithEventRetention(9, time.Minute)(&reconciler{}))
+	require.NoError(t, WithEventRetention(9, time.Minute)("unrelated"))
+}
+
 func TestWithMaxRetryIntervalDispatch(t *testing.T) {
 	r := &reconciler{}
 	require.NoError(t, WithMaxRetryInterval(9*time.Second)(r))

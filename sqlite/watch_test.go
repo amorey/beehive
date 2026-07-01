@@ -29,6 +29,187 @@ import (
 
 var errWatchBoom = errors.New("boom")
 
+// recvLogEvent waits for the next event-log run on w, failing on timeout/close.
+func recvLogEvent(t *testing.T, w storeapi.EventWatcher) storeapi.Event {
+	t.Helper()
+	select {
+	case ev, ok := <-w.Events():
+		if !ok {
+			t.Fatal("event watcher channel closed unexpectedly")
+		}
+		return ev
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for log event")
+		panic("unreachable")
+	}
+}
+
+// assertNoLogEvent fails if any event-log run arrives on w within d.
+func assertNoLogEvent(t *testing.T, w storeapi.EventWatcher, d time.Duration) {
+	t.Helper()
+	select {
+	case ev, ok := <-w.Events():
+		if ok {
+			t.Fatalf("unexpected log event: %+v", ev)
+		}
+		t.Fatal("event watcher channel closed unexpectedly")
+	case <-time.After(d):
+	}
+}
+
+// mergeEvent keeps the higher-resource-version run, so a slow subscriber
+// converges to a run's latest count/window rather than seeing every bump.
+func TestMergeEvent(t *testing.T) {
+	older := storeapi.Event{ID: 1, ResourceVersion: 5, Count: 1}
+	newer := storeapi.Event{ID: 1, ResourceVersion: 7, Count: 3}
+
+	got, keep := mergeEvent(older, newer)
+	assert.True(t, keep)
+	assert.EqualValues(t, 7, got.ResourceVersion)
+	assert.Equal(t, 3, got.Count, "latest count wins")
+
+	got, keep = mergeEvent(newer, older) // prev already newer
+	assert.True(t, keep)
+	assert.EqualValues(t, 7, got.ResourceVersion)
+	assert.Equal(t, 3, got.Count)
+}
+
+// eventMatchesQuery bounds Since at stored (millisecond) precision, matching
+// ListEvents' toMillis(Since) SQL bound, so a sub-millisecond Since doesn't drop a
+// live run in that same millisecond that the snapshot would keep.
+func TestEventMatchesQuerySincePrecision(t *testing.T) {
+	const ms = int64(1_700_000_000_123)
+	// Since carries a sub-millisecond remainder within the run's millisecond.
+	q := storeapi.EventQuery{Since: fromMillis(ms).Add(700 * time.Microsecond)}
+
+	atBoundary := storeapi.Event{LastAt: fromMillis(ms)}
+	assert.True(t, eventMatchesQuery(atBoundary, q),
+		"a run at the truncated-ms bound must pass, matching the snapshot query")
+
+	earlier := storeapi.Event{LastAt: fromMillis(ms - 1)}
+	assert.False(t, eventMatchesQuery(earlier, q), "a run a full millisecond earlier is filtered")
+}
+
+// WatchEvents delivers the object's current runs as a snapshot (oldest-first),
+// then streams live runs.
+func TestWatchEventsSnapshotThenLive(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Connected"})
+	require.NoError(t, err)
+
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	defer w.Close()
+
+	assert.Equal(t, "ProbeFailed", recvLogEvent(t, w).Reason, "snapshot oldest-first")
+	assert.Equal(t, "Connected", recvLogEvent(t, w).Reason)
+
+	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "TLSHandshake"})
+	require.NoError(t, err)
+	assert.Equal(t, "TLSHandshake", recvLogEvent(t, w).Reason, "streamed live after the snapshot")
+}
+
+// A run buffered in the race window whose object is deleted before the snapshot
+// is stale (the snapshot is empty by deletion, not Limit truncation) and must not
+// be delivered — there are no tombstones in this stream to clear a phantom.
+func TestWatchEventsDropsRaceWindowRunsForDeletedObject(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	// Record a run then delete the object, both in the subscribe→snapshot window:
+	// the run is buffered in the receiver, but the FK cascade removes it before the
+	// snapshot reads, so ListEvents (and the object scope-check) see it gone.
+	store.beforeSnapshot = func() {
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+		require.NoError(t, err)
+		require.NoError(t, store.DeleteObject(ctx, id))
+	}
+
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	defer w.Close()
+
+	assertNoLogEvent(t, w, 200*time.Millisecond)
+}
+
+// WatchEvents scopes its snapshot to gk: a foreign id's existing log must not
+// leak through the snapshot, keeping it consistent with the gk-scoped live stream.
+func TestWatchEventsScopesSnapshotToKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store) // belongs to testGK
+
+	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	require.NoError(t, err)
+
+	// Watch the same id under a different kind: the snapshot must be empty, not the
+	// testGK object's log.
+	w, err := store.WatchEvents(ctx, beehive.GroupKind{Kind: "Other"}, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	defer w.Close()
+
+	assertNoLogEvent(t, w, 200*time.Millisecond)
+}
+
+// A Limit bounds only the snapshot: a matching run committed in the
+// subscribe→snapshot window but truncated from the (limited) snapshot must still
+// stream live, not be dropped by the resource-version dedup.
+func TestWatchEventsLimitDoesNotDropRaceWindowRuns(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	// Two distinct runs commit in the race window; both carry rv ≤ the snapshot's
+	// high-water. With Limit 1 the snapshot carries only the newest (Second); the
+	// older run (First) is excluded by the limit and must arrive live.
+	store.beforeSnapshot = func() {
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "First"})
+		require.NoError(t, err)
+		_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Second"})
+		require.NoError(t, err)
+	}
+
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{Limit: 1})
+	require.NoError(t, err)
+	defer w.Close()
+
+	got := map[string]bool{}
+	got[recvLogEvent(t, w).Reason] = true
+	got[recvLogEvent(t, w).Reason] = true
+	assert.True(t, got["Second"], "snapshot run delivered")
+	assert.True(t, got["First"], "limit-excluded race-window run must still stream live")
+}
+
+// The query filters the live stream too, not just the snapshot: an emission in
+// another category never reaches a category-scoped subscriber.
+func TestWatchEventsFiltersLiveByCategory(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	conn := "connection"
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{Category: &conn})
+	require.NoError(t, err)
+	defer w.Close()
+
+	// An out-of-category emission must be skipped, so the first delivered run is
+	// the connection one that follows it.
+	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "Synced"})
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Warning", Reason: "ProbeFailed"})
+	require.NoError(t, err)
+
+	got := recvLogEvent(t, w)
+	assert.Equal(t, "connection", got.Category)
+	assert.Equal(t, "ProbeFailed", got.Reason)
+}
+
 // recvEvent waits for the next event on w, failing the test if none arrives or
 // the channel closes within the failsafe timeout.
 func recvEvent(t *testing.T, w beehive.Watcher) storeapi.RawWatchEvent {
@@ -251,21 +432,21 @@ func TestWatchAfterCloseErrors(t *testing.T) {
 	require.ErrorIs(t, err, errStoreClosed)
 	_, err = store.Watch(context.Background(), testGK, 1)
 	require.ErrorIs(t, err, errStoreClosed)
-	_, err = store.WatchEvents(context.Background(), testGK)
+	_, err = store.WatchChanges(context.Background(), testGK)
 	require.ErrorIs(t, err, errStoreClosed)
 }
 
-// TestWatchEventsSkipsSnapshot verifies WatchEvents delivers no initial snapshot
+// TestWatchChangesSkipsSnapshot verifies WatchChanges delivers no initial snapshot
 // for pre-existing objects, but does stream subsequent live changes.
-func TestWatchEventsSkipsSnapshot(t *testing.T) {
+func TestWatchChangesSkipsSnapshot(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	// A pre-existing object: WatchList would replay it as Added; WatchEvents must not.
+	// A pre-existing object: WatchList would replay it as Added; WatchChanges must not.
 	pre, err := store.CreateObject(ctx, newWatchObject())
 	require.NoError(t, err)
 
-	w, err := store.WatchEvents(ctx, testGK)
+	w, err := store.WatchChanges(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	assertNoEvent(t, w, 200*time.Millisecond)
@@ -278,13 +459,13 @@ func TestWatchEventsSkipsSnapshot(t *testing.T) {
 	assert.Equal(t, pre.ID, ev.Object.ID)
 }
 
-// TestWatchEventsStreamsLiveAdded verifies a newly created object reaches a
-// WatchEvents subscriber as an Added event (only the initial snapshot is skipped).
-func TestWatchEventsStreamsLiveAdded(t *testing.T) {
+// TestWatchChangesStreamsLiveAdded verifies a newly created object reaches a
+// WatchChanges subscriber as an Added event (only the initial snapshot is skipped).
+func TestWatchChangesStreamsLiveAdded(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	w, err := store.WatchEvents(ctx, testGK)
+	w, err := store.WatchChanges(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -556,7 +737,7 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 	assert.Equal(t, beehive.WatchEventDeleted, got.Type)
 }
 
-// TestAnnihilatingMergeForEvents verifies the WatchEvents memory bound: with no
+// TestAnnihilatingMergeForEvents verifies the WatchChanges memory bound: with no
 // snapshot to preserve (preserve == nil), every unobserved Added→Deleted pair is
 // annihilated, while a non-delete coalescence still survives.
 func TestAnnihilatingMergeForEvents(t *testing.T) {
@@ -774,4 +955,111 @@ func TestWatchLiveSendCtxDone(t *testing.T) {
 	<-exited
 	_, ok := <-w.Events()
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
+}
+
+// WatchEvents on a closed store returns errStoreClosed (nil event hub).
+func TestWatchEventsAfterCloseErrors(t *testing.T) {
+	store := newRawStore(t)
+	require.NoError(t, store.Close())
+	_, err := store.WatchEvents(context.Background(), testGK, 1, storeapi.EventQuery{})
+	require.ErrorIs(t, err, errStoreClosed)
+}
+
+// emitEvent outside a transaction publishes immediately (no collector on ctx).
+func TestEmitEventOutsideTransaction(t *testing.T) {
+	store := newRawStore(t)
+	// No collector in ctx → the publishEvent path; no watcher, so the send drops.
+	store.emitEvent(context.Background(), testGK, &storeapi.Event{ID: 1, ObjectID: 1})
+}
+
+// eventMatchesQuery filters a live run by type and by reason.
+func TestEventMatchesQueryTypeAndReason(t *testing.T) {
+	run := storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed", LastAt: fromMillis(1)}
+	assert.False(t, eventMatchesQuery(run, storeapi.EventQuery{Type: "Normal"}))
+	assert.False(t, eventMatchesQuery(run, storeapi.EventQuery{Reason: "Other"}))
+	assert.True(t, eventMatchesQuery(run, storeapi.EventQuery{Type: "Warning", Reason: "ProbeFailed"}))
+}
+
+// WatchEvents surfaces snapshot faults: the object scope-check and the list query.
+func TestWatchEventsSnapshotErrors(t *testing.T) {
+	t.Run("object scope check fails", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		store.beforeSnapshot = func() { dropObjectsTable(t, store) }
+		_, err := store.WatchEvents(context.Background(), testGK, id, storeapi.EventQuery{})
+		require.Error(t, err)
+	})
+	t.Run("snapshot list fails", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		store.beforeSnapshot = func() { dropEventsTable(t, store) }
+		_, err := store.WatchEvents(context.Background(), testGK, id, storeapi.EventQuery{})
+		require.Error(t, err)
+	})
+}
+
+// The snapshot send exits on context cancellation (afterStream confirms exit).
+func TestWatchEventsSnapshotSendCtxDone(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+	require.NoError(t, err)
+
+	exited := make(chan struct{})
+	store.afterStream = func() { close(exited) }
+	wctx, cancel := context.WithCancel(ctx)
+	w, err := store.WatchEvents(wctx, testGK, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+
+	cancel() // goroutine parks on the snapshot send (no reader) → ctx.Done
+	<-exited
+	_, ok := <-w.Events()
+	assert.False(t, ok)
+}
+
+// The live send exits on context cancellation. beforeSnapshot buffers a live run
+// (RecvContext prefers a ready value over a cancelled ctx), so with an empty
+// snapshot the goroutine reaches the live send and takes the ctx.Done arm.
+func TestWatchEventsLiveSendCtxDone(t *testing.T) {
+	store := newRawStore(t)
+	id := newEventObject(t, store)
+	exited := make(chan struct{})
+	store.afterStream = func() { close(exited) }
+	ctx, cancel := context.WithCancel(context.Background())
+
+	store.beforeSnapshot = func() {
+		store.publishEvent(testGK, storeapi.Event{
+			ID: 1, ObjectID: id, Category: "c", Type: "Normal", Reason: "R",
+			FirstAt: fromMillis(1), LastAt: fromMillis(1), ResourceVersion: 1 << 30,
+		})
+	}
+
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{}) // empty snapshot, one buffered run
+	require.NoError(t, err)
+
+	cancel() // goroutine parks on the live send → ctx.Done
+	<-exited
+	_, ok := <-w.Events()
+	assert.False(t, ok)
+}
+
+// The send exits when the store closes while parked (the s.done arm, distinct
+// from ctx cancellation — closing the hub only wakes a receive, not a send).
+func TestWatchEventsSendStoreClose(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+	require.NoError(t, err)
+
+	exited := make(chan struct{})
+	store.afterStream = func() { close(exited) }
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Close()) // goroutine parked on the snapshot send → s.done
+	<-exited
+	_, ok := <-w.Events()
+	assert.False(t, ok)
 }

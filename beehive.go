@@ -42,6 +42,10 @@ type Beehive struct {
 	store          Store
 	resyncInterval time.Duration
 	concurrency    int // default worker count for all controllers; 0/1 = single-threaded
+	// Event-log retention, applied globally by the GC sweeper (see WithEventRetention).
+	// Zero on both disables the sweep — the log grows unbounded until configured.
+	eventRetentionPerObject int
+	eventRetentionMaxAge    time.Duration
 	// startupReconcile is the default startup strategy copied into each reconciler.
 	startupReconcile StartupReconcileStrategy
 	// logger and logLevel are the user-supplied logging config (nil logger =
@@ -123,7 +127,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// and resync disabled). A subscribe failure is non-fatal: that controller
 	// still resyncs on its own timer.
 	for _, r := range bh.order {
-		w, err := bh.store.WatchEvents(runCtx, r.gk)
+		w, err := bh.store.WatchChanges(runCtx, r.gk)
 		if err != nil {
 			bh.logger.Warn("dependency waker subscription failed; relying on resync",
 				"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
@@ -162,6 +166,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 // backstop.
 func (bh *Beehive) runGCSweeper(ctx context.Context) {
 	bh.sweepDeletionPending(ctx)
+	bh.sweepEventRetention(ctx)
 	if bh.resyncInterval <= 0 {
 		<-ctx.Done()
 		return
@@ -174,7 +179,20 @@ func (bh *Beehive) runGCSweeper(ctx context.Context) {
 			return
 		case <-ticker.C:
 			bh.sweepDeletionPending(ctx)
+			bh.sweepEventRetention(ctx)
 		}
+	}
+}
+
+// sweepEventRetention trims the event log to the configured retention (see
+// WithEventRetention). It is a no-op unless a bound is set, and best-effort: a
+// failed sweep is retried on the next cadence tick.
+func (bh *Beehive) sweepEventRetention(ctx context.Context) {
+	if bh.eventRetentionPerObject <= 0 && bh.eventRetentionMaxAge <= 0 {
+		return
+	}
+	if _, err := bh.store.SweepEvents(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
+		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }
 

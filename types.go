@@ -15,6 +15,7 @@
 package beehive
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -48,6 +49,8 @@ const (
 	LoadDependentsBit
 	// LoadOwnedBit selects the objects this one owns (incoming owned_by edges).
 	LoadOwnedBit
+	// LoadEventsBit selects the object's event-log runs (see LoadEvents).
+	LoadEventsBit
 )
 
 // Object is a single resource: user-owned desired state (Spec) plus
@@ -75,10 +78,11 @@ type Object[Spec, Status any] struct {
 	// actually fetched, so the GetOwner/ListDependencies/ListDependents/ListOwned
 	// accessors distinguish "loaded and empty" from "never asked". These fields are
 	// unexported; reach for the accessors, never the backing storage.
-	owner        *Ref  // the owning object, if any
-	dependencies []Ref // objects this one depends on
-	dependents   []Ref // objects that depend on this one
-	owned        []Ref // objects this one owns
+	owner        *Ref    // the owning object, if any
+	dependencies []Ref   // objects this one depends on
+	dependents   []Ref   // objects that depend on this one
+	owned        []Ref   // objects this one owns
+	events       []Event // the object's event-log runs
 	loaded       LoadSet
 }
 
@@ -130,6 +134,17 @@ func (o *Object[Spec, Status]) ListOwned() ([]Ref, error) {
 	return o.owned, nil
 }
 
+// ListEvents returns the object's event-log runs, newest-first, or ErrNotLoaded
+// if LoadEvents() was not passed to the read. A loaded-but-empty log is an empty
+// slice with a nil error. (Use the lazy Client.ListEvents to fetch on demand, or
+// to filter/limit.)
+func (o *Object[Spec, Status]) ListEvents() ([]Event, error) {
+	if o.loaded&LoadEventsBit == 0 {
+		return nil, fmt.Errorf("%w: events (pass LoadEvents())", ErrNotLoaded)
+	}
+	return o.events, nil
+}
+
 // Result is returned by a controller's Reconcile to influence requeueing.
 type Result struct {
 	// RequeueAfter requeues the object after the given delay. Zero means no
@@ -158,4 +173,58 @@ type Condition struct {
 	// condition written by a prior process to Unknown ("verifying") until a
 	// controller re-confirms it. The default (false) is durable store-truth.
 	Liveness bool
+}
+
+// EventID is the store-assigned unique identifier for an event run.
+type EventID = storeapi.EventID
+
+// EventType classifies an event's severity: Normal (✓) or Warning (✗).
+type EventType string
+
+const (
+	EventNormal  EventType = "Normal"
+	EventWarning EventType = "Warning"
+)
+
+// EventSpec is the caller-supplied portion of an event, passed to
+// ControllerClient.RecordEvent. It excludes the store-owned run fields (id,
+// count, window) so a caller can't set them. Consecutive emissions sharing
+// (Category, Type, Reason) coalesce into one run; Message and Detail are sampled
+// (latest wins), not part of that key.
+type EventSpec struct {
+	Category string // independent timeline; "" = default
+	Type     EventType
+	Reason   string // machine-readable token, e.g. "ProbeFailed"
+	Message  string // human-readable; sampled, not keyed
+	Detail   any    // optional payload; marshaled on write; nil = none
+}
+
+// Event is one contiguous run of observations about an object, aggregated by
+// (Category, Type, Reason). Count grows and the [FirstAt, LastAt] window widens
+// while the run holds; a change in the key starts a new run.
+type Event struct {
+	ID       EventID
+	ObjectID ObjectID // object this event is about
+	Category string
+	Type     EventType
+	Reason   string
+	Message  string          // latest occurrence's message
+	Detail   json.RawMessage // latest occurrence's payload; nil = none
+	Count    int             // occurrences in this run (>= 1)
+	FirstAt  time.Time       // run start
+	LastAt   time.Time       // run end (latest occurrence)
+}
+
+// EventDetail unmarshals an event's Detail payload into T. An empty Detail
+// yields the zero value with a nil error; otherwise it returns the result of
+// json.Unmarshal. It is a free generic helper over the non-generic Event, so a
+// single timeline can carry reasons with different detail shapes — decode each
+// with the type its Reason implies.
+func EventDetail[T any](e Event) (T, error) {
+	var v T
+	if len(e.Detail) == 0 {
+		return v, nil
+	}
+	err := json.Unmarshal(e.Detail, &v)
+	return v, err
 }

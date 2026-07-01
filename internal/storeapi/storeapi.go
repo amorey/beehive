@@ -34,6 +34,9 @@ type GroupKind struct {
 // ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = int64
 
+// EventID is the store-assigned unique identifier for an event run.
+type EventID = int64
+
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = errors.New("beehive: object not found")
 
@@ -77,6 +80,15 @@ type Watcher interface {
 	Close()
 }
 
+// EventWatcher is a subscription to one object's event log: the current runs
+// (the snapshot) followed by live runs, each an aggregated Event. Unlike Watcher
+// there are no tombstones — a run only appears or updates — so a lagging
+// subscriber converges to each run's latest count/window. Close is idempotent.
+type EventWatcher interface {
+	Events() <-chan Event
+	Close()
+}
+
 // Condition is the untyped form of a single condition row. Status is one of
 // "True"/"False"/"Unknown"; Liveness marks a condition derived from a live
 // in-process resource (valid only within the writing process — see the read
@@ -91,6 +103,38 @@ type Condition struct {
 	Liveness       bool
 	TransitionedAt time.Time
 	UpdatedAt      time.Time
+}
+
+// Event is the untyped form of a single event-log row: one contiguous run of
+// observations about an object, aggregated by (Category, Type, Reason). Detail is
+// opaque JSON the store never inspects. The client decodes these into the public,
+// generic-free beehive.Event; the store-only ResourceVersion cursor stops at that
+// boundary.
+type Event struct {
+	ID              EventID
+	ObjectID        ObjectID
+	Category        string
+	Type            string
+	Reason          string
+	Message         string
+	Detail          []byte // opaque JSON payload; nil when none
+	Count           int
+	FirstAt         time.Time
+	LastAt          time.Time
+	ResourceVersion int64
+}
+
+// EventQuery filters and bounds a ListEvents read. The zero value selects every
+// run for the object, newest first (by LastAt, then id). The client builds one
+// from its EventOptions; the store never sees the option type.
+type EventQuery struct {
+	// Category, when non-nil, restricts to that exact timeline (including "", the
+	// default). Nil returns every category interleaved.
+	Category *string
+	Type     string    // "" = any type
+	Reason   string    // "" = any reason
+	Since    time.Time // zero = no lower bound; else runs with LastAt >= Since
+	Limit    int       // 0 = no limit; else the newest N runs
 }
 
 // RawObject is the untyped row below the generic boundary. Spec and Status are
@@ -251,6 +295,39 @@ type Store interface {
 	// write every sweep.
 	MarkOwnedForDeletion(ctx context.Context, ownerID ObjectID) ([]Referrer, error)
 
+	// RecordEvent records an observation about id in the (id, ev.Category) timeline,
+	// aggregating into contiguous runs: if the latest run there shares ev's
+	// (Type, Reason) it is extended (Count++, LastAt bumped, Message/Detail
+	// re-sampled), else a new run is appended (Count 1). Only ev's
+	// Category/Type/Reason/Message/Detail are read; the store assigns the rest and
+	// returns the run. The compare is scoped to (id, Category), so an interleaved
+	// other-category emission never breaks this run. Scoped to gk: foreign id
+	// ErrWrongKind, missing id ErrNotFound.
+	RecordEvent(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
+
+	// ListEvents returns id's event runs matching q, newest first (by LastAt, then
+	// id). The zero EventQuery returns every run for the object. Reads by object id
+	// only — not kind-scoped, like the ref-list reads.
+	ListEvents(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
+
+	// GetLatestEvent returns the most recent run in id's category timeline, or nil
+	// if that timeline has no events. Reads by object id only (not kind-scoped).
+	GetLatestEvent(ctx context.Context, id ObjectID, category string) (*Event, error)
+
+	// WatchEvents subscribes to id's event log within gk: the runs matching q as a
+	// snapshot (oldest-first), then live runs. q filters both the snapshot and the
+	// live stream (Limit bounds only the snapshot). Runs conflate per run id, so a
+	// lagging subscriber converges to each run's latest state.
+	WatchEvents(ctx context.Context, gk GroupKind, id ObjectID, q EventQuery) (EventWatcher, error)
+
+	// SweepEvents trims the event log by retention, returning the number of runs
+	// deleted. perObject > 0 caps each (object, category) timeline to its newest
+	// perObject runs (a ring, so a flapping timeline can't evict a quiet one);
+	// maxAge > 0 drops any run whose LastAt is older than maxAge. A zero bound is
+	// skipped. It sweeps every object of every kind — retention is global, not
+	// per-kind — so the global GC sweeper calls it once per pass.
+	SweepEvents(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
+
 	// AddRef inserts a directed (fromID -> toID) edge with the given relation.
 	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on
 	// the object, so it bumps no version and emits no event.
@@ -317,9 +394,9 @@ type Store interface {
 	// an Added snapshot, then all live changes for the kind.
 	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
 
-	// WatchEvents returns a Watcher for live changes to gk only — no initial
+	// WatchChanges returns a Watcher for live changes to gk only — no initial
 	// snapshot. Use it when current state is already accounted for elsewhere and
 	// only subsequent changes matter (e.g. the dependency waker), to skip the
 	// snapshot build that WatchList would do on every subscribe.
-	WatchEvents(ctx context.Context, gk GroupKind) (Watcher, error)
+	WatchChanges(ctx context.Context, gk GroupKind) (Watcher, error)
 }

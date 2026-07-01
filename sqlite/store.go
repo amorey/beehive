@@ -38,10 +38,13 @@ type sqliteStore struct {
 	processStart time.Time
 
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
-	// created lazily on first use. hubMu guards the map and the closed flag.
-	hubMu  sync.RWMutex
-	hubs   map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent]
-	closed bool
+	// created lazily on first use. hubMu guards the maps and the closed flag.
+	hubMu sync.RWMutex
+	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent]
+	// eventHubs fan the event log out, one per GroupKind, keyed by run so a run's
+	// count-bumps conflate while distinct runs stay separate (see eventKey).
+	eventHubs map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]
+	closed    bool
 	// done is closed by Close to wake watcher goroutines that are parked on a
 	// send (closing the hub only wakes those parked on a receive).
 	done chan struct{}
@@ -70,7 +73,11 @@ func (s *sqliteStore) Close() error {
 		for _, h := range s.hubs {
 			h.Close()
 		}
+		for _, h := range s.eventHubs {
+			h.Close()
+		}
 		s.hubs = nil
+		s.eventHubs = nil
 	}
 	s.hubMu.Unlock()
 	return s.db.Close()
@@ -228,6 +235,20 @@ func (s *sqliteStore) getObjectRowScoped(ctx context.Context, gk storeapi.GroupK
 			storeapi.ErrWrongKind, id, obj.Group, obj.Kind, gk.Group, gk.Kind)
 	}
 	return obj, nil
+}
+
+// objectInKind reports whether id exists and belongs to gk. A missing id
+// (ErrNotFound) or foreign id (ErrWrongKind) reports false without erroring —
+// used to scope a read to gk while treating "not this kind's object" as empty
+// rather than a failure; other read errors propagate.
+func (s *sqliteStore) objectInKind(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
+	if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
+		if errors.Is(err, storeapi.ErrNotFound) || errors.Is(err, storeapi.ErrWrongKind) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *sqliteStore) GetObject(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
@@ -657,6 +678,202 @@ func (s *sqliteStore) DeleteCondition(ctx context.Context, gk storeapi.GroupKind
 		return err
 	})
 	return result, err
+}
+
+// eventColumns is the canonical select list for an event row; scanEvent reads
+// them in order.
+const eventColumns = `id, object_id, category, type, reason, message, detail,
+	count, first_at, last_at, resource_version`
+
+// scanEvent decodes one event row in eventColumns order. message is "" when
+// NULL; detail is opaque JSON bytes, nil when NULL.
+func scanEvent(sc scanner) (*storeapi.Event, error) {
+	var e storeapi.Event
+	var message sql.NullString
+	var firstMs, lastMs int64
+	if err := sc.Scan(&e.ID, &e.ObjectID, &e.Category, &e.Type, &e.Reason,
+		&message, &e.Detail, &e.Count, &firstMs, &lastMs, &e.ResourceVersion); err != nil {
+		return nil, err
+	}
+	e.Message = message.String
+	e.FirstAt = fromMillis(firstMs)
+	e.LastAt = fromMillis(lastMs)
+	return &e, nil
+}
+
+// latestEventRun returns the full newest run for (id, category), or nil if that
+// timeline is empty. GetLatestEvent returns it as-is.
+func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
+	row := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`, id, category)
+	e, err := scanEvent(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// latestEventKey returns just the run key (id, type, reason) of the newest run
+// for (id, category), or ok=false if that timeline is empty. RecordEvent needs
+// only the key to decide extend-vs-append, so it deliberately does not decode the
+// full row (unlike GetLatestEvent): probing the columns it is about to discard
+// would let a decode fault in an older run mask — rather than surface through —
+// the write RecordEvent is about to make.
+func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
+	row := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`, id, category)
+	err = row.Scan(&evID, &typ, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", "", false, nil
+	}
+	if err != nil {
+		return 0, "", "", false, err
+	}
+	return evID, typ, reason, true, nil
+}
+
+func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
+	// Within serializes the read-latest-then-write (via _txlock=immediate) so the
+	// run-boundary decision can't race, and joins the caller's tx when nested.
+	var result *storeapi.Event
+	err := s.Within(ctx, func(ctx context.Context) error {
+		c := s.conn(ctx)
+		// Scoped read enforces the kind boundary (ErrNotFound/ErrWrongKind), like
+		// SetCondition — the events table carries no group/kind to fold in.
+		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
+			return err
+		}
+		rv, err := nextResourceVersion(ctx, c)
+		if err != nil {
+			return err
+		}
+		now := toMillis(time.Now().UTC())
+
+		latestID, latestType, latestReason, hasLatest, err := s.latestEventKey(ctx, id, ev.Category)
+		if err != nil {
+			return err
+		}
+		var row *sql.Row
+		if hasLatest && latestType == ev.Type && latestReason == ev.Reason {
+			// Extend: bump count and window end, re-sample message/detail, advance rv.
+			row = c.QueryRowContext(ctx, `
+				UPDATE events SET count = count + 1, last_at = ?, message = ?,
+					detail = ?, resource_version = ?
+				WHERE id = ?
+				RETURNING `+eventColumns, now, ev.Message, ev.Detail, rv, latestID)
+		} else {
+			// New run (empty timeline or key changed): count 1, point window.
+			row = c.QueryRowContext(ctx, `
+				INSERT INTO events
+					(object_id, category, type, reason, message, detail,
+					 count, first_at, last_at, resource_version)
+				VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+				RETURNING `+eventColumns,
+				id, ev.Category, ev.Type, ev.Reason, ev.Message, ev.Detail, now, now, rv)
+		}
+		result, err = scanEvent(row)
+		if err != nil {
+			return err
+		}
+		// Publish the resulting run to event-log watchers — buffered in the tx
+		// collector and published after commit, like the object mutators' emit.
+		s.emitEvent(ctx, gk, result)
+		return nil
+	})
+	return result, err
+}
+
+// scanEvents decodes all rows of a query into a value slice, closing rows.
+func scanEvents(rows *sql.Rows) ([]storeapi.Event, error) {
+	defer rows.Close()
+	var out []storeapi.Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) ListEvents(ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery) ([]storeapi.Event, error) {
+	where := []string{"object_id = ?"}
+	args := []any{id}
+	if q.Category != nil {
+		where = append(where, "category = ?")
+		args = append(args, *q.Category)
+	}
+	if q.Type != "" {
+		where = append(where, "type = ?")
+		args = append(args, q.Type)
+	}
+	if q.Reason != "" {
+		where = append(where, "reason = ?")
+		args = append(args, q.Reason)
+	}
+	if !q.Since.IsZero() {
+		where = append(where, "last_at >= ?")
+		args = append(args, toMillis(q.Since))
+	}
+	// Newest first; id breaks same-millisecond last_at ties deterministically.
+	query := `SELECT ` + eventColumns + ` FROM events WHERE ` +
+		strings.Join(where, " AND ") + ` ORDER BY last_at DESC, id DESC`
+	if q.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, q.Limit)
+	}
+	rows, err := s.conn(ctx).QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanEvents(rows)
+}
+
+func (s *sqliteStore) GetLatestEvent(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
+	return s.latestEventRun(ctx, id, category)
+}
+
+func (s *sqliteStore) SweepEvents(ctx context.Context, perObject int, maxAge time.Duration) (int, error) {
+	var total int64
+	// One transaction so both bounds see the same snapshot and land together.
+	err := s.Within(ctx, func(ctx context.Context) error {
+		c := s.conn(ctx)
+		if perObject > 0 {
+			// Rank each run within its (object, category) timeline newest-first and
+			// drop everything past the cap — the per-timeline ring.
+			res, err := c.ExecContext(ctx, `
+				DELETE FROM events WHERE id IN (
+					SELECT id FROM (
+						SELECT id, ROW_NUMBER() OVER (
+							PARTITION BY object_id, category
+							ORDER BY last_at DESC, id DESC) AS rn
+						FROM events
+					) WHERE rn > ?
+				)`, perObject)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			total += n
+		}
+		if maxAge > 0 {
+			cutoff := toMillis(time.Now().UTC().Add(-maxAge))
+			res, err := c.ExecContext(ctx, `DELETE FROM events WHERE last_at < ?`, cutoff)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			total += n
+		}
+		return nil
+	})
+	return int(total), err
 }
 
 func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (*storeapi.RawObject, error) {

@@ -67,6 +67,20 @@ type Client[Spec, Status any] interface {
 	// lazy counterpart to LoadOwned().
 	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 
+	// ListEvents returns id's event-log runs, newest-first, filtered by the given
+	// options (see EventOption). Like the ref lookups it reads by id and does not
+	// kind-scope: a foreign id reads that object's log. An empty log is an empty slice.
+	ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
+	// GetLatestEvent returns the current (most-recent) run in id's category timeline.
+	// ok reports presence: false (with a nil error) when the timeline is empty.
+	GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
+	// WatchEvents streams id's event log: the runs matching opts as a snapshot, then
+	// live runs, on the returned channel. The channel closes when ctx is cancelled or
+	// the stream ends. Like Watch it requires a registered controller and is scoped to
+	// this client's kind. Runs conflate per run, so a lagging reader converges to each
+	// run's latest state.
+	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+
 	// Requeue requeues id for immediate reconcile. A latency hint, not a
 	// synchronous run; correctness rests on the periodic resync, not this.
 	//
@@ -329,6 +343,14 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.owned = owned
 		obj.loaded |= LoadOwnedBit
 	}
+	if set&LoadEventsBit != 0 {
+		raw, err := store.ListEvents(ctx, obj.ID, storeapi.EventQuery{})
+		if err != nil {
+			return err
+		}
+		obj.events = eventsFromRaw(raw)
+		obj.loaded |= LoadEventsBit
+	}
 	return nil
 }
 
@@ -424,6 +446,20 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		for _, o := range objs {
 			o.owned = byID[o.ID]
 			o.loaded |= LoadOwnedBit
+		}
+	}
+	if set&LoadEventsBit != 0 {
+		// Events have no batched store primitive (unlike the ref relations), so this
+		// is one query per object — the deliberate exception to loadListRelated's
+		// batching. Each object's log is retention-bounded; for large lists or
+		// filtered reads, prefer the lazy Client.ListEvents.
+		for _, o := range objs {
+			raw, err := c.bh.store.ListEvents(ctx, o.ID, storeapi.EventQuery{})
+			if err != nil {
+				return err
+			}
+			o.events = eventsFromRaw(raw)
+			o.loaded |= LoadEventsBit
 		}
 	}
 	return nil
@@ -578,6 +614,67 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 	return out
 }
 
+// ListEvents reads id's runs and maps them to public Events. It reads by id
+// (not kind-scoped), like the ref lookups.
+func (c *clientImpl[Spec, Status]) ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
+	raw, err := c.bh.store.ListEvents(ctx, id, resolveEvents(opts))
+	if err != nil {
+		return nil, err
+	}
+	return eventsFromRaw(raw), nil
+}
+
+func (c *clientImpl[Spec, Status]) GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error) {
+	raw, err := c.bh.store.GetLatestEvent(ctx, id, category)
+	if err != nil {
+		return Event{}, false, err
+	}
+	if raw == nil {
+		return Event{}, false, nil
+	}
+	return eventFromRaw(*raw), true, nil
+}
+
+func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error) {
+	if !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+	}
+	w, err := c.bh.store.WatchEvents(ctx, c.gk, id, resolveEvents(opts))
+	if err != nil {
+		return nil, err
+	}
+	return adaptEventWatcher(ctx, w), nil
+}
+
+// adaptEventWatcher forwards a store EventWatcher's raw runs as public Events
+// until ctx is cancelled or the stream ends, then closes the channel and releases
+// the watcher. Simpler than adaptWatcher: event runs carry no Spec/Status to
+// decode, so there is no migrator and no per-event quarantine — it needs nothing
+// from the client, so it is a free function.
+func adaptEventWatcher(ctx context.Context, w EventWatcher) <-chan Event {
+	out := make(chan Event)
+	go func() {
+		defer close(out)
+		defer w.Close()
+		for {
+			select {
+			case ev, ok := <-w.Events():
+				if !ok {
+					return
+				}
+				select {
+				case out <- eventFromRaw(ev):
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
 // conditionsFromRaw maps the store's raw conditions to the public Condition
 // type, dropping the storage-only bookkeeping (last-transition/updated/observed
 // generation) that the user-facing type doesn't carry. Returns nil for none.
@@ -594,6 +691,36 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 			Message:  c.Message,
 			Liveness: c.Liveness,
 		}
+	}
+	return out
+}
+
+// eventFromRaw maps a raw event row to the public Event, translating the type
+// string and detail bytes and dropping the store-only resource_version cursor
+// (the watch layer needs it; the user-facing type doesn't).
+func eventFromRaw(raw storeapi.Event) Event {
+	return Event{
+		ID:       raw.ID,
+		ObjectID: raw.ObjectID,
+		Category: raw.Category,
+		Type:     EventType(raw.Type),
+		Reason:   raw.Reason,
+		Message:  raw.Message,
+		Detail:   json.RawMessage(raw.Detail),
+		Count:    raw.Count,
+		FirstAt:  raw.FirstAt,
+		LastAt:   raw.LastAt,
+	}
+}
+
+// eventsFromRaw maps a slice of raw event rows to public Events. Returns nil for none.
+func eventsFromRaw(raw []storeapi.Event) []Event {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]Event, len(raw))
+	for i, r := range raw {
+		out[i] = eventFromRaw(r)
 	}
 	return out
 }

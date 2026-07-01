@@ -15,6 +15,7 @@
 package beehive
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -104,4 +105,57 @@ func TestObjectListOwned(t *testing.T) {
 	got, err = o.ListOwned()
 	require.NoError(t, err)
 	assert.Equal(t, owned, got)
+}
+
+// Object.ListEvents is gated by LoadEventsBit like the ref accessors: ErrNotLoaded
+// until LoadEvents() was passed, then the loaded runs (empty slice when none).
+func TestObjectListEvents(t *testing.T) {
+	events := []Event{{ID: 1, Reason: "Connected"}}
+
+	t.Run("not loaded errors", func(t *testing.T) {
+		var o Object[struct{}, struct{}]
+		_, err := o.ListEvents()
+		assert.ErrorIs(t, err, ErrNotLoaded)
+	})
+
+	t.Run("loaded returns events", func(t *testing.T) {
+		o := Object[struct{}, struct{}]{loaded: LoadEventsBit, events: events}
+		got, err := o.ListEvents()
+		require.NoError(t, err)
+		assert.Equal(t, events, got)
+	})
+
+	t.Run("loaded but empty", func(t *testing.T) {
+		o := Object[struct{}, struct{}]{loaded: LoadEventsBit}
+		got, err := o.ListEvents()
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+}
+
+type probeDetail struct {
+	Endpoint  string `json:"endpoint"`
+	LatencyMs int    `json:"latencyMs"`
+}
+
+// EventDetail unmarshals an event's Detail payload into the caller's type; an
+// empty Detail yields the zero value without erroring.
+func TestEventDetail(t *testing.T) {
+	t.Run("decodes payload", func(t *testing.T) {
+		e := Event{Detail: json.RawMessage(`{"endpoint":"h:443","latencyMs":5000}`)}
+		got, err := EventDetail[probeDetail](e)
+		require.NoError(t, err)
+		assert.Equal(t, probeDetail{Endpoint: "h:443", LatencyMs: 5000}, got)
+	})
+
+	t.Run("empty detail is the zero value", func(t *testing.T) {
+		got, err := EventDetail[probeDetail](Event{})
+		require.NoError(t, err)
+		assert.Equal(t, probeDetail{}, got)
+	})
+
+	t.Run("malformed detail errors", func(t *testing.T) {
+		_, err := EventDetail[probeDetail](Event{Detail: json.RawMessage(`{`)})
+		assert.Error(t, err)
+	})
 }

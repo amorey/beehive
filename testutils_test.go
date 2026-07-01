@@ -142,6 +142,18 @@ func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
 func (s *fakeStore) MarkOwnedForDeletion(context.Context, ObjectID) ([]storeapi.Referrer, error) {
 	panic("not implemented: fakeStore.MarkOwnedForDeletion")
 }
+func (s *fakeStore) RecordEvent(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
+	panic("not implemented: fakeStore.RecordEvent")
+}
+func (s *fakeStore) ListEvents(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
+	panic("not implemented: fakeStore.ListEvents")
+}
+func (s *fakeStore) GetLatestEvent(context.Context, ObjectID, string) (*RawEvent, error) {
+	panic("not implemented: fakeStore.GetLatestEvent")
+}
+func (s *fakeStore) SweepEvents(context.Context, int, time.Duration) (int, error) {
+	panic("not implemented: fakeStore.SweepEvents")
+}
 func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
 	panic("not implemented: fakeStore.AddRef")
 }
@@ -179,8 +191,11 @@ func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error)
 func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
 }
-func (s *fakeStore) WatchEvents(context.Context, GroupKind) (Watcher, error) {
+func (s *fakeStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
+}
+func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
+	panic("not implemented: fakeStore.WatchEvents")
 }
 
 // noopWatcher is a Watcher whose event stream never fires; Close is a no-op.
@@ -203,7 +218,7 @@ func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, err
 func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
 }
-func (s *watcherStore) WatchEvents(context.Context, GroupKind) (Watcher, error) {
+func (s *watcherStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
 }
 

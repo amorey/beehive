@@ -130,6 +130,45 @@ CREATE TABLE refs (
 CREATE INDEX idx_refs_to ON refs(to_id, relation);
 
 -- ============================================================
+-- events
+-- Append-only per-object log, aggregated into contiguous runs:
+-- one row per run of consecutive observations sharing
+-- (object_id, category, type, reason). count/last_at grow while
+-- the run holds; a key change appends a new row. category
+-- partitions the log into independent timelines — a run is only
+-- compared against the latest of its own (object_id, category),
+-- so interleaved categories never break each other.
+-- ============================================================
+
+CREATE TABLE events (
+    -- Run identity. AUTOINCREMENT so a physically-deleted (retention-swept) run's
+    -- id is never reused as a UI row key. int64 in Go.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+
+    category TEXT NOT NULL DEFAULT '',   -- independent timeline within the object
+    type     TEXT NOT NULL CHECK (type IN ('Normal', 'Warning')),
+    reason   TEXT NOT NULL,              -- machine-readable token, e.g. "ProbeFailed"
+    message  TEXT,                       -- human-readable; sampled (latest occurrence wins)
+    detail   BLOB,                       -- opaque JSON payload; sampled (latest occurrence wins)
+
+    count    INTEGER NOT NULL DEFAULT 1, -- occurrences coalesced into this run
+    first_at INTEGER NOT NULL,           -- epoch ms of the first occurrence
+    last_at  INTEGER NOT NULL,           -- epoch ms of the latest occurrence
+
+    -- Draws from resource_version_seq like objects: the watch cursor / ordering key.
+    resource_version INTEGER NOT NULL
+);
+
+-- Serves both the append-time "latest run for (object, category)" probe and the
+-- newest-first panel query (ORDER BY last_at DESC).
+CREATE INDEX idx_events_object_cat ON events(object_id, category, last_at DESC);
+
+-- Watch ordering (mirrors idx_objects_rv).
+CREATE INDEX idx_events_rv ON events(resource_version);
+
+-- ============================================================
 -- resource_version_seq
 -- Monotonic global write cursor, decoupled from the objects table.
 -- ============================================================

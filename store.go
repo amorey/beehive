@@ -30,6 +30,10 @@ type Store = storeapi.Store
 // Object[Spec, Status] values; the Store never inspects them.
 type RawObject = storeapi.RawObject
 
+// RawEvent is the untyped event-log row below the generic boundary — one
+// aggregated run. The client decodes it into the public Event.
+type RawEvent = storeapi.Event
+
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
@@ -54,6 +58,10 @@ const (
 // store's Watch/WatchList. The client decodes its raw events into the typed
 // WatchEvent[Spec, Status] surface.
 type Watcher = storeapi.Watcher
+
+// EventWatcher is a subscription to one object's event log, returned by the
+// store's WatchEvents. The client decodes its raw runs into public Events.
+type EventWatcher = storeapi.EventWatcher
 
 // WatchEventType classifies a WatchEvent.
 type WatchEventType = storeapi.WatchEventType

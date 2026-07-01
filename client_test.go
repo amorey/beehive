@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1705,4 +1706,349 @@ func TestClientNextRequeueAtNoController(t *testing.T) {
 
 	at := client.NextRequeueAt(ctx, obj.ID)
 	assert.True(t, at.IsZero(), "client-only kind must report the zero time, got %s", at)
+}
+
+// eventErrStore wraps a real store, failing only the event paths so object ops
+// still work — drives the client's event error branches.
+type eventErrStore struct {
+	Store
+}
+
+func (eventErrStore) ListEvents(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
+	return nil, errBoom
+}
+func (eventErrStore) GetLatestEvent(context.Context, ObjectID, string) (*RawEvent, error) {
+	return nil, errBoom
+}
+func (eventErrStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
+	return nil, errBoom
+}
+func (eventErrStore) SweepEvents(context.Context, int, time.Duration) (int, error) {
+	return 0, errBoom
+}
+
+// A store error from any client event read (including the eager LoadEvents paths)
+// propagates to the caller.
+func TestClientEventReadsPropagateStoreError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(eventErrStore{newClientTestStore(t)})
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	_, err = client.ListEvents(ctx, obj.ID)
+	assert.ErrorIs(t, err, errBoom)
+	_, _, err = client.GetLatestEvent(ctx, obj.ID, "c")
+	assert.ErrorIs(t, err, errBoom)
+	_, err = client.WatchEvents(ctx, obj.ID)
+	assert.ErrorIs(t, err, errBoom)
+	_, err = client.Get(ctx, obj.ID, LoadEvents())
+	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on Get")
+	_, err = client.List(ctx, LoadEvents())
+	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on List")
+}
+
+// A client ListEvents on an object with no runs returns an empty slice (the
+// eventsFromRaw nil branch).
+func TestClientListEventsEmpty(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	got, err := client.ListEvents(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// fakeEventWatcher is a controllable EventWatcher for adaptEventWatcher tests.
+type fakeEventWatcher struct{ ch chan RawEvent }
+
+func (w *fakeEventWatcher) Events() <-chan RawEvent { return w.ch }
+func (w *fakeEventWatcher) Close()                  {}
+
+// adaptEventWatcher closes its output when the source stream ends, when ctx is
+// cancelled while waiting, and when ctx is cancelled mid-send.
+func TestAdaptEventWatcher(t *testing.T) {
+	t.Run("closes when the stream ends", func(t *testing.T) {
+		w := &fakeEventWatcher{ch: make(chan RawEvent)}
+		out := adaptEventWatcher(context.Background(), w)
+		close(w.ch)
+		_, ok := <-out
+		assert.False(t, ok)
+	})
+
+	t.Run("exits when ctx cancelled while waiting", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		w := &fakeEventWatcher{ch: make(chan RawEvent)} // never sends or closes
+		out := adaptEventWatcher(ctx, w)
+		cancel()
+		_, ok := <-out
+		assert.False(t, ok)
+	})
+
+	t.Run("exits when ctx cancelled mid-send", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		w := &fakeEventWatcher{ch: make(chan RawEvent)} // unbuffered
+		out := adaptEventWatcher(ctx, w)
+		// This send returns only once the goroutine has received the event, so it is
+		// then parked on `out <- ev` (nothing reads out). Cancelling makes the inner
+		// select take ctx.Done.
+		w.ch <- RawEvent{Reason: "pending"}
+		cancel()
+		for range out { // drain to closure
+		}
+	})
+}
+
+// The motivating use case, end-to-end through the public API: a flapping cluster's
+// connection-probe outcomes emitted via ControllerClient.RecordEvent render as the
+// aggregated, newest-first timeline the health panel shows.
+func TestEventsConnectionPanelTimeline(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	cluster, err := client.Create(ctx, cSpec{Val: "prod"})
+	require.NoError(t, err)
+
+	// The prober emits one event per probe; identical consecutive outcomes coalesce.
+	emit := func(typ EventType, reason, msg string, detail any, n int) {
+		for i := 0; i < n; i++ {
+			require.NoError(t, cc.RecordEvent(ctx, cluster.ID, EventSpec{
+				Category: "connection", Type: typ, Reason: reason, Message: msg, Detail: detail,
+			}))
+		}
+	}
+	// A flapping cluster, oldest → newest.
+	emit(EventNormal, "Connected", "", nil, 16)
+	emit(EventWarning, "TLSHandshake", "x509: certificate expired", nil, 5)
+	emit(EventNormal, "Connected", "", nil, 7)
+	emit(EventWarning, "ProbeFailed", "i/o timeout", probeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18)
+	emit(EventNormal, "Connected", "", nil, 4)
+
+	panel, err := client.ListEvents(ctx, cluster.ID, WithEventCategory("connection"))
+	require.NoError(t, err)
+
+	type row struct {
+		typ    EventType
+		reason string
+		count  int
+	}
+	want := []row{
+		{EventNormal, "Connected", 4},
+		{EventWarning, "ProbeFailed", 18},
+		{EventNormal, "Connected", 7},
+		{EventWarning, "TLSHandshake", 5},
+		{EventNormal, "Connected", 16},
+	}
+	require.Len(t, panel, len(want), "one run per contiguous outcome, newest-first")
+	for i, w := range want {
+		assert.Equal(t, w.typ, panel[i].Type, "row %d type", i)
+		assert.Equal(t, w.reason, panel[i].Reason, "row %d reason", i)
+		assert.Equal(t, w.count, panel[i].Count, "row %d count", i)
+		assert.False(t, panel[i].LastAt.Before(panel[i].FirstAt), "row %d window", i)
+	}
+
+	// Failure runs carry their sampled message and structured detail.
+	assert.Equal(t, "i/o timeout", panel[1].Message)
+	detail, err := EventDetail[probeDetail](panel[1])
+	require.NoError(t, err)
+	assert.Equal(t, 5000, detail.LatencyMs)
+	assert.Equal(t, "x509: certificate expired", panel[3].Message)
+
+	// The panel header — current state of the connection timeline.
+	latest, ok, err := client.GetLatestEvent(ctx, cluster.ID, "connection")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "Connected", latest.Reason)
+	assert.Equal(t, 4, latest.Count)
+}
+
+// Get(LoadEvents()) eager-loads the object's runs onto Object.ListEvents(); without
+// it the accessor reports ErrNotLoaded.
+func TestClientGetLoadsEvents(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	require.NoError(t, err)
+
+	plain, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	_, err = plain.ListEvents()
+	assert.ErrorIs(t, err, ErrNotLoaded, "not loaded without LoadEvents()")
+
+	loaded, err := client.Get(ctx, obj.ID, LoadEvents())
+	require.NoError(t, err)
+	evs, err := loaded.ListEvents()
+	require.NoError(t, err)
+	require.Len(t, evs, 1)
+	assert.Equal(t, "ProbeFailed", evs[0].Reason)
+	assert.Equal(t, EventWarning, evs[0].Type)
+}
+
+// List(LoadEvents()) attaches each object's own runs.
+func TestClientListLoadsEvents(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	a, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	b, err := client.Create(ctx, cSpec{Val: "b"})
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	require.NoError(t, err)
+	_, err = store.RecordEvent(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
+	require.NoError(t, err)
+
+	objs, err := client.List(ctx, LoadEvents())
+	require.NoError(t, err)
+	byReason := map[ObjectID]string{}
+	for _, o := range objs {
+		evs, err := o.ListEvents()
+		require.NoError(t, err)
+		require.Len(t, evs, 1, "each object gets its own log")
+		byReason[o.ID] = evs[0].Reason
+	}
+	assert.Equal(t, "AOK", byReason[a.ID])
+	assert.Equal(t, "BBad", byReason[b.ID])
+}
+
+// ListEvents returns an object's runs as public Events, newest-first, with the
+// query options resolved into the store filter.
+func TestClientListEvents(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	rec := func(cat, typ, reason string) {
+		_, err := store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
+		require.NoError(t, err)
+	}
+	rec("connection", "Warning", "ProbeFailed")
+	rec("connection", "Normal", "Connected")
+	rec("sync", "Normal", "Synced")
+
+	all, err := client.ListEvents(ctx, obj.ID)
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	assert.Equal(t, "Synced", all[0].Reason, "newest-first across categories")
+
+	conn, err := client.ListEvents(ctx, obj.ID, WithEventCategory("connection"))
+	require.NoError(t, err)
+	require.Len(t, conn, 2)
+	assert.Equal(t, EventNormal, conn[0].Type, "newest connection run mapped to EventType")
+	assert.Equal(t, "Connected", conn[0].Reason)
+	assert.Equal(t, EventWarning, conn[1].Type)
+}
+
+// GetLatestEvent returns the current run in a category with ok=true, or the zero
+// Event with ok=false when the timeline is empty.
+func TestClientGetLatestEvent(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	_, err = store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	require.NoError(t, err)
+
+	got, ok, err := client.GetLatestEvent(ctx, obj.ID, "connection")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "Connected", got.Reason)
+
+	_, ok, err = client.GetLatestEvent(ctx, obj.ID, "nope")
+	require.NoError(t, err)
+	assert.False(t, ok, "empty timeline is ok=false")
+}
+
+// WatchEvents streams live runs as public Events and, like Watch, requires a
+// registered controller.
+func TestClientWatchEvents(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	ch, err := client.WatchEvents(ctx, obj.ID)
+	require.NoError(t, err)
+
+	_, err = store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	require.NoError(t, err)
+
+	select {
+	case ev := <-ch:
+		assert.Equal(t, "ProbeFailed", ev.Reason)
+		assert.Equal(t, EventWarning, ev.Type)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for event")
+	}
+
+	unregistered := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Unregistered"})
+	_, err = unregistered.WatchEvents(ctx, obj.ID)
+	assert.Error(t, err, "WatchEvents requires a registered controller")
+}
+
+// eventFromRaw maps the store's raw event row to the public Event, translating
+// the type string and detail bytes and dropping the store-only resource_version.
+func TestEventFromRaw(t *testing.T) {
+	first := time.Now().UTC().Add(-time.Minute)
+	last := first.Add(time.Minute)
+	raw := storeapi.Event{
+		ID:              42,
+		ObjectID:        7,
+		Category:        "connection",
+		Type:            "Warning",
+		Reason:          "ProbeFailed",
+		Message:         "i/o timeout",
+		Detail:          []byte(`{"latencyMs":5000}`),
+		Count:           18,
+		FirstAt:         first,
+		LastAt:          last,
+		ResourceVersion: 99,
+	}
+
+	e := eventFromRaw(raw)
+	assert.Equal(t, EventID(42), e.ID)
+	assert.Equal(t, ObjectID(7), e.ObjectID)
+	assert.Equal(t, "connection", e.Category)
+	assert.Equal(t, EventWarning, e.Type)
+	assert.Equal(t, "ProbeFailed", e.Reason)
+	assert.Equal(t, "i/o timeout", e.Message)
+	assert.Equal(t, json.RawMessage(`{"latencyMs":5000}`), e.Detail)
+	assert.Equal(t, 18, e.Count)
+	assert.Equal(t, first, e.FirstAt)
+	assert.Equal(t, last, e.LastAt)
 }
