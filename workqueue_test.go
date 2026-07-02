@@ -332,3 +332,168 @@ func TestWorkQueueRequeueNow(t *testing.T) {
 	require.True(t, ok, "requeueNow must make the id dispatchable now")
 	assert.Equal(t, ObjectID(1), id)
 }
+
+// schedRecorder captures onSchedule emissions for assertions. It is unbuffered-safe:
+// the callback runs under q.mu, so record must not block on the queue; a generous
+// buffer keeps the producer non-blocking while the test drains.
+type schedRecorder struct {
+	ch chan schedEmit
+}
+
+type schedEmit struct {
+	id        ObjectID
+	at        time.Time
+	scheduled bool
+}
+
+func newSchedRecorder() *schedRecorder { return &schedRecorder{ch: make(chan schedEmit, 64)} }
+
+func (r *schedRecorder) record(id ObjectID, at time.Time, scheduled bool) {
+	r.ch <- schedEmit{id, at, scheduled}
+}
+
+// next returns the next emission, failing the test on timeout so a missing emit is
+// a failure rather than a hang.
+func (r *schedRecorder) next(t *testing.T) schedEmit {
+	t.Helper()
+	select {
+	case e := <-r.ch:
+		return e
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a schedule emission, got none")
+		return schedEmit{}
+	}
+}
+
+// expectNone asserts no emission arrives promptly — used to prove the dedup guard
+// suppressed a redundant equal value.
+func (r *schedRecorder) expectNone(t *testing.T) {
+	t.Helper()
+	select {
+	case e := <-r.ch:
+		t.Fatalf("expected no emission, got %+v", e)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestWorkQueueOnScheduleAddEmitsNow verifies an immediate add emits a due-now
+// Schedule for the id.
+func TestWorkQueueOnScheduleAddEmitsNow(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.add(1)
+
+	e := rec.next(t)
+	assert.Equal(t, ObjectID(1), e.id)
+	assert.True(t, e.scheduled, "a queued-now id must emit as scheduled")
+	assert.False(t, e.at.IsZero(), "a queued-now id must emit a non-zero time")
+	assert.False(t, e.at.After(time.Now()), "queued-now must be due now, not future")
+}
+
+// TestWorkQueueOnScheduleDedupsEqual verifies a redundant add (id already queued,
+// still due-now) does not emit a second, identical Schedule.
+func TestWorkQueueOnScheduleDedupsEqual(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.add(1)
+	rec.next(t) // the first, real emission
+
+	q.add(1) // duplicate: still due-now, value unchanged
+	rec.expectNone(t)
+}
+
+// TestWorkQueueOnScheduleAddAfterEmitsFireTime verifies a delayed add emits its
+// future fire time.
+func TestWorkQueueOnScheduleAddAfterEmitsFireTime(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.addAfter(1, time.Hour)
+
+	e := rec.next(t)
+	assert.Equal(t, ObjectID(1), e.id)
+	assert.True(t, e.scheduled, "a delayed add must emit as scheduled")
+	assert.True(t, e.at.After(time.Now().Add(time.Minute)),
+		"delayed add must emit its ~1h fire time, got %s", e.at)
+}
+
+// TestWorkQueueOnScheduleGetEmitsZero verifies dispatching an id (get) with no
+// pending future alarm emits the zero/unscheduled Schedule — the transition a
+// countdown UI shows as "reconciling now, nothing scheduled".
+func TestWorkQueueOnScheduleGetEmitsZero(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.add(1)
+	rec.next(t) // due-now emit from add
+
+	_, ok := q.get()
+	require.True(t, ok)
+
+	e := rec.next(t)
+	assert.Equal(t, ObjectID(1), e.id)
+	assert.False(t, e.scheduled, "dispatch must emit as unscheduled")
+	assert.True(t, e.at.IsZero(), "dispatch must emit the unscheduled zero time")
+}
+
+// TestWorkQueueOnScheduleTimerFiredEmitsNow verifies an alarm firing (its timer
+// enqueues the id) emits a due-now Schedule.
+func TestWorkQueueOnScheduleTimerFiredEmitsNow(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.addAfter(1, 20*time.Millisecond)
+	rec.next(t) // the future fire-time emit from addAfter
+
+	// When the timer fires it enqueues the id: the schedule flips to due-now.
+	e := rec.next(t)
+	assert.Equal(t, ObjectID(1), e.id)
+	assert.False(t, e.at.After(time.Now()), "a fired timer makes the id due now")
+}
+
+// TestWorkQueueOnScheduleRequeueNowEmitsNow verifies requeueNow (which drops a
+// pending future alarm and enqueues) emits a due-now Schedule.
+func TestWorkQueueOnScheduleRequeueNowEmitsNow(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.addAfter(1, time.Hour)
+	rec.next(t) // future fire-time emit
+
+	q.requeueNow(1)
+
+	e := rec.next(t)
+	assert.Equal(t, ObjectID(1), e.id)
+	assert.False(t, e.at.After(time.Now()), "requeueNow must emit due-now")
+}
+
+// TestWorkQueueOnScheduleDoneRequeueEmitsNow verifies the schedule emits track
+// dirty transitions across a mid-processing re-add: the re-add reports due-now, and
+// done — which only shuffles processing/items, not the schedule — emits nothing.
+func TestWorkQueueOnScheduleDoneRequeueEmitsNow(t *testing.T) {
+	rec := newSchedRecorder()
+	q := newWorkQueue()
+	q.onSchedule = rec.record
+
+	q.add(1)
+	rec.next(t) // due-now from add
+	_, ok := q.get()
+	require.True(t, ok)
+	rec.next(t) // zero from dispatch
+
+	q.add(1) // re-added while processing: marked dirty, still emits due-now
+	e := rec.next(t)
+	assert.Equal(t, ObjectID(1), e.id)
+	assert.False(t, e.at.After(time.Now()))
+
+	q.done(1) // shuffles processing/items only; schedule unchanged, so no emit
+	rec.expectNone(t)
+}

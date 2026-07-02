@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/amorey/beehive/internal/conflate"
 )
 
 const (
@@ -134,6 +136,10 @@ type reconciler struct {
 	adapter           controllerAdapter
 	store             Store
 	work              *workQueue
+	// scheduleHub fans each object's next-requeue changes out to WatchSchedule
+	// subscribers, keyed by ObjectID with latest-value-per-id coalescing. The work
+	// queue feeds it through onSchedule; Close (on teardown) ends live streams.
+	scheduleHub *conflate.Hub[ObjectID, Schedule]
 	resyncInterval    time.Duration
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
@@ -269,6 +275,61 @@ func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
 	return r.work.nextRequeueAt(id)
 }
 
+// mergeSchedule is the schedule hub's coalescing policy: latest value wins and the
+// slot is never annihilated. Unlike the object watch, "unscheduled" (the zero
+// Schedule) is a real gauge value a subscriber must observe, so it is kept, not
+// dropped — a slow reader converges to the id's current schedule.
+func mergeSchedule(_, next Schedule) (Schedule, bool) { return next, true }
+
+// publishSchedule feeds one work-queue schedule change into the hub. It is the
+// onSchedule callback, so it runs under the queue lock: it maps the queue's native
+// (time, scheduled) to the public Schedule (unscheduled folds to the zero time),
+// then Sends — which never blocks, and a closed hub drops it. The scheduled bool is
+// redundant with a zero time here, so it is ignored.
+func (r *reconciler) publishSchedule(id ObjectID, at time.Time, _ bool) {
+	_ = r.scheduleHub.Sender().Send(id, Schedule{NextRequeueAt: at})
+}
+
+// watchSchedule returns a channel that delivers id's current schedule on subscribe
+// and every reschedule thereafter, until ctx is cancelled or the hub closes. The
+// receiver is registered atomically with the snapshot read (subscribeSchedule), so
+// no change between the two is lost. The queue's native (time, scheduled) is mapped
+// to a Schedule here — the reconciler owns that domain type, not the queue.
+func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Schedule {
+	var rx *conflate.Receiver[ObjectID, Schedule]
+	at := r.work.subscribeSchedule(id, func() {
+		rx = r.scheduleHub.ReceiverFunc(func(k ObjectID) bool { return k == id })
+	})
+	snapshot := Schedule{NextRequeueAt: at}
+
+	out := make(chan Schedule)
+	go func() {
+		defer close(out)
+		defer rx.Close()
+		send := func(s Schedule) bool {
+			select {
+			case out <- s:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		if !send(snapshot) {
+			return
+		}
+		for {
+			s, err := rx.RecvContext(ctx)
+			if err != nil {
+				return // ctx cancelled or hub closed
+			}
+			if !send(s) {
+				return
+			}
+		}
+	}()
+	return out
+}
+
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
 //
 // A resyncInterval <= 0 disables the periodic resync entirely: the loop then
@@ -309,11 +370,16 @@ func (r *reconciler) run(ctx context.Context) {
 	}
 	r.logger.Info("reconciler started", "workers", n, "resyncInterval", r.resyncInterval)
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
-	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue.
+	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue,
+	// and close the schedule hub so live WatchSchedule streams end instead of hanging
+	// on a subscriber context that outlives the control plane.
 	defer func() {
 		wg.Wait()
 		if r.work != nil {
 			r.work.stop()
+		}
+		if r.scheduleHub != nil {
+			r.scheduleHub.Close()
 		}
 	}()
 

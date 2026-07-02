@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/amorey/beehive/internal/conflate"
 )
 
 const defaultResyncInterval = 30 * time.Second
@@ -334,6 +336,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		gk:               gk,
 		store:            bh.store,
 		work:             newWorkQueue(),
+		scheduleHub:      conflate.New[ObjectID](mergeSchedule),
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
 		concurrency:      bh.concurrency,
@@ -344,6 +347,8 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		logger:   bh.logger,
 		logLevel: bh.logLevel,
 	}
+	// Feed the work queue's schedule changes into the hub (see publishSchedule).
+	r.work.onSchedule = r.publishSchedule
 	// Build the client once here so it's allocated per kind, not per reconcile,
 	// and hand the same instance to both the adapter and the caller.
 	client := &controllerClientImpl[Status]{bh: bh, gk: gk}
@@ -395,8 +400,9 @@ func (bh *Beehive) migratorFor(gk GroupKind) Migrator {
 }
 
 // reconcilerFor returns the reconciler registered for gk, if one exists. The
-// client's Requeue reaches the per-kind work queue through it, and NextRequeueAt
-// reads schedule state through it; a client-only kind (no Register) has none.
+// client's Requeue reaches the per-kind work queue through it, and GetSchedule /
+// WatchSchedule read schedule state through it; a client-only kind (no Register)
+// has none.
 func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()

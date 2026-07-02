@@ -1314,6 +1314,61 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	waitClosed(t, ctrl.deleted, "reconcile after deletion requested")
 }
 
+// TestIntegrationWatchScheduleClosesOnStop verifies a live WatchSchedule stream is
+// torn down when the control plane stops, even though the subscriber's own context
+// stays open: run's teardown closes the schedule hub, which ends the receiver and
+// closes the channel. Without that close the stream would hang forever on Background.
+func TestIntegrationWatchScheduleClosesOnStop(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	// Subscribe with a context that never cancels, so only the control plane's
+	// teardown can close the stream.
+	ch, err := client.WatchSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+	recv(t, ch) // drain the snapshot: the stream is live before we stop
+
+	require.NoError(t, stop(ctx))
+	assertChanClosed(t, ch)
+}
+
+// TestIntegrationWatchScheduleClosesOnCtxCancel verifies cancelling the subscriber's
+// own context closes the stream independently of the control plane — the other half
+// of the lifecycle contract.
+func TestIntegrationWatchScheduleClosesOnCtxCancel(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	wctx, cancel := context.WithCancel(ctx)
+	ch, err := client.WatchSchedule(wctx, obj.ID)
+	require.NoError(t, err)
+	recv(t, ch) // drain the snapshot: the stream is live before we cancel
+
+	cancel()
+	assertChanClosed(t, ch)
+}
+
 // TestIntegrationWritePersistsAcrossReconcileError is the end-to-end counterpart
 // of TestReconcilePersistsWritesOnError: a status write made during a reconcile
 // that then returns an error stays committed, because reconcile no longer runs
