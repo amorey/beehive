@@ -29,9 +29,9 @@ import (
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// WatchEvent reports a change to a watched object.
-type WatchEvent[Spec, Status any] struct {
-	Type   WatchEventType
+// Change reports a change to a watched object.
+type Change[Spec, Status any] struct {
+	Type   ChangeType
 	Object *Object[Spec, Status]
 }
 
@@ -45,8 +45,8 @@ type Client[Spec, Status any] interface {
 	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
 	Delete(ctx context.Context, id ObjectID) error
-	Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error)
-	WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error)
+	Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error)
+	WatchList(ctx context.Context) (<-chan Change[Spec, Status], error)
 
 	// GetOwner returns id's owner, if any. ok reports presence: false (with a nil
 	// error) when the object simply has no owner. The lazy counterpart to
@@ -551,7 +551,7 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	return nil
 }
 
-func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context) (<-chan Change[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
@@ -562,7 +562,7 @@ func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context) (<-chan WatchE
 	return c.adaptWatcher(ctx, w), nil
 }
 
-func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
@@ -575,11 +575,11 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-ch
 
 // adaptWatcher decodes a store Watcher's raw events (the snapshot's Added events
 // followed by live changes — the store owns snapshotting, dedup, and id
-// filtering) into typed WatchEvents. It forwards on the returned channel until
+// filtering) into typed Changes. It forwards on the returned channel until
 // ctx is cancelled, the watcher's stream ends, or an event fails to decode; the
 // channel closes and the watcher is released on exit.
-func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) <-chan WatchEvent[Spec, Status] {
-	out := make(chan WatchEvent[Spec, Status])
+func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) <-chan Change[Spec, Status] {
+	out := make(chan Change[Spec, Status])
 	// The migrator is invariant for the watcher's lifetime; resolve it once rather
 	// than re-locking the registry on every event.
 	mig := c.bh.migratorFor(c.gk)
@@ -588,7 +588,7 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 		defer w.Close()
 		for {
 			select {
-			case ev, ok := <-w.Events():
+			case ev, ok := <-w.Changes():
 				if !ok {
 					return
 				}
@@ -602,7 +602,7 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 					continue
 				}
 				select {
-				case out <- WatchEvent[Spec, Status]{Type: ev.Type, Object: obj}:
+				case out <- Change[Spec, Status]{Type: ev.Type, Object: obj}:
 				case <-ctx.Done():
 					return
 				}

@@ -59,7 +59,7 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		// processStart, so a sub-ms processStart would wrongly flag a condition
 		// written in the same millisecond the process started.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
-		hubs:         make(map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent]),
+		hubs:         make(map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]),
 		eventHubs:    make(map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]),
 		done:         make(chan struct{}),
 	}, nil

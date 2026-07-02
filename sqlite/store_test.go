@@ -627,7 +627,7 @@ func TestUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	again, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
 	require.NoError(t, err)
@@ -896,7 +896,7 @@ func TestMarkOwnedForDeletionCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	for i := 0; i < 2; i++ {
-		assert.Equal(t, beehive.WatchEventModified, recvEvent(t, w).Type)
+		assert.Equal(t, beehive.Modified, recvEvent(t, w).Type)
 	}
 	a1, err := store.GetObjectMeta(ctx, childA)
 	require.NoError(t, err)
@@ -958,7 +958,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	// Removing a present finalizer is a real change: only that finalizer drops,
 	// resource_version bumps, and watchers see a Modified event.
@@ -968,7 +968,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	assert.Greater(t, got.ResourceVersion, created.ResourceVersion)
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, beehive.Modified, ev.Type)
 	assert.Equal(t, []string{"b"}, ev.Object.Finalizers)
 
 	// Persisted, not just reflected in the returned struct.
@@ -990,7 +990,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	// Removing a finalizer that isn't present changes nothing: the list is intact,
 	// resource_version is unbumped, and no event fires (a watcher would otherwise
@@ -1627,8 +1627,8 @@ func TestAddRefNoVersionBumpNoEvent(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Close()
 	// Drain the snapshot Added events for the two pre-existing objects.
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type)
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type)
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 
 	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, "depends_on"))
 	assertNoEvent(t, w, 200*time.Millisecond)
@@ -1665,8 +1665,8 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type)
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type)
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 
 	require.NoError(t, store.DeleteRef(ctx, a.ID, b.ID, "depends_on"))
 	assertNoEvent(t, w, 200*time.Millisecond)
@@ -1861,14 +1861,14 @@ func TestSetConditionEmitsAndBumpsResourceVersion(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Close()
 	// Drain the snapshot Added for the pre-existing object.
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type)
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 
 	got, err := store.SetCondition(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	assert.Greater(t, got.ResourceVersion, obj.ResourceVersion, "a condition change bumps resource_version")
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, beehive.Modified, ev.Type)
 	assert.Equal(t, got.ResourceVersion, ev.Object.ResourceVersion)
 	require.NotNil(t, findCondition(ev.Object.Conditions, "Ready"), "emitted object carries the new condition")
 }
@@ -1884,7 +1884,7 @@ func TestSetConditionNoOpSuppressed(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	// An identical write changes nothing: no resource_version bump, no event.
 	again, err := store.SetCondition(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"})
@@ -1906,7 +1906,7 @@ func TestDeleteCondition(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	got, err := store.DeleteCondition(ctx, testGK, obj.ID, "Ready")
 	require.NoError(t, err)
@@ -1914,7 +1914,7 @@ func TestDeleteCondition(t *testing.T) {
 	require.NotNil(t, findCondition(got.Conditions, "Healthy"), "Healthy untouched")
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, beehive.Modified, ev.Type)
 	assert.Equal(t, got.ResourceVersion, ev.Object.ResourceVersion)
 }
 
@@ -1926,7 +1926,7 @@ func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	got, err := store.DeleteCondition(ctx, testGK, obj.ID, "Ready")
 	require.NoError(t, err)
@@ -1948,7 +1948,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	w, err := store.WatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
-	require.Equal(t, beehive.WatchEventAdded, recvEvent(t, w).Type) // snapshot
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
 	// UpdateStatus return + emitted event both carry the existing condition.
 	updated, err := store.UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"v":1}`), 0)

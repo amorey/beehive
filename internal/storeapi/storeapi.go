@@ -54,29 +54,29 @@ var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 // settled once its spec later reached that generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
-// WatchEventType classifies a watch event.
-type WatchEventType string
+// ChangeType classifies a Change.
+type ChangeType string
 
 const (
-	WatchEventAdded    WatchEventType = "Added"
-	WatchEventModified WatchEventType = "Modified"
-	WatchEventDeleted  WatchEventType = "Deleted"
+	Added    ChangeType = "Added"
+	Modified ChangeType = "Modified"
+	Deleted  ChangeType = "Deleted"
 )
 
-// RawWatchEvent is the untyped event a Watcher delivers. The client decodes it
-// into the generic, user-facing WatchEvent[Spec, Status]; the name carries the
+// RawChange is the untyped change a Watcher delivers. The client decodes it
+// into the generic, user-facing Change[Spec, Status]; the name carries the
 // "Raw" prefix (like RawObject) to avoid colliding with that generic type.
-type RawWatchEvent struct {
-	Type   WatchEventType
+type RawChange struct {
+	Type   ChangeType
 	Object *RawObject
 }
 
-// Watcher is a subscription to a kind's change stream. Events yields the current
-// state as Added events (the snapshot) followed by live changes, until the
+// Watcher is a subscription to a kind's change stream. Changes yields the current
+// state as Added changes (the snapshot) followed by live changes, until the
 // watcher is closed or its store shuts down, at which point the channel closes.
 // Close releases the subscription and is safe to call more than once.
 type Watcher interface {
-	Events() <-chan RawWatchEvent
+	Changes() <-chan RawChange
 	Close()
 }
 

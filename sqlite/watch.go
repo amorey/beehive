@@ -31,7 +31,7 @@ var errStoreClosed = errors.New("beehive/sqlite: store is closed")
 // nil if the store is closed. Hub lookup is not a hot path (the store
 // serializes writes on a single connection), so a single write lock is simpler
 // than double-checked locking and avoids a race-only, untestable branch.
-func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent] {
+func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.ObjectID, storeapi.RawChange] {
 	s.hubMu.Lock()
 	defer s.hubMu.Unlock()
 	if s.closed {
@@ -39,7 +39,7 @@ func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.Objec
 	}
 	h := s.hubs[gk]
 	if h == nil {
-		h = conflate.New[storeapi.ObjectID](mergeWatchEvent)
+		h = conflate.New[storeapi.ObjectID](mergeChange)
 		s.hubs[gk] = h
 	}
 	return h
@@ -80,7 +80,7 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 	return next, true
 }
 
-// mergeWatchEvent coalesces a receiver's undelivered pending event for an object
+// mergeChange coalesces a receiver's undelivered pending event for an object
 // with a newly published one. The store's resource_version is a global monotonic
 // cursor, so the higher-versioned event is always the newer lifecycle state.
 // A surviving update keeps Added type when prev was Added (it is still "new" to
@@ -92,19 +92,19 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 // truly never observed. WatchList/WatchChanges override this with
 // annihilatingMerge, which can drop such tombstones early (WatchList preserving
 // snapshot-covered deletes, WatchChanges preserving nothing).
-func mergeWatchEvent(prev, next storeapi.RawWatchEvent) (storeapi.RawWatchEvent, bool) {
+func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
 	hi := next
 	if prev.Object.ResourceVersion > next.Object.ResourceVersion {
 		hi = prev
 	}
-	if hi.Type == storeapi.WatchEventDeleted {
+	if hi.Type == storeapi.Deleted {
 		return hi, true // real-body tombstone; seenIDs in watch() guards the rest
 	}
 	typ := hi.Type
-	if prev.Type == storeapi.WatchEventAdded {
-		typ = storeapi.WatchEventAdded // still new to the consumer
+	if prev.Type == storeapi.Added {
+		typ = storeapi.Added // still new to the consumer
 	}
-	return storeapi.RawWatchEvent{Type: typ, Object: hi.Object}, true
+	return storeapi.RawChange{Type: typ, Object: hi.Object}, true
 }
 
 // snapshotIDs is an immutable set of the ids a watcher's snapshot contained,
@@ -112,25 +112,25 @@ func mergeWatchEvent(prev, next storeapi.RawWatchEvent) (storeapi.RawWatchEvent,
 // the snapshot is loaded.
 type snapshotIDs map[storeapi.ObjectID]struct{}
 
-// annihilatingMerge is a per-receiver merge that extends mergeWatchEvent with one
+// annihilatingMerge is a per-receiver merge that extends mergeChange with one
 // annihilation: when an undelivered pending Added coalesces with a Deleted, the
 // consumer was never told the object existed, so the resulting tombstone is pure
 // noise — drop the slot entirely. This is what keeps a slow consumer's memory
 // bounded by the live key set instead of growing one tombstone per transient id
-// in a high-churn kind. mergeWatchEvent (the shared default) cannot do this
+// in a high-churn kind. mergeChange (the shared default) cannot do this
 // blindly: a snapshot-covered object born in the subscribe→snapshot race window
 // also coalesces Added→Deleted, and its delete MUST survive. preserve reports the
 // ids whose delete must be kept; an Added→Deleted pair is annihilated only when
 // preserve is nil (WatchChanges has no snapshot, so nothing is pre-known) or
 // preserve returns false for the id.
-func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawWatchEvent] {
-	return func(prev, next storeapi.RawWatchEvent) (storeapi.RawWatchEvent, bool) {
-		if prev.Type == storeapi.WatchEventAdded && next.Type == storeapi.WatchEventDeleted {
+func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawChange] {
+	return func(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
+		if prev.Type == storeapi.Added && next.Type == storeapi.Deleted {
 			if preserve == nil || !preserve(next.Object.ID) {
-				return storeapi.RawWatchEvent{}, false // unobserved transient: annihilate
+				return storeapi.RawChange{}, false // unobserved transient: annihilate
 			}
 		}
-		return mergeWatchEvent(prev, next)
+		return mergeChange(prev, next)
 	}
 }
 
@@ -157,7 +157,7 @@ type collectorKey struct{}
 // pendingEvent is a watch event awaiting its transaction's commit.
 type pendingEvent struct {
 	gk storeapi.GroupKind
-	ev storeapi.RawWatchEvent
+	ev storeapi.RawChange
 }
 
 // pendingEventRow is an event-log run awaiting its transaction's commit.
@@ -193,9 +193,9 @@ func gkOf(raw *storeapi.RawObject) storeapi.GroupKind {
 // emit delivers an event for the written row. Inside a transaction it queues on
 // the ambient collector (flushed after commit by Within); outside one it
 // publishes immediately.
-func (s *sqliteStore) emit(ctx context.Context, typ storeapi.WatchEventType, raw *storeapi.RawObject) {
+func (s *sqliteStore) emit(ctx context.Context, typ storeapi.ChangeType, raw *storeapi.RawObject) {
 	gk := gkOf(raw)
-	ev := storeapi.RawWatchEvent{Type: typ, Object: raw}
+	ev := storeapi.RawChange{Type: typ, Object: raw}
 	if c, ok := ctx.Value(collectorKey{}).(*eventCollector); ok {
 		c.add(pendingEvent{gk: gk, ev: ev})
 		return
@@ -205,7 +205,7 @@ func (s *sqliteStore) emit(ctx context.Context, typ storeapi.WatchEventType, raw
 
 // publish sends ev to gk's hub, keyed by object id so per-object updates
 // coalesce. Send never blocks; a closed hub drops it.
-func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawWatchEvent) {
+func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawChange) {
 	if h := s.hubFor(gk); h != nil {
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
@@ -246,14 +246,18 @@ func (s *sqliteStore) flush(coll *eventCollector) {
 // watcherImpl streams a snapshot followed by live items on out. A merge
 // goroutine owns out and the receiver; Close cancels its context, which makes
 // the goroutine exit, close the receiver, and close out. V is the streamed item
-// type — RawWatchEvent for object watches, Event for the event log.
+// type — RawChange for object watches, Event for the event log.
 type watcherImpl[V any] struct {
 	out    chan V
 	cancel context.CancelFunc
 }
 
-func (w *watcherImpl[V]) Events() <-chan V { return w.out }
-func (w *watcherImpl[V]) Close()           { w.cancel() }
+// Changes and Events are the same accessor under the two interface names the
+// shared impl satisfies: Watcher.Changes (V = RawChange) and EventWatcher.Events
+// (V = Event). Each instantiation is only ever used through its own interface.
+func (w *watcherImpl[V]) Changes() <-chan V { return w.out }
+func (w *watcherImpl[V]) Events() <-chan V  { return w.out }
+func (w *watcherImpl[V]) Close()            { w.cancel() }
 
 func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
 	return s.watch(ctx, gk, nil, true, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
@@ -331,7 +335,7 @@ func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context)
 //     coalesces to Added in the buffer; seenIDs detects that the consumer already
 //     has X from the snapshot and promotes the type to Modified.
 //   - A race-window Added for X followed by a post-snapshot Deleted coalesces to
-//     Deleted (mergeWatchEvent never annihilates, to preserve real tombstones for
+//     Deleted (mergeChange never annihilates, to preserve real tombstones for
 //     snapshot-covered objects); if X was in the snapshot seenIDs lets it through,
 //     otherwise it is dropped — the object was born and died without the consumer
 //     ever observing it, and emitting a lone Deleted would be spurious.
@@ -355,7 +359,7 @@ func (s *sqliteStore) watch(
 	//     key set, not by the count of distinct deleted ids a slow consumer falls
 	//     behind on). WatchList must preserve snapshot-covered deletes; WatchChanges
 	//     has no snapshot, so it annihilates every unobserved Added→Deleted pair.
-	var rx *conflate.Receiver[storeapi.ObjectID, storeapi.RawWatchEvent]
+	var rx *conflate.Receiver[storeapi.ObjectID, storeapi.RawChange]
 	var seed atomic.Pointer[snapshotIDs] // published to the merge once the snapshot is known
 	switch {
 	case filterID != nil:
@@ -387,7 +391,7 @@ func (s *sqliteStore) watch(
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := &watcherImpl[storeapi.RawWatchEvent]{out: make(chan storeapi.RawWatchEvent), cancel: cancel}
+	w := &watcherImpl[storeapi.RawChange]{out: make(chan storeapi.RawChange), cancel: cancel}
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -400,7 +404,7 @@ func (s *sqliteStore) watch(
 		// the caller's context was cancelled (wctx) or the store was closed
 		// (s.done). The store-close arm matters when no one is reading: closing
 		// the hub only wakes a receive, not a parked send.
-		send := func(ev storeapi.RawWatchEvent) bool {
+		send := func(ev storeapi.RawChange) bool {
 			select {
 			case w.out <- ev:
 				return true
@@ -424,7 +428,7 @@ func (s *sqliteStore) watch(
 		// blobs until the watcher closes.
 		for _, raw := range snapshot {
 			seenIDs[raw.ID] = struct{}{}
-			if !send(storeapi.RawWatchEvent{Type: storeapi.WatchEventAdded, Object: raw}) {
+			if !send(storeapi.RawChange{Type: storeapi.Added, Object: raw}) {
 				return
 			}
 		}
@@ -445,17 +449,17 @@ func (s *sqliteStore) watch(
 			// (see filterID above), so unrelated ids never reach this loop.
 			if seenIDs != nil {
 				switch ev.Type {
-				case storeapi.WatchEventAdded:
+				case storeapi.Added:
 					if _, ok := seenIDs[ev.Object.ID]; ok {
 						// Conflation promoted a race-window Added to Added, but the
 						// consumer already has this object from the snapshot.
-						ev.Type = storeapi.WatchEventModified
+						ev.Type = storeapi.Modified
 					} else {
 						seenIDs[ev.Object.ID] = struct{}{}
 					}
-				case storeapi.WatchEventModified:
+				case storeapi.Modified:
 					seenIDs[ev.Object.ID] = struct{}{}
-				case storeapi.WatchEventDeleted:
+				case storeapi.Deleted:
 					if _, ok := seenIDs[ev.Object.ID]; !ok {
 						// Object was born and died without the consumer ever observing
 						// it (race-window Added coalesced into this Deleted, but the

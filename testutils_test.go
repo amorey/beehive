@@ -201,8 +201,8 @@ func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.E
 // noopWatcher is a Watcher whose event stream never fires; Close is a no-op.
 type noopWatcher struct{}
 
-func (noopWatcher) Events() <-chan storeapi.RawWatchEvent { return nil }
-func (noopWatcher) Close()                                {}
+func (noopWatcher) Changes() <-chan storeapi.RawChange { return nil }
+func (noopWatcher) Close()                             {}
 
 // watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
 // error, so client-layer tests can drive the typed-adapter goroutine directly.
@@ -226,25 +226,25 @@ func (s *watcherStore) WatchChanges(context.Context, GroupKind) (Watcher, error)
 // the stream, and Close signals the adapter goroutine's exit. It backs the
 // client adaptWatcher tests.
 type fakeWatcher struct {
-	ch        chan storeapi.RawWatchEvent
+	ch        chan storeapi.RawChange
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
 func newFakeWatcher() *fakeWatcher {
-	return &fakeWatcher{ch: make(chan storeapi.RawWatchEvent), closed: make(chan struct{})}
+	return &fakeWatcher{ch: make(chan storeapi.RawChange), closed: make(chan struct{})}
 }
 
-func (w *fakeWatcher) Events() <-chan storeapi.RawWatchEvent { return w.ch }
+func (w *fakeWatcher) Changes() <-chan storeapi.RawChange { return w.ch }
 
 // Close (called by adaptWatcher's defer on exit) closes closed, letting tests
-// synchronize on goroutine exit instead of reading Events — which could itself
+// synchronize on goroutine exit instead of reading Changes — which could itself
 // satisfy a pending send and race the outcome.
 func (w *fakeWatcher) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
 
 // push delivers a raw event to the adapter goroutine.
-func (w *fakeWatcher) push(typ WatchEventType, obj *RawObject) {
-	w.ch <- storeapi.RawWatchEvent{Type: typ, Object: obj}
+func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
+	w.ch <- storeapi.RawChange{Type: typ, Object: obj}
 }
 
 // endStream closes the event channel, signalling the stream has ended.
