@@ -36,6 +36,8 @@ type workQueue struct {
 	ready      chan struct{}       // pulsed when items are available
 	stopped    bool                // set by stop; adds become no-ops
 	alarms     map[ObjectID]*alarm // pending delayed adds (addAfter), keyed by id
+
+	onSchedule func(id ObjectID, at time.Time, scheduled bool) // fires under mu when next-requeue changes; must not re-enter the queue
 }
 
 // alarm is a pending delayed enqueue: the timer that will enqueue the id and the
@@ -72,12 +74,24 @@ func (q *workQueue) addLocked(id ObjectID) {
 		return
 	}
 	q.dirty[id] = struct{}{}
-	if _, ok := q.processing[id]; ok {
-		// In flight: leave it dirty; done will re-queue it. Not dispatchable now.
+	if _, ok := q.processing[id]; !ok {
+		q.items = append(q.items, id)
+		q.signal()
+	}
+	// else in flight: leave it dirty; done will re-queue it, not dispatchable now.
+	q.emitScheduleLocked(id)
+}
+
+// emitScheduleLocked publishes id's current schedule to onSchedule. Caller holds
+// mu. It carries no dedup memory: callers invoke it only at genuine transitions of
+// the dirty/alarms state (which are the sole source of truth for the schedule), so
+// no consecutive emit repeats a value. See addLocked/get/addAfter.
+func (q *workQueue) emitScheduleLocked(id ObjectID) {
+	if q.onSchedule == nil {
 		return
 	}
-	q.items = append(q.items, id)
-	q.signal()
+	at, scheduled := q.nextRequeueAtLocked(id)
+	q.onSchedule(id, at, scheduled)
 }
 
 func (q *workQueue) signal() {
@@ -109,6 +123,12 @@ func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	a := &alarm{fireAt: time.Now().Add(delay)}
 	a.timer = time.AfterFunc(delay, func() { q.timerFired(id, a) })
 	q.alarms[id] = a
+	// A due-now (dirty) id already reported due-now, which dominates this future
+	// alarm (nextRequeueAt prefers queued), so only emit the fire time when the id
+	// isn't already queued for immediate dispatch.
+	if _, dirty := q.dirty[id]; !dirty {
+		q.emitScheduleLocked(id)
+	}
 }
 
 // timerFired runs when an alarm's timer fires. It enqueues id only if a is still
@@ -154,6 +174,26 @@ func (q *workQueue) requeueNow(id ObjectID) {
 func (q *workQueue) nextRequeueAt(id ObjectID) (time.Time, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	return q.nextRequeueAtLocked(id)
+}
+
+// subscribeSchedule runs subscribe — which registers a schedule hub receiver —
+// and reads id's current next-requeue time atomically under mu. Holding mu across
+// both means no emit can interleave between the snapshot and the subscription, so
+// the receiver captures every change strictly after the returned snapshot (a gauge
+// consumer that briefly sees a value twice just reconverges). Returns the zero time
+// when nothing is scheduled — the caller folds that into an empty Schedule anyway.
+func (q *workQueue) subscribeSchedule(id ObjectID, subscribe func()) time.Time {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	subscribe()
+	at, _ := q.nextRequeueAtLocked(id)
+	return at
+}
+
+// nextRequeueAtLocked is the lock-free core of nextRequeueAt, shared with the
+// schedule-emit path. Caller holds mu.
+func (q *workQueue) nextRequeueAtLocked(id ObjectID) (time.Time, bool) {
 	if _, ok := q.dirty[id]; ok {
 		return time.Now(), true
 	}
@@ -192,6 +232,8 @@ func (q *workQueue) get() (ObjectID, bool) {
 	if len(q.items) > 0 {
 		q.signal()
 	}
+	// Dispatch clears the dirty slot: absent a future alarm, the id is now unscheduled.
+	q.emitScheduleLocked(id)
 	return id, true
 }
 
@@ -206,4 +248,6 @@ func (q *workQueue) done(id ObjectID) {
 		q.items = append(q.items, id)
 		q.signal()
 	}
+	// No schedule emit: done only moves the id between processing and items, which
+	// nextRequeueAt ignores — the dirty/alarms state (hence the schedule) is unchanged.
 }

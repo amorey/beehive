@@ -243,6 +243,17 @@ type Result struct {
 }
 ```
 
+### Schedule
+
+```go
+type Schedule struct {
+    NextRequeueAt time.Time // when the object is next due to reconcile; zero = nothing scheduled
+    // reserved: a future Trigger/Reason (backoff | success-cadence | manual poke)
+}
+```
+
+`Schedule` is the value the [scheduling API](#scheduling) reports: an object's **next reconcile time, as a gauge**. It is a struct rather than a bare `time.Time` so fields can be added — e.g. a reschedule **trigger** (backoff vs. success-cadence vs. manual poke), reserved but not yet populated — without a breaking change. `NextRequeueAt` reflects only per-id timers (a pending backoff retry or `RequeueAfter` delay, or now if already queued) and is the zero time when nothing is scheduled.
+
 ### Client
 
 ```go
@@ -282,7 +293,10 @@ type Client[Spec, Status any] interface {
 
     // Reconcile control.
     Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
-    NextRequeueAt(ctx context.Context, id ObjectID) time.Time              // next scheduled requeue (zero if none)
+
+    // Scheduling — observe the next-requeue time.
+    GetSchedule(ctx context.Context, id ObjectID) (Schedule, error)          // current schedule (zero if nothing scheduled)
+    WatchSchedule(ctx context.Context, id ObjectID) (<-chan Schedule, error) // stream the schedule live as a gauge
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
@@ -305,16 +319,17 @@ Both issue the same secondary query (edges are a separate indexed lookup, never 
 
 By default `Requeue` **preserves the object's retry backoff ladder**. A requeue is the ordinary event-driven nudge (config change, dependency update, manual poke) and almost never proves the failing condition is resolved; the only event that proves recovery is a successful reconcile, which already clears backoff. The invariant: **backoff is cleared by a successful reconcile or an explicit `WithResetBackoff()`, never by a plain requeue.** Pass `beehive.WithResetBackoff()` only when the caller knows the failure is resolved and the next retry should restart from the base interval — the analog of controller-runtime's `Forget`. (This mirrors controller-runtime's split between `Add`/`AddAfter`, which requeue without resetting, and `Forget`, which explicitly resets.)
 
-`NextRequeueAt` reports when the reconcile loop has, **in advance, scheduled the object to be requeued**: a pending backoff retry or `RequeueAfter` delay, or now if it is already queued. It returns the **zero time** when no requeue is scheduled.
+`Requeue` validates the id against the client's kind first (`ErrNotFound` for a missing or foreign id), then requires a registered controller (`ErrNoController` for a client-only kind, which has no reconcile loop to schedule against). It is `Client`-only — a controller schedules itself with `Result.RequeueAfter` and influences other objects through the store, never by poking another reconcile loop directly.
 
-This is the next *scheduled requeue* — not a prediction of the next reconcile. By design it sees only per-id timers, so it does **not** account for any other wake:
+#### Scheduling
 
-- the **periodic resync** (kind-wide, conditional on the object being unsettled),
-- **dependency-change** wakes, **store-write** enqueues, or a `Requeue`.
+The scheduling API observes when an object is **next due to reconcile** — a [`Schedule`](#schedule) gauge whose `NextRequeueAt` is a pending backoff retry or `RequeueAfter` delay, or now if the object is already queued, and the zero time when nothing is scheduled.
 
-So the actual next reconcile can be **earlier** than reported, and a **zero time means "nothing scheduled", not "will not reconcile"** — an unsettled object with no pending timer is still picked up by the next resync tick. Treat it as observability, not a guarantee.
+`GetSchedule` is the point read. It is a non-blocking, best-effort read of in-memory schedule state — no store lookup, no kind guard — so it returns no error today (the error is reserved for symmetry). A missing, foreign, or client-only-kind id reads as the zero-value `Schedule`, indistinguishable from a real object with nothing scheduled.
 
-`Requeue` validates the id against the client's kind first (`ErrNotFound` for a missing or foreign id), then requires a registered controller (`ErrNoController` for a client-only kind, which has no reconcile loop to schedule against). `NextRequeueAt` does neither: it reads in-memory schedule state directly, so it returns no error — a missing, foreign, or client-only id simply reads as the zero time, indistinguishable from a real object with nothing scheduled. Both are `Client`-only — a controller schedules itself with `Result.RequeueAfter` and influences other objects through the store, never by poking another reconcile loop directly.
+`WatchSchedule` streams that schedule live as a **gauge**: the current value on subscribe, then a new `Schedule` on every (re)schedule — backoff step, `RequeueAfter`, resync or dependency wake, dispatch, or `Requeue`. None of these fire the object `Watch`/`WatchList` (a reschedule bumps no generation or resource version) and no other signal captures them all, so this is the only way to reliably observe reschedules — e.g. to drive a "next attempt" countdown that stays accurate for an object whose spec/status has stopped changing. Delivery mirrors `WatchEvents`: snapshot-then-live, conflated **per object** so a lagging reader converges to the latest value (it can miss intermediate values but never the current one), and the channel closes when `ctx` is cancelled or the control plane stops. Unlike `GetSchedule`, `WatchSchedule` returns `ErrNoController` for a client-only kind — a live stream that can never emit should say so rather than hang — but `id` need not exist: an unscheduled id simply streams the zero `Schedule` until something schedules it.
+
+Both are `Client`-only and read **only per-id timers**, so neither is a prediction of the next reconcile: the actual next reconcile can be **earlier** than reported (the periodic resync — kind-wide, conditional on the object being unsettled — plus dependency-change wakes and store-write enqueues are not per-id timers), and a **zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee. It is a sibling watch surface to `WatchEvents`, deliberately **not** routed through the event log: an event is an append-only, retained record of a past occurrence, whereas a requeue time is a single mutable future gauge — different data, different delivery and retention.
 
 `Create` generates a slug unless `beehive.WithSlug` is provided. If a slug is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
 

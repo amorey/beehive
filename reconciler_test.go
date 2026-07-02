@@ -1314,6 +1314,143 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	waitClosed(t, ctrl.deleted, "reconcile after deletion requested")
 }
 
+// TestIntegrationWatchScheduleClosesOnStop verifies a live WatchSchedule stream is
+// torn down when the control plane stops, even though the subscriber's own context
+// stays open: run's teardown closes the schedule hub, which ends the receiver and
+// closes the channel. Without that close the stream would hang forever on Background.
+func TestIntegrationWatchScheduleClosesOnStop(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	// Subscribe with a context that never cancels, so only the control plane's
+	// teardown can close the stream.
+	ch, err := client.WatchSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+	recv(t, ch) // drain the snapshot: the stream is live before we stop
+
+	require.NoError(t, stop(ctx))
+	assertChanClosed(t, ch)
+}
+
+// TestIntegrationWatchScheduleClosesOnCtxCancel verifies cancelling the subscriber's
+// own context closes the stream independently of the control plane — the other half
+// of the lifecycle contract.
+func TestIntegrationWatchScheduleClosesOnCtxCancel(t *testing.T) {
+	ctx := context.Background()
+
+	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	wctx, cancel := context.WithCancel(ctx)
+	ch, err := client.WatchSchedule(wctx, obj.ID)
+	require.NoError(t, err)
+	recv(t, ch) // drain the snapshot: the stream is live before we cancel
+
+	cancel()
+	assertChanClosed(t, ch)
+}
+
+// TestMergeSchedule pins the schedule hub's coalescing policy: latest value wins
+// and the slot is never annihilated — even the zero (unscheduled) Schedule is a
+// real gauge value a subscriber must observe, so keep is always true.
+func TestMergeSchedule(t *testing.T) {
+	prev := Schedule{NextRequeueAt: time.Unix(1, 0)}
+
+	got, keep := mergeSchedule(prev, Schedule{NextRequeueAt: time.Unix(2, 0)})
+	assert.True(t, keep)
+	assert.Equal(t, time.Unix(2, 0), got.NextRequeueAt)
+
+	// The unscheduled zero is kept, not annihilated.
+	got, keep = mergeSchedule(prev, Schedule{})
+	assert.True(t, keep)
+	assert.True(t, got.NextRequeueAt.IsZero())
+}
+
+// TestWatchScheduleSnapshotSendCtxDone covers the snapshot-send arm exiting on
+// context cancellation: no one reads the channel, so the goroutine parks on the
+// snapshot send and takes ctx.Done. Exit is awaited via afterWatchSchedule rather
+// than reading the channel, which would let the send succeed and mask the arm.
+func TestWatchScheduleSnapshotSendCtxDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	r := bh.reconcilers[clientTestGK]
+	exited := make(chan struct{})
+	r.afterWatchSchedule = func() { close(exited) }
+
+	ch, err := client.WatchSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+
+	cancel() // goroutine parks on the snapshot send (no reader) → ctx.Done
+	<-exited
+	_, ok := <-ch
+	assert.False(t, ok, "channel must be closed after the goroutine exits")
+}
+
+// TestWatchScheduleLiveSendCtxDone covers the live-send arm exiting on context
+// cancellation. A reschedule is buffered before the snapshot is drained, so once
+// the goroutine advances past the snapshot RecvContext returns that ready value
+// (a pending value beats a cancelled ctx) and parks on the live send with no
+// reader, taking ctx.Done.
+func TestWatchScheduleLiveSendCtxDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	r := bh.reconcilers[clientTestGK]
+	drainQueue(r.work)
+
+	exited := make(chan struct{})
+	r.afterWatchSchedule = func() { close(exited) }
+
+	ch, err := client.WatchSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+
+	// Buffer a live reschedule before draining the snapshot: it is pending by the
+	// time the goroutine reaches the live RecvContext, so it is returned rather
+	// than the cancelled ctx observed.
+	r.work.addAfter(obj.ID, time.Hour)
+
+	recv(t, ch) // drain the snapshot; goroutine advances to the live send
+
+	cancel() // live send parks with no reader → ctx.Done
+	<-exited
+	_, ok := <-ch
+	assert.False(t, ok, "channel must be closed after the goroutine exits")
+}
+
 // TestIntegrationWritePersistsAcrossReconcileError is the end-to-end counterpart
 // of TestReconcilePersistsWritesOnError: a status write made during a reconcile
 // that then returns an error stays committed, because reconcile no longer runs

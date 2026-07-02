@@ -858,26 +858,26 @@ func TestClientAdaptWatcherClosesWhenStreamEnds(t *testing.T) {
 	}
 }
 
-// recvWatch waits for the next event on ch, failing the test if none arrives
-// within the failsafe timeout.
-func recvWatch[S, T any](t *testing.T, ch <-chan Change[S, T]) Change[S, T] {
+// recv waits for the next value on ch, failing the test if none arrives within
+// the failsafe timeout.
+func recv[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
 	select {
-	case evt, ok := <-ch:
+	case v, ok := <-ch:
 		if !ok {
 			t.Fatal("watch channel closed unexpectedly")
 		}
-		return evt
+		return v
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for watch event")
+		t.Fatal("timed out waiting for a watch value")
 		panic("unreachable")
 	}
 }
 
 // assertChanClosed fails the test if ch does not close within the failsafe timeout.
-func assertChanClosed[S, T any](t *testing.T, ch <-chan Change[S, T]) {
+func assertChanClosed[T any](t *testing.T, ch <-chan T) {
 	t.Helper()
-	// Drain any buffered events, then expect close.
+	// Drain any buffered values, then expect close.
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
@@ -915,7 +915,7 @@ func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	evt := recvWatch(t, ch)
+	evt := recv(t, ch)
 	assert.Equal(t, Added, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "hello", evt.Object.Spec.Val)
@@ -935,12 +935,12 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "v1"})
 	require.NoError(t, err)
 	// Drain the Added event from Create.
-	recvWatch(t, ch)
+	recv(t, ch)
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
-	evt := recvWatch(t, ch)
+	evt := recv(t, ch)
 	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "v2", evt.Object.Spec.Val)
@@ -959,11 +959,11 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{})
 	require.NoError(t, err)
 	// Drain the Added event from Create.
-	recvWatch(t, ch)
+	recv(t, ch)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
-	evt := recvWatch(t, ch)
+	evt := recv(t, ch)
 	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.NotNil(t, evt.Object.DeletionRequestedAt)
@@ -980,10 +980,10 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 
 	obj, err := client.Create(ctx, cSpec{})
 	require.NoError(t, err)
-	recvWatch(t, ch) // drain Added
+	recv(t, ch) // drain Added
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	recvWatch(t, ch) // drain first Modified
+	recv(t, ch) // drain first Modified
 
 	// Second Delete is idempotent; no new event should arrive.
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -1012,7 +1012,7 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	require.NoError(t, err)
 
 	// Drain the initial snapshot Added event for obj1.
-	snap := recvWatch(t, ch)
+	snap := recv(t, ch)
 	assert.Equal(t, Added, snap.Type)
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
@@ -1024,7 +1024,7 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	_, err = client.Update(ctx, obj1.ID, cSpec{Val: "a2"})
 	require.NoError(t, err)
 
-	evt := recvWatch(t, ch)
+	evt := recv(t, ch)
 	assert.Equal(t, obj1.ID, evt.Object.ID)
 	assert.Equal(t, "a2", evt.Object.Spec.Val)
 }
@@ -1086,13 +1086,13 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	require.NoError(t, err)
 
 	// Drain the initial snapshot Added event.
-	snap := recvWatch(t, ch)
+	snap := recv(t, ch)
 	assert.Equal(t, Added, snap.Type)
 	assert.Equal(t, obj.ID, snap.Object.ID)
 
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	evt := recvWatch(t, ch)
+	evt := recv(t, ch)
 	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	require.NotNil(t, evt.Object.Status)
@@ -1116,7 +1116,7 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	// Two snapshot Added events must arrive, one per existing object.
 	seen := map[ObjectID]string{}
 	for range 2 {
-		evt := recvWatch(t, ch)
+		evt := recv(t, ch)
 		assert.Equal(t, Added, evt.Type)
 		seen[evt.Object.ID] = evt.Object.Spec.Val
 	}
@@ -1136,7 +1136,7 @@ func TestWatchInitialSnapshot(t *testing.T) {
 	ch, err := client.Watch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	evt := recvWatch(t, ch)
+	evt := recv(t, ch)
 	assert.Equal(t, Added, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "hello", evt.Object.Spec.Val)
@@ -1632,9 +1632,26 @@ func TestClientRequeue(t *testing.T) {
 	}
 }
 
-// TestClientNextRequeueAtScheduled verifies NextRequeueAt returns a pending
-// delayed reconcile's fire time.
-func TestClientNextRequeueAtScheduled(t *testing.T) {
+// TestClientGetScheduleUnknownID verifies GetSchedule reads in-memory schedule
+// state without a store lookup: an id that does not exist (or belongs to another
+// kind) is simply unscheduled, so it reads as the zero Schedule with a nil error
+// rather than ErrNotFound.
+func TestClientGetScheduleUnknownID(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	s, err := client.GetSchedule(ctx, 999)
+	require.NoError(t, err)
+	assert.True(t, s.NextRequeueAt.IsZero(), "unknown id must read as the zero Schedule, got %s", s.NextRequeueAt)
+}
+
+// TestClientGetScheduleScheduled verifies GetSchedule returns a Schedule carrying
+// the pending delayed reconcile's fire time in NextRequeueAt.
+func TestClientGetScheduleScheduled(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -1645,19 +1662,20 @@ func TestClientNextRequeueAtScheduled(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	// Drain the create-time enqueue so only the future schedule remains; otherwise
-	// the id is queued-now and NextRequeueAt correctly reports "due now" instead.
+	// Drain the create-time enqueue so only the future schedule remains.
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
 	r.work.addAfter(obj.ID, time.Hour)
 
-	at := client.NextRequeueAt(ctx, obj.ID)
-	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
+	s, err := client.GetSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.True(t, s.NextRequeueAt.After(time.Now().Add(time.Minute)),
+		"fire time must be ~1h out, got %s", s.NextRequeueAt)
 }
 
-// TestClientNextRequeueAtUnscheduled verifies NextRequeueAt returns the zero
-// time (and no error) when nothing is firmly scheduled for the id.
-func TestClientNextRequeueAtUnscheduled(t *testing.T) {
+// TestClientGetScheduleUnscheduled verifies GetSchedule returns the zero-value
+// Schedule (and no error) when nothing is scheduled for the id.
+func TestClientGetScheduleUnscheduled(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -1668,34 +1686,18 @@ func TestClientNextRequeueAtUnscheduled(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	// Drain the create-time enqueue so nothing is pending.
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
 
-	at := client.NextRequeueAt(ctx, obj.ID)
-	assert.True(t, at.IsZero(), "unscheduled id must report the zero time, got %s", at)
+	s, err := client.GetSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.True(t, s.NextRequeueAt.IsZero(), "unscheduled id must carry the zero time, got %s", s.NextRequeueAt)
 }
 
-// TestClientNextRequeueAtUnknownID verifies NextRequeueAt reads in-memory
-// schedule state without a store lookup: an id that does not exist (or belongs
-// to another kind) is simply unscheduled, so it reports the zero time and no
-// error rather than ErrNotFound.
-func TestClientNextRequeueAtUnknownID(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	at := client.NextRequeueAt(ctx, 999)
-	assert.True(t, at.IsZero(), "unknown id must report the zero time, got %s", at)
-}
-
-// TestClientNextRequeueAtNoController verifies a client-only kind (no registered
-// controller, hence no reconcile loop to schedule against) reports the zero time
-// rather than an error.
-func TestClientNextRequeueAtNoController(t *testing.T) {
+// TestClientGetScheduleNoController verifies GetSchedule folds a client-only kind
+// (no reconcile loop to schedule against) into the zero Schedule and a nil error,
+// degrading gracefully rather than erroring like the WatchSchedule live stream.
+func TestClientGetScheduleNoController(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -1704,8 +1706,98 @@ func TestClientNextRequeueAtNoController(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	at := client.NextRequeueAt(ctx, obj.ID)
-	assert.True(t, at.IsZero(), "client-only kind must report the zero time, got %s", at)
+	s, err := client.GetSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.True(t, s.NextRequeueAt.IsZero(), "client-only kind must carry the zero time, got %s", s.NextRequeueAt)
+}
+
+// TestClientWatchScheduleSnapshot verifies WatchSchedule delivers the current
+// schedule on subscribe: an id with a pending future requeue emits that fire time
+// first, before any live change.
+func TestClientWatchScheduleSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	// Drain the create-time enqueue and schedule a future requeue before watching.
+	r := bh.reconcilers[clientTestGK]
+	drainQueue(r.work)
+	r.work.addAfter(obj.ID, time.Hour)
+
+	ch, err := client.WatchSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+
+	s := recv(t, ch)
+	assert.True(t, s.NextRequeueAt.After(time.Now().Add(time.Minute)),
+		"snapshot must carry the pending ~1h fire time, got %s", s.NextRequeueAt)
+}
+
+// TestClientWatchScheduleLive verifies WatchSchedule streams reschedules live: the
+// snapshot, then a future fire time, then due-now, then the unscheduled zero as the
+// id moves through addAfter → requeueNow → dispatch.
+func TestClientWatchScheduleLive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	r := bh.reconcilers[clientTestGK]
+	drainQueue(r.work)
+
+	ch, err := client.WatchSchedule(ctx, obj.ID)
+	require.NoError(t, err)
+
+	// Snapshot: nothing scheduled after the drain.
+	snap := recv(t, ch)
+	assert.True(t, snap.NextRequeueAt.IsZero(), "snapshot must be unscheduled, got %s", snap.NextRequeueAt)
+
+	// A future requeue: emits the fire time.
+	r.work.addAfter(obj.ID, time.Hour)
+	future := recv(t, ch)
+	assert.True(t, future.NextRequeueAt.After(time.Now().Add(time.Minute)),
+		"reschedule must emit the ~1h fire time, got %s", future.NextRequeueAt)
+
+	// requeueNow: flips to due-now.
+	r.work.requeueNow(obj.ID)
+	now := recv(t, ch)
+	require.False(t, now.NextRequeueAt.IsZero(), "due-now must carry a non-zero time")
+	assert.False(t, now.NextRequeueAt.After(time.Now()), "requeueNow must emit due-now, got %s", now.NextRequeueAt)
+
+	// Dispatch: the id leaves the queue, so the schedule clears to the zero time.
+	_, ok := r.work.get()
+	require.True(t, ok)
+	cleared := recv(t, ch)
+	assert.True(t, cleared.NextRequeueAt.IsZero(), "dispatch must emit the unscheduled zero, got %s", cleared.NextRequeueAt)
+}
+
+// TestClientWatchScheduleNoController verifies WatchSchedule rejects a client-only
+// kind with ErrNoController: a live stream that can never emit should say so, unlike
+// the point-read GetSchedule which degrades to the zero Schedule.
+func TestClientWatchScheduleNoController(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "x"})
+	require.NoError(t, err)
+
+	_, err = client.WatchSchedule(ctx, obj.ID)
+	assert.ErrorIs(t, err, ErrNoController)
 }
 
 // eventErrStore wraps a real store, failing only the event paths so object ops
