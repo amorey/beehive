@@ -132,14 +132,14 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 // reconciler drives the reconcile loop for a single registered controller.
 // It owns the work queue, exponential backoff, and periodic resync timer.
 type reconciler struct {
-	gk                GroupKind
-	adapter           controllerAdapter
-	store             Store
-	work              *workQueue
+	gk      GroupKind
+	adapter controllerAdapter
+	store   Store
+	work    *workQueue
 	// scheduleHub fans each object's next-requeue changes out to WatchSchedule
 	// subscribers, keyed by ObjectID with latest-value-per-id coalescing. The work
 	// queue feeds it through onSchedule; Close (on teardown) ends live streams.
-	scheduleHub *conflate.Hub[ObjectID, Schedule]
+	scheduleHub       *conflate.Hub[ObjectID, Schedule]
 	resyncInterval    time.Duration
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
@@ -157,6 +157,11 @@ type reconciler struct {
 
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
+
+	// afterWatchSchedule, when set, runs after a watchSchedule goroutine exits.
+	// Tests use it to await teardown without reading the channel — a read would
+	// let a parked send succeed and mask the ctx.Done/close arm under test.
+	afterWatchSchedule func()
 }
 
 // enqueue adds id to the work queue if one is configured.
@@ -304,6 +309,9 @@ func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Sche
 
 	out := make(chan Schedule)
 	go func() {
+		if r.afterWatchSchedule != nil {
+			defer r.afterWatchSchedule()
+		}
 		defer close(out)
 		defer rx.Close()
 		send := func(s Schedule) bool {
