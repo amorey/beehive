@@ -331,7 +331,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
-	fw.push(WatchEventModified, &RawObject{ID: 1})
+	fw.push(Modified, &RawObject{ID: 1})
 	<-store.entered
 
 	stopped := make(chan struct{})
@@ -385,7 +385,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		close(done)
 	}()
 
-	fw.push(WatchEventAdded, &RawObject{ID: 1})
+	fw.push(Added, &RawObject{ID: 1})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(1), id, "Added event wakes dependents (a coalesced create+modify)")
@@ -393,7 +393,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Added event did not trigger a wake")
 	}
 
-	fw.push(WatchEventModified, &RawObject{ID: 2})
+	fw.push(Modified, &RawObject{ID: 2})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(2), id, "Modified event wakes dependents of the changed object")
@@ -401,7 +401,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Modified event did not trigger a wake")
 	}
 
-	fw.push(WatchEventDeleted, &RawObject{ID: 3})
+	fw.push(Deleted, &RawObject{ID: 3})
 	select {
 	case <-calls:
 		t.Fatal("Deleted event triggered a dependents wake")

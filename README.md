@@ -246,16 +246,16 @@ type Result struct {
 ### Client
 
 ```go
-type WatchEventType string
+type ChangeType string
 
 const (
-    WatchEventAdded    WatchEventType = "Added"
-    WatchEventModified WatchEventType = "Modified"
-    WatchEventDeleted  WatchEventType = "Deleted"
+    Added    ChangeType = "Added"
+    Modified ChangeType = "Modified"
+    Deleted  ChangeType = "Deleted"
 )
 
-type WatchEvent[Spec, Status any] struct {
-    Type   WatchEventType
+type Change[Spec, Status any] struct {
+    Type   ChangeType
     Object *Object[Spec, Status]
 }
 
@@ -266,8 +266,8 @@ type Client[Spec, Status any] interface {
     GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
     List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
     Delete(ctx context.Context, id ObjectID) error
-    Watch(ctx context.Context, id ObjectID) (<-chan WatchEvent[Spec, Status], error)
-    WatchList(ctx context.Context) (<-chan WatchEvent[Spec, Status], error)
+    Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error)
+    WatchList(ctx context.Context) (<-chan Change[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
     GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
@@ -324,7 +324,7 @@ obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithSlug("prod-cluster"),
 client.Update(ctx, obj.ID, ClusterSpec{...})
 ```
 
-`Watch` and `WatchList` emit the current state as `Added` events on start, then stream subsequent changes. The channel closes when `ctx` is cancelled. Events are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model.
+`Watch` and `WatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `Change` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `ListEvents`/`WatchEvents` below — is a separate concept: `Change` is an object-change notification, `Event` is a recorded log entry.)
 
 #### Events
 

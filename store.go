@@ -56,18 +56,18 @@ const (
 
 // Watcher is a closeable subscription to a kind's change stream, returned by the
 // store's Watch/WatchList. The client decodes its raw events into the typed
-// WatchEvent[Spec, Status] surface.
+// Change[Spec, Status] surface.
 type Watcher = storeapi.Watcher
 
 // EventWatcher is a subscription to one object's event log, returned by the
 // store's WatchEvents. The client decodes its raw runs into public Events.
 type EventWatcher = storeapi.EventWatcher
 
-// WatchEventType classifies a WatchEvent.
-type WatchEventType = storeapi.WatchEventType
+// ChangeType classifies a Change.
+type ChangeType = storeapi.ChangeType
 
 const (
-	WatchEventAdded    = storeapi.WatchEventAdded
-	WatchEventModified = storeapi.WatchEventModified
-	WatchEventDeleted  = storeapi.WatchEventDeleted
+	Added    = storeapi.Added
+	Modified = storeapi.Modified
+	Deleted  = storeapi.Deleted
 )

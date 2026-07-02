@@ -224,7 +224,7 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, ok := <-w.Events():
+		case ev, ok := <-w.Changes():
 			if !ok {
 				return
 			}
@@ -234,7 +234,7 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
 			// brand-new object usually has no dependents, so the extra lookup is a
 			// cheap no-op — the over-wake is harmless. Deleted carries nothing to
 			// requeue (a gone object has no dependents).
-			if ev.Type == WatchEventAdded || ev.Type == WatchEventModified {
+			if ev.Type == Added || ev.Type == Modified {
 				bh.wakeDependents(ctx, ev.Object.ID)
 			}
 		}

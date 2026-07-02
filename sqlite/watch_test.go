@@ -212,10 +212,10 @@ func TestWatchEventsFiltersLiveByCategory(t *testing.T) {
 
 // recvEvent waits for the next event on w, failing the test if none arrives or
 // the channel closes within the failsafe timeout.
-func recvEvent(t *testing.T, w beehive.Watcher) storeapi.RawWatchEvent {
+func recvEvent(t *testing.T, w beehive.Watcher) storeapi.RawChange {
 	t.Helper()
 	select {
-	case ev, ok := <-w.Events():
+	case ev, ok := <-w.Changes():
 		if !ok {
 			t.Fatal("watcher channel closed unexpectedly")
 		}
@@ -230,7 +230,7 @@ func recvEvent(t *testing.T, w beehive.Watcher) storeapi.RawWatchEvent {
 func assertNoEvent(t *testing.T, w beehive.Watcher, d time.Duration) {
 	t.Helper()
 	select {
-	case ev, ok := <-w.Events():
+	case ev, ok := <-w.Changes():
 		if ok {
 			t.Fatalf("unexpected event: %+v", ev)
 		}
@@ -245,7 +245,7 @@ func assertWatcherClosed(t *testing.T, w beehive.Watcher) {
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case _, ok := <-w.Events():
+		case _, ok := <-w.Changes():
 			if !ok {
 				return
 			}
@@ -275,7 +275,7 @@ func TestWithinFlushesAfterCommit(t *testing.T) {
 	}))
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, ev.Type)
+	assert.Equal(t, beehive.Added, ev.Type)
 }
 
 // TestWithinRollbackDiscardsEvents verifies a rolled-back transaction publishes
@@ -317,7 +317,7 @@ func TestNestedWithinSingleFlush(t *testing.T) {
 	}))
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, ev.Type)
+	assert.Equal(t, beehive.Added, ev.Type)
 	assertNoEvent(t, w, 200*time.Millisecond) // only one flush
 }
 
@@ -336,13 +336,13 @@ func TestRequestDeletionIdempotentNoEvent(t *testing.T) {
 
 	// Drain the snapshot Added for the pre-existing object.
 	snap := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, snap.Type)
+	assert.Equal(t, beehive.Added, snap.Type)
 
 	_, changed, err := store.RequestDeletion(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.True(t, changed)
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, beehive.Modified, ev.Type)
 
 	_, changed, err = store.RequestDeletion(ctx, testGK, obj.ID)
 	require.NoError(t, err)
@@ -362,7 +362,7 @@ func TestWatchDedupesSnapshotResourceVersion(t *testing.T) {
 
 	store.beforeSnapshot = func() {
 		// Same resource version as the snapshot will carry → must be deduped.
-		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified, Object: obj})
+		store.publish(testGK, storeapi.RawChange{Type: beehive.Modified, Object: obj})
 	}
 
 	w, err := store.WatchList(ctx, testGK)
@@ -370,7 +370,7 @@ func TestWatchDedupesSnapshotResourceVersion(t *testing.T) {
 	defer w.Close()
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, ev.Type)
+	assert.Equal(t, beehive.Added, ev.Type)
 	assert.Equal(t, obj.ID, ev.Object.ID)
 	assertNoEvent(t, w, 200*time.Millisecond) // the duplicate live event was dropped
 }
@@ -393,7 +393,7 @@ func TestWatchStreamsLiveAfterSnapshot(t *testing.T) {
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, beehive.Modified, ev.Type)
 	assert.Equal(t, obj.ID, ev.Object.ID)
 }
 
@@ -455,7 +455,7 @@ func TestWatchChangesSkipsSnapshot(t *testing.T) {
 	_, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, ev.Type)
+	assert.Equal(t, beehive.Modified, ev.Type)
 	assert.Equal(t, pre.ID, ev.Object.ID)
 }
 
@@ -472,7 +472,7 @@ func TestWatchChangesStreamsLiveAdded(t *testing.T) {
 	created, err := store.CreateObject(ctx, newWatchObject())
 	require.NoError(t, err)
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, ev.Type)
+	assert.Equal(t, beehive.Added, ev.Type)
 	assert.Equal(t, created.ID, ev.Object.ID)
 }
 
@@ -519,7 +519,7 @@ func TestWatchClosesOnStoreCloseWhileParkedOnSend(t *testing.T) {
 
 	require.NoError(t, store.Close())
 	<-exited
-	_, ok := <-w.Events()
+	_, ok := <-w.Changes()
 	assert.False(t, ok, "channel must close when the store closes mid-send")
 }
 
@@ -540,7 +540,7 @@ func TestDeleteObjectEmitsDeleted(t *testing.T) {
 	require.NoError(t, store.DeleteObject(ctx, obj.ID))
 
 	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventDeleted, ev.Type)
+	assert.Equal(t, beehive.Deleted, ev.Type)
 	assert.Equal(t, obj.ID, ev.Object.ID)
 }
 
@@ -587,7 +587,7 @@ func TestWatchSnapshotSendCtxDone(t *testing.T) {
 
 	cancel() // goroutine parks on the snapshot send (no reader) → takes ctx.Done
 	<-exited
-	_, ok := <-w.Events()
+	_, ok := <-w.Changes()
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
 }
 
@@ -609,17 +609,17 @@ func TestWatchCoalescesRapidUpdates(t *testing.T) {
 	// Two live updates with rv > high-water, published before the snapshot Added
 	// is drained, so the goroutine is parked and both land in the receiver's slot.
 	mod := func(rv int64, spec string) {
-		store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+		store.publish(testGK, storeapi.RawChange{Type: beehive.Modified,
 			Object: &beehive.RawObject{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(spec), ResourceVersion: rv}})
 	}
 	mod(2, `{"v":2}`)
 	mod(3, `{"v":3}`)
 
 	first := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, first.Type)
+	assert.Equal(t, beehive.Added, first.Type)
 
 	rec := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, rec.Type)
+	assert.Equal(t, beehive.Modified, rec.Type)
 	assert.Equal(t, obj.ID, rec.Object.ID)
 	assert.JSONEq(t, `{"v":3}`, string(rec.Object.Spec))
 
@@ -644,16 +644,16 @@ func TestWatchDeliversRealDeleteBodyWhenSlow(t *testing.T) {
 
 	// Update then delete while parked on the snapshot Added: the Modified
 	// coalesces into the Deleted, which carries the real last row.
-	store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+	store.publish(testGK, storeapi.RawChange{Type: beehive.Modified,
 		Object: &beehive.RawObject{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"hello":"mutated"}`), ResourceVersion: 2}})
-	store.publish(testGK, storeapi.RawWatchEvent{Type: beehive.WatchEventDeleted,
+	store.publish(testGK, storeapi.RawChange{Type: beehive.Deleted,
 		Object: &beehive.RawObject{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"hello":"final"}`), ResourceVersion: 3}})
 
 	first := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, first.Type)
+	assert.Equal(t, beehive.Added, first.Type)
 
 	rec := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventDeleted, rec.Type)
+	assert.Equal(t, beehive.Deleted, rec.Type)
 	assert.Equal(t, obj.ID, rec.Object.ID)
 	assert.JSONEq(t, `{"hello":"final"}`, string(rec.Object.Spec))
 }
@@ -661,7 +661,7 @@ func TestWatchDeliversRealDeleteBodyWhenSlow(t *testing.T) {
 // TestWatchSnapshotRaceDeleteNotLost verifies the P1 correctness property: an
 // object created in the subscribe→snapshot race window (its Added is buffered
 // before the snapshot is taken, and the snapshot includes it) must not lose a
-// subsequent delete. The old annihilation in mergeWatchEvent would coalesce the
+// subsequent delete. The old annihilation in mergeChange would coalesce the
 // buffered Added+Deleted into nothing, leaving the consumer with a stale object.
 func TestWatchSnapshotRaceDeleteNotLost(t *testing.T) {
 	store := newRawStore(t)
@@ -687,8 +687,8 @@ func TestWatchSnapshotRaceDeleteNotLost(t *testing.T) {
 	// Publish Deleted before reading any event; goroutine is parked on the
 	// snapshot send, so this lands in the buffer and merges with the buffered
 	// race-window Added.
-	store.publish(testGK, storeapi.RawWatchEvent{
-		Type: beehive.WatchEventDeleted,
+	store.publish(testGK, storeapi.RawChange{
+		Type: beehive.Deleted,
 		Object: &storeapi.RawObject{
 			ID: created.ID, Group: testGK.Group, Kind: testGK.Kind,
 			ResourceVersion: created.ResourceVersion + 1,
@@ -696,11 +696,11 @@ func TestWatchSnapshotRaceDeleteNotLost(t *testing.T) {
 	})
 
 	snap := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, snap.Type)
+	assert.Equal(t, beehive.Added, snap.Type)
 	assert.Equal(t, created.ID, snap.Object.ID)
 
 	del := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventDeleted, del.Type)
+	assert.Equal(t, beehive.Deleted, del.Type)
 	assert.Equal(t, created.ID, del.Object.ID)
 }
 
@@ -712,15 +712,15 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 	var seed atomic.Pointer[snapshotIDs]
 	merge := annihilatingMerge(snapshotPreserve(&seed))
 	const id storeapi.ObjectID = 42
-	added := storeapi.RawWatchEvent{Type: beehive.WatchEventAdded,
+	added := storeapi.RawChange{Type: beehive.Added,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 5}}
-	deleted := storeapi.RawWatchEvent{Type: beehive.WatchEventDeleted,
+	deleted := storeapi.RawChange{Type: beehive.Deleted,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 6}}
 
 	// Snapshot not yet loaded: membership unknown, so keep conservatively.
 	got, keep := merge(added, deleted)
 	require.True(t, keep)
-	assert.Equal(t, beehive.WatchEventDeleted, got.Type)
+	assert.Equal(t, beehive.Deleted, got.Type)
 
 	// Snapshot loaded without the id: transient object the consumer never saw —
 	// annihilate the pair.
@@ -734,7 +734,7 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 	seed.Store(&withID)
 	got, keep = merge(added, deleted)
 	require.True(t, keep)
-	assert.Equal(t, beehive.WatchEventDeleted, got.Type)
+	assert.Equal(t, beehive.Deleted, got.Type)
 }
 
 // TestAnnihilatingMergeForEvents verifies the WatchChanges memory bound: with no
@@ -743,11 +743,11 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 func TestAnnihilatingMergeForEvents(t *testing.T) {
 	merge := annihilatingMerge(nil)
 	const id storeapi.ObjectID = 7
-	added := storeapi.RawWatchEvent{Type: beehive.WatchEventAdded,
+	added := storeapi.RawChange{Type: beehive.Added,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 1}}
-	deleted := storeapi.RawWatchEvent{Type: beehive.WatchEventDeleted,
+	deleted := storeapi.RawChange{Type: beehive.Deleted,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
-	modified := storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+	modified := storeapi.RawChange{Type: beehive.Modified,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
 
 	// Unobserved create→delete: dropped entirely.
@@ -757,12 +757,12 @@ func TestAnnihilatingMergeForEvents(t *testing.T) {
 	// Create→modify still coalesces and survives (kept as Added, latest body).
 	got, keep := merge(added, modified)
 	require.True(t, keep)
-	assert.Equal(t, beehive.WatchEventAdded, got.Type)
+	assert.Equal(t, beehive.Added, got.Type)
 	assert.EqualValues(t, 2, got.Object.ResourceVersion)
 }
 
 // TestWatchSnapshotRaceModifiedNotAdded verifies that when a race-window Added
-// and a post-snapshot Modified coalesce in the buffer (mergeWatchEvent preserves
+// and a post-snapshot Modified coalesce in the buffer (mergeChange preserves
 // Added type since prev was Added), the consumer — which already received the
 // object via the snapshot — sees Modified, not a spurious second Added.
 func TestWatchSnapshotRaceModifiedNotAdded(t *testing.T) {
@@ -784,8 +784,8 @@ func TestWatchSnapshotRaceModifiedNotAdded(t *testing.T) {
 	// The merge of (buffered Added, incoming Modified) yields Added — but the
 	// consumer already has this object from the snapshot, so it must arrive
 	// as Modified.
-	store.publish(testGK, storeapi.RawWatchEvent{
-		Type: beehive.WatchEventModified,
+	store.publish(testGK, storeapi.RawChange{
+		Type: beehive.Modified,
 		Object: &storeapi.RawObject{
 			ID: created.ID, Group: testGK.Group, Kind: testGK.Kind,
 			Spec:            []byte(`{"v":2}`),
@@ -794,11 +794,11 @@ func TestWatchSnapshotRaceModifiedNotAdded(t *testing.T) {
 	})
 
 	snap := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventAdded, snap.Type)
+	assert.Equal(t, beehive.Added, snap.Type)
 	assert.Equal(t, created.ID, snap.Object.ID)
 
 	mod := recvEvent(t, w)
-	assert.Equal(t, beehive.WatchEventModified, mod.Type) // not a second Added
+	assert.Equal(t, beehive.Modified, mod.Type) // not a second Added
 	assert.Equal(t, created.ID, mod.Object.ID)
 }
 
@@ -843,12 +843,12 @@ func TestWatchBornAndDiedAfterSnapshotUnobserved(t *testing.T) {
 	// empty snapshot means id 99 was never observed, so the resulting lone Deleted
 	// must be silently dropped rather than delivered.
 	store.beforeSnapshot = func() {
-		store.publish(testGK, storeapi.RawWatchEvent{
-			Type:   beehive.WatchEventAdded,
+		store.publish(testGK, storeapi.RawChange{
+			Type:   beehive.Added,
 			Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 1},
 		})
-		store.publish(testGK, storeapi.RawWatchEvent{
-			Type:   beehive.WatchEventDeleted,
+		store.publish(testGK, storeapi.RawChange{
+			Type:   beehive.Deleted,
 			Object: &storeapi.RawObject{ID: 99, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 2},
 		})
 	}
@@ -860,17 +860,17 @@ func TestWatchBornAndDiedAfterSnapshotUnobserved(t *testing.T) {
 	assertNoEvent(t, w, 200*time.Millisecond)
 }
 
-// TestMergeWatchEventKeepsHigherResourceVersion verifies an out-of-order merge
+// TestMergeChangeKeepsHigherResourceVersion verifies an out-of-order merge
 // (prev's resource version exceeds next's) keeps the higher-versioned event as
 // the newer lifecycle state.
-func TestMergeWatchEventKeepsHigherResourceVersion(t *testing.T) {
+func TestMergeChangeKeepsHigherResourceVersion(t *testing.T) {
 	const id storeapi.ObjectID = 3
-	prev := storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+	prev := storeapi.RawChange{Type: beehive.Modified,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 9, Spec: []byte(`{"v":"new"}`)}}
-	next := storeapi.RawWatchEvent{Type: beehive.WatchEventModified,
+	next := storeapi.RawChange{Type: beehive.Modified,
 		Object: &storeapi.RawObject{ID: id, ResourceVersion: 4, Spec: []byte(`{"v":"old"}`)}}
 
-	got, keep := mergeWatchEvent(prev, next)
+	got, keep := mergeChange(prev, next)
 	require.True(t, keep)
 	assert.EqualValues(t, 9, got.Object.ResourceVersion, "higher-RV (prev) body wins")
 	assert.Equal(t, []byte(`{"v":"new"}`), got.Object.Spec)
@@ -923,8 +923,8 @@ func TestWatchOrphanTombstoneDropped(t *testing.T) {
 
 	// RV 1 clears the empty snapshot's high-water (0) so the event reaches the
 	// seenIDs switch, where the orphan tombstone is dropped.
-	store.publish(testGK, storeapi.RawWatchEvent{
-		Type:   beehive.WatchEventDeleted,
+	store.publish(testGK, storeapi.RawChange{
+		Type:   beehive.Deleted,
 		Object: &storeapi.RawObject{ID: id, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 1},
 	})
 
@@ -942,8 +942,8 @@ func TestWatchLiveSendCtxDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	store.beforeSnapshot = func() {
-		store.publish(testGK, storeapi.RawWatchEvent{
-			Type:   beehive.WatchEventModified,
+		store.publish(testGK, storeapi.RawChange{
+			Type:   beehive.Modified,
 			Object: &beehive.RawObject{ID: 1, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1},
 		})
 	}
@@ -953,7 +953,7 @@ func TestWatchLiveSendCtxDone(t *testing.T) {
 
 	cancel() // goroutine parks on the live send (no reader) → takes ctx.Done
 	<-exited
-	_, ok := <-w.Events()
+	_, ok := <-w.Changes()
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
 }
 

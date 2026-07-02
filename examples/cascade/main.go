@@ -170,8 +170,8 @@ func stopBeehive(stop func(context.Context) error) {
 func watchCascade(
 	ctx context.Context,
 	clusterClient beehive.Client[ClusterSpec, ClusterStatus],
-	clusterCh <-chan beehive.WatchEvent[ClusterSpec, ClusterStatus],
-	cacheCh <-chan beehive.WatchEvent[ClusterCacheSpec, ClusterCacheStatus],
+	clusterCh <-chan beehive.Change[ClusterSpec, ClusterStatus],
+	cacheCh <-chan beehive.Change[ClusterCacheSpec, ClusterCacheStatus],
 	clusterID beehive.ObjectID,
 ) {
 	warmed := map[beehive.ObjectID]bool{}
@@ -194,7 +194,7 @@ func watchCascade(
 		select {
 		case ev := <-clusterCh:
 			o := ev.Object
-			if ev.Type == beehive.WatchEventDeleted {
+			if ev.Type == beehive.Deleted {
 				fmt.Printf("Cluster %d: removed\n", o.ID)
 				clusterRemoved = true
 				continue
@@ -206,7 +206,7 @@ func watchCascade(
 			}
 		case ev := <-cacheCh:
 			o := ev.Object
-			if ev.Type == beehive.WatchEventDeleted {
+			if ev.Type == beehive.Deleted {
 				fmt.Printf("ClusterCache %d: removed\n", o.ID)
 				cachesRemoved++
 				continue

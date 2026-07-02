@@ -764,8 +764,8 @@ func TestClientAdaptWatcherConversionError(t *testing.T) {
 	ch, err := client.WatchList(context.Background())
 	require.NoError(t, err)
 
-	w.push(WatchEventModified, &RawObject{ID: 1, Spec: []byte("not-json")})
-	w.push(WatchEventAdded, &RawObject{ID: 2, Spec: []byte(`{}`)})
+	w.push(Modified, &RawObject{ID: 1, Spec: []byte("not-json")})
+	w.push(Added, &RawObject{ID: 2, Spec: []byte(`{}`)})
 
 	select {
 	case evt, ok := <-ch:
@@ -777,7 +777,7 @@ func TestClientAdaptWatcherConversionError(t *testing.T) {
 }
 
 // TestClientAdaptWatcherForwardsThenClosesOnCancel verifies a decodable event is
-// forwarded as a typed WatchEvent, and cancelling the context closes the channel.
+// forwarded as a typed Change, and cancelling the context closes the channel.
 func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	w := newFakeWatcher()
@@ -787,11 +787,11 @@ func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
 	ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	w.push(WatchEventAdded, &RawObject{ID: 1, Spec: []byte(`{}`)})
+	w.push(Added, &RawObject{ID: 1, Spec: []byte(`{}`)})
 	select {
 	case evt, ok := <-ch:
 		require.True(t, ok)
-		assert.Equal(t, WatchEventAdded, evt.Type)
+		assert.Equal(t, Added, evt.Type)
 		assert.EqualValues(t, 1, evt.Object.ID)
 	case <-time.After(testTimeout):
 		t.Fatal("timed out waiting for forwarded event")
@@ -823,7 +823,7 @@ func TestClientAdaptWatcherSendParkCtxDone(t *testing.T) {
 	// arm. Synchronize on the goroutine's exit (Close) rather than reading ch:
 	// a read here could satisfy the pending send and race the closed-vs-delivered
 	// outcome (notably under -race).
-	w.push(WatchEventAdded, &RawObject{ID: 1, Spec: []byte(`{}`)})
+	w.push(Added, &RawObject{ID: 1, Spec: []byte(`{}`)})
 	cancel()
 	select {
 	case <-w.closed:
@@ -860,7 +860,7 @@ func TestClientAdaptWatcherClosesWhenStreamEnds(t *testing.T) {
 
 // recvWatch waits for the next event on ch, failing the test if none arrives
 // within the failsafe timeout.
-func recvWatch[S, T any](t *testing.T, ch <-chan WatchEvent[S, T]) WatchEvent[S, T] {
+func recvWatch[S, T any](t *testing.T, ch <-chan Change[S, T]) Change[S, T] {
 	t.Helper()
 	select {
 	case evt, ok := <-ch:
@@ -875,7 +875,7 @@ func recvWatch[S, T any](t *testing.T, ch <-chan WatchEvent[S, T]) WatchEvent[S,
 }
 
 // assertChanClosed fails the test if ch does not close within the failsafe timeout.
-func assertChanClosed[S, T any](t *testing.T, ch <-chan WatchEvent[S, T]) {
+func assertChanClosed[S, T any](t *testing.T, ch <-chan Change[S, T]) {
 	t.Helper()
 	// Drain any buffered events, then expect close.
 	deadline := time.After(2 * time.Second)
@@ -904,7 +904,7 @@ func watchTestBH(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
 }
 
 // TestWatchListReceivesAddedOnCreate verifies that WatchList delivers a
-// WatchEventAdded when an object is created.
+// Added when an object is created.
 func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
@@ -916,13 +916,13 @@ func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	require.NoError(t, err)
 
 	evt := recvWatch(t, ch)
-	assert.Equal(t, WatchEventAdded, evt.Type)
+	assert.Equal(t, Added, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "hello", evt.Object.Spec.Val)
 }
 
 // TestWatchListReceivesModifiedOnUpdate verifies that WatchList delivers a
-// WatchEventModified when an object's spec is updated.
+// Modified when an object's spec is updated.
 func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
@@ -941,13 +941,13 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	require.NoError(t, err)
 
 	evt := recvWatch(t, ch)
-	assert.Equal(t, WatchEventModified, evt.Type)
+	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "v2", evt.Object.Spec.Val)
 }
 
 // TestWatchListReceivesModifiedOnDelete verifies that WatchList delivers a
-// WatchEventModified (not Deleted) when deletion is requested, because the
+// Modified (not Deleted) when deletion is requested, because the
 // object still exists in the store with DeletionRequestedAt set.
 func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ctx := context.Background()
@@ -964,7 +964,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
 	evt := recvWatch(t, ch)
-	assert.Equal(t, WatchEventModified, evt.Type)
+	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.NotNil(t, evt.Object.DeletionRequestedAt)
 }
@@ -1013,7 +1013,7 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 
 	// Drain the initial snapshot Added event for obj1.
 	snap := recvWatch(t, ch)
-	assert.Equal(t, WatchEventAdded, snap.Type)
+	assert.Equal(t, Added, snap.Type)
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
 	// Update obj2 first — this event must not appear on ch.
@@ -1058,7 +1058,7 @@ func TestWatchClosesOnCtxCancel(t *testing.T) {
 }
 
 // TestWatchReceivesModifiedOnStatusUpdate verifies that WatchList delivers a
-// WatchEventModified when the controller calls UpdateStatus.
+// Modified when the controller calls UpdateStatus.
 func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	ctx := context.Background()
 
@@ -1087,13 +1087,13 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 
 	// Drain the initial snapshot Added event.
 	snap := recvWatch(t, ch)
-	assert.Equal(t, WatchEventAdded, snap.Type)
+	assert.Equal(t, Added, snap.Type)
 	assert.Equal(t, obj.ID, snap.Object.ID)
 
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
 	evt := recvWatch(t, ch)
-	assert.Equal(t, WatchEventModified, evt.Type)
+	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	require.NotNil(t, evt.Object.Status)
 	assert.Equal(t, "done", evt.Object.Status.Val)
@@ -1117,7 +1117,7 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	seen := map[ObjectID]string{}
 	for range 2 {
 		evt := recvWatch(t, ch)
-		assert.Equal(t, WatchEventAdded, evt.Type)
+		assert.Equal(t, Added, evt.Type)
 		seen[evt.Object.ID] = evt.Object.Spec.Val
 	}
 	assert.Equal(t, "a", seen[a.ID])
@@ -1137,7 +1137,7 @@ func TestWatchInitialSnapshot(t *testing.T) {
 	require.NoError(t, err)
 
 	evt := recvWatch(t, ch)
-	assert.Equal(t, WatchEventAdded, evt.Type)
+	assert.Equal(t, Added, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "hello", evt.Object.Spec.Val)
 }

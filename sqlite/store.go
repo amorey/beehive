@@ -40,7 +40,7 @@ type sqliteStore struct {
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
 	// created lazily on first use. hubMu guards the maps and the closed flag.
 	hubMu sync.RWMutex
-	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawWatchEvent]
+	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]
 	// eventHubs fan the event log out, one per GroupKind, keyed by run so a run's
 	// count-bumps conflate while distinct runs stay separate (see eventKey).
 	eventHubs map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]
@@ -178,7 +178,7 @@ func currentResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 // success emits a watch event of typ for the written object. Mutators share it,
 // so both the returned object and its watch event carry the full conditions set
 // regardless of which column the write touched, matching Get/List.
-func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.WatchEventType, sc scanner) (*storeapi.RawObject, error) {
+func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.ChangeType, sc scanner) (*storeapi.RawObject, error) {
 	obj, err := scanObject(sc)
 	if err != nil {
 		return nil, err
@@ -209,7 +209,7 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject)
 		RETURNING `+objectColumns,
 		obj.Group, obj.Kind, obj.Slug, obj.Spec, obj.SpecVersion,
 		rv, finalizers, now, now)
-	return s.scanAndEmit(ctx, storeapi.WatchEventAdded, row)
+	return s.scanAndEmit(ctx, storeapi.Added, row)
 }
 
 // getObjectRow reads the objects row without assembling conditions. Internal
@@ -420,7 +420,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 			WHERE id = ?
 			RETURNING `+objectColumns,
 			spec, specVersion, rv, toMillis(time.Now().UTC()), id)
-		result, err = s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		return err
 	})
 	return result, err
@@ -450,7 +450,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			WHERE id = ? AND generation >= ? AND "group" = ? AND kind = ?
 			RETURNING `+objectColumns,
 			status, statusVersion, observedGeneration, now, rv, now, id, observedGeneration, gk.Group, gk.Kind)
-		obj, err := s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+		obj, err := s.scanAndEmit(ctx, storeapi.Modified, row)
 		if errors.Is(err, storeapi.ErrNotFound) {
 			// No row matched: the object is gone, names another kind, or the guard
 			// rejected a future generation. Re-read (no conditions) to return a
@@ -575,7 +575,7 @@ func (s *sqliteStore) bumpObjectAndEmit(ctx context.Context, c dbtx, id storeapi
 		UPDATE objects SET resource_version = ?, updated_at = ?
 		WHERE id = ?
 		RETURNING `+objectColumns, rv, toMillis(time.Now().UTC()), id)
-	return s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+	return s.scanAndEmit(ctx, storeapi.Modified, row)
 }
 
 // conditionUnchanged reports whether an existing condition already matches the
@@ -904,7 +904,7 @@ func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind
 			WHERE id = ?
 			RETURNING `+objectColumns,
 			marshalFinalizers(remaining), rv, toMillis(time.Now().UTC()), id)
-		result, err = s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		return err
 	})
 	return result, err
@@ -929,7 +929,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, id storeapi.ObjectID,
 		SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
 		WHERE id = ? AND deletion_requested_at IS NULL`+extraWhere+`
 		RETURNING `+objectColumns, args...)
-	obj, err := s.scanAndEmit(ctx, storeapi.WatchEventModified, row)
+	obj, err := s.scanAndEmit(ctx, storeapi.Modified, row)
 	if err != nil {
 		return nil, false, err // ErrNotFound = no transition (guard/extraWhere/missing)
 	}
@@ -1033,7 +1033,7 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 	// drop events at or below their snapshot's version, and the row's last
 	// version may already sit in a snapshot, which would swallow the Deleted.
 	obj.ResourceVersion = rv
-	s.emit(ctx, storeapi.WatchEventDeleted, obj)
+	s.emit(ctx, storeapi.Deleted, obj)
 	return nil
 }
 

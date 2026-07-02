@@ -104,7 +104,7 @@ func stopBeehive(stop func(context.Context) error) {
 }
 
 // waitForConvergence drains watchCh until it sees a status-bearing event for id.
-func waitForConvergence(id int64, watchCh <-chan beehive.WatchEvent[GreetingSpec, GreetingStatus]) {
+func waitForConvergence(id int64, watchCh <-chan beehive.Change[GreetingSpec, GreetingStatus]) {
 	for evt := range watchCh {
 		if evt.Object.ID != id || evt.Object.Status == nil {
 			continue
