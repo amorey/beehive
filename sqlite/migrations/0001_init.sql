@@ -1,5 +1,5 @@
 -- Timestamps: INTEGER Unix-epoch milliseconds, UTC.
--- JSON blobs:  TEXT (spec, status, finalizers).
+-- JSON blobs:  TEXT (spec, status, finalizers, event detail).
 -- Core group:  empty string "" (never NULL).
 -- Requires:    PRAGMA foreign_keys = ON.
 
@@ -57,7 +57,7 @@ CREATE TABLE objects (
     updated_at INTEGER NOT NULL,
 
     UNIQUE ("group", kind, slug)
-);
+) STRICT;
 
 CREATE INDEX idx_objects_kind ON objects("group", kind);    -- list / resync a kind
 CREATE INDEX idx_objects_rv   ON objects(resource_version); -- watch ordering
@@ -92,13 +92,13 @@ CREATE TABLE conditions (
     -- prior-process write surfaces as Unknown / "verifying" until a controller
     -- re-confirms it (which bumps updated_at). Default is store-truth; liveness is
     -- opt-in by the writer.
-    liveness INTEGER NOT NULL DEFAULT 0,
+    liveness INTEGER NOT NULL DEFAULT 0 CHECK (liveness IN (0, 1)),
 
     transitioned_at INTEGER NOT NULL, -- epoch ms when status last CHANGED
     updated_at      INTEGER NOT NULL, -- epoch ms of last write (also the liveness stamp)
 
     PRIMARY KEY (object_id, type)
-);
+) STRICT;
 
 -- Fetch all conditions for an object (status assembly, cascade delete).
 CREATE INDEX idx_conditions_object ON conditions(object_id);
@@ -124,7 +124,7 @@ CREATE TABLE refs (
     relation TEXT NOT NULL CHECK (relation IN ('owned_by', 'depends_on')),
 
     PRIMARY KEY (from_id, to_id, relation)
-);
+) STRICT;
 
 -- Answers "who points at X?" for cascade-GC and wake-dependents.
 CREATE INDEX idx_refs_to ON refs(to_id, relation);
@@ -151,7 +151,7 @@ CREATE TABLE events (
     type     TEXT NOT NULL CHECK (type IN ('Normal', 'Warning')),
     reason   TEXT NOT NULL,              -- machine-readable token, e.g. "ProbeFailed"
     message  TEXT,                       -- human-readable; sampled (latest occurrence wins)
-    detail   BLOB,                       -- opaque JSON payload; sampled (latest occurrence wins)
+    detail   TEXT,                       -- opaque JSON payload; sampled (latest occurrence wins)
 
     count    INTEGER NOT NULL DEFAULT 1, -- occurrences coalesced into this run
     first_at INTEGER NOT NULL,           -- epoch ms of the first occurrence
@@ -159,7 +159,7 @@ CREATE TABLE events (
 
     -- Draws from resource_version_seq like objects: the watch cursor / ordering key.
     resource_version INTEGER NOT NULL
-);
+) STRICT;
 
 -- Serves both the append-time "latest run for (object, category)" probe and the
 -- newest-first panel query (ORDER BY last_at DESC).
@@ -180,6 +180,6 @@ CREATE INDEX idx_events_rv ON events(resource_version);
 CREATE TABLE resource_version_seq (
     id    INTEGER PRIMARY KEY CHECK (id = 1), -- single row, always id = 1
     value INTEGER NOT NULL                    -- last resource_version handed out
-);
+) STRICT;
 
 INSERT INTO resource_version_seq (id, value) VALUES (1, 0);

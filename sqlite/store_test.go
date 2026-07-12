@@ -386,12 +386,19 @@ func dropEventsTable(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
-// corruptEventFirstAt stores non-numeric text in a run's first_at so a later
-// full-row scan of it fails (INTEGER affinity keeps unconvertible text, which
-// can't scan into int64; the column is NOT NULL, so a NULL is not an option).
-func corruptEventFirstAt(t *testing.T, store *sqliteStore, runID storeapi.EventID) {
+// breakEventRowRead makes events.first_at NULL for every existing run so any
+// later full-row read fails inside Scan: first_at scans into a non-nullable
+// int64, and "converting NULL to int64" is a scan error. Dropping and re-adding
+// the column (rather than just dropping it) keeps the column present so the
+// SELECT still prepares — the fault surfaces per row in the scan loop, not at
+// QueryContext. STRICT + NOT NULL rules out the old trick of storing
+// unconvertible text in the INTEGER column (STRICT rejects the write outright).
+func breakEventRowRead(t *testing.T, store *sqliteStore) {
 	t.Helper()
-	_, err := store.db.ExecContext(context.Background(), `UPDATE events SET first_at = 'corrupt' WHERE id = ?`, runID)
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `ALTER TABLE events DROP COLUMN first_at`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN first_at INTEGER`)
 	require.NoError(t, err)
 }
 
@@ -419,11 +426,12 @@ func TestRecordEventStoreErrors(t *testing.T) {
 	t.Run("written row fails to scan", func(t *testing.T) {
 		store := newRawStore(t)
 		id := newEventObject(t, store)
-		run, err := store.RecordEvent(ctx, testGK, id, ev)
+		_, err := store.RecordEvent(ctx, testGK, id, ev)
 		require.NoError(t, err)
-		corruptEventFirstAt(t, store, run.ID)
+		breakEventRowRead(t, store)
 		// Same key → the key-only probe still reads the run (it ignores first_at),
-		// so EXTEND updates it and RETURNINGs the corrupted full row → scan fails.
+		// so EXTEND updates it and RETURNINGs the full row whose now-NULL first_at
+		// → scan fails.
 		_, err = store.RecordEvent(ctx, testGK, id, ev)
 		require.Error(t, err)
 	})
@@ -444,9 +452,9 @@ func TestListEventsStoreErrors(t *testing.T) {
 	t.Run("row fails to scan", func(t *testing.T) {
 		store := newRawStore(t)
 		id := newEventObject(t, store)
-		run, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
 		require.NoError(t, err)
-		corruptEventFirstAt(t, store, run.ID)
+		breakEventRowRead(t, store)
 		_, err = store.ListEvents(ctx, id, storeapi.EventQuery{})
 		require.Error(t, err)
 	})
@@ -457,9 +465,9 @@ func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)
 	id := newEventObject(t, store)
-	run, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
 	require.NoError(t, err)
-	corruptEventFirstAt(t, store, run.ID)
+	breakEventRowRead(t, store)
 	_, err = store.GetLatestEvent(ctx, id, "c")
 	require.Error(t, err)
 }
@@ -2094,6 +2102,26 @@ func TestDeleteConditionDBError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// breakConditionRowRead inserts a valid condition row for objID, then makes
+// conditions.transitioned_at NULL so any later full-row read of it fails inside
+// Scan: transitioned_at scans into a non-nullable int64, and "converting NULL to
+// int64" is a scan error. Dropping and re-adding the column (rather than just
+// dropping it) keeps the column present so the SELECT still prepares — the fault
+// surfaces per row in the scan loop, not at QueryContext. STRICT + NOT NULL rules
+// out the old trick of storing unconvertible text in the INTEGER column.
+func breakConditionRowRead(t *testing.T, store *sqliteStore, objID storeapi.ObjectID) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `
+		INSERT INTO conditions (object_id, type, status, transitioned_at, updated_at)
+		VALUES (?, 'Ready', 'True', 0, 0)`, objID)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `ALTER TABLE conditions DROP COLUMN transitioned_at`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `ALTER TABLE conditions ADD COLUMN transitioned_at INTEGER`)
+	require.NoError(t, err)
+}
+
 // TestConditionAssemblyError corrupts a condition row so the read-path scan
 // fails, exercising the conditions-assembly error branches in GetObject (via
 // loadConditions) and ListObjects (via loadConditionsForKind).
@@ -2102,13 +2130,9 @@ func TestConditionAssemblyError(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "corrupt")
 
-	// transitioned_at is an INTEGER column; storing text makes the int64 scan fail.
-	_, err := store.db.ExecContext(ctx, `
-		INSERT INTO conditions (object_id, type, status, transitioned_at, updated_at)
-		VALUES (?, 'Ready', 'True', 'not-an-int', 0)`, obj.ID)
-	require.NoError(t, err)
+	breakConditionRowRead(t, store, obj.ID)
 
-	_, err = store.GetObject(ctx, obj.ID)
+	_, err := store.GetObject(ctx, obj.ID)
 	require.Error(t, err, "GetObject surfaces a conditions scan error")
 
 	_, err = store.ListObjects(ctx, testGK)
@@ -2153,14 +2177,11 @@ func TestGetConditionScanError(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "getcond-corrupt")
 
-	_, err := store.db.ExecContext(ctx, `
-		INSERT INTO conditions (object_id, type, status, transitioned_at, updated_at)
-		VALUES (?, 'Ready', 'True', 'not-an-int', 0)`, obj.ID)
-	require.NoError(t, err)
+	breakConditionRowRead(t, store, obj.ID)
 
 	// The object row reads fine, but SetCondition's getCondition pre-read hits the
-	// corrupt row and fails before any write.
-	_, err = store.SetCondition(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
+	// unreadable row and fails before any write.
+	_, err := store.SetCondition(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
 }
 

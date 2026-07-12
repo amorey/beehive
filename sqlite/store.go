@@ -207,8 +207,8 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject)
 			 generation, resource_version, finalizers, created_at, updated_at)
 		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
 		RETURNING `+objectColumns,
-		obj.Group, obj.Kind, obj.Slug, obj.Spec, obj.SpecVersion,
-		rv, finalizers, now, now)
+		obj.Group, obj.Kind, obj.Slug, jsonText(obj.Spec), obj.SpecVersion,
+		rv, jsonText(finalizers), now, now)
 	return s.scanAndEmit(ctx, storeapi.Added, row)
 }
 
@@ -419,7 +419,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			spec, specVersion, rv, toMillis(time.Now().UTC()), id)
+			jsonText(spec), specVersion, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		return err
 	})
@@ -449,7 +449,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			    resource_version = ?, updated_at = ?
 			WHERE id = ? AND generation >= ? AND "group" = ? AND kind = ?
 			RETURNING `+objectColumns,
-			status, statusVersion, observedGeneration, now, rv, now, id, observedGeneration, gk.Group, gk.Kind)
+			jsonText(status), statusVersion, observedGeneration, now, rv, now, id, observedGeneration, gk.Group, gk.Kind)
 		obj, err := s.scanAndEmit(ctx, storeapi.Modified, row)
 		if errors.Is(err, storeapi.ErrNotFound) {
 			// No row matched: the object is gone, names another kind, or the guard
@@ -765,7 +765,7 @@ func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id
 				UPDATE events SET count = count + 1, last_at = ?, message = ?,
 					detail = ?, resource_version = ?
 				WHERE id = ?
-				RETURNING `+eventColumns, now, ev.Message, ev.Detail, rv, latestID)
+				RETURNING `+eventColumns, now, ev.Message, jsonText(ev.Detail), rv, latestID)
 		} else {
 			// New run (empty timeline or key changed): count 1, point window.
 			row = c.QueryRowContext(ctx, `
@@ -774,7 +774,7 @@ func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id
 					 count, first_at, last_at, resource_version)
 				VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
 				RETURNING `+eventColumns,
-				id, ev.Category, ev.Type, ev.Reason, ev.Message, ev.Detail, now, now, rv)
+				id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
 		}
 		result, err = scanEvent(row)
 		if err != nil {
@@ -903,7 +903,7 @@ func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind
 			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			marshalFinalizers(remaining), rv, toMillis(time.Now().UTC()), id)
+			jsonText(marshalFinalizers(remaining)), rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		return err
 	})
@@ -1327,6 +1327,16 @@ func marshalFinalizers(f []string) []byte {
 	}
 	b, _ := json.Marshal(f) // marshaling []string never errors
 	return b
+}
+
+// jsonText binds a JSON blob into a TEXT column. A []byte binds as a BLOB, which
+// a STRICT table rejects in a TEXT column, so hand the driver a string instead; a
+// nil blob stays NULL (e.g. an unwritten status).
+func jsonText(b []byte) any {
+	if b == nil {
+		return nil
+	}
+	return string(b)
 }
 
 func toMillis(t time.Time) int64 { return t.UnixMilli() }
