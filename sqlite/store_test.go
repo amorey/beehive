@@ -386,14 +386,19 @@ func dropEventsTable(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
-// breakEventRowRead drops the events.first_at column so any later full-row read
-// of a run fails: the SELECT/RETURNING references the now-missing column, and
-// QueryRow defers that error to Scan — exercising scanEvent's error branch.
-// STRICT + NOT NULL rules out the old trick of storing unconvertible text in the
-// INTEGER column (STRICT rejects the write outright).
+// breakEventRowRead makes events.first_at NULL for every existing run so any
+// later full-row read fails inside Scan: first_at scans into a non-nullable
+// int64, and "converting NULL to int64" is a scan error. Dropping and re-adding
+// the column (rather than just dropping it) keeps the column present so the
+// SELECT still prepares — the fault surfaces per row in the scan loop, not at
+// QueryContext. STRICT + NOT NULL rules out the old trick of storing
+// unconvertible text in the INTEGER column (STRICT rejects the write outright).
 func breakEventRowRead(t *testing.T, store *sqliteStore) {
 	t.Helper()
-	_, err := store.db.ExecContext(context.Background(), `ALTER TABLE events DROP COLUMN first_at`)
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `ALTER TABLE events DROP COLUMN first_at`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN first_at INTEGER`)
 	require.NoError(t, err)
 }
 
@@ -425,8 +430,8 @@ func TestRecordEventStoreErrors(t *testing.T) {
 		require.NoError(t, err)
 		breakEventRowRead(t, store)
 		// Same key → the key-only probe still reads the run (it ignores first_at),
-		// so EXTEND updates it and RETURNINGs the full row referencing the dropped
-		// column → scan fails.
+		// so EXTEND updates it and RETURNINGs the full row whose now-NULL first_at
+		// → scan fails.
 		_, err = store.RecordEvent(ctx, testGK, id, ev)
 		require.Error(t, err)
 	})
@@ -2097,11 +2102,13 @@ func TestDeleteConditionDBError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// breakConditionRowRead inserts a valid condition row for objID, then drops the
-// conditions.transitioned_at column so any later full-row read of it fails: the
-// SELECT references the now-missing column and QueryRow defers that to Scan,
-// exercising scanCondition's error branch. STRICT + NOT NULL rules out the old
-// trick of storing unconvertible text in the INTEGER column.
+// breakConditionRowRead inserts a valid condition row for objID, then makes
+// conditions.transitioned_at NULL so any later full-row read of it fails inside
+// Scan: transitioned_at scans into a non-nullable int64, and "converting NULL to
+// int64" is a scan error. Dropping and re-adding the column (rather than just
+// dropping it) keeps the column present so the SELECT still prepares — the fault
+// surfaces per row in the scan loop, not at QueryContext. STRICT + NOT NULL rules
+// out the old trick of storing unconvertible text in the INTEGER column.
 func breakConditionRowRead(t *testing.T, store *sqliteStore, objID storeapi.ObjectID) {
 	t.Helper()
 	ctx := context.Background()
@@ -2110,6 +2117,8 @@ func breakConditionRowRead(t *testing.T, store *sqliteStore, objID storeapi.Obje
 		VALUES (?, 'Ready', 'True', 0, 0)`, objID)
 	require.NoError(t, err)
 	_, err = store.db.ExecContext(ctx, `ALTER TABLE conditions DROP COLUMN transitioned_at`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `ALTER TABLE conditions ADD COLUMN transitioned_at INTEGER`)
 	require.NoError(t, err)
 }
 
