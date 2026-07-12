@@ -1,5 +1,5 @@
 -- Timestamps: INTEGER Unix-epoch milliseconds, UTC.
--- JSON blobs:  TEXT (spec, status, finalizers).
+-- JSON blobs:  TEXT (spec, status, finalizers, event detail).
 -- Core group:  empty string "" (never NULL).
 -- Requires:    PRAGMA foreign_keys = ON.
 
@@ -92,7 +92,7 @@ CREATE TABLE conditions (
     -- prior-process write surfaces as Unknown / "verifying" until a controller
     -- re-confirms it (which bumps updated_at). Default is store-truth; liveness is
     -- opt-in by the writer.
-    liveness INTEGER NOT NULL DEFAULT 0,
+    liveness INTEGER NOT NULL DEFAULT 0 CHECK (liveness IN (0, 1)),
 
     transitioned_at INTEGER NOT NULL, -- epoch ms when status last CHANGED
     updated_at      INTEGER NOT NULL, -- epoch ms of last write (also the liveness stamp)
@@ -151,7 +151,7 @@ CREATE TABLE events (
     type     TEXT NOT NULL CHECK (type IN ('Normal', 'Warning')),
     reason   TEXT NOT NULL,              -- machine-readable token, e.g. "ProbeFailed"
     message  TEXT,                       -- human-readable; sampled (latest occurrence wins)
-    detail   BLOB,                       -- opaque JSON payload; sampled (latest occurrence wins)
+    detail   TEXT,                       -- opaque JSON payload; sampled (latest occurrence wins)
 
     count    INTEGER NOT NULL DEFAULT 1, -- occurrences coalesced into this run
     first_at INTEGER NOT NULL,           -- epoch ms of the first occurrence

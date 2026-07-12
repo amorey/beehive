@@ -765,7 +765,7 @@ func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id
 				UPDATE events SET count = count + 1, last_at = ?, message = ?,
 					detail = ?, resource_version = ?
 				WHERE id = ?
-				RETURNING `+eventColumns, now, ev.Message, ev.Detail, rv, latestID)
+				RETURNING `+eventColumns, now, ev.Message, jsonText(ev.Detail), rv, latestID)
 		} else {
 			// New run (empty timeline or key changed): count 1, point window.
 			row = c.QueryRowContext(ctx, `
@@ -774,7 +774,7 @@ func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id
 					 count, first_at, last_at, resource_version)
 				VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
 				RETURNING `+eventColumns,
-				id, ev.Category, ev.Type, ev.Reason, ev.Message, ev.Detail, now, now, rv)
+				id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
 		}
 		result, err = scanEvent(row)
 		if err != nil {
