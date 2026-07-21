@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amorey/beehive/internal/conflate"
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gobus/conflate"
 )
 
 type sqliteStore struct {

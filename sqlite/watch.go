@@ -20,8 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/amorey/beehive/internal/conflate"
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gobus/conflate"
 )
 
 // errStoreClosed is returned by Watch/WatchList once the store has been closed.
@@ -364,11 +364,11 @@ func (s *sqliteStore) watch(
 	switch {
 	case filterID != nil:
 		want := *filterID
-		rx = h.ReceiverFunc(func(id storeapi.ObjectID) bool { return id == want })
+		rx = h.Receiver(h.WithKeyFilter(func(id storeapi.ObjectID) bool { return id == want }))
 	case hasSnapshot:
-		rx = h.ReceiverMerge(annihilatingMerge(snapshotPreserve(&seed)))
+		rx = h.Receiver(h.WithMerge(annihilatingMerge(snapshotPreserve(&seed))))
 	default:
-		rx = h.ReceiverMerge(annihilatingMerge(nil))
+		rx = h.Receiver(h.WithMerge(annihilatingMerge(nil)))
 	}
 	if s.beforeSnapshot != nil {
 		s.beforeSnapshot() // test seam: inject events into the subscribe→snapshot window
@@ -438,10 +438,11 @@ func (s *sqliteStore) watch(
 		// delete, which carries the real final row) rather than observing a gap.
 		// No relist or tombstone synthesis is needed.
 		for {
-			ev, err := rx.RecvContext(wctx)
+			wev, err := rx.RecvContext(wctx)
 			if err != nil {
 				return // ctx cancelled, watcher closed, or hub closed
 			}
+			ev := wev.Value
 			if ev.Object.ResourceVersion <= snapshotHighWaterRV {
 				continue // already represented by the snapshot
 			}
@@ -509,7 +510,7 @@ func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id
 	}
 	// Key-filter to this object: the run id in the key makes the filter exact
 	// without inspecting values, so the receiver never buffers other objects' runs.
-	rx := h.ReceiverFunc(func(k eventKey) bool { return k.ObjectID == id })
+	rx := h.Receiver(h.WithKeyFilter(func(k eventKey) bool { return k.ObjectID == id }))
 	if s.beforeSnapshot != nil {
 		s.beforeSnapshot() // test seam: inject runs into the subscribe→snapshot window
 	}
@@ -570,10 +571,11 @@ func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id
 		}
 		snapshot = nil
 		for {
-			ev, err := rx.RecvContext(wctx)
+			wev, err := rx.RecvContext(wctx)
 			if err != nil {
 				return // ctx cancelled, watcher closed, or hub closed
 			}
+			ev := wev.Value
 			// Drop a run committed at or below the snapshot's high-water when it is
 			// already reflected: either the snapshot delivered it, or the object was
 			// deleted before the snapshot (its log empty by deletion, not Limit

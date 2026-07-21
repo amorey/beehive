@@ -22,9 +22,9 @@ import (
 	"embed"
 	"time"
 
-	"github.com/amorey/beehive/internal/conflate"
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlitemigrate"
+	"github.com/amorey/gobus/conflate"
 	_ "modernc.org/sqlite"
 )
 
