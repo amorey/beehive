@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amorey/beehive/internal/conflate"
+	"github.com/amorey/gobus/conflate"
 )
 
 const (
@@ -303,7 +303,7 @@ func (r *reconciler) publishSchedule(id ObjectID, at time.Time, _ bool) {
 func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Schedule {
 	var rx *conflate.Receiver[ObjectID, Schedule]
 	at := r.work.subscribeSchedule(id, func() {
-		rx = r.scheduleHub.ReceiverFunc(func(k ObjectID) bool { return k == id })
+		rx = r.scheduleHub.Receiver(r.scheduleHub.WithKeyFilter(func(k ObjectID) bool { return k == id }))
 	})
 	snapshot := Schedule{NextRequeueAt: at}
 
@@ -326,11 +326,11 @@ func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Sche
 			return
 		}
 		for {
-			s, err := rx.RecvContext(ctx)
+			sev, err := rx.RecvContext(ctx)
 			if err != nil {
 				return // ctx cancelled or hub closed
 			}
-			if !send(s) {
+			if !send(sev.Value) {
 				return
 			}
 		}

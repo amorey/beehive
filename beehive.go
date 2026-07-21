@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amorey/beehive/internal/conflate"
+	"github.com/amorey/gobus/conflate"
 )
 
 const defaultResyncInterval = 30 * time.Second
