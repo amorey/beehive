@@ -150,10 +150,6 @@ func snapshotPreserve(seed *atomic.Pointer[snapshotIDs]) func(storeapi.ObjectID)
 	}
 }
 
-// collectorKey carries the in-flight transaction's eventCollector through the
-// context, mirroring txKey, so mutators can buffer events until Within commits.
-type collectorKey struct{}
-
 // pendingEvent is a watch event awaiting its transaction's commit.
 type pendingEvent struct {
 	gk storeapi.GroupKind
@@ -168,22 +164,44 @@ type pendingEventRow struct {
 
 // eventCollector buffers events emitted during a transaction. The mutex guards
 // against a Within whose fn fans store calls across goroutines on the tx ctx.
+//
+// It outlives its transaction: a post-commit hook can hold the tx ctx it was
+// registered on (rather than the detached one it is handed) and reach the
+// collector through it. Buffering there would be a silent drop, since flush has
+// already drained it — so the collector latches flushed and every add reports
+// whether it took ownership, leaving the caller to act immediately instead.
 type eventCollector struct {
 	mu      sync.Mutex
 	events  []pendingEvent    // object watch events
 	logRows []pendingEventRow // event-log runs
+	hooks   []func()          // post-commit callbacks, run after the events
+	flushed bool              // set by flush; buffering is closed from here on
 }
 
-func (c *eventCollector) add(p pendingEvent) {
+// buffer runs store under the lock unless the collector is already flushed,
+// reporting whether it took ownership. A false return means flush has drained
+// the collector (a hook reaching it through a captured tx ctx), so the caller
+// must act now rather than queue where nothing will look again.
+func (c *eventCollector) buffer(store func()) bool {
 	c.mu.Lock()
-	c.events = append(c.events, p)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.flushed {
+		return false
+	}
+	store()
+	return true
 }
 
-func (c *eventCollector) addEventRow(p pendingEventRow) {
-	c.mu.Lock()
-	c.logRows = append(c.logRows, p)
-	c.mu.Unlock()
+func (c *eventCollector) add(p pendingEvent) bool {
+	return c.buffer(func() { c.events = append(c.events, p) })
+}
+
+func (c *eventCollector) addEventRow(p pendingEventRow) bool {
+	return c.buffer(func() { c.logRows = append(c.logRows, p) })
+}
+
+func (c *eventCollector) addHook(fn func()) bool {
+	return c.buffer(func() { c.hooks = append(c.hooks, fn) })
 }
 
 func gkOf(raw *storeapi.RawObject) storeapi.GroupKind {
@@ -196,8 +214,7 @@ func gkOf(raw *storeapi.RawObject) storeapi.GroupKind {
 func (s *sqliteStore) emit(ctx context.Context, typ storeapi.ChangeType, raw *storeapi.RawObject) {
 	gk := gkOf(raw)
 	ev := storeapi.RawChange{Type: typ, Object: raw}
-	if c, ok := ctx.Value(collectorKey{}).(*eventCollector); ok {
-		c.add(pendingEvent{gk: gk, ev: ev})
+	if st, ok := txFrom(ctx); ok && st.coll.add(pendingEvent{gk: gk, ev: ev}) {
 		return
 	}
 	s.publish(gk, ev)
@@ -215,8 +232,7 @@ func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawChange) {
 // collector inside a transaction (flushed after commit by Within), published
 // immediately otherwise. Mirrors emit.
 func (s *sqliteStore) emitEvent(ctx context.Context, gk storeapi.GroupKind, ev *storeapi.Event) {
-	if c, ok := ctx.Value(collectorKey{}).(*eventCollector); ok {
-		c.addEventRow(pendingEventRow{gk: gk, ev: *ev})
+	if st, ok := txFrom(ctx); ok && st.coll.addEventRow(pendingEventRow{gk: gk, ev: *ev}) {
 		return
 	}
 	s.publishEvent(gk, *ev)
@@ -231,15 +247,30 @@ func (s *sqliteStore) publishEvent(gk storeapi.GroupKind, ev storeapi.Event) {
 }
 
 // flush publishes a committed transaction's buffered events (object changes then
-// event-log runs).
+// event-log runs), then runs its post-commit hooks — a hook that wakes a
+// reconciler must not run before the events it should follow.
+//
+// The buffers are taken under the lock and the callbacks run without it: a hook
+// runs code from the layer above this store and may re-enter it, so holding the
+// collector's mutex across it would invite a deadlock. Taking them also latches
+// the collector closed, so a re-entrant emit or AfterCommit reaching it through a
+// captured tx ctx acts immediately rather than appending to a slice this flush
+// has already passed.
 func (s *sqliteStore) flush(coll *eventCollector) {
 	coll.mu.Lock()
-	defer coll.mu.Unlock()
-	for _, p := range coll.events {
+	events, logRows, hooks := coll.events, coll.logRows, coll.hooks
+	coll.events, coll.logRows, coll.hooks = nil, nil, nil
+	coll.flushed = true
+	coll.mu.Unlock()
+
+	for _, p := range events {
 		s.publish(p.gk, p.ev)
 	}
-	for _, p := range coll.logRows {
+	for _, p := range logRows {
 		s.publishEvent(p.gk, p.ev)
+	}
+	for _, fn := range hooks {
+		fn()
 	}
 }
 

@@ -890,16 +890,96 @@ func (s *getObjectBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawO
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json")}, nil
 }
 
+// TestTypedControllerReconcileRawToTypedError pins the quarantine: an undecodable
+// row (not deletion-pending) is a no-op success, not a retryable error — returning
+// the error would retry the identical bytes forever under backoff, and resync
+// re-enqueues it regardless. The controller must not run on a row that never
+// decoded.
 func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 	bh := &Beehive{store: &getObjectBadSpecStore{}}
-	inner := &noopController[tSpec, tStatus]{}
-	tc := &typedController[tSpec, tStatus]{
+	var called bool
+	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		called = true
+		return Result{}, nil
+	}}
+	tc := &typedController[cSpec, cStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
+	}
+	res, err := tc.reconcile(context.Background(), 1)
+	require.NoError(t, err, "an undecodable row must not retry forever")
+	assert.Equal(t, Result{}, res)
+	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
+}
+
+// TestTypedControllerReconcileRawToTypedErrorCollectsDeleting pins the GC leg of
+// the quarantine: a deletion-pending, finalizer-free row that can't decode is
+// still collected here (collect needs only the id), so it doesn't strand holding
+// its slug and owned_by edge waiting for a controller that can never decode it.
+func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+
+	// Inject an undecodable row directly (a valid create can always decode), then
+	// request its deletion so the reconcile sees a deletion-pending poison row.
+	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte("not-json")})
+	require.NoError(t, err)
+	_, _, err = store.RequestDeletion(ctx, gk, raw.ID)
+	require.NoError(t, err)
+
+	var called bool
+	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		called = true
+		return Result{}, nil
+	}}
+	tc := &typedController[cSpec, cStatus]{gk: gk, bh: bh, inner: inner}
+
+	res, err := tc.reconcile(ctx, raw.ID)
+	require.NoError(t, err)
+	assert.Equal(t, Result{}, res)
+	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
+
+	_, err = store.GetObject(ctx, raw.ID)
+	require.ErrorIs(t, err, ErrNotFound, "the finalizer-free deleting poison row must be collected, not stranded")
+}
+
+// undecodableDeletingCollectErrorStore returns an undecodable, deletion-pending
+// row from GetObject, and errors from GetObjectMeta so that collect (which reads
+// meta first) fails. This exercises the GC-error leg of the quarantine: a poison
+// deleting row whose collect fails must surface the error for retry, not swallow
+// it as a no-op success.
+type undecodableDeletingCollectErrorStore struct {
+	fakeStore
+}
+
+func (s *undecodableDeletingCollectErrorStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	deletedAt := time.Unix(1, 0)
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), DeletionRequestedAt: &deletedAt}, nil
+}
+
+func (s *undecodableDeletingCollectErrorStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
+	return nil, errBoom
+}
+
+func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
+	bh := &Beehive{store: &undecodableDeletingCollectErrorStore{}}
+	var called bool
+	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		called = true
+		return Result{}, nil
+	}}
+	tc := &typedController[cSpec, cStatus]{
 		gk:    GroupKind{Kind: "Widget"},
 		bh:    bh,
 		inner: inner,
 	}
 	_, err := tc.reconcile(context.Background(), 1)
-	require.Error(t, err)
+	require.ErrorIs(t, err, errBoom, "a failed collect on a poison deleting row must surface for retry")
+	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
 
 // getObjectErrorStore returns an error from GetObject to exercise path A in

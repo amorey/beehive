@@ -128,8 +128,41 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 }
 
 // advanceGC moves (gk, id) forward toward collection after a deletion-related
-// change, picking the mechanism that fits the kind. A registered kind is
-// requeued so its own reconcile loop runs collect.
+// change, once the caller's transaction (if any) has committed.
+//
+// The post-commit hook is what makes it safe to call from inside a transaction —
+// Client.Delete nested in a controller's ControllerClient.Within, or collect's own
+// toWake loop when collect itself is nested. Running inline there would wake a
+// reconciler for an uncommitted deletion (a phantom wake if the caller rolls back)
+// and, on the synchronous branch below, run a cascade of physical deletes inside
+// the caller's transaction. Deferring costs nothing when there is no transaction:
+// AfterCommit runs the hook inline.
+//
+// Collection stays correct across the deferral because collect is level-triggered:
+// it re-reads DeletionRequestedAt, so if the caller rolled the deletion back there
+// is simply nothing to collect.
+func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
+	bh.store.AfterCommit(ctx, func(ctx context.Context) {
+		bh.advanceGCNow(ctx, gk, id)
+	})
+}
+
+// wakeAfterCommit schedules a reconciler wake for gk/id once the ambient
+// transaction commits and its watch events are out — the wake sibling of
+// advanceGC, kept non-generic here rather than on the typed client. Registering
+// on the store rather than enqueuing after Within is what keeps the ordering
+// under nesting: a caller may have wrapped the write in ControllerClient.Within,
+// and the nested Within returns while that outer transaction is still open — so a
+// wake issued there could reach a controller before the spec event (letting a
+// Modified overtake the Added), or at all for a row the outer transaction then
+// rolls back. Outside a transaction AfterCommit runs it inline.
+func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectID) {
+	bh.store.AfterCommit(ctx, func(context.Context) { bh.enqueueIfRegistered(gk, id) })
+}
+
+// advanceGCNow is advanceGC's body, run with no transaction in flight. It picks
+// the mechanism that fits the kind: a registered kind is requeued so its own
+// reconcile loop runs collect.
 //
 // A client-only kind has no reconcile loop. When resync is enabled the global GC
 // sweeper is its backstop, so we leave the object for the next sweep — keeping
@@ -140,7 +173,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 // owned_by edge RESTRICT-blocking the owner's delete. In that one configuration
 // we collect synchronously here instead. Recursion terminates: each collect that
 // deletes a row shrinks the object graph before waking the targets it freed.
-func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
+func (bh *Beehive) advanceGCNow(ctx context.Context, gk GroupKind, id ObjectID) {
 	bh.mu.Lock()
 	r, ok := bh.reconcilers[gk]
 	bh.mu.Unlock()

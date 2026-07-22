@@ -607,9 +607,10 @@ func TestUpdateSpecBumpsGeneration(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	updated, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":2}`), 0)
+	updated, changed, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 
+	assert.True(t, changed, "a real spec change reports changed")
 	assert.EqualValues(t, 2, updated.Generation, "spec change bumps generation")
 	assert.Greater(t, updated.ResourceVersion, created.ResourceVersion)
 	assert.JSONEq(t, `{"v":2}`, string(updated.Spec))
@@ -637,9 +638,10 @@ func TestUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
-	again, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
+	again, changed, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
 	require.NoError(t, err)
 
+	assert.False(t, changed, "the no-op must report changed=false so callers can skip their follow-up")
 	assert.EqualValues(t, created.Generation, again.Generation, "identical spec must not bump generation")
 	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "identical spec must not bump resource_version")
 	require.NotNil(t, again.ObservedGeneration)
@@ -705,7 +707,7 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 	assert.EqualValues(t, 7, withStatus.StatusVersion)
 
 	// UpdateSpec stamps only the spec version, leaving status untouched.
-	withSpec, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 5)
+	withSpec, _, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 5)
 	require.NoError(t, err)
 	assert.EqualValues(t, 5, withSpec.SpecVersion)
 	assert.EqualValues(t, 7, withSpec.StatusVersion, "spec write must not touch status version")
@@ -740,7 +742,7 @@ func TestUpdateStatusAcceptsStaleGeneration(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	bumped, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	bumped, _, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
@@ -797,7 +799,7 @@ func TestResourceVersionIsMonotonic(t *testing.T) {
 	assert.Greater(t, b.ResourceVersion, a.ResourceVersion, "each create takes the next cursor value")
 
 	// A later mutation advances the global cursor past every prior write.
-	updated, err := store.UpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
+	updated, _, err := store.UpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 	assert.Greater(t, updated.ResourceVersion, b.ResourceVersion)
 }
@@ -819,7 +821,7 @@ func TestResourceVersionNotReusedAfterDelete(t *testing.T) {
 	// fall back to b's version — it only ever moves forward.
 	require.NoError(t, store.DeleteObject(ctx, b.ID))
 
-	updated, err := store.UpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
+	updated, _, err := store.UpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 	assert.Greater(t, updated.ResourceVersion, b.ResourceVersion,
 		"a deleted row's resource_version must never be reused")
@@ -1244,7 +1246,7 @@ func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
 
 	ops := map[string]func() error{
 		"UpdateSpec": func() error {
-			_, err := store.UpdateSpec(ctx, testGK, missing, []byte(`{}`), 0)
+			_, _, err := store.UpdateSpec(ctx, testGK, missing, []byte(`{}`), 0)
 			return err
 		},
 		"UpdateStatus": func() error {
@@ -1336,6 +1338,78 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "rolled-back write must not persist")
 }
 
+func TestAfterCommit(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Outside a transaction there is nothing to wait for: the hook runs inline.
+	ran := false
+	store.AfterCommit(ctx, func(context.Context) { ran = true })
+	assert.True(t, ran, "hook outside a transaction must run inline")
+
+	// Inside one it waits for the commit — including through a nested Within,
+	// which joins the outer transaction's collector.
+	var order []string
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		return store.Within(ctx, func(ctx context.Context) error {
+			obj, err := store.CreateObject(ctx, &beehive.RawObject{
+				Group: testGK.Group, Kind: testGK.Kind, Slug: new("hooked"),
+				Spec: []byte(`{}`),
+			})
+			require.NoError(t, err)
+			store.AfterCommit(ctx, func(hookCtx context.Context) {
+				order = append(order, "first")
+				// The hook's ctx is detached from the (now committed) transaction, so
+				// this read runs on the pool and the write below opens a fresh
+				// transaction instead of joining a dead *sql.Tx.
+				_, err := store.GetObject(hookCtx, obj.ID)
+				assert.NoError(t, err, "hook must see the committed row")
+				assert.NoError(t, store.Within(hookCtx, func(hookCtx context.Context) error {
+					_, _, err := store.UpdateSpec(hookCtx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+					return err
+				}), "a hook must be able to open its own transaction")
+			})
+			store.AfterCommit(ctx, func(context.Context) { order = append(order, "second") })
+			assert.Empty(t, order, "hooks must not run before the outer commit")
+			return nil
+		})
+	}))
+	assert.Equal(t, []string{"first", "second"}, order, "hooks run in registration order")
+
+	// A hook that chains more post-commit work through the transaction ctx it
+	// captured — rather than the detached one it was handed — must still run it.
+	// flush has already drained the collector by then, so buffering would drop it.
+	var chained []string
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		store.AfterCommit(txCtx, func(context.Context) {
+			chained = append(chained, "first")
+			store.AfterCommit(txCtx, func(context.Context) {
+				chained = append(chained, "second")
+			})
+		})
+		return nil
+	}))
+	assert.Equal(t, []string{"first", "second"}, chained, "a hook registered from a hook must run")
+
+	// emit/emitEvent carry the same guard (publish instead of buffering once the
+	// collector is drained). No test drives them: reaching that path needs a ctx
+	// holding the drained collector *without* its committed transaction, and every
+	// mutator that could carry one either fails on the dead tx first or self-wraps
+	// in Within, which installs a fresh collector. The guard is uniformity, not a
+	// reachable bug — see TestFlushedCollectorRefusesLateAdds for the unit-level
+	// proof that the collector reports the drop.
+
+	// A rolled-back transaction discards its hooks along with its writes.
+	sentinel := errors.New("boom")
+	var rolledBack bool
+	err := store.Within(ctx, func(ctx context.Context) error {
+		store.AfterCommit(ctx, func(context.Context) { rolledBack = true })
+		return sentinel
+	})
+	assert.ErrorIs(t, err, sentinel)
+	assert.False(t, rolledBack, "a rolled-back transaction must not run its hooks")
+}
+
 func TestListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1363,7 +1437,7 @@ func TestListUnsettledIDs(t *testing.T) {
 	require.NoError(t, err)
 	_, err = store.UpdateStatus(ctx, testGK, stale.ID, stale.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, err = store.UpdateSpec(ctx, testGK, stale.ID, []byte(`{"updated":true}`), 0)
+	_, _, err = store.UpdateSpec(ctx, testGK, stale.ID, []byte(`{"updated":true}`), 0)
 	require.NoError(t, err)
 
 	// different kind — must NOT appear
@@ -1497,7 +1571,7 @@ func TestUpdateSpecDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.UpdateSpec(context.Background(), testGK, 1, []byte(`{}`), 0)
+	_, _, err := store.UpdateSpec(context.Background(), testGK, 1, []byte(`{}`), 0)
 	require.Error(t, err)
 }
 
@@ -1965,7 +2039,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	require.NotNil(t, findCondition(recvEvent(t, w).Object.Conditions, "Ready"), "UpdateStatus event carries conditions")
 
 	// UpdateSpec too.
-	spec, err := store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"s":1}`), 0)
+	spec, _, err := store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"s":1}`), 0)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(spec.Conditions, "Ready"), "UpdateSpec result carries conditions")
 	require.NotNil(t, findCondition(recvEvent(t, w).Object.Conditions, "Ready"), "UpdateSpec event carries conditions")
@@ -1990,7 +2064,7 @@ func TestNonConditionWriteAssemblyError(t *testing.T) {
 
 	_, err = store.UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0)
 	require.Error(t, err)
-	_, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{}`), 0)
+	_, _, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{}`), 0)
 	require.Error(t, err)
 	_, _, err = store.RequestDeletion(ctx, testGK, obj.ID)
 	require.Error(t, err)
@@ -2226,7 +2300,7 @@ func TestUpdateSpecResourceVersionError(t *testing.T) {
 	obj := newRefObject(t, store)
 	dropSeq(t, store)
 
-	_, err := store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"changed":true}`), 0)
+	_, _, err := store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"changed":true}`), 0)
 	require.Error(t, err)
 }
 

@@ -91,9 +91,27 @@ func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
 
-// txKey carries an in-flight *sql.Tx through the context so that Store calls
-// made with the ctx passed to Within join that transaction.
+// txKey carries the in-flight transaction through the context so that Store
+// calls made with the ctx passed to Within join it.
 type txKey struct{}
+
+// txState is everything a transaction puts on the context. The connection and
+// the buffer travel as one value on purpose: "am I inside a transaction?" and
+// "where do I buffer until it commits?" are the same question, and answering
+// them from two independent context keys would let a future path install one
+// without the other — a ctx that looks transactional to conn but standalone to
+// AfterCommit would fire wakes mid-transaction, the exact race the buffering
+// exists to prevent.
+type txState struct {
+	tx   *sql.Tx
+	coll *eventCollector
+}
+
+// txFrom returns the ambient transaction state, if any.
+func txFrom(ctx context.Context) (*txState, bool) {
+	st, ok := ctx.Value(txKey{}).(*txState)
+	return st, ok
+}
 
 // dbtx is the subset of *sql.DB and *sql.Tx the object queries use, so the same
 // code path runs both standalone and inside a Within transaction.
@@ -105,8 +123,8 @@ type dbtx interface {
 
 // conn returns the ambient transaction if ctx carries one, else the pool.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
-	if tx, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
-		return tx
+	if st, ok := txFrom(ctx); ok {
+		return st.tx
 	}
 	return s.db
 }
@@ -129,7 +147,7 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // commit; on rollback (an fn error or a failed Commit) the buffer is discarded
 // and watchers never see the rolled-back writes.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
-	if _, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
+	if _, ok := txFrom(ctx); ok {
 		return fn(ctx) // nested: joins the outer tx and its collector
 	}
 
@@ -138,8 +156,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		return err
 	}
 	coll := &eventCollector{}
-	ctx = context.WithValue(ctx, txKey{}, tx)
-	ctx = context.WithValue(ctx, collectorKey{}, coll)
+	ctx = context.WithValue(ctx, txKey{}, &txState{tx: tx, coll: coll})
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
 	if err := fn(ctx); err != nil {
 		return err // collector discarded, nothing published
@@ -152,6 +169,35 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		s.flush(coll)
 	}
 	return err
+}
+
+// AfterCommit defers fn to the outermost transaction's post-commit flush, right
+// after that transaction's watch events go out. A nested Within joins the outer
+// collector, so a hook registered deep inside a controller's Within still waits
+// for the outer commit — which is the point: a wake published before the commit
+// can send a reconciler at a row that isn't visible (or never lands at all).
+//
+// Outside a transaction there is nothing to wait for — the write has committed
+// and emitted already — so fn runs inline on the caller's own ctx. So does a
+// registration that arrives too late to be buffered: a hook holding the tx ctx it
+// was registered on (instead of the detached one it is handed) can call back in
+// here after flush has drained the collector, and "run after the commit" is
+// satisfied by running now, not by queueing where nothing will look again.
+func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context)) {
+	st, ok := txFrom(ctx)
+	if !ok {
+		fn(ctx) // nothing to defer to, and nothing to strip
+		return
+	}
+	// Strip the transaction before handing the ctx on: by the time the hook runs
+	// that *sql.Tx is committed, so a store call joining it would fail outright.
+	// A hook that writes gets a fresh transaction, which is the only thing it could
+	// have meant. Everything else on the ctx is inherited.
+	hookCtx := context.WithValue(ctx, txKey{}, nil)
+	if st.coll.addHook(func() { fn(hookCtx) }) {
+		return
+	}
+	fn(hookCtx)
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.
@@ -396,10 +442,11 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	return ids, rows.Err()
 }
 
-func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
+func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
 	var result *storeapi.RawObject
+	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
@@ -429,9 +476,10 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 			RETURNING `+objectColumns,
 			jsonText(spec), specVersion, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
+		changed = err == nil
 		return err
 	})
-	return result, err
+	return result, changed, err
 }
 
 func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {

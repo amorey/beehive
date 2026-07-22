@@ -389,7 +389,7 @@ func TestWatchStreamsLiveAfterSnapshot(t *testing.T) {
 	defer w.Close()
 	recvEvent(t, w) // drain snapshot Added
 
-	_, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"v":2}`), 0)
+	_, _, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
@@ -413,9 +413,9 @@ func TestWatchFiltersByID(t *testing.T) {
 	snap := recvEvent(t, w) // snapshot Added for obj1 only
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
-	_, err = store.UpdateSpec(ctx, testGK, obj2.ID, []byte(`{"v":2}`), 0) // filtered out
+	_, _, err = store.UpdateSpec(ctx, testGK, obj2.ID, []byte(`{"v":2}`), 0) // filtered out
 	require.NoError(t, err)
-	_, err = store.UpdateSpec(ctx, testGK, obj1.ID, []byte(`{"v":2}`), 0) // delivered
+	_, _, err = store.UpdateSpec(ctx, testGK, obj1.ID, []byte(`{"v":2}`), 0) // delivered
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
@@ -452,7 +452,7 @@ func TestWatchChangesSkipsSnapshot(t *testing.T) {
 	assertNoEvent(t, w, 200*time.Millisecond)
 
 	// A live change to that object streams through.
-	_, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
+	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	ev := recvEvent(t, w)
 	assert.Equal(t, beehive.Modified, ev.Type)
@@ -1061,4 +1061,55 @@ func TestWatchEventsSendStoreClose(t *testing.T) {
 	<-exited
 	_, ok := <-w.Events()
 	assert.False(t, ok)
+}
+
+// A collector outlives its transaction — a post-commit hook can reach it through
+// the tx ctx it captured. Once flush has drained it, every buffering path must
+// report that it did not take ownership, so the caller acts immediately instead
+// of appending to a slice nothing will drain again.
+func TestFlushedCollectorRefusesLateAdds(t *testing.T) {
+	store := newRawStore(t)
+	coll := &eventCollector{}
+
+	ran := false
+	require.True(t, coll.addHook(func() { ran = true }), "an open collector buffers")
+
+	store.flush(coll)
+	assert.True(t, ran, "flush runs the buffered hook")
+
+	assert.False(t, coll.addHook(func() {}), "hook after flush must not be buffered")
+	assert.False(t, coll.add(pendingEvent{gk: testGK}), "event after flush must not be buffered")
+	assert.False(t, coll.addEventRow(pendingEventRow{gk: testGK}), "event row after flush must not be buffered")
+	assert.Empty(t, coll.hooks)
+	assert.Empty(t, coll.events)
+	assert.Empty(t, coll.logRows)
+}
+
+// flush publishes a transaction's watch events *before* it runs the post-commit
+// hooks — the whole reason the hooks loop sits below the publish loops, since a
+// hook that wakes a reconciler must not run ahead of the event that wake follows
+// (a woken controller could otherwise publish its Modified before the Added).
+//
+// The hook receives from the watcher, which pins the order without timing
+// assumptions in either direction: if the events go out first the receive
+// completes, and if the loops were reordered flush would be blocked inside this
+// hook and could never publish, so the receive can only end in recvEvent's
+// failsafe — a hang turned into a failure.
+func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchChanges(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+
+	var seen storeapi.RawChange
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		if _, err := store.CreateObject(txCtx, newWatchObject()); err != nil {
+			return err
+		}
+		store.AfterCommit(txCtx, func(context.Context) { seen = recvEvent(t, w) })
+		return nil
+	}))
+	assert.Equal(t, beehive.Added, seen.Type, "the hook must observe the already-published event")
 }

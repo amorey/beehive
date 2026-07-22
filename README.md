@@ -203,7 +203,7 @@ type Object[Spec, Status any] struct {
     ID                  ObjectID
     Group               string
     Kind                string
-    Slug                *string  // nil for internally-generated objects
+    Slug                *string  // nil when created without WithSlug; never auto-generated
     Spec                Spec
     Status              *Status
     Generation          int64
@@ -272,6 +272,8 @@ type Change[Spec, Status any] struct {
 
 type Client[Spec, Status any] interface {
     Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+    CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
+    GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
     Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
     Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
     GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
@@ -288,8 +290,8 @@ type Client[Spec, Status any] interface {
 
     // Event log — per-object, category-partitioned, contiguous-run aggregated.
     ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
-    WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
     GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
+    WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
 
     // Reconcile control.
     Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
@@ -301,6 +303,80 @@ type Client[Spec, Status any] interface {
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 ```
+
+#### Writes
+
+`Create` leaves the slug **unset** unless `beehive.WithSlug` is provided — it is `nil`, stored as SQL `NULL`, and nothing is generated for you. NULL slugs don't collide (`NULL != NULL` in SQLite), so any number of slugless objects of a kind coexist; they are reachable by `ObjectID` and `List`, just not by name. If a slug *is* given and already exists, `Create` fails on the `UNIQUE ("group", kind, slug)` constraint. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
+
+```go
+client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithSlug("prod-cluster"), beehive.WithFinalizers("kstack.sh/cluster"))
+client.Update(ctx, obj.ID, ClusterSpec{...})
+```
+
+**A slug is an opaque key, and beehive does not validate it** — no charset rule, no length limit, no normalization. The empty string is therefore a perfectly ordinary slug: a real value under the unique constraint, and distinct from `NULL`. `GetOrCreate(ctx, "", spec)` creates *the* empty-slug object of that kind, and the next caller passing `""` gets that same row back with `created=false` — exactly as two callers passing `"prod"` would. That is the contract rather than a collision bug, but it has a sharp edge worth knowing: a slug derived from configuration is `""` when the config field is unset, which silently keys every such caller to one shared object. Validate slugs at the edge if they come from outside your code, and when you mean "no name" use `nil` — `Create` without `WithSlug` — not `""`.
+
+The three slug-keyed writes differ **only in what they do when the slug is already taken** — and the table holds under concurrency too, not just against a row that was already there. `CreateOrUpdate` and `GetOrCreate` wrap their read-and-write in one transaction, so two callers racing on the same slug never both insert: the loser observes the winner's row and updates or returns it, rather than surfacing a constraint error you would have to retry. `Create` does no lookup — it inserts — so the loser of the same race fails on `UNIQUE`, exactly as it would against a pre-existing row:
+
+| Slug already held by    | `Create`         | `CreateOrUpdate`     | `GetOrCreate`                         |
+| ----------------------- | ---------------- | -------------------- | ------------------------------------- |
+| nothing                 | creates          | creates              | creates, `created=true`               |
+| a live row              | fails (`UNIQUE`) | updates it to `spec` | returns it untouched, `created=false` |
+| a deletion-pending row  | fails (`UNIQUE`) | updates it to `spec` | returns it untouched, `created=false` |
+
+Where `CreateOrUpdate` says "updates it", re-applying the spec the row already holds is a **complete** no-op: no generation bump, no `resource_version` bump, no watch event, and no reconciler wake. That last part matters if a controller re-applies a spec of its own kind on every pass — it converges instead of waking itself in a loop. The same holds for `Update`.
+
+Every write **validates before it commits.** `Create`, `CreateOrUpdate`, `GetOrCreate`, and `Update` decode the written row back into `Spec`/`Status` *inside* the write transaction, so a spec that marshals but does not round-trip — typically an asymmetric `MarshalJSON`/`UnmarshalJSON` — rolls the write back rather than committing a row the process cannot read. **An error from a write therefore means nothing was committed:** no poison row, no reconciler wake, no `UNIQUE` left behind for a retry to trip on, and for `Update`/`CreateOrUpdate` the prior good spec is preserved. `GetOrCreate` in particular returns `created=false` on such an error, since nothing was created. The cost is that the write holds the store's single writer across the decode (`json.Marshal` still runs *before* the transaction). This guards only the write path; a row can still become undecodable *later* — e.g. a schema downgrade — which is a read/reconcile concern handled by quarantine (see [Migrator](#migrator)).
+
+Reach for `GetOrCreate` when a controller must idempotently ensure a child exists **without ever mutating it** — the pattern otherwise open-coded as `GetBySlug` → `Create` → re-`GetBySlug` on conflict, where the fallback path tends to drift from the primary one's checks. Its found branch performs no write at all, so a deletion-pending row comes back as-is with `DeletionRequestedAt` set rather than being resurrected by an `UpdateSpec`:
+
+Two surfaces appear in the example below, and they are not interchangeable:
+`GetOrCreate` is on `Client` (the child kind's client, built with `NewClient` and
+held by the controller), while `RecordEvent` is on the `ControllerClient` that
+`Reconcile` is handed for writes about the object being reconciled. `Client` has no
+`RecordEvent`, and `ControllerClient` has no `GetOrCreate` — a controller creates
+children through a `Client` for that kind.
+
+```go
+type ProjectController struct {
+    // built once at wiring time:
+    //   beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
+    clusters beehive.Client[ClusterSpec, ClusterStatus]
+}
+
+// Ensure the Cluster this Project owns exists, without ever mutating it. The
+// options apply only if this call creates the row — a pre-existing row is
+// returned exactly as it is (see the caveat below).
+func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.ControllerClient[ProjectStatus], obj *beehive.Object[ProjectSpec, ProjectStatus]) (beehive.Result, error) {
+    cluster, created, err := p.clusters.GetOrCreate(ctx, "prod-cluster", ClusterSpec{...},
+        beehive.WithOwner(obj.ID), beehive.WithFinalizers("kstack.sh/cluster"))
+    if err != nil {
+        return beehive.Result{}, err
+    }
+    if cluster.DeletionRequestedAt != nil {
+        // The slug is still held by a tombstone; it is released only once GC clears
+        // the row's finalizers. Wait and retry — a replacement cannot be created yet.
+        return beehive.Result{RequeueAfter: 5 * time.Second}, nil
+    }
+    if created {
+        // RecordEvent is about obj (this controller's object), not the child.
+        if err := cc.RecordEvent(ctx, obj.ID, beehive.EventSpec{
+            Category: "lifecycle", Reason: "ClusterCreated",
+        }); err != nil {
+            return beehive.Result{}, err
+        }
+    }
+    return beehive.Result{}, nil
+}
+```
+
+`created` reports whether this call inserted the row: on create the `Added` event is emitted and the object enqueued, exactly as with `Create`; returning an existing row emits and enqueues nothing. Both are post-commit, including when you nest the call in an outer transaction (`ControllerClient.Within`): the wake is registered as a post-commit hook, so it fires after the *outermost* commit has published the object's event, and not at all if that transaction rolls back. The return value can't be deferred that way, so `created=true` is still provisional until the outer transaction commits; don't act on it outside the transaction's own writes — for a side effect that must run only if the row lands, use `WithOnCreate` (below), which is deferred to the same post-commit point as the wake. `Create`, `CreateOrUpdate`, and `Update` behave the same way when nested. The options apply **only on the create branch** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). `WithSlug` is **rejected** with `ErrConflictingOption`: the slug is positional here, so the option can only contradict it, and dropping it silently would put the row under one slug while the caller went looking for it under another. (This is narrower than the general option rule — an option aimed at a target that doesn't understand it is still ignored by design. A contradiction is a caller mistake, not an inapplicable setting.)
+
+That last point has a sharp edge worth stating plainly: on the found branch the options are ignored outright, so **`created=false` does not mean "exists and matches your options."** A row created earlier by a path that passed no `WithOwner` comes back with no owner edge, and a caller that assumes otherwise gets a child the GC cascade will never collect when the parent is deleted. If you depend on the owner edge, verify it — `GetOrCreate` then `GetOwner` (or a `Get(ctx, id, LoadOwner())`) — and reconcile the difference yourself. Beehive deliberately does not adopt the row for you: `owner` is single, so adding the edge to a row that already has a *different* owner would produce a two-owner object, and choosing which owner wins is your policy, not the library's.
+
+#### Watching
+
+`Watch` and `WatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `Change` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `ListEvents`/`WatchEvents` below — is a separate concept: `Change` is an object-change notification, `Event` is a recorded log entry.)
 
 #### Secondary lookups (owner / dependencies / dependents / owned)
 
@@ -330,16 +406,6 @@ The scheduling API observes when an object is **next due to reconcile** — a [`
 `WatchSchedule` streams that schedule live as a **gauge**: the current value on subscribe, then a new `Schedule` on every (re)schedule — backoff step, `RequeueAfter`, resync or dependency wake, dispatch, or `Requeue`. None of these fire the object `Watch`/`WatchList` (a reschedule bumps no generation or resource version) and no other signal captures them all, so this is the only way to reliably observe reschedules — e.g. to drive a "next attempt" countdown that stays accurate for an object whose spec/status has stopped changing. Delivery mirrors `WatchEvents`: snapshot-then-live, conflated **per object** so a lagging reader converges to the latest value (it can miss intermediate values but never the current one), and the channel closes when `ctx` is cancelled or the control plane stops. Unlike `GetSchedule`, `WatchSchedule` returns `ErrNoController` for a client-only kind — a live stream that can never emit should say so rather than hang — but `id` need not exist: an unscheduled id simply streams the zero `Schedule` until something schedules it.
 
 Both are `Client`-only and read **only per-id timers**, so neither is a prediction of the next reconcile: the actual next reconcile can be **earlier** than reported (the periodic resync — kind-wide, conditional on the object being unsettled — plus dependency-change wakes and store-write enqueues are not per-id timers), and a **zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee. It is a sibling watch surface to `WatchEvents`, deliberately **not** routed through the event log: an event is an append-only, retained record of a past occurrence, whereas a requeue time is a single mutable future gauge — different data, different delivery and retention.
-
-`Create` generates a slug unless `beehive.WithSlug` is provided. If a slug is given and already exists, `Create` fails. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
-
-```go
-client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithSlug("prod-cluster"), beehive.WithFinalizers("kstack.sh/cluster"))
-client.Update(ctx, obj.ID, ClusterSpec{...})
-```
-
-`Watch` and `WatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `Change` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `ListEvents`/`WatchEvents` below — is a separate concept: `Change` is an object-change notification, `Event` is a recorded log entry.)
 
 #### Events
 
@@ -388,6 +454,8 @@ A controller owns **no lifecycle** in beehive — it implements only `Reconcile`
 
 When several writes must be atomic — all land together or none do — wrap them in `ControllerClient.Within(ctx, func(ctx) error { … })`. Writes made with the inner `ctx` join one transaction that commits on a `nil` return and rolls back on error. That transaction holds the store's single write lock for the whole duration of the function, so keep external I/O outside it — do your I/O first, then open `Within` only around the writes.
 
+`Client` writes made with the inner `ctx` join the transaction too, and their side effects wait for it: the reconciler wake, and for `Delete` the garbage-collection follow-up, are deferred to after the outermost commit and skipped entirely on rollback. So a controller can create or delete children inside `Within` without waking anything at a row that never lands.
+
 A non-nil error triggers an automatic retry with exponential backoff starting at 1s and capped at 30s by default. Configurable per-controller with `WithMaxRetryInterval`.
 
 ### Migrator
@@ -403,7 +471,7 @@ type Migrator interface {
 
 Attach a `Migrator` per kind with `WithMigrator` passed to `Register`. The store persists the version each blob was written at in two opaque per-row columns (spec and status). On read, a blob below the current version is run through `ConvertSpec`/`ConvertStatus`; an equal version (or a current version of `0`, "not versioned") passes through; a *greater* version is a downgrade and is rejected as a decode error. `from == 0` is the unversioned baseline, so once a migrator is enabled its converters must handle it.
 
-Conversion is lazy and per-column — a blob is re-stamped only when next written, so a status-only write re-stamps just the status version. A blob that fails to convert, fails to unmarshal, or is a downgrade is a decode failure: `List` and live watches skip-and-log it and continue, while `Get`/`GetBySlug` return the error. A kind with no migrator is unchanged — its columns stay `0`. Only `Register`ed kinds can have a migrator; client-only kinds cannot.
+Conversion is lazy and per-column — a blob is re-stamped only when next written, so a status-only write re-stamps just the status version. A blob that fails to convert, fails to unmarshal, or is a downgrade is a decode failure, and each read path handles it in the way that fails safest for it: `List` and live watches skip-and-log the bad row and continue; `Get`/`GetBySlug` return the error; and the **reconcile loop quarantines** it — a row it cannot decode cannot be reconciled and its bytes won't change until someone rewrites the spec, so it logs and treats the pass as a no-op success rather than retrying the same bytes forever under backoff (a deletion-pending row is still collected, since GC needs only the id). Because resync re-enqueues an unsettled poison row every tick, this warning recurs at the resync cadence — deliberately, so a persistent bad row stays visible rather than logging once and going silent. A kind with no migrator is unchanged — its columns stay `0`. Only `Register`ed kinds can have a migrator; client-only kinds cannot.
 
 ### Options
 
@@ -413,6 +481,7 @@ type Option interface{ apply(any) }
 func WithSlug(slug string) Option                  // set a human-readable slug; fails if already exists
 func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
+func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
 func WithResyncInterval(d time.Duration) Option    // override the default resync interval
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
@@ -420,6 +489,8 @@ func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log
 ```
 
 `WithOwner` sets an `owned_by` edge in `refs` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
+
+`WithOnCreate` is the commit-safe channel for a create-conditional side effect (an external call, an in-memory counter). It is registered on the same post-commit path as the reconciler wake, so it runs once after the *outermost* commit and never on a rollback. `Create` always fires it; `GetOrCreate` fires it only on the create branch, not when it returns an existing row. Prefer it over branching on `GetOrCreate`'s returned `created` bool: that bool is synchronous, so inside a caller's `ControllerClient.Within` it is set before the enclosing transaction commits, and acting on it there fires the side effect for a row a later rollback would discard.
 
 `AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.
 
