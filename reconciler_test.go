@@ -947,6 +947,41 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound, "the finalizer-free deleting poison row must be collected, not stranded")
 }
 
+// undecodableDeletingCollectErrorStore returns an undecodable, deletion-pending
+// row from GetObject, and errors from GetObjectMeta so that collect (which reads
+// meta first) fails. This exercises the GC-error leg of the quarantine: a poison
+// deleting row whose collect fails must surface the error for retry, not swallow
+// it as a no-op success.
+type undecodableDeletingCollectErrorStore struct {
+	fakeStore
+}
+
+func (s *undecodableDeletingCollectErrorStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	deletedAt := time.Unix(1, 0)
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), DeletionRequestedAt: &deletedAt}, nil
+}
+
+func (s *undecodableDeletingCollectErrorStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
+	return nil, errBoom
+}
+
+func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
+	bh := &Beehive{store: &undecodableDeletingCollectErrorStore{}}
+	var called bool
+	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		called = true
+		return Result{}, nil
+	}}
+	tc := &typedController[cSpec, cStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
+	}
+	_, err := tc.reconcile(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom, "a failed collect on a poison deleting row must surface for retry")
+	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
+}
+
 // getObjectErrorStore returns an error from GetObject to exercise path A in
 // typedController.reconcile (the GetObject error before rawToTyped). Within is
 // inherited from fakeStore (inline passthrough).
