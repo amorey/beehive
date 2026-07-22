@@ -470,6 +470,9 @@ func (s *sqliteStore) watch(
 					delete(seenIDs, ev.Object.ID)
 				}
 			}
+			if s.beforeLiveSend != nil {
+				s.beforeLiveSend() // test seam: act while the goroutine is provably past the receive
+			}
 			if !send(ev) {
 				return
 			}
@@ -586,6 +589,9 @@ func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id
 			}
 			if !eventMatchesQuery(ev, q) {
 				continue // q filters the live stream too, not just the snapshot
+			}
+			if s.beforeLiveSend != nil {
+				s.beforeLiveSend() // test seam: act while the goroutine is provably past the receive
 			}
 			if !send(ev) {
 				return
