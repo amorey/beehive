@@ -15,6 +15,8 @@
 package beehive
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -25,6 +27,13 @@ import (
 // operation — depending on where it is passed. Each option type-switches on the
 // targets it understands and ignores the rest.
 type Option func(target any) error
+
+// ErrConflictingOption reports an option that contradicts an argument the call
+// already carries — passing WithSlug to a method that takes the slug positionally,
+// for instance. It is distinct from an option being *inapplicable*: an option
+// aimed at a target it doesn't understand is ignored by design (see Option), while
+// a contradiction is a caller mistake whose effect would otherwise be invisible.
+var ErrConflictingOption = errors.New("beehive: option conflicts with an explicit argument")
 
 // LoadOption selects a secondary lookup to fetch alongside an object on a read.
 // It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
@@ -161,6 +170,21 @@ type createOptions struct {
 	slug       *string
 	finalizers []string
 	owner      *ObjectID
+	onCreate   func(context.Context)
+}
+
+// resolveCreate folds the create-time options into one createOptions, the
+// counterpart to resolveLoads/resolveRequeue/resolveEvents for the create
+// family. It errors on the first option that does, so a bad option fails the
+// call before any store work.
+func resolveCreate(opts []Option) (*createOptions, error) {
+	co := &createOptions{}
+	for _, o := range opts {
+		if err := o(co); err != nil {
+			return nil, err
+		}
+	}
+	return co, nil
 }
 
 // WithSlug sets the object's unique slug, looked up later via GetBySlug.
@@ -189,6 +213,28 @@ func WithOwner(id ObjectID) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {
 			t.owner = &id
+		}
+		return nil
+	}
+}
+
+// WithOnCreate registers fn to run once, on the caller's ctx, only if this call
+// actually inserts a new row — and only after the outermost transaction it runs
+// in commits. Create always fires it; GetOrCreate fires it on the create branch
+// but not when it returns an existing row.
+//
+// It is the commit-safe channel for create-conditional side effects. The
+// GetOrCreate created bool is synchronous, so inside a caller's
+// ControllerClient.Within it reports true before the enclosing transaction
+// commits — act on it for a non-store side effect (an external call, an
+// in-memory counter) and a later rollback leaves that effect fired for a row
+// that never landed. fn is deferred through the same post-commit path as the
+// reconcile wake (Store.AfterCommit), so a rollback simply never runs it. Put
+// such side effects here rather than gating them on the returned bool.
+func WithOnCreate(fn func(ctx context.Context)) Option {
+	return func(target any) error {
+		if t, ok := target.(*createOptions); ok {
+			t.onCreate = fn
 		}
 		return nil
 	}

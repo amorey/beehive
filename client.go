@@ -39,6 +39,56 @@ type Change[Spec, Status any] struct {
 type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
 	CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
+	// GetOrCreate returns the object with the given slug, creating it from spec if
+	// absent. Unlike CreateOrUpdate it NEVER mutates an existing row: a slug held by
+	// a live OR deletion-pending row is returned as-is with created=false, so the
+	// caller can inspect DeletionRequestedAt and decide whether to wait for GC and
+	// retry — a tombstone still holds the slug's UNIQUE constraint, so no replacement
+	// can be created until GC clears it. The read-or-create is atomic (a single
+	// store.Within transaction), so concurrent reconciles can't both create — one
+	// wins, the other observes it with created=false.
+	//
+	// On create the Added event is emitted and the object enqueued, as with Create;
+	// returning an existing row emits and enqueues nothing.
+	//
+	// opts apply only on the create branch (WithOwner, WithFinalizers, WithOnCreate).
+	// WithSlug is rejected with ErrConflictingOption rather than ignored: the slug is
+	// positional here, so the option can only contradict it, and silently dropping it
+	// would surface much later as an ErrNotFound on the slug the caller meant to use.
+	//
+	// The returned created bool is synchronous, so inside a caller's
+	// ControllerClient.Within it is set before the enclosing transaction commits: a
+	// caller that fires a non-store side effect on created==true acts for a row a
+	// later rollback discards. Route create-conditional side effects through
+	// WithOnCreate, which runs only after the outermost commit; read created as a
+	// correct after-the-fact report, not a pre-commit trigger.
+	//
+	// A non-nil err means nothing was created: the new row is decoded back into
+	// Spec/Status inside the atomic Within, so a spec whose bytes don't round-trip (a
+	// marshal/type bug) rolls the insert back rather than committing a row the process
+	// can't read. Such an error therefore returns created=false, and a retry does not
+	// hit a spurious UNIQUE on a phantom row. (A decode error on the found branch — a
+	// pre-existing poison row this call did not write — likewise returns created=false,
+	// since it plainly wasn't created here.)
+	//
+	// On the found branch the options are ignored outright — an existing row that
+	// lacks the owner or finalizers you passed keeps lacking them, and created=false
+	// is the only signal you get. Do not read created=false as "exists and matches
+	// opts": a caller depending on the owner edge (for cascade collection, say) must
+	// check it with LoadOwner()/GetOwner and reconcile the difference itself.
+	// Beehive can't adopt the row for you — owner is single, so adding the edge to a
+	// row that already has a different owner would produce a two-owner object, and
+	// picking a winner is caller policy.
+	//
+	// spec and opts are nonetheless validated up front, before the slug is read, so
+	// an unmarshalable spec or an erroring option fails the call even when the row
+	// already exists and neither would have been used. Both are caller bugs, and
+	// validating them eagerly keeps the error independent of store state: deferring
+	// would make the same call succeed or fail depending on whether the row happens
+	// to exist, hiding the bug until GC or a cold start removed it. It also keeps
+	// json.Marshal out of the transaction, which on a single-connection store would
+	// hold the write lock across arbitrary user MarshalJSON code.
+	GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
 	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
 	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
@@ -148,45 +198,100 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	if err != nil {
 		return nil, err
 	}
-	co := &createOptions{}
-	for _, o := range opts {
-		if err := o(co); err != nil {
-			return nil, err
-		}
+	co, err := resolveCreate(opts)
+	if err != nil {
+		return nil, err
 	}
 
-	var raw *RawObject
+	var obj *Object[Spec, Status]
 	// Within keeps the insert and its owner ref atomic, so a crash between them
 	// can't leave an ownerless child the GC path would never collect.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err = c.bh.store.CreateObject(ctx, &RawObject{
-			Group:       c.gk.Group,
-			Kind:        c.gk.Kind,
-			Slug:        co.slug,
-			Spec:        b,
-			SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
-			Finalizers:  co.finalizers,
-		})
+		raw, err := c.insertObject(ctx, b, co)
 		if err != nil {
 			return err
 		}
-		// The child owns the edge (child -> owner) so the owner's GC walk finds it
-		// via ListIncomingRefs(owner, RelationOwnedBy).
-		if co.owner != nil {
-			return c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		// Decode inside the transaction so a row whose bytes don't round-trip never
+		// commits: returning the error here rolls back the insert and discards the
+		// buffered wake, preserving "a Create that returns an error made no change"
+		// (no committed poison row, no phantom enqueue). decode is pure over the
+		// in-memory raw — no store read — and the migrator never runs on a create
+		// (the row is stamped at the current version, so from==current is identity),
+		// so the only failure here is an asymmetric caller codec. This is the one
+		// spot we accept user unmarshal code inside the tx; marshal stays outside it.
+		obj, err = c.decode(raw)
+		if err != nil {
+			return err
 		}
+		c.signalCreated(ctx, raw.ID, co)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	return obj, nil
+}
+
+// insertObject inserts one new row of this client's kind and wires its owner
+// edge. Every create path shares it, so the row shape, the spec-version stamp,
+// and the owner-ref policy live in one place. Callers run it inside a Within:
+// the insert and its ref must commit together, or a crash between them leaves an
+// ownerless child the GC path would never collect. The slug rides on co, which
+// each caller has already populated from its single source (WithSlug for Create,
+// the positional argument for CreateOrUpdate/GetOrCreate).
+func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
+	raw, err := c.bh.store.CreateObject(ctx, &RawObject{
+		Group:       c.gk.Group,
+		Kind:        c.gk.Kind,
+		Slug:        co.slug,
+		Spec:        spec,
+		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
+		Finalizers:  co.finalizers,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// The child owns the edge (child -> owner) so the owner's GC walk finds it
+	// via ListIncomingRefs(owner, RelationOwnedBy).
+	if co.owner != nil {
+		if err := c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy); err != nil {
+			return nil, err
+		}
+	}
+	return raw, nil
+}
+
+// signalCreated registers the post-commit side effects a freshly inserted row owes:
+// the reconciler wake and, if the caller passed one, the WithOnCreate hook. Both go
+// through AfterCommit, so they fire after the outermost commit and never on a
+// rollback. Create and GetOrCreate share it so the create-side-effect wiring — and
+// the wake-then-hook ordering — lives in one place, alongside insertObject.
+// CreateOrUpdate does not use it: its create branch has no onCreate, and its wake is
+// folded into the shared "if changed" path so an update and a create wake alike.
+func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, id ObjectID, co *createOptions) {
+	c.bh.wakeAfterCommit(ctx, c.gk, id)
+	if co.onCreate != nil {
+		c.bh.store.AfterCommit(ctx, co.onCreate)
+	}
+}
+
+// decodeAndWake is the shared tail of the slug-upsert writes (Update,
+// CreateOrUpdate): it decodes raw *inside the caller's transaction* so a spec that
+// doesn't round-trip rolls the write back rather than committing a row the process
+// can't read (see Create), and then registers the post-commit reconcile wake — but
+// only when changed is true. The wake is gated because a no-op write (an identical
+// spec, which UpdateSpec collapses) emits nothing; waking anyway would be the lone
+// signal claiming something happened and, for a controller re-applying its own
+// kind's spec each pass, a self-sustaining reconcile loop. Keeping this contract in
+// one place is the update-path counterpart to signalCreated on the create paths.
+func (c *clientImpl[Spec, Status]) decodeAndWake(ctx context.Context, raw *RawObject, changed bool) (*Object[Spec, Status], error) {
 	obj, err := c.decode(raw)
 	if err != nil {
 		return nil, err
 	}
-	// The store emitted the Added event inside CreateObject, before this enqueue,
-	// so a fast controller can't produce a Modified event ahead of the Added.
-	c.bh.enqueueIfRegistered(c.gk, raw.ID)
+	if changed {
+		c.bh.wakeAfterCommit(ctx, c.gk, raw.ID)
+	}
 	return obj, nil
 }
 
@@ -197,46 +302,114 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 // first's row and updates instead. Re-applying the same spec is a no-op (UpdateSpec
 // suppresses the generation bump on equal bytes).
 //
-// It drives the store mutators directly rather than composing Create/Update so the
-// reconciler is woken only after Within commits and flushes the spec watch event:
-// those methods enqueue internally, which inside the outer transaction would wake
-// a reconciler that could publish a status event ahead of the still-buffered spec
-// event. Here the single enqueue runs after Within returns, preserving the
-// spec-event-before-wake ordering Create and Update keep on their own.
+// It drives the store mutators directly rather than composing Create/Update so
+// one row change produces exactly one wake, registered post-commit like every
+// other write path (see wakeAfterCommit) — and no wake at all when the spec was
+// already what the caller asked for.
 func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
 	}
-	var raw *RawObject
+	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		specVersion := migratorSpecVersion(c.bh.migratorFor(c.gk))
 		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		var raw *RawObject
+		changed := true // the create branch always changes something
 		switch {
 		case err == nil:
-			raw, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b, specVersion)
+			raw, changed, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		case errors.Is(err, ErrNotFound):
-			raw, err = c.bh.store.CreateObject(ctx, &RawObject{
-				Group:       c.gk.Group,
-				Kind:        c.gk.Kind,
-				Slug:        &slug,
-				Spec:        b,
-				SpecVersion: specVersion,
-			})
+			// No opts on this surface, so the row carries no finalizers and no owner.
+			raw, err = c.insertObject(ctx, b, &createOptions{slug: &slug})
 		}
 		// A non-NotFound read error falls through both cases with raw unset; err
 		// still carries it. Both write branches reassign err.
+		if err != nil {
+			return err
+		}
+		obj, err = c.decodeAndWake(ctx, raw, changed)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	obj, err := c.decode(raw)
-	if err != nil {
-		return nil, err
-	}
-	c.bh.enqueueIfRegistered(c.gk, raw.ID)
 	return obj, nil
+}
+
+// GetOrCreate returns the row holding slug, creating it only when absent. It is
+// the create-if-absent sibling of CreateOrUpdate: the found branch does no write
+// at all, so a deletion-pending row comes back with its tombstone intact rather
+// than being spuriously bumped back to life. See the Client interface for the
+// full contract.
+func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return nil, false, err
+	}
+	co, err := resolveCreate(opts)
+	if err != nil {
+		return nil, false, err
+	}
+	// The slug is positional here, so WithSlug can only contradict it. Reject rather
+	// than silently drop it: the ignored option would otherwise surface much later,
+	// as an ErrNotFound on a slug the caller believed it had asked for.
+	if co.slug != nil {
+		return nil, false, fmt.Errorf("%w: GetOrCreate takes the slug positionally; WithSlug(%q) conflicts with %q",
+			ErrConflictingOption, *co.slug, slug)
+	}
+
+	var obj *Object[Spec, Status]
+	var created bool
+	// One Within around the read and the insert is what removes the caller's
+	// TOCTOU: the loser of a concurrent create observes the winner's row instead
+	// of failing on the slug's UNIQUE constraint.
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		if err == nil {
+			// Found: return the existing row as-is (live or deletion-pending; never
+			// mutated). A pre-existing poison row is not ours to roll back, so its
+			// decode error surfaces with created=false — it plainly wasn't created here.
+			obj, err = c.decode(existing)
+			return err
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		// co.slug is nil here — WithSlug was rejected up front — so the positional
+		// slug is the row's only name.
+		co.slug = &slug
+		raw, err := c.insertObject(ctx, b, co)
+		if err != nil {
+			return err
+		}
+		// Decode inside the transaction (see Create): a new row whose bytes don't
+		// round-trip must never commit, so its decode error rolls the insert back
+		// rather than leaving a committed poison row. created is set only after the
+		// decode succeeds, so a rolled-back create reports created=false — the bool
+		// tracks what actually landed, never a row the transaction discarded.
+		obj, err = c.decode(raw)
+		if err != nil {
+			return err
+		}
+		created = true
+		// Wake and any WithOnCreate hook fire only for a row we just made: returning
+		// an existing object is a pure read and must not nudge the reconciler or run
+		// create-conditional side effects (which is also why they aren't gated on the
+		// returned created bool — see below).
+		c.signalCreated(ctx, raw.ID, co)
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	// The returned created bool is synchronous: inside a caller's Within it reports
+	// true before the enclosing transaction commits, so a caller that fires a
+	// non-store side effect on it can act for a row a later rollback discards. Route
+	// such effects through WithOnCreate, which defers to the post-commit flush and
+	// so never runs on a rollback. The bool remains a correct after-the-fact report
+	// once the outermost transaction commits.
+	return obj, created, nil
 }
 
 func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
@@ -244,18 +417,26 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	if err != nil {
 		return nil, err
 	}
-	// UpdateSpec folds this client's kind into the write, so a foreign id is
-	// rejected at the store (no separate read-then-write to keep atomic);
-	// hideWrongKind keeps that foreign id invisible to this single-kind client.
-	raw, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
-	if err = c.hideWrongKind(err); err != nil {
-		return nil, err
-	}
-	obj, err := c.decode(raw)
+	// UpdateSpec self-wraps in Within; wrapping it here lets the decode join that
+	// same transaction, so a spec that doesn't round-trip rolls the write back (see
+	// Create), keeping the prior good spec instead of committing a row the process
+	// can't read. Outside a caller's Within this is a standalone tx; nested in one it
+	// joins, and the wake defers to that outer commit either way.
+	var obj *Object[Spec, Status]
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		// UpdateSpec folds this client's kind into the write, so a foreign id is
+		// rejected at the store (no separate read-then-write to keep atomic);
+		// hideWrongKind keeps that foreign id invisible to this single-kind client.
+		raw, changed, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		if err = c.hideWrongKind(err); err != nil {
+			return err
+		}
+		obj, err = c.decodeAndWake(ctx, raw, changed)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	c.bh.enqueueIfRegistered(c.gk, raw.ID)
 	return obj, nil
 }
 

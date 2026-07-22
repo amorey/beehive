@@ -198,6 +198,31 @@ type Store interface {
 	// that transaction; calls made with any other context run standalone.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
+	// AfterCommit registers fn to run once the transaction ctx belongs to has
+	// committed, after that transaction's buffered watch events are published.
+	// If ctx carries no transaction the write has already committed, so fn runs
+	// before AfterCommit returns. Hooks run in registration order, and a
+	// rolled-back transaction never runs them.
+	//
+	// Callers use it for side effects that must not be observable before the
+	// write is durable and its events are out — waking a reconciler, most of all.
+	//
+	// fn receives a context detached from the transaction, so a store call it
+	// makes opens a fresh transaction instead of joining the committed one.
+	// Everything else — deadline, cancellation, values — is inherited, so a hook
+	// is still bound to the caller's lifetime.
+	//
+	// Registering from inside a running hook is allowed and runs the new hook
+	// immediately: its transaction has already committed, so "after the commit"
+	// is now. This holds even when the hook passes back the transaction context
+	// it captured rather than the detached one it was handed.
+	//
+	// fn must not panic: hooks run in sequence, so a panic aborts the ones
+	// registered after it while the transaction stays committed. Nothing
+	// recovers here — a panicking hook is a bug in the layer that registered it,
+	// and this library lets panics surface (Reconcile is not recovered either).
+	AfterCommit(ctx context.Context, fn func(ctx context.Context))
+
 	// CreateObject inserts a new object. The store assigns ID and
 	// ResourceVersion and sets Generation to 1; the caller supplies the rest
 	// (Group, Kind, Slug, Spec, Finalizers).
@@ -245,9 +270,12 @@ type Store interface {
 	// change) and ResourceVersion, and stamps specVersion (the migrator schema
 	// version the bytes were written at). Writing spec bytes identical to the
 	// stored ones is an idempotent no-op: no Generation/ResourceVersion bump and
-	// no event, so a converged object isn't falsely unsettled. Scoped to gk: an id
-	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
+	// no event, so a converged object isn't falsely unsettled. changed reports
+	// which happened — true for a real write, false for the no-op — so callers can
+	// keep their own follow-up (a reconciler wake) in step with the store's
+	// silence. Scoped to gk: an id of another kind is rejected with ErrWrongKind,
+	// a missing id with ErrNotFound.
+	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
 	// UpdateStatus replaces an object's status and records the generation the
 	// controller observed, bumping ObservedAt and ResourceVersion, and stamps

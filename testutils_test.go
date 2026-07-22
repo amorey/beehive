@@ -91,6 +91,10 @@ func (s *fakeStore) Close() error {
 func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }
+
+// AfterCommit runs inline: the fake never opens a transaction, so there is no
+// commit to wait for.
+func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
 func (s *fakeStore) CreateObject(context.Context, *RawObject) (*RawObject, error) {
 	panic("not implemented: fakeStore.CreateObject")
 }
@@ -118,7 +122,7 @@ func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]Object
 func (s *fakeStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, error) {
+func (s *fakeStore) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }
 func (s *fakeStore) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) (*RawObject, error) {
@@ -287,4 +291,22 @@ func drainQueue(q *workQueue) {
 	for id, ok := q.get(); ok; id, ok = q.get() {
 		q.done(id)
 	}
+}
+
+// runCommitRollback runs body as two subtests, "commit" (commit=true) and
+// "rollback" (commit=false), for the many wake-ordering tests that assert one
+// thing on a committed outer transaction and the opposite on a rolled-back one.
+func runCommitRollback(t *testing.T, body func(t *testing.T, commit bool)) {
+	t.Helper()
+	t.Run("commit", func(t *testing.T) { body(t, true) })
+	t.Run("rollback", func(t *testing.T) { body(t, false) })
+}
+
+// queuedIDs snapshots q's dispatchable items, for tests that assert on which
+// objects a write woke. Reading items directly (rather than draining) leaves the
+// queue untouched, so a test can check it repeatedly.
+func queuedIDs(q *workQueue) []ObjectID {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]ObjectID(nil), q.items...)
 }

@@ -318,6 +318,22 @@ func TestClientCreateWithOptions(t *testing.T) {
 	assert.Equal(t, child.ID, refs[0].ID)
 }
 
+func TestClientCreateOwnerRefError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	// The owner must exist: the ref's foreign key rejects a dangling owner, and
+	// Within rolls the half-made child back with it.
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "child"}, WithOwner(9999))
+	require.Error(t, err)
+
+	objs, err := client.List(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, objs)
+}
+
 func TestClientGet(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -458,6 +474,621 @@ func TestClientCreateOrUpdateRawToTypedError(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, err = client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
 	require.Error(t, err)
+}
+
+func TestClientGetOrCreateCreates(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotZero(t, obj.ID)
+	require.NotNil(t, obj.Slug)
+	assert.Equal(t, "w1", *obj.Slug)
+	assert.Equal(t, int64(1), obj.Generation)
+	assert.Equal(t, "a", obj.Spec.Val)
+
+	got, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, got.ID)
+}
+
+func TestClientGetOrCreateReturnsExisting(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first, _, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	// A different spec must not touch the existing row: no update, no bump.
+	second, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.ID, second.ID)
+	assert.Equal(t, first.Generation, second.Generation)
+	assert.Equal(t, "a", second.Spec.Val)
+}
+
+func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	// The finalizer keeps the tombstone around after Delete, so the slug is still
+	// held by a deletion-pending row when GetOrCreate runs.
+	orig, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"), WithFinalizers("test/hold"))
+	require.NoError(t, err)
+	require.NoError(t, client.Delete(ctx, orig.ID))
+
+	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, orig.ID, obj.ID)
+	assert.NotNil(t, obj.DeletionRequestedAt)
+}
+
+// TestClientGetOrCreateEnqueuesOnlyOnCreate pins the found branch's defining
+// property: returning an existing row is a pure read and must not wake the
+// reconciler. Registering without Start gives a reconciler whose queue nothing
+// drains, so the enqueues are directly observable.
+func TestClientGetOrCreateEnqueuesOnlyOnCreate(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.True(t, created)
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "create must enqueue the new object")
+
+	// Drain first: addLocked early-returns for an already-dirty id, so a still-queued
+	// id would mask a missing guard on the found branch.
+	drainQueue(r.work)
+	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+
+	_, created, err = client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Empty(t, queuedIDs(r.work), "returning an existing row must not enqueue")
+}
+
+// badDecodeSpec marshals to valid JSON that does not unmarshal back into the
+// struct, standing in for the marshal/type-param mismatch that makes a freshly
+// written row undecodable on read-back.
+type badDecodeSpec struct{ Val string }
+
+func (badDecodeSpec) MarshalJSON() ([]byte, error) { return []byte(`"not-an-object"`), nil }
+
+// TestClientGetOrCreateRollsBackOnDecodeError pins validate-before-commit: the new
+// row is decoded inside the Within, so bytes that don't round-trip roll the insert
+// back instead of committing a poison row. The call returns (nil, false, err) —
+// created=false because nothing landed — and the slug is left free, so a retry does
+// not hit a spurious UNIQUE on a phantom row.
+func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "BadDecode"}
+	client := NewClient[badDecodeSpec, cStatus](bh, gk)
+
+	obj, created, err := client.GetOrCreate(ctx, "w1", badDecodeSpec{Val: "a"})
+	require.Error(t, err, "the new row's bytes must fail to decode")
+	assert.Nil(t, obj)
+	assert.False(t, created, "a rolled-back create must report created=false")
+
+	// Nothing committed: the slug is still absent, so a second attempt takes the
+	// create branch again (not the found branch) and likewise rolls back.
+	_, err = store.GetObjectBySlug(ctx, gk, "w1")
+	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
+	_, created, err = client.GetOrCreate(ctx, "w1", badDecodeSpec{Val: "b"})
+	require.Error(t, err)
+	assert.False(t, created, "still nothing created")
+}
+
+// TestClientCreateRollsBackOnDecodeError is Create's counterpart: an undecodable
+// new row is rolled back inside the Within, so the row never commits and the
+// post-commit wake (discarded on rollback) never enqueues the reconciler. Register
+// without Start leaves a queue nothing drains, so a stray enqueue would be visible.
+func TestClientCreateRollsBackOnDecodeError(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "BadDecode"}
+	_, err = Register(bh, gk, &noopController[badDecodeSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(gk)
+	require.True(t, ok)
+
+	client := NewClient[badDecodeSpec, cStatus](bh, gk)
+	obj, err := client.Create(ctx, badDecodeSpec{Val: "a"}, WithSlug("w1"))
+	require.Error(t, err, "the new row's bytes must fail to decode")
+	assert.Nil(t, obj)
+	assert.Empty(t, queuedIDs(r.work), "a rolled-back create must not wake the reconciler")
+
+	_, err = store.GetObjectBySlug(ctx, gk, "w1")
+	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
+}
+
+// conditionalBadSpec round-trips normally, but when Bad is set it marshals to bytes
+// that won't unmarshal back — letting a test hold a good row and then attempt an
+// undecodable update to it, which badDecodeSpec (always poison) can't express.
+type conditionalBadSpec struct {
+	Val string
+	Bad bool
+}
+
+func (s conditionalBadSpec) MarshalJSON() ([]byte, error) {
+	if s.Bad {
+		return []byte(`"not-an-object"`), nil
+	}
+	type alias conditionalBadSpec // avoid recursing back into MarshalJSON
+	return json.Marshal(alias(s))
+}
+
+// TestClientUpdateRollsBackOnDecodeError pins validate-before-commit on Update: an
+// update to a spec that marshals but does not round-trip is decoded inside the tx,
+// so it rolls back — the prior good spec (and generation) survive, and no wake fires.
+func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "CondBad"}
+	_, err = Register(bh, gk, &noopController[conditionalBadSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(gk)
+	require.True(t, ok)
+	client := NewClient[conditionalBadSpec, cStatus](bh, gk)
+
+	orig, err := client.Create(ctx, conditionalBadSpec{Val: "good"})
+	require.NoError(t, err)
+	drainQueue(r.work)
+	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+
+	_, err = client.Update(ctx, orig.ID, conditionalBadSpec{Val: "bad", Bad: true})
+	require.Error(t, err, "the new spec's bytes must fail to decode")
+	assert.Empty(t, queuedIDs(r.work), "a rolled-back update must not wake the reconciler")
+
+	got, err := client.Get(ctx, orig.ID)
+	require.NoError(t, err, "the prior good spec must still decode")
+	assert.Equal(t, "good", got.Spec.Val, "the spec update must have rolled back")
+	assert.Equal(t, orig.Generation, got.Generation, "no generation bump on a rolled-back update")
+}
+
+// TestClientCreateOrUpdateRollsBackOnDecodeError pins validate-before-commit on both
+// of CreateOrUpdate's branches: an undecodable update keeps the prior good spec, and
+// an undecodable create leaves the slug free (no committed poison row).
+func TestClientCreateOrUpdateRollsBackOnDecodeError(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "CondBad"}
+	client := NewClient[conditionalBadSpec, cStatus](bh, gk)
+
+	// Update branch: an existing good row, updated to an undecodable spec, rolls back.
+	orig, err := client.CreateOrUpdate(ctx, "w1", conditionalBadSpec{Val: "good"})
+	require.NoError(t, err)
+	_, err = client.CreateOrUpdate(ctx, "w1", conditionalBadSpec{Val: "bad", Bad: true})
+	require.Error(t, err)
+	got, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err, "the prior good spec must still decode")
+	assert.Equal(t, "good", got.Spec.Val, "the update must have rolled back")
+	assert.Equal(t, orig.Generation, got.Generation, "no generation bump on a rolled-back update")
+
+	// Create branch: an absent slug written with an undecodable spec rolls back,
+	// leaving the slug free for a later good create.
+	_, err = client.CreateOrUpdate(ctx, "w2", conditionalBadSpec{Val: "bad", Bad: true})
+	require.Error(t, err)
+	_, err = store.GetObjectBySlug(ctx, gk, "w2")
+	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
+}
+
+// TestClientWithOnCreateFiresOnlyOnCreate pins WithOnCreate to the create branch:
+// Create always runs it, GetOrCreate runs it when it inserts but not when it
+// returns an existing row.
+func TestClientWithOnCreateFiresOnlyOnCreate(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	var calls int
+	onCreate := WithOnCreate(func(context.Context) { calls++ })
+
+	_, err = client.Create(ctx, cSpec{Val: "a"}, WithSlug("c1"), onCreate)
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls, "Create must run onCreate")
+
+	_, created, err := client.GetOrCreate(ctx, "g1", cSpec{Val: "a"}, onCreate)
+	require.NoError(t, err)
+	require.True(t, created)
+	assert.Equal(t, 2, calls, "GetOrCreate create branch must run onCreate")
+
+	_, created, err = client.GetOrCreate(ctx, "g1", cSpec{Val: "b"}, onCreate)
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Equal(t, 2, calls, "GetOrCreate found branch must not run onCreate")
+}
+
+// TestClientWithOnCreateFiresOnlyAfterOuterCommit is why WithOnCreate exists: it
+// is the commit-safe channel for create-conditional side effects. Nested in a
+// ControllerClient.Within it must not run until the outer transaction commits, and
+// must not run at all on rollback — unlike the synchronous created bool, which is
+// already set inside the transaction.
+func TestClientWithOnCreateFiresOnlyAfterOuterCommit(t *testing.T) {
+	writes := []struct {
+		name  string
+		write func(ctx context.Context, c Client[cSpec, cStatus], onCreate Option) error
+	}{
+		{"Create", func(ctx context.Context, c Client[cSpec, cStatus], onCreate Option) error {
+			_, err := c.Create(ctx, cSpec{Val: "b"}, onCreate)
+			return err
+		}},
+		{"GetOrCreate", func(ctx context.Context, c Client[cSpec, cStatus], onCreate Option) error {
+			_, _, err := c.GetOrCreate(ctx, "new", cSpec{Val: "b"}, onCreate)
+			return err
+		}},
+	}
+
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			runCommitRollback(t, func(t *testing.T, commit bool) {
+				ctx := context.Background()
+				bh, err := New(newClientTestStore(t))
+				require.NoError(t, err)
+				client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+				var calls int
+				onCreate := WithOnCreate(func(context.Context) { calls++ })
+
+				cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+				err = cc.Within(ctx, func(ctx context.Context) error {
+					require.NoError(t, w.write(ctx, client, onCreate))
+					assert.Zero(t, calls, "onCreate must wait for the outer commit")
+					if !commit {
+						return errBoom
+					}
+					return nil
+				})
+
+				if commit {
+					require.NoError(t, err)
+					assert.Equal(t, 1, calls, "a committed create must run onCreate")
+				} else {
+					require.ErrorIs(t, err, errBoom)
+					assert.Zero(t, calls, "a rolled-back create must not run onCreate")
+				}
+			})
+		})
+	}
+}
+
+// TestClientWritesWakeOnlyAfterOuterCommit pins the post-commit wake. A write
+// nested in ControllerClient.Within joins that transaction, so enqueuing when the
+// nested store.Within returns would wake the controller while the row is still
+// uncommitted and its spec event still buffered — letting a Modified event
+// overtake the Added, and waking at all for a row that never lands.
+func TestClientWritesWakeOnlyAfterOuterCommit(t *testing.T) {
+	writes := []struct {
+		name  string
+		write func(ctx context.Context, c Client[cSpec, cStatus], seeded ObjectID) error
+	}{
+		{"Create", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
+			_, err := c.Create(ctx, cSpec{Val: "b"})
+			return err
+		}},
+		{"CreateOrUpdate", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
+			_, err := c.CreateOrUpdate(ctx, "new", cSpec{Val: "b"})
+			return err
+		}},
+		{"GetOrCreate", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
+			_, _, err := c.GetOrCreate(ctx, "new", cSpec{Val: "b"})
+			return err
+		}},
+		{"Update", func(ctx context.Context, c Client[cSpec, cStatus], seeded ObjectID) error {
+			_, err := c.Update(ctx, seeded, cSpec{Val: "b"})
+			return err
+		}},
+	}
+
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			runCommitRollback(t, func(t *testing.T, commit bool) {
+				ctx := context.Background()
+				bh, err := New(newClientTestStore(t))
+				require.NoError(t, err)
+				// Registering without Start leaves a reconciler whose queue nothing
+				// drains, so the enqueues are directly observable.
+				_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+				require.NoError(t, err)
+				r, ok := bh.reconcilerFor(clientTestGK)
+				require.True(t, ok)
+
+				client := NewClient[cSpec, cStatus](bh, clientTestGK)
+				seeded, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("seed"))
+				require.NoError(t, err)
+				// Drain: addLocked early-returns for an already-dirty id, so the
+				// seed's own wake would mask the write's.
+				drainQueue(r.work)
+				require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+
+				cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+				err = cc.Within(ctx, func(ctx context.Context) error {
+					require.NoError(t, w.write(ctx, client, seeded.ID))
+					assert.Empty(t, queuedIDs(r.work), "the wake must wait for the outer commit")
+					if !commit {
+						return errBoom
+					}
+					return nil
+				})
+
+				if commit {
+					require.NoError(t, err)
+					assert.NotEmpty(t, queuedIDs(r.work), "a committed write must wake the reconciler")
+				} else {
+					require.ErrorIs(t, err, errBoom)
+					assert.Empty(t, queuedIDs(r.work), "a rolled-back write must not wake the reconciler")
+				}
+			})
+		})
+	}
+}
+
+// TestClientNoOpUpdateDoesNotWake pins the wake to a real row change. UpdateSpec
+// suppresses an identical-bytes write entirely — no generation bump, no
+// resource_version bump, no event — so a wake would be the lone signal claiming
+// something happened. It also closes a spin: a controller that idempotently
+// re-applies its own kind's spec each pass would otherwise wake itself forever.
+func TestClientNoOpUpdateDoesNotWake(t *testing.T) {
+	writes := []struct {
+		name  string
+		write func(ctx context.Context, c Client[cSpec, cStatus], id ObjectID) error
+	}{
+		{"Update", func(ctx context.Context, c Client[cSpec, cStatus], id ObjectID) error {
+			_, err := c.Update(ctx, id, cSpec{Val: "a"})
+			return err
+		}},
+		{"CreateOrUpdate", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
+			_, err := c.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+			return err
+		}},
+	}
+
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			ctx := context.Background()
+			bh, err := New(newClientTestStore(t))
+			require.NoError(t, err)
+			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+			require.NoError(t, err)
+			r, ok := bh.reconcilerFor(clientTestGK)
+			require.True(t, ok)
+
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+			obj, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
+			require.NoError(t, err)
+			drainQueue(r.work) // drop the create's own wake
+			require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+
+			require.NoError(t, w.write(ctx, client, obj.ID))
+			assert.Empty(t, queuedIDs(r.work), "re-applying the identical spec must not wake")
+
+			// A real change still does, so the suppression is scoped to the no-op.
+			_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+			require.NoError(t, err)
+			assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a real spec change must wake")
+		})
+	}
+}
+
+// TestClientDeleteAdvancesGCOnlyAfterOuterCommit covers Delete, whose follow-up is
+// advanceGC rather than a plain wake. Both of its branches must wait for the outer
+// commit: the wake for the same reason every other write's does, and the
+// synchronous collect because it is a cascade of physical deletes that has no
+// business running inside — and being rolled back with — the caller's transaction.
+func TestClientDeleteAdvancesGCOnlyAfterOuterCommit(t *testing.T) {
+	t.Run("registered kind defers the wake", func(t *testing.T) {
+		runCommitRollback(t, func(t *testing.T, commit bool) {
+			ctx := context.Background()
+			bh, err := New(newClientTestStore(t))
+			require.NoError(t, err)
+			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+			require.NoError(t, err)
+			r, ok := bh.reconcilerFor(clientTestGK)
+			require.True(t, ok)
+
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+			obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("test/hold"))
+			require.NoError(t, err)
+			drainQueue(r.work) // drop the create's own wake
+			require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+
+			cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+			err = cc.Within(ctx, func(ctx context.Context) error {
+				require.NoError(t, client.Delete(ctx, obj.ID))
+				assert.Empty(t, queuedIDs(r.work), "the GC wake must wait for the outer commit")
+				if !commit {
+					return errBoom
+				}
+				return nil
+			})
+
+			if commit {
+				require.NoError(t, err)
+				assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a committed delete must wake the reconciler")
+			} else {
+				require.ErrorIs(t, err, errBoom)
+				assert.Empty(t, queuedIDs(r.work), "a rolled-back delete must not wake the reconciler")
+			}
+		})
+	})
+
+	// With no controller and resync disabled, advanceGC collects inline — the one
+	// branch that writes. Nested, those writes would join the caller's transaction.
+	t.Run("client-only kind defers the collect", func(t *testing.T) {
+		runCommitRollback(t, func(t *testing.T, commit bool) {
+			ctx := context.Background()
+			bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+			require.NoError(t, err)
+
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+			obj, err := client.Create(ctx, cSpec{Val: "a"})
+			require.NoError(t, err)
+
+			err = bh.store.Within(ctx, func(ctx context.Context) error {
+				require.NoError(t, client.Delete(ctx, obj.ID))
+				// Still there: the collect that removes it must not run inside this
+				// transaction.
+				_, err := client.Get(ctx, obj.ID)
+				assert.NoError(t, err, "the collect must wait for the outer commit")
+				if !commit {
+					return errBoom
+				}
+				return nil
+			})
+
+			if commit {
+				require.NoError(t, err)
+				_, err = client.Get(ctx, obj.ID)
+				assert.ErrorIs(t, err, ErrNotFound, "a committed delete must be collected post-commit")
+			} else {
+				require.ErrorIs(t, err, errBoom)
+				got, err := client.Get(ctx, obj.ID)
+				require.NoError(t, err, "a rolled-back delete must leave the object alive")
+				assert.Nil(t, got.DeletionRequestedAt)
+			}
+		})
+	})
+}
+
+func TestClientGetOrCreateWithOwner(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner, err := client.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+
+	child, created, err := client.GetOrCreate(ctx, "child-1", cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+	require.True(t, created)
+
+	owned, err := client.ListOwned(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+	assert.Equal(t, child.ID, owned[0].ID)
+}
+
+func TestClientGetOrCreateWithFinalizers(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"},
+		WithFinalizers("cleanup-a", "cleanup-b"))
+	require.NoError(t, err)
+	require.True(t, created)
+	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, obj.Finalizers)
+
+	got, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
+}
+
+func TestClientGetOrCreateMarshalError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, created, err := client.GetOrCreate(ctx, "w1", errMarshaler{})
+	require.Error(t, err)
+	assert.False(t, created)
+}
+
+func TestClientGetOrCreateStoreError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&slugErrorStore{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.ErrorIs(t, err, errBoom)
+	assert.False(t, created)
+}
+
+func TestClientGetOrCreateOptionError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	badOpt := func(any) error { return errBoom }
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"}, badOpt)
+	require.ErrorIs(t, err, errBoom)
+	assert.False(t, created)
+}
+
+func TestClientGetOrCreateRejectsWithSlug(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	// The slug is positional, so WithSlug can only contradict it — a silent drop
+	// would land the row under "w1" and strand a later GetBySlug("other").
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"}, WithSlug("other"))
+	require.ErrorIs(t, err, ErrConflictingOption)
+	assert.False(t, created)
+
+	// The call is rejected before any write: neither slug exists afterwards.
+	_, err = client.GetBySlug(ctx, "w1")
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = client.GetBySlug(ctx, "other")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestClientGetOrCreateCreateError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&createErrorStore{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.ErrorIs(t, err, errBoom)
+	assert.False(t, created)
+}
+
+func TestClientGetOrCreateRawToTypedError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&createOrUpdateBadJSONStore{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.Error(t, err)
+	// Decode runs inside the Within now, so an undecodable new row rolls back rather
+	// than committing; created is set only after a successful decode, so it reports
+	// false for the row the transaction discarded.
+	assert.False(t, created)
 }
 
 func TestClientGetNotFound(t *testing.T) {
@@ -614,8 +1245,8 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
-	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
+func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+	return &RawObject{ID: 1, Spec: []byte("not-json")}, true, nil
 }
 
 // errorUpdateSpecStore returns an error from UpdateSpec.
@@ -623,8 +1254,8 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
-	return nil, errBoom
+func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+	return nil, false, errBoom
 }
 
 // slugErrorStore returns a non-NotFound error from GetObjectBySlug, driving
@@ -650,6 +1281,17 @@ func (s *createOrUpdateBadJSONStore) GetObjectBySlug(_ context.Context, _ GroupK
 
 func (s *createOrUpdateBadJSONStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
+}
+
+// createErrorStore drives the create branch's write-error path: it borrows
+// createOrUpdateBadJSONStore's absent-slug lookup so the insert runs, but fails
+// the insert instead of returning an undecodable row.
+type createErrorStore struct {
+	createOrUpdateBadJSONStore
+}
+
+func (s *createErrorStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
+	return nil, errBoom
 }
 
 // errorListObjectsStore returns an error from ListObjects.

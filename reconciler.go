@@ -89,7 +89,27 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	deleting := raw.DeletionRequestedAt != nil
 	obj, err := rawToTyped[Spec, Status](raw, t.bh.migratorFor(t.gk))
 	if err != nil {
-		return Result{}, err
+		// Quarantine, as List and adaptWatcher do (see rawToTyped's callers): a row
+		// whose bytes don't decode can't be reconciled, and the bytes won't change
+		// until someone rewrites the spec — which re-enqueues it. Returning the error
+		// would instead retry the identical row forever under backoff, and resync
+		// (enqueue-by-id, no decode) re-adds it every tick regardless. Treat it as a
+		// no-op success so the worker drops it. GC still runs: collect needs only the
+		// id, so a finalizer-free deletion-pending row is still collected here; a
+		// finalizer-bearing one can't be cleared without a decode the controller can
+		// never do, so it correctly waits for a fixed build.
+		//
+		// This re-WARNs each time resync re-enqueues the unsettled poison row: a bad
+		// row is an ongoing operational fault, and a recurring warning at the (coarse)
+		// resync cadence keeps it visible rather than logging once and going silent.
+		log.WarnContext(ctx, "skipping undecodable object; cannot reconcile", "err", err)
+		if deleting {
+			if _, gcErr := t.bh.collect(ctx, id); gcErr != nil {
+				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
+				return Result{}, gcErr
+			}
+		}
+		return Result{}, nil
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
