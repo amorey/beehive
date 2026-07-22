@@ -932,26 +932,25 @@ func TestWatchOrphanTombstoneDropped(t *testing.T) {
 }
 
 // TestWatchLiveSendCtxDone covers the live-send path exiting on context
-// cancellation. beforeSnapshot buffers a live event (RecvContext prefers a
-// ready value over a cancelled context), so with an empty snapshot the goroutine
-// reaches the live send and takes the ctx.Done arm.
+// cancellation. The receiver ranks cancellation above a pending value, so
+// cancelling from the test would wake the receive, not the send; beforeLiveSend
+// cancels once the goroutine is past the receive and about to park on the send.
 func TestWatchLiveSendCtxDone(t *testing.T) {
 	store := newRawStore(t)
 	exited := make(chan struct{})
 	store.afterStream = func() { close(exited) }
 	ctx, cancel := context.WithCancel(context.Background())
+	store.beforeLiveSend = cancel
 
-	store.beforeSnapshot = func() {
-		store.publish(testGK, storeapi.RawChange{
-			Type:   beehive.Modified,
-			Object: &beehive.RawObject{ID: 1, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1},
-		})
-	}
-
-	w, err := store.WatchList(ctx, testGK) // empty snapshot, one buffered live event
+	w, err := store.WatchList(ctx, testGK) // empty snapshot
 	require.NoError(t, err)
 
-	cancel() // goroutine parks on the live send (no reader) → takes ctx.Done
+	// Buffered in the receiver; the goroutine pops it, cancels via the seam, then
+	// parks on the send (no reader) → takes ctx.Done.
+	store.publish(testGK, storeapi.RawChange{
+		Type:   beehive.Modified,
+		Object: &beehive.RawObject{ID: 1, Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`), ResourceVersion: 1},
+	})
 	<-exited
 	_, ok := <-w.Changes()
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
@@ -1018,27 +1017,27 @@ func TestWatchEventsSnapshotSendCtxDone(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// The live send exits on context cancellation. beforeSnapshot buffers a live run
-// (RecvContext prefers a ready value over a cancelled ctx), so with an empty
-// snapshot the goroutine reaches the live send and takes the ctx.Done arm.
+// The live send exits on context cancellation. The receiver ranks cancellation
+// above a pending value, so cancelling from the test would wake the receive, not
+// the send; beforeLiveSend cancels once the goroutine is past the receive and
+// about to park on the send.
 func TestWatchEventsLiveSendCtxDone(t *testing.T) {
 	store := newRawStore(t)
 	id := newEventObject(t, store)
 	exited := make(chan struct{})
 	store.afterStream = func() { close(exited) }
 	ctx, cancel := context.WithCancel(context.Background())
+	store.beforeLiveSend = cancel
 
-	store.beforeSnapshot = func() {
-		store.publishEvent(testGK, storeapi.Event{
-			ID: 1, ObjectID: id, Category: "c", Type: "Normal", Reason: "R",
-			FirstAt: fromMillis(1), LastAt: fromMillis(1), ResourceVersion: 1 << 30,
-		})
-	}
-
-	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{}) // empty snapshot, one buffered run
+	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{}) // empty snapshot
 	require.NoError(t, err)
 
-	cancel() // goroutine parks on the live send → ctx.Done
+	// Buffered in the receiver; the goroutine pops it, cancels via the seam, then
+	// parks on the send (no reader) → takes ctx.Done.
+	store.publishEvent(testGK, storeapi.Event{
+		ID: 1, ObjectID: id, Category: "c", Type: "Normal", Reason: "R",
+		FirstAt: fromMillis(1), LastAt: fromMillis(1), ResourceVersion: 1 << 30,
+	})
 	<-exited
 	_, ok := <-w.Events()
 	assert.False(t, ok)

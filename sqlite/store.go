@@ -59,6 +59,14 @@ type sqliteStore struct {
 	// output (which would race the goroutine's send/cancel selection); nil in
 	// production.
 	afterStream func()
+
+	// beforeLiveSend, if non-nil, runs after a watcher's goroutine has taken a
+	// live value off its receiver and decided to deliver it, but before it parks
+	// on the send. Tests cancel from here to reach the send's ctx.Done arm: the
+	// receiver ranks cancellation above a pending value, so cancelling from
+	// outside wakes the receive instead and never reaches the send; nil in
+	// production.
+	beforeLiveSend func()
 }
 
 // Close terminates every active watcher — whether parked on a receive (closing
