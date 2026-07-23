@@ -2038,6 +2038,174 @@ func TestClientListOwned(t *testing.T) {
 	assert.Empty(t, none)
 }
 
+// ownedObjectsFixture builds an owner of kind Owner plus children of two kinds:
+// two Widgets and one Gadget, all owned by that owner — the multi-kind shape
+// ListOwnedObjects has to filter down. It returns the two clients, the owner id,
+// and the widget children in id order.
+func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus], Client[cSpec, cStatus], ObjectID, []*Object[cSpec, cStatus]) {
+	t.Helper()
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	owners := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Owner"})
+	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
+	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
+
+	owner, err := owners.Create(ctx, cSpec{Val: "owner"})
+	require.NoError(t, err)
+	w1, err := widgets.Create(ctx, cSpec{Val: "w1"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+	w2, err := widgets.Create(ctx, cSpec{Val: "w2"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+	_, err = gadgets.Create(ctx, cSpec{Val: "g1"}, WithOwner(owner.ID))
+	require.NoError(t, err)
+
+	return ctx, owners, widgets, owner.ID, []*Object[cSpec, cStatus]{w1, w2}
+}
+
+func TestClientListOwnedObjectsReturnsTypedChildren(t *testing.T) {
+	ctx, _, widgets, ownerID, children := ownedObjectsFixture(t)
+
+	got, err := widgets.ListOwnedObjects(ctx, ownerID)
+	require.NoError(t, err)
+	require.Len(t, got, 2, "the Gadget child belongs to another kind")
+	// Ordered by id, decoded, and kind-scoped: no Gadget in sight.
+	assert.Equal(t, []ObjectID{children[0].ID, children[1].ID}, []ObjectID{got[0].ID, got[1].ID})
+	assert.Equal(t, "w1", got[0].Spec.Val)
+	assert.Equal(t, "w2", got[1].Spec.Val)
+	assert.Equal(t, clientTestGK.Kind, got[0].Kind)
+}
+
+// TestClientListOwnedObjectsLoads covers the LoadOptions passing through to the
+// same batched loader List uses: without them the children are unloaded.
+func TestClientListOwnedObjectsLoads(t *testing.T) {
+	ctx, _, widgets, ownerID, _ := ownedObjectsFixture(t)
+
+	bare, err := widgets.ListOwnedObjects(ctx, ownerID)
+	require.NoError(t, err)
+	require.Len(t, bare, 2)
+	_, _, err = bare[0].GetOwner()
+	assert.ErrorIs(t, err, ErrNotLoaded, "no load option -> nothing loaded")
+
+	got, err := widgets.ListOwnedObjects(ctx, ownerID, LoadOwner())
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	for _, child := range got {
+		owner, ok, err := child.GetOwner()
+		require.NoError(t, err)
+		require.True(t, ok)
+		assert.Equal(t, ownerID, owner.ID)
+	}
+}
+
+func TestClientListOwnedObjectsEmpty(t *testing.T) {
+	ctx, _, widgets, _, children := ownedObjectsFixture(t)
+
+	// A child owns nothing, so it has no children of this kind.
+	got, err := widgets.ListOwnedObjects(ctx, children[0].ID)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
+	ctx, owners, widgets, _, _ := ownedObjectsFixture(t)
+
+	// A second owner, so the fixture's children don't crowd the assertion.
+	owner, err := owners.Create(ctx, cSpec{Val: "owner2"})
+	require.NoError(t, err)
+	// The finalizer holds the row after Delete, leaving it deletion-pending.
+	child, err := widgets.Create(ctx, cSpec{Val: "w1"},
+		WithOwner(owner.ID), WithFinalizers("test/hold"))
+	require.NoError(t, err)
+	require.NoError(t, widgets.Delete(ctx, child.ID))
+
+	got, err := widgets.ListOwnedObjects(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "deletion-pending children are included, as in ListOwned")
+	assert.Equal(t, child.ID, got[0].ID)
+	assert.NotNil(t, got[0].DeletionRequestedAt)
+}
+
+func TestClientListOwnedObjectsUnknownOwner(t *testing.T) {
+	ctx, _, widgets, _, _ := ownedObjectsFixture(t)
+
+	// Like ListOwned, it reads edges: a missing owner is empty, not ErrNotFound.
+	got, err := widgets.ListOwnedObjects(ctx, 99999)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// ownedObjectsErrorStore errors on the batched owned-children read.
+type ownedObjectsErrorStore struct {
+	fakeStore
+}
+
+func (*ownedObjectsErrorStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return nil, errBoom
+}
+
+func TestClientListOwnedObjectsStoreError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&ownedObjectsErrorStore{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.ListOwnedObjects(ctx, 1)
+	require.ErrorIs(t, err, errBoom)
+}
+
+// ownedObjectsBadJSONStore returns one undecodable row alongside a good one,
+// driving ListOwnedObjects' quarantine branch.
+type ownedObjectsBadJSONStore struct {
+	fakeStore
+	gk GroupKind
+}
+
+func (s *ownedObjectsBadJSONStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return []*RawObject{
+		{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")},
+		{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)},
+	}, nil
+}
+
+func TestClientListOwnedObjectsQuarantinesUndecodable(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&ownedObjectsBadJSONStore{gk: clientTestGK})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	got, err := client.ListOwnedObjects(ctx, 1)
+	require.NoError(t, err, "one bad row is skipped, not fatal")
+	require.Len(t, got, 1)
+	assert.Equal(t, ObjectID(2), got[0].ID)
+}
+
+// ownedObjectsLoadErrorStore returns a decodable child but fails the batched ref
+// read, driving ListOwnedObjects' eager-load error branch.
+type ownedObjectsLoadErrorStore struct {
+	fakeStore
+	gk GroupKind
+}
+
+func (s *ownedObjectsLoadErrorStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
+}
+
+func (*ownedObjectsLoadErrorStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+	return nil, errBoom
+}
+
+func TestClientListOwnedObjectsLoadError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&ownedObjectsLoadErrorStore{gk: clientTestGK})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.ListOwnedObjects(ctx, 1, LoadOwner())
+	require.ErrorIs(t, err, errBoom)
+}
+
 func refObjectIDs(refs []Ref) []ObjectID {
 	var ids []ObjectID
 	for _, r := range refs {

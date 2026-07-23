@@ -130,6 +130,26 @@ type Client[Spec, Status any] interface {
 	// lazy counterpart to LoadOwned().
 	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
 
+	// ListOwnedObjects returns the objects owned by ownerID that belong to THIS
+	// client's kind, fully decoded — the typed, kind-scoped form of ListOwned
+	// (which returns untyped Refs across every owned kind, leaving the caller to
+	// filter by Kind and Get each child through that kind's client). Ownership is
+	// the owned_by edge (child -> owner), so these are ownerID's children of this
+	// kind, ordered by id as ListOwned is.
+	//
+	// ownerID need not be this client's kind — it is the owner, typically another
+	// kind — and like ListOwned it is not kind-scoped or existence-checked: an
+	// owner with no children of this kind, and an ownerID that doesn't exist, both
+	// read empty rather than ErrNotFound. A deletion-pending child is included;
+	// whether to skip it is the caller's call (check DeletionRequestedAt).
+	// Undecodable rows are quarantined and logged, as in List.
+	//
+	// It takes the same LoadOptions as List, batched the same way: without them the
+	// children come back with nothing loaded and their ref/event accessors return
+	// ErrNotLoaded. Pass e.g. LoadOwned() to walk a second level of the tree
+	// without a Get per child — the per-child Get this method exists to avoid.
+	ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
+
 	// ListEvents returns id's event-log runs, newest-first, filtered by the given
 	// options (see EventOption). Like the ref lookups it reads by id and does not
 	// kind-scope: a foreign id reads that object's log. An empty log is an empty slice.
@@ -579,26 +599,32 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption
 	if err != nil {
 		return nil, err
 	}
-	// The migrator is invariant for the kind, so resolve it once rather than
-	// re-locking the registry on every row.
+	objs := c.decodeList(raws, "List")
+	if err := c.loadListRelated(ctx, objs, resolveLoads(loads)); err != nil {
+		return nil, err
+	}
+	return objs, nil
+}
+
+// decodeList decodes a multi-row read, quarantining rather than aborting: one
+// un-decodable row — an un-migratable shape, or a blob written by a newer build
+// (downgrade) — is skipped and logged so it can't break the whole read. The
+// calling method rides along as a field rather than in the message, so the log
+// line groups across call sites. The migrator is invariant for the kind, so it
+// is resolved once rather than re-locking the registry on every row.
+func (c *clientImpl[Spec, Status]) decodeList(raws []*RawObject, method string) []*Object[Spec, Status] {
 	mig := c.bh.migratorFor(c.gk)
 	objs := make([]*Object[Spec, Status], 0, len(raws))
 	for _, raw := range raws {
 		obj, err := rawToTyped[Spec, Status](raw, mig)
 		if err != nil {
-			// Quarantine, don't abort: one un-decodable row — an un-migratable shape
-			// or a blob written by a newer build (downgrade) — is skipped and logged
-			// so it can't break listing every other object of the kind.
-			c.bh.log().Warn("beehive: skipping undecodable object in List",
-				"group", c.gk.Group, "kind", c.gk.Kind, "id", raw.ID, "err", err)
+			c.bh.log().Warn("beehive: skipping undecodable object",
+				"op", method, "group", c.gk.Group, "kind", c.gk.Kind, "id", raw.ID, "err", err)
 			continue
 		}
 		objs = append(objs, obj)
 	}
-	if err := c.loadListRelated(ctx, objs, resolveLoads(loads)); err != nil {
-		return nil, err
-	}
-	return objs, nil
+	return objs
 }
 
 // loadListRelated eager-loads the requested secondary lookups for a whole list
@@ -694,6 +720,20 @@ func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id Object
 
 func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
 	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
+}
+
+// The kind filter lives in the store statement's WHERE, so foreign-kind children
+// never reach Go. See the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
+	raws, err := c.bh.store.ListIncomingRefObjects(ctx, c.gk, ownerID, RelationOwnedBy)
+	if err != nil {
+		return nil, err
+	}
+	objs := c.decodeList(raws, "ListOwnedObjects")
+	if err := c.loadListRelated(ctx, objs, resolveLoads(loads)); err != nil {
+		return nil, err
+	}
+	return objs, nil
 }
 
 // reconcilerForObject validates id against this client's kind, then resolves the

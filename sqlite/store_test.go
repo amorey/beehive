@@ -1135,8 +1135,8 @@ func TestGroupOutgoingRefsByID(t *testing.T) {
 // spans several queries, proving refsByIDs stays under SQLite's bound-parameter
 // limit and merges every chunk's rows into one map.
 func TestGroupOutgoingRefsByIDChunks(t *testing.T) {
-	defer func(n int) { refsByIDsChunkSize = n }(refsByIDsChunkSize)
-	refsByIDsChunkSize = 2 // 5 ids -> 3 chunks (2, 2, 1)
+	defer func(n int) { idChunkSize = n }(idChunkSize)
+	idChunkSize = 2 // 5 ids -> 3 chunks (2, 2, 1)
 
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -1862,6 +1862,56 @@ func TestListIncomingRefs(t *testing.T) {
 	assert.Empty(t, none, "a target with no dependents returns an empty slice, not an error")
 }
 
+func TestListIncomingRefObjects(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Kind: "Other"}
+
+	owner := newRefObject(t, store)
+	// Two children of testGK plus one of another kind, all owned by owner.
+	c2 := newRefObject(t, store)
+	c1 := newRefObject(t, store)
+	foreign, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	for _, child := range []*beehive.RawObject{c1, c2, foreign} {
+		require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, "owned_by"))
+	}
+	// A depends_on edge into owner must not surface under an owned_by query.
+	dep := newRefObject(t, store)
+	require.NoError(t, store.AddRef(ctx, dep.ID, owner.ID, "depends_on"))
+
+	_, err = store.SetCondition(ctx, testGK, c1.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	got, err := store.ListIncomingRefObjects(ctx, testGK, owner.ID, "owned_by")
+	require.NoError(t, err)
+	require.Len(t, got, 2, "the foreign-kind child and the depends_on referrer are excluded")
+	// Ordered by id (c2 was created first), with full rows and conditions attached.
+	assert.Equal(t, []beehive.ObjectID{c2.ID, c1.ID}, []beehive.ObjectID{got[0].ID, got[1].ID})
+	assert.Equal(t, []byte(`{}`), []byte(got[0].Spec))
+	assert.Empty(t, got[0].Conditions)
+	require.Len(t, got[1].Conditions, 1)
+	assert.Equal(t, "Ready", got[1].Conditions[0].Type)
+
+	none, err := store.ListIncomingRefObjects(ctx, testGK, c1.ID, "owned_by")
+	require.NoError(t, err)
+	assert.Empty(t, none, "an owner with no children of this kind reads empty")
+
+	missing, err := store.ListIncomingRefObjects(ctx, testGK, 99999, "owned_by")
+	require.NoError(t, err)
+	assert.Empty(t, missing, "a nonexistent owner reads empty, not ErrNotFound")
+}
+
+func TestListIncomingRefObjectsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.ListIncomingRefObjects(context.Background(), testGK, 1, "owned_by")
+	require.Error(t, err)
+}
+
 func TestAddRefDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
@@ -2253,7 +2303,7 @@ func breakConditionRowRead(t *testing.T, store *sqliteStore, objID storeapi.Obje
 
 // TestConditionAssemblyError corrupts a condition row so the read-path scan
 // fails, exercising the conditions-assembly error branches in GetObject (via
-// loadConditions) and ListObjects (via loadConditionsForKind).
+// loadConditions) and ListObjects (via conditionsByIDs).
 func TestConditionAssemblyError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -2339,10 +2389,35 @@ func dropObjects(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
-func TestLoadConditionsForKindQueryError(t *testing.T) {
+// TestListObjectsConditionsChunks shrinks the chunk size so a modest result set
+// spans several conditions queries, proving conditionsByIDs stays under SQLite's
+// bound-parameter limit and merges every chunk into one map.
+func TestListObjectsConditionsChunks(t *testing.T) {
+	defer func(n int) { idChunkSize = n }(idChunkSize)
+	idChunkSize = 2 // 5 objects -> 3 chunks (2, 2, 1)
+
+	store := newRawStore(t)
+	ctx := context.Background()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		obj := newConditionObject(t, store, "chunked-"+name)
+		_, err := store.SetCondition(ctx, testGK, obj.ID,
+			storeapi.Condition{Type: "Ready", Status: "True"})
+		require.NoError(t, err)
+	}
+
+	got, err := store.ListObjects(ctx, testGK)
+	require.NoError(t, err)
+	require.Len(t, got, 5)
+	for _, obj := range got {
+		assert.NotNil(t, findCondition(obj.Conditions, "Ready"),
+			"object %d kept its condition across chunks", obj.ID)
+	}
+}
+
+func TestConditionsByIDsQueryError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.loadConditionsForKind(context.Background(), testGK)
+	_, err := store.conditionsByIDs(context.Background(), []storeapi.ObjectID{1})
 	require.Error(t, err)
 }
 

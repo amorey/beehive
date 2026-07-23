@@ -338,20 +338,55 @@ func (s *sqliteStore) GetObjectBySlug(ctx context.Context, gk storeapi.GroupKind
 }
 
 func (s *sqliteStore) ListObjects(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
+	return s.listObjectsWhere(ctx, `WHERE o."group" = ? AND o.kind = ?`, gk.Group, gk.Kind)
+}
+
+// ListIncomingRefObjects returns the full rows of the objects pointing at toID
+// through relation, restricted to kind gk — the blob-bearing form of
+// ListIncomingRefs (which returns bare id/GroupKind referrers). Resolving the
+// edges in the statement is what saves the caller a Get per child.
+//
+// The edge is a semi-join, not a join: written as a join the planner drives from
+// idx_objects_kind (which already delivers ORDER BY o.id) and probes refs once
+// per object *of the kind*. IN (SELECT …) lets idx_refs_to drive instead, so the
+// work scales with the owner's children rather than the whole table.
+func (s *sqliteStore) ListIncomingRefObjects(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
+	return s.listObjectsWhere(ctx, `
+		WHERE o.id IN (SELECT from_id FROM refs WHERE to_id = ? AND relation = ?)
+		  AND o."group" = ? AND o.kind = ?`,
+		toID, string(relation), gk.Group, gk.Kind)
+}
+
+// listObjectsWhere is the shared multi-row object read: the rows matching tail,
+// ordered by id, each with its conditions attached. The predicate runs once, in
+// the blob-bearing SELECT; the conditions are then fetched by the ids it
+// returned (see conditionsByIDs). tail is a fixed internal fragment, never user
+// input, so concatenating it is injection-safe; only its bound arguments come
+// from the caller.
+func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ...any) ([]*storeapi.RawObject, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
-		gk.Group, gk.Kind)
+		`SELECT `+objectColumns+` FROM objects o `+tail+` ORDER BY o.id`, args...)
 	if err != nil {
 		return nil, err
 	}
+	// scanObjects closes rows on return, which is what frees the single-connection
+	// pool for the conditions query below — no explicit Close needed here.
 	out, err := scanObjects(rows)
 	if err != nil {
 		return nil, err
 	}
-	rows.Close() // free the connection before the conditions query (single-conn pool)
+	if len(out) == 0 {
+		// Nothing to attach to. conditionsByIDs is already a no-op on an empty id
+		// list (it binds no query at all), so this only makes the skip obvious.
+		return out, nil
+	}
 
-	// One batched query for the whole kind avoids an N+1 per-object lookup.
-	byID, err := s.loadConditionsForKind(ctx, gk)
+	// One batched query for the whole result set avoids an N+1 per-object lookup.
+	ids := make([]storeapi.ObjectID, len(out))
+	for i, obj := range out {
+		ids[i] = obj.ID
+	}
+	byID, err := s.conditionsByIDs(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -361,33 +396,57 @@ func (s *sqliteStore) ListObjects(ctx context.Context, gk storeapi.GroupKind) ([
 	return out, nil
 }
 
-// loadConditionsForKind returns every condition for objects of kind gk, grouped
-// by object id, ordered by type within each object.
-func (s *sqliteStore) loadConditionsForKind(ctx context.Context, gk storeapi.GroupKind) (map[storeapi.ObjectID][]storeapi.Condition, error) {
-	// Columns qualified to c.* (object_id/type/status order matches
-	// conditionColumns) because the JOIN with objects makes bare status ambiguous.
-	rows, err := s.conn(ctx).QueryContext(ctx, `
-		SELECT c.object_id, c.type, c.status, c.reason, c.message, c.liveness,
-		       c.transitioned_at, c.updated_at
-		FROM conditions c
-		JOIN objects o ON o.id = c.object_id
-		WHERE o."group" = ? AND o.kind = ?
-		ORDER BY c.object_id, c.type`, gk.Group, gk.Kind)
+// conditionsByIDs returns the conditions of the given objects, grouped by object
+// id and ordered by type within each object — the conditions half of
+// listObjectsWhere. Kept a separate query because the two can't be one:
+// conditions are a per-object fan-out, and folding them into the blob-bearing
+// SELECT would re-send each row's spec/status per condition.
+//
+// It keys off the ids already scanned rather than re-running the object
+// predicate. The two statements are not in one transaction, so a re-run could
+// match a different set — a concurrent ref or object write between them would
+// silently drop the conditions of a row we are about to return. Keying off the
+// ids also avoids paying the predicate (a refs semi-join, for
+// ListIncomingRefObjects) twice. The list is chunked under the bound-parameter
+// limit (see idChunkSize).
+func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.ObjectID) (map[storeapi.ObjectID][]storeapi.Condition, error) {
+	byID := make(map[storeapi.ObjectID][]storeapi.Condition, len(ids))
+	for start := 0; start < len(ids); start += idChunkSize {
+		if err := s.conditionsByIDsChunk(ctx, ids[start:min(start+idChunkSize, len(ids))], byID); err != nil {
+			return nil, err
+		}
+	}
+	return byID, nil
+}
+
+// conditionsByIDsChunk runs conditionsByIDs for one chunk of ids, merging rows
+// into out. It closes its result set before returning so the next chunk's query
+// can run on the single-connection store.
+func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
+	args := make([]any, len(ids))
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT `+conditionColumns+` FROM conditions
+		 WHERE object_id IN (`+strings.Join(placeholders, ",")+`)
+		 ORDER BY object_id, type`, args...)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 
-	byID := make(map[storeapi.ObjectID][]storeapi.Condition)
 	for rows.Next() {
 		id, cond, err := scanCondition(rows)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		s.downgradeLiveness(&cond)
-		byID[id] = append(byID[id], cond)
+		out[id] = append(out[id], cond)
 	}
-	return byID, rows.Err()
+	return rows.Err()
 }
 
 func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
@@ -1182,24 +1241,25 @@ func (s *sqliteStore) GroupIncomingRefsByID(ctx context.Context, toIDs []storeap
 	return s.refsByIDs(ctx, toIDs, relation, "to_id", "from_id")
 }
 
-// refsByIDsChunkSize bounds how many ids refsByIDs binds in a single query, kept
-// under SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc) with room for the
-// relation parameter — otherwise a large List eager-load would fail with "too
-// many SQL variables". A var, not a const, so tests can shrink it to exercise the
-// multi-chunk merge without seeding tens of thousands of rows.
-var refsByIDsChunkSize = 30000
+// idChunkSize bounds how many ids the batched by-id reads (refsByIDs,
+// conditionsByIDs) bind in a single query, kept under SQLite's
+// SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc) with room for the extra
+// parameters — otherwise a large List would fail with "too many SQL variables".
+// A var, not a const, so tests can shrink it to exercise the multi-chunk merge
+// without seeding tens of thousands of rows.
+var idChunkSize = 30000
 
 // refsByIDs is the shared batched edge lookup behind GroupIncomingRefsByID and
 // GroupOutgoingRefsByID: it filters refs by routeCol IN (ids), joins objects on
 // the opposite endpoint joinCol, and buckets each referrer under its routeCol
 // value. routeCol/joinCol are fixed internal column names (never user input), so
 // concatenating them is injection-safe. The id list is chunked under the bound-
-// parameter limit (see refsByIDsChunkSize); each chunk merges into the same map,
+// parameter limit (see idChunkSize); each chunk merges into the same map,
 // and a routeCol value with no matching edge never appears.
 func (s *sqliteStore) refsByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
 	out := make(map[storeapi.ObjectID][]storeapi.Referrer, len(ids))
-	for start := 0; start < len(ids); start += refsByIDsChunkSize {
-		end := start + refsByIDsChunkSize
+	for start := 0; start < len(ids); start += idChunkSize {
+		end := start + idChunkSize
 		if end > len(ids) {
 			end = len(ids)
 		}
