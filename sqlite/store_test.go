@@ -2712,6 +2712,64 @@ func TestUpdateStatusResourceVersionError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// blockObjectUpdates makes every UPDATE against objects abort while SELECTs keep
+// working, isolating restamp's error branch — the content-no-op paths read the
+// row first, so dropping the table would fail earlier.
+func blockObjectUpdates(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `
+		CREATE TRIGGER block_object_updates BEFORE UPDATE ON objects
+		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	require.NoError(t, err)
+}
+
+// TestUpdateSpecRestampError covers UpdateSpec's content-no-op restamp branch:
+// identical spec bytes at a lower stored version, so the upward re-stamp runs and
+// fails.
+func TestUpdateSpecRestampError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	blockObjectUpdates(t, store)
+
+	_, _, err := store.UpdateSpec(ctx, testGK, obj.ID, obj.Spec, 1)
+	require.Error(t, err)
+}
+
+// TestUpdateStatusRestampError covers UpdateStatus's already-settled restamp
+// branch: identical status at the recorded generation, but a higher schema
+// version, so the invisible re-stamp runs and fails.
+func TestUpdateStatusRestampError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	status := []byte(`{"ok":true}`)
+	settled, err := store.UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 1)
+	require.NoError(t, err)
+	blockObjectUpdates(t, store)
+
+	_, err = store.UpdateStatus(ctx, testGK, obj.ID, *settled.ObservedGeneration, status, 2)
+	require.Error(t, err)
+}
+
+// TestUpdateStatusHandshakeResourceVersionError covers the nextResourceVersion
+// branch on the content-no-op path: the bytes match but the handshake advances to
+// a generation the object hadn't settled at, so the version bump still runs.
+func TestUpdateStatusHandshakeResourceVersionError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	status := []byte(`{"ok":true}`)
+	// Settle at generation 0 first, so the repeat call at the object's real
+	// generation is an unsettled no-op rather than the already-settled path.
+	_, err := store.UpdateStatus(ctx, testGK, obj.ID, 0, status, 0)
+	require.NoError(t, err)
+	dropSeq(t, store)
+
+	_, err = store.UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 0)
+	require.Error(t, err)
+}
+
 // TestDeleteConditionScopedReadError covers DeleteCondition's scoped-read error
 // branch: BeginTx succeeds, but the objects table is gone so the read fails.
 func TestDeleteConditionScopedReadError(t *testing.T) {
