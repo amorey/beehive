@@ -170,6 +170,9 @@ func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) err
 func (s *fakeStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
+func (s *fakeStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return nil, nil
+}
 func (s *fakeStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
 	return nil, nil
 }

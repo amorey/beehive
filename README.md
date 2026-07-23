@@ -288,6 +288,8 @@ type Client[Spec, Status any] interface {
     ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
     ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
     ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
+    // The typed, kind-scoped form of ListOwned: this kind's decoded children.
+    ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
 
     // Event log — per-object, category-partitioned, contiguous-run aggregated.
     ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
@@ -399,6 +401,8 @@ An object's ref edges are fetched on request, two ways:
 - **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` / `ListOwned` when the data is actually needed. These hit the edge query directly and do **not** kind-scope `id` (no validating read in front): a foreign id reads that kind's edges and a missing id reads empty, neither as `ErrNotFound`. Reserve them for ids the client owns.
 
 `ListOwned` (and the eager `LoadOwned()` / `Object.ListOwned()`) is the inverse of `GetOwner` over `owned_by`: it returns the objects a given owner owns, the same way `ListDependents` inverts `ListDependencies` over `depends_on`.
+
+`ListOwnedObjects(ownerID)` is its typed counterpart: where `ListOwned` returns untyped `Ref`s across *every* owned kind — leaving the caller to filter by `Kind` and `Get` each child through that kind's client — `ListOwnedObjects` returns the fully decoded `*Object[Spec, Status]` children of **this client's kind**, in one store query (the kind filter and the row read are folded into the edge semi-join, so there is no `Get` per child). Same ordering (by id) and same missing-owner behavior as `ListOwned`; deletion-pending children are included, so a caller that wants to skip them checks `DeletionRequestedAt` itself. It takes the same `LoadOption`s as `List`, batched the same way — without them the children carry nothing loaded and their accessors return `ErrNotLoaded`.
 
 Both issue the same secondary query (edges are a separate indexed lookup, never joined into the object's blob-bearing `SELECT`); eager just attaches the result to the object and batches across a `List`.
 

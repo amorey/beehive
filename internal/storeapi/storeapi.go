@@ -384,6 +384,14 @@ type Store interface {
 	// id (e.g. the dependents to requeue, or the owned children to GC).
 	ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
 
+	// ListIncomingRefObjects is the blob-bearing, kind-scoped form of
+	// ListIncomingRefs: the full rows of the objects of kind gk pointing at toID
+	// through relation, ordered by id, conditions attached. It resolves the edges
+	// and the rows in one query so a typed read of an owner's children of one kind
+	// (Client.ListOwnedObjects) costs no Get per child. Objects of other kinds are
+	// filtered out; a toID with no matching edge reads empty, never ErrNotFound.
+	ListIncomingRefObjects(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
+
 	// GroupIncomingRefsByID is the batched form of ListIncomingRefs: the inbound
 	// referrers for many targets through relation, bucketed by target id. The
 	// incoming-edge twin of GroupOutgoingRefsByID (e.g. eager-loading dependents
