@@ -105,6 +105,30 @@ tell "we decided against this for now" from "nobody thought of it."
   the GC sweeper's equivalent (`sweepDeletionPending`), which warns. Worth a log
   line when one of the items above is touched; not worth a commit on its own.
 
+- **Mutators materialize a `RawObject` no caller reads** — known, not fixed, and
+  the general form of the point the `DeleteBySlug` item above records for one
+  method. Every mutator returns a full `*RawObject` with conditions assembled:
+  `scanAndEmit` calls `attachConditions` on the write path, and the branches that
+  emit nothing (`UpdateSpec`'s content no-op, `UpdateStatus`'s settled and restamp
+  no-ops, `requestDeletion`'s already-pending re-read) still pay a conditions query
+  to build a value their sole caller discards — `controllerClientImpl.UpdateStatus`
+  drops it, `client.go`'s delete path reads only `obj.ID`. On an emitting path the
+  work is load-bearing (the `Modified` event carries the object body and its
+  conditions), so this is only slack on the silent branches.
+
+  Skipping `attachConditions` per-branch is the wrong fix and was rejected: it
+  would make one method's return shape depend on which branch it took, and diverge
+  from its sibling a few lines away. The contract is the thing to change — the
+  `Store` godoc says a returned `RawObject` matches the `Get` shape, so the options
+  are narrowing that promise for the silent branches, splitting off mutator
+  variants that return nothing (or just the id/`resource_version`), or making the
+  discard explicit at the `storeapi` boundary so the store can skip the assembly.
+  Deferred because `type Store = storeapi.Store` is an alias, so any of these is a
+  break on an externally-implementable interface, and the saving is one indexed
+  query per silent write. Revisit when the next `Store` break is on the table
+  anyway — the v0.17.0 `RequestDeletionBySlug` change was exactly such a moment and
+  would have been the cheap time to take this with it.
+
 ## Resolved
 
 - **Slug-keyed delete as a store mutator (`RequestDeletionBySlug`)** — done.
