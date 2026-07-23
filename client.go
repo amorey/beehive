@@ -93,7 +93,21 @@ type Client[Spec, Status any] interface {
 	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
 	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
+	// Delete soft-deletes the object (sets DeletionRequestedAt) and advances GC so
+	// the controller runs its finalizers; physical removal follows once they clear.
+	// An id naming no object of this kind is ErrNotFound — contrast DeleteBySlug,
+	// which folds absence to nil.
 	Delete(ctx context.Context, id ObjectID) error
+	// DeleteBySlug requests deletion of the object with the given slug. It is
+	// idempotent: a slug that matches no object returns nil (already gone), and a
+	// row already deletion-pending is a no-op returning nil (as Delete is on a
+	// repeated call). Kind-scoped like GetBySlug — a slug is per-kind, so this only
+	// ever targets this client's kind. Deletion itself is Delete's: a soft delete
+	// plus a GC advance.
+	//
+	// The delete-if-present partner to GetOrCreate's create-if-absent, so an
+	// ensure/remove pair is one call on each side.
+	DeleteBySlug(ctx context.Context, slug string) error
 	Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error)
 	WatchList(ctx context.Context) (<-chan Change[Spec, Status], error)
 
@@ -751,6 +765,31 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// than waiting on the resync sweeper (which a disabled resync would never run
 	// again after startup).
 	c.bh.advanceGC(ctx, c.gk, id)
+	return nil
+}
+
+// DeleteBySlug resolves the slug and delegates: it is Delete keyed by a name
+// rather than a handle, so the resolve is all it adds. See the Client interface
+// for the full contract.
+func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string) error {
+	// Kind-scoped, and it finds deletion-pending rows — they hold the slug until GC
+	// clears them, so the already-deleting case lands here rather than looking absent.
+	obj, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil // already gone — idempotent success
+		}
+		return err
+	}
+	// Fold ErrNotFound to success: it means the row this call resolved is gone, either
+	// collected between the resolve and the delete (the state the call wanted, so no
+	// enclosing Within is needed) or rejected as foreign by RequestDeletion's own kind
+	// scope — a slug of another kind is "not found" here by contract, and hideWrongKind
+	// spells that ErrNotFound. Neither is a failure to report. This is the one place a
+	// slug delete departs from Delete, which reports a missing id.
+	if err := c.Delete(ctx, obj.ID); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
 	return nil
 }
 

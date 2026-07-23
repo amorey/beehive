@@ -279,6 +279,7 @@ type Client[Spec, Status any] interface {
     GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
     List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
     Delete(ctx context.Context, id ObjectID) error
+    DeleteBySlug(ctx context.Context, slug string) error // idempotent: absent or already-deleting is a nil no-op
     Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error)
     WatchList(ctx context.Context) (<-chan Change[Spec, Status], error)
 
@@ -373,6 +374,16 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
 `created` reports whether this call inserted the row: on create the `Added` event is emitted and the object enqueued, exactly as with `Create`; returning an existing row emits and enqueues nothing. Both are post-commit, including when you nest the call in an outer transaction (`ControllerClient.Within`): the wake is registered as a post-commit hook, so it fires after the *outermost* commit has published the object's event, and not at all if that transaction rolls back. The return value can't be deferred that way, so `created=true` is still provisional until the outer transaction commits; don't act on it outside the transaction's own writes — for a side effect that must run only if the row lands, use `WithOnCreate` (below), which is deferred to the same post-commit point as the wake. `Create`, `CreateOrUpdate`, and `Update` behave the same way when nested. The options apply **only on the create branch** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). `WithSlug` is **rejected** with `ErrConflictingOption`: the slug is positional here, so the option can only contradict it, and dropping it silently would put the row under one slug while the caller went looking for it under another. (This is narrower than the general option rule — an option aimed at a target that doesn't understand it is still ignored by design. A contradiction is a caller mistake, not an inapplicable setting.)
 
 That last point has a sharp edge worth stating plainly: on the found branch the options are ignored outright, so **`created=false` does not mean "exists and matches your options."** A row created earlier by a path that passed no `WithOwner` comes back with no owner edge, and a caller that assumes otherwise gets a child the GC cascade will never collect when the parent is deleted. If you depend on the owner edge, verify it — `GetOrCreate` then `GetOwner` (or a `Get(ctx, id, LoadOwner())`) — and reconcile the difference yourself. Beehive deliberately does not adopt the row for you: `owner` is single, so adding the edge to a row that already has a *different* owner would produce a two-owner object, and choosing which owner wins is your policy, not the library's.
+
+`DeleteBySlug` is the remove half of that ensure/remove pair: `GetOrCreate` creates-if-absent, `DeleteBySlug` deletes-if-present, and both are idempotent and tombstone-aware, so a controller that ensures a slug-keyed child on one branch and removes it on another spells each side as a single call. It collapses what is otherwise open-coded as `GetBySlug` → `ErrNotFound`-is-success → `DeletionRequestedAt`-is-a-no-op → `Delete`:
+
+| Slug held by           | `DeleteBySlug`                                              |
+| ---------------------- | ----------------------------------------------------------- |
+| nothing                | `nil` — already gone                                         |
+| a live row             | soft-deletes it (sets `DeletionRequestedAt`), advances GC    |
+| a deletion-pending row | no-op — no write, no event — advances GC; `nil`              |
+
+Like `Delete` it soft-deletes and hands the object to the controller to clear its finalizers; physical removal follows once they clear, and only then is the slug released. It is kind-scoped like `GetBySlug` — a slug is per-kind, so another kind's row holding the same slug is simply not found, and reported as success rather than as a wrong-kind error.
 
 #### Watching
 

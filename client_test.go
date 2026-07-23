@@ -1169,6 +1169,140 @@ func TestClientDelete(t *testing.T) {
 	assert.NotNil(t, got.DeletionRequestedAt)
 }
 
+func TestClientDeleteBySlugDeletes(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{}, WithSlug("w1"))
+	require.NoError(t, err)
+
+	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
+
+	// As in TestClientDelete, the object lingers marked for deletion rather than
+	// being collected synchronously.
+	got, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err)
+	assert.NotNil(t, got.DeletionRequestedAt)
+}
+
+func TestClientDeleteBySlugNotFoundIsNil(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	assert.NoError(t, client.DeleteBySlug(ctx, "never-created"))
+}
+
+func TestClientDeleteBySlugIdempotent(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{}, WithSlug("w1"))
+	require.NoError(t, err)
+
+	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
+	assert.NoError(t, client.DeleteBySlug(ctx, "w1"))
+}
+
+// A row held deletion-pending by a finalizer must absorb a second DeleteBySlug
+// as a pure no-op: no error, and no second state change for watchers to see.
+func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
+	require.NoError(t, err)
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	pending, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err)
+	require.NotNil(t, pending.DeletionRequestedAt)
+
+	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
+
+	got, err := client.GetBySlug(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, pending.ID, got.ID)
+	assert.Equal(t, pending.DeletionRequestedAt, got.DeletionRequestedAt)
+	// RequestDeletion reports no change, so no write and no Modified event: the
+	// resource_version is the tell.
+	assert.Equal(t, pending.ResourceVersion, got.ResourceVersion)
+}
+
+// advanceGC's registered-kind branch: the object must be handed to its controller
+// to clear finalizers. DeleteBySlug reaches this only by delegating to Delete, so
+// the test also pins that delegation — re-inlining the tail without the GC advance
+// fails here. A slug that resolves to nothing must wake nobody.
+func TestClientDeleteBySlugAdvancesGC(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
+	require.NoError(t, err)
+	drainQueue(r.work) // drop the create's own wake
+	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+
+	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+
+	drainQueue(r.work)
+	require.NoError(t, client.DeleteBySlug(ctx, "absent"))
+	assert.Empty(t, queuedIDs(r.work), "an unresolved slug must not enqueue anything")
+}
+
+// A slug is per-kind, so another kind's row holding the same slug is invisible:
+// DeleteBySlug reports success (nothing of this kind to delete) and leaves it be.
+func TestClientDeleteBySlugKindScoped(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
+	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
+
+	w, err := widgets.Create(ctx, cSpec{Val: "v1"}, WithSlug("shared"))
+	require.NoError(t, err)
+
+	require.NoError(t, gadgets.DeleteBySlug(ctx, "shared"))
+
+	got, err := widgets.Get(ctx, w.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.DeletionRequestedAt, "the Widget must be untouched")
+}
+
+func TestClientDeleteBySlugStoreError(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("resolve fails", func(t *testing.T) {
+		bh, err := New(&slugErrorStore{})
+		require.NoError(t, err)
+
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+		require.ErrorIs(t, client.DeleteBySlug(ctx, "w1"), errBoom)
+	})
+
+	t.Run("request fails", func(t *testing.T) {
+		bh, err := New(&requestDeletionErrorStore{})
+		require.NoError(t, err)
+
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+		require.ErrorIs(t, client.DeleteBySlug(ctx, "w1"), errBoom)
+	})
+}
+
 // TestClientIDOpsScopedToKind verifies that ID-based operations on a Client are
 // confined to that client's kind: an id naming an object of another kind is
 // invisible (Get/Update/Delete all report ErrNotFound) and the foreign object is
@@ -1266,6 +1400,19 @@ type slugErrorStore struct {
 
 func (s *slugErrorStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, errBoom
+}
+
+// requestDeletionErrorStore resolves any slug, then fails the deletion request.
+type requestDeletionErrorStore struct {
+	fakeStore
+}
+
+func (s *requestDeletionErrorStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+	return &RawObject{ID: 1}, nil
+}
+
+func (s *requestDeletionErrorStore) RequestDeletion(_ context.Context, _ GroupKind, _ ObjectID) (*RawObject, bool, error) {
+	return nil, false, errBoom
 }
 
 // createOrUpdateBadJSONStore drives CreateOrUpdate's rawToTyped error path: the
