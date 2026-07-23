@@ -508,6 +508,34 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	return ids, rows.Err()
 }
 
+// stampVersion resolves the schema version a write should leave on the row, given
+// what's stored and what the caller reports. It is the write-side twin of
+// convertBlob and applies to *both* branches of UpdateSpec/UpdateStatus — the
+// content no-op and the real content write — because the tag records the shape the
+// bytes are in, and a wrong tag corrupts every later read the same way regardless
+// of whether the bytes moved.
+//
+// An incoming 0 means "no opinion": the kind isn't versioned, or this build lost
+// the migrator. convertBlob reads that as identity rather than converting, so the
+// write must leave the stored tag alone rather than zero it — a build that can't
+// interpret the version has no business relabelling data as unversioned, and
+// stamping 0 over a v3 row makes a later re-registered migrator convert v3 bytes
+// from 0. Below the stored version (non-zero) is a genuine downgrade: refuse it,
+// exactly as the read path refuses from > current. Such a caller could not have
+// decoded the row it is writing back, so this is a bug worth surfacing, not a
+// case to clamp silently.
+func stampVersion(stored, incoming int) (int, error) {
+	switch {
+	case incoming == 0:
+		return stored, nil
+	case incoming < stored:
+		return 0, fmt.Errorf("%w: stored %d, this build's %d",
+			storeapi.ErrSchemaVersionDowngrade, stored, incoming)
+	default:
+		return incoming, nil
+	}
+}
+
 func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
@@ -521,11 +549,29 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		if err != nil {
 			return err
 		}
-		// Identical spec: nothing changed, so don't bump generation/resource_version
-		// or emit. A bump would falsely unsettle a converged object and trigger a
-		// needless reconcile, and the event would show watchers a spurious diff
-		// (mirrors RequestDeletion's idempotent no-op).
-		if bytes.Equal(obj.Spec, spec) {
+		// Never downward — see stampVersion. A build that can't read this row's
+		// version can't be trusted to retag it either.
+		stamp, err := stampVersion(obj.SpecVersion, specVersion)
+		if err != nil {
+			return err
+		}
+		// Identical spec *at the same schema version*: nothing changed, so don't
+		// bump generation/resource_version or emit. A bump would falsely unsettle a
+		// converged object and trigger a needless reconcile, and the event would show
+		// watchers a spurious diff (mirrors RequestDeletion's idempotent no-op).
+		//
+		// The version gate is what makes the byte compare meaningful. Convert-on-read
+		// leaves old rows tagged at the version they were written in, so a caller at a
+		// newer version hands us bytes in a *different shape* — equal bytes there can
+		// carry different values (a converter reading v1's absent field as a default
+		// the v2 shape spells explicitly). Suppressing that as a no-op would change
+		// what every later read decodes while reporting changed=false, bumping no
+		// resource_version and emitting nothing, so no watcher learns and the client
+		// skips the controller wake. When the shapes disagree we can't compare, so we
+		// fall through and write it as the real change it may be: worst case a
+		// re-stamp costs one spurious reconcile per row per version bump, which the
+		// level-triggered loop absorbs.
+		if stamp == obj.SpecVersion && bytes.Equal(obj.Spec, spec) {
 			result, err = s.attachConditions(ctx, obj)
 			return err
 		}
@@ -534,13 +580,16 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 			return err
 		}
 		// A real spec change bumps generation so the convergence handshake notices.
+		// Keyed on id alone: the kind boundary came from the scoped read above, in
+		// this same transaction, and group/kind are write-once at insert. Keep the
+		// read if you move this statement.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
 			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(spec), specVersion, rv, toMillis(time.Now().UTC()), id)
+			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		changed = err == nil
 		return err
@@ -548,43 +597,123 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 	return result, changed, err
 }
 
+// UpdateStatus skips the status write when the incoming bytes equal the stored
+// ones, mirroring UpdateSpec/DeleteFinalizer/DeleteCondition: no resource_version
+// bump, no updated_at touch, no Modified event — a watcher would otherwise see a
+// spurious diff, and downstream controllers that wake dependents off a status
+// Modified would reconcile for nothing on every unchanged health poll.
+//
+// The convergence handshake is the one thing a content no-op must still carry:
+// observed_generation/observed_at record *that the controller ran*, not what it
+// wrote, and ListUnsettledIDs (the resync backstop) keys off observed_generation
+// < generation. Leaving it behind on an identical-status reconcile would strand
+// the object unsettled forever, re-enqueued every resync. And that advance is a
+// real transition — the object just settled at a new generation — so it bumps
+// resource_version and emits Modified even though the bytes didn't move: anything
+// gating on ObservedGeneration == Generation would otherwise wait for the next
+// resync to learn the object converged. It can't spin a controller re-applying
+// its own status, because it fires at most once per generation; the repeat poll
+// takes the already-settled path below.
+//
+// The no-op is gated on the schema version matching, not just the bytes: bytes
+// written in a different shape aren't comparable, so a caller at a newer version
+// takes the content path even when the bytes look identical. Identical status at
+// the same version, with the generation already recorded, writes nothing at all.
 func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
-	// Within keeps the rv-bump and the write atomic now that the controller's
-	// retired withinKind no longer provides the transaction (mutators self-wrap).
 	var result *storeapi.RawObject
+	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
+	// between the no-op check and the update.
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
+		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
+		// while doubling as the no-op compare's load — no separate kind check.
+		obj, err := s.getObjectRowScoped(ctx, gk, id)
+		if err != nil {
+			return err
+		}
+		// Was the WHERE generation >= ? guard: a controller can only have observed a
+		// generation that exists, and recording a future one would falsely settle
+		// the object once its spec caught up. An older value is fine — the normal
+		// case where the spec changed mid-reconcile. The guard fires on the no-op
+		// path too; a stale-ahead observedGeneration is a caller bug either way.
+		if obj.Generation < observedGeneration {
+			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
+				storeapi.ErrObservedGenerationFuture, observedGeneration, obj.Generation, id)
+		}
+		// Never downward — see stampVersion. A build that can't read this row's
+		// version can't be trusted to retag it either.
+		stamp, err := stampVersion(obj.StatusVersion, statusVersion)
+		if err != nil {
+			return err
+		}
+		if stamp == obj.StatusVersion && bytes.Equal(obj.Status, status) {
+			// Content no-op: write only the bookkeeping, and only if it would
+			// actually move.
+			//
+			// The version gate is what makes the byte compare meaningful — see
+			// UpdateSpec for the argument. A caller at a newer schema version holds
+			// bytes in a different shape, so equal bytes aren't equal values; that
+			// case falls through to the content write below, which stamps, bumps
+			// resource_version and emits. It writes the reported generation verbatim
+			// like any content write: there is something to relay, so the settled
+			// clamp below doesn't apply.
+			//
+			// >=, not ==: with no content to write, a report at or below the recorded
+			// generation is nothing new to record. Treating a stale one as an advance
+			// would roll observed_generation backwards, re-unsettling a converged
+			// object for ListUnsettledIDs and emitting a Modified that wakes every
+			// dependent — all to relay strictly less than what's already stored. The
+			// changed-status path below deliberately does *not* clamp: there the
+			// stale reporter overwrote the status content, so unsettling the object
+			// is what gets that content re-derived. Identical bytes means there is
+			// nothing to heal, which is what makes suppressing it free here.
+			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
+			if settled {
+				result, err = s.attachConditions(ctx, obj)
+				return err
+			}
+			// The handshake advanced: the object settled at a generation it hadn't
+			// settled at before. That's watch-visible even with identical bytes.
+			// updated_at still tracks content and stays put — observed_at is what
+			// records the handshake.
+			rv, err := nextResourceVersion(ctx, c)
+			if err != nil {
+				return err
+			}
+			row := c.QueryRowContext(ctx, `
+				UPDATE objects
+				SET schema_version_status = ?, observed_generation = ?, observed_at = ?,
+				    resource_version = ?
+				WHERE id = ?
+				RETURNING `+objectColumns,
+				stamp, observedGeneration, toMillis(time.Now().UTC()), rv, id)
+			result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
+			return err
+		}
 		rv, err := nextResourceVersion(ctx, c)
 		if err != nil {
 			return err
 		}
 		now := toMillis(time.Now().UTC())
-		// The kind and generation >= ? guards both live in the WHERE so the happy
-		// path stays a single statement. A foreign id matches no row (scoped out);
-		// the generation guard rejects a future observedGeneration — a controller
-		// can only have observed a generation that exists, and recording a future
-		// one would falsely settle the object once its spec caught up. An older
-		// value is fine — the normal case where the spec changed mid-reconcile.
+		// observedGeneration is written verbatim, unclamped — deliberately, unlike
+		// the no-op path above. A reporter behind the recorded generation just
+		// overwrote the status with content derived from an older spec, and letting
+		// its generation land is what marks the object unsettled so the resync
+		// backstop re-derives that content. Clamping here would pin stale status as
+		// converged, and nothing would ever revisit it.
+		//
+		// Keyed on id alone, like UpdateSpec's: the kind boundary and the
+		// generation guard both came from the scoped read above, in this same
+		// transaction, and group/kind are write-once at insert. Keep the read if you
+		// move this statement.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
 			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
 			    resource_version = ?, updated_at = ?
-			WHERE id = ? AND generation >= ? AND "group" = ? AND kind = ?
+			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(status), statusVersion, observedGeneration, now, rv, now, id, observedGeneration, gk.Group, gk.Kind)
-		obj, err := s.scanAndEmit(ctx, storeapi.Modified, row)
-		if errors.Is(err, storeapi.ErrNotFound) {
-			// No row matched: the object is gone, names another kind, or the guard
-			// rejected a future generation. Re-read (no conditions) to return a
-			// precise error instead of a misleading ErrNotFound.
-			cur, gerr := s.getObjectRowScoped(ctx, gk, id)
-			if gerr != nil {
-				return gerr // genuinely gone (ErrNotFound) or wrong kind (ErrWrongKind)
-			}
-			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
-				storeapi.ErrObservedGenerationFuture, observedGeneration, cur.Generation, id)
-		}
-		result = obj
+			jsonText(status), stamp, observedGeneration, now, rv, now, id)
+		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		return err
 	})
 	return result, err
@@ -1259,10 +1388,7 @@ var idChunkSize = 30000
 func (s *sqliteStore) refsByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
 	out := make(map[storeapi.ObjectID][]storeapi.Referrer, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
-		end := start + idChunkSize
-		if end > len(ids) {
-			end = len(ids)
-		}
+		end := min(start+idChunkSize, len(ids))
 		if err := s.refsByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
 			return nil, err
 		}

@@ -42,6 +42,11 @@ var ErrNotFound = storeapi.ErrNotFound
 // violation (a controller must pass the generation it received in Reconcile).
 var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
 
+// ErrSchemaVersionDowngrade is returned by UpdateSpec/UpdateStatus when the
+// caller's schema version is lower than the one stamped on the row — the
+// write-side twin of the read path's refusal to decode data a newer build wrote.
+var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade
+
 // Referrer is an object pointing at a target through a ref edge, with the
 // GroupKind needed to route a requeue.
 type Referrer = storeapi.Referrer

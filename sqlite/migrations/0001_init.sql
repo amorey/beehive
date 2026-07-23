@@ -36,9 +36,11 @@ CREATE TABLE objects (
     -- Convergence handshake. generation bumps only on a spec change.
     -- observed_generation is the last generation a reconciler finished;
     -- observed_generation == generation means "applied" (spec progress, not liveness).
-    -- observed_at gates the SETTLED indicator: a value older than the current process
-    -- start (or NULL) surfaces as "verifying" — spec progress is durable, but not yet
-    -- re-confirmed by a controller in this process.
+    -- observed_at records *when* the object settled at observed_generation — a
+    -- handshake timestamp, not a reconcile heartbeat. It stops ticking once a
+    -- generation is recorded (an UpdateStatus that changes neither the bytes nor
+    -- the generation writes nothing at all), so it can't be read as "last ran".
+    -- Controller liveness belongs in the events log.
     generation          INTEGER NOT NULL DEFAULT 1,
     observed_generation INTEGER,
     observed_at         INTEGER,

@@ -54,6 +54,15 @@ var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 // settled once its spec later reached that generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
+// ErrSchemaVersionDowngrade is returned by UpdateSpec/UpdateStatus when the
+// caller's schema version is non-zero and lower than the one already stamped on
+// the row. Zero is the "no opinion" case (the kind is unversioned, or this build
+// has no migrator for it) and keeps the stored tag instead of erroring. It is the
+// write-side twin of the read path's downgrade refusal: an older versioned build
+// must not relabel newer bytes as older, because every later read would then
+// convert already-converted data instead of refusing to decode it.
+var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
+
 // ChangeType classifies a Change.
 type ChangeType string
 
@@ -273,19 +282,55 @@ type Store interface {
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
 	// change) and ResourceVersion, and stamps specVersion (the migrator schema
 	// version the bytes were written at). Writing spec bytes identical to the
-	// stored ones is an idempotent no-op: no Generation/ResourceVersion bump and
-	// no event, so a converged object isn't falsely unsettled. changed reports
+	// stored ones *at the row's own schema version* is an idempotent no-op: no
+	// Generation/ResourceVersion bump and no event, so a converged object isn't
+	// falsely unsettled. The version qualifier is load-bearing: bytes written at a
+	// different schema version are in a different shape, so comparing them says
+	// nothing about whether the value changed, and such a write takes the normal
+	// path (stamped, bumped, emitted). changed reports
 	// which happened — true for a real write, false for the no-op — so callers can
 	// keep their own follow-up (a reconciler wake) in step with the store's
 	// silence. Scoped to gk: an id of another kind is rejected with ErrWrongKind,
 	// a missing id with ErrNotFound.
 	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
-	// UpdateStatus replaces an object's status and records the generation the
-	// controller observed, bumping ObservedAt and ResourceVersion, and stamps
-	// statusVersion (the migrator schema version the status bytes were written at).
+	// UpdateStatus replaces an object's status, records the generation the
+	// controller observed, and stamps statusVersion (the migrator schema version
+	// the status bytes were written at). When the bytes differ from the stored
+	// ones it bumps ObservedAt, ResourceVersion and UpdatedAt and emits Modified.
+	//
+	// Status bytes identical to the stored ones *at the row's own schema version*
+	// write no status and never touch UpdatedAt. The version qualifier is
+	// load-bearing: bytes written at a different schema version are in a different
+	// shape, so comparing them says nothing about whether the value changed, and
+	// such a write takes the normal path above. Two things still ride the no-op
+	// path:
+	//
+	//   - ObservedGeneration/ObservedAt advance if this reconcile settled a
+	//     generation the object hadn't settled at before, so neither the
+	//     convergence handshake nor the unsettled resync keying off it is
+	//     stranded by a reconcile that changed no status content. That advance
+	//     is a real transition, so it does bump ResourceVersion and emit
+	//     Modified — a watcher gating on ObservedGeneration == Generation sees
+	//     the object converge. It fires at most once per generation.
+	//   - Nothing else. A call identical in both respects writes nothing at
+	//     all: no ResourceVersion bump, no Modified event. So ObservedAt holds
+	//     when ObservedGeneration was recorded and does not tick per reconcile —
+	//     it is a handshake timestamp, not a liveness heartbeat.
+	//
+	// The two paths treat a stale observedGeneration — one at or below the recorded
+	// value — differently, and the split is deliberate. On the no-op path it is
+	// ignored: with identical bytes it relays strictly less than what is already
+	// stored, so recording it would only un-converge a settled object and emit a
+	// Modified for nothing. On the content-changed path it is written verbatim,
+	// rolling ObservedGeneration back so the object reads as unsettled — the
+	// reporter just overwrote the status with content derived from an older spec,
+	// and being unsettled is what makes the resync backstop re-derive it. Pinning
+	// stale status as converged would leave nothing to revisit it.
+	//
 	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
-	// id with ErrNotFound.
+	// id with ErrNotFound. An observedGeneration greater than the row's current
+	// generation is rejected with ErrObservedGenerationFuture, no-op or not.
 	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
 
 	// SetCondition upserts the condition keyed by (id, cond.Type). A real change
