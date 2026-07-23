@@ -1239,7 +1239,7 @@ func TestHasIncomingRefsIgnoresFinalizingDependent(t *testing.T) {
 	assert.True(t, has, "a finalizing owned child still blocks deletion")
 }
 
-func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
+func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	const missing beehive.ObjectID = 999
@@ -1255,6 +1255,12 @@ func TestMutatorsReturnNotFoundForMissingID(t *testing.T) {
 		},
 		"RequestDeletion": func() error {
 			_, _, err := store.RequestDeletion(ctx, testGK, missing)
+			return err
+		},
+		// Keyed by a slug no row holds, so here ErrNotFound carries its full meaning:
+		// nothing of this kind is named that.
+		"RequestDeletionBySlug": func() error {
+			_, _, err := store.RequestDeletionBySlug(ctx, testGK, "never-created")
 			return err
 		},
 	}
@@ -1283,6 +1289,55 @@ func TestRequestDeletionIsIdempotent(t *testing.T) {
 	require.NotNil(t, second.DeletionRequestedAt)
 	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,
 		"deletion timestamp is stamped once and not moved by requeues")
+}
+
+// The first call marks and resolves the slug to its row; the repeat is the no-op,
+// returning the row so the caller can still advance GC but stamping nothing — same
+// timestamp, same resource_version, so no watch churn.
+func TestRequestDeletionBySlugIsIdempotent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new("w1"), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	first, changed, err := store.RequestDeletionBySlug(ctx, testGK, "w1")
+	require.NoError(t, err)
+	require.True(t, changed, "this call set the flag")
+	require.Equal(t, created.ID, first.ID, "the slug resolved to its row")
+	require.NotNil(t, first.DeletionRequestedAt)
+
+	second, changed, err := store.RequestDeletionBySlug(ctx, testGK, "w1")
+	require.NoError(t, err)
+	assert.False(t, changed, "the repeat changed nothing")
+	require.NotNil(t, second.DeletionRequestedAt)
+	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,
+		"the deletion timestamp is stamped once")
+	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
+		"a no-op must not bump the watch cursor")
+}
+
+// Slugs are unique per kind, not globally, so another kind's row holding the same
+// slug is simply absent here — ErrNotFound, never ErrWrongKind, and untouched.
+func TestRequestDeletionBySlugIsKindScoped(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
+
+	other, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Slug: new("shared"), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.RequestDeletionBySlug(ctx, testGK, "shared")
+	assert.ErrorIs(t, err, beehive.ErrNotFound)
+	assert.NotErrorIs(t, err, beehive.ErrWrongKind)
+
+	got, err := store.GetObject(ctx, other.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.DeletionRequestedAt, "the other kind's row is untouched")
 }
 
 func TestDeleteObject(t *testing.T) {

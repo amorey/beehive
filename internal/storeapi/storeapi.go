@@ -189,7 +189,11 @@ type Referrer struct {
 // lives one layer up, in the typedController adapter.
 //
 // Mutators return the freshly written row so callers see the store-assigned
-// id, resource_version, and timestamps without a re-read.
+// id, resource_version, and timestamps without a re-read. A nil error therefore
+// guarantees a non-nil object, and callers dereference it unguarded — including
+// on the idempotent no-op paths, where the row is unchanged but still returned
+// (RequestDeletion and RequestDeletionBySlug with changed=false). An
+// implementation that returns (nil, nil) is broken, not a case to handle.
 type Store interface {
 	io.Closer
 
@@ -311,6 +315,17 @@ type Store interface {
 	// repeat calls are idempotent and return changed=false. Scoped to gk: an id
 	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
 	RequestDeletion(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
+
+	// RequestDeletionBySlug is RequestDeletion keyed by slug within gk: the slug is
+	// folded into the write itself, so the resolve and the mark are one atomic
+	// statement rather than a lookup wrapped in a transaction with the write. Both
+	// are race-free; this one costs a round trip less, which a single-connection
+	// store feels. Semantics otherwise match RequestDeletion: changed is true only
+	// when this call set the flag, a repeat is idempotent with changed=false, and
+	// ErrNotFound means no object of gk holds the slug (there is no ErrWrongKind —
+	// a foreign kind's slug is simply not found, since slugs are unique per kind
+	// rather than globally).
+	RequestDeletionBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
 
 	// DeleteObject removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.

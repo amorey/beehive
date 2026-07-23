@@ -134,6 +134,9 @@ func (s *fakeStore) DeleteFinalizer(context.Context, GroupKind, ObjectID, string
 func (s *fakeStore) RequestDeletion(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.RequestDeletion")
 }
+func (s *fakeStore) RequestDeletionBySlug(context.Context, GroupKind, string) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.RequestDeletionBySlug")
+}
 func (s *fakeStore) SetCondition(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
 	panic("not implemented: fakeStore.SetCondition")
 }

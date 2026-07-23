@@ -319,11 +319,18 @@ func (s *sqliteStore) GetObjectMeta(ctx context.Context, id storeapi.ObjectID) (
 	return s.getObjectRow(ctx, id)
 }
 
-func (s *sqliteStore) GetObjectBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
+// getObjectRowBySlug is getObjectRow keyed by slug within gk: the bare row, no
+// conditions assembled. The slug-keyed sibling of getObjectRowScoped — no
+// ErrWrongKind, since the kind is in the WHERE rather than checked after the read.
+func (s *sqliteStore) getObjectRowBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
 		gk.Group, gk.Kind, slug)
-	obj, err := scanObject(row)
+	return scanObject(row)
+}
+
+func (s *sqliteStore) GetObjectBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
+	obj, err := s.getObjectRowBySlug(ctx, gk, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -966,47 +973,58 @@ func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind
 	return result, err
 }
 
-// markForDeletion stamps id's deletion clock and emits a Modified, once: the
-// `IS NULL` guard makes a repeat a no-op (changed=false, ErrNotFound) so retries
-// don't churn the watch cursor. extraWhere folds an extra guard into the statement
-// (e.g. the kind scope). The row persists (deletion is async via finalizers), so
-// the emitted object still carries its conditions, matching Get/List. Runs on the
-// ambient connection — callers wrap it in Within to make rv-bump/write/emit atomic.
-func (s *sqliteStore) markForDeletion(ctx context.Context, id storeapi.ObjectID, extraWhere string, extraArgs ...any) (*storeapi.RawObject, bool, error) {
+// markForDeletion stamps the deletion clock of the row named by key and emits a
+// Modified, once: the `IS NULL` guard makes a repeat a no-op (changed=false,
+// ErrNotFound) so retries don't churn the watch cursor. where is the caller's whole
+// row predicate, keying and scope together — `id = ?` plus a kind scope, or the
+// group/kind/slug triple — so a new keying is a call-site change rather than a
+// second copy of this statement. It is parenthesized before the guard is appended,
+// so a disjunctive key can't bind loosely enough to escape the IS NULL and re-stamp
+// an already-deleting row. Like refsByIDs' column names it is a compile-time
+// fragment, never user input; only whereArgs carry values. The row persists
+// (deletion is async via finalizers), so the emitted object still carries its
+// conditions, matching Get/List. Runs on the ambient connection — callers wrap it
+// in Within to make rv-bump/write/emit atomic.
+func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (*storeapi.RawObject, bool, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
 		return nil, false, err
 	}
 	now := toMillis(time.Now().UTC())
-	args := append([]any{now, rv, now, id}, extraArgs...)
+	args := append([]any{now, rv, now}, whereArgs...)
 	row := c.QueryRowContext(ctx, `
 		UPDATE objects
 		SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
-		WHERE id = ? AND deletion_requested_at IS NULL`+extraWhere+`
+		WHERE (`+where+`) AND deletion_requested_at IS NULL
 		RETURNING `+objectColumns, args...)
 	obj, err := s.scanAndEmit(ctx, storeapi.Modified, row)
 	if err != nil {
-		return nil, false, err // ErrNotFound = no transition (guard/extraWhere/missing)
+		return nil, false, err // ErrNotFound = no transition (guard/where/missing)
 	}
 	return obj, true, nil
 }
 
-func (s *sqliteStore) RequestDeletion(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
-	// Within keeps the rv-bump, write, and emit atomic now that callers no longer
-	// always wrap RequestDeletion (mutators self-wrap; nested it joins the caller's
-	// transaction — e.g. the GC cascade). The kind is folded in so a foreign id
-	// matches no row.
+// requestDeletion is the mark-or-reread protocol behind both deletion entry points.
+// markForDeletion's ErrNotFound is ambiguous — already deleting, out of scope, or
+// gone — so reread resolves it on the caller's own key and supplies the current row
+// for the no-op case, which callers still need in order to advance GC. Within keeps
+// the rv-bump, write, and emit atomic now that callers no longer always wrap these
+// (mutators self-wrap; nested they join the caller's transaction — e.g. the GC
+// cascade).
+func (s *sqliteStore) requestDeletion(
+	ctx context.Context,
+	reread func(context.Context) (*storeapi.RawObject, error),
+	where string, whereArgs ...any,
+) (*storeapi.RawObject, bool, error) {
 	var result *storeapi.RawObject
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
-		obj, ch, err := s.markForDeletion(ctx, id, ` AND "group" = ? AND kind = ?`, gk.Group, gk.Kind)
+		obj, ch, err := s.markForDeletion(ctx, where, whereArgs...)
 		if errors.Is(err, storeapi.ErrNotFound) {
-			// Zero rows: already deleting (the no-op), another kind, or gone. The scoped
-			// re-read distinguishes them and returns the current row for the no-op case.
-			cur, rerr := s.getObjectRowScoped(ctx, gk, id)
+			cur, rerr := reread(ctx)
 			if rerr != nil {
-				return rerr // ErrNotFound (gone) or ErrWrongKind
+				return rerr
 			}
 			result, err = s.attachConditions(ctx, cur)
 			return err
@@ -1018,6 +1036,25 @@ func (s *sqliteStore) RequestDeletion(ctx context.Context, gk storeapi.GroupKind
 		return nil
 	})
 	return result, changed, err
+}
+
+// RequestDeletion marks id within gk. The kind is folded into the write, so a
+// foreign id matches no row and the re-read reports ErrWrongKind.
+func (s *sqliteStore) RequestDeletion(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
+	return s.requestDeletion(ctx,
+		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowScoped(ctx, gk, id) },
+		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
+}
+
+// RequestDeletionBySlug marks the gk row holding slug. The slug rides in the
+// UPDATE's own WHERE the way the kind does for RequestDeletion, so the resolve and
+// the mark are one statement: atomic, and a round trip cheaper than the alternative
+// of wrapping a GetObjectBySlug + RequestDeletion pair in a Within — which matters
+// on a store that runs every caller through one connection.
+func (s *sqliteStore) RequestDeletionBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
+	return s.requestDeletion(ctx,
+		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowBySlug(ctx, gk, slug) },
+		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
 // MarkOwnedForDeletion cascades deletion to ownerID's owned children. One indexed
@@ -1061,7 +1098,7 @@ func (s *sqliteStore) MarkOwnedForDeletion(ctx context.Context, ownerID storeapi
 		}
 		// A race could have set the flag since the SELECT; markForDeletion's guard
 		// then returns ErrNotFound — benign here.
-		if _, _, err := s.markForDeletion(ctx, ch.ref.ID, ""); err != nil &&
+		if _, _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil &&
 			!errors.Is(err, storeapi.ErrNotFound) {
 			return nil, err
 		}
