@@ -686,15 +686,12 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			// nothing to heal, which is what makes suppressing it free here.
 			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
 			if settled {
-				if obj.StatusVersion == stamp {
-					result, err = s.attachConditions(ctx, obj)
-					return err
+				if obj.StatusVersion != stamp {
+					if obj, err = s.restamp(ctx, colStatusVersion, stamp, id); err != nil {
+						return err
+					}
 				}
-				cur, err := s.restamp(ctx, colStatusVersion, stamp, id)
-				if err != nil {
-					return err
-				}
-				result, err = s.attachConditions(ctx, cur)
+				result, err = s.attachConditions(ctx, obj)
 				return err
 			}
 			// The handshake advanced: the object settled at a generation it hadn't
