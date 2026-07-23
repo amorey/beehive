@@ -109,8 +109,8 @@ tell "we decided against this for now" from "nobody thought of it."
   the general form of the point the `DeleteBySlug` item above records for one
   method. Every mutator returns a full `*RawObject` with conditions assembled:
   `scanAndEmit` calls `attachConditions` on the write path, and the branches that
-  emit nothing (`UpdateSpec`'s content no-op, `UpdateStatus`'s settled and restamp
-  no-ops, `requestDeletion`'s already-pending re-read) still pay a conditions query
+  emit nothing (`UpdateSpec`'s content no-op, `UpdateStatus`'s settled no-op,
+  `requestDeletion`'s already-pending re-read) still pay a conditions query
   to build a value their sole caller discards — `controllerClientImpl.UpdateStatus`
   drops it, `client.go`'s delete path reads only `obj.ID`. On an emitting path the
   work is load-bearing (the `Modified` event carries the object body and its

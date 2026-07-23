@@ -55,11 +55,12 @@ var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
 // ErrSchemaVersionDowngrade is returned by UpdateSpec/UpdateStatus when the
-// caller's schema version is lower than the one already stamped on the row (and
-// non-zero, which means "no opinion"). It is the write-side twin of the read
-// path's downgrade refusal: an older versioned build must not relabel newer
-// bytes as older, because every later read would then convert already-converted
-// data instead of refusing to decode it.
+// caller's schema version is non-zero and lower than the one already stamped on
+// the row. Zero is the "no opinion" case (the kind is unversioned, or this build
+// has no migrator for it) and keeps the stored tag instead of erroring. It is the
+// write-side twin of the read path's downgrade refusal: an older versioned build
+// must not relabel newer bytes as older, because every later read would then
+// convert already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
 // ChangeType classifies a Change.
@@ -281,10 +282,12 @@ type Store interface {
 	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
 	// change) and ResourceVersion, and stamps specVersion (the migrator schema
 	// version the bytes were written at). Writing spec bytes identical to the
-	// stored ones is an idempotent no-op: no Generation/ResourceVersion bump and
-	// no event, so a converged object isn't falsely unsettled (specVersion is
-	// still stamped, silently, so a converter whose output matches the stored
-	// bytes doesn't leave the row tagged at its old schema version). changed reports
+	// stored ones *at the row's own schema version* is an idempotent no-op: no
+	// Generation/ResourceVersion bump and no event, so a converged object isn't
+	// falsely unsettled. The version qualifier is load-bearing: bytes written at a
+	// different schema version are in a different shape, so comparing them says
+	// nothing about whether the value changed, and such a write takes the normal
+	// path (stamped, bumped, emitted). changed reports
 	// which happened — true for a real write, false for the no-op — so callers can
 	// keep their own follow-up (a reconciler wake) in step with the store's
 	// silence. Scoped to gk: an id of another kind is rejected with ErrWrongKind,
@@ -296,8 +299,12 @@ type Store interface {
 	// the status bytes were written at). When the bytes differ from the stored
 	// ones it bumps ObservedAt, ResourceVersion and UpdatedAt and emits Modified.
 	//
-	// Status bytes identical to the stored ones write no status and never touch
-	// UpdatedAt. Three things still ride that path:
+	// Status bytes identical to the stored ones *at the row's own schema version*
+	// write no status and never touch UpdatedAt. The version qualifier is
+	// load-bearing: bytes written at a different schema version are in a different
+	// shape, so comparing them says nothing about whether the value changed, and
+	// such a write takes the normal path above. Two things still ride the no-op
+	// path:
 	//
 	//   - ObservedGeneration/ObservedAt advance if this reconcile settled a
 	//     generation the object hadn't settled at before, so neither the
@@ -306,11 +313,7 @@ type Store interface {
 	//     is a real transition, so it does bump ResourceVersion and emit
 	//     Modified — a watcher gating on ObservedGeneration == Generation sees
 	//     the object converge. It fires at most once per generation.
-	//   - statusVersion is stamped, so a converter whose output matches the
-	//     stored bytes doesn't leave the row tagged at its old schema version.
-	//     On this path the stamp is upward only: the bytes staying put are the
-	//     stored ones, at the row's version rather than the caller's.
-	//   - Nothing else. A call identical in all three respects writes nothing at
+	//   - Nothing else. A call identical in both respects writes nothing at
 	//     all: no ResourceVersion bump, no Modified event. So ObservedAt holds
 	//     when ObservedGeneration was recorded and does not tick per reconcile —
 	//     it is a handshake timestamp, not a liveness heartbeat.

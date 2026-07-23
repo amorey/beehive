@@ -508,14 +508,6 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	return ids, rows.Err()
 }
 
-// schema version columns, named here so the two content-no-op re-stamps can
-// share one statement template. col is always one of these constants — never
-// caller data — since it is interpolated into the SQL.
-const (
-	colSpecVersion   = "schema_version_spec"
-	colStatusVersion = "schema_version_status"
-)
-
 // stampVersion resolves the schema version a write should leave on the row, given
 // what's stored and what the caller reports. It is the write-side twin of
 // convertBlob and applies to *both* branches of UpdateSpec/UpdateStatus — the
@@ -544,20 +536,6 @@ func stampVersion(stored, incoming int) (int, error) {
 	}
 }
 
-// restamp writes one schema-version column and nothing else — no
-// resource_version bump, no updated_at touch, no emit. It is the content-no-op
-// path shared by UpdateSpec and UpdateStatus: the stored bytes stay put, so the
-// only thing that may move is the version tag recording what shape they're in,
-// and nothing observable changed for a watcher to see. Callers must have
-// established the kind boundary already (both reach it through
-// getObjectRowScoped in the same transaction) and pass a version stampVersion
-// already resolved.
-func (s *sqliteStore) restamp(ctx context.Context, col string, version int, id storeapi.ObjectID) (*storeapi.RawObject, error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
-		`UPDATE objects SET `+col+` = ? WHERE id = ? RETURNING `+objectColumns, version, id)
-	return scanObject(row)
-}
-
 func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
@@ -571,28 +549,29 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		if err != nil {
 			return err
 		}
-		// Identical spec: nothing changed, so don't bump generation/resource_version
-		// or emit. A bump would falsely unsettle a converged object and trigger a
-		// needless reconcile, and the event would show watchers a spurious diff
-		// (mirrors RequestDeletion's idempotent no-op). The schema version is the
-		// exception, for the same reason as UpdateStatus's no-op: a converter whose
-		// output equals the stored bytes must still re-stamp, or the row keeps its
-		// old version and every later read reconverts it. That stamp is invisible —
-		// no generation/rv bump, no emit, and still changed=false.
-		// Never downward — see stampVersion. On a content no-op the bytes staying
-		// put are the *stored* ones, so a lower tag would relabel them as older than
-		// they are; on a real write the bytes are the caller's, but a build that
-		// can't read this row's version can't be trusted to retag it either.
+		// Never downward — see stampVersion. A build that can't read this row's
+		// version can't be trusted to retag it either.
 		stamp, err := stampVersion(obj.SpecVersion, specVersion)
 		if err != nil {
 			return err
 		}
-		if bytes.Equal(obj.Spec, spec) {
-			if obj.SpecVersion != stamp {
-				if obj, err = s.restamp(ctx, colSpecVersion, stamp, id); err != nil {
-					return err
-				}
-			}
+		// Identical spec *at the same schema version*: nothing changed, so don't
+		// bump generation/resource_version or emit. A bump would falsely unsettle a
+		// converged object and trigger a needless reconcile, and the event would show
+		// watchers a spurious diff (mirrors RequestDeletion's idempotent no-op).
+		//
+		// The version gate is what makes the byte compare meaningful. Convert-on-read
+		// leaves old rows tagged at the version they were written in, so a caller at a
+		// newer version hands us bytes in a *different shape* — equal bytes there can
+		// carry different values (a converter reading v1's absent field as a default
+		// the v2 shape spells explicitly). Suppressing that as a no-op would change
+		// what every later read decodes while reporting changed=false, bumping no
+		// resource_version and emitting nothing, so no watcher learns and the client
+		// skips the controller wake. When the shapes disagree we can't compare, so we
+		// fall through and write it as the real change it may be: worst case a
+		// re-stamp costs one spurious reconcile per row per version bump, which the
+		// level-triggered loop absorbs.
+		if stamp == obj.SpecVersion && bytes.Equal(obj.Spec, spec) {
 			result, err = s.attachConditions(ctx, obj)
 			return err
 		}
@@ -636,10 +615,10 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 // its own status, because it fires at most once per generation; the repeat poll
 // takes the already-settled path below.
 //
-// schema_version_status is the genuinely invisible half: a migrator's output can
-// equal the stored bytes and still need re-stamping, so an already-settled call
-// re-stamps with no rv bump and no emit. Identical status, generation, and schema
-// version writes nothing at all.
+// The no-op is gated on the schema version matching, not just the bytes: bytes
+// written in a different shape aren't comparable, so a caller at a newer version
+// takes the content path even when the bytes look identical. Identical status at
+// the same version, with the generation already recorded, writes nothing at all.
 func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
 	var result *storeapi.RawObject
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
@@ -661,19 +640,23 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
 				storeapi.ErrObservedGenerationFuture, observedGeneration, obj.Generation, id)
 		}
-		// Never downward — see stampVersion. A converter whose output happens to
-		// equal the stored bytes still has to re-stamp, or the row keeps its old
-		// version and every later read reconverts it, breaking convert-on-read. But
-		// the tag may only move up: on the no-op path the bytes are the stored ones
-		// at obj.StatusVersion, and on the content path a build that can't read this
-		// row's version can't be trusted to retag it either.
+		// Never downward — see stampVersion. A build that can't read this row's
+		// version can't be trusted to retag it either.
 		stamp, err := stampVersion(obj.StatusVersion, statusVersion)
 		if err != nil {
 			return err
 		}
-		if bytes.Equal(obj.Status, status) {
+		if stamp == obj.StatusVersion && bytes.Equal(obj.Status, status) {
 			// Content no-op: write only the bookkeeping, and only if it would
 			// actually move.
+			//
+			// The version gate is what makes the byte compare meaningful — see
+			// UpdateSpec for the argument. A caller at a newer schema version holds
+			// bytes in a different shape, so equal bytes aren't equal values; that
+			// case falls through to the content write below, which stamps, bumps
+			// resource_version and emits. It writes the reported generation verbatim
+			// like any content write: there is something to relay, so the settled
+			// clamp below doesn't apply.
 			//
 			// >=, not ==: with no content to write, a report at or below the recorded
 			// generation is nothing new to record. Treating a stale one as an advance
@@ -686,11 +669,6 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			// nothing to heal, which is what makes suppressing it free here.
 			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
 			if settled {
-				if obj.StatusVersion != stamp {
-					if obj, err = s.restamp(ctx, colStatusVersion, stamp, id); err != nil {
-						return err
-					}
-				}
 				result, err = s.attachConditions(ctx, obj)
 				return err
 			}

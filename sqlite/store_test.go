@@ -997,12 +997,16 @@ func TestUpdateStatusChangedStaleGenerationUnsettles(t *testing.T) {
 	assert.Contains(t, unsettled, created.ID)
 }
 
-// TestNoOpWritesStillStampSchemaVersion pins the one thing a content no-op must
-// still persist besides the handshake: the schema version. A migrator whose
-// conversion leaves the serialized bytes unchanged still needs the row re-tagged,
-// or convert-on-read would reconvert it forever. The stamp stays invisible — no
-// generation/resource_version bump, no event.
-func TestNoOpWritesStillStampSchemaVersion(t *testing.T) {
+// TestCrossVersionWriteIsNotANoOp pins the version gate on the content no-op.
+// Convert-on-read leaves a row tagged at the version it was written in, so bytes
+// arriving from a caller at a *newer* version are in a different shape: equal
+// bytes there can carry different values, and the byte compare that decides the
+// no-op is meaningless across that gap. Suppressing such a write would change
+// what every later read decodes while reporting changed=false, bumping no
+// resource_version and emitting nothing — so no watcher learns and the client
+// skips the controller wake. A version mismatch therefore takes the content path:
+// it stamps, bumps, and emits, exactly like any other real write.
+func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
@@ -1018,27 +1022,62 @@ func TestNoOpWritesStillStampSchemaVersion(t *testing.T) {
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
-	// Same status bytes, newer status schema version.
+	// Same status bytes, newer status schema version: a real write, announced.
 	statusStamped, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 2)
 	require.NoError(t, err)
-	assert.Equal(t, 2, statusStamped.StatusVersion, "an identical-bytes status write still re-stamps its version")
+	assert.Equal(t, 2, statusStamped.StatusVersion, "the newer status version lands")
 	assert.Equal(t, 1, statusStamped.SpecVersion, "and leaves the spec version alone")
-	assert.Equal(t, settled.ResourceVersion, statusStamped.ResourceVersion, "the stamp bumps no resource_version")
+	assert.Greater(t, statusStamped.ResourceVersion, settled.ResourceVersion,
+		"a shape change is watch-visible even with identical bytes")
+	assert.Equal(t, beehive.Modified, recvEvent(t, w).Type)
 
-	// Same spec bytes, newer spec schema version.
+	// Same spec bytes, newer spec schema version: likewise, and changed=true so the
+	// client wakes the controller to re-derive from the reinterpreted spec.
 	specStamped, changed, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 3)
 	require.NoError(t, err)
-	assert.False(t, changed, "a re-stamp is not a spec change")
-	assert.Equal(t, 3, specStamped.SpecVersion, "an identical-bytes spec write still re-stamps its version")
+	assert.True(t, changed, "a shape change is a spec change — the caller's bytes mean something new")
+	assert.Equal(t, 3, specStamped.SpecVersion, "the newer spec version lands")
 	assert.Equal(t, 2, specStamped.StatusVersion, "and leaves the status version alone")
-	assert.EqualValues(t, created.Generation, specStamped.Generation, "the stamp bumps no generation")
-	assert.Equal(t, settled.ResourceVersion, specStamped.ResourceVersion, "the stamp bumps no resource_version")
+	assert.Greater(t, specStamped.Generation, created.Generation, "and unsettles the object")
+	assert.Greater(t, specStamped.ResourceVersion, statusStamped.ResourceVersion)
+	assert.Equal(t, beehive.Modified, recvEvent(t, w).Type)
 
-	// Both stamps survive a re-read, and neither was announced to watchers.
+	// Both stamps survive a re-read.
 	reread, err := store.GetObject(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, reread.SpecVersion)
 	assert.Equal(t, 2, reread.StatusVersion)
+}
+
+// TestSameVersionNoOpWritesNothing is the other side of the gate: identical bytes
+// at the version the row already carries stay silent, since there is genuinely
+// nothing to relay.
+func TestSameVersionNoOpWritesNothing(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"v":1}`), SpecVersion: 1,
+	})
+	require.NoError(t, err)
+	settled, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
+	require.NoError(t, err)
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+
+	again, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
+	require.NoError(t, err)
+	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "no resource_version bump")
+
+	sameSpec, changed, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 1)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.EqualValues(t, created.Generation, sameSpec.Generation, "no generation bump")
+	assert.Equal(t, settled.ResourceVersion, sameSpec.ResourceVersion, "no resource_version bump")
+
 	assertNoEvent(t, w, 100*time.Millisecond)
 }
 
@@ -2866,8 +2905,8 @@ func TestUpdateStatusResourceVersionError(t *testing.T) {
 }
 
 // blockObjectUpdates makes every UPDATE against objects abort while SELECTs keep
-// working, isolating restamp's error branch — the content-no-op paths read the
-// row first, so dropping the table would fail earlier.
+// working, isolating the mutators' UPDATE branch — they read the row first, so
+// dropping the table would fail earlier.
 func blockObjectUpdates(t *testing.T, store *sqliteStore) {
 	t.Helper()
 	_, err := store.db.ExecContext(context.Background(), `
@@ -2876,10 +2915,10 @@ func blockObjectUpdates(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
-// TestUpdateSpecRestampError covers UpdateSpec's content-no-op restamp branch:
-// identical spec bytes at a lower stored version, so the upward re-stamp runs and
-// fails.
-func TestUpdateSpecRestampError(t *testing.T) {
+// TestUpdateSpecCrossVersionUpdateError covers UpdateSpec's UPDATE branch reached
+// through the version gate: identical spec bytes at a higher schema version skip
+// the no-op and run the content write, which fails here.
+func TestUpdateSpecCrossVersionUpdateError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -2889,10 +2928,10 @@ func TestUpdateSpecRestampError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestUpdateStatusRestampError covers UpdateStatus's already-settled restamp
-// branch: identical status at the recorded generation, but a higher schema
-// version, so the invisible re-stamp runs and fails.
-func TestUpdateStatusRestampError(t *testing.T) {
+// TestUpdateStatusCrossVersionUpdateError is the status twin: identical status at
+// the recorded generation, but a higher schema version, so the version gate sends
+// it down the content write rather than suppressing it.
+func TestUpdateStatusCrossVersionUpdateError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
