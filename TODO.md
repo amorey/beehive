@@ -86,6 +86,85 @@ tell "we decided against this for now" from "nobody thought of it."
   Deferred with them because the flag only means something once the tick can do a
   full pass.
 
+- **`AddDependency`'s read-then-declare race is unguarded, and invisible to the
+  resync backstop** — known, not fixed; a guard was built and reverted (see below).
+  A controller reads target T, decides, then declares the edge. A change to T
+  landing in that window reaches nobody: `wakeDependents` resolves dependents at the
+  instant of the change, and the edge did not exist yet. The dependent then settles
+  at `obj.Generation` on the stale read, so `ListUnsettledIDs` structurally cannot
+  see it (the resync item above), and it stays wrong until T changes again or the
+  process restarts — with no error, no condition, and no log line.
+
+  The window is sub-millisecond and opens *once per edge*: every later pass has the
+  edge in place and the waker covers it normally. What earns this an entry is the
+  consequence rather than the odds — it is the one failure mode here that is both
+  permanent and invisible to the mechanism advertised as the correctness backstop.
+  The exposure is also correlated rather than uniform: startup is when edges are
+  first declared *and* when their targets churn most.
+
+  **The obvious guard is not the cheap answer it looks like.** Waking `fromID` when
+  the edge is new — pre-read via `ListOutgoingRefsByRelation` inside `AddDependency`'s
+  existing `Within`, wake after commit when the target is absent from it — was
+  implemented, reviewed, and reverted. Two problems. First, "new" ends up measured
+  against the *current transaction*, so a controller that clears and re-declares its
+  dependency set each pass (`DeleteDependency` then `AddDependency`) finds the
+  pre-read empty every time and wakes itself every time; nothing throttles the
+  result, since `typedController.reconcile` has no already-settled skip on the
+  dispatch path (that check lives only in `ListUnsettledIDs`) and `workQueue.addLocked`
+  has no rate limiter, so it reconciles at CPU speed. Routing the wake through
+  `addAfter` bounds that to the delay cadence but never converges. Second, and the
+  decisive one: the pre-read is paid on *every* `AddDependency` call, and the
+  level-triggered style means every dependent re-asserts its edges every reconcile
+  forever. On that path it always answers "already declared, don't wake" — so it is a
+  permanent extra indexed query per dependency per reconcile, bought to cover a
+  once-per-edge window. The re-assert and fan-out cases were fine (N new edges in one
+  pass register N post-commit hooks naming the same `fromID`, which collapse on the
+  `dirty` set to one requeue); the cost and the rebuild-deps spin are what sank it.
+
+  **Proposed fix: a per-object dependency watermark, and no wake at all.** Record on
+  `objects` the store's `resource_version` as of when the reconciler *loaded* the
+  object. A backstop query joins `refs ⋈ objects` on `to_id` (the PK
+  `(from_id, to_id, relation)` already leads with `from_id`) and enqueues any
+  dependent whose target has a higher `resource_version`. One column suffices despite
+  N dependencies only because `resource_version_seq` is a single global cursor every
+  writer draws from — generations are per-object counters and are not comparable
+  across targets. This puts dependencies under the same "events are latency, resync is
+  correctness" rule as everything else, and needs no pre-read, no wake, and no API
+  change.
+
+  Two details carry it. Stamp the *load-time* rv, not "max rv among my deps" computed
+  at write time: deriving it inside the store re-inherits the original race, asserting
+  the dependent saw a change that landed after its read. And advance the watermark in
+  `UpdateStatus`, the moment the object settles — including on the content-no-op
+  branch, the carve-out `observed_generation` already has. That write site is what
+  avoids a *new* permanent-unsettled hazard: a stamp advanced by asserting an edge
+  would strand any controller that stops re-asserting, whereas every controller that
+  converges calls `UpdateStatus` by definition. The residual case — a controller that
+  never calls it at all — is already permanently unsettled (`observed_generation IS
+  NULL`), so it adds no condition that did not exist. The scheme over-flags: any
+  dependency change during a reconcile costs one extra pass even when the read
+  happened to be late enough. That is the self-healing-over-efficiency trade taken
+  elsewhere, and it strictly converges, since the watermark advances on every settle.
+
+  Other alternatives rejected. *Per-edge* `observed_generation` on `refs` works only
+  if the generation is controller-supplied (a store-derived stamp inherits the race
+  one level up), which means breaking `AddDependency`'s signature and taxing every
+  controller — and it is the variant that strands non-re-asserting controllers.
+  *Documenting that controllers should requeue themselves* turns a silent race into
+  documentation, and a controller doing it correctly needs its own pre-read of the
+  dependency set, while one doing it naively (`Requeue: true` unconditionally)
+  reproduces the spin above in user code. *Scoping "new" to the reconcile* (track
+  edges removed this pass on the existing `pendingWakes` collector and suppress the
+  wake for a delete-then-re-add) fixes the spin but not the pre-read cost, and not the
+  invisible-to-resync gap that is the actual defect.
+
+  Deferred because the fix is a schema migration plus a reconciler change plus a new
+  backstop query, to harden a race that fires once per edge. Revisit when the
+  resync-strategy item above is decided — these share a tick and should land as one
+  story — or sooner if a real controller is found that reads a target and settles on
+  it in the same pass that first declares the edge, which makes the hole live rather
+  than theoretical.
+
 - **`advanceGCNow`'s synchronous collect inherits the caller's cancellation** —
   known, not fixed, and already documented inline. With resync disabled, a
   `Delete` (or freed-target wake) whose caller cancels immediately after commit
