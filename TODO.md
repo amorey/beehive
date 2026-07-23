@@ -102,6 +102,19 @@ tell "we decided against this for now" from "nobody thought of it."
   The exposure is also correlated rather than uniform: startup is when edges are
   first declared *and* when their targets churn most.
 
+  **The out-of-band spelling is the same hole, one notch wider.** `Register` hands
+  the embedding application a `ControllerClient`, so `AddDependency` can be called
+  from its own goroutines with no reconcile in flight. In-band the losing pass at
+  least runs to completion around the declaration; out-of-band the declaration is
+  all that happens, and it enqueues nothing — the edge appears with `fromID`
+  already settled at its generation, so a change that landed before the commit has
+  nobody to reach and nothing re-derives it. Any wake-on-new-edge guard would have
+  to cover this call site too, and the watermark scheme does so for free (the
+  backstop query does not care who declared the edge). Pinned, skipped, by
+  `TestDependencyRequeueRaceOnOutOfBandDeclare` alongside the in-band
+  `TestDependencyRequeueRaceOnDeclare`; both fail deterministically at the requeue
+  assertion, 3/3.
+
   **The obvious guard is not the cheap answer it looks like.** Waking `fromID` when
   the edge is new — pre-read via `ListOutgoingRefsByRelation` inside `AddDependency`'s
   existing `Within`, wake after commit when the target is absent from it — was

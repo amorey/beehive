@@ -426,6 +426,119 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	}
 }
 
+// observedReadyController reports, once per pass over depID, whether the target
+// was Ready as that pass read it. It never declares the edge itself — the
+// out-of-band repro puts the declaration in the embedding application, not in
+// the reconcile. Each pass settles at obj.Generation, as a level-triggered
+// controller does.
+type observedReadyController struct {
+	client   Client[tSpec, tStatus]
+	depID    ObjectID
+	targetID ObjectID
+
+	observed chan bool // the target's Ready condition as each dep pass saw it
+}
+
+func (c *observedReadyController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	if obj.ID != c.depID {
+		return Result{}, nil // the target's own reconcile is not under test
+	}
+	target, err := c.client.Get(ctx, c.targetID)
+	if err != nil {
+		return Result{}, err
+	}
+	ready := false
+	for _, cond := range target.Conditions {
+		if cond.Type == "Ready" {
+			ready = cond.Status == ConditionTrue
+		}
+	}
+	if err := cc.UpdateStatus(ctx, c.depID, obj.Generation, tStatus{}); err != nil {
+		return Result{}, err
+	}
+	c.observed <- ready
+	return Result{}, nil
+}
+
+// TestDependencyRequeueRaceOnOutOfBandDeclare is the out-of-band mirror of
+// TestDependencyRequeueRaceOnDeclare: the same read-then-declare window, but with
+// the two halves in different goroutines. The embedding application declares the
+// edge through the ControllerClient Register handed it, after its own read of the
+// target — so no reconcile is in flight to carry the miss, and the hole is a
+// notch wider than the in-band one. In-band, the pass that loses the change at
+// least runs to completion around the declaration; here the declaration is the
+// only thing that happens, and AddDependency enqueues nothing: the edge appears
+// with fromID already settled, so a change that landed before the commit reaches
+// nobody and nothing re-derives it. With resync disabled the dependent holds a
+// stale read forever, with no error, no condition and no log line.
+func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
+	t.Skip("pins a known, unfixed race — see \"AddDependency's read-then-declare race\" in TODO.md")
+
+	ctx := context.Background()
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
+
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	ctrl := &observedReadyController{observed: make(chan bool, 8)}
+	// Resync disabled so the dependency waker is the only thing that can requeue
+	// the dependent — the backstop must not paper over the miss.
+	cc, err := Register(bh, gk, ctrl, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	ctrl.client = client
+
+	// Create before Start: the waker's watch is events-only, so pre-Start creates
+	// emit nothing into it and the only lookup the probe can see is the one the
+	// test triggers below.
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl.targetID, ctrl.depID = target.ID, dep.ID
+	store.targetID = target.ID
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The startup pass settles the dependent on a not-Ready target. From here on
+	// only a requeue can make it look again.
+	select {
+	case ready := <-ctrl.observed:
+		require.False(t, ready, "the startup pass reads the target before it goes Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's startup reconcile did not run")
+	}
+
+	// The application changes the target and only then declares the edge — the
+	// out-of-band spelling of read-then-declare. Waiting for the waker's lookup
+	// makes the window deterministic: with no edge yet it comes back empty, so the
+	// change is already unclaimed by the time AddDependency commits.
+	_, err = store.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	select {
+	case <-store.looked:
+	case <-time.After(testTimeout):
+		t.Fatal("dependency waker never looked up the target's dependents")
+	}
+	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID))
+
+	// The edge is in place and the target's change is still unobserved, so the
+	// dependent must be reconciled again and see Ready.
+	select {
+	case ready := <-ctrl.observed:
+		assert.True(t, ready, "the requeued pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never requeued: the target changed before the out-of-band AddDependency declared the edge")
+	}
+}
+
 // TestStartToleratesWatchError verifies that a dependency-watch subscription
 // failure is non-fatal: Start (which now establishes the watch synchronously)
 // still succeeds and the controller runs — only the waker is skipped, and the
