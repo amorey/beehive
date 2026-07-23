@@ -1413,10 +1413,7 @@ var idChunkSize = 30000
 func (s *sqliteStore) refsByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
 	out := make(map[storeapi.ObjectID][]storeapi.Referrer, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
-		end := start + idChunkSize
-		if end > len(ids) {
-			end = len(ids)
-		}
+		end := min(start+idChunkSize, len(ids))
 		if err := s.refsByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
 			return nil, err
 		}
