@@ -63,7 +63,7 @@ type Object[Spec, Status any] struct {
 	Slug                *string
 	Spec                Spec
 	Status              *Status
-	Generation          int64      // bumped on every Spec change
+	Generation          int64      // bumped on every Spec write not provably a no-op (see UpdateSpec)
 	ObservedGeneration  *int64     // Generation the controller last reconciled; nil until first reconcile
 	ObservedAt          *time.Time // when ObservedGeneration was recorded; not a reconcile heartbeat
 	ResourceVersion     int64      // bumped on every write, for optimistic concurrency
