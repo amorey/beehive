@@ -568,9 +568,14 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		// what every later read decodes while reporting changed=false, bumping no
 		// resource_version and emitting nothing, so no watcher learns and the client
 		// skips the controller wake. When the shapes disagree we can't compare, so we
-		// fall through and write it as the real change it may be: worst case a
-		// re-stamp costs one spurious reconcile per row per version bump, which the
-		// level-triggered loop absorbs.
+		// fall through and write it as the real change it may be — generation bump
+		// included. That is the point, not a side effect: bumping resource_version
+		// while leaving generation would re-stamp a row that stays settled
+		// (ObservedGeneration == Generation), so neither the reconciler nor
+		// ListUnsettledIDs would ever re-derive status against the new shape. Worst
+		// case a re-stamp costs one generation bump and one spurious reconcile per
+		// row per version bump — at most once per row, since the next write compares
+		// equal — which the level-triggered loop absorbs.
 		if stamp == obj.SpecVersion && bytes.Equal(obj.Spec, spec) {
 			result, err = s.attachConditions(ctx, obj)
 			return err
