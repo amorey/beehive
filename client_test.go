@@ -2181,6 +2181,31 @@ func TestClientListOwnedObjectsQuarantinesUndecodable(t *testing.T) {
 	assert.Equal(t, ObjectID(2), got[0].ID)
 }
 
+// ownedObjectsLoadErrorStore returns a decodable child but fails the batched ref
+// read, driving ListOwnedObjects' eager-load error branch.
+type ownedObjectsLoadErrorStore struct {
+	fakeStore
+	gk GroupKind
+}
+
+func (s *ownedObjectsLoadErrorStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
+}
+
+func (*ownedObjectsLoadErrorStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+	return nil, errBoom
+}
+
+func TestClientListOwnedObjectsLoadError(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(&ownedObjectsLoadErrorStore{gk: clientTestGK})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.ListOwnedObjects(ctx, 1, LoadOwner())
+	require.ErrorIs(t, err, errBoom)
+}
+
 func refObjectIDs(refs []Ref) []ObjectID {
 	var ids []ObjectID
 	for _, r := range refs {
