@@ -516,13 +516,42 @@ const (
 	colStatusVersion = "schema_version_status"
 )
 
+// stampVersion resolves the schema version a write should leave on the row, given
+// what's stored and what the caller reports. It is the write-side twin of
+// convertBlob and applies to *both* branches of UpdateSpec/UpdateStatus — the
+// content no-op and the real content write — because the tag records the shape the
+// bytes are in, and a wrong tag corrupts every later read the same way regardless
+// of whether the bytes moved.
+//
+// An incoming 0 means "no opinion": the kind isn't versioned, or this build lost
+// the migrator. convertBlob reads that as identity rather than converting, so the
+// write must leave the stored tag alone rather than zero it — a build that can't
+// interpret the version has no business relabelling data as unversioned, and
+// stamping 0 over a v3 row makes a later re-registered migrator convert v3 bytes
+// from 0. Below the stored version (non-zero) is a genuine downgrade: refuse it,
+// exactly as the read path refuses from > current. Such a caller could not have
+// decoded the row it is writing back, so this is a bug worth surfacing, not a
+// case to clamp silently.
+func stampVersion(stored, incoming int) (int, error) {
+	switch {
+	case incoming == 0:
+		return stored, nil
+	case incoming < stored:
+		return 0, fmt.Errorf("%w: stored %d, this build's %d",
+			storeapi.ErrSchemaVersionDowngrade, stored, incoming)
+	default:
+		return incoming, nil
+	}
+}
+
 // restamp writes one schema-version column and nothing else — no
 // resource_version bump, no updated_at touch, no emit. It is the content-no-op
 // path shared by UpdateSpec and UpdateStatus: the stored bytes stay put, so the
 // only thing that may move is the version tag recording what shape they're in,
 // and nothing observable changed for a watcher to see. Callers must have
 // established the kind boundary already (both reach it through
-// getObjectRowScoped in the same transaction) and must only ever stamp upward.
+// getObjectRowScoped in the same transaction) and pass a version stampVersion
+// already resolved.
 func (s *sqliteStore) restamp(ctx context.Context, col string, version int, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`UPDATE objects SET `+col+` = ? WHERE id = ? RETURNING `+objectColumns, version, id)
@@ -550,15 +579,17 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		// output equals the stored bytes must still re-stamp, or the row keeps its
 		// old version and every later read reconverts it. That stamp is invisible —
 		// no generation/rv bump, no emit, and still changed=false.
+		// Never downward — see stampVersion. On a content no-op the bytes staying
+		// put are the *stored* ones, so a lower tag would relabel them as older than
+		// they are; on a real write the bytes are the caller's, but a build that
+		// can't read this row's version can't be trusted to retag it either.
+		stamp, err := stampVersion(obj.SpecVersion, specVersion)
+		if err != nil {
+			return err
+		}
 		if bytes.Equal(obj.Spec, spec) {
-			// Upward only. On a content no-op the bytes are the *stored* ones, so
-			// they're at obj.SpecVersion, not at the caller's — stamping a lower
-			// value would relabel unchanged data as older than it is, and the next
-			// reader would convert already-converted bytes instead of getting
-			// convertBlob's downgrade error. An older build's no-op write leaves the
-			// row alone; the read path still refuses to decode it.
-			if obj.SpecVersion < specVersion {
-				if obj, err = s.restamp(ctx, colSpecVersion, specVersion, id); err != nil {
+			if obj.SpecVersion != stamp {
+				if obj, err = s.restamp(ctx, colSpecVersion, stamp, id); err != nil {
 					return err
 				}
 			}
@@ -579,7 +610,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(spec), specVersion, rv, toMillis(time.Now().UTC()), id)
+			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		changed = err == nil
 		return err
@@ -630,23 +661,20 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
 				storeapi.ErrObservedGenerationFuture, observedGeneration, obj.Generation, id)
 		}
+		// Never downward — see stampVersion. A converter whose output happens to
+		// equal the stored bytes still has to re-stamp, or the row keeps its old
+		// version and every later read reconverts it, breaking convert-on-read. But
+		// the tag may only move up: on the no-op path the bytes are the stored ones
+		// at obj.StatusVersion, and on the content path a build that can't read this
+		// row's version can't be trusted to retag it either.
+		stamp, err := stampVersion(obj.StatusVersion, statusVersion)
+		if err != nil {
+			return err
+		}
 		if bytes.Equal(obj.Status, status) {
 			// Content no-op: write only the bookkeeping, and only if it would
 			// actually move.
 			//
-			// The stamp is upward only. A converter whose output happens to equal
-			// the stored bytes still has to re-stamp, or the row keeps its old
-			// version and every later read reconverts it, breaking convert-on-read.
-			// But the bytes here are the *stored* ones, at obj.StatusVersion, not
-			// the caller's — stamping downward would relabel unchanged data as older
-			// than it is, so the next reader would convert already-converted bytes
-			// instead of getting convertBlob's downgrade error. An older build's
-			// no-op write leaves the version alone; the read path still refuses to
-			// decode the row.
-			stamp := statusVersion
-			if obj.StatusVersion > stamp {
-				stamp = obj.StatusVersion
-			}
 			// >=, not ==: with no content to write, a report at or below the recorded
 			// generation is nothing new to record. Treating a stale one as an advance
 			// would roll observed_generation backwards, re-unsettling a converged
@@ -709,7 +737,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(status), statusVersion, observedGeneration, now, rv, now, id)
+			jsonText(status), stamp, observedGeneration, now, rv, now, id)
 		result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 		return err
 	})

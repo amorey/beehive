@@ -30,6 +30,81 @@ tell "we decided against this for now" from "nobody thought of it."
   if `RequestDeletion` ever gets the same treatment (its absent path has always
   had this shape, so the probe would belong in `requestDeletion` for both).
 
+- **The periodic resync is unsettled-only, so it is not a backstop for
+  event-driven wakes** — known, not fixed. The architecture says "events are a
+  latency optimization; periodic resync is the correctness backstop", but the
+  tick (`reconciler.run`) enqueues only `ListUnsettledIDs` +
+  `ListDeletionPendingIDs`, and unsettled is `observed_generation < generation`.
+  A *settled* object is therefore never re-dispatched by the tick, so the claim
+  holds for an object's own spec convergence and for deletion progress — and for
+  nothing else.
+
+  The gap is the ordinary dependent pattern. D depends on T; D reconciles, sees T
+  not ready, writes a "waiting" status at `obj.Generation`, and is now settled.
+  When T becomes ready, D's own generation never moves, so the dependency waker is
+  the *only* thing that re-reconciles it. Lose that one wake (see the item below)
+  and D sits at "waiting" until its spec changes or the process restarts. The
+  startup pass already does the full sweep (`StartupReconcileAll`) on the reasoning
+  that "staleness is purely a startup concern" — that is the assumption at issue
+  here, and it holds only if no wake is ever lost at runtime. Kubernetes'
+  resync period re-delivers every object precisely so missed events self-heal.
+
+  The fix is to let the tick enqueue everything: always, every Nth tick, or behind
+  a `WithResyncStrategy` mirroring the existing `WithStartupReconcileStrategy`. The
+  cost is one reconcile per object per period, which is bounded and mostly free —
+  reconciles are level-triggered, and the content no-ops mean a converged object's
+  pass writes nothing and emits nothing, so it cannot cascade into other kinds.
+  Deferred because it is a behavior change for existing users and the shape (on by
+  default vs opt-in) wants a decision, not a guess. Revisit before making any
+  further claim that resync backstops event delivery — today it does not.
+
+- **Three silent loss points in the dependency waker, none of them logged** —
+  known, not fixed. Given the item above, a dropped dependency wake is permanent
+  for the process, so each of these is a stuck-dependent bug rather than a latency
+  hiccup:
+
+    - `wakeDependents` swallows its `ListIncomingRefs` error and returns. One
+      transient failure and every dependent of that target misses that change,
+      silently. This is the same efficiency-flavored silent drop that the
+      `UpdateStatus` no-op path was fixed away from, and the cheapest to correct.
+    - `runDependencyWaker` returns on a closed change stream with no log and no
+      re-subscribe, so a kind's wakes would be dead for the process lifetime with
+      nothing saying so. No reachable path closes that channel short of store
+      `Close` today, so this is latent rather than live — but it is unlogged
+      either way.
+    - `Start`'s subscribe-failure branch warns "relying on resync", which per the
+      item above is not the coverage it sounds like: the timer reaches that
+      controller's unsettled objects, not the dependency wakes the failed
+      subscription was to deliver. The code is fine; the comment promises
+      something that does not exist, and is the likely reason a reader would
+      believe the gap is already handled.
+
+  The fix for the first two is a `missedWake` flag that forces the next resync
+  tick to enqueue everything for registered kinds — the targeted version of the
+  item above, free in the normal case — plus logging at Warn. The third is a
+  comment correction and should land regardless of what happens to the other two.
+  Deferred with them because the flag only means something once the tick can do a
+  full pass.
+
+- **`advanceGCNow`'s synchronous collect inherits the caller's cancellation** —
+  known, not fixed, and already documented inline. With resync disabled, a
+  `Delete` (or freed-target wake) whose caller cancels immediately after commit
+  abandons the collect mid-flight; `Start` is one-shot, so nothing in that process
+  retries and the row stays deletion-pending, RESTRICT-blocking its owner, until a
+  *fresh* `Beehive` runs its unconditional startup sweep over the same store.
+
+  The fix is `context.WithoutCancel(ctx)` for the collect — finishing work the
+  caller stopped waiting on, which is the trade this deliberately declined. That
+  call predates the decision (recorded on the `UpdateStatus` handshake) to prefer
+  a slightly wasteful self-healing path over a silent strand, so it is worth
+  re-taking on those terms rather than left as settled. One line if so.
+
+- **`reconciler.enqueueFrom` swallows its list error** — known, not fixed, and the
+  benign member of this set: a failed resync list skips one tick and the next
+  retries, so it self-heals on cadence. The only gap is that it is silent, unlike
+  the GC sweeper's equivalent (`sweepDeletionPending`), which warns. Worth a log
+  line when one of the items above is touched; not worth a commit on its own.
+
 ## Resolved
 
 - **Slug-keyed delete as a store mutator (`RequestDeletionBySlug`)** — done.

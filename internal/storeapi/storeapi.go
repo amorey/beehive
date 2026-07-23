@@ -54,6 +54,14 @@ var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 // settled once its spec later reached that generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
+// ErrSchemaVersionDowngrade is returned by UpdateSpec/UpdateStatus when the
+// caller's schema version is lower than the one already stamped on the row (and
+// non-zero, which means "no opinion"). It is the write-side twin of the read
+// path's downgrade refusal: an older versioned build must not relabel newer
+// bytes as older, because every later read would then convert already-converted
+// data instead of refusing to decode it.
+var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
+
 // ChangeType classifies a Change.
 type ChangeType string
 

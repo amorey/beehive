@@ -1066,8 +1066,9 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
 
-	// An older build re-applies identical content at a lower version.
-	stale, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
+	// A build that lost the kind's migrator (reporting 0) has no version opinion:
+	// the write goes through and leaves the tag alone.
+	stale, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, 3, stale.StatusVersion, "a no-op status write never stamps backwards")
 
@@ -1102,12 +1103,75 @@ func TestNoOpWriteStampsUpwardWhileConverging(t *testing.T) {
 	bumped, _, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 3)
 	require.NoError(t, err)
 
-	// Converging at the new generation with identical status and a stale version.
-	got, err := store.UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 1)
+	// Converging at the new generation with identical status and no version opinion.
+	got, err := store.UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, 3, got.StatusVersion, "the convergence write doesn't stamp backwards either")
 	require.NotNil(t, got.ObservedGeneration)
 	assert.EqualValues(t, bumped.Generation, *got.ObservedGeneration)
+}
+
+// TestWriteRejectsSchemaVersionDowngrade pins the other half of the stamp rule,
+// on *both* branches. A non-zero version below the row's is a real, wrong opinion
+// — not the "no migrator" 0 — and the read path already refuses to decode such a
+// row (from > current), so the caller could not have obtained the object it is
+// writing back. Clamping it silently, or letting the content path stamp it down,
+// would leave newer bytes labelled older and make every later read convert
+// already-converted data.
+func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"v":3}`), SpecVersion: 3,
+	})
+	require.NoError(t, err)
+	_, err = store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	require.NoError(t, err)
+
+	// Content no-op and real content change, spec and status alike.
+	_, _, err = store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":3}`), 1)
+	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
+	_, _, err = store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":9}`), 1)
+	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
+	_, err = store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
+	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
+	_, err = store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 1)
+	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
+
+	// Nothing landed: the row still holds its v3 bytes at v3.
+	reread, err := store.GetObject(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 3, reread.SpecVersion)
+	assert.Equal(t, 3, reread.StatusVersion)
+	assert.JSONEq(t, `{"v":3}`, string(reread.Spec))
+	assert.JSONEq(t, `{"msg":"hi"}`, string(reread.Status))
+}
+
+// TestContentWriteWithNoMigratorKeepsSchemaVersion is the finding this rule was
+// written for: a build with no migrator (version 0) writing *changed* bytes must
+// not zero the row's tag. convertBlob treats current == 0 as identity, so such a
+// build decodes v3 bytes untouched and marshals them back — stamping 0 would make
+// a later build with the migrator restored convert v3 bytes from 0.
+func TestContentWriteWithNoMigratorKeepsSchemaVersion(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{"v":3}`), SpecVersion: 3,
+	})
+	require.NoError(t, err)
+	_, err = store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	require.NoError(t, err)
+
+	updated, changed, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":4}`), 0)
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Equal(t, 3, updated.SpecVersion, "a content write with no migrator keeps the stored version")
+
+	settled, err := store.UpdateStatus(ctx, testGK, created.ID, updated.Generation, []byte(`{"msg":"bye"}`), 0)
+	require.NoError(t, err)
+	assert.Equal(t, 3, settled.StatusVersion, "same on the status half")
 }
 
 func TestListObjects(t *testing.T) {
