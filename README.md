@@ -208,7 +208,7 @@ type Object[Spec, Status any] struct {
     Status              *Status
     Generation          int64
     ObservedGeneration  *int64
-    ObservedAt          *time.Time
+    ObservedAt          *time.Time // when ObservedGeneration was recorded; not a reconcile heartbeat
     ResourceVersion     int64
     DeletionRequestedAt *time.Time
     Finalizers          []string
@@ -450,6 +450,12 @@ type ControllerClient[Status any] interface {
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
+
+`UpdateStatus` is a **no-op when the status marshals to the bytes already stored**: no `resource_version` bump and no watch event, exactly as re-applying an unchanged spec is a no-op on the `Client` side. So a controller reports its observed state unconditionally — no hand-rolled equality guard — and a dependent that free-rides on this kind's status changes isn't woken by a poll that found nothing new.
+
+The generation handshake is the exception. `observedGeneration`/`ObservedAt` are recorded even when the content didn't change, so a reconcile that legitimately changed no status still settles the object rather than being re-enqueued by every resync — and because settling at a new generation is a real transition, that write *does* bump `resource_version` and emit, so a watcher gating on `ObservedGeneration == Generation` sees the object converge instead of waiting for the next resync. It fires at most once per generation: the next unchanged poll finds the generation already recorded and writes nothing.
+
+So `ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran. A converged object polled every 30s keeps the timestamp of the reconcile that converged it. Don't build a controller-liveness check on it — a reconcile that calls no `UpdateStatus` at all never moved it either. For "when did we last check", record an event: `RecordEvent` extends the current run and bumps its `LastAt` on every poll, which is exactly that signal, retained and rate-shaped.
 
 `GetOwner`/`ListDependencies`/`ListDependents`/`ListOwned` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `GetOwner` returns the owner via `owned_by`, `ListOwned` the inverse (the owner's children); `ListDependents` is the inverse of `ListDependencies` over `depends_on`. Distinct from `HasIncomingRefs`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `ListDependents`.
 

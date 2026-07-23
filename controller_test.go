@@ -130,6 +130,54 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
 }
 
+// TestControllerClientUpdateStatusNoOpIsSilent pins the property downstream
+// controllers rely on: reporting the same status again produces no Modified
+// frame on the watch, so a dependent that free-rides on a status change isn't
+// woken by an unchanged poll. A controller can therefore report unconditionally
+// instead of hand-rolling an equality guard.
+func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "hello"})
+	require.NoError(t, err)
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+
+	ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	select { // snapshot
+	case ev := <-ch:
+		require.Equal(t, Added, ev.Type)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the snapshot event")
+	}
+
+	// Same status: silent.
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+	select {
+	case ev := <-ch:
+		t.Fatalf("unchanged status must not emit, got %v", ev.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A real change still flows.
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "changed"}))
+	select {
+	case ev := <-ch:
+		assert.Equal(t, Modified, ev.Type)
+		require.NotNil(t, ev.Object.Status)
+		assert.Equal(t, "changed", ev.Object.Status.Val)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the changed-status event")
+	}
+}
+
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made
 // inside Within commit together on a nil return and roll back together on error,
 // with the nested ControllerClient writes joining the one transaction.

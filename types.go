@@ -65,7 +65,7 @@ type Object[Spec, Status any] struct {
 	Status              *Status
 	Generation          int64      // bumped on every Spec change
 	ObservedGeneration  *int64     // Generation the controller last reconciled; nil until first reconcile
-	ObservedAt          *time.Time // time of the last successful reconcile
+	ObservedAt          *time.Time // when ObservedGeneration was recorded; not a reconcile heartbeat
 	ResourceVersion     int64      // bumped on every write, for optimistic concurrency
 	DeletionRequestedAt *time.Time // set when deletion is requested; object lingers until finalizers clear
 	Finalizers          []string

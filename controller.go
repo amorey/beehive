@@ -44,6 +44,13 @@ type Controller[Spec, Status any] interface {
 // ControllerClient is the write surface a controller uses to report observed
 // state. It only writes Status and metadata — never Spec, which the user owns.
 type ControllerClient[Status any] interface {
+	// UpdateStatus records status and the generation this reconcile observed.
+	// Status that marshals to the stored bytes writes nothing: no
+	// resource_version bump and no Modified event, so a controller can report
+	// unconditionally without waking watchers (or dependents) on an unchanged
+	// poll. The exception is the generation handshake — if this reconcile
+	// settled a generation the object hadn't settled at before, that advance is
+	// recorded and does emit, so watchers see the object converge.
 	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
 	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
 	DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
