@@ -680,18 +680,19 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			// The handshake advanced: the object settled at a generation it hadn't
 			// settled at before. That's watch-visible even with identical bytes.
 			// updated_at still tracks content and stays put — observed_at is what
-			// records the handshake.
+			// records the handshake. schema_version_status isn't written: this branch
+			// only runs when the stamp already equals the stored version, so
+			// re-stamping happens on the content path below, never here.
 			rv, err := nextResourceVersion(ctx, c)
 			if err != nil {
 				return err
 			}
 			row := c.QueryRowContext(ctx, `
 				UPDATE objects
-				SET schema_version_status = ?, observed_generation = ?, observed_at = ?,
-				    resource_version = ?
+				SET observed_generation = ?, observed_at = ?, resource_version = ?
 				WHERE id = ?
 				RETURNING `+objectColumns,
-				stamp, observedGeneration, toMillis(time.Now().UTC()), rv, id)
+				observedGeneration, toMillis(time.Now().UTC()), rv, id)
 			result, err = s.scanAndEmit(ctx, storeapi.Modified, row)
 			return err
 		}
