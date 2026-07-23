@@ -768,28 +768,20 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	return nil
 }
 
-// DeleteBySlug resolves the slug and delegates: it is Delete keyed by a name
-// rather than a handle, so the resolve is all it adds. See the Client interface
-// for the full contract.
+// DeleteBySlug is Delete keyed by a name rather than a handle; the store resolves
+// and marks in one statement. See the Client interface for the full contract.
 func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string) error {
-	// Kind-scoped, and it finds deletion-pending rows — they hold the slug until GC
-	// clears them, so the already-deleting case lands here rather than looking absent.
-	obj, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
+	// kind's included — so it is idempotent success rather than a failure to report.
+	// The one place a slug delete departs from Delete, which reports a missing id.
+	obj, _, err := c.bh.store.RequestDeletionBySlug(ctx, c.gk, slug)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return nil // already gone — idempotent success
+			return nil // already gone
 		}
 		return err
 	}
-	// Fold ErrNotFound to success: it means the row this call resolved is gone, either
-	// collected between the resolve and the delete (the state the call wanted, so no
-	// enclosing Within is needed) or rejected as foreign by RequestDeletion's own kind
-	// scope — a slug of another kind is "not found" here by contract, and hideWrongKind
-	// spells that ErrNotFound. Neither is a failure to report. This is the one place a
-	// slug delete departs from Delete, which reports a missing id.
-	if err := c.Delete(ctx, obj.ID); err != nil && !errors.Is(err, ErrNotFound) {
-		return err
-	}
+	c.bh.advanceGC(ctx, c.gk, obj.ID) // unconditionally, as in Delete
 	return nil
 }
 

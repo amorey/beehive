@@ -385,6 +385,8 @@ That last point has a sharp edge worth stating plainly: on the found branch the 
 
 Like `Delete` it soft-deletes and hands the object to the controller to clear its finalizers; physical removal follows once they clear, and only then is the slug released. It is kind-scoped like `GetBySlug` — a slug is per-kind, so another kind's row holding the same slug is simply not found, and reported as success rather than as a wrong-kind error.
 
+The resolve is **atomic with the delete**, in the same sense the table above holds for `CreateOrUpdate`/`GetOrCreate`: the slug is folded into the store's write, not looked up first and deleted after, so no concurrent collection can retire the row and hand the slug to a replacement in between. `nil` therefore means "no object of this kind holds this slug" rather than "the row I happened to resolve is gone." What it does *not* promise — and no implementation could — is that the slug is still free when the call returns: a concurrent `GetOrCreate` may take it the instant the delete commits. As everywhere in Beehive, the next reconcile re-derives from current state.
+
 #### Watching
 
 `Watch` and `WatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `Change` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `ListEvents`/`WatchEvents` below — is a separate concept: `Change` is an object-change notification, `Event` is a recorded log entry.)

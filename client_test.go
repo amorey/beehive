@@ -1237,9 +1237,9 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 }
 
 // advanceGC's registered-kind branch: the object must be handed to its controller
-// to clear finalizers. DeleteBySlug reaches this only by delegating to Delete, so
-// the test also pins that delegation — re-inlining the tail without the GC advance
-// fails here. A slug that resolves to nothing must wake nobody.
+// to clear finalizers, the one part of Delete's tail DeleteBySlug still runs itself
+// now that the store resolves and marks in one statement. A slug that matches no
+// row must wake nobody.
 func TestClientDeleteBySlugAdvancesGC(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -1285,22 +1285,11 @@ func TestClientDeleteBySlugKindScoped(t *testing.T) {
 
 func TestClientDeleteBySlugStoreError(t *testing.T) {
 	ctx := context.Background()
+	bh, err := New(&requestDeletionBySlugErrorStore{})
+	require.NoError(t, err)
 
-	t.Run("resolve fails", func(t *testing.T) {
-		bh, err := New(&slugErrorStore{})
-		require.NoError(t, err)
-
-		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		require.ErrorIs(t, client.DeleteBySlug(ctx, "w1"), errBoom)
-	})
-
-	t.Run("request fails", func(t *testing.T) {
-		bh, err := New(&requestDeletionErrorStore{})
-		require.NoError(t, err)
-
-		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		require.ErrorIs(t, client.DeleteBySlug(ctx, "w1"), errBoom)
-	})
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	require.ErrorIs(t, client.DeleteBySlug(ctx, "w1"), errBoom)
 }
 
 // TestClientIDOpsScopedToKind verifies that ID-based operations on a Client are
@@ -1402,16 +1391,12 @@ func (s *slugErrorStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ strin
 	return nil, errBoom
 }
 
-// requestDeletionErrorStore resolves any slug, then fails the deletion request.
-type requestDeletionErrorStore struct {
+// requestDeletionBySlugErrorStore fails the slug-keyed deletion request.
+type requestDeletionBySlugErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionErrorStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
-	return &RawObject{ID: 1}, nil
-}
-
-func (s *requestDeletionErrorStore) RequestDeletion(_ context.Context, _ GroupKind, _ ObjectID) (*RawObject, bool, error) {
+func (s *requestDeletionBySlugErrorStore) RequestDeletionBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
 	return nil, false, errBoom
 }
 
