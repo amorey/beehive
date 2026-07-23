@@ -129,6 +129,54 @@ tell "we decided against this for now" from "nobody thought of it."
   anyway — the v0.17.0 `RequestDeletionBySlug` change was exactly such a moment and
   would have been the cheap time to take this with it.
 
+- **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
+  launder reshaped bytes under the stored schema version** — known, not fixed.
+  Explore a `WithSchemaVersion(n)` option that lets a kind declare its schema
+  version independently of registering a `Migrator`.
+
+  The mechanism: `convertBlob`'s `current == 0` identity lets a build with no
+  migrator decode a v3 row untouched. If that build's struct is the *older* shape,
+  `json.Unmarshal` silently drops the v3-only fields; the write-back then reports
+  `incoming == 0`, `stampVersion` keeps the stored tag, and v-old-shaped bytes end
+  up labeled v3. A later v3 reader sees `from == current`, skips conversion, and
+  misinterprets them. `stampVersion` (`sqlite/store.go:535`) is where it gets
+  laundered, but it is not where the information is lost.
+
+  The obvious guard — reject a content change when `stored > 0 && incoming == 0` —
+  was considered and rejected. `incoming == 0` means "no migrator registered", not
+  "old struct", and those come apart constantly: registering a `Migrator` is
+  optional, so a build carrying the *current* struct with no converter yet writes
+  faithful v3 bytes and reports 0; and a client-only kind (never `Register`ed)
+  cannot attach a migrator at all, so any embedder driving the DB purely through
+  `Client` reports 0 by construction. The predicate is therefore dominated by the
+  benign case, and the guard would wedge those writers permanently (every reconcile
+  erroring) to defend against a mixed-binary rollback.
+
+  Nor can the store pick a better tag from what it has. Bytes changing does not
+  imply reshaping — an ordinary `Update` changes bytes too. Stamping `stored` is
+  wrong when the round-trip was lossy; stamping `0` is wrong when it was faithful
+  (a restored build would then see `from < current` and re-convert already-converted
+  data — the case the `CLAUDE.md` handshake bullet argues through). There is no
+  third answer available at that call site, which is what makes this a signal
+  problem rather than a stamping bug.
+
+  Hence `WithSchemaVersion(n)`: give a kind a way to say "my shape is v3" without
+  shipping a converter, reachable from client-only kinds too. Then `incoming == 0`
+  really does mean unversioned, the guard above becomes sound, and the fix lands
+  where the ambiguity is instead of on top of it.
+
+  The read path deserves the same pass in the same sitting: if an unversioned build
+  cannot be trusted with a v3 row, `from > 0 && current == 0` is arguably the same
+  "older build reading newer data" downgrade as `from > current`, and refusing it in
+  `convertBlob` stops the lossy decode *before* it can become a write. Blocking only
+  the write yields a process that can observe but not act — defensible, but it
+  should be one deliberate decision across both sides.
+
+  Deferred because it needs a new public option and a read-path policy change
+  together, and the corruption it prevents requires two builds of differing struct
+  shape sharing one DB file. Revisit before the first real `Migrator` consumer ships
+  a v2, or the first time a rollback across a schema bump is a supported operation.
+
 ## Resolved
 
 - **Slug-keyed delete as a store mutator (`RequestDeletionBySlug`)** — done.
