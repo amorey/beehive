@@ -165,6 +165,59 @@ tell "we decided against this for now" from "nobody thought of it."
   it in the same pass that first declares the edge, which makes the hole live rather
   than theoretical.
 
+- **`Create` accepts a `WithOwner` naming an already-deleting owner, stranding both
+  rows when resync is off** — known, not fixed. The ownership mirror of the
+  `AddDependency` race above: there the edge is declared after the *change*, here
+  after the *cascade*. `insertObject` checks nothing about the owner's lifecycle, and
+  `AddRef` only verifies both endpoints exist — never that the target is live — so a
+  child created against an owner that is already deletion-pending, and whose
+  `MarkOwnedForDeletion` pass has already run, is born live and unmarked under a
+  finalizing owner. Its `owned_by` edge is an unconditional live claim in
+  `HasIncomingRefs` (only deletion-pending `depends_on` sources are excluded), so the
+  owner can never be physically collected.
+
+  Nothing event-driven recovers it. `AddRef` bumps no `resource_version` and emits
+  nothing, so no watcher fires; `wakeDependents` reads only `depends_on` and would
+  ignore the edge regardless; the child's own `collect` returns at the
+  `DeletionRequestedAt == nil` early-out because *it* is not finalizing; and the owner
+  is re-woken by `collect`'s `toWake` referents only when a child row is physically
+  *removed*, which this one never will be. Reproduced with `WithResyncInterval(0)`, an
+  owner held alive by a finalizer, and the cascade provably complete (its first child
+  already collected): the second child stays alive and unmarked indefinitely while the
+  owner sits deletion-pending, 3/3 runs.
+
+  **Unlike the `depends_on` race, this one self-heals whenever resync is on.**
+  `sweepDeletionPending` and `enqueueDeletionPending` re-list the still-pending owner
+  and `collect` re-runs `MarkOwnedForDeletion`, which is explicitly built to be re-run
+  and picks the new child up; the exposure is one resync interval. The permanent
+  strand is confined to `resyncInterval = 0` — which is exactly the configuration the
+  GC tests treat as supported, and the one where every other GC path was deliberately
+  made event-complete. It is also *visible* where the dependency race is not: the
+  owner is observably stuck deletion-pending rather than silently settled on a stale
+  read.
+
+  **The fix looks cheap, but the behavior is the open question.** `insertObject`
+  already runs inside the create transaction, so reading the owner's
+  `DeletionRequestedAt` there is one indexed read paid once per child creation — not
+  the once-per-reconcile-forever tax that sank `AddDependency`'s pre-read guard. What
+  it should *do* is undecided. Rejecting with an error is the honest signal (the
+  caller asked to attach to something being torn down) but adds a new failure mode to
+  `Create` and races anyway — the owner can be deleted the instant after the check.
+  Creating the child already-marked is self-consistent and needs no new error, but
+  manufactures a deletion-pending object the caller never asked to delete, and its
+  spec is then unreachable. A third option is to leave `Create` alone and make the
+  *sweeper* the answer by having it run unconditionally at least once per some
+  cadence even when resync is disabled — which is really the resync-strategy item
+  above wearing a different hat.
+
+  Deferred because the window needs a finalizer-held owner *plus* disabled resync to
+  become permanent, and because picking between reject / create-marked is a public API
+  decision worth making alongside the resync-strategy item rather than ahead of it.
+  Revisit if a controller is found that creates children against owners it does not
+  itself hold a finalizer on, or when the resync strategy is settled. There is no test
+  for it yet: the repro exists only as a throwaway, and `TestMarkOwnedForDeletionCascadesThenIsNoOp`
+  re-cascades over a fixed child set, so it never adds a child between passes.
+
 - **`advanceGCNow`'s synchronous collect inherits the caller's cancellation** —
   known, not fixed, and already documented inline. With resync disabled, a
   `Delete` (or freed-target wake) whose caller cancels immediately after commit

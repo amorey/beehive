@@ -276,6 +276,156 @@ func TestDependencyRequeue(t *testing.T) {
 	}
 }
 
+// wakeProbeStore signals every time the dependency waker asks who depends on
+// targetID. The race is between the *waker's lookup* and the edge's commit, not
+// between the change and the commit, so a test that wants the window
+// deterministically has to wait for this rather than assume the waker is done.
+type wakeProbeStore struct {
+	Store
+	targetID ObjectID
+	looked   chan struct{} // one send per wakeDependents(targetID) lookup
+}
+
+func (s *wakeProbeStore) ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error) {
+	refs, err := s.Store.ListIncomingRefs(ctx, toID, relation)
+	if toID == s.targetID && relation == RelationDependsOn {
+		s.looked <- struct{}{}
+	}
+	return refs, err
+}
+
+// dependencyRaceController reproduces the read-then-declare window. On its first
+// pass over dep it reads the target, hands control back to the test, and only
+// then calls AddDependency — the interleaving a real controller hits when the
+// target changes between the read its decision was based on and the edge that
+// records the decision. Every pass reports what it observed and settles at
+// obj.Generation, as a level-triggered controller does.
+type dependencyRaceController struct {
+	client   Client[tSpec, tStatus]
+	depID    ObjectID
+	targetID ObjectID
+
+	observed chan bool     // the target's Ready condition as each dep pass saw it
+	readDone chan struct{} // closed once the first pass has read the target
+	proceed  chan struct{} // test closes it after changing the target
+	once     sync.Once
+}
+
+func (c *dependencyRaceController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	if obj.ID != c.depID {
+		return Result{}, nil // the target's own reconcile is not under test
+	}
+	target, err := c.client.Get(ctx, c.targetID)
+	if err != nil {
+		return Result{}, err
+	}
+	ready := false
+	for _, cond := range target.Conditions {
+		if cond.Type == "Ready" {
+			ready = cond.Status == ConditionTrue
+		}
+	}
+	// First pass only: park between the read and the declaration so the test can
+	// land its change to the target inside the window.
+	first := false
+	c.once.Do(func() { first = true })
+	if first {
+		close(c.readDone)
+		<-c.proceed
+	}
+	if err := cc.AddDependency(ctx, c.depID, c.targetID); err != nil {
+		return Result{}, err
+	}
+	// Settling at obj.Generation is what hides a missed wake from the resync
+	// backstop: ListUnsettledIDs sees a converged object.
+	if err := cc.UpdateStatus(ctx, c.depID, obj.Generation, tStatus{}); err != nil {
+		return Result{}, err
+	}
+	c.observed <- ready
+	return Result{}, nil
+}
+
+// TestDependencyRequeueRaceOnDeclare pins the read-then-declare race: a change to
+// the target that lands after the dependent read it but before AddDependency
+// commits reaches nobody — wakeDependents resolves dependents at the instant of
+// the change, and the edge did not exist yet. The dependent is left holding a
+// stale read with no error, no condition, and (because it settled at its own
+// generation) nothing for the resync backstop to notice.
+func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
+	t.Skip("pins a known, unfixed race — see \"AddDependency's read-then-declare race\" in TODO.md")
+
+	ctx := context.Background()
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
+
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	ctrl := &dependencyRaceController{
+		observed: make(chan bool, 8),
+		readDone: make(chan struct{}),
+		proceed:  make(chan struct{}),
+	}
+	// Resync disabled so the dependency waker is the only thing that can requeue
+	// the dependent — the backstop must not paper over the miss.
+	_, err = Register(bh, gk, ctrl, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	ctrl.client = client
+
+	// Create before Start so the ids are set before any reconcile can dispatch;
+	// the startup pass then drives both objects.
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl.targetID, ctrl.depID = target.ID, dep.ID
+	store.targetID = target.ID
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The dependent has read the target and not yet declared the edge.
+	select {
+	case <-ctrl.readDone:
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's first reconcile did not read the target")
+	}
+
+	// Change the target inside the window and wait for the waker to resolve its
+	// dependents — with no edge yet, that lookup comes back empty and the change
+	// is now permanently unclaimed. Only then let the declaration commit.
+	_, err = store.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	select {
+	case <-store.looked:
+	case <-time.After(testTimeout):
+		t.Fatal("dependency waker never looked up the target's dependents")
+	}
+	close(ctrl.proceed)
+
+	select {
+	case ready := <-ctrl.observed:
+		require.False(t, ready, "the first pass read the target before it went Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's first reconcile did not finish")
+	}
+
+	// The edge is in place now and the target's change is still unobserved, so
+	// the dependent must be reconciled again and see Ready.
+	select {
+	case ready := <-ctrl.observed:
+		assert.True(t, ready, "the requeued pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never requeued: the target's change landed between its read and AddDependency")
+	}
+}
+
 // TestStartToleratesWatchError verifies that a dependency-watch subscription
 // failure is non-fatal: Start (which now establishes the watch synchronously)
 // still succeeds and the controller runs — only the waker is skipped, and the
