@@ -908,6 +908,95 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	assertNoEvent(t, w, 100*time.Millisecond)
 }
 
+// TestUpdateStatusNoOpKeepsNewerObservedGeneration pins the handshake as
+// forward-only. Two reconciles can be in flight for one object and the older can
+// commit last; a content no-op reporting a generation already covered by a newer
+// recorded one must stay silent, not write observed_generation backwards —
+// regressing it would re-unsettle a converged object for the resync backstop and
+// emit a Modified that wakes every dependent.
+func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	bumped, _, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, bumped.Generation)
+
+	// The newer reconcile lands first and settles the object at generation 2.
+	settled, err := store.UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0)
+	require.NoError(t, err)
+	require.NotNil(t, settled.ObservedGeneration)
+	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
+
+	w, err := store.WatchList(ctx, testGK)
+	require.NoError(t, err)
+	defer w.Close()
+	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+
+	// The straggler, still holding generation 1, reports identical status.
+	late, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
+	require.NoError(t, err)
+
+	require.NotNil(t, late.ObservedGeneration)
+	assert.EqualValues(t, bumped.Generation, *late.ObservedGeneration,
+		"a stale report must not roll the handshake back")
+	assert.Equal(t, settled.ResourceVersion, late.ResourceVersion, "nothing moved, so no version bump")
+	assert.Equal(t, settled.ObservedAt, late.ObservedAt)
+	assertNoEvent(t, w, 100*time.Millisecond)
+
+	// The object is still converged as far as the resync backstop is concerned.
+	unsettled, err := store.ListUnsettledIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.NotContains(t, unsettled, created.ID)
+}
+
+// TestUpdateStatusChangedStaleGenerationUnsettles is the content-changed
+// counterpart, and pins the opposite behavior on purpose. Here the stale reporter
+// overwrote the status with content derived from an older spec, so its generation
+// is written back verbatim: the object goes unsettled and the resync backstop
+// re-derives the content. Clamping it forward — correct on the no-op path, where
+// identical bytes mean there is nothing to heal — would pin stale status as
+// converged with nothing left to revisit it.
+func TestUpdateStatusChangedStaleGenerationUnsettles(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	bumped, _, err := store.UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, bumped.Generation)
+
+	settled, err := store.UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0)
+	require.NoError(t, err)
+	require.NotNil(t, settled.ObservedGeneration)
+	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
+
+	// The straggler, still holding generation 1, writes different status.
+	late, err := store.UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"stale"}`), 0)
+	require.NoError(t, err)
+
+	assert.JSONEq(t, `{"msg":"stale"}`, string(late.Status), "the status content lands")
+	require.NotNil(t, late.ObservedGeneration)
+	assert.EqualValues(t, created.Generation, *late.ObservedGeneration,
+		"the stale generation is recorded verbatim, unlike on the no-op path")
+	assert.Greater(t, late.ResourceVersion, settled.ResourceVersion, "a content write is a real transition")
+
+	// The point of not clamping: the object is unsettled again, so the resync
+	// backstop re-reconciles it and the stale content gets re-derived.
+	unsettled, err := store.ListUnsettledIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.Contains(t, unsettled, created.ID)
+}
+
 // TestNoOpWritesStillStampSchemaVersion pins the one thing a content no-op must
 // still persist besides the handshake: the schema version. A migrator whose
 // conversion leaves the serialized bytes unchanged still needs the row re-tagged,

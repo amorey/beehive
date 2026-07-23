@@ -307,6 +307,16 @@ type Store interface {
 	//     when ObservedGeneration was recorded and does not tick per reconcile —
 	//     it is a handshake timestamp, not a liveness heartbeat.
 	//
+	// The two paths treat a stale observedGeneration — one at or below the recorded
+	// value — differently, and the split is deliberate. On the no-op path it is
+	// ignored: with identical bytes it relays strictly less than what is already
+	// stored, so recording it would only un-converge a settled object and emit a
+	// Modified for nothing. On the content-changed path it is written verbatim,
+	// rolling ObservedGeneration back so the object reads as unsettled — the
+	// reporter just overwrote the status with content derived from an older spec,
+	// and being unsettled is what makes the resync backstop re-derive it. Pinning
+	// stale status as converged would leave nothing to revisit it.
+	//
 	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
 	// id with ErrNotFound. An observedGeneration greater than the row's current
 	// generation is rejected with ErrObservedGenerationFuture, no-op or not.

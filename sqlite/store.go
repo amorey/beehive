@@ -647,7 +647,16 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			if obj.StatusVersion > stamp {
 				stamp = obj.StatusVersion
 			}
-			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration == observedGeneration
+			// >=, not ==: with no content to write, a report at or below the recorded
+			// generation is nothing new to record. Treating a stale one as an advance
+			// would roll observed_generation backwards, re-unsettling a converged
+			// object for ListUnsettledIDs and emitting a Modified that wakes every
+			// dependent — all to relay strictly less than what's already stored. The
+			// changed-status path below deliberately does *not* clamp: there the
+			// stale reporter overwrote the status content, so unsettling the object
+			// is what gets that content re-derived. Identical bytes means there is
+			// nothing to heal, which is what makes suppressing it free here.
+			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
 			if settled {
 				if obj.StatusVersion == stamp {
 					result, err = s.attachConditions(ctx, obj)
@@ -683,6 +692,13 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			return err
 		}
 		now := toMillis(time.Now().UTC())
+		// observedGeneration is written verbatim, unclamped — deliberately, unlike
+		// the no-op path above. A reporter behind the recorded generation just
+		// overwrote the status with content derived from an older spec, and letting
+		// its generation land is what marks the object unsettled so the resync
+		// backstop re-derives that content. Clamping here would pin stale status as
+		// converged, and nothing would ever revisit it.
+		//
 		// Keyed on id alone, like UpdateSpec's: the kind boundary and the
 		// generation guard both came from the scoped read above, in this same
 		// transaction, and group/kind are write-once at insert. Keep the read if you
