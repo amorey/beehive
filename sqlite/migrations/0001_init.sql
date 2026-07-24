@@ -55,6 +55,16 @@ CREATE TABLE objects (
     deletion_requested_at INTEGER,
     finalizers            TEXT NOT NULL DEFAULT '[]', -- JSON array of finalizer names
 
+    -- Count of owed durable dependency wakes. AddDependency increments it when it
+    -- detects its target moved between the caller's read and the declare (the
+    -- read-then-declare race), so the wake survives a crash that loses the in-memory
+    -- requeue; a successful reconcile subtracts the count it observed. 0 = nothing
+    -- owed. A count (not a flag) so a wake owed while an earlier one is being
+    -- reconciled is not lost: it lands above the observed count and survives the
+    -- subtraction. Subtracting the whole observed count (not 1) is what drains a
+    -- multi-wake row in the single pass the backstop schedules for it.
+    pending_wake INTEGER NOT NULL DEFAULT 0,
+
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
 
@@ -72,6 +82,13 @@ CREATE INDEX idx_objects_deleting
 CREATE INDEX idx_objects_unsettled
     ON objects("group", kind)
     WHERE observed_generation IS NULL OR observed_generation < generation;
+
+-- Objects owed a durable dependency wake (see pending_wake). Separate from the
+-- unsettled index because the two are orthogonal: an object can be spec-converged
+-- yet still owe a wake. The backstop query (ListPendingWakeIDs) rides this.
+CREATE INDEX idx_objects_pending_wake
+    ON objects("group", kind)
+    WHERE pending_wake != 0;
 
 -- ============================================================
 -- conditions

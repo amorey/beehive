@@ -1996,8 +1996,8 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 
 	// a depends on b and c.
-	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn))
-	require.NoError(t, store.AddRef(ctx, a.ID, c.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, a.ID, c.ID, RelationDependsOn))
 
 	deps, err := client.ListDependencies(ctx, a.ID)
 	require.NoError(t, err)
@@ -2206,14 +2206,6 @@ func TestClientListOwnedObjectsLoadError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-func refObjectIDs(refs []Ref) []ObjectID {
-	var ids []ObjectID
-	for _, r := range refs {
-		ids = append(ids, r.ID)
-	}
-	return ids
-}
-
 func TestClientGetWithLoadOwner(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -2362,7 +2354,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn)) // a depends on b
+	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn)) // a depends on b
 
 	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)
@@ -2391,7 +2383,7 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
 
 	objs, err := client.List(ctx, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)

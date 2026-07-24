@@ -211,17 +211,6 @@ func TestReconcilerRequeueAfter(t *testing.T) {
 	waitClosed(t, done, "run to exit")
 }
 
-// reconcileCapture is a Controller whose Reconcile sends the received object to
-// a channel so the test can inspect it.
-type reconcileCapture struct {
-	ch chan *Object[tSpec, tStatus]
-}
-
-func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
-	c.ch <- obj
-	return Result{}, nil
-}
-
 // TestDependencyRequeue verifies the end-to-end auto-requeue: once D depends_on
 // T, an observable change to T requeues D's reconcile — across the store, with
 // no controller-to-controller call.
@@ -262,7 +251,7 @@ func TestDependencyRequeue(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, "depends_on"))
+	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
 	_, err = store.SetCondition(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
@@ -273,6 +262,319 @@ func TestDependencyRequeue(t *testing.T) {
 		assert.Equal(t, dep.ID, obj.ID, "the dependent is the object requeued by the waker")
 	case <-time.After(testTimeout):
 		t.Fatal("dependent was not requeued after the target changed")
+	}
+}
+
+// dependentController is the dependent in the read-then-declare repros. Every
+// pass reads the target, reports the target's Ready state as that pass saw it,
+// and settles at obj.Generation — the settle being what hides a missed wake from
+// the resync backstop, since ListUnsettledIDs then sees a converged object.
+//
+// afterRead, when set, runs between the read and the settle. That is where the
+// in-band race lives: the controller declares the edge there, and the test parks
+// it to land a change to the target inside the window. Left nil the controller
+// only observes, which is the out-of-band spelling — there the declaration is the
+// embedding application's, not a reconcile's.
+type dependentController struct {
+	client   Client[tSpec, tStatus]
+	depID    ObjectID
+	targetID ObjectID
+
+	observed  chan bool // the target's Ready condition as each dep pass saw it
+	afterRead func(ctx context.Context, cc ControllerClient[tStatus], target *Object[tSpec, tStatus]) error
+}
+
+func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	if obj.ID != c.depID {
+		return Result{}, nil // the target's own reconcile is not under test
+	}
+	target, err := c.client.Get(ctx, c.targetID)
+	if err != nil {
+		return Result{}, err
+	}
+	ready := false
+	for _, cond := range target.Conditions {
+		if cond.Type == "Ready" {
+			ready = cond.Status == ConditionTrue
+		}
+	}
+	if c.afterRead != nil {
+		if err := c.afterRead(ctx, cc, target); err != nil {
+			return Result{}, err
+		}
+	}
+	// Settling at obj.Generation is what hides a missed wake from the resync
+	// backstop: ListUnsettledIDs sees a converged object.
+	if err := cc.UpdateStatus(ctx, c.depID, obj.Generation, tStatus{}); err != nil {
+		return Result{}, err
+	}
+	c.observed <- ready
+	return Result{}, nil
+}
+
+// TestDependencyRequeueRaceOnDeclare pins the read-then-declare race: a change to
+// the target that lands after the dependent read it but before AddDependency
+// commits reaches nobody — wakeDependents resolves dependents at the instant of
+// the change, and the edge did not exist yet. The dependent is left holding a
+// stale read with no error, no condition, and (because it settled at its own
+// generation) nothing for the resync backstop to notice.
+func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
+
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	ctrl := &dependentController{observed: make(chan bool, 8)}
+	var once sync.Once
+	readDone := make(chan struct{}) // closed once the first pass has read the target
+	proceed := make(chan struct{})  // closed by the test after it changes the target
+	ctrl.afterRead = func(ctx context.Context, cc ControllerClient[tStatus], target *Object[tSpec, tStatus]) error {
+		// First pass only: park between the read and the declaration so the test can
+		// land its change to the target inside the window. Later passes declare
+		// straight through, as a level-triggered controller re-asserting its edges.
+		once.Do(func() {
+			close(readDone)
+			<-proceed
+		})
+		// The version the read above reflects — not a fresh one, which would claim
+		// to have seen changes this pass did not.
+		return cc.AddDependency(ctx, ctrl.depID, ctrl.targetID, target.ResourceVersion)
+	}
+	// Resync disabled so the dependency waker is the only thing that can requeue
+	// the dependent — the backstop must not paper over the miss.
+	_, err = Register(bh, gk, ctrl, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	ctrl.client = client
+
+	// Create before Start so the ids are set before any reconcile can dispatch;
+	// the startup pass then drives both objects.
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl.targetID, ctrl.depID = target.ID, dep.ID
+	store.targetID = target.ID
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The dependent has read the target and not yet declared the edge.
+	select {
+	case <-readDone:
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's first reconcile did not read the target")
+	}
+
+	// Change the target inside the window and wait for the waker to resolve its
+	// dependents — with no edge yet, that lookup comes back empty and the change
+	// is now permanently unclaimed. Only then let the declaration commit.
+	store.resetLooked()
+	_, err = store.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	store.waitLooked(t)
+	close(proceed)
+
+	select {
+	case ready := <-ctrl.observed:
+		require.False(t, ready, "the first pass read the target before it went Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's first reconcile did not finish")
+	}
+
+	// The edge is in place now and the target's change is still unobserved, so
+	// the dependent must be reconciled again and see Ready.
+	select {
+	case ready := <-ctrl.observed:
+		assert.True(t, ready, "the requeued pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never requeued: the target's change landed between its read and AddDependency")
+	}
+}
+
+// TestDependencyRequeueRaceOnOutOfBandDeclare is the out-of-band mirror of
+// TestDependencyRequeueRaceOnDeclare: the same read-then-declare window, but with
+// the two halves in different goroutines. The embedding application declares the
+// edge through the ControllerClient Register handed it, after its own read of the
+// target — so no reconcile is in flight to carry the miss, and the hole is a
+// notch wider than the in-band one. In-band, the pass that loses the change at
+// least runs to completion around the declaration; here the declaration is the
+// only thing that happens, and AddDependency enqueues nothing: the edge appears
+// with fromID already settled, so a change that landed before the commit reaches
+// nobody and nothing re-derives it. With resync disabled the dependent holds a
+// stale read forever, with no error, no condition and no log line.
+func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
+
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	ctrl := &dependentController{observed: make(chan bool, 8)}
+	// Resync disabled so the dependency waker is the only thing that can requeue
+	// the dependent — the backstop must not paper over the miss.
+	cc, err := Register(bh, gk, ctrl, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	ctrl.client = client
+
+	// Create before Start: the waker's watch is events-only, so pre-Start creates
+	// emit nothing into it and the only lookup the probe can see is the one the
+	// test triggers below.
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl.targetID, ctrl.depID = target.ID, dep.ID
+	store.targetID = target.ID
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The startup pass settles the dependent on a not-Ready target. From here on
+	// only a requeue can make it look again.
+	select {
+	case ready := <-ctrl.observed:
+		require.False(t, ready, "the startup pass reads the target before it goes Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's startup reconcile did not run")
+	}
+
+	// The application changes the target and only then declares the edge — the
+	// out-of-band spelling of read-then-declare. Waiting for the waker's lookup
+	// makes the window deterministic: with no edge yet it comes back empty, so the
+	// change is already unclaimed by the time AddDependency commits.
+	store.resetLooked()
+	_, err = store.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	store.waitLooked(t)
+	// target is the application's read of the target, taken before the change
+	// above — so the version it carries is the one the decision to depend was
+	// based on, and the target has since moved past it.
+	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, target.ResourceVersion))
+
+	// The edge is in place and the target's change is still unobserved, so the
+	// dependent must be reconciled again and see Ready.
+	select {
+	case ready := <-ctrl.observed:
+		assert.True(t, ready, "the requeued pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never requeued: the target changed before the out-of-band AddDependency declared the edge")
+	}
+}
+
+// TestDependencyRequeueLostAcrossRestart pins the durability half of the
+// read-then-declare race: a wake that a process owes but never dispatches is
+// gone, because the only record of it was the in-memory work queue.
+//
+// The two repros above are about *deriving* the wake; this one is about
+// surviving it. Its diagnostic value lands once the edge-triggered wake exists:
+// at that point the out-of-band repro passes while this one still fails, and the
+// failure means exactly one thing — the signal was in-memory only. Until then it
+// fails for the same reason they do, which is why all three are skipped together.
+//
+// The crash is spelled as a stopped work queue rather than a killed process: the
+// change and the declaration both commit durably, and the wake they imply lands
+// on a queue whose addLocked returns early on q.stopped. From the store's side
+// that is indistinguishable from dying between the commit and the dispatch, and
+// it needs no goroutine timing to be deterministic.
+//
+// The restart runs with StartupReconcileNone, which is load-bearing twice over.
+// Under the default StartupReconcileAll the sweep reconciles everything and heals
+// the crash for reasons that have nothing to do with dependencies, so the test
+// would prove nothing. And a wake that is owed is not a spec-convergence
+// question, so recovering it must not be a startup *strategy* question either —
+// the fix has to reach the dependent under the strategy that asks for no startup
+// pass at all.
+func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	// One store, two control planes: the rows outlive the process, the work queue
+	// does not. Owned by the test, since stop leaves the store open (see
+	// Beehive.stop) — which is what makes the restart possible.
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	gk := GroupKind{Kind: "Widget"}
+
+	// --- first process: settle the dependent on a not-Ready target ---
+	bh1, err := New(db)
+	require.NoError(t, err)
+	ctrl1 := &dependentController{observed: make(chan bool, 8)}
+	// Resync disabled here and on the restart: the wake must be what requeues the
+	// dependent, not a timer that happens to sweep it up.
+	cc, err := Register(bh1, gk, ctrl1, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client1 := NewClient[tSpec, tStatus](bh1, gk)
+	ctrl1.client = client1
+
+	target, err := client1.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client1.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
+
+	stop1, err := bh1.Start(ctx)
+	require.NoError(t, err)
+
+	select {
+	case ready := <-ctrl1.observed:
+		require.False(t, ready, "the startup pass reads the target before it goes Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's startup reconcile did not run")
+	}
+	require.NoError(t, stop1(ctx))
+
+	// --- the crash window: both writes commit, the wake reaches nobody ---
+	// The target changes and only then is the edge declared, so the change is
+	// already unclaimed when the edge appears — the out-of-band race. The
+	// ControllerClient outlives the control plane (it holds the store, not the
+	// loops), so the declaration commits normally; what it can no longer do is
+	// reach a running queue.
+	_, err = db.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, target.ResourceVersion))
+
+	// --- second process over the same store ---
+	bh2, err := New(db)
+	require.NoError(t, err)
+	ctrl2 := &dependentController{
+		observed: make(chan bool, 8),
+		depID:    dep.ID,
+		targetID: target.ID,
+	}
+	_, err = Register(bh2, gk, ctrl2,
+		WithResyncInterval(0),
+		WithStartupReconcileStrategy(StartupReconcileNone))
+	require.NoError(t, err)
+	ctrl2.client = NewClient[tSpec, tStatus](bh2, gk)
+
+	stop2, err := bh2.Start(ctx)
+	require.NoError(t, err)
+	defer stop2(ctx)
+
+	// The edge is durably in place and the target's change is still unobserved, so
+	// the new process owes the dependent a reconcile that no live event will
+	// deliver — nothing is going to change again.
+	select {
+	case ready := <-ctrl2.observed:
+		assert.True(t, ready, "the recovered pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never reconciled after restart: the owed wake died with the process that owed it")
 	}
 }
 
@@ -549,6 +851,35 @@ func TestEnqueueUnsettledEnqueuesReturnedIDs(t *testing.T) {
 	items := append([]ObjectID(nil), r.work.items...)
 	r.work.mu.Unlock()
 	assert.Equal(t, []ObjectID{42, 99}, items)
+}
+
+// errPendingWakeStore fails the durable-wake listing, so a test can drive
+// enqueueFrom's skipped-pass branch — the one whose silence used to be
+// indistinguishable from "nothing was owed".
+type errPendingWakeStore struct {
+	fakeStore
+}
+
+func (s *errPendingWakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, errBoom
+}
+
+// TestEnqueueFromListErrorSkipsPass pins that a failed lister enqueues nothing and
+// survives a reconciler built without a logger — the shape these tests use, and the
+// one the new warn would panic on if it reached r.logger directly.
+func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
+	r := &reconciler{
+		store:      &errPendingWakeStore{},
+		work:       newWorkQueue(),
+		backoffFor: make(map[ObjectID]time.Duration),
+	}
+
+	r.enqueuePendingWake(context.Background()) // r.logger is nil: must warn, not panic
+
+	r.work.mu.Lock()
+	items := append([]ObjectID(nil), r.work.items...)
+	r.work.mu.Unlock()
+	assert.Empty(t, items, "a failed list enqueues nothing")
 }
 
 func TestEnqueueDeletionPending(t *testing.T) {
@@ -913,6 +1244,45 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
 
+// owedBadSpecStore is getObjectBadSpecStore with a wake already owed, and records
+// whether the reconcile tried to drain it.
+type owedBadSpecStore struct {
+	fakeStore
+	decremented bool
+}
+
+func (s *owedBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), PendingWake: 2}, nil
+}
+
+func (s *owedBadSpecStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+	s.decremented = true
+	return nil
+}
+
+// TestTypedControllerReconcileQuarantineKeepsPendingWake pins that quarantining an
+// undecodable row does not drain its owed wake. The pass never reached the
+// controller, so the wake is still owed; draining it would silently discard a real
+// obligation and leave the dependent stale with nothing recording it. The count is
+// meant to outlive the poison and be serviced by the first pass that can decode —
+// so a future refactor must not "fix" this by hoisting the decrement above the
+// quarantine return.
+func TestTypedControllerReconcileQuarantineKeepsPendingWake(t *testing.T) {
+	store := &owedBadSpecStore{}
+	bh := &Beehive{store: store}
+	tc := &typedController[cSpec, cStatus]{
+		gk: GroupKind{Kind: "Widget"},
+		bh: bh,
+		inner: &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+			return Result{}, nil
+		}},
+	}
+
+	_, err := tc.reconcile(context.Background(), 1)
+	require.NoError(t, err, "an undecodable row is still a no-op success")
+	assert.False(t, store.decremented, "a wake the pass could not service must stay owed")
+}
+
 // TestTypedControllerReconcileRawToTypedErrorCollectsDeleting pins the GC leg of
 // the quarantine: a deletion-pending, finalizer-free row that can't decode is
 // still collected here (collect needs only the id), so it doesn't strand holding
@@ -1185,6 +1555,152 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Status, "the status write committed despite the reconcile error")
 	assert.NotNil(t, got.ObservedGeneration)
+}
+
+// reconcilePendingWakeHarness builds a typedController over a real store, driven
+// synchronously so the decrement has run by the time reconcile returns. wrap, if
+// non-nil, decorates the store the controller writes through (to inject a failing
+// mutator); the returned count always reads the real store underneath it.
+// reconcilePendingWakeHarness returns the pieces the durable-wake tests need,
+// including owe: seeding an owed wake goes through the concrete store, since
+// IncrementPendingWake is deliberately absent from the Store interface (AddRef is
+// production's only producer). A closure rather than the store itself because the
+// concrete type is unexported in package sqlite and so cannot be named here.
+func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
+	t.Helper()
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	raw, err := s.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+
+	var store Store = s
+	if wrap != nil {
+		store = wrap(store)
+	}
+	bh := &Beehive{store: store}
+	inner := &funcController{}
+	tc := &typedController[cSpec, cStatus]{
+		gk:     clientTestGK,
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
+		inner:  inner,
+	}
+	count := func(t *testing.T) int64 {
+		t.Helper()
+		got, err := s.GetObject(ctx, raw.ID)
+		require.NoError(t, err)
+		return got.PendingWake
+	}
+	owe := func() error { return s.IncrementPendingWake(ctx, raw.ID) }
+	return tc, inner, raw.ID, count, owe
+}
+
+// TestReconcileDecrementsPendingWake pins the durable-wake decrement: a successful
+// pass services one owed wake (count down by one), and a failed pass leaves the
+// count owed for the backstop to retry.
+func TestReconcileDecrementsPendingWake(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+
+	// Success decrements the owed count to zero.
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	require.NoError(t, owe())
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, count(t), "a successful pass services the owed wake")
+
+	// A failed pass leaves the count owed for the backstop.
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, errBoom
+	}
+	require.NoError(t, owe())
+	_, err = tc.reconcile(ctx, id)
+	require.ErrorIs(t, err, errBoom)
+	assert.Equal(t, int64(1), count(t), "a failed pass leaves the wake owed")
+}
+
+// TestReconcileDrainsMultiplePendingWakes pins that one pass services every wake
+// it observed, not just one. A crashed process can leave a count above 1; the
+// backstop enqueues that row exactly once (the work queue coalesces), so a pass
+// that subtracted only 1 would strand the remainder with nothing to re-enqueue it —
+// indefinitely when resync is disabled, and one per tick otherwise. Subtracting the
+// observed count drains it in the single pass the backstop scheduled.
+func TestReconcileDrainsMultiplePendingWakes(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	// Three wakes owed, as a crashed process would have left them.
+	for range 3 {
+		require.NoError(t, owe())
+	}
+	require.Equal(t, int64(3), count(t))
+
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, count(t), "one recovery pass drains every wake it observed")
+}
+
+// TestReconcilePendingWakeSurvivesConcurrentWake pins the condition the reviewer
+// surfaced, and the reason pending_wake is a count rather than a single token: a
+// second wake owed *while a reconcile is already servicing an earlier one* must not
+// be lost. Under the reverted design (the token was the target's resource_version)
+// two wakes for the same unchanged target shared a value, so the reconcile's clear
+// matched and dropped the second — and a crash before the in-memory requeue then
+// lost it entirely. As a +1/-1 count it cannot: the mid-pass increment outlives the
+// pass's subtraction (it lands above the count that pass observed), leaving the
+// object owed and re-enqueued by the backstop.
+func TestReconcilePendingWakeSurvivesConcurrentWake(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+
+	// The pass is servicing one owed wake; a second is owed during it.
+	inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, owe()
+	}
+	require.NoError(t, owe()) // the wake this pass loads
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count(t),
+		"the wake owed during the pass is not clobbered by the pass's decrement")
+}
+
+// failDecrementPendingWakeStore fails the durable-wake decrement while delegating
+// the rest, so a test can exercise the reconciler's log-and-continue branch.
+type failDecrementPendingWakeStore struct {
+	Store
+}
+
+func (s *failDecrementPendingWakeStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+	return errBoom
+}
+
+// TestReconcileDecrementPendingWakeErrorIsNonFatal pins that a failed decrement does
+// not fail the reconcile: the count stays up and the backstop re-enqueues (a
+// harmless extra pass), so shadowing the successful reconcile with the decrement
+// error would be strictly worse.
+func TestReconcileDecrementPendingWakeErrorIsNonFatal(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, func(s Store) Store {
+		return &failDecrementPendingWakeStore{Store: s}
+	})
+	require.NoError(t, owe())
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err, "a failed decrement must not fail an otherwise successful reconcile")
+	assert.Equal(t, int64(1), count(t), "the count stays owed for the backstop to retry")
 }
 
 // TestReconcileRunsGCAfterCommittedWritesOnError guards against stranding: a

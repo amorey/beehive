@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/amorey/beehive/internal/storeapi"
 )
 
 func TestControllerClientDeleteFinalizer(t *testing.T) {
@@ -346,7 +348,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	to, err := client.Create(ctx, cSpec{Val: "to"})
 	require.NoError(t, err)
 
-	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID))
+	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID, to.ResourceVersion))
 	deps, err := bh.store.ListIncomingRefs(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []Referrer{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
@@ -357,9 +359,9 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
 
-// addRefTxTrackingStore records whether AddRef ran inside a Within call, so a test
-// can assert AddDependency wraps its endpoint check + insert in one transaction.
-// Accessed only from the test goroutine, so it needs no locking.
+// addRefTxTrackingStore records whether the ref insert ran inside a Within call,
+// so a test can assert AddDependency wraps its endpoint check + insert in one
+// transaction. Accessed only from the test goroutine, so it needs no locking.
 type addRefTxTrackingStore struct {
 	Store
 	depth      int
@@ -372,9 +374,9 @@ func (s *addRefTxTrackingStore) Within(ctx context.Context, fn func(context.Cont
 	return s.Store.Within(ctx, fn)
 }
 
-func (s *addRefTxTrackingStore) AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error {
+func (s *addRefTxTrackingStore) AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.AddRefResult, error) {
 	s.addRefInTx = s.depth > 0
-	return s.Store.AddRef(ctx, fromID, toID, relation)
+	return s.Store.AddRef(ctx, fromID, toID, relation, targetRV)
 }
 
 // TestControllerClientAddDependencyIsTransactional pins that AddDependency runs its
@@ -395,9 +397,292 @@ func TestControllerClientAddDependencyIsTransactional(t *testing.T) {
 	to, err := client.Create(ctx, cSpec{Val: "to"})
 	require.NoError(t, err)
 
-	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID))
+	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID, to.ResourceVersion))
 	assert.True(t, tracking.addRefInTx,
 		"AddDependency must wrap its endpoint check + insert in one transaction")
+}
+
+// declareFixture is the shared setup for the targetResourceVersion tests: a
+// running control plane, a dependent, and a target.
+//
+// The two live in *different kinds* on purpose. The edge is deliberately
+// cross-kind, so cc — the ControllerClient the tests declare through — belongs to
+// the target's kind, not the dependent's: every test therefore exercises the
+// routing rule (the requeue follows fromID's own GroupKind, not the caller's) by
+// construction, and a wake misrouted to the declarer's reconciler shows up as a
+// dependent that was never woken. It also keeps reconciled free of the target's
+// own passes, so the channel carries only what these tests are asserting about.
+type declareFixture struct {
+	cc          ControllerClient[tStatus] // the target kind's client: a foreign kind to dep
+	store       Store
+	targetGK    GroupKind
+	depClient   Client[tSpec, tStatus] // creates the barrier object, see requireNotRequeued
+	dep, target *Object[tSpec, tStatus]
+	// witness is a second dependent of dep's kind whose edge to the target exists
+	// from the start. It is how moveTarget knows the waker has finished with a
+	// change: the waker requeues from its own lookup's results, so the witness
+	// reconciling is an effect that cannot precede that lookup — and it proves dep
+	// was absent from it. Watching the lookup itself cannot show that; a probe on
+	// ListIncomingRefs sees a call, not which change it is for, so one already in
+	// flight is indistinguishable from the one under test.
+	witness    *Object[tSpec, tStatus]
+	reconciled chan *Object[tSpec, tStatus] // dep's kind only
+}
+
+func newDeclareFixture(t *testing.T) *declareFixture {
+	t.Helper()
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	depGK := GroupKind{Kind: "Dependent"}
+	f := &declareFixture{
+		store:      store,
+		targetGK:   GroupKind{Kind: "Target"},
+		reconciled: make(chan *Object[tSpec, tStatus], 8),
+	}
+	// Resync disabled: a requeue that arrives must be the declaration's doing.
+	// Single-threaded so dispatch order is the queue's FIFO order, which is what
+	// makes requireNotRequeued's barrier exact. That is the default; pinning it
+	// here keeps the barrier's precondition visible rather than inherited.
+	_, err = Register(bh, depGK, &reconcileCapture{ch: f.reconciled},
+		WithResyncInterval(0), WithConcurrency(1))
+	require.NoError(t, err)
+	f.cc, err = Register(bh, f.targetGK, &noopController[tSpec, tStatus]{}, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	f.depClient = NewClient[tSpec, tStatus](bh, depGK)
+	f.dep, err = f.depClient.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	f.witness, err = f.depClient.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	f.target, err = NewClient[tSpec, tStatus](bh, f.targetGK).Create(ctx, tSpec{})
+	require.NoError(t, err)
+	// Declared straight through the store: the witness's edge is scaffolding, not a
+	// use of the guard under test.
+	require.NoError(t, addRef(ctx, store, f.witness.ID, f.target.ID, RelationDependsOn))
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+
+	// Drain both creation reconciles, so anything arriving afterwards is
+	// attributable to what the test does next.
+	seen := map[ObjectID]bool{}
+	for len(seen) < 2 {
+		seen[recv(t, f.reconciled).ID] = true
+	}
+	require.Equal(t, map[ObjectID]bool{f.dep.ID: true, f.witness.ID: true}, seen)
+	return f
+}
+
+// moveTarget changes the target and returns the version it held before, i.e. the
+// one a decision taken before the change was based on. It returns once the waker
+// has resolved this change with no edge to the dependent yet, so the change is
+// unclaimed and every later requeue of the dependent is the declaration's doing.
+func (f *declareFixture) moveTarget(t *testing.T) int64 {
+	t.Helper()
+	before := f.target.ResourceVersion
+	_, err := f.store.SetCondition(context.Background(), f.targetGK, f.target.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	require.Equal(t, f.witness.ID, recv(t, f.reconciled).ID,
+		"the waker resolved this change, and reached only the witness")
+	return before
+}
+
+// requireRequeued asserts the dependent was requeued.
+func (f *declareFixture) requireRequeued(t *testing.T) {
+	t.Helper()
+	assert.Equal(t, f.dep.ID, recv(t, f.reconciled).ID)
+}
+
+// requireNotRequeued asserts the dependent was not requeued — an absence, proven
+// with a barrier rather than a deadline. Creating a fresh object of the
+// dependent's kind enqueues it strictly after any wake the declaration owed:
+// AddDependency's post-commit hook has already run by the time it returns, and
+// the queue is FIFO over a single worker. So the dependent, if it had been woken,
+// must be dispatched before the barrier — and seeing the barrier first proves it
+// never was, with no waiting on the clock.
+func (f *declareFixture) requireNotRequeued(t *testing.T) {
+	t.Helper()
+	barrier, err := f.depClient.Create(context.Background(), tSpec{})
+	require.NoError(t, err)
+	assert.Equal(t, barrier.ID, recv(t, f.reconciled).ID,
+		"the dependent was requeued ahead of the barrier; no wake was owed")
+}
+
+// TestAddDependencyWakesWhenTargetMovedSinceRead pins the fix for the
+// read-then-declare race: a target that moved past the version the caller read
+// requeues the dependent, because the change landed while no edge existed to
+// carry it. The declaration goes through the target kind's ControllerClient (see
+// declareFixture), so this also pins that the requeue routes by fromID's own
+// kind rather than the declarer's.
+func TestAddDependencyWakesWhenTargetMovedSinceRead(t *testing.T) {
+	f := newDeclareFixture(t)
+	asRead := f.moveTarget(t)
+	require.NoError(t, f.cc.AddDependency(context.Background(), f.dep.ID, f.target.ID, asRead))
+	f.requireRequeued(t)
+}
+
+// TestAddDependencyNoWakeWhenTargetUnmoved is the anti-spin case, and the reason
+// the check is on the target's version rather than on the edge being new: a
+// level-triggered controller re-asserts its edges every pass, and nothing
+// throttles a self-sustaining requeue. See the rejected wake-when-the-edge-is-new
+// guard in TODO.md.
+func TestAddDependencyNoWakeWhenTargetUnmoved(t *testing.T) {
+	f := newDeclareFixture(t)
+	ctx := context.Background()
+	// Re-assert the same edge repeatedly with a current version, as a controller
+	// converging on an unchanging target does.
+	for range 3 {
+		require.NoError(t, f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+	}
+	f.requireNotRequeued(t)
+}
+
+// TestAddDependencyRejectsFutureResourceVersion pins the one wrong value the call
+// can actually detect. Versions come from one global cursor, so any other object's
+// is a plausible-looking int64 — but the target's own only moves forward, so a
+// version above it cannot have been read from the target. Left to stand it would
+// disable the guard silently and permanently (the comparison can never fire), so
+// it is rejected, and the edge rolls back with the transaction rather than
+// persisting with an inert guard.
+func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
+	f := newDeclareFixture(t)
+	ctx := context.Background()
+
+	err := f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1)
+	require.ErrorIs(t, err, ErrTargetResourceVersionFuture)
+
+	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration leaves no edge")
+	f.requireNotRequeued(t)
+
+	// The target's own current version is the boundary, and is accepted.
+	require.NoError(t, f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+}
+
+// TestAddDependencyStampRidesAddRef pins that the durable stamp is not a second
+// store call sequenced after the edge. Were it one, a caller nested in its own
+// Within could handle this method's error and commit the edge with no wake — a
+// dependent stranded on a stale read, the very race the version claim closes —
+// because a nested Within is a bare fn(ctx) that unwinds nothing.
+//
+// That the stamp *cannot* be a second call is now structural: the Store interface
+// carries no standalone increment, so nothing on this path could issue one. What
+// remains to check is the other half — that folding it into AddRef actually stamps —
+// which is what the two assertions below do: edge and wake land together.
+func TestAddDependencyStampRidesAddRef(t *testing.T) {
+	ctx := context.Background()
+	real := newClientTestStore(t)
+
+	bh, err := New(real)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+
+	stale := target.ResourceVersion
+	_, err = real.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	// Conjunction fires: new edge, target moved past stale.
+	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, stale))
+
+	refs, err := real.ListIncomingRefs(ctx, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, refObjectIDs(refs), "the edge landed")
+
+	owed, err := real.ListPendingWakeIDs(ctx, gk)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside AddRef")
+}
+
+// TestAddDependencyRejectsFutureResourceVersionNested is the rejection's harder
+// case: nested in a caller's Within, whose error the caller swallows. A nested
+// Within is a bare fn(ctx) with no transaction of its own, so returning the error
+// unwinds nothing — only the caller propagating it can roll anything back. The
+// edge must therefore never be written in the first place.
+func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
+	f := newDeclareFixture(t)
+	ctx := context.Background()
+
+	err := f.cc.Within(ctx, func(ctx context.Context) error {
+		if err := f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1); err != nil {
+			return nil // the caller logs and carries on; the outer tx still commits
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration must leave no edge, committed or not")
+}
+
+// TestAddDependencyStaleResourceVersionWakesAtMostOnce pins the wake's
+// once-per-edge bound against the caller who gets it wrong. A version that never
+// advances — cached across passes, or read once and reused — compares as "moved"
+// forever, so gating on that alone would re-fire every pass, and nothing throttles
+// the result. The edge-new half of the conjunction is what stops it: the second
+// declaration inserts nothing, so it wakes nothing, however stale the version.
+func TestAddDependencyStaleResourceVersionWakesAtMostOnce(t *testing.T) {
+	f := newDeclareFixture(t)
+	ctx := context.Background()
+	stale := f.moveTarget(t)
+
+	// First declaration: the edge is new and the target moved, so this is the
+	// requeue the guard exists for.
+	require.NoError(t, f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, stale))
+	f.requireRequeued(t)
+
+	// Every later pass re-asserts the same edge with the same stale version.
+	for range 3 {
+		require.NoError(t, f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, stale))
+	}
+	f.requireNotRequeued(t)
+}
+
+// TestAddDependencyZeroResourceVersionSkipsCheck pins the sentinel: 0 is "no
+// opinion", the correct value when the edge is declared before the target is
+// read. It must not mean "wake unconditionally" — that would reproduce the spin
+// above in any caller that passes the zero value.
+func TestAddDependencyZeroResourceVersionSkipsCheck(t *testing.T) {
+	f := newDeclareFixture(t)
+	f.moveTarget(t)
+	require.NoError(t, f.cc.AddDependency(context.Background(), f.dep.ID, f.target.ID, 0))
+	f.requireNotRequeued(t)
+}
+
+// TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:
+// a declaration rolled back by the controller's enclosing transaction never
+// happened, so there is no edge to have missed a change and nothing to requeue.
+func TestAddDependencyNoWakeOnRollback(t *testing.T) {
+	f := newDeclareFixture(t)
+	ctx := context.Background()
+	asRead := f.moveTarget(t)
+
+	err := f.cc.Within(ctx, func(ctx context.Context) error {
+		if err := f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, asRead); err != nil {
+			return err
+		}
+		return errBoom
+	})
+	require.ErrorIs(t, err, errBoom)
+
+	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	require.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "the rolled-back declaration left no edge")
+	f.requireNotRequeued(t)
 }
 
 func TestControllerClientHasIncomingRefs(t *testing.T) {
@@ -479,20 +764,20 @@ func TestControllerClientHasIncomingRefsStoreError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// failAddRefStore returns an error from AddRef.
+// failAddRefStore returns an error from the ref insert.
 type failAddRefStore struct {
 	fakeStore
 }
 
-func (s *failAddRefStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
-	return errBoom
+func (s *failAddRefStore) AddRef(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
+	return storeapi.AddRefResult{}, errBoom
 }
 
 func TestControllerClientAddDependencyStoreError(t *testing.T) {
 	bh, err := New(&failAddRefStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.AddDependency(context.Background(), 1, 2)
+	err = cc.AddDependency(context.Background(), 1, 2, 0)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -659,7 +944,7 @@ func TestControllerClientReadRefs(t *testing.T) {
 	require.NoError(t, err)
 	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
-	require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, child.ID, owner.ID, RelationDependsOn))
 
 	ref, ok, err := cc.GetOwner(ctx, child.ID)
 	require.NoError(t, err)

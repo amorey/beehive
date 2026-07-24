@@ -286,9 +286,10 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte
 		return nil, err
 	}
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it
-	// via ListIncomingRefs(owner, RelationOwnedBy).
+	// via ListIncomingRefs(owner, RelationOwnedBy). No version claim and no wake
+	// stamp: an owner edge carries no read this call could be racing.
 	if co.owner != nil {
-		if err := c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy); err != nil {
+		if _, err := c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
 			return nil, err
 		}
 	}

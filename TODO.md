@@ -58,6 +58,48 @@ tell "we decided against this for now" from "nobody thought of it."
   default vs opt-in) wants a decision, not a guess. Revisit before making any
   further claim that resync backstops event delivery — today it does not.
 
+- **`StartupReconcileNone` + `resyncInterval = 0` silently disables all crash
+  recovery for unsettled objects** — known, not fixed. `enqueueUnsettled` — the only
+  path that re-derives `observed_generation < generation` — runs solely under
+  `StartupReconcileUnsettled`/`All` at startup (`reconciler.run`'s strategy switch) or
+  on a resync tick, and the tick's `resync` channel is nil when `resyncInterval <= 0`.
+  So with both knobs off, nothing ever enqueues an unsettled object. An object a prior
+  process left with `observed_generation < generation` — crashed mid-reconcile, or its
+  spec updated then the process died before the controller settled it — or a freshly
+  created object (`observed_generation IS NULL`) whose create wake was lost to the same
+  crash, is never reconciled on restart: its desired spec is simply never actuated, with
+  no error and no log. In-process new work is unaffected (`Create`/`Update` enqueue via
+  `wakeAfterCommit`); this is purely a restart-recovery hole, the spec-convergence
+  sibling of the dependency-wake durability fix (`pending_wake`, now resolved below).
+
+  It is the *combination* that breaks, not either setting alone. `StartupReconcileNone`
+  is documented as "leaving the periodic resync … as the only driver" — it presupposes
+  resync is on — and `resyncInterval = 0` removes exactly that driver. Each is
+  individually documented as dropping a backstop; together they contradict (None
+  delegates convergence to resync; resync is disabled), and nothing rejects or warns
+  about the contradiction. The silence is the defect.
+
+  What flags it as an oversight rather than a decision: startup already resumes
+  deletion-pending **unconditionally** (`reconciler.run`'s `enqueueDeletionPending`,
+  outside the strategy switch) on the reasoning that "a process that crashed mid-delete
+  must still drive those rows to removal." The identical argument applies verbatim to
+  unsettled objects — a process that crashed mid-reconcile must still drive them to
+  convergence — yet their resumption is gated behind the strategy. Crashed-mid-*delete*
+  is always recovered at startup; crashed-mid-*reconcile* is not, under None.
+
+  Two candidate fixes. (a) Enqueue unsettled at startup unconditionally, next to
+  `enqueueDeletionPending`, on the same "orthogonal to the spec strategy" reasoning —
+  small, and it makes None mean "no *full* re-confirm pass" rather than "no recovery at
+  all." (b) Reject or warn on the contradictory `None` + `resync = 0` combination at
+  `Start`. Deferred because it tangles with the resync-strategy item above (both are
+  about what the tick/startup must cover) and should land as one decision. It is
+  distinct from that item, though: that one is about *settled* dependents whose
+  generation never moves, this is about *unsettled* objects across a restart. Revisit
+  alongside the resync strategy, and note the parallel to the dependency-wake durability
+  fix (`pending_wake`, resolved): the two are the same crash-recovery gap for two
+  different signals, and candidate (a) is literally that fix's move — unconditional
+  startup/tick enqueue of a specific known-owed set — applied to unsettled objects.
+
 - **Three silent loss points in the dependency waker, none of them logged** —
   known, not fixed. Given the item above, a dropped dependency wake is permanent
   for the process, so each of these is a stuck-dependent bug rather than a latency
@@ -79,6 +121,19 @@ tell "we decided against this for now" from "nobody thought of it."
       something that does not exist, and is the likely reason a reader would
       believe the gap is already handled.
 
+  **`AddDependency`'s guard does not cover these, by construction.** It would have
+  the evidence to: a dependent re-declaring its edge after a dropped wake passes the
+  version it read *before* the change, and the target's current version is already
+  past it. But the wake is gated on that call having created the edge, so a
+  re-declaration never fires it. Dropping that half to pick up the repair trades a
+  bounded miss for an unbounded one — a caller whose version never advances (cached
+  across passes) would then re-fire every pass, unthrottled, and unlike a missed wake
+  that spin is invisible to the caller and permanent for the process. The guard is
+  deliberately an intent recorder for the declare window, not a staleness detector;
+  what repairs a *lost* wake is a backstop that re-derives staleness, which is the
+  `observed_cursor` watermark recorded under the item above. Noted here so the
+  conjunction is not "simplified" away later on the reasoning that it is redundant.
+
   The fix for the first two is a `missedWake` flag that forces the next resync
   tick to enqueue everything for registered kinds — the targeted version of the
   item above, free in the normal case — plus logging at Warn. The third is a
@@ -86,84 +141,104 @@ tell "we decided against this for now" from "nobody thought of it."
   Deferred with them because the flag only means something once the tick can do a
   full pass.
 
-- **`AddDependency`'s read-then-declare race is unguarded, and invisible to the
-  resync backstop** — known, not fixed; a guard was built and reverted (see below).
-  A controller reads target T, decides, then declares the edge. A change to T
-  landing in that window reaches nobody: `wakeDependents` resolves dependents at the
-  instant of the change, and the edge did not exist yet. The dependent then settles
-  at `obj.Generation` on the stale read, so `ListUnsettledIDs` structurally cannot
-  see it (the resync item above), and it stays wrong until T changes again or the
-  process restarts — with no error, no condition, and no log line.
+- **A target change landing *mid-reconcile* is safe in memory, but has no durable
+  twin** — analyzed, in-memory half verified sound, durable half not fixed. The
+  scenario: D depends on T, T changes and wakes D, and T changes *again* while D's
+  reconcile is still running. The question is whether the second change is lost to
+  the pass that was already in flight when it arrived.
 
-  The window is sub-millisecond and opens *once per edge*: every later pass has the
-  edge in place and the waker covers it normally. What earns this an entry is the
-  consequence rather than the odds — it is the one failure mode here that is both
-  permanent and invisible to the mechanism advertised as the correctness backstop.
-  The exposure is also correlated rather than uniform: startup is when edges are
-  first declared *and* when their targets churn most.
+  **In memory it is not.** `workQueue` keeps `dirty` (queued) and `processing`
+  (handed out, not yet `done`) as separate sets. `get` moves the id from `dirty` to
+  `processing`; a wake arriving mid-pass hits `addLocked`, which sets `dirty[id]`
+  but sees the id in `processing` and deliberately does *not* push to `items`; and
+  `runWorker` calls `work.done(id)` unconditionally after `adapter.reconcile`
+  returns — error or not — where `done` finds the dirty bit and makes the id
+  dispatchable immediately. So the second change costs one extra pass, never a lost
+  one. The publish side orders correctly too: the wake is registered post-commit
+  (`wakeAfterCommit` → `flush`), so the requeue can never point at an uncommitted
+  row. The benign variant — T changing after `get` but *before* D reads T — is
+  simply a level-triggered no-op re-pass on a value D already saw.
 
-  **The obvious guard is not the cheap answer it looks like.** Waking `fromID` when
-  the edge is new — pre-read via `ListOutgoingRefsByRelation` inside `AddDependency`'s
-  existing `Within`, wake after commit when the target is absent from it — was
-  implemented, reviewed, and reverted. Two problems. First, "new" ends up measured
-  against the *current transaction*, so a controller that clears and re-declares its
-  dependency set each pass (`DeleteDependency` then `AddDependency`) finds the
-  pre-read empty every time and wakes itself every time; nothing throttles the
-  result, since `typedController.reconcile` has no already-settled skip on the
-  dispatch path (that check lives only in `ListUnsettledIDs`) and `workQueue.addLocked`
-  has no rate limiter, so it reconciles at CPU speed. Routing the wake through
-  `addAfter` bounds that to the delay cadence but never converges. Second, and the
-  decisive one: the pre-read is paid on *every* `AddDependency` call, and the
-  level-triggered style means every dependent re-asserts its edges every reconcile
-  forever. On that path it always answers "already declared, don't wake" — so it is a
-  permanent extra indexed query per dependency per reconcile, bought to cover a
-  once-per-edge window. The re-assert and fan-out cases were fine (N new edges in one
-  pass register N post-commit hooks naming the same `fromID`, which collapse on the
-  `dirty` set to one requeue); the cost and the rebuild-deps spin are what sank it.
+  **What is missing is durability.** This wake is in-memory only. `pending_wake`
+  covers the *declare* window (`AddRef` stamps when a new edge's caller-supplied
+  target version is already stale) and nothing else, so an ordinary target-change
+  wake has no persisted "reconcile owed". A crash between T's commit and D's
+  re-dispatch loses it permanently: D settled at its own generation, so
+  `ListUnsettledIDs` structurally cannot see it, and per the resync item above the
+  tick is unsettled-only. The mid-reconcile timing makes the window *wider* than
+  the plain case — the owed wake sits in `dirty` behind a whole reconcile pass
+  rather than a queue hop — but the loss mode is the same one, not a new one.
 
-  **Proposed fix: a per-object dependency watermark, and no wake at all.** Record on
-  `objects` the store's `resource_version` as of when the reconciler *loaded* the
-  object. A backstop query joins `refs ⋈ objects` on `to_id` (the PK
-  `(from_id, to_id, relation)` already leads with `from_id`) and enqueues any
-  dependent whose target has a higher `resource_version`. One column suffices despite
-  N dependencies only because `resource_version_seq` is a single global cursor every
-  writer draws from — generations are per-object counters and are not comparable
-  across targets. This puts dependencies under the same "events are latency, resync is
-  correctness" rule as everything else, and needs no pre-read, no wake, and no API
-  change.
+  Deferred because the fix is not local to this timing. Stamping `pending_wake` in
+  `wakeDependents` would make every target change a write per dependent on the
+  wake path — the cost `pending_wake` avoids today by riding a write `AddRef` was
+  already doing — and the decrement is per-pass, so a stamp-per-change would need
+  the same count-not-flag reasoning re-derived against a much higher write volume.
+  The cheaper repair is the `observed_cursor` watermark / full-sweep resync
+  recorded under the two items above: it re-derives staleness instead of tracking
+  each owed wake. Revisit with those; this item exists so the in-memory analysis
+  is not redone, and so "the queue handles it" is not mistaken for "it survives a
+  restart."
 
-  Two details carry it. Stamp the *load-time* rv, not "max rv among my deps" computed
-  at write time: deriving it inside the store re-inherits the original race, asserting
-  the dependent saw a change that landed after its read. And advance the watermark in
-  `UpdateStatus`, the moment the object settles — including on the content-no-op
-  branch, the carve-out `observed_generation` already has. That write site is what
-  avoids a *new* permanent-unsettled hazard: a stamp advanced by asserting an edge
-  would strand any controller that stops re-asserting, whereas every controller that
-  converges calls `UpdateStatus` by definition. The residual case — a controller that
-  never calls it at all — is already permanently unsettled (`observed_generation IS
-  NULL`), so it adds no condition that did not exist. The scheme over-flags: any
-  dependency change during a reconcile costs one extra pass even when the read
-  happened to be late enough. That is the self-healing-over-efficiency trade taken
-  elsewhere, and it strictly converges, since the watermark advances on every settle.
+- **`Create` accepts a `WithOwner` naming an already-deleting owner, stranding both
+  rows when resync is off** — known, not fixed. The ownership mirror of the
+  `AddDependency` race above: there the edge is declared after the *change*, here
+  after the *cascade*. `insertObject` checks nothing about the owner's lifecycle, and
+  `AddRef` only verifies both endpoints exist — never that the target is live — so a
+  child created against an owner that is already deletion-pending, and whose
+  `MarkOwnedForDeletion` pass has already run, is born live and unmarked under a
+  finalizing owner. Its `owned_by` edge is an unconditional live claim in
+  `HasIncomingRefs` (only deletion-pending `depends_on` sources are excluded), so the
+  owner can never be physically collected.
 
-  Other alternatives rejected. *Per-edge* `observed_generation` on `refs` works only
-  if the generation is controller-supplied (a store-derived stamp inherits the race
-  one level up), which means breaking `AddDependency`'s signature and taxing every
-  controller — and it is the variant that strands non-re-asserting controllers.
-  *Documenting that controllers should requeue themselves* turns a silent race into
-  documentation, and a controller doing it correctly needs its own pre-read of the
-  dependency set, while one doing it naively (`Requeue: true` unconditionally)
-  reproduces the spin above in user code. *Scoping "new" to the reconcile* (track
-  edges removed this pass on the existing `pendingWakes` collector and suppress the
-  wake for a delete-then-re-add) fixes the spin but not the pre-read cost, and not the
-  invisible-to-resync gap that is the actual defect.
+  Nothing event-driven recovers it. `AddRef` bumps no `resource_version` and emits
+  nothing, so no watcher fires; `wakeDependents` reads only `depends_on` and would
+  ignore the edge regardless; the child's own `collect` returns at the
+  `DeletionRequestedAt == nil` early-out because *it* is not finalizing; and the owner
+  is re-woken by `collect`'s `toWake` referents only when a child row is physically
+  *removed*, which this one never will be. Reproduced with `WithResyncInterval(0)`, an
+  owner held alive by a finalizer, and the cascade provably complete (its first child
+  already collected): the second child stays alive and unmarked indefinitely while the
+  owner sits deletion-pending, 3/3 runs.
 
-  Deferred because the fix is a schema migration plus a reconciler change plus a new
-  backstop query, to harden a race that fires once per edge. Revisit when the
-  resync-strategy item above is decided — these share a tick and should land as one
-  story — or sooner if a real controller is found that reads a target and settles on
-  it in the same pass that first declares the edge, which makes the hole live rather
-  than theoretical.
+  **Unlike the `depends_on` race, this one self-heals whenever resync is on.**
+  `sweepDeletionPending` and `enqueueDeletionPending` re-list the still-pending owner
+  and `collect` re-runs `MarkOwnedForDeletion`, which is explicitly built to be re-run
+  and picks the new child up; the exposure is one resync interval. The permanent
+  strand is confined to `resyncInterval = 0` — which is exactly the configuration the
+  GC tests treat as supported, and the one where every other GC path was deliberately
+  made event-complete. It is also *visible* where the dependency race is not: the
+  owner is observably stuck deletion-pending rather than silently settled on a stale
+  read.
+
+  **The fix looks cheap, but the behavior is the open question.** `insertObject`
+  already runs inside the create transaction, so reading the owner's
+  `DeletionRequestedAt` there is one indexed read paid once per child creation — not
+  the once-per-reconcile-forever tax that sank `AddDependency`'s pre-read guard. What
+  it should *do* is undecided. Rejecting with an error is the honest signal (the
+  caller asked to attach to something being torn down) but adds a new failure mode to
+  `Create` and races anyway — the owner can be deleted the instant after the check.
+  Creating the child already-marked is self-consistent and needs no new error, but
+  manufactures a deletion-pending object the caller never asked to delete, and its
+  spec is then unreachable. A third option is to leave `Create` alone and make the
+  *sweeper* the answer by having it run unconditionally at least once per some
+  cadence even when resync is disabled — which is really the resync-strategy item
+  above wearing a different hat.
+
+  Whichever is chosen, the owner's `DeletionRequestedAt` is already on the row
+  `AddRef` reads for its endpoint check — the same check that reports
+  `TargetResourceVersion` for the dependency guard. Adding it to `AddRefResult`
+  would let `insertObject` see the owner's lifecycle from the write it already
+  makes, rather than a second read, exactly as `AddDependency` reads the target's
+  version from that one call.
+
+  Deferred because the window needs a finalizer-held owner *plus* disabled resync to
+  become permanent, and because picking between reject / create-marked is a public API
+  decision worth making alongside the resync-strategy item rather than ahead of it.
+  Revisit if a controller is found that creates children against owners it does not
+  itself hold a finalizer on, or when the resync strategy is settled. There is no test
+  for it yet: the repro exists only as a throwaway, and `TestMarkOwnedForDeletionCascadesThenIsNoOp`
+  re-cascades over a fixed child set, so it never adds a child between passes.
 
 - **`advanceGCNow`'s synchronous collect inherits the caller's cancellation** —
   known, not fixed, and already documented inline. With resync disabled, a
@@ -178,11 +253,67 @@ tell "we decided against this for now" from "nobody thought of it."
   a slightly wasteful self-healing path over a silent strand, so it is worth
   re-taking on those terms rather than left as settled. One line if so.
 
-- **`reconciler.enqueueFrom` swallows its list error** — known, not fixed, and the
-  benign member of this set: a failed resync list skips one tick and the next
-  retries, so it self-heals on cadence. The only gap is that it is silent, unlike
-  the GC sweeper's equivalent (`sweepDeletionPending`), which warns. Worth a log
-  line when one of the items above is touched; not worth a commit on its own.
+- **A client-only dependent's `pending_wake` count is never reclaimed** — known, not
+  fixed. Edges are deliberately cross-kind, so `AddDependency(clientOnlyID, target,
+  staleRV)` is legal and its stamp lands on a row whose kind has no reconcile loop.
+  Nothing drains it (`DecrementPendingWake` is called only by a reconcile) and
+  nothing scans it (`ListPendingWakeIDs` is per-kind, called only by that kind's
+  reconciler), so the count and its `idx_objects_pending_wake` entry persist for the
+  life of the row. Re-declaring an edge — `DeleteDependency` then `AddDependency`
+  with a claim the target has already moved past — satisfies the edge-new half again
+  and increments it again, so it is not even bounded by the distinct-target count.
+  Earlier prose called this "inert"; it is *unread*, which is not the same thing.
+
+  The impact is small and does not compound. Nothing reads the count, so there is no
+  behavioural effect while the kind stays client-only; and if it later gains a
+  controller, the first reconcile subtracts the whole observed count, so the accrued
+  N costs **one** spurious pass, not N. What remains is durable storage and an index
+  entry nobody harvests.
+
+  **Gating the stamp on registration is the wrong fix**, and is why it wasn't taken.
+  The stamp is SQL inside `AddRef` (it has to be, for the ordering guarantee the
+  nested-`Within` contract forces), and the store cannot know which kinds are
+  registered — so the caller would have to resolve `fromID`'s kind before every
+  declare, which is exactly the per-call pre-read that sank the original wake guard,
+  on a path level-triggered controllers re-run forever. It would also bake in a fact
+  that changes between runs: a kind registered later would have lost its wake
+  outright.
+
+  The fix that fits is a **cross-kind sweeper**, the `pending_wake` analogue of the
+  global GC sweeper's `ListAllDeletionPendingIDs`: list rows with a nonzero count
+  across all kinds, zero the ones whose kind has no registered reconciler, on the
+  sweeper's existing cadence. Off the hot path, symmetric with machinery that already
+  exists, and it reclaims the index entry. Deferred because it is new store surface
+  plus a sweep for an effect that is storage-only, and because the "kind gains a
+  controller later" case argues for keeping the count — so whether to reclaim at all
+  is a judgement call worth making deliberately. Revisit if a deployment is found
+  that declares many edges from client-only kinds, where the index entries would
+  actually be measurable.
+
+- **`CreateObject` takes a `RawObject` and silently drops most of it** — known, not
+  fixed, and the input-side twin of the item below. `RawObject` is a *read*-shaped
+  DTO (it mirrors the full row, and is publicly aliased as `beehive.RawObject`), but
+  it is also `CreateObject`'s parameter. The INSERT binds six caller fields — group,
+  kind, slug, spec, schema_version_spec, finalizers — and ignores the other twelve:
+  `ID`, `ResourceVersion`, `CreatedAt`, `UpdatedAt` (store-assigned), `Status` and
+  `Generation` (hardcoded `NULL` and `1`), `StatusVersion`, `ObservedGeneration`,
+  `ObservedAt`, `DeletionRequestedAt`, `Conditions`, and `PendingWake`. A caller
+  passing any of them gets a row without it and no error.
+
+  `Status` is the sharp one: seeding a status on create is a plausible thing to
+  attempt, and it is discarded silently. The store-assigned fields are defensible
+  (a caller cannot pick its own id or cursor), but nothing says so at the call site —
+  the struct advertises eighteen settable fields and honours six.
+
+  The fix is to stop reusing the read shape for the write: a `CreateObjectInput` (or
+  functional options) carrying only the six fields create actually accepts, so the
+  compiler rejects the rest instead of the store dropping them. Deferred because
+  `RawObject` is an exported alias, so narrowing the parameter is a breaking change
+  to an externally-implementable `Store`, and it wants doing alongside the return-shape
+  item below rather than as a second separate break. Surfaced in review of the
+  `pending_wake` work, where the new field simply joined the existing eleven; noted
+  here so the next reader sees it is a pre-existing shape problem and not something
+  that arrived with the durable wake.
 
 - **Mutators materialize a `RawObject` no caller reads** — known, not fixed, and
   the general form of the point the `DeleteBySlug` item above records for one
@@ -256,7 +387,139 @@ tell "we decided against this for now" from "nobody thought of it."
   shape sharing one DB file. Revisit before the first real `Migrator` consumer ships
   a v2, or the first time a rollback across a schema bump is a supported operation.
 
+- **A nested `Within` is not a rollback boundary, so no multi-write composition is
+  atomic against a caller that handles its error** — known, not fixed, and the
+  general form of a defect already fixed once in the specific.
+
+  `sqliteStore.Within` returns `fn(ctx)` when it finds an ambient transaction: the
+  nested call joins the outer one and opens nothing of its own. So an error
+  returned from inside a nested `Within` unwinds *nothing*. Only the outermost
+  caller propagating it to the real `Within` rolls anything back, and a caller that
+  logs and carries on commits every write that already landed. Any method
+  performing two writes is therefore atomic only by the grace of its callers:
+  `ControllerClient.DeleteDependency` (the `DeleteRef` plus its GC re-check), any
+  controller's own two-write `Within` block, and — until it was restructured —
+  `AddDependency`.
+
+  That last one is the worked example. Its durable wake stamp used to be a second
+  store call sequenced after `AddRef`; a reviewer pointed out that a caller
+  swallowing the stamp's error would commit the edge with neither the stamp nor the
+  requeue, which is exactly the stranded-dependent race the edge's version claim
+  exists to close. The fix was local and ordering-based: fold the stamp into
+  `AddRef` ahead of the insert, so the only write that can fail after the edge
+  exists is none. That is the same trick `ErrTargetResourceVersionFuture` already
+  used, and it works precisely because there were two writes and one could be moved.
+  It does not generalize — reorder anything whose second write depends on the first
+  and you have nowhere to put it.
+
+  The general fix is `SAVEPOINT`. The nested branch of `Within` would issue
+  `SAVEPOINT`, `ROLLBACK TO` on an `fn` error and `RELEASE` on success, making every
+  nested composition a real boundary and retiring the class — including the
+  contortions above, which could then be written in whatever order reads best.
+
+  Deferred because the cost is not in the SQL. The tx-scoped `eventCollector` is
+  append-only and drains once at the outermost commit, so a savepoint rollback has
+  to unwind it too — buffered emits *and* `AfterCommit` hooks truncated back to a
+  watermark taken at `SAVEPOINT`, with the `flushed` latch's late-registration path
+  thought through against it — or writes that were just rolled back still publish to
+  watchers and still fire their wakes. And it changes the semantics of every nested
+  `Within` in the codebase at once, on a store where the whole suite runs through
+  this one function; anything today relying on "a nested error unwinds nothing"
+  silently starts behaving differently, which needs an audit rather than an
+  assumption. Two extra statements per nested `Within` on a single-connection store
+  is the smaller cost.
+
+  Revisit when a second instance of the class shows up that ordering *cannot* fix —
+  that is the signal that the specific fixes have run out — or if the collector ever
+  grows a watermark for another reason, which removes most of the work.
+
 ## Resolved
+
+- **`reconciler.enqueueFrom` logs its list error** — done. It was silent, on the
+  reasoning that a failed resync list skips one tick and the next retries, so it
+  self-heals on cadence. `enqueuePendingWake` broke that premise: at
+  `resyncInterval = 0` its startup call is the *only* invocation, so a failed
+  `ListPendingWakeIDs` defers every recorded owed wake to the next process start —
+  the one backstop whose entire purpose is not losing them, failing indistinguishably
+  from "nothing was owed". It now warns, and takes a `source` naming which backstop
+  lost its pass, since the cost differs sharply between them. Surfaced in review of
+  the `pending_wake` work, which is exactly the "when one of the items above is
+  touched" trigger the deferred entry named. `reconciler.log()` was added alongside
+  it (the nil-safe accessor `typedController` already had), because the enqueue
+  helpers are reachable on reconcilers built outside `Register`.
+
+- **Durable twin for the in-memory dependency wake (`pending_wake`)** — done.
+  `AddDependency`'s guard (see CLAUDE.md) produced an ordinary `wakeAfterCommit`
+  requeue, and the work queue does not outlive the process: a crash between the
+  edge's commit and the dispatch left the edge in place, the dependent settled on a
+  stale read, and *nothing* recording that a reconcile was owed — the same permanent,
+  silent end state the race had, now reachable with a correct guard. Unlike every
+  other in-memory wake, dependency staleness left no persisted trace (a lost
+  spec-write wake still leaves `generation > observed_generation` for the resync tick
+  to re-derive).
+
+  The fix increments `objects.pending_wake` under the same edge-new ∧ target-moved
+  conjunction that fires the wake — so the durable record and the edge commit
+  together. It lives *inside* `AddRef` and *before* the insert, reporting through
+  `AddRefResult.WakeStamped`; as a second store call after `AddRef` returned it was
+  not actually indivisible from the edge, since a nested `Within` unwinds nothing
+  (see "A nested `Within` is not a rollback boundary" above, which records both the
+  reviewer's finding and why the general fix was not taken). The stamp is
+  deliberately *not* gated on `fromID`'s kind being registered: an ungated stamp on
+  a client-only kind is an unread count nothing scans (see the sweeper item above), where a gated one loses the wake
+  outright if that kind ever gains a controller — and gating would have meant
+  running a beehive predicate inside the write transaction and deciding
+  registration in two places, when `enqueueIfRegistered` already decides it once.
+  `typedController.reconcile` subtracts, on a successful pass, **the count it
+  loaded** (`DecrementPendingWake(id, observed)`, floored at 0), skipping the write
+  when that count is 0. `pending_wake` is a **count of outstanding wakes, not a
+  single token** — that is what survives a wake owed *while an earlier one is being
+  reconciled*: it lands above `observed` and so survives the subtraction, where a
+  token compared to the loaded value (an earlier design used the target's rv) would
+  have been dropped when two wakes for the same unchanged target shared a value, then
+  lost to a crash (surfaced in review, pinned by
+  `TestReconcilePendingWakeSurvivesConcurrentWake`). Subtracting `observed` rather
+  than 1 is the second half, also from review: one pass reads the target's *current*
+  state, addressing every wake outstanding when it began, and the backstop enqueues a
+  row only once (the work queue coalesces), so a `-1` would strand the remainder with
+  nothing to re-enqueue it — indefinitely at `resyncInterval=0`, one per tick
+  otherwise (`TestReconcileDrainsMultiplePendingWakes`). No follow-up requeue is
+  scheduled: a residual exists only when an increment landed mid-pass, and that
+  increment carried its own in-memory requeue. A failed subtraction is logged and
+  left for the backstop rather than requeued, which would spin against a store that
+  keeps failing. The
+  backstop `ListPendingWakeIDs` rides the partial index
+  `idx_objects_pending_wake WHERE pending_wake != 0` — a sibling of
+  `ListDeletionPendingIDs`, not folded into `ListUnsettledIDs` (an owed wake is
+  orthogonal to spec convergence), enqueued unconditionally at startup and each
+  resync tick so `StartupReconcileNone` + `resyncInterval=0` still recovers.
+  `TestDependencyRequeueLostAcrossRestart` now passes unskipped (restart under
+  `StartupReconcileNone` + `resyncInterval=0`, 3/3).
+
+  Two things it deliberately does *not* do. It is a durable *wake*, not a derived
+  backstop: it recovers only signals something explicitly raised, so a wake lost
+  because `wakeDependents` swallowed its `ListIncomingRefs` error (see "Three silent
+  loss points" above) still heals never, and "resync is the correctness backstop"
+  stays false in general. And it shares spec-convergence's coverage everywhere *but*
+  the unconditional startup/tick enqueue — which is why it works under
+  `StartupReconcileNone` + `resyncInterval=0` where plain unsettled recovery does not
+  (see "`StartupReconcileNone` + `resyncInterval = 0` silently disables all crash
+  recovery for unsettled objects"); a wake owed is a specific known-owed reconcile,
+  like a pending deletion, so unconditional resumption is justified where a broad
+  unsettled sweep would not be.
+
+  The **per-object `observed_cursor` watermark** stays the recorded stronger
+  alternative: stamp the global `resource_version` as of the reconciler's load,
+  advance it on every successful pass, and enqueue any dependent whose target's
+  version exceeds it. Because it *derives* staleness rather than recording an intent,
+  it heals any lost wake — including the three silent loss points — and subsumes
+  `pending_wake`. It costs a write on every successful pass (vs only when something is
+  owed) and over-flags (a target change during a pass costs an extra tick even when
+  the read was late enough), so it was not taken now; revisit it if the waker's silent
+  loss points are addressed. Storing the cursor **per-edge on `refs`** was rejected
+  outright: advanced only on re-assert, a controller that declares an edge once and
+  never re-asserts freezes its cursor and the backstop re-enqueues it every tick
+  forever.
 
 - **Slug-keyed delete as a store mutator (`RequestDeletionBySlug`)** — done.
   `Client.DeleteBySlug` previously resolved the slug with `GetObjectBySlug` and then

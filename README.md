@@ -439,7 +439,7 @@ type ControllerClient[Status any] interface {
     DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
     RecordEvent(ctx context.Context, id ObjectID, event EventSpec) error
     DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
-    AddDependency(ctx context.Context, fromID, toID ObjectID) error
+    AddDependency(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
     DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
     HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
     // Lazy secondary lookups, for reading an object's edges during reconcile.
@@ -516,6 +516,12 @@ func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log
 `WithOnCreate` is the commit-safe channel for a create-conditional side effect (an external call, an in-memory counter). It is registered on the same post-commit path as the reconciler wake, so it runs once after the *outermost* commit and never on a rollback. `Create` always fires it; `GetOrCreate` fires it only on the create branch, not when it returns an existing row. Prefer it over branching on `GetOrCreate`'s returned `created` bool: that bool is synchronous, so inside a caller's `ControllerClient.Within` it is set before the enclosing transaction commits, and acting on it there fires the side effect for a row a later rollback would discard.
 
 `AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.
+
+`AddDependency` takes `targetResourceVersion`: the `ResourceVersion` of the target *as the decision to depend on it was read*, not a freshly fetched one. A change to the target that lands between that read and the edge's commit would otherwise reach nobody — the waker resolves dependents at the instant of the change, and the edge does not exist yet — so if the target has moved past the version you pass, the dependent is requeued. Pass `0` to skip the check; that is the right value when you declare the edge *before* reading the target, which needs no check.
+
+A version *above* the target's current one is rejected with `ErrTargetResourceVersionFuture` — versions only move forward, so it cannot have come from reading the target. The rejection happens before anything is written, so no edge is declared even if you call it inside your own `Within` and ignore the error.
+
+The requeue fires at most once per edge — it is also gated on the call that creates the edge, and every change after that reaches an edge the waker already sees. So re-asserting your edges on every pass costs nothing after the first, and a stale version costs at most one spurious reconcile rather than a loop.
 
 Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned):
 

@@ -63,6 +63,15 @@ var ErrObservedGenerationFuture = errors.New("beehive: observed generation excee
 // convert already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
+// ErrTargetResourceVersionFuture is returned by AddRef when the caller's
+// claimed version of the target exceeds the target's current one. An object's
+// version only moves forward, so a version above the target's own cannot have come
+// from reading it — the caller passed some other object's version, or some other
+// field. Checked before the insert, so a rejected call writes nothing: the sibling
+// of ErrObservedGenerationFuture, and the same argument — a caller can only report
+// what it could have observed.
+var ErrTargetResourceVersionFuture = errors.New("beehive: target resource version is ahead of the target")
+
 // ChangeType classifies a Change.
 type ChangeType string
 
@@ -168,10 +177,17 @@ type RawObject struct {
 	ObservedAt          *time.Time
 	ResourceVersion     int64
 	DeletionRequestedAt *time.Time
-	Finalizers          []string
-	Conditions          []Condition // assembled on reads; nil when the object has none
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// PendingWake is the count of owed durable dependency wakes (see the
+	// objects.pending_wake column). 0 means nothing owed. The reconciler reads it to
+	// decide whether to decrement on a successful pass. Store-owned and
+	// store-assigned, like ResourceVersion: it is reported on reads and moved only by
+	// Increment/DecrementPendingWake, so a value set on a RawObject handed to
+	// CreateObject is not persisted (a new object owes nothing).
+	PendingWake int64
+	Finalizers  []string
+	Conditions  []Condition // assembled on reads; nil when the object has none
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // Relation is the kind of edge in the refs table. The schema's CHECK constraint
@@ -184,6 +200,23 @@ const (
 	// RelationDependsOn: a change to the target requeues the dependent.
 	RelationDependsOn Relation = "depends_on"
 )
+
+// AddRefResult is what a caller needs to follow up on an edge it declared, all
+// of it a by-product of work AddRef already does — no extra query pays for any
+// of it.
+type AddRefResult struct {
+	// From is the source object's GroupKind, projected from the endpoint check.
+	// Edges are cross-kind, so a caller routing a requeue to fromID cannot assume
+	// its own kind.
+	From GroupKind
+	// WakeStamped reports whether this call incremented fromID's pending_wake:
+	// the edge was new *and* the target had moved past the claimed version. A
+	// caller pairing the durable stamp with an in-memory requeue gates the requeue
+	// on this rather than recomputing the conjunction, so the two halves cannot
+	// drift — and there is deliberately no second, independently derived
+	// edge-new report to drift against.
+	WakeStamped bool
+}
 
 // Referrer is an object pointing at a target through a ref edge, with the
 // GroupKind needed to route a requeue. ListIncomingRefs returns these.
@@ -265,6 +298,32 @@ type Store interface {
 	// removed. The GC backstop enqueues these so a delete makes progress without a
 	// spec change to wake it.
 	ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// ListPendingWakeIDs returns the IDs of objects of kind gk owed a durable
+	// dependency wake (pending_wake != 0). The reconcile backstop enqueues these so
+	// a wake that outlived the process (its in-memory requeue lost to a crash) is
+	// serviced on restart, without a spec change to wake it. Orthogonal to
+	// ListUnsettledIDs: an object can be spec-converged yet still owe a wake.
+	ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// There is deliberately no standalone increment here. Wakes are produced by
+	// AddRef — its stamp has to be indivisible from the edge insert, so it issues
+	// one itself and reports it as AddRefResult.WakeStamped — and consumed by
+	// DecrementPendingWake. An interface increment would be surface no caller could
+	// use correctly for the declare path (it cannot be made atomic with the edge)
+	// and none uses at all otherwise; leaving it off makes "the stamp rides AddRef"
+	// a compile-time property rather than something a test has to police. Add it
+	// when a producer other than AddRef exists — the durable-wake half of the
+	// dependency-waker item in TODO.md would be one.
+
+	// DecrementPendingWake subtracts observed from id's pending_wake (floored at 0),
+	// recording that a reconcile serviced every wake it saw. Callers pass the count
+	// they loaded, not 1: a single pass reads the target's current state, which
+	// addresses all the wakes outstanding when it started, so subtracting 1 would
+	// strand the rest as a residual nothing re-enqueues. Increments landing *after*
+	// that load are above observed, so they survive the subtraction and stay owed.
+	// Bumps no resource_version and emits no event.
+	DecrementPendingWake(ctx context.Context, id ObjectID, observed int64) error
 
 	// ListAllDeletionPendingIDs is ListDeletionPendingIDs across every kind. The
 	// global GC sweeper uses it to collect deletion-pending objects of kinds with
@@ -419,7 +478,35 @@ type Store interface {
 	// AddRef inserts a directed (fromID -> toID) edge with the given relation.
 	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on
 	// the object, so it bumps no version and emits no event.
-	AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+	//
+	// targetResourceVersion is the caller's claimed version of toID — the version
+	// its decision to depend on toID was based on — or 0 for no claim. It drives
+	// two things, and every implementation owes both:
+	//
+	// A claim above toID's current version is rejected with
+	// ErrTargetResourceVersionFuture *before* the insert, so nothing is written.
+	// The rejection cannot depend on a caller unwinding a transaction it may be
+	// sharing with writes it means to keep.
+	//
+	// A claim that toID has already moved past, on an edge this call creates,
+	// increments fromID's pending_wake — the durable record that a dependency
+	// wake is owed — and reports it as AddRefResult.WakeStamped. That write must
+	// land on the same side of the insert as the rejection, and for the same
+	// reason: were it a second call after AddRef returned, a caller sharing an
+	// ambient transaction could handle the error and commit the edge with no
+	// wake, which is precisely the stranded-dependent race the claim exists to
+	// close. The endpoint check, the stamp and the insert are therefore one
+	// atomic unit, and an implementation must not leave them separable.
+	//
+	// The stamp is unconditional on fromID's kind: the store cannot know which
+	// kinds have reconcile loops, and gating would cost the caller a pre-read of
+	// fromID's kind on every declare. A kind with no loop never drains its count,
+	// and nothing scans it either (ListPendingWakeIDs is per-kind), so the count is
+	// unread — but it is a lasting row and index entry, and re-declaring an edge
+	// bumps it again. Reclaiming it wants a cross-kind sweeper (see TODO.md), not a
+	// gate here: declining to stamp would lose the wake outright for a kind that
+	// gains a controller later.
+	AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (AddRefResult, error)
 
 	// DeleteRef removes the (fromID, toID, relation) edge; an absent edge is a
 	// no-op. Like AddRef it bumps no version and emits no event.
