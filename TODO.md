@@ -30,6 +30,46 @@ tell "we decided against this for now" from "nobody thought of it."
   if `RequestDeletion` ever gets the same treatment (its absent path has always
   had this shape, so the probe would belong in `requestDeletion` for both).
 
+- **A standing waker escalation runs a full pass at the *catchup* cadence,
+  permanently** — known, not fixed, and deliberately left alone rather than
+  throttled. `resyncEveryTick` sets `resyncAlways`, which nothing ever clears
+  (correctly — neither signal that sets it has a recovery path), and `tickResyncs`
+  makes *every* catchup tick a full pass from then on. The catchup tick is the
+  frequent one by design, and `WithCatchupInterval`'s own doc tells operators to
+  set it well below the resync cadence because it is cheap. So one closed change
+  stream or one failed subscription converts a bounded, index-driven listing into
+  a whole-table `ListIDs` pass at the fastest cadence the deployment configured,
+  for the life of the process, on a large object set.
+
+  **A stride throttle was built and reverted**, and the reasoning is why this stays
+  open rather than getting a quick fix. Spacing the standing pass (one tick in
+  `ceil(window / catchupInterval)`, prompt on the tick the escalation lands on)
+  works and is about thirty lines. But it makes the *emergency repair* slower to
+  make it cheaper, on the one path where latency matters most; the window is a new
+  unanchored constant with no natural source (`resyncInterval` defaults to 0, so
+  there is nothing to inherit) and no option to tune it; and it is thirty lines of
+  new surface — a field, a counter, a stride helper, tests, a CLAUDE.md paragraph —
+  hung on a subsystem `observed_cursor` deletes outright. Mitigating the cost of a
+  mechanism whose replacement removes the mechanism is churn twice over.
+
+  **Two real fixes, in increasing order of scope.** The narrow one: the escalation
+  exists solely to reach stale *dependents*, and an object with no outgoing
+  `depends_on` edge cannot be one — so the escalated pass never needed to be a full
+  pass. `SELECT DISTINCT from_id FROM refs WHERE relation='depends_on'` (joined to
+  the kind) scales with declared edges instead of table size, and wants the same
+  `idx_refs_dependents` partial index `observed_cursor` does. That is a contained
+  change that would close this item on its own. The broad one is
+  `observed_cursor` (recorded under the pending-wake backstop item below), which
+  deletes the escalation entirely — all three waker loss points get re-derived by
+  the tick query, so nothing needs to *observe* a loss to repair it.
+
+  Not fixed now because the escalation only fires on a store-level watch failure
+  (rare), while both fixes cost index and query work that wants measuring, and the
+  narrow one is subsumed by the broad one. Revisit if `observed_cursor` is declined
+  or deferred past a release — at that point take the narrow fix, since leaving a
+  permanent full-table pass reachable from a single dropped subscription is worse
+  than the index it costs.
+
 - **A target change landing *mid-reconcile* is safe in memory, but has no durable
   twin** — analyzed, in-memory half verified sound, durable half not fixed. The
   scenario: D depends on T, T changes and wakes D, and T changes *again* while D's
