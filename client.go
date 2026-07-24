@@ -807,10 +807,9 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 		return err
 	}
 	// Always advance GC: a retry or post-crash Delete must still hand the
-	// deletion-pending object to the controller to clear finalizers. A
-	// client-only kind has no controller, so collect runs synchronously rather
-	// than waiting on the resync sweeper (which a disabled resync would never run
-	// again after startup).
+	// deletion-pending object to the controller to clear finalizers. A client-only
+	// kind has no controller to hand it to, so it falls to the global GC sweeper —
+	// whose cadence is guaranteed, since WithGCInterval refuses to be disabled.
 	c.bh.advanceGC(ctx, c.gk, id)
 	return nil
 }

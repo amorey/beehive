@@ -318,7 +318,7 @@ func WithGCInterval(d time.Duration) Option {
 }
 
 // WithEventRetention bounds the per-object event log, enforced globally by the GC
-// sweeper on the startup + resync cadence. perObject > 0 caps each
+// sweeper on its own cadence (startup pass + WithGCInterval). perObject > 0 caps each
 // (object, category) timeline to its newest perObject runs — a ring, so a flapping
 // timeline can't evict a quiet one; maxAge > 0 drops runs whose window ended more
 // than maxAge ago. A zero bound is skipped, and both zero (the default) leaves the

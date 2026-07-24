@@ -41,8 +41,8 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 }
 
 // collect is the garbage-collection step for a single object, run after its
-// controller's Reconcile returns (see typedController.reconcile) and on the
-// deletion-pending resync backstop. It runs in its own transaction. It is a no-op
+// controller's Reconcile returns (see typedController.reconcile) and on the global
+// GC sweep (see sweepDeletionPending). It runs in its own transaction. It is a no-op
 // unless the object is finalizing.
 //
 // Two things happen for a finalizing object:
@@ -54,7 +54,7 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 //     makes that ordering mandatory — an owner cannot be removed while a child
 //     still points at it — and ON DELETE CASCADE on the child side means
 //     removing the last child drops the edge that was blocking the owner. The
-//     freed owner is re-examined by the deletion-pending resync backstop.
+//     freed owner is re-examined by the global GC sweep.
 //
 // The whole step runs in one transaction so the cascade writes and the delete
 // commit together; the watch events they emit publish only on commit.
@@ -106,7 +106,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		// Removing this row drops its outgoing edges (ON DELETE CASCADE), which may
 		// unblock a deletion-pending target RESTRICT was holding. Capture those
 		// targets before the delete so we can wake them — the event-driven path that
-		// lets a cascade finish without waiting on the resync backstop.
+		// lets a cascade finish without waiting on the next GC sweep.
 		referents, err := bh.store.ListOutgoingRefs(ctx, id)
 		if err != nil {
 			return err

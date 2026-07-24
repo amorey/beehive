@@ -100,9 +100,10 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// finalizer-bearing one can't be cleared without a decode the controller can
 		// never do, so it correctly waits for a fixed build.
 		//
-		// This re-WARNs each time resync re-enqueues the unsettled poison row: a bad
-		// row is an ongoing operational fault, and a recurring warning at the (coarse)
-		// resync cadence keeps it visible rather than logging once and going silent.
+		// This re-WARNs each time the catchup tick re-enqueues the unsettled poison row
+		// (it never settles, so ListUnsettledIDs keeps returning it): a bad row is an
+		// ongoing operational fault, and a recurring warning at that coarse cadence keeps
+		// it visible rather than logging once and going silent.
 		//
 		// Returning here also leaves any owed pending_wake count standing, which is
 		// deliberate, not an oversight of the early return: the wake is owed because a
@@ -134,8 +135,8 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// A successful pass read the target's current state, which addresses every wake
 	// outstanding when it loaded the object — so subtract that whole count, not one.
 	// Subtracting one would leave a residual with nothing to re-enqueue it: the work
-	// queue coalesces, so the backstop's single enqueue is already spent, and with
-	// resync disabled the leftover would sit until the next process start.
+	// queue coalesces, so the backstop's single enqueue is already spent, and with the
+	// catchup tick disabled the leftover would sit until the next process start.
 	// Increments that land *during* the pass are above the observed count, so they
 	// survive the subtraction and keep the object owed — and each brought its own
 	// in-memory requeue, so nothing has to schedule the follow-up here. Skip the
@@ -148,11 +149,10 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		}
 	}
 	// Advance any targets the controller freed via DeleteDependency, so a
-	// now-unreferenced deletion-pending target is re-examined without waiting on the
-	// resync backstop. advanceGC (not enqueueIfRegistered) routes the wake by kind: a
-	// registered kind enqueues, while a client-only kind with resync disabled — whose
-	// freed target would otherwise strand, RESTRICT-blocking nothing else re-checks
-	// it — collects synchronously.
+	// now-unreferenced deletion-pending target is re-examined without waiting on the GC
+	// sweep. advanceGC (not enqueueIfRegistered) rather than a plain wake because the
+	// follow-up a deletion owes is a collect, not a reconcile — it routes by the
+	// target's own kind, and a client-only target falls to the sweeper's next tick.
 	for _, tgt := range wakes.targets {
 		t.bh.advanceGC(ctx, tgt.GroupKind(), tgt.ID)
 	}
@@ -240,7 +240,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 
 // enqueuePendingWake enqueues objects owed a durable dependency wake (see
 // pending_wake). Like a pending deletion it is recorded, known-owed work: a
-// wake bumps no generation, so the unsettled resync never sees it, and its
+// wake bumps no generation, so the unsettled listing never sees it, and its
 // in-memory requeue does not outlive the process — a crash between the token's
 // commit and the dispatch leaves a stranded dependent nothing else re-checks.
 // Run unconditionally at startup (like deletion-pending, not gated by the spec
@@ -326,11 +326,15 @@ func (r *reconciler) log() *slog.Logger {
 // done), so this never triggers a duplicate or concurrent reconcile.
 //
 // A failed list is logged, not retried: source names which backstop lost its pass,
-// because what that costs differs sharply. Unsettled and deletion-pending retry on
-// the next tick, but pending-wake at resyncInterval=0 is called only at startup, so
-// a failure there defers every recorded owed wake to the next process start — the
-// one path whose whole point is not losing them. Silence made that indistinguishable
-// from "nothing was owed".
+// because what that costs differs sharply. The two catchup listings (unsettled,
+// pending-wake) retry on the next catchup tick — unless catchup is off, where the
+// startup pass was the only one, and a lost pending-wake listing defers every
+// recorded owed wake to the next process start, the one path whose whole point is
+// not losing them. The full pass ("all") rides the resync tick, which is off by
+// default, so a failure there usually has no second chance in this process at all —
+// hence the return value, which lets a caller that spent a one-shot escalation on
+// the pass re-arm it. Silence made all of that indistinguishable from "nothing was
+// owed".
 //
 // It reports whether the listing succeeded (an empty result is still a success:
 // nothing was owed).
@@ -471,9 +475,12 @@ func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Sche
 
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
 //
-// A resyncInterval <= 0 disables the periodic resync entirely: the loop then
-// reconciles only in response to events (once the work queue lands), never on a
-// timer.
+// It runs two independent tickers, and each is disabled by a non-positive interval
+// (tickerChan yields a nil channel, which never fires). resyncInterval <= 0 — the
+// default — disables the *full* pass only; the catchup tick still drives periodic
+// passes over the work the store records as owed. Only with both off does the loop
+// reconcile purely in response to events and its own startup passes, which is why
+// that combination is the one the log calls out.
 func (r *reconciler) run(ctx context.Context) {
 	// A reconciler built outside Register (e.g. in tests) may have no logger;
 	// fall back to discard so the log sites below stay nil-safe.
