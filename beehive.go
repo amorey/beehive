@@ -374,6 +374,13 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watch
 func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 	deps, err := bh.store.ListIncomingRefs(ctx, targetID, RelationDependsOn)
 	if err != nil {
+		// Shutdown cancels this same ctx, so a change already dequeued when Stop
+		// lands fails here for no reason of its own. Escalating would arm a full
+		// pass on every reconciler of a control plane that is going away — the same
+		// re-check the stream-ended path above makes, for the same reason.
+		if ctx.Err() != nil {
+			return
+		}
 		// Every dependent of this target just missed this change. A dependent that
 		// has settled is invisible to every owed-work listing — its own generation
 		// never moved — so with no full pass configured the miss is permanent, not

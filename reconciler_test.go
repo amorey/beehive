@@ -2700,6 +2700,28 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 		"a dropped wake must not be silent")
 }
 
+// TestWakeDependentsCancelledDoesNotLog is the lookup path's negative twin of
+// TestDependencyWakerCancelDoesNotLog. Stop cancels the ctx the waker passes down,
+// so a change already dequeued fails its lookup for no reason of its own — and
+// escalating there would arm a full pass on every reconciler of a control plane
+// that is going away, once per in-flight change on every clean shutdown.
+func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	r := &reconciler{}
+	bh := &Beehive{
+		store:       &errDepsStore{},
+		logger:      logger,
+		reconcilers: map[GroupKind]*reconciler{{Kind: "Widget"}: r},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bh.wakeDependents(ctx, 1)
+
+	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
+	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
+}
+
 // TestDependencyWakerStreamEndLogs pins the second. A closed change stream ends
 // the waker for the life of the process — nothing re-subscribes — so every future
 // change on that kind reaches no dependent at all. No reachable path closes the
