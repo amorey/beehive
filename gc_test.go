@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -628,6 +629,54 @@ func TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete(t *testing.T) {
 
 	_, err = client.Get(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// sweepFailStore hands the GC sweep one deletion-pending row of a client-only
+// kind (no controller registered, so the sweep collects it itself) and lets the
+// embedded collectFakeStore decide how that collect fails.
+type sweepFailStore struct {
+	collectFakeStore
+	rows []Referrer
+}
+
+func (s *sweepFailStore) ListAllDeletionPending(context.Context) ([]Referrer, error) {
+	return s.rows, nil
+}
+
+// A per-row collect failure must be logged, not swallowed: for a client-only kind
+// the sweep is the only collector, so a row that fails every pass would otherwise
+// strand silently and RESTRICT-block its owner's delete forever. The one
+// exception is ErrNotFound — another path collected the row first, which is the
+// benign race and not worth a warning on every sweep.
+func TestGCSweepLogsCollectFailure(t *testing.T) {
+	ctx := context.Background()
+	rows := []Referrer{{ID: 7, Kind: "ClientOnly"}}
+
+	t.Run("real error", func(t *testing.T) {
+		logger, buf := captureLogger(slog.LevelWarn)
+		store := &sweepFailStore{rows: rows}
+		store.markErr = errBoom
+		bh, err := New(store, WithLogger(logger))
+		require.NoError(t, err)
+
+		bh.sweepDeletionPending(ctx)
+
+		assert.Contains(t, buf.String(), "gc sweep: collecting object failed")
+		assert.Contains(t, buf.String(), errBoom.Error())
+		assert.Contains(t, buf.String(), "ClientOnly")
+	})
+
+	t.Run("already collected", func(t *testing.T) {
+		logger, buf := captureLogger(slog.LevelWarn)
+		store := &sweepFailStore{rows: rows}
+		store.getMetaErr = ErrNotFound
+		bh, err := New(store, WithLogger(logger))
+		require.NoError(t, err)
+
+		bh.sweepDeletionPending(ctx)
+
+		assert.Empty(t, buf.String())
+	})
 }
 
 func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
