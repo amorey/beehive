@@ -19,6 +19,7 @@ package beehive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -285,9 +286,15 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 		return
 	}
 	for _, row := range rows {
-		// Best-effort: a benign ErrNotFound (already collected) or a transient
-		// error is retried on the next sweep.
-		_ = bh.advanceDeletion(ctx, row.GroupKind(), row.ID)
+		// Best-effort: a transient error is retried on the next sweep, but it is
+		// still logged — for a client-only kind this sweep is the only collector,
+		// so a row that fails every time would otherwise strand silently and
+		// RESTRICT-block its owner's delete forever. ErrNotFound is the benign
+		// already-collected race and stays quiet.
+		if err := bh.advanceDeletion(ctx, row.GroupKind(), row.ID); err != nil && !errors.Is(err, ErrNotFound) {
+			bh.logger.Warn("gc sweep: collecting object failed; retry next sweep",
+				"group", row.Group, "kind", row.Kind, "id", row.ID, "err", err)
+		}
 	}
 }
 
