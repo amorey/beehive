@@ -2775,3 +2775,129 @@ func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 }
+
+// TestCatchupTickEscalationPredicate covers the tick's full-pass decision
+// directly, because the two escalation reasons differ in a way an integration
+// test cannot show cheaply: a dead waker is a standing condition, while a dropped
+// wake is a one-shot that must be *consumed* by the tick it drives.
+//
+// It also pins the consumption order. When a standing reason already applies, the
+// one-shot must survive rather than be burned — that tick sweeps anyway, and
+// spending it there would discard the repair still owed if the standing reason
+// later goes away.
+func TestCatchupTickEscalationPredicate(t *testing.T) {
+	t.Run("no escalation by default", func(t *testing.T) {
+		assert.False(t, (&reconciler{}).tickResyncs())
+	})
+
+	t.Run("resyncNextTick fires once", func(t *testing.T) {
+		r := &reconciler{}
+		r.resyncNextTick()
+		assert.True(t, r.tickResyncs())
+		assert.False(t, r.tickResyncs(), "one-shot: a transient drop must not degrade the process")
+	})
+
+	t.Run("resyncEveryTick fires forever", func(t *testing.T) {
+		r := &reconciler{}
+		r.resyncEveryTick()
+		assert.True(t, r.tickResyncs())
+		assert.True(t, r.tickResyncs(), "sticky: the waker is gone for the process lifetime")
+	})
+
+	t.Run("a standing reason leaves the one-shot armed", func(t *testing.T) {
+		r := &reconciler{}
+		r.resyncEveryTick()
+		r.resyncNextTick()
+		assert.True(t, r.tickResyncs())
+		assert.True(t, r.resyncOnce.Load(), "not consumed by a tick it did not decide")
+	})
+}
+
+// TestDroppedWakeEscalatesEveryKind pins the property the first attempt at this
+// got wrong. The flags were process-wide but consumed per-reconciler, so a dropped
+// wake repaired whichever kind ticked first and silently spent the repair for the
+// rest — a guarantee stated in a comment and contradicted by the code.
+//
+// Cross-kind is forced by the mechanism, not chosen: dependency edges are
+// deliberately cross-kind, so a lost wake on one kind strands dependents of any
+// kind, and the lookup that failed is what would have named them.
+func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	r1, r2 := &reconciler{}, &reconciler{}
+	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Contains(t, buf.String(), "forcing a full resync pass")
+	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
+	assert.True(t, r2.resyncOnce.Load())
+	assert.False(t, r1.resyncAlways.Load(), "a transient lookup error is not a permanent escalation")
+}
+
+// TestDeadWakerEscalatesEveryKind is the sticky counterpart: a waker whose stream
+// ended keeps dropping every future change, so one pass would repair the instant
+// of death and strand everything after it.
+func TestDeadWakerEscalatesEveryKind(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	r1, r2 := &reconciler{}, &reconciler{}
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger, order: []*reconciler{r1, r2}}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+
+	assert.Contains(t, buf.String(), "escalating")
+	assert.True(t, r1.resyncAlways.Load(), "a dead waker escalates every kind's later ticks")
+	assert.True(t, r2.resyncAlways.Load())
+}
+
+// TestEscalatedCatchupTickReconcilesSettled closes the loop end to end: an armed
+// escalation must actually reach a settled object, which is the only kind of
+// object the repair exists for — one that is owed nothing and therefore invisible
+// to the catchup listings the tick would otherwise run.
+func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+	_, err = store.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+	require.NoError(t, err)
+
+	reconciled := make(chan ObjectID, 4)
+	// Catchup on (it carries the escalation), resync off, no startup pass: only an
+	// escalated catchup tick can reach a settled object.
+	bh, err := New(store, WithCatchupInterval(10*time.Millisecond),
+		WithResyncInterval(0), WithGCInterval(0))
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
+		WithStartupResync(false))
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	select {
+	case got := <-reconciled:
+		t.Fatalf("settled object %d dispatched before any escalation", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	bh.resyncKindsNextTick()
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, raw.ID, got)
+	case <-time.After(testTimeout):
+		t.Fatal("escalation never reached the settled object")
+	}
+}

@@ -92,6 +92,34 @@ type Beehive struct {
 	wg     sync.WaitGroup
 }
 
+// resyncKindsNextTick repairs a dependency-wake failure that dropped a single
+// change: every registered reconciler runs one full pass on its next catchup
+// tick, then returns to draining owed work.
+//
+// resyncKindsEveryTick is the sticky counterpart, for a failure that will keep
+// dropping changes for the life of the process.
+//
+// Both reach every reconciler rather than the failing kind's, and that is forced
+// by the failures themselves: dependency edges are deliberately cross-kind, so a
+// lost wake strands dependents of any kind, and the lookup that fails in
+// wakeDependents is the very thing that would have named them. Escalating one kind
+// would repair one arbitrary kind and silently spend the repair for the rest.
+// order is frozen once Start runs, so it reads without bh.mu — the same reasoning
+// stop relies on.
+func (bh *Beehive) resyncKindsNextTick() {
+	for _, r := range bh.order {
+		r.resyncNextTick()
+	}
+}
+
+// resyncKindsEveryTick is the sticky counterpart of resyncKindsNextTick; see that
+// method's doc for why both are cross-kind.
+func (bh *Beehive) resyncKindsEveryTick() {
+	for _, r := range bh.order {
+		r.resyncEveryTick()
+	}
+}
+
 // log returns a non-nil logger. Start resolves bh.logger, but Stop (and tests
 // that drive state directly) may run before that, so guard against nil.
 func (bh *Beehive) log() *slog.Logger {
@@ -275,8 +303,9 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watch
 				// The stream ended without the control plane stopping (that arrives on
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, so every
 				// future change on this kind now reaches no dependent at all.
-				bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for this kind for the life of the process",
+				bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for this kind for the life of the process; escalating every catchup tick to a full resync pass",
 					"group", gk.Group, "kind", gk.Kind)
+				bh.resyncKindsEveryTick()
 				return
 			}
 			// Wake on any present-state change. We must handle Added, not just
@@ -303,8 +332,9 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 		// never moved — so with no full pass configured the miss is permanent, not
 		// slow. Nothing here can name who was missed: the lookup that failed is
 		// exactly the one that would have said.
-		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for this change were dropped",
+		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for this change were dropped, forcing a full resync pass",
 			"targetID", targetID, "err", err)
+		bh.resyncKindsNextTick()
 		return
 	}
 	for _, d := range deps {
