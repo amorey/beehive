@@ -2785,6 +2785,52 @@ func TestCatchupTickEscalationPredicate(t *testing.T) {
 	})
 }
 
+// errListIDsStore fails the full-pass listing and reports each attempt, so a test
+// can await the tick that consumed an escalation.
+type errListIDsStore struct {
+	fakeStore
+	calls chan struct{}
+}
+
+func (s *errListIDsStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	// Non-blocking: the ticker keeps firing, so a report the test isn't waiting
+	// for is dropped rather than parking run's loop past cancellation.
+	select {
+	case s.calls <- struct{}{}:
+	default:
+	}
+	return nil, errBoom
+}
+
+// TestFailedEscalatedPassRearmsOneShot pins the other half of the one-shot's
+// contract: it is spent on a full pass that *ran*, not merely on one that was
+// attempted. tickResyncs consumes the flag before the listing, so a transient
+// ListIDs failure used to swallow the repair permanently — and with resync off by
+// default nothing else reaches the settled dependents a dropped wake stranded.
+func TestFailedEscalatedPassRearmsOneShot(t *testing.T) {
+	store := &errListIDsStore{calls: make(chan struct{}, 1)}
+	r := &reconciler{store: store, catchupInterval: time.Millisecond, logger: discardLogger}
+	r.resyncNextTick()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(r, ctx)
+
+	// Two escalated passes: the second can only happen because the first re-armed
+	// the flag it consumed.
+	for range 2 {
+		select {
+		case <-store.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the escalated full pass")
+		}
+	}
+
+	cancel()
+	<-done
+	assert.True(t, r.resyncOnce.Load(), "a pass that never listed leaves the repair owed")
+}
+
 // TestDroppedWakeEscalatesEveryKind pins the property the first attempt at this
 // got wrong. The flags were process-wide but consumed per-reconciler, so a dropped
 // wake repaired whichever kind ticked first and silently spent the repair for the
