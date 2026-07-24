@@ -102,6 +102,16 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// This re-WARNs each time resync re-enqueues the unsettled poison row: a bad
 		// row is an ongoing operational fault, and a recurring warning at the (coarse)
 		// resync cadence keeps it visible rather than logging once and going silent.
+		//
+		// Returning here also leaves any owed pending_wake count standing, which is
+		// deliberate, not an oversight of the early return: the wake is owed because a
+		// dependency moved, and this pass did not service it — the controller never
+		// saw the object. Draining it would be exactly the silent discard the
+		// quarantine is written to avoid, and would leave the dependent stale with no
+		// record that a reconcile was owed. The cost is that the pending-wake backstop
+		// re-enqueues this row (and re-warns) until the bytes decode again, which is
+		// the same recurring-visibility trade as above, and it self-clears the moment a
+		// fixed build lets the pass run to the decrement below.
 		log.WarnContext(ctx, "skipping undecodable object; cannot reconcile", "err", err)
 		if deleting {
 			if _, gcErr := t.bh.collect(ctx, id); gcErr != nil {
@@ -119,6 +129,22 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// absorbs. We don't return yet — the controller's committed writes still need
 		// their GC follow-up below (see func doc), or a freed object could strand.
 		log.WarnContext(ctx, "reconcile failed; will retry", "err", reconcileErr)
+	}
+	// A successful pass read the target's current state, which addresses every wake
+	// outstanding when it loaded the object — so subtract that whole count, not one.
+	// Subtracting one would leave a residual with nothing to re-enqueue it: the work
+	// queue coalesces, so the backstop's single enqueue is already spent, and with
+	// resync disabled the leftover would sit until the next process start.
+	// Increments that land *during* the pass are above the observed count, so they
+	// survive the subtraction and keep the object owed — and each brought its own
+	// in-memory requeue, so nothing has to schedule the follow-up here. Skip the
+	// write when nothing was owed. A failed subtraction is not fatal: the count
+	// stays up and the backstop retries it, whereas requeueing on the error would
+	// spin against a store that keeps failing.
+	if reconcileErr == nil && raw.PendingWake != 0 {
+		if err := t.bh.store.DecrementPendingWake(ctx, id, raw.PendingWake); err != nil {
+			log.WarnContext(ctx, "failed to decrement pending-wake count; backstop will retry", "err", err)
+		}
 	}
 	// Advance any targets the controller freed via DeleteDependency, so a
 	// now-unreferenced deletion-pending target is re-examined without waiting on the
@@ -198,7 +224,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, r.store.ListUnsettledIDs)
+	r.enqueueFrom(ctx, "unsettled", r.store.ListUnsettledIDs)
 }
 
 // enqueueDeletionPending enqueues objects that are finalizing (deletion
@@ -209,7 +235,22 @@ func (r *reconciler) enqueueDeletionPending(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, r.store.ListDeletionPendingIDs)
+	r.enqueueFrom(ctx, "deletion-pending", r.store.ListDeletionPendingIDs)
+}
+
+// enqueuePendingWake enqueues objects owed a durable dependency wake (see
+// pending_wake). It is the reconcile counterpart of enqueueDeletionPending: a
+// wake bumps no generation, so the unsettled resync never sees it, and its
+// in-memory requeue does not outlive the process — a crash between the token's
+// commit and the dispatch leaves a stranded dependent nothing else re-checks.
+// Run unconditionally at startup (like deletion-pending, not gated by the spec
+// strategy): a wake owed is a specific known-owed reconcile, orthogonal to spec
+// convergence, so StartupReconcileNone must not suppress it.
+func (r *reconciler) enqueuePendingWake(ctx context.Context) {
+	if r.store == nil {
+		return
+	}
+	r.enqueueFrom(ctx, "pending-wake", r.store.ListPendingWakeIDs)
 }
 
 // enqueueAll enqueues every object of the kind, including ones whose spec is
@@ -220,15 +261,34 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, r.store.ListIDs)
+	r.enqueueFrom(ctx, "all", r.store.ListIDs)
+}
+
+// log returns a non-nil logger, guarding reconcilers built outside Register (e.g.
+// the minimal ones in tests): run assigns discardLogger, but the enqueue helpers
+// are reachable without it.
+func (r *reconciler) log() *slog.Logger {
+	if r.logger == nil {
+		return discardLogger
+	}
+	return r.logger
 }
 
 // enqueueFrom enqueues the IDs returned by list. The work queue coalesces an ID
 // that is already queued and defers one that is mid-reconcile (re-queuing it via
 // done), so this never triggers a duplicate or concurrent reconcile.
-func (r *reconciler) enqueueFrom(ctx context.Context, list func(context.Context, GroupKind) ([]ObjectID, error)) {
+//
+// A failed list is logged, not retried: source names which backstop lost its pass,
+// because what that costs differs sharply. Unsettled and deletion-pending retry on
+// the next tick, but pending-wake at resyncInterval=0 is called only at startup, so
+// a failure there defers every recorded owed wake to the next process start — the
+// one path whose whole point is not losing them. Silence made that indistinguishable
+// from "nothing was owed".
+func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(context.Context, GroupKind) ([]ObjectID, error)) {
 	ids, err := list(ctx, r.gk)
 	if err != nil {
+		r.log().WarnContext(ctx, "failed to list objects to enqueue; this pass is skipped",
+			"source", source, "group", r.gk.Group, "kind", r.gk.Kind, "err", err)
 		return
 	}
 	for _, id := range ids {
@@ -383,11 +443,13 @@ func (r *reconciler) run(ctx context.Context) {
 	default: // StartupReconcileAll
 		r.enqueueAll(ctx)
 	}
-	// Always resume in-progress deletions at startup, independent of the spec
-	// strategy above: a process that crashed mid-delete must still drive those
-	// rows to removal. Deletion progress is orthogonal to spec convergence; the
-	// work queue's set semantics coalesce any overlap with the pass above.
+	// Always resume in-progress deletions and owed dependency wakes at startup,
+	// independent of the spec strategy above: a process that crashed mid-delete must
+	// still drive those rows to removal, and one that crashed owing a dependency
+	// wake must still deliver it. Both are orthogonal to spec convergence; the work
+	// queue's set semantics coalesce any overlap with the pass above.
 	r.enqueueDeletionPending(ctx)
+	r.enqueuePendingWake(ctx)
 
 	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup
@@ -429,6 +491,7 @@ func (r *reconciler) run(ctx context.Context) {
 			r.logger.Debug("resync tick")
 			r.enqueueUnsettled(ctx)
 			r.enqueueDeletionPending(ctx)
+			r.enqueuePendingWake(ctx)
 		}
 	}
 }

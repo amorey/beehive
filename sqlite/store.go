@@ -204,7 +204,7 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 const objectColumns = `id, "group", kind, slug, spec, status,
 	schema_version_spec, schema_version_status,
 	generation, observed_generation, observed_at, resource_version,
-	deletion_requested_at, finalizers, created_at, updated_at`
+	deletion_requested_at, pending_wake, finalizers, created_at, updated_at`
 
 // nextResourceVersion advances and returns the global write cursor. It draws
 // from a standalone counter (not MAX(objects.resource_version)) so that
@@ -484,6 +484,42 @@ func (s *sqliteStore) ListAllDeletionPendingIDs(ctx context.Context) ([]storeapi
 		return nil, err
 	}
 	return scanIDs(rows)
+}
+
+func (s *sqliteStore) ListPendingWakeIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+	// Matches the partial index idx_objects_pending_wake WHERE pending_wake != 0.
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT id FROM objects
+		 WHERE "group" = ? AND kind = ? AND pending_wake != 0
+		 ORDER BY id`,
+		gk.Group, gk.Kind)
+	if err != nil {
+		return nil, err
+	}
+	return scanIDs(rows)
+}
+
+// IncrementPendingWake and DecrementPendingWake are single no-emit UPDATEs on the
+// owed-wake count. The decrement's contract (cross-kind, no resource_version bump,
+// why it takes the observed count) is on storeapi.Store; the subtraction floors at
+// 0 with max() so it can never drive the count negative.
+//
+// The increment is deliberately *not* on that interface: production wakes are
+// produced by AddRef, whose stamp must be indivisible from the edge insert, so the
+// declare path cannot route through a separate call and no other producer exists
+// yet. It stays here as the standalone form — reachable on the concrete store, so
+// tests can seed a count without staging the whole declare race — and is where a
+// future non-edge producer (see the dependency-waker item in TODO.md) would hook in.
+func (s *sqliteStore) IncrementPendingWake(ctx context.Context, id storeapi.ObjectID) error {
+	_, err := s.conn(ctx).ExecContext(ctx,
+		`UPDATE objects SET pending_wake = pending_wake + 1 WHERE id = ?`, id)
+	return err
+}
+
+func (s *sqliteStore) DecrementPendingWake(ctx context.Context, id storeapi.ObjectID, observed int64) error {
+	_, err := s.conn(ctx).ExecContext(ctx,
+		`UPDATE objects SET pending_wake = max(pending_wake - ?, 0) WHERE id = ?`, observed, id)
+	return err
 }
 
 func (s *sqliteStore) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
@@ -1324,21 +1360,30 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 	return nil
 }
 
-// AddRef inserts a (from_id, to_id, relation) edge and reports what its endpoint
-// check and insert already know (see storeapi.AddRefResult) — no extra query pays
-// for any of it. It neither bumps resource_version nor emits — a ref is not a
-// field of the object, so watchers would see no diff. Reporting rather than
-// interpreting keeps the wake policy in the beehive layer (see
-// ControllerClient.AddDependency).
+// AddRef inserts a (from_id, to_id, relation) edge, stamping an owed dependency
+// wake when the caller's version claim says the target moved under it (see
+// storeapi.Store.AddRef for the contract, and ControllerClient.AddDependency for
+// what the claim means). It neither bumps resource_version nor emits — a ref is
+// not a field of the object, so watchers would see no diff.
 //
-// It self-wraps in Within like the other mutators, so the endpoint check and the
-// insert are one atomic unit however it is called. That is what lets it report a
-// resource_version the caller can reason about: read as a separate statement, a
-// write to the target landing between the two would be invisible both to this
-// result (the version is already read) and to wakeDependents (the edge is not yet
-// inserted) — which is the very window AddDependency exists to close. Relying on
-// the caller to supply the transaction, or on sqlite serializing writers on one
-// connection, would leave that as an unstated precondition of the guard.
+// It self-wraps in Within like the other mutators, so the endpoint check, the
+// wake stamp and the insert are one atomic unit however it is called. That is
+// what makes the claim decidable at all: read as a separate statement, a write to
+// the target landing between the version read and the insert would be invisible
+// both here and to wakeDependents (the edge is not yet inserted) — which is the
+// very window AddDependency exists to close. Relying on the caller to supply the
+// transaction, or on sqlite serializing writers on one connection, would leave
+// that as an unstated precondition of the guard.
+//
+// The insert is deliberately the *last* write: every fallible step precedes the
+// edge coming into existence. A nested Within is a bare fn(ctx) with no
+// transaction of its own, so an error returned from here unwinds nothing — a
+// caller sharing an ambient transaction and handling the error would commit
+// whatever already landed. Ordering is therefore the only guarantee available,
+// and it points the residual failure the harmless way: a stamp with no edge is
+// one spurious owed wake, which costs a no-op reconcile and drains back to zero,
+// where an edge with no stamp is a dependent stranded on a stale read that
+// ListUnsettledIDs structurally cannot see.
 func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation, targetResourceVersion int64) (storeapi.AddRefResult, error) {
 	var out storeapi.AddRefResult
 	err := s.Within(ctx, func(ctx context.Context) error {
@@ -1367,25 +1412,38 @@ func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID
 		if targetResourceVersion > targetRV {
 			return storeapi.ErrTargetResourceVersionFuture
 		}
-		res, err := s.conn(ctx).ExecContext(ctx, `
+		// The durable wake stamp, on the same side of the insert as the rejection
+		// above and for the same reason. Its NOT EXISTS is the edge-new test, a
+		// covering probe on the refs primary key — one statement, no extra
+		// round-trip, and the *only* place edge-newness is decided, so there is no
+		// second derivation of it to fall out of agreement with.
+		var stamped bool
+		if targetResourceVersion > 0 && targetRV > targetResourceVersion {
+			res, err := s.conn(ctx).ExecContext(ctx, `
+				UPDATE objects SET pending_wake = pending_wake + 1
+				WHERE id = ? AND NOT EXISTS (
+					SELECT 1 FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?)`,
+				fromID, fromID, toID, string(relation))
+			if err != nil {
+				return err
+			}
+			// The error is discarded as at the other RowsAffected sites — modernc caches
+			// the count and cannot fail here, and a branch this driver can never take is
+			// untestable dead code. Worth knowing if the driver ever changes: this site is
+			// the one where a wrong count is not a wrong return value but a silently
+			// skipped wake, and a lost dependency wake is permanent and invisible.
+			n, _ := res.RowsAffected()
+			stamped = n > 0
+		}
+		if _, err := s.conn(ctx).ExecContext(ctx, `
 			INSERT INTO refs (from_id, to_id, relation) VALUES (?, ?, ?)
 			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
-			fromID, toID, string(relation))
-		if err != nil {
+			fromID, toID, string(relation)); err != nil {
 			return err
 		}
-		// DO NOTHING inserts no row on conflict, so the count distinguishes a new edge
-		// from one that was already declared. The error is discarded as at the other
-		// RowsAffected sites — modernc caches the count and cannot fail here, and a
-		// branch this driver can never take is untestable dead code. Worth knowing if
-		// the driver ever changes: this site is the one where a wrong count is not a
-		// wrong return value but a silently skipped wake, and a lost dependency wake
-		// is permanent and invisible. Revisit all four sites together if so.
-		n, _ := res.RowsAffected()
 		out = storeapi.AddRefResult{
-			From:                  storeapi.GroupKind{Group: group, Kind: kind},
-			TargetResourceVersion: targetRV,
-			Inserted:              n > 0,
+			From:        storeapi.GroupKind{Group: group, Kind: kind},
+			WakeStamped: stamped,
 		}
 		return nil
 	})
@@ -1592,7 +1650,7 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
 		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
-		&deletionAt, &finalizers, &createdAt, &updatedAt)
+		&deletionAt, &obj.PendingWake, &finalizers, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storeapi.ErrNotFound
 	}

@@ -500,8 +500,6 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 // the fix has to reach the dependent under the strategy that asks for no startup
 // pass at all.
 func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
-	t.Skip("pins a known, unfixed gap — see \"A dependency wake is in-memory\" in TODO.md")
-
 	ctx := context.Background()
 	// One store, two control planes: the rows outlive the process, the work queue
 	// does not. Owned by the test, since stop leaves the store open (see
@@ -853,6 +851,35 @@ func TestEnqueueUnsettledEnqueuesReturnedIDs(t *testing.T) {
 	items := append([]ObjectID(nil), r.work.items...)
 	r.work.mu.Unlock()
 	assert.Equal(t, []ObjectID{42, 99}, items)
+}
+
+// errPendingWakeStore fails the durable-wake listing, so a test can drive
+// enqueueFrom's skipped-pass branch — the one whose silence used to be
+// indistinguishable from "nothing was owed".
+type errPendingWakeStore struct {
+	fakeStore
+}
+
+func (s *errPendingWakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, errBoom
+}
+
+// TestEnqueueFromListErrorSkipsPass pins that a failed lister enqueues nothing and
+// survives a reconciler built without a logger — the shape these tests use, and the
+// one the new warn would panic on if it reached r.logger directly.
+func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
+	r := &reconciler{
+		store:      &errPendingWakeStore{},
+		work:       newWorkQueue(),
+		backoffFor: make(map[ObjectID]time.Duration),
+	}
+
+	r.enqueuePendingWake(context.Background()) // r.logger is nil: must warn, not panic
+
+	r.work.mu.Lock()
+	items := append([]ObjectID(nil), r.work.items...)
+	r.work.mu.Unlock()
+	assert.Empty(t, items, "a failed list enqueues nothing")
 }
 
 func TestEnqueueDeletionPending(t *testing.T) {
@@ -1217,6 +1244,45 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
 
+// owedBadSpecStore is getObjectBadSpecStore with a wake already owed, and records
+// whether the reconcile tried to drain it.
+type owedBadSpecStore struct {
+	fakeStore
+	decremented bool
+}
+
+func (s *owedBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), PendingWake: 2}, nil
+}
+
+func (s *owedBadSpecStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+	s.decremented = true
+	return nil
+}
+
+// TestTypedControllerReconcileQuarantineKeepsPendingWake pins that quarantining an
+// undecodable row does not drain its owed wake. The pass never reached the
+// controller, so the wake is still owed; draining it would silently discard a real
+// obligation and leave the dependent stale with nothing recording it. The count is
+// meant to outlive the poison and be serviced by the first pass that can decode —
+// so a future refactor must not "fix" this by hoisting the decrement above the
+// quarantine return.
+func TestTypedControllerReconcileQuarantineKeepsPendingWake(t *testing.T) {
+	store := &owedBadSpecStore{}
+	bh := &Beehive{store: store}
+	tc := &typedController[cSpec, cStatus]{
+		gk: GroupKind{Kind: "Widget"},
+		bh: bh,
+		inner: &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+			return Result{}, nil
+		}},
+	}
+
+	_, err := tc.reconcile(context.Background(), 1)
+	require.NoError(t, err, "an undecodable row is still a no-op success")
+	assert.False(t, store.decremented, "a wake the pass could not service must stay owed")
+}
+
 // TestTypedControllerReconcileRawToTypedErrorCollectsDeleting pins the GC leg of
 // the quarantine: a deletion-pending, finalizer-free row that can't decode is
 // still collected here (collect needs only the id), so it doesn't strand holding
@@ -1489,6 +1555,152 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Status, "the status write committed despite the reconcile error")
 	assert.NotNil(t, got.ObservedGeneration)
+}
+
+// reconcilePendingWakeHarness builds a typedController over a real store, driven
+// synchronously so the decrement has run by the time reconcile returns. wrap, if
+// non-nil, decorates the store the controller writes through (to inject a failing
+// mutator); the returned count always reads the real store underneath it.
+// reconcilePendingWakeHarness returns the pieces the durable-wake tests need,
+// including owe: seeding an owed wake goes through the concrete store, since
+// IncrementPendingWake is deliberately absent from the Store interface (AddRef is
+// production's only producer). A closure rather than the store itself because the
+// concrete type is unexported in package sqlite and so cannot be named here.
+func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
+	t.Helper()
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	raw, err := s.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+
+	var store Store = s
+	if wrap != nil {
+		store = wrap(store)
+	}
+	bh := &Beehive{store: store}
+	inner := &funcController{}
+	tc := &typedController[cSpec, cStatus]{
+		gk:     clientTestGK,
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
+		inner:  inner,
+	}
+	count := func(t *testing.T) int64 {
+		t.Helper()
+		got, err := s.GetObject(ctx, raw.ID)
+		require.NoError(t, err)
+		return got.PendingWake
+	}
+	owe := func() error { return s.IncrementPendingWake(ctx, raw.ID) }
+	return tc, inner, raw.ID, count, owe
+}
+
+// TestReconcileDecrementsPendingWake pins the durable-wake decrement: a successful
+// pass services one owed wake (count down by one), and a failed pass leaves the
+// count owed for the backstop to retry.
+func TestReconcileDecrementsPendingWake(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+
+	// Success decrements the owed count to zero.
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	require.NoError(t, owe())
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, count(t), "a successful pass services the owed wake")
+
+	// A failed pass leaves the count owed for the backstop.
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, errBoom
+	}
+	require.NoError(t, owe())
+	_, err = tc.reconcile(ctx, id)
+	require.ErrorIs(t, err, errBoom)
+	assert.Equal(t, int64(1), count(t), "a failed pass leaves the wake owed")
+}
+
+// TestReconcileDrainsMultiplePendingWakes pins that one pass services every wake
+// it observed, not just one. A crashed process can leave a count above 1; the
+// backstop enqueues that row exactly once (the work queue coalesces), so a pass
+// that subtracted only 1 would strand the remainder with nothing to re-enqueue it —
+// indefinitely when resync is disabled, and one per tick otherwise. Subtracting the
+// observed count drains it in the single pass the backstop scheduled.
+func TestReconcileDrainsMultiplePendingWakes(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	// Three wakes owed, as a crashed process would have left them.
+	for range 3 {
+		require.NoError(t, owe())
+	}
+	require.Equal(t, int64(3), count(t))
+
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, count(t), "one recovery pass drains every wake it observed")
+}
+
+// TestReconcilePendingWakeSurvivesConcurrentWake pins the condition the reviewer
+// surfaced, and the reason pending_wake is a count rather than a single token: a
+// second wake owed *while a reconcile is already servicing an earlier one* must not
+// be lost. Under the reverted design (the token was the target's resource_version)
+// two wakes for the same unchanged target shared a value, so the reconcile's clear
+// matched and dropped the second — and a crash before the in-memory requeue then
+// lost it entirely. As a +1/-1 count it cannot: the mid-pass increment outlives the
+// pass's subtraction (it lands above the count that pass observed), leaving the
+// object owed and re-enqueued by the backstop.
+func TestReconcilePendingWakeSurvivesConcurrentWake(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+
+	// The pass is servicing one owed wake; a second is owed during it.
+	inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, owe()
+	}
+	require.NoError(t, owe()) // the wake this pass loads
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count(t),
+		"the wake owed during the pass is not clobbered by the pass's decrement")
+}
+
+// failDecrementPendingWakeStore fails the durable-wake decrement while delegating
+// the rest, so a test can exercise the reconciler's log-and-continue branch.
+type failDecrementPendingWakeStore struct {
+	Store
+}
+
+func (s *failDecrementPendingWakeStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+	return errBoom
+}
+
+// TestReconcileDecrementPendingWakeErrorIsNonFatal pins that a failed decrement does
+// not fail the reconcile: the count stays up and the backstop re-enqueues (a
+// harmless extra pass), so shadowing the successful reconcile with the decrement
+// error would be strictly worse.
+func TestReconcileDecrementPendingWakeErrorIsNonFatal(t *testing.T) {
+	ctx := context.Background()
+	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, func(s Store) Store {
+		return &failDecrementPendingWakeStore{Store: s}
+	})
+	require.NoError(t, owe())
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := tc.reconcile(ctx, id)
+	require.NoError(t, err, "a failed decrement must not fail an otherwise successful reconcile")
+	assert.Equal(t, int64(1), count(t), "the count stays owed for the backstop to retry")
 }
 
 // TestReconcileRunsGCAfterCommittedWritesOnError guards against stranding: a

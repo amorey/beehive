@@ -2206,14 +2206,6 @@ func TestClientListOwnedObjectsLoadError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-func refObjectIDs(refs []Ref) []ObjectID {
-	var ids []ObjectID
-	for _, r := range refs {
-		ids = append(ids, r.ID)
-	}
-	return ids
-}
-
 func TestClientGetWithLoadOwner(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

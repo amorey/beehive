@@ -558,11 +558,53 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 
 	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, referrerIDs(refs), "a rejected declaration leaves no edge")
+	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration leaves no edge")
 	f.requireNotRequeued(t)
 
 	// The target's own current version is the boundary, and is accepted.
 	require.NoError(t, f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+}
+
+// TestAddDependencyStampRidesAddRef pins that the durable stamp is not a second
+// store call sequenced after the edge. Were it one, a caller nested in its own
+// Within could handle this method's error and commit the edge with no wake — a
+// dependent stranded on a stale read, the very race the version claim closes —
+// because a nested Within is a bare fn(ctx) that unwinds nothing.
+//
+// That the stamp *cannot* be a second call is now structural: the Store interface
+// carries no standalone increment, so nothing on this path could issue one. What
+// remains to check is the other half — that folding it into AddRef actually stamps —
+// which is what the two assertions below do: edge and wake land together.
+func TestAddDependencyStampRidesAddRef(t *testing.T) {
+	ctx := context.Background()
+	real := newClientTestStore(t)
+
+	bh, err := New(real)
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	dep, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	target, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+
+	stale := target.ResourceVersion
+	_, err = real.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	// Conjunction fires: new edge, target moved past stale.
+	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, stale))
+
+	refs, err := real.ListIncomingRefs(ctx, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, refObjectIDs(refs), "the edge landed")
+
+	owed, err := real.ListPendingWakeIDs(ctx, gk)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside AddRef")
 }
 
 // TestAddDependencyRejectsFutureResourceVersionNested is the rejection's harder
@@ -584,7 +626,7 @@ func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
 
 	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, referrerIDs(refs), "a rejected declaration must leave no edge, committed or not")
+	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration must leave no edge, committed or not")
 }
 
 // TestAddDependencyStaleResourceVersionWakesAtMostOnce pins the wake's
@@ -639,7 +681,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 
 	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	require.Equal(t, []ObjectID{f.witness.ID}, referrerIDs(refs), "the rolled-back declaration left no edge")
+	require.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "the rolled-back declaration left no edge")
 	f.requireNotRequeued(t)
 }
 

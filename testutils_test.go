@@ -122,6 +122,12 @@ func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]Object
 func (s *fakeStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
 	return nil, nil
 }
+func (s *fakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+func (s *fakeStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.DecrementPendingWake")
+}
 func (s *fakeStore) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.UpdateSpec")
 }
@@ -337,10 +343,12 @@ func addRef(ctx context.Context, store Store, from, to ObjectID, relation Relati
 	return err
 }
 
-// referrerIDs projects a Referrer slice to its ids, for assertions that care which
-// objects point at a target rather than how they were reached.
-func referrerIDs(refs []Referrer) []ObjectID {
-	ids := make([]ObjectID, 0, len(refs))
+// refObjectIDs projects a Ref/Referrer slice to its ids, for assertions that care
+// which objects are on the far end of an edge rather than how they were reached.
+// Ref and Referrer are both aliases of storeapi.Referrer, so one projection serves
+// the owner/dependency lookups and the incoming-ref lookups alike.
+func refObjectIDs(refs []Ref) []ObjectID {
+	var ids []ObjectID
 	for _, r := range refs {
 		ids = append(ids, r.ID)
 	}

@@ -218,24 +218,25 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id O
 
 // AddDependency implements the contract documented on ControllerClient. The
 // relation is always "depends_on" (owner edges come from WithOwner at create
-// time). AddRef is atomic on its own, and the version check now lives
-// inside it, so the Within here is not what makes either safe. It is the seam for
-// this method's own composition: the store call plus whatever else has to land
-// with it, joining a controller's Within when nested rather than opening a second
-// transaction (a nested Within is a bare fn(ctx)). Today that is one store call
-// and a post-commit wake; the durable-wake work in TODO.md adds a second write
-// that must commit with the edge or not at all.
+// time). Both writes — the edge and the durable wake stamp — live inside AddRef,
+// which is atomic on its own, so the Within here is not what makes either safe;
+// it is only the seam for this method's own composition, joining a controller's
+// Within when nested rather than opening a second transaction.
 //
-// The wake is a conjunction — the edge is new *and* the target moved — and needs
-// both halves to converge. Neither is a proxy for the other, and the edge-new half
-// is a deliberate under-approximation: see the interface docs for what it gives up. Waking whenever the target moved lets a caller whose
-// version never advances re-fire every pass, and waking whenever the edge is new
-// (the guard TODO.md records as built and reverted) re-fires every pass for a
-// controller that clears and re-declares its dependency set. Neither is throttled:
-// the dispatch path has no already-settled skip and workQueue.addLocked has no
-// rate limiter. Requiring both bounds the wake to once per edge, which is the
-// whole window — and Inserted rides the insert's RowsAffected, so the edge-new
-// half costs nothing (a pre-read for it is what sank the earlier guard).
+// They are in the store rather than sequenced here precisely because a nested
+// Within unwinds nothing: a stamp issued as a second call after AddRef returned
+// would leave a caller who handles this method's error free to commit the edge
+// without it — a dependent stranded on a stale read, which is the race this
+// method exists to close. Ordering inside one store call is the guarantee (see
+// AddRef), and WakeStamped reports what it did rather than having the conjunction
+// recomputed here, where the two halves could drift apart.
+//
+// The wake is a conjunction — the edge is new *and* the target moved — and both
+// halves are load-bearing: either alone re-fires every pass for some ordinary
+// controller, and nothing throttles that (the dispatch path has no already-settled
+// skip, and workQueue.addLocked has no rate limiter). TODO.md records the two
+// rejected one-sided guards; the interface doc covers what the conjunction gives
+// up. The edge-new half costs nothing, riding the stamp statement's own NOT EXISTS.
 //
 // The requeue is routed by fromID's own GroupKind, not the caller's — the edge is
 // deliberately cross-kind, so a controller may declare one on another kind's
@@ -243,9 +244,10 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id O
 // another kind's bytes as this one's Spec. wakeAfterCommit (not the
 // reconcile-scoped pendingWakes, which is nil for the out-of-band call) registers
 // it post-commit, so it can't reach a controller before the edge it is about, or
-// at all if the transaction rolls back. It is in-memory: a process that dies
-// between the commit and the requeue owes a reconcile that nothing records. See
-// "A dependency wake is in-memory" in TODO.md.
+// at all if the transaction rolls back. It is in-memory, and deliberately the
+// expendable half: a process that dies before it runs still finds the stamp on
+// restart, and the backstop that drains pending_wake makes the reconcile happen
+// late rather than never.
 func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error {
 	return c.bh.store.Within(ctx, func(ctx context.Context) error {
 		// The store rejects a version above the target's own before it inserts (see
@@ -255,7 +257,14 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 		if err != nil {
 			return err
 		}
-		if res.Inserted && targetResourceVersion > 0 && res.TargetResourceVersion > targetResourceVersion {
+		if res.WakeStamped {
+			// The durable half already landed with the edge (pending_wake is a count of
+			// outstanding wakes, decremented by the reconcile that services one, so a
+			// wake owed mid-pass is not lost — see the pending_wake column). This is the
+			// latency half: the in-memory requeue, so the dependent reconciles now rather
+			// than waiting for the backstop. It self-gates on registration via
+			// enqueueIfRegistered — which is also why the stamp doesn't need gating: an
+			// unregistered kind simply owes a count nothing scans.
 			c.bh.wakeAfterCommit(ctx, res.From, fromID)
 		}
 		return nil
