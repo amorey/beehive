@@ -186,6 +186,7 @@ type reconciler struct {
 	// subscribers, keyed by ObjectID with latest-value-per-id coalescing. The work
 	// queue feeds it through onSchedule; Close (on teardown) ends live streams.
 	scheduleHub       *conflate.Hub[ObjectID, Schedule]
+	catchupInterval   time.Duration
 	resyncInterval    time.Duration
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
@@ -251,6 +252,20 @@ func (r *reconciler) enqueuePendingWake(ctx context.Context) {
 		return
 	}
 	r.enqueueFrom(ctx, "pending-wake", r.store.ListPendingWakeIDs)
+}
+
+// enqueueCatchup drains the work the store has recorded as owed: objects whose
+// spec has not converged, and objects owed a durable dependency wake. Both are
+// derived from a column, so they are cheap to ask for and return nothing in a
+// converged system — which is what lets this run on a frequent cadence where a
+// full pass could not.
+//
+// The two listings stay separate rather than being unioned in SQL so that a
+// failure in one still lets the other through, and so enqueueFrom's log names
+// which backstop lost its pass (see its doc).
+func (r *reconciler) enqueueCatchup(ctx context.Context) {
+	r.enqueueUnsettled(ctx)
+	r.enqueuePendingWake(ctx)
 }
 
 // enqueueAll enqueues every object of the kind, including ones whose spec is
@@ -498,12 +513,23 @@ func (r *reconciler) run(ctx context.Context) {
 		defer ticker.Stop()
 		resync = ticker.C
 	}
+	// The catchup tick is the cheap, frequent one: it drains only what the store
+	// records as owed, so it can run often without scaling with the object count.
+	var catchup <-chan time.Time
+	if r.catchupInterval > 0 {
+		ticker := time.NewTicker(r.catchupInterval)
+		defer ticker.Stop()
+		catchup = ticker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			r.logger.Info("reconciler stopped")
 			return
+		case <-catchup:
+			r.logger.Debug("catchup tick")
+			r.enqueueCatchup(ctx)
 		case <-resync:
 			r.logger.Debug("resync tick")
 			r.enqueueUnsettled(ctx)

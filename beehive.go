@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	defaultResyncInterval = 30 * time.Second
-	defaultGCInterval     = 30 * time.Second
+	defaultCatchupInterval = 30 * time.Second
+	defaultResyncInterval  = 30 * time.Second
+	defaultGCInterval      = 30 * time.Second
 )
 
 type beehiveState uint8
@@ -44,8 +45,13 @@ const (
 // registered controllers, and drives their reconcile loops between Start and
 // Stop.
 type Beehive struct {
-	store          Store
-	resyncInterval time.Duration
+	store Store
+	// catchupInterval paces the cheap tick that drains work the store has recorded
+	// as owed. Separate from resyncInterval because the two scale differently: the
+	// owed set is bounded by what is actually outstanding, a full pass by the
+	// object count.
+	catchupInterval time.Duration
+	resyncInterval  time.Duration
 	// gcInterval paces the global GC sweeper (deletion-pending collection and
 	// event-log retention). It is deliberately separate from the reconcile
 	// intervals: collecting dead rows and re-confirming live ones are different
@@ -331,11 +337,12 @@ func (bh *Beehive) stop(ctx context.Context) error {
 // returned Beehive before calling Start.
 func New(s Store, opts ...Option) (*Beehive, error) {
 	bh := &Beehive{
-		store:          s,
-		resyncInterval: defaultResyncInterval,
-		gcInterval:     defaultGCInterval,
-		reconcilers:    make(map[GroupKind]*reconciler),
-		migrators:      make(map[GroupKind]Migrator),
+		store:           s,
+		catchupInterval: defaultCatchupInterval,
+		resyncInterval:  defaultResyncInterval,
+		gcInterval:      defaultGCInterval,
+		reconcilers:     make(map[GroupKind]*reconciler),
+		migrators:       make(map[GroupKind]Migrator),
 	}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
@@ -365,6 +372,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		store:            bh.store,
 		work:             newWorkQueue(),
 		scheduleHub:      conflate.New[ObjectID](mergeSchedule),
+		catchupInterval:  bh.catchupInterval,
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
 		concurrency:      bh.concurrency,

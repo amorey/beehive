@@ -113,6 +113,31 @@ func TestWithStartupReconcileStrategyDispatch(t *testing.T) {
 	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileAll)("unrelated"))
 }
 
+func TestWithCatchupIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithCatchupInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.catchupInterval)
+
+	r := &reconciler{}
+	require.NoError(t, WithCatchupInterval(time.Minute)(r))
+	assert.Equal(t, time.Minute, r.catchupInterval)
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, WithCatchupInterval(time.Second)("unrelated"))
+}
+
+func TestWithGCIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithGCInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.gcInterval)
+
+	// GC is global: a reconciler is not a target it recognizes, and neither is
+	// anything else.
+	r := &reconciler{}
+	require.NoError(t, WithGCInterval(time.Minute)(r))
+	require.NoError(t, WithGCInterval(time.Second)("unrelated"))
+}
+
 func TestWithLoggerDispatch(t *testing.T) {
 	l := slog.New(slog.DiscardHandler)
 

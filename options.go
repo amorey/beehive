@@ -266,6 +266,30 @@ func WithOnCreate(fn func(ctx context.Context)) Option {
 	}
 }
 
+// WithCatchupInterval sets how often a controller drains work the store has
+// recorded as owed: objects whose spec has not converged
+// (observed_generation < generation) and objects owed a durable dependency wake.
+// A value <= 0 disables the catchup tick.
+//
+// It is separate from WithResyncInterval because the two scale differently. The
+// owed set is bounded by what is actually outstanding — indexed listings that
+// return nothing in a converged system — while a full pass scales with the object
+// count. One interval governing both would mean tuning either moves the other.
+//
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithCatchupInterval(d time.Duration) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.catchupInterval = d
+		case *reconciler:
+			t.catchupInterval = d
+		}
+		return nil
+	}
+}
+
 // WithResyncInterval sets the periodic resync interval for a controller. A
 // value <= 0 disables periodic resync, leaving the controller event-driven
 // only.

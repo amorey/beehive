@@ -2465,3 +2465,143 @@ func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
 	assert.False(t, ok, "nil work queue must report nothing scheduled")
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
 }
+
+// catchupProbeStore signals the startup listings a catchup test must order itself
+// against. Start only *launches* the reconcile loop, and the startup pass drains
+// the same owed sets the tick does — so a test that seeds owed work before Start
+// (or right after it) is measuring the startup pass, not the tick. Waiting for
+// these signals and only then seeding leaves the tick as the sole possible cause.
+type catchupProbeStore struct {
+	Store
+	unsettledListed chan struct{}
+	wakeListed      chan struct{}
+}
+
+func (s *catchupProbeStore) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListUnsettledIDs(ctx, gk)
+	select {
+	case s.unsettledListed <- struct{}{}:
+	default:
+	}
+	return ids, err
+}
+
+func (s *catchupProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
+	select {
+	case s.wakeListed <- struct{}{}:
+	default:
+	}
+	return ids, err
+}
+
+// wakeStampingStore is the store surface a catchup test needs: the Store contract
+// plus IncrementPendingWake, which is deliberately not on Store (see the comment
+// on reconcilePendingWakeHarness) but exists on the concrete sqlite store so a
+// test can seed an owed wake without staging the whole declare race.
+type wakeStampingStore interface {
+	Store
+	IncrementPendingWake(context.Context, ObjectID) error
+}
+
+// newCatchupHarness starts a control plane whose only periodic driver is the
+// catchup tick — resync and GC off, no startup spec pass — and returns once the
+// startup pass has provably drained both owed sets. Whatever the caller seeds
+// after this can only be dispatched by a tick.
+func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore)) (wakeStampingStore, <-chan ObjectID) {
+	t.Helper()
+	real, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { real.Close() })
+	// Seeding before Start lets a test establish a *settled* object without racing
+	// the tick, which would otherwise dispatch it for being briefly unsettled.
+	if seed != nil {
+		seed(real)
+	}
+
+	store := &catchupProbeStore{
+		Store:           real,
+		unsettledListed: make(chan struct{}, 8),
+		wakeListed:      make(chan struct{}, 8),
+	}
+	reconciled := make(chan ObjectID, 4)
+
+	bh, err := New(store, WithResyncInterval(0), WithGCInterval(0),
+		WithCatchupInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
+		WithStartupReconcileStrategy(StartupReconcileNone))
+	require.NoError(t, err)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(context.Background()) })
+
+	// The startup pass runs enqueuePendingWake unconditionally; the unsettled
+	// listing only arrives via a tick under StartupReconcileNone, so waiting on
+	// the wake signal is what proves startup is behind us.
+	select {
+	case <-store.wakeListed:
+	case <-time.After(testTimeout):
+		t.Fatal("startup pass never listed pending wakes")
+	}
+	return real, reconciled
+}
+
+// TestCatchupTickDispatchesOwedWork pins the catchup ticker: the cheap, frequent
+// pass that drains work the store has *recorded* as owed — an unconverged spec
+// here — on a cadence of its own.
+//
+// It is deliberately separate from the resync knob. Draining owed work is bounded
+// by what is actually outstanding (indexed listings that return nothing in a
+// converged system), while re-confirming every object scales with the object
+// count. One interval governing both means tuning either moves the other.
+func TestCatchupTickDispatchesOwedWork(t *testing.T) {
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+	real, reconciled := newCatchupHarness(t, gk, nil)
+
+	// An object a prior process left unconverged: written straight through the
+	// store, so observed_generation is NULL and nothing has dispatched it.
+	raw, err := real.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, raw.ID, got)
+	case <-time.After(testTimeout):
+		t.Fatal("unsettled object was never dispatched: no catchup tick is draining owed work")
+	}
+}
+
+// TestCatchupTickDispatchesOwedWake pins the *other* half of the catchup set.
+// An object owed a durable dependency wake is settled by definition — that is
+// precisely why the unsettled listing cannot see it — so if catchup drained only
+// unsettled objects, a wake recorded across a restart would never be delivered.
+// The two listings read different columns and need separate coverage.
+func TestCatchupTickDispatchesOwedWake(t *testing.T) {
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	// Seeded before Start and left *settled*, so the unsettled listing can never
+	// be what dispatches it.
+	var id ObjectID
+	real, reconciled := newCatchupHarness(t, gk, func(s wakeStampingStore) {
+		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		_, err = s.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		require.NoError(t, err)
+		id = raw.ID
+	})
+
+	// Now owed a wake, the way a crash between a target's commit and the
+	// dependent's dispatch leaves it.
+	require.NoError(t, real.IncrementPendingWake(ctx, id))
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, id, got)
+	case <-time.After(testTimeout):
+		t.Fatal("object owed a wake was never dispatched: catchup drains only the unsettled half")
+	}
+}
