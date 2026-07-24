@@ -1076,14 +1076,16 @@ func TestEnqueuePendingWake(t *testing.T) {
 	assert.Equal(t, []ObjectID{5, 8}, items)
 }
 
-// TestResyncTickEnqueuesPendingWake covers run's *tick* call to enqueuePendingWake,
-// which had no coverage at all: the restart test that pins durable-wake recovery
-// disables resync, so deleting the tick's enqueue left the suite green.
+// TestCatchupTickEnqueuesPendingWake covers run's *tick* call to
+// enqueuePendingWake at the unit level, with no store: the restart test that pins
+// durable-wake recovery disables every ticker, so deleting the tick's enqueue left
+// the suite green. Owed wakes ride the catchup tick, not resync — a wake is
+// recorded work, which is what catchup exists to drain.
 //
 // StartupReconcileNone plus a store that withholds its owed IDs until the second
 // listing means neither the startup pass nor any other backstop can be what
 // enqueues the object — only a tick can.
-func TestResyncTickEnqueuesPendingWake(t *testing.T) {
+func TestCatchupTickEnqueuesPendingWake(t *testing.T) {
 	const owedID = ObjectID(21)
 
 	reconciled := make(chan ObjectID, 1)
@@ -1100,7 +1102,7 @@ func TestResyncTickEnqueuesPendingWake(t *testing.T) {
 		adapter:          adapter,
 		store:            &tickOnlyPendingWakeStore{ids: []ObjectID{owedID}},
 		work:             newWorkQueue(),
-		resyncInterval:   time.Millisecond, // the tick is the code under test
+		catchupInterval:  time.Millisecond, // the tick is the code under test
 		maxRetryInterval: time.Second,
 		startupReconcile: StartupReconcileNone,
 		backoffFor:       make(map[ObjectID]time.Duration),
@@ -1114,7 +1116,7 @@ func TestResyncTickEnqueuesPendingWake(t *testing.T) {
 	case got := <-reconciled:
 		assert.Equal(t, owedID, got)
 	case <-time.After(testTimeout):
-		t.Fatal("owed wake was never enqueued by a resync tick")
+		t.Fatal("owed wake was never enqueued by a catchup tick")
 	}
 
 	cancel()
@@ -1374,13 +1376,16 @@ func (s *listCallStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]Obje
 	return nil, nil
 }
 
-func TestRunResyncsOnTick(t *testing.T) {
+// TestRunCatchesUpOnTick verifies the catchup ticker keeps firing: the unsettled
+// listing runs once at startup and again on every tick. This is the loop-level
+// pin; which objects each listing returns is covered by the store-backed tests.
+func TestRunCatchesUpOnTick(t *testing.T) {
 	store := &listCallStore{callCh: make(chan struct{}, 10)}
 	r := &reconciler{
-		store:          store,
-		work:           newWorkQueue(),
-		resyncInterval: 5 * time.Millisecond,
-		backoffFor:     make(map[ObjectID]time.Duration),
+		store:           store,
+		work:            newWorkQueue(),
+		catchupInterval: 5 * time.Millisecond,
+		backoffFor:      make(map[ObjectID]time.Duration),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(r, ctx)
@@ -1392,11 +1397,11 @@ func TestRunResyncsOnTick(t *testing.T) {
 		t.Fatal("initial enqueueUnsettled not called")
 	}
 
-	// Wait for at least one resync-tick-driven enqueueUnsettled call.
+	// Wait for at least one catchup-tick-driven enqueueUnsettled call.
 	select {
 	case <-store.callCh:
 	case <-time.After(testTimeout):
-		t.Fatal("resync tick did not call enqueueUnsettled")
+		t.Fatal("catchup tick did not call enqueueUnsettled")
 	}
 
 	cancel()
@@ -2603,5 +2608,71 @@ func TestCatchupTickDispatchesOwedWake(t *testing.T) {
 		assert.Equal(t, id, got)
 	case <-time.After(testTimeout):
 		t.Fatal("object owed a wake was never dispatched: catchup drains only the unsettled half")
+	}
+}
+
+// newSettledHarness starts a control plane over a real store holding one settled
+// object, with the catchup tick and GC off and no startup spec pass. A settled
+// object is invisible to every owed-work listing, so nothing but a full pass can
+// re-dispatch it — which is exactly what makes it the probe for resync. tune
+// configures the reconciler options (i.e. whether resync is on).
+func newSettledHarness(t *testing.T, opts ...Option) (ObjectID, <-chan ObjectID) {
+	t.Helper()
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+
+	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+	// Settled before Start: observed_generation == generation, so it is owed
+	// nothing and no catchup listing will ever return it.
+	_, err = store.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+	require.NoError(t, err)
+
+	reconciled := make(chan ObjectID, 4)
+	bh, err := New(store, WithCatchupInterval(0), WithGCInterval(0))
+	require.NoError(t, err)
+	opts = append(opts, WithStartupReconcileStrategy(StartupReconcileNone))
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+	return raw.ID, reconciled
+}
+
+// TestResyncTickReconcilesSettled pins what WithResyncInterval now buys: a pass
+// over *every* object, converged ones included. That is the only thing that
+// re-confirms process-scoped state a restart invalidated (liveness conditions read
+// as "verifying" until this process rewrites them) and the only thing that heals a
+// wake lost for a reason nothing recorded — neither is visible to any owed-work
+// listing, so no catchup tick can reach it.
+func TestResyncTickReconcilesSettled(t *testing.T) {
+	id, reconciled := newSettledHarness(t, WithResyncInterval(10*time.Millisecond))
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, id, got)
+	case <-time.After(testTimeout):
+		t.Fatal("settled object was never re-dispatched: the resync tick is not a full pass")
+	}
+}
+
+// TestDefaultConfigDoesNotFullPass is the other half of the contract: with no
+// resync asked for, nothing re-dispatches a settled object. It guards the *shape*
+// — that no other driver quietly grew into a full pass — not the default's value,
+// which it cannot see: any default longer than the grace window below looks
+// identical from here. TestNewAppliesDefaults pins the value itself.
+func TestDefaultConfigDoesNotFullPass(t *testing.T) {
+	_, reconciled := newSettledHarness(t)
+
+	select {
+	case got := <-reconciled:
+		t.Fatalf("settled object %d was re-dispatched: the full pass is not opt-in", got)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

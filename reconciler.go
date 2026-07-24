@@ -531,10 +531,10 @@ func (r *reconciler) run(ctx context.Context) {
 			r.logger.Debug("catchup tick")
 			r.enqueueCatchup(ctx)
 		case <-resync:
+			// The full pass: every object, converged or not. It subsumes the catchup
+			// set, so it stands in for it rather than running both.
 			r.logger.Debug("resync tick")
-			r.enqueueUnsettled(ctx)
-			r.enqueueDeletionPending(ctx)
-			r.enqueuePendingWake(ctx)
+			r.enqueueAll(ctx)
 		}
 	}
 }

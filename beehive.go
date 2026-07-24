@@ -29,8 +29,11 @@ import (
 
 const (
 	defaultCatchupInterval = 30 * time.Second
-	defaultResyncInterval  = 30 * time.Second
-	defaultGCInterval      = 30 * time.Second
+	// The full pass scales with the object count rather than with what is owed, so
+	// it is opt-in: the catchup tick and the startup pass cover convergence, and a
+	// deployment that wants periodic re-confirmation asks for it.
+	defaultResyncInterval time.Duration = 0
+	defaultGCInterval                   = 30 * time.Second
 )
 
 type beehiveState uint8

@@ -290,14 +290,26 @@ func WithCatchupInterval(d time.Duration) Option {
 	}
 }
 
-// WithResyncInterval sets the periodic resync interval for a controller. A
-// value <= 0 disables periodic resync, leaving the controller event-driven
-// only.
+// WithResyncInterval sets how often a controller re-dispatches *every* object it
+// owns, converged or not. The default is 0, which disables it.
 //
-// The resync is what re-derives spec staleness (observed_generation < generation)
-// after startup, so disabling it alongside StartupReconcileNone leaves no automatic
-// driver for convergence at all — supported, but the embedder then owns recovery.
-// See StartupReconcileNone for the recipe and the warning that configuration logs.
+// This is the expensive pass, and the only one that reaches an object nothing has
+// recorded as owing work: process-scoped state a restart invalidated (liveness
+// conditions read as "verifying" until this process rewrites them), and a
+// dependency wake lost for a reason nothing observed. Both are invisible to
+// WithCatchupInterval, whose listings are driven by columns.
+//
+// It is opt-in because its cost scales with the object count rather than with what
+// is outstanding, and because the two cheaper drivers already cover convergence:
+// the catchup tick drains recorded work, and the startup pass re-confirms
+// everything once per process. Reach for this when the gap until the next restart
+// is itself too long — then set it well above WithCatchupInterval, since a full
+// pass subsumes the catchup set.
+//
+// Note for callers upgrading: this option previously paced the owed-work tick,
+// which is now WithCatchupInterval. A call left unchanged still compiles and now
+// buys a full pass at that cadence — likely more work than intended, and the
+// catchup tick keeps running at its own default regardless.
 func WithResyncInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {

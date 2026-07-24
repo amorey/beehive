@@ -69,7 +69,13 @@ func TestSweepEventRetention(t *testing.T) {
 func TestNewAppliesDefaults(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
-	assert.Equal(t, defaultResyncInterval, bh.resyncInterval)
+	// Literals, not the constants: comparing a default to its own constant passes
+	// whatever the value is, so it would not notice a default changing. These three
+	// are the contract — cheap owed-work drain and GC on, the object-count-scaled
+	// full pass off — so changing one should be a deliberate edit here.
+	assert.Equal(t, 30*time.Second, bh.catchupInterval, "owed work drains by default")
+	assert.Equal(t, time.Duration(0), bh.resyncInterval, "the full pass is opt-in")
+	assert.Equal(t, 30*time.Second, bh.gcInterval, "dead rows are collected by default")
 	assert.NotNil(t, bh.reconcilers)
 }
 
@@ -89,6 +95,7 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	r, ok := bh.reconcilers[gk]
 	require.True(t, ok, "reconciler should be registered under its GroupKind")
 	assert.Equal(t, gk, r.gk)
+	assert.Equal(t, defaultCatchupInterval, r.catchupInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultResyncInterval, r.resyncInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
 }
