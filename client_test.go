@@ -896,82 +896,43 @@ func TestClientNoOpUpdateDoesNotWake(t *testing.T) {
 }
 
 // TestClientDeleteAdvancesGCOnlyAfterOuterCommit covers Delete, whose follow-up is
-// advanceGC rather than a plain wake. Both of its branches must wait for the outer
-// commit: the wake for the same reason every other write's does, and the
-// synchronous collect because it is a cascade of physical deletes that has no
-// business running inside — and being rolled back with — the caller's transaction.
+// advanceGC rather than a plain wake. It must wait for the outer commit for the same
+// reason every other write's wake does: a reconciler woken mid-transaction would
+// either read a row whose tombstone is not visible yet, or be woken for a deletion
+// the caller then rolls back.
 func TestClientDeleteAdvancesGCOnlyAfterOuterCommit(t *testing.T) {
-	t.Run("registered kind defers the wake", func(t *testing.T) {
-		runCommitRollback(t, func(t *testing.T, commit bool) {
-			ctx := context.Background()
-			bh, err := New(newClientTestStore(t))
-			require.NoError(t, err)
-			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-			require.NoError(t, err)
-			r, ok := bh.reconcilerFor(clientTestGK)
-			require.True(t, ok)
+	runCommitRollback(t, func(t *testing.T, commit bool) {
+		ctx := context.Background()
+		bh, err := New(newClientTestStore(t))
+		require.NoError(t, err)
+		_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+		require.NoError(t, err)
+		r, ok := bh.reconcilerFor(clientTestGK)
+		require.True(t, ok)
 
-			client := NewClient[cSpec, cStatus](bh, clientTestGK)
-			obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("test/hold"))
-			require.NoError(t, err)
-			drainQueue(r.work) // drop the create's own wake
-			require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+		obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("test/hold"))
+		require.NoError(t, err)
+		drainQueue(r.work) // drop the create's own wake
+		require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
-			cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-			err = cc.Within(ctx, func(ctx context.Context) error {
-				require.NoError(t, client.Delete(ctx, obj.ID))
-				assert.Empty(t, queuedIDs(r.work), "the GC wake must wait for the outer commit")
-				if !commit {
-					return errBoom
-				}
-				return nil
-			})
-
-			if commit {
-				require.NoError(t, err)
-				assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a committed delete must wake the reconciler")
-			} else {
-				require.ErrorIs(t, err, errBoom)
-				assert.Empty(t, queuedIDs(r.work), "a rolled-back delete must not wake the reconciler")
+		cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+		err = cc.Within(ctx, func(ctx context.Context) error {
+			require.NoError(t, client.Delete(ctx, obj.ID))
+			assert.Empty(t, queuedIDs(r.work), "the GC wake must wait for the outer commit")
+			if !commit {
+				return errBoom
 			}
+			return nil
 		})
-	})
 
-	// With no controller and resync disabled, advanceGC collects inline — the one
-	// branch that writes. Nested, those writes would join the caller's transaction.
-	t.Run("client-only kind defers the collect", func(t *testing.T) {
-		runCommitRollback(t, func(t *testing.T, commit bool) {
-			ctx := context.Background()
-			bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+		if commit {
 			require.NoError(t, err)
-
-			client := NewClient[cSpec, cStatus](bh, clientTestGK)
-			obj, err := client.Create(ctx, cSpec{Val: "a"})
-			require.NoError(t, err)
-
-			err = bh.store.Within(ctx, func(ctx context.Context) error {
-				require.NoError(t, client.Delete(ctx, obj.ID))
-				// Still there: the collect that removes it must not run inside this
-				// transaction.
-				_, err := client.Get(ctx, obj.ID)
-				assert.NoError(t, err, "the collect must wait for the outer commit")
-				if !commit {
-					return errBoom
-				}
-				return nil
-			})
-
-			if commit {
-				require.NoError(t, err)
-				_, err = client.Get(ctx, obj.ID)
-				assert.ErrorIs(t, err, ErrNotFound, "a committed delete must be collected post-commit")
-			} else {
-				require.ErrorIs(t, err, errBoom)
-				got, err := client.Get(ctx, obj.ID)
-				require.NoError(t, err, "a rolled-back delete must leave the object alive")
-				assert.Nil(t, got.DeletionRequestedAt)
-			}
-		})
+			assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a committed delete must wake the reconciler")
+		} else {
+			require.ErrorIs(t, err, errBoom)
+			assert.Empty(t, queuedIDs(r.work), "a rolled-back delete must not wake the reconciler")
+		}
 	})
 }
 

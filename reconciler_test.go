@@ -15,11 +15,9 @@
 package beehive
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -39,17 +37,6 @@ type unsettledIDsStore struct {
 }
 
 func (s *unsettledIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
-	return s.ids, nil
-}
-
-// deletionPendingIDsStore is a fakeStore whose ListDeletionPendingIDs returns a
-// fixed slice, used to exercise the GC backstop enqueue without a real database.
-type deletionPendingIDsStore struct {
-	fakeStore
-	ids []ObjectID
-}
-
-func (s *deletionPendingIDsStore) ListDeletionPendingIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
@@ -529,13 +516,11 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 // that is indistinguishable from dying between the commit and the dispatch, and
 // it needs no goroutine timing to be deterministic.
 //
-// The restart runs with StartupReconcileNone, which is load-bearing twice over.
-// Under the default StartupReconcileAll the sweep reconciles everything and heals
-// the crash for reasons that have nothing to do with dependencies, so the test
-// would prove nothing. And a wake that is owed is not a spec-convergence
-// question, so recovering it must not be a startup *strategy* question either —
-// the fix has to reach the dependent under the strategy that asks for no startup
-// pass at all.
+// The restart runs with WithStartupResync(false), which is load-bearing: under the
+// default full pass the startup sweep reconciles everything and heals the crash for
+// reasons that have nothing to do with dependencies, so the test would prove
+// nothing. What must reach the dependent is the owed-work drain, which startup runs
+// regardless — a wake that is owed is recorded work, not a re-confirm.
 func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	// One store, two control planes: the rows outlive the process, the work queue
@@ -596,7 +581,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	}
 	_, err = Register(bh2, gk, ctrl2,
 		WithResyncInterval(0),
-		WithStartupReconcileStrategy(StartupReconcileNone))
+		WithStartupResync(false))
 	require.NoError(t, err)
 	ctrl2.client = NewClient[tSpec, tStatus](bh2, gk)
 
@@ -616,9 +601,10 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 }
 
 // TestStartToleratesWatchError verifies that a dependency-watch subscription
-// failure is non-fatal: Start (which now establishes the watch synchronously)
-// still succeeds and the controller runs — only the waker is skipped, and the
-// controller still resyncs on its own timer.
+// failure is non-fatal: Start (which establishes the watch synchronously) still
+// succeeds and the controller runs — only the waker is skipped. What that skip
+// costs, and the escalation that pays for it, is
+// TestSubscribeFailureMessageMatchesCoverage.
 func TestStartToleratesWatchError(t *testing.T) {
 	bh, err := New(&watcherStore{err: errBoom}, WithResyncInterval(0))
 	require.NoError(t, err)
@@ -666,7 +652,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw) })
+	bh.wg.Go(func() { bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
@@ -720,7 +706,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, fw)
+		bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw)
 		close(done)
 	}()
 
@@ -773,7 +759,7 @@ func TestDependencyWakerStreamEnd(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw)
+		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
 		close(done)
 	}()
 
@@ -799,10 +785,13 @@ func TestStartupEnqueuesAllNotJustUnsettled(t *testing.T) {
 		},
 	}
 	r := &reconciler{
-		adapter:          adapter,
-		store:            &allIDsStore{ids: []ObjectID{objID}},
-		work:             newWorkQueue(),
-		resyncInterval:   0,
+		adapter: adapter,
+		store:   &allIDsStore{ids: []ObjectID{objID}},
+		work:    newWorkQueue(),
+		// Set explicitly: unlike the strategy enum this replaced, a bool's zero
+		// value is the *off* state, so a reconciler built outside Register (as here)
+		// does not inherit New's true default.
+		startupResync:    true,
 		maxRetryInterval: time.Second,
 		backoffFor:       make(map[ObjectID]time.Duration),
 	}
@@ -837,79 +826,13 @@ func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tS
 	return Result{}, nil
 }
 
-// TestStartupReconcileNoneWithoutResyncDrivesNothing pins the opt-out:
-// StartupReconcileNone with the resync disabled means beehive drives no spec
-// convergence at all, not even for an object a previous process left unconverged.
-// That is deliberate — the embedder reconciles on its own schedule (see the
-// companion test below) — and the point of pinning it is that the obvious "fix",
-// resuming unsettled objects unconditionally at startup, would silently take the
-// configuration away from the caller who asked for it.
-//
-// The prior process is spelled as a row written straight to the store, so it
-// carries observed_generation IS NULL: what a process that created the object and
-// died before its controller settled it would leave behind.
-func TestStartupReconcileNoneWithoutResyncDrivesNothing(t *testing.T) {
-	ctx := context.Background()
-	store := newClientTestStore(t)
-	gk := GroupKind{Kind: "Widget"}
-
-	_, err := store.CreateObject(ctx, &RawObject{
-		Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-
-	bh, err := New(store, WithResyncInterval(0))
-	require.NoError(t, err)
-	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, gk, ctrl, WithStartupReconcileStrategy(StartupReconcileNone))
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	defer stop(ctx)
-
-	select {
-	case got := <-ctrl.reconciled:
-		t.Fatalf("object %d reconciled: the caller asked for no automatic driver and got one anyway", got)
-	case <-time.After(200 * time.Millisecond):
-	}
-}
-
-// TestStartupReconcileNoneWithoutResyncWarns verifies the configuration above
-// announces itself. Honoring the opt-out is only defensible because it is not
-// silent: reached by accident, the failure mode is a spec that is never actuated
-// with nothing to notice, so the warning is what separates "deliberate" from
-// "stranded". It names the two primitives that make the configuration usable.
-func TestStartupReconcileNoneWithoutResyncWarns(t *testing.T) {
-	ctx := context.Background()
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	bh, err := New(newClientTestStore(t), WithResyncInterval(0), WithLogger(logger))
-	require.NoError(t, err)
-	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, ctrl,
-		WithStartupReconcileStrategy(StartupReconcileNone))
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	require.NoError(t, stop(ctx)) // stop first: run logs the warning during startup
-
-	out := buf.String()
-	assert.Contains(t, out, "no automatic reconcile driver")
-	assert.Contains(t, out, "ListUnsettledIDs")
-	assert.Contains(t, out, "Requeue")
-}
-
-// TestStartupReconcileNoneSelfDrivenRecovery exercises the recipe the
-// StartupReconcileNone godoc hands the embedder who takes over recovery:
-// Store.ListUnsettledIDs reports exactly the objects owed a pass, and
-// Client.Requeue dispatches one. It is what makes honoring the opt-out reasonable
-// rather than a config with no correct use, so it is pinned as public surface: if
-// either primitive stops being reachable or stops reporting the unconverged row,
-// the documented escape hatch is gone.
-func TestStartupReconcileNoneSelfDrivenRecovery(t *testing.T) {
+// TestSelfDrivenRecovery pins the primitives an embedder uses to drive reconciles
+// on its own schedule: Store.ListUnsettledIDs reports exactly the objects owed a
+// pass, and Client.Requeue dispatches one. Startup now drains owed work itself, so
+// this is no longer the *only* way such an object gets reconciled — but it stays
+// pinned as public surface, because a deployment that turns every ticker off still
+// needs it for anything that falls behind after startup.
+func TestSelfDrivenRecovery(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	gk := GroupKind{Kind: "Widget"}
@@ -919,16 +842,25 @@ func TestStartupReconcileNoneSelfDrivenRecovery(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	bh, err := New(store, WithResyncInterval(0))
+	bh, err := New(store, WithCatchupInterval(0), WithResyncInterval(0))
 	require.NoError(t, err)
 	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, gk, ctrl, WithStartupReconcileStrategy(StartupReconcileNone))
+	_, err = Register(bh, gk, ctrl, WithStartupResync(false))
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
+
+	// Startup drains owed work regardless of the resync choice, so consume that
+	// dispatch first — otherwise it, not the requeue below, could satisfy the
+	// assertion.
+	select {
+	case <-ctrl.reconciled:
+	case <-time.After(testTimeout):
+		t.Fatal("startup did not drain the owed object")
+	}
 
 	// The embedder's own backstop, on whatever schedule it likes.
 	ids, err := store.ListUnsettledIDs(ctx, gk)
@@ -944,47 +876,42 @@ func TestStartupReconcileNoneSelfDrivenRecovery(t *testing.T) {
 	}
 }
 
-// TestStartupReconcileSkipsSettled verifies that the non-default strategies do
-// not reconcile a settled object at startup. allIDsStore reports the object via
-// ListIDs but not ListUnsettledIDs, so StartupReconcileUnsettled (empty unsettled
-// set) and StartupReconcileNone (no startup pass) both leave it untouched.
-func TestStartupReconcileSkipsSettled(t *testing.T) {
-	for _, strategy := range []StartupReconcileStrategy{StartupReconcileUnsettled, StartupReconcileNone} {
-		t.Run(fmt.Sprintf("strategy=%d", strategy), func(t *testing.T) {
-			reconciled := make(chan ObjectID, 1)
-			adapter := &fakeAdapter{
-				reconcileFn: func(_ context.Context, id ObjectID) (Result, error) {
-					select {
-					case reconciled <- id:
-					default:
-					}
-					return Result{}, nil
-				},
-			}
-			r := &reconciler{
-				adapter:          adapter,
-				store:            &allIDsStore{ids: []ObjectID{7}},
-				work:             newWorkQueue(),
-				resyncInterval:   0,
-				maxRetryInterval: time.Second,
-				startupReconcile: strategy,
-				backoffFor:       make(map[ObjectID]time.Duration),
-			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			done := runInBackground(r, ctx)
-
+// TestStartupResyncDisabledSkipsSettled is the unit-level twin of the
+// store-backed TestStartupResyncReconcilesSettled: allIDsStore reports the object
+// via ListIDs but not via any owed-work listing, so with the startup resync off
+// nothing enqueues it — the owed-work drain has nothing to drain.
+func TestStartupResyncDisabledSkipsSettled(t *testing.T) {
+	reconciled := make(chan ObjectID, 1)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) (Result, error) {
 			select {
-			case got := <-reconciled:
-				t.Fatalf("settled object %d reconciled despite strategy %d", got, strategy)
-			case <-time.After(200 * time.Millisecond):
+			case reconciled <- id:
+			default:
 			}
-
-			cancel()
-			waitClosed(t, done, "run to return after cancel")
-		})
+			return Result{}, nil
+		},
 	}
+	r := &reconciler{
+		adapter:          adapter,
+		store:            &allIDsStore{ids: []ObjectID{7}},
+		work:             newWorkQueue(),
+		maxRetryInterval: time.Second,
+		startupResync:    false,
+		backoffFor:       make(map[ObjectID]time.Duration),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(r, ctx)
+
+	select {
+	case got := <-reconciled:
+		t.Fatalf("settled object %d reconciled with the startup resync off", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	cancel()
+	waitClosed(t, done, "run to return after cancel")
 }
 
 // TestEnqueueNilStoreNoop verifies the enqueue helpers are no-ops (no panic)
@@ -1041,23 +968,8 @@ func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
 	assert.Empty(t, items, "a failed list enqueues nothing")
 }
 
-func TestEnqueueDeletionPending(t *testing.T) {
-	r := &reconciler{
-		store:      &deletionPendingIDsStore{ids: []ObjectID{7, 13}},
-		work:       newWorkQueue(),
-		backoffFor: make(map[ObjectID]time.Duration),
-	}
-
-	r.enqueueDeletionPending(context.Background())
-
-	r.work.mu.Lock()
-	items := append([]ObjectID(nil), r.work.items...)
-	r.work.mu.Unlock()
-	assert.Equal(t, []ObjectID{7, 13}, items)
-}
-
 // TestEnqueuePendingWake verifies that enqueuePendingWake enqueues exactly the IDs
-// returned by ListPendingWakeIDs, in order — the sibling of the two tests above.
+// returned by ListPendingWakeIDs, in order — the sibling of the test above.
 // Only its failed-list branch was covered (TestEnqueueFromListErrorSkipsPass), so
 // the helper whose whole purpose is not losing an owed wake was the one of the
 // three that could have stopped enqueuing anything without a test noticing.
@@ -1076,14 +988,16 @@ func TestEnqueuePendingWake(t *testing.T) {
 	assert.Equal(t, []ObjectID{5, 8}, items)
 }
 
-// TestResyncTickEnqueuesPendingWake covers run's *tick* call to enqueuePendingWake,
-// which had no coverage at all: the restart test that pins durable-wake recovery
-// disables resync, so deleting the tick's enqueue left the suite green.
+// TestCatchupTickEnqueuesPendingWake covers run's *tick* call to
+// enqueuePendingWake at the unit level, with no store: the restart test that pins
+// durable-wake recovery disables every ticker, so deleting the tick's enqueue left
+// the suite green. Owed wakes ride the catchup tick, not resync — a wake is
+// recorded work, which is what catchup exists to drain.
 //
-// StartupReconcileNone plus a store that withholds its owed IDs until the second
+// A disabled startup resync plus a store that withholds its owed IDs until the second
 // listing means neither the startup pass nor any other backstop can be what
 // enqueues the object — only a tick can.
-func TestResyncTickEnqueuesPendingWake(t *testing.T) {
+func TestCatchupTickEnqueuesPendingWake(t *testing.T) {
 	const owedID = ObjectID(21)
 
 	reconciled := make(chan ObjectID, 1)
@@ -1100,9 +1014,9 @@ func TestResyncTickEnqueuesPendingWake(t *testing.T) {
 		adapter:          adapter,
 		store:            &tickOnlyPendingWakeStore{ids: []ObjectID{owedID}},
 		work:             newWorkQueue(),
-		resyncInterval:   time.Millisecond, // the tick is the code under test
+		catchupInterval:  time.Millisecond, // the tick is the code under test
 		maxRetryInterval: time.Second,
-		startupReconcile: StartupReconcileNone,
+		startupResync:    false,
 		backoffFor:       make(map[ObjectID]time.Duration),
 	}
 
@@ -1114,7 +1028,7 @@ func TestResyncTickEnqueuesPendingWake(t *testing.T) {
 	case got := <-reconciled:
 		assert.Equal(t, owedID, got)
 	case <-time.After(testTimeout):
-		t.Fatal("owed wake was never enqueued by a resync tick")
+		t.Fatal("owed wake was never enqueued by a catchup tick")
 	}
 
 	cancel()
@@ -1374,13 +1288,16 @@ func (s *listCallStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]Obje
 	return nil, nil
 }
 
-func TestRunResyncsOnTick(t *testing.T) {
+// TestRunCatchesUpOnTick verifies the catchup ticker keeps firing: the unsettled
+// listing runs once at startup and again on every tick. This is the loop-level
+// pin; which objects each listing returns is covered by the store-backed tests.
+func TestRunCatchesUpOnTick(t *testing.T) {
 	store := &listCallStore{callCh: make(chan struct{}, 10)}
 	r := &reconciler{
-		store:          store,
-		work:           newWorkQueue(),
-		resyncInterval: 5 * time.Millisecond,
-		backoffFor:     make(map[ObjectID]time.Duration),
+		store:           store,
+		work:            newWorkQueue(),
+		catchupInterval: 5 * time.Millisecond,
+		backoffFor:      make(map[ObjectID]time.Duration),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(r, ctx)
@@ -1392,11 +1309,11 @@ func TestRunResyncsOnTick(t *testing.T) {
 		t.Fatal("initial enqueueUnsettled not called")
 	}
 
-	// Wait for at least one resync-tick-driven enqueueUnsettled call.
+	// Wait for at least one catchup-tick-driven enqueueUnsettled call.
 	select {
 	case <-store.callCh:
 	case <-time.After(testTimeout):
-		t.Fatal("resync tick did not call enqueueUnsettled")
+		t.Fatal("catchup tick did not call enqueueUnsettled")
 	}
 
 	cancel()
@@ -2464,4 +2381,602 @@ func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
 	_, ok := r.nextRequeueAt(1)
 	assert.False(t, ok, "nil work queue must report nothing scheduled")
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
+}
+
+// wakeStampingStore is the store surface a catchup test needs: the Store contract
+// plus IncrementPendingWake, which is deliberately not on Store (see the comment
+// on reconcilePendingWakeHarness) but exists on the concrete sqlite store so a
+// test can seed an owed wake without staging the whole declare race.
+type wakeStampingStore interface {
+	Store
+	IncrementPendingWake(context.Context, ObjectID) error
+}
+
+// newCatchupHarness starts a control plane whose only periodic driver is the
+// catchup tick — resync and GC off, no startup spec pass — and returns once the
+// startup pass has provably drained both owed sets. Whatever the caller seeds
+// after this can only be dispatched by a tick.
+func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore)) (wakeStampingStore, <-chan ObjectID) {
+	t.Helper()
+	real, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { real.Close() })
+	// Seeding before Start lets a test establish a *settled* object without racing
+	// the tick, which would otherwise dispatch it for being briefly unsettled.
+	if seed != nil {
+		seed(real)
+	}
+
+	store := &listProbeStore{
+		Store:           real,
+		unsettledListed: make(chan struct{}, 8),
+		wakeListed:      make(chan struct{}, 8),
+	}
+	reconciled := make(chan ObjectID, 4)
+
+	bh, err := New(store, WithResyncInterval(0), withoutGCSweeper(),
+		WithCatchupInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
+		WithStartupResync(false))
+	require.NoError(t, err)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(context.Background()) })
+
+	// The startup pass runs enqueuePendingWake unconditionally; the unsettled
+	// listing only arrives via a tick with the startup resync off, so waiting on
+	// the wake signal is what proves startup is behind us.
+	select {
+	case <-store.wakeListed:
+	case <-time.After(testTimeout):
+		t.Fatal("startup pass never listed pending wakes")
+	}
+	return real, reconciled
+}
+
+// TestCatchupTickDispatchesOwedWork pins the catchup ticker: the cheap, frequent
+// pass that drains work the store has *recorded* as owed — an unconverged spec
+// here — on a cadence of its own.
+//
+// It is deliberately separate from the resync knob. Draining owed work is bounded
+// by what is actually outstanding (indexed listings that return nothing in a
+// converged system), while re-confirming every object scales with the object
+// count. One interval governing both means tuning either moves the other.
+func TestCatchupTickDispatchesOwedWork(t *testing.T) {
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+	real, reconciled := newCatchupHarness(t, gk, nil)
+
+	// An object a prior process left unconverged: written straight through the
+	// store, so observed_generation is NULL and nothing has dispatched it.
+	raw, err := real.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, raw.ID, got)
+	case <-time.After(testTimeout):
+		t.Fatal("unsettled object was never dispatched: no catchup tick is draining owed work")
+	}
+}
+
+// TestCatchupTickDispatchesOwedWake pins the *other* half of the catchup set.
+// An object owed a durable dependency wake is settled by definition — that is
+// precisely why the unsettled listing cannot see it — so if catchup drained only
+// unsettled objects, a wake recorded across a restart would never be delivered.
+// The two listings read different columns and need separate coverage.
+func TestCatchupTickDispatchesOwedWake(t *testing.T) {
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	// Seeded before Start and left *settled*, so the unsettled listing can never
+	// be what dispatches it.
+	var id ObjectID
+	real, reconciled := newCatchupHarness(t, gk, func(s wakeStampingStore) {
+		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		_, err = s.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		require.NoError(t, err)
+		id = raw.ID
+	})
+
+	// Now owed a wake, the way a crash between a target's commit and the
+	// dependent's dispatch leaves it.
+	require.NoError(t, real.IncrementPendingWake(ctx, id))
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, id, got)
+	case <-time.After(testTimeout):
+		t.Fatal("object owed a wake was never dispatched: catchup drains only the unsettled half")
+	}
+}
+
+// newSettledHarness starts a control plane over a real store holding one settled
+// object, with the catchup tick and GC off and no startup spec pass. A settled
+// object is invisible to every owed-work listing, so nothing but a full pass can
+// re-dispatch it — which is exactly what makes it the probe for resync. opts are
+// forwarded to Register (i.e. whether resync is on).
+func newSettledHarness(t *testing.T, opts ...Option) (ObjectID, <-chan ObjectID) {
+	t.Helper()
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+
+	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+	// Settled before Start: observed_generation == generation, so it is owed
+	// nothing and no catchup listing will ever return it.
+	_, err = store.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+	require.NoError(t, err)
+
+	reconciled := make(chan ObjectID, 4)
+	bh, err := New(store, WithCatchupInterval(0), withoutGCSweeper())
+	require.NoError(t, err)
+	opts = append(opts, WithStartupResync(false))
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+	return raw.ID, reconciled
+}
+
+// TestResyncTickReconcilesSettled pins what WithResyncInterval now buys: a pass
+// over *every* object, converged ones included. That is the only thing that
+// re-confirms process-scoped state a restart invalidated (liveness conditions read
+// as "verifying" until this process rewrites them) and the only thing that heals a
+// wake lost for a reason nothing recorded — neither is visible to any owed-work
+// listing, so no catchup tick can reach it.
+func TestResyncTickReconcilesSettled(t *testing.T) {
+	id, reconciled := newSettledHarness(t, WithResyncInterval(10*time.Millisecond))
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, id, got)
+	case <-time.After(testTimeout):
+		t.Fatal("settled object was never re-dispatched: the resync tick is not a full pass")
+	}
+}
+
+// TestDefaultConfigDoesNotFullPass is the other half of the contract: with no
+// resync asked for, nothing re-dispatches a settled object. It guards the *shape*
+// — that no other driver quietly grew into a full pass — not the default's value,
+// which it cannot see: any default longer than the grace window below looks
+// identical from here. TestNewAppliesDefaults pins the value itself.
+func TestDefaultConfigDoesNotFullPass(t *testing.T) {
+	_, reconciled := newSettledHarness(t)
+
+	select {
+	case got := <-reconciled:
+		t.Fatalf("settled object %d was re-dispatched: the full pass is not opt-in", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// newStartupHarness starts a control plane with every periodic driver off, so the
+// startup pass is the only thing that can dispatch anything. seed runs before
+// Start. It returns the ids the controller reconciled, collected until the
+// channel is quiet.
+func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option) []ObjectID {
+	t.Helper()
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	seed(store, gk)
+
+	reconciled := make(chan ObjectID, 8)
+	bh, err := New(store, WithCatchupInterval(0), WithResyncInterval(0), withoutGCSweeper())
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+
+	var got []ObjectID
+	for {
+		select {
+		case id := <-reconciled:
+			got = append(got, id)
+		case <-time.After(200 * time.Millisecond):
+			return got
+		}
+	}
+}
+
+// TestStartupAlwaysDrainsOwedWork pins that startup resumes work the store has
+// recorded as owed regardless of the resync choice. Declining it is not a
+// cheapness knob — an object a previous process left unconverged, or one owed a
+// durable wake, is *already* owed a pass, and with every ticker off nothing else
+// will ever run it. The knob governs only the full re-confirm pass below.
+func TestStartupAlwaysDrainsOwedWork(t *testing.T) {
+	ctx := context.Background()
+	var unsettled ObjectID
+	got := newStartupHarness(t, func(s Store, gk GroupKind) {
+		// Unconverged: observed_generation NULL, as a crash mid-reconcile leaves it.
+		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		unsettled = raw.ID
+	}, WithStartupResync(false))
+
+	assert.Equal(t, []ObjectID{unsettled}, got,
+		"owed work must be resumed even when the full startup pass is declined")
+}
+
+// TestStartupResyncReconcilesSettled is the other half: the knob's actual job is
+// the *settled* objects, which no owed-work listing can see. That pass is what
+// re-confirms process-scoped state a restart invalidated.
+func TestStartupResyncReconcilesSettled(t *testing.T) {
+	ctx := context.Background()
+	var settled ObjectID
+	seed := func(s Store, gk GroupKind) {
+		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		_, err = s.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		require.NoError(t, err)
+		settled = raw.ID
+	}
+
+	t.Run("enabled reconciles it", func(t *testing.T) {
+		got := newStartupHarness(t, seed, WithStartupResync(true))
+		assert.Equal(t, []ObjectID{settled}, got)
+	})
+
+	t.Run("disabled leaves it alone", func(t *testing.T) {
+		got := newStartupHarness(t, seed, WithStartupResync(false))
+		assert.Empty(t, got, "a settled object is owed nothing")
+	})
+
+	t.Run("defaults to enabled", func(t *testing.T) {
+		got := newStartupHarness(t, seed)
+		assert.Equal(t, []ObjectID{settled}, got, "the safe default holds without the option")
+	})
+}
+
+// TestDisabledBackstopsAnnounceThemselves pins that turning a periodic driver off
+// is visible in the log. Both of these are supported configurations, so neither is
+// an error — but the failure mode when one is reached by accident (an unset config
+// field, a bad duration parse) is silence: work quietly stops being re-derived and
+// nothing says so.
+//
+// GC is the driver that is *not* here: it cannot be turned off at all, because it
+// is the one with no recourse left (see WithGCInterval), so the mistake is reported
+// as an error from New rather than a log line nobody reads
+// (TestWithGCIntervalRejectsNonPositive).
+func TestDisabledBackstopsAnnounceThemselves(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+
+	start := func(t *testing.T, level slog.Level, opts ...Option) string {
+		t.Helper()
+		logger, buf := captureLogger(level)
+		opts = append(opts, WithLogger(logger))
+		bh, err := New(&fakeStore{}, opts...)
+		require.NoError(t, err)
+		_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+		stop, err := bh.Start(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stop(context.Background()))
+		return buf.String()
+	}
+
+	t.Run("catchup off is Info: the caller can still requeue", func(t *testing.T) {
+		out := start(t, slog.LevelInfo, WithCatchupInterval(0))
+		assert.Contains(t, out, "catchup disabled")
+		assert.Contains(t, out, "Requeue", "name the primitive that replaces it")
+	})
+
+	t.Run("the defaults say nothing", func(t *testing.T) {
+		out := start(t, slog.LevelInfo)
+		assert.NotContains(t, out, "disabled",
+			"a default configuration must not narrate; resync-off is the default and would be noise")
+	})
+}
+
+// TestWakeDependentsListErrorLogs pins the first of the dependency waker's silent
+// loss points. When the dependents lookup fails, every dependent of that target
+// misses that change — and a dependent that has settled is invisible to every
+// owed-work listing, so with the full resync off by default the miss is permanent
+// rather than slow. Swallowing it silently is what made this a stuck-dependent bug
+// instead of a hiccup.
+func TestWakeDependentsListErrorLogs(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh := &Beehive{store: &errDepsStore{}, logger: logger}
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Contains(t, buf.String(), "dependents lookup failed",
+		"a dropped wake must not be silent")
+}
+
+// TestWakeDependentsCancelledDoesNotLog is the lookup path's negative twin of
+// TestDependencyWakerCancelDoesNotLog. Stop cancels the ctx the waker passes down,
+// so a change already dequeued fails its lookup for no reason of its own — and
+// escalating there would arm a full pass on every reconciler of a control plane
+// that is going away, once per in-flight change on every clean shutdown.
+func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	r := &reconciler{}
+	bh := &Beehive{
+		store:       &errDepsStore{},
+		logger:      logger,
+		reconcilers: map[GroupKind]*reconciler{{Kind: "Widget"}: r},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bh.wakeDependents(ctx, 1)
+
+	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
+	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
+}
+
+// TestDependencyWakerStreamEndLogs pins the second. A closed change stream ends
+// the waker for the life of the process — nothing re-subscribes — so every future
+// change on that kind reaches no dependent at all. No reachable path closes the
+// channel short of store Close today, which makes this latent rather than live;
+// unlogged either way.
+func TestDependencyWakerStreamEndLogs(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+
+	assert.Contains(t, buf.String(), "dependency waker stopped",
+		"a dead waker must not be silent")
+}
+
+// TestDependencyWakerCancelDoesNotLog is the negative: an ordinary shutdown ends
+// every waker, and that is not a loss. Warning on it would put a line per kind in
+// every clean stop, training operators to ignore the one message that matters.
+func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+
+	cancel()
+	waitClosed(t, done, "waker to exit on cancel")
+
+	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
+}
+
+// TestCatchupTickEscalationPredicate covers the tick's full-pass decision
+// directly, because the two escalation reasons differ in a way an integration
+// test cannot show cheaply: a dead waker is a standing condition, while a dropped
+// wake is a one-shot that must be *consumed* by the tick it drives.
+//
+// It also pins the consumption order. When a standing reason already applies, the
+// one-shot must survive rather than be burned — that tick sweeps anyway, and
+// spending it there would discard the repair still owed if the standing reason
+// later goes away.
+func TestCatchupTickEscalationPredicate(t *testing.T) {
+	t.Run("no escalation by default", func(t *testing.T) {
+		assert.False(t, (&reconciler{}).tickResyncs())
+	})
+
+	t.Run("resyncNextTick fires once", func(t *testing.T) {
+		r := &reconciler{}
+		r.resyncNextTick()
+		assert.True(t, r.tickResyncs())
+		assert.False(t, r.tickResyncs(), "one-shot: a transient drop must not degrade the process")
+	})
+
+	t.Run("resyncEveryTick fires forever", func(t *testing.T) {
+		r := &reconciler{}
+		r.resyncEveryTick()
+		assert.True(t, r.tickResyncs())
+		assert.True(t, r.tickResyncs(), "sticky: the waker is gone for the process lifetime")
+	})
+
+	t.Run("a standing reason leaves the one-shot armed", func(t *testing.T) {
+		r := &reconciler{}
+		r.resyncEveryTick()
+		r.resyncNextTick()
+		assert.True(t, r.tickResyncs())
+		assert.True(t, r.resyncOnce.Load(), "not consumed by a tick it did not decide")
+	})
+}
+
+// errListIDsStore fails the full-pass listing and reports each attempt, so a test
+// can await the tick that consumed an escalation.
+type errListIDsStore struct {
+	fakeStore
+	calls chan struct{}
+}
+
+func (s *errListIDsStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	// Non-blocking: the ticker keeps firing, so a report the test isn't waiting
+	// for is dropped rather than parking run's loop past cancellation.
+	select {
+	case s.calls <- struct{}{}:
+	default:
+	}
+	return nil, errBoom
+}
+
+// TestFailedEscalatedPassRearmsOneShot pins the other half of the one-shot's
+// contract: it is spent on a full pass that *ran*, not merely on one that was
+// attempted. tickResyncs consumes the flag before the listing, so a transient
+// ListIDs failure used to swallow the repair permanently — and with resync off by
+// default nothing else reaches the settled dependents a dropped wake stranded.
+func TestFailedEscalatedPassRearmsOneShot(t *testing.T) {
+	store := &errListIDsStore{calls: make(chan struct{}, 1)}
+	r := &reconciler{store: store, catchupInterval: time.Millisecond, logger: discardLogger}
+	r.resyncNextTick()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(r, ctx)
+
+	// Two escalated passes: the second can only happen because the first re-armed
+	// the flag it consumed.
+	for range 2 {
+		select {
+		case <-store.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the escalated full pass")
+		}
+	}
+
+	cancel()
+	<-done
+	assert.True(t, r.resyncOnce.Load(), "a pass that never listed leaves the repair owed")
+}
+
+// TestDroppedWakeEscalatesEveryKind pins the property the first attempt at this
+// got wrong. The flags were process-wide but consumed per-reconciler, so a dropped
+// wake repaired whichever kind ticked first and silently spent the repair for the
+// rest — a guarantee stated in a comment and contradicted by the code.
+//
+// Cross-kind is forced by the mechanism, not chosen: dependency edges are
+// deliberately cross-kind, so a lost wake on one kind strands dependents of any
+// kind, and the lookup that failed is what would have named them.
+func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	r1, r2 := &reconciler{}, &reconciler{}
+	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Contains(t, buf.String(), "forcing a full resync pass")
+	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
+	assert.True(t, r2.resyncOnce.Load())
+	assert.False(t, r1.resyncAlways.Load(), "a transient lookup error is not a permanent escalation")
+}
+
+// TestDeadWakerEscalatesEveryKind is the sticky counterpart: a waker whose stream
+// ended keeps dropping every future change, so one pass would repair the instant
+// of death and strand everything after it.
+func TestDeadWakerEscalatesEveryKind(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	r1, r2 := &reconciler{}, &reconciler{}
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger, order: []*reconciler{r1, r2}}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+
+	assert.Contains(t, buf.String(), "escalating")
+	assert.True(t, r1.resyncAlways.Load(), "a dead waker escalates every kind's later ticks")
+	assert.True(t, r2.resyncAlways.Load())
+}
+
+// TestEscalatedCatchupTickReconcilesSettled closes the loop end to end: an armed
+// escalation must actually reach a settled object, which is the only kind of
+// object the repair exists for — one that is owed nothing and therefore invisible
+// to the catchup listings the tick would otherwise run.
+func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+	_, err = store.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+	require.NoError(t, err)
+
+	reconciled := make(chan ObjectID, 4)
+	// Catchup on (it carries the escalation), resync off, no startup pass: only an
+	// escalated catchup tick can reach a settled object.
+	bh, err := New(store, WithCatchupInterval(10*time.Millisecond),
+		WithResyncInterval(0), withoutGCSweeper())
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
+		WithStartupResync(false))
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	select {
+	case got := <-reconciled:
+		t.Fatalf("settled object %d dispatched before any escalation", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	bh.resyncKindsNextTick()
+
+	select {
+	case got := <-reconciled:
+		assert.Equal(t, raw.ID, got)
+	case <-time.After(testTimeout):
+		t.Fatal("escalation never reached the settled object")
+	}
+}
+
+// TestSubscribeFailureMessageMatchesCoverage covers the third of the waker's loss
+// points. The code there was always fine; the *message* was the defect — it said
+// "relying on resync", which was false even before resync became opt-in, because
+// the tick was owed-work-only and a settled dependent is exactly what that cannot
+// see. Rather than delete the promise, the failure now makes it true by escalating
+// the tick — and says which of the two situations the operator is in.
+//
+// The predicate is deliberately whether *any* kind has a catchup tick, not the
+// failing kind's: the escalation is cross-kind, so a tick on any kind repairs
+// dependents of that kind whatever kind's waker was lost. A per-kind test would
+// tell an operator to hand-drive recovery beehive is already providing, or promise
+// one it is not.
+func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+
+	start := func(t *testing.T, opts ...Option) (string, *Beehive) {
+		t.Helper()
+		logger, buf := captureLogger(slog.LevelWarn)
+		bh, err := New(&watcherStore{err: errBoom}, append(opts, WithLogger(logger))...)
+		require.NoError(t, err)
+		_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+		stop, err := bh.Start(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stop(context.Background()))
+		return buf.String(), bh
+	}
+
+	t.Run("with a tick, the promise is made true", func(t *testing.T) {
+		out, bh := start(t) // catchup on by default
+		assert.Contains(t, out, "escalating")
+		assert.True(t, bh.reconcilers[gk].resyncAlways.Load(),
+			"a waker that never started is a dead waker")
+	})
+
+	t.Run("with no tick, it says coverage is gone", func(t *testing.T) {
+		out, _ := start(t, WithCatchupInterval(0), WithResyncInterval(0))
+		assert.Contains(t, out, "no periodic pass to fall back on")
+		assert.Contains(t, out, "Requeue", "the caller owns recovery here, so name the primitive")
+		assert.NotContains(t, out, "escalating", "do not promise a repair that cannot run")
+	})
 }

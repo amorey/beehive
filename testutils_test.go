@@ -15,9 +15,11 @@
 package beehive
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -60,6 +62,28 @@ func (m *fakeMigrator) ConvertStatus(from int, raw json.RawMessage) (json.RawMes
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
 // fail rather than block forever. Tests never rely on it to pace anything.
 const testTimeout = 2 * time.Second
+
+// captureLogger returns a logger that records everything at or above level into
+// the returned buffer, for tests asserting that a code path announces itself.
+func captureLogger(level slog.Level) (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})), &buf
+}
+
+// withoutGCSweeper stops the global GC sweeper from starting, for tests that are
+// measuring some other driver's listings and want the sweeper's own enqueues out of
+// the picture. It sets the field directly because WithGCInterval rejects a
+// non-positive interval: production has no way to run without a sweeper (nothing
+// public collects a row, so disabling it strands deletion-pending rows for good),
+// and this is a test-only escape hatch, not that configuration being supported.
+func withoutGCSweeper() Option {
+	return func(target any) error {
+		if bh, ok := target.(*Beehive); ok {
+			bh.gcInterval = 0
+		}
+		return nil
+	}
+}
 
 // tSpec / tStatus are placeholder payload types. The lifecycle tests never
 // inspect them; they exist only to satisfy the generic signatures.
@@ -116,10 +140,7 @@ func (s *fakeStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
-func (s *fakeStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
+func (s *fakeStore) ListAllDeletionPending(context.Context) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
 func (s *fakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
@@ -410,4 +431,51 @@ func (s *wakeProbeStore) resetLooked() {
 func (s *wakeProbeStore) waitLooked(t *testing.T) {
 	t.Helper()
 	waitClosed(t, s.looked, "the dependency waker's lookup")
+}
+
+// listProbeStore wraps a Store and signals each of the periodic listings a test
+// may need to order itself against: the reconciler's two owed-work listings and
+// the GC sweeper's cross-kind pass. Start only *launches* those loops, and their
+// startup passes drain the same sets a tick does — so a test that seeds work
+// around Start is racing them, and would pass or fail on timing rather than on
+// the behavior under test. Waiting for the relevant signal and only then seeding
+// leaves the driver under test as the sole possible cause.
+//
+// A nil channel means that listing isn't observed, so each test names only the
+// ones it orders against.
+type listProbeStore struct {
+	Store
+	unsettledListed chan struct{} // ListUnsettledIDs (per-kind)
+	wakeListed      chan struct{} // ListPendingWakeIDs (per-kind)
+	gcSwept         chan struct{} // ListAllDeletionPending (global)
+}
+
+// probeSignal reports one listing. The send is non-blocking so a late pass after
+// the test stops reading never wedges the goroutine that made it.
+func probeSignal(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (s *listProbeStore) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListUnsettledIDs(ctx, gk)
+	probeSignal(s.unsettledListed)
+	return ids, err
+}
+
+func (s *listProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
+	probeSignal(s.wakeListed)
+	return ids, err
+}
+
+func (s *listProbeStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
+	rows, err := s.Store.ListAllDeletionPending(ctx)
+	probeSignal(s.gcSwept)
+	return rows, err
 }

@@ -86,7 +86,7 @@ func main() {
 
 - **Declarative core.** Users write `spec` (desired state); controllers continuously reconcile actual state toward it. Reconciliation is level-triggered — driven by current state, not event sequences — so the system self-heals on restart and is robust to missed events. A cold start is just a reconcile from persisted desired state.
 
-- **Coordination through the store.** Controllers never call each other. They read/write the shared store and wake on change-events; a periodic resync catches anything dropped. Events are a latency optimization, not a correctness dependency.
+- **Coordination through the store.** Controllers never call each other. They read/write the shared store and wake on change-events. Events are a latency optimization: an object whose spec has not converged, or which is owed a recorded dependency wake, is re-derived from the store by the catchup tick and at startup, so a dropped event costs latency rather than convergence. The one case events alone cover is a *settled* object whose state changed for a reason the store did not record — for that, either enable `WithResyncInterval` or rely on the next startup pass.
 
 - **`spec`/`status` separation.** Only controllers may write `status`. This is structural in the API: the user-facing `Client` surface has no status-write path; only the `Controller` surface does.
 
@@ -103,7 +103,21 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 
 `Register` returns the kind's `ControllerClient` — the status-write surface — so the embedding application can write status out-of-band (e.g. from its own goroutines) without beehive handing it over via a callback. A `ControllerClient` is obtainable *only* by registering a controller for that kind, which keeps the "only the owning controller writes its status" boundary intact.
 
-Options are dispatched by caller type — `WithResyncInterval` passed to `New` sets the global default; passed to `Register` it overrides for that controller only. Unrecognised options for a given caller are ignored.
+Options are dispatched by caller type — `WithResyncInterval` passed to `New` sets the global default; passed to `Register` it overrides for that controller only. Unrecognised options for a given caller are ignored. (`WithGCInterval` is the exception: garbage collection is global, spanning kinds that have no controller at all, so it is meaningful only at `New`.)
+
+#### Periodic drivers
+
+Three independent cadences, because they are three different jobs with different costs:
+
+| option | what it re-dispatches | cost scales with | default |
+|---|---|---|---|
+| `WithCatchupInterval` | work the store *records* as owed — unconverged specs (`observed_generation < generation`) and owed dependency wakes | what is actually outstanding | 30s |
+| `WithResyncInterval` | **every** object, converged or not | the object count | 0 (off) |
+| `WithGCInterval` | deletion-pending rows, plus event-log retention | rows being deleted | 30s |
+
+The full resync is opt-in because it is the only one whose cost is unbounded by outstanding work. It is also the only one that reaches an object nothing has recorded as owing anything — process-scoped state a restart invalidated (a liveness condition reads as "verifying" until a controller in *this* process rewrites it), or a dependency wake lost for a reason nothing observed. The startup pass covers the same ground once per process, which is why the periodic form is not needed by default.
+
+Disabling a driver is supported for the two reconcile cadences and logged at startup, so a knob left at 0 by accident is visible rather than silent. **GC is the exception: it cannot be disabled.** `WithGCInterval` rejects a non-positive interval with `ErrInvalidOption`, because nothing on the public surface triggers collection — where a disabled catchup still leaves `Client.Requeue`, a disabled sweeper leaves no recourse at all, and deletion-pending rows accumulate with each one's `owned_by` edge blocking its owner's deletion. It is also the only cross-kind driver, so a client-only kind has no reconcile loop to fall back on. A long interval says "collect rarely"; there is no way to say "never".
 
 ### GroupKind
 
@@ -408,7 +422,7 @@ Both issue the same secondary query (edges are a separate indexed lookup, never 
 
 #### Reconcile control
 
-`Requeue` requeues an object for immediate reconcile — the manual counterpart to the store-write and dependency-change wakes. It is a **latency hint, not a synchronous run**: it returns once the object is enqueued, and a worker reconciles it on its own schedule. Correctness never depends on it — the periodic resync remains the backstop — so a missed or coalesced requeue is harmless. Use it to promptly re-examine an object after out-of-band state the controller reads has changed.
+`Requeue` requeues an object for immediate reconcile — the manual counterpart to the store-write and dependency-change wakes. It is a **latency hint, not a synchronous run**: it returns once the object is enqueued, and a worker reconciles it on its own schedule. A missed or coalesced requeue is harmless whenever the object is *owed* something the store records, since the catchup tick re-derives that. It is also the supported way to drive reconciles yourself when every periodic driver is disabled. Use it to promptly re-examine an object after out-of-band state the controller reads has changed.
 
 By default `Requeue` **preserves the object's retry backoff ladder**. A requeue is the ordinary event-driven nudge (config change, dependency update, manual poke) and almost never proves the failing condition is resolved; the only event that proves recovery is a successful reconcile, which already clears backoff. The invariant: **backoff is cleared by a successful reconcile or an explicit `WithResetBackoff()`, never by a plain requeue.** Pass `beehive.WithResetBackoff()` only when the caller knows the failure is resolved and the next retry should restart from the base interval — the analog of controller-runtime's `Forget`. (This mirrors controller-runtime's split between `Add`/`AddAfter`, which requeue without resetting, and `Forget`, which explicitly resets.)
 
@@ -422,7 +436,7 @@ The scheduling API observes when an object is **next due to reconcile** — a [`
 
 `WatchSchedule` streams that schedule live as a **gauge**: the current value on subscribe, then a new `Schedule` on every (re)schedule — backoff step, `RequeueAfter`, resync or dependency wake, dispatch, or `Requeue`. None of these fire the object `Watch`/`WatchList` (a reschedule bumps no generation or resource version) and no other signal captures them all, so this is the only way to reliably observe reschedules — e.g. to drive a "next attempt" countdown that stays accurate for an object whose spec/status has stopped changing. Delivery mirrors `WatchEvents`: snapshot-then-live, conflated **per object** so a lagging reader converges to the latest value (it can miss intermediate values but never the current one), and the channel closes when `ctx` is cancelled or the control plane stops. Unlike `GetSchedule`, `WatchSchedule` returns `ErrNoController` for a client-only kind — a live stream that can never emit should say so rather than hang — but `id` need not exist: an unscheduled id simply streams the zero `Schedule` until something schedules it.
 
-Both are `Client`-only and read **only per-id timers**, so neither is a prediction of the next reconcile: the actual next reconcile can be **earlier** than reported (the periodic resync — kind-wide, conditional on the object being unsettled — plus dependency-change wakes and store-write enqueues are not per-id timers), and a **zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee. It is a sibling watch surface to `WatchEvents`, deliberately **not** routed through the event log: an event is an append-only, retained record of a past occurrence, whereas a requeue time is a single mutable future gauge — different data, different delivery and retention.
+Both are `Client`-only and read **only per-id timers**, so neither is a prediction of the next reconcile: the actual next reconcile can be **earlier** than reported (the catchup tick — kind-wide, conditional on the object being owed something — plus the full resync, dependency-change wakes and store-write enqueues are not per-id timers), and a **zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee. It is a sibling watch surface to `WatchEvents`, deliberately **not** routed through the event log: an event is an append-only, retained record of a past occurrence, whereas a requeue time is a single mutable future gauge — different data, different delivery and retention.
 
 #### Events
 
@@ -453,7 +467,7 @@ type ControllerClient[Status any] interface {
 
 `UpdateStatus` is a **no-op when the status marshals to the bytes already stored**: no `resource_version` bump and no watch event, exactly as re-applying an unchanged spec is a no-op on the `Client` side. So a controller reports its observed state unconditionally — no hand-rolled equality guard — and a dependent that free-rides on this kind's status changes isn't woken by a poll that found nothing new.
 
-The generation handshake is the exception. `observedGeneration`/`ObservedAt` are recorded even when the content didn't change, so a reconcile that legitimately changed no status still settles the object rather than being re-enqueued by every resync — and because settling at a new generation is a real transition, that write *does* bump `resource_version` and emit, so a watcher gating on `ObservedGeneration == Generation` sees the object converge instead of waiting for the next resync. It fires at most once per generation: the next unchanged poll finds the generation already recorded and writes nothing.
+The generation handshake is the exception. `observedGeneration`/`ObservedAt` are recorded even when the content didn't change, so a reconcile that legitimately changed no status still settles the object rather than being re-enqueued by every catchup tick — and because settling at a new generation is a real transition, that write *does* bump `resource_version` and emit, so a watcher gating on `ObservedGeneration == Generation` sees the object converge instead of waiting for the next resync. It fires at most once per generation: the next unchanged poll finds the generation already recorded and writes nothing.
 
 So `ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran. A converged object polled every 30s keeps the timestamp of the reconcile that converged it. Don't build a controller-liveness check on it — a reconcile that calls no `UpdateStatus` at all never moved it either. For "when did we last check", record an event: `RecordEvent` extends the current run and bumps its `LastAt` on every poll, which is exactly that signal, retained and rate-shaped.
 
@@ -471,7 +485,7 @@ type Controller[Spec, Status any] interface {
 }
 ```
 
-A controller owns **no lifecycle** in beehive — it implements only `Reconcile`, which receives the kind's `ControllerClient` as a parameter. Any background work (timers, subscriptions, engines) belongs to the embedding application, which already owns its own lifecycle and obtains a `ControllerClient` from `Register`. Beehive owns the reconcile lifecycle only: the work queue, backoff, resync, dependency wakers, GC, and drain ordering.
+A controller owns **no lifecycle** in beehive — it implements only `Reconcile`, which receives the kind's `ControllerClient` as a parameter. Any background work (timers, subscriptions, engines) belongs to the embedding application, which already owns its own lifecycle and obtains a `ControllerClient` from `Register`. Beehive owns the reconcile lifecycle only: the work queue, backoff, the periodic drivers, dependency wakers, GC, and drain ordering.
 
 `Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed — the level loop simply re-derives from the persisted state on the next pass, so make `Reconcile` idempotent. (Each write is still internally atomic, and the `obj` snapshot a concurrent spec change can race is covered by the generation handshake: `UpdateStatus` rejects a future `observedGeneration`, and an older one leaves the object unsettled to reconcile again.)
 
@@ -494,7 +508,7 @@ type Migrator interface {
 
 Attach a `Migrator` per kind with `WithMigrator` passed to `Register`. The store persists the version each blob was written at in two opaque per-row columns (spec and status). On read, a blob below the current version is run through `ConvertSpec`/`ConvertStatus`; an equal version (or a current version of `0`, "not versioned") passes through; a *greater* version is a downgrade and is rejected as a decode error. `from == 0` is the unversioned baseline, so once a migrator is enabled its converters must handle it.
 
-Conversion is lazy and per-column — a blob is re-stamped only when next written, so a status-only write re-stamps just the status version. A blob that fails to convert, fails to unmarshal, or is a downgrade is a decode failure, and each read path handles it in the way that fails safest for it: `List` and live watches skip-and-log the bad row and continue; `Get`/`GetBySlug` return the error; and the **reconcile loop quarantines** it — a row it cannot decode cannot be reconciled and its bytes won't change until someone rewrites the spec, so it logs and treats the pass as a no-op success rather than retrying the same bytes forever under backoff (a deletion-pending row is still collected, since GC needs only the id). Because resync re-enqueues an unsettled poison row every tick, this warning recurs at the resync cadence — deliberately, so a persistent bad row stays visible rather than logging once and going silent. A kind with no migrator is unchanged — its columns stay `0`. Only `Register`ed kinds can have a migrator; client-only kinds cannot.
+Conversion is lazy and per-column — a blob is re-stamped only when next written, so a status-only write re-stamps just the status version. A blob that fails to convert, fails to unmarshal, or is a downgrade is a decode failure, and each read path handles it in the way that fails safest for it: `List` and live watches skip-and-log the bad row and continue; `Get`/`GetBySlug` return the error; and the **reconcile loop quarantines** it — a row it cannot decode cannot be reconciled and its bytes won't change until someone rewrites the spec, so it logs and treats the pass as a no-op success rather than retrying the same bytes forever under backoff (a deletion-pending row is still collected, since GC needs only the id). Because the catchup tick re-enqueues an unsettled poison row every time, this warning recurs at that cadence — deliberately, so a persistent bad row stays visible rather than logging once and going silent. A kind with no migrator is unchanged — its columns stay `0`. Only `Register`ed kinds can have a migrator; client-only kinds cannot.
 
 ### Options
 
@@ -505,7 +519,10 @@ func WithSlug(slug string) Option                  // set a human-readable slug;
 func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
-func WithResyncInterval(d time.Duration) Option    // override the default resync interval
+func WithCatchupInterval(d time.Duration) Option   // how often to drain recorded owed work (default: 30s; 0 disables)
+func WithResyncInterval(d time.Duration) Option    // how often to re-dispatch EVERY object (default: 0, off)
+func WithGCInterval(d time.Duration) Option        // how often to collect dead rows + prune the event log (default: 30s; New only; must be > 0)
+func WithStartupResync(enabled bool) Option        // also re-dispatch settled objects once at startup (default: true)
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
 func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring + optional age bound (0 = no age bound)

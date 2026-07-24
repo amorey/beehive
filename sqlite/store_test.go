@@ -1476,44 +1476,6 @@ func TestDeleteFinalizerMissingObject(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
-func TestListDeletionPendingIDs(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	// alive: deletion never requested — must NOT appear.
-	_, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-
-	// pendingA and pendingB: deletion requested — must appear, ordered by id.
-	pendingA, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-	pendingB, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-	_, _, err = store.RequestDeletion(ctx, testGK, pendingA.ID)
-	require.NoError(t, err)
-	_, _, err = store.RequestDeletion(ctx, testGK, pendingB.ID)
-	require.NoError(t, err)
-
-	// A deleting object of another kind must not leak into this kind's listing.
-	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
-	other, err := store.CreateObject(ctx, &beehive.RawObject{
-		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-	_, _, err = store.RequestDeletion(ctx, otherGK, other.ID)
-	require.NoError(t, err)
-
-	ids, err := store.ListDeletionPendingIDs(ctx, testGK)
-	require.NoError(t, err)
-	assert.Equal(t, []beehive.ObjectID{pendingA.ID, pendingB.ID}, ids)
-}
-
 func TestListOutgoingRefs(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3391,7 +3353,7 @@ func TestListOutgoingRefsByRelationDBError(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestListAllDeletionPendingIDs(t *testing.T) {
+func TestListAllDeletionPending(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
@@ -3403,18 +3365,33 @@ func TestListAllDeletionPendingIDs(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	ids, err := store.ListAllDeletionPendingIDs(ctx)
+	// A deleting object of another kind: it must appear too, tagged with its own
+	// kind. This listing is deliberately cross-kind — it is the GC sweeper's, and
+	// the sweeper's whole reason to exist is the kinds no controller watches.
+	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
+	other, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
+	})
 	require.NoError(t, err)
-	assert.Equal(t, []beehive.ObjectID{a.ID, b.ID}, ids, "every finalizing object, kind-agnostic")
+	_, _, err = store.RequestDeletion(ctx, otherGK, other.ID)
+	require.NoError(t, err)
+
+	rows, err := store.ListAllDeletionPending(ctx)
+	require.NoError(t, err)
+	// The kind rides along so the sweeper can route on it: a registered kind is
+	// enqueued for its controller, a client-only kind collected directly.
+	assert.Equal(t, []storeapi.Referrer{
+		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: other.ID, Group: otherGK.Group, Kind: otherGK.Kind},
+	}, rows, "every finalizing object, of every kind, each with its own kind")
 }
 
-func TestDeletionPendingIDsDBError(t *testing.T) {
+func TestListAllDeletionPendingDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 	ctx := context.Background()
-	_, err := store.ListDeletionPendingIDs(ctx, testGK)
-	require.Error(t, err)
-	_, err = store.ListAllDeletionPendingIDs(ctx)
+	_, err := store.ListAllDeletionPending(ctx)
 	require.Error(t, err)
 }
 

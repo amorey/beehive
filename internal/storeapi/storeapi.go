@@ -226,6 +226,11 @@ type Referrer struct {
 	Kind  string
 }
 
+// GroupKind is the kind to route a requeue (or a GC step) to.
+func (r Referrer) GroupKind() GroupKind {
+	return GroupKind{Group: r.Group, Kind: r.Kind}
+}
+
 // Store is the durable-store contract Beehive depends on internally. It is
 // non-generic and deals only in raw rows: the generic-to-non-generic boundary
 // lives one layer up, in the typedController adapter.
@@ -293,12 +298,6 @@ type Store interface {
 	// observed_generation doesn't match generation (not yet converged).
 	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
-	// ListDeletionPendingIDs returns the IDs of objects of kind gk that have been
-	// marked for deletion (DeletionRequestedAt set) but not yet physically
-	// removed. The GC backstop enqueues these so a delete makes progress without a
-	// spec change to wake it.
-	ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
 	// ListPendingWakeIDs returns the IDs of objects of kind gk owed a durable
 	// dependency wake (pending_wake != 0). The reconcile backstop enqueues these so
 	// a wake that outlived the process (its in-memory requeue lost to a crash) is
@@ -325,12 +324,14 @@ type Store interface {
 	// Bumps no resource_version and emits no event.
 	DecrementPendingWake(ctx context.Context, id ObjectID, observed int64) error
 
-	// ListAllDeletionPendingIDs is ListDeletionPendingIDs across every kind. The
-	// global GC sweeper uses it to collect deletion-pending objects of kinds with
-	// no registered controller (client-only kinds), which the per-controller
-	// backstop never reaches and which could otherwise strand and RESTRICT-block
-	// an owner's delete forever.
-	ListAllDeletionPendingIDs(ctx context.Context) ([]ObjectID, error)
+	// ListAllDeletionPending returns every deletion-pending object, of every kind,
+	// each row's GroupKind alongside its id. The global GC sweeper is the sole
+	// caller and needs the kind to route: an object of a registered kind is
+	// enqueued so its controller can clear finalizers (a step collect cannot take),
+	// while a client-only kind — which no reconcile loop reaches, and which could
+	// otherwise strand and RESTRICT-block an owner's delete forever — is collected
+	// directly.
+	ListAllDeletionPending(ctx context.Context) ([]Referrer, error)
 
 	// ListIDs returns the IDs of every object of kind gk, ordered by id. The
 	// reconciler uses it to enqueue a full reconcile pass at startup, so

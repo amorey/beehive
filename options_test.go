@@ -100,17 +100,69 @@ func TestWithConcurrencyDispatch(t *testing.T) {
 	require.NoError(t, WithConcurrency(1)("unrelated"))
 }
 
-func TestWithStartupReconcileStrategyDispatch(t *testing.T) {
-	bh := &Beehive{}
-	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileUnsettled)(bh))
-	assert.Equal(t, StartupReconcileUnsettled, bh.startupReconcile)
+func TestWithStartupResyncDispatch(t *testing.T) {
+	bh := &Beehive{startupResync: true}
+	require.NoError(t, WithStartupResync(false)(bh))
+	assert.False(t, bh.startupResync)
 
 	r := &reconciler{}
-	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileNone)(r))
-	assert.Equal(t, StartupReconcileNone, r.startupReconcile)
+	require.NoError(t, WithStartupResync(true)(r))
+	assert.True(t, r.startupResync)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileAll)("unrelated"))
+	require.NoError(t, WithStartupResync(true)("unrelated"))
+}
+
+func TestWithCatchupIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithCatchupInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.catchupInterval)
+
+	r := &reconciler{}
+	require.NoError(t, WithCatchupInterval(time.Minute)(r))
+	assert.Equal(t, time.Minute, r.catchupInterval)
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, WithCatchupInterval(time.Second)("unrelated"))
+}
+
+func TestWithGCIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithGCInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.gcInterval)
+
+	// GC is global: a reconciler is not a target it recognizes, and neither is
+	// anything else.
+	r := &reconciler{}
+	require.NoError(t, WithGCInterval(time.Minute)(r))
+	require.NoError(t, WithGCInterval(time.Second)("unrelated"))
+}
+
+// TestWithGCIntervalRejectsNonPositive pins the one interval that cannot be turned
+// off. The reconcile knobs accept 0 as "off" because Client.Requeue still drives a
+// pass by hand, but nothing public triggers collect — so a sweeper-less Beehive
+// accumulates deletion-pending rows with no recourse, each RESTRICT-blocking its
+// owner's delete. Every swallowed error inside a sweep also assumes a next tick to
+// retry on, which is only true while this holds.
+func TestWithGCIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{gcInterval: time.Minute}
+			err := WithGCInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "WithGCInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.gcInterval, "a rejected option must not have written")
+
+			// Rejected wherever it is aimed: the value is nonsense independent of target,
+			// so a misdirected call must not carry the mistake silently.
+			require.ErrorIs(t, WithGCInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, WithGCInterval(d)("unrelated"), ErrInvalidOption)
+
+			// And it surfaces from New, which is where a real caller meets it.
+			_, err = New(&fakeStore{}, WithGCInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
 }
 
 func TestWithLoggerDispatch(t *testing.T) {

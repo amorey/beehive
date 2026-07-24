@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -34,6 +35,12 @@ type Option func(target any) error
 // aimed at a target it doesn't understand is ignored by design (see Option), while
 // a contradiction is a caller mistake whose effect would otherwise be invisible.
 var ErrConflictingOption = errors.New("beehive: option conflicts with an explicit argument")
+
+// ErrInvalidOption reports an option carrying a value that has no meaning — a
+// non-positive GC interval, for instance. Unlike ErrConflictingOption it is about
+// the argument alone, so it is returned regardless of the target the option lands
+// on: a value that means nothing at one call site means nothing at any of them.
+var ErrInvalidOption = errors.New("beehive: option value is invalid")
 
 // LoadOption selects a secondary lookup to fetch alongside an object on a read.
 // It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
@@ -144,51 +151,6 @@ func resolveEvents(opts []EventOption) storeapi.EventQuery {
 	return q
 }
 
-// StartupReconcileStrategy selects which objects a controller reconciles once at
-// startup. The zero value is StartupReconcileAll, so the safe default holds for a
-// controller that never sets it.
-//
-// It governs the spec-convergence pass only. In-progress deletions and objects owed
-// a durable dependency wake are resumed at startup under every strategy, including
-// StartupReconcileNone: those are store bookkeeping rather than spec convergence —
-// a half-deleted row RESTRICT-blocks its owner until collected, and an owed wake was
-// explicitly stamped — so an embedder driving its own reconciles is not expected to
-// know about them.
-type StartupReconcileStrategy int
-
-const (
-	// StartupReconcileAll reconciles every object at startup, settled or not. The
-	// full pass re-confirms process-scoped state such as liveness conditions,
-	// which read as "verifying" after a restart until a controller rewrites them.
-	StartupReconcileAll StartupReconcileStrategy = iota
-	// StartupReconcileUnsettled reconciles only objects whose spec has not yet
-	// converged — cheaper, but leaves process-scoped state unconfirmed until some
-	// other event wakes the object. This is the pass that resumes an object a
-	// previous process left unconverged (crashed mid-reconcile, or created and
-	// never settled), so it is the cheapest strategy that still recovers on restart.
-	StartupReconcileUnsettled
-	// StartupReconcileNone does no startup reconcile at all, leaving live events
-	// and the periodic resync as the only drivers.
-	//
-	// Combined with a disabled resync (WithResyncInterval(0)) it leaves no automatic
-	// driver for spec convergence whatsoever: an object a previous process left
-	// unconverged is *not* resumed, and its spec is never actuated unless something
-	// requeues it. That combination is supported, for an embedder that wants to
-	// drive reconciles on its own schedule rather than beehive's — the store's
-	// ListUnsettledIDs reports exactly the objects owed a pass, and Client.Requeue
-	// dispatches one:
-	//
-	//	ids, err := store.ListUnsettledIDs(ctx, gk)
-	//	for _, id := range ids {
-	//		err := client.Requeue(ctx, id)
-	//	}
-	//
-	// Because the failure mode when it is reached by accident is silent, a
-	// controller starting in that configuration logs a warning naming it. Choose
-	// StartupReconcileUnsettled instead if you did not mean to take over recovery.
-	StartupReconcileNone
-)
-
 // createOptions collects the per-object settings the create-time options apply.
 // Client.Create builds one, runs the options against it, and folds the result
 // into the new row (slug/finalizers) and its owner ref.
@@ -266,14 +228,50 @@ func WithOnCreate(fn func(ctx context.Context)) Option {
 	}
 }
 
-// WithResyncInterval sets the periodic resync interval for a controller. A
-// value <= 0 disables periodic resync, leaving the controller event-driven
-// only.
+// WithCatchupInterval sets how often a controller drains work the store has
+// recorded as owed: objects whose spec has not converged
+// (observed_generation < generation) and objects owed a durable dependency wake.
+// A value <= 0 disables the catchup tick.
 //
-// The resync is what re-derives spec staleness (observed_generation < generation)
-// after startup, so disabling it alongside StartupReconcileNone leaves no automatic
-// driver for convergence at all — supported, but the embedder then owns recovery.
-// See StartupReconcileNone for the recipe and the warning that configuration logs.
+// It is separate from WithResyncInterval because the two scale differently. The
+// owed set is bounded by what is actually outstanding — indexed listings that
+// return nothing in a converged system — while a full pass scales with the object
+// count. One interval governing both would mean tuning either moves the other.
+//
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithCatchupInterval(d time.Duration) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.catchupInterval = d
+		case *reconciler:
+			t.catchupInterval = d
+		}
+		return nil
+	}
+}
+
+// WithResyncInterval sets how often a controller re-dispatches *every* object it
+// owns, converged or not. The default is 0, which disables it.
+//
+// This is the expensive pass, and the only one that reaches an object nothing has
+// recorded as owing work: process-scoped state a restart invalidated (liveness
+// conditions read as "verifying" until this process rewrites them), and a
+// dependency wake lost for a reason nothing observed. Both are invisible to
+// WithCatchupInterval, whose listings are driven by columns.
+//
+// It is opt-in because its cost scales with the object count rather than with what
+// is outstanding, and because the two cheaper drivers already cover convergence:
+// the catchup tick drains recorded work, and the startup pass re-confirms
+// everything once per process. Reach for this when the gap until the next restart
+// is itself too long — then set it well above WithCatchupInterval, since a full
+// pass subsumes the catchup set.
+//
+// Note for callers upgrading: this option previously paced the owed-work tick,
+// which is now WithCatchupInterval. A call left unchanged still compiles and now
+// buys a full pass at that cadence — likely more work than intended, and the
+// catchup tick keeps running at its own default regardless.
 func WithResyncInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {
@@ -286,8 +284,41 @@ func WithResyncInterval(d time.Duration) Option {
 	}
 }
 
+// WithGCInterval sets how often the global GC sweeper runs: it collects
+// deletion-pending objects (of every kind, including ones with no registered
+// controller) and applies event-log retention.
+//
+// It is separate from the reconcile intervals on purpose. Removing dead rows and
+// re-dispatching live ones are different jobs with different costs, and a single
+// interval for both means tuning one moves the other. GC is also global rather
+// than per-kind — the sweeper covers kinds no controller watches — so this is
+// meaningful only at New; passed elsewhere it is ignored.
+//
+// Unlike the reconcile intervals, it cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption. Those two knobs pace work that has another way through —
+// Client.Requeue drives a reconcile by hand — but nothing on the public surface
+// triggers collect, so a sweeper-less Beehive would let deletion-pending rows
+// accumulate with no recourse, each one's owned_by edge RESTRICT-blocking its
+// owner's own deletion. It is also the only cross-kind driver: a client-only kind
+// has no reconcile loop to fall back on. A long interval expresses "collect
+// rarely"; there is no supported way to express "never".
+func WithGCInterval(d time.Duration) Option {
+	return func(target any) error {
+		// Checked before the target switch: the value is nonsense wherever it was
+		// aimed, and reporting that only for the target that happens to consume it
+		// would let a misdirected call carry the mistake silently.
+		if d <= 0 {
+			return fmt.Errorf("%w: WithGCInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.gcInterval = d
+		}
+		return nil
+	}
+}
+
 // WithEventRetention bounds the per-object event log, enforced globally by the GC
-// sweeper on the startup + resync cadence. perObject > 0 caps each
+// sweeper on its own cadence (startup pass + WithGCInterval). perObject > 0 caps each
 // (object, category) timeline to its newest perObject runs — a ring, so a flapping
 // timeline can't evict a quiet one; maxAge > 0 drops runs whose window ended more
 // than maxAge ago. A zero bound is skipped, and both zero (the default) leaves the
@@ -317,17 +348,31 @@ func WithMigrator(m Migrator) Option {
 	}
 }
 
-// WithStartupReconcileStrategy sets which objects a controller reconciles at
-// startup (see StartupReconcileStrategy). The default is StartupReconcileAll.
-// Passed to New it sets the default for all controllers; passed to Register it
-// overrides that default for one.
-func WithStartupReconcileStrategy(s StartupReconcileStrategy) Option {
+// WithStartupResync sets whether a controller re-dispatches *every* object once
+// at startup, converged ones included. The default is true.
+//
+// The pass re-confirms process-scoped state that a restart invalidated — liveness
+// conditions, for instance, read as "verifying" until a controller in this process
+// rewrites them — which no owed-work listing can see, because nothing in the store
+// records it as outstanding.
+//
+// It does not govern work that *is* recorded as owed. An object whose spec has not
+// converged, and one owed a durable dependency wake, are resumed at startup either
+// way: they are already owed a pass, and declining them is a correctness hole
+// rather than a saving. In-progress deletions are likewise resumed, by the GC
+// sweeper's own startup pass.
+//
+// Set it false for a large object set where the re-confirm is not worth its cost,
+// or where the embedder drives its own reconciles. Passed to New it sets the
+// default for all controllers; passed to Register it overrides that default for
+// one.
+func WithStartupResync(enabled bool) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.startupReconcile = s
+			t.startupResync = enabled
 		case *reconciler:
-			t.startupReconcile = s
+			t.startupResync = enabled
 		}
 		return nil
 	}

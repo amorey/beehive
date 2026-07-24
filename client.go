@@ -168,10 +168,10 @@ type Client[Spec, Status any] interface {
 	// synchronous run: with the periodic resync enabled, correctness rests on that,
 	// not on this call.
 	//
-	// It is also the supported way to drive reconciles yourself when there is no
-	// resync to rest on — StartupReconcileNone with WithResyncInterval(0), where
-	// beehive resumes nothing and Store.ListUnsettledIDs reports what is owed. See
-	// StartupReconcileNone.
+	// It is also the supported way to drive reconciles yourself when no ticker is
+	// configured — WithCatchupInterval(0) with WithResyncInterval(0), where startup
+	// drains owed work once and nothing re-derives it afterward.
+	// Store.ListUnsettledIDs reports what is owed.
 	//
 	// By default it preserves id's retry backoff ladder: a requeue is the common
 	// event-driven nudge (config change, dependency update, manual poke) and
@@ -807,10 +807,9 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 		return err
 	}
 	// Always advance GC: a retry or post-crash Delete must still hand the
-	// deletion-pending object to the controller to clear finalizers. A
-	// client-only kind has no controller, so collect runs synchronously rather
-	// than waiting on the resync sweeper (which a disabled resync would never run
-	// again after startup).
+	// deletion-pending object to the controller to clear finalizers. A client-only
+	// kind has no controller to hand it to, so it falls to the global GC sweeper —
+	// whose cadence is guaranteed, since WithGCInterval refuses to be disabled.
 	c.bh.advanceGC(ctx, c.gk, id)
 	return nil
 }

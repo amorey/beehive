@@ -69,7 +69,13 @@ func TestSweepEventRetention(t *testing.T) {
 func TestNewAppliesDefaults(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
-	assert.Equal(t, defaultResyncInterval, bh.resyncInterval)
+	// Literals, not the constants: comparing a default to its own constant passes
+	// whatever the value is, so it would not notice a default changing. These three
+	// are the contract — cheap owed-work drain and GC on, the object-count-scaled
+	// full pass off — so changing one should be a deliberate edit here.
+	assert.Equal(t, 30*time.Second, bh.catchupInterval, "owed work drains by default")
+	assert.Equal(t, time.Duration(0), bh.resyncInterval, "the full pass is opt-in")
+	assert.Equal(t, 30*time.Second, bh.gcInterval, "dead rows are collected by default")
 	assert.NotNil(t, bh.reconcilers)
 }
 
@@ -89,6 +95,7 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	r, ok := bh.reconcilers[gk]
 	require.True(t, ok, "reconciler should be registered under its GroupKind")
 	assert.Equal(t, gk, r.gk)
+	assert.Equal(t, defaultCatchupInterval, r.catchupInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultResyncInterval, r.resyncInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
 }
@@ -244,35 +251,18 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// gcTickStore signals every time the GC sweeper lists deletion-pending objects,
-// letting a test await the periodic tick (the second call onward) instead of
-// sleeping. The send is non-blocking so a late tick after the test stops reading
-// never wedges the sweeper goroutine.
-type gcTickStore struct {
-	*fakeStore
-	swept chan struct{}
-}
-
-func (s *gcTickStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
-	select {
-	case s.swept <- struct{}{}:
-	default:
-	}
-	return nil, nil
-}
-
 // TestRunGCSweeperTicks covers runGCSweeper's periodic branch: after the startup
 // pass it sweeps again on every resync tick. The store signals each sweep, so the
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
-	store := &gcTickStore{fakeStore: &fakeStore{}, swept: make(chan struct{}, 8)}
-	bh, err := New(store, WithResyncInterval(time.Millisecond))
+	store := &listProbeStore{Store: &fakeStore{}, gcSwept: make(chan struct{}, 8)}
+	bh, err := New(store, WithGCInterval(time.Millisecond))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go bh.runGCSweeper(ctx)
 
-	recv(t, store.swept) // startup pass
-	recv(t, store.swept) // a periodic tick
+	recv(t, store.gcSwept) // startup pass
+	recv(t, store.gcSwept) // a periodic tick
 }

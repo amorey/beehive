@@ -74,8 +74,21 @@ CREATE TABLE objects (
 CREATE INDEX idx_objects_kind ON objects("group", kind);    -- list / resync a kind
 CREATE INDEX idx_objects_rv   ON objects(resource_version); -- watch ordering
 
+-- Finalizing objects, for the global GC sweeper. Keyed on (id, "group", kind)
+-- rather than on deletion_requested_at because the sweeper's only query is
+--
+--   SELECT id, "group", kind FROM objects
+--    WHERE deletion_requested_at IS NOT NULL ORDER BY id
+--
+-- (it needs the kind to route: registered kind -> enqueue for its controller,
+-- client-only -> collect directly). This key covers that read and is already in
+-- id order, so it plans as a plain `SCAN ... USING INDEX` with no row fetch and
+-- no sort; keying on deletion_requested_at instead costs both. The partial WHERE
+-- is what keeps the wider key cheap — only finalizing rows are indexed, and
+-- id/group/kind are write-once, so entries appear when a delete is requested and
+-- vanish when the row is collected, never updated in between.
 CREATE INDEX idx_objects_deleting
-    ON objects(deletion_requested_at)
+    ON objects(id, "group", kind)
     WHERE deletion_requested_at IS NOT NULL;
 
 -- Objects whose spec has not yet been fully reconciled by a controller.
