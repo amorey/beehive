@@ -195,7 +195,7 @@ func (bh *Beehive) advanceGCNow(ctx context.Context, gk GroupKind, id ObjectID) 
 	// the row stays deletion-pending — in a long-running process that declines to
 	// detach the caller's cancellation, that strand persists for the process's life.
 	if _, err := bh.collect(ctx, id); err != nil {
-		bh.log().Warn("gc: synchronous collect of client-only object failed; no resync backstop",
+		bh.log().Warn("gc: synchronous collect of client-only object failed; no GC sweeper to retry it",
 			"group", gk.Group, "kind", gk.Kind, "id", id, "err", err)
 	}
 }

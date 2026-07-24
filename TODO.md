@@ -30,75 +30,6 @@ tell "we decided against this for now" from "nobody thought of it."
   if `RequestDeletion` ever gets the same treatment (its absent path has always
   had this shape, so the probe would belong in `requestDeletion` for both).
 
-- **The periodic resync is unsettled-only, so it is not a backstop for
-  event-driven wakes** — known, not fixed. The architecture says "events are a
-  latency optimization; periodic resync is the correctness backstop", but the
-  tick (`reconciler.run`) enqueues only `ListUnsettledIDs` +
-  `ListDeletionPendingIDs`, and unsettled is `observed_generation < generation`.
-  A *settled* object is therefore never re-dispatched by the tick, so the claim
-  holds for an object's own spec convergence and for deletion progress — and for
-  nothing else.
-
-  The gap is the ordinary dependent pattern. D depends on T; D reconciles, sees T
-  not ready, writes a "waiting" status at `obj.Generation`, and is now settled.
-  When T becomes ready, D's own generation never moves, so the dependency waker is
-  the *only* thing that re-reconciles it. Lose that one wake (see the item below)
-  and D sits at "waiting" until its spec changes or the process restarts. The
-  startup pass already does the full sweep (`StartupReconcileAll`) on the reasoning
-  that "staleness is purely a startup concern" — that is the assumption at issue
-  here, and it holds only if no wake is ever lost at runtime. Kubernetes'
-  resync period re-delivers every object precisely so missed events self-heal.
-
-  The fix is to let the tick enqueue everything: always, every Nth tick, or behind
-  a `WithResyncStrategy` mirroring the existing `WithStartupReconcileStrategy`. The
-  cost is one reconcile per object per period, which is bounded and mostly free —
-  reconciles are level-triggered, and the content no-ops mean a converged object's
-  pass writes nothing and emits nothing, so it cannot cascade into other kinds.
-  Deferred because it is a behavior change for existing users and the shape (on by
-  default vs opt-in) wants a decision, not a guess. Revisit before making any
-  further claim that resync backstops event delivery — today it does not.
-
-- **Three silent loss points in the dependency waker, none of them logged** —
-  known, not fixed. Given the item above, a dropped dependency wake is permanent
-  for the process, so each of these is a stuck-dependent bug rather than a latency
-  hiccup:
-
-    - `wakeDependents` swallows its `ListIncomingRefs` error and returns. One
-      transient failure and every dependent of that target misses that change,
-      silently. This is the same efficiency-flavored silent drop that the
-      `UpdateStatus` no-op path was fixed away from, and the cheapest to correct.
-    - `runDependencyWaker` returns on a closed change stream with no log and no
-      re-subscribe, so a kind's wakes would be dead for the process lifetime with
-      nothing saying so. No reachable path closes that channel short of store
-      `Close` today, so this is latent rather than live — but it is unlogged
-      either way.
-    - `Start`'s subscribe-failure branch warns "relying on resync", which per the
-      item above is not the coverage it sounds like: the timer reaches that
-      controller's unsettled objects, not the dependency wakes the failed
-      subscription was to deliver. The code is fine; the comment promises
-      something that does not exist, and is the likely reason a reader would
-      believe the gap is already handled.
-
-  **`AddDependency`'s guard does not cover these, by construction.** It would have
-  the evidence to: a dependent re-declaring its edge after a dropped wake passes the
-  version it read *before* the change, and the target's current version is already
-  past it. But the wake is gated on that call having created the edge, so a
-  re-declaration never fires it. Dropping that half to pick up the repair trades a
-  bounded miss for an unbounded one — a caller whose version never advances (cached
-  across passes) would then re-fire every pass, unthrottled, and unlike a missed wake
-  that spin is invisible to the caller and permanent for the process. The guard is
-  deliberately an intent recorder for the declare window, not a staleness detector;
-  what repairs a *lost* wake is a backstop that re-derives staleness, which is the
-  `observed_cursor` watermark recorded under the item above. Noted here so the
-  conjunction is not "simplified" away later on the reasoning that it is redundant.
-
-  The fix for the first two is a `missedWake` flag that forces the next resync
-  tick to enqueue everything for registered kinds — the targeted version of the
-  item above, free in the normal case — plus logging at Warn. The third is a
-  comment correction and should land regardless of what happens to the other two.
-  Deferred with them because the flag only means something once the tick can do a
-  full pass.
-
 - **A target change landing *mid-reconcile* is safe in memory, but has no durable
   twin** — analyzed, in-memory half verified sound, durable half not fixed. The
   scenario: D depends on T, T changes and wakes D, and T changes *again* while D's
@@ -121,22 +52,39 @@ tell "we decided against this for now" from "nobody thought of it."
   covers the *declare* window (`AddRef` stamps when a new edge's caller-supplied
   target version is already stale) and nothing else, so an ordinary target-change
   wake has no persisted "reconcile owed". A crash between T's commit and D's
-  re-dispatch loses it permanently: D settled at its own generation, so
-  `ListUnsettledIDs` structurally cannot see it, and per the resync item above the
-  tick is unsettled-only. The mid-reconcile timing makes the window *wider* than
-  the plain case — the owed wake sits in `dirty` behind a whole reconcile pass
-  rather than a queue hop — but the loss mode is the same one, not a new one.
+  re-dispatch loses it: D settled at its own generation, so no owed-work listing
+  can see it. The mid-reconcile timing makes the window *wider* than the plain
+  case — the owed wake sits in `dirty` behind a whole reconcile pass rather than a
+  queue hop — but the loss mode is the same one, not a new one.
 
-  Deferred because the fix is not local to this timing. Stamping `pending_wake` in
-  `wakeDependents` would make every target change a write per dependent on the
-  wake path — the cost `pending_wake` avoids today by riding a write `AddRef` was
-  already doing — and the decrement is per-pass, so a stamp-per-change would need
-  the same count-not-flag reasoning re-derived against a much higher write volume.
-  The cheaper repair is the `observed_cursor` watermark / full-sweep resync
-  recorded under the two items above: it re-derives staleness instead of tracking
-  each owed wake. Revisit with those; this item exists so the in-memory analysis
-  is not redone, and so "the queue handles it" is not mistaken for "it survives a
-  restart."
+  **Under stock defaults it heals at the next process start, and that is the point
+  most likely to be misread.** The loss is permanent for the *current* process: the
+  catchup tick sees only what the store records as owed, and the wake-failure
+  escalations cannot reach it either, since nothing *observed* the loss — neither
+  `resyncNextTick` nor `resyncEveryTick` fires. But the crash that loses the wake
+  also ends the process, and the next one starts with `WithStartupResync` true (the
+  default), re-dispatching every object: D reconciles, reads T's current state,
+  converges. So the durable gap is not "a stranded dependent forever" but "a
+  stranded dependent until restart".
+
+  Two configurations remove that backstop, and they are the ones that actually want
+  `WithResyncInterval` set: `WithStartupResync(false)` (the restart no longer
+  sweeps), and every ticker disabled (nothing to escalate, and by that
+  configuration's contract the embedder owns recovery). This is also why it is not
+  an argument for making the full resync a default — the startup pass already
+  covers the crash case, so a periodic full pass would pay forever for a residual
+  the restart path already handles.
+
+  Deferred as a *durable* fix because it is not local to this timing. Stamping
+  `pending_wake` in `wakeDependents` would make every target change a write per
+  dependent on the wake path — the cost `pending_wake` avoids today by riding a
+  write `AddRef` was already doing — and the decrement is per-pass, so a
+  stamp-per-change would need the same count-not-flag reasoning re-derived against
+  a much higher write volume. The `observed_cursor` watermark stays the recorded
+  alternative that would make it durable under *any* configuration: it re-derives
+  staleness instead of tracking each owed wake. This item exists so the in-memory
+  analysis is not redone, and so "the queue handles it" is not mistaken for "it
+  survives a restart."
 
 - **`Create` accepts a `WithOwner` naming an already-deleting owner, stranding both
   rows when resync is off** — known, not fixed. The ownership mirror of the
@@ -159,13 +107,15 @@ tell "we decided against this for now" from "nobody thought of it."
   already collected): the second child stays alive and unmarked indefinitely while the
   owner sits deletion-pending, 3/3 runs.
 
-  **Unlike the `depends_on` race, this one self-heals whenever resync is on.**
-  `sweepDeletionPending` and `enqueueDeletionPending` re-list the still-pending owner
-  and `collect` re-runs `MarkOwnedForDeletion`, which is explicitly built to be re-run
-  and picks the new child up; the exposure is one resync interval. The permanent
-  strand is confined to `resyncInterval = 0` — which is exactly the configuration the
-  GC tests treat as supported, and the one where every other GC path was deliberately
-  made event-complete. It is also *visible* where the dependency race is not: the
+  **Unlike the `depends_on` race, this one self-heals whenever the GC sweeper runs.**
+  `sweepDeletionPending` re-lists the still-pending owner and `collect` re-runs
+  `MarkOwnedForDeletion`, which is explicitly built to be re-run and picks the new
+  child up; the exposure is one GC interval. Splitting the intervals narrowed the
+  permanent strand considerably: it used to follow from `resyncInterval = 0`, a
+  documented and commonly-used way to say "event-driven only", and is now confined to
+  `WithGCInterval(0)` — which defaults on and which nothing else has reason to
+  disable. (The repro above predates the split and was written against
+  `WithResyncInterval(0)`; re-run it against `WithGCInterval(0)`.) It is also *visible* where the dependency race is not: the
   owner is observably stuck deletion-pending rather than silently settled on a stale
   read.
 
@@ -199,11 +149,20 @@ tell "we decided against this for now" from "nobody thought of it."
   re-cascades over a fixed child set, so it never adds a child between passes.
 
 - **`advanceGCNow`'s synchronous collect inherits the caller's cancellation** —
-  known, not fixed, and already documented inline. With resync disabled, a
-  `Delete` (or freed-target wake) whose caller cancels immediately after commit
-  abandons the collect mid-flight; `Start` is one-shot, so nothing in that process
-  retries and the row stays deletion-pending, RESTRICT-blocking its owner, until a
-  *fresh* `Beehive` runs its unconditional startup sweep over the same store.
+  known, not fixed, and already documented inline. With **GC disabled**
+  (`WithGCInterval(0)`), a `Delete` (or freed-target wake) on a client-only kind
+  whose caller cancels immediately after commit abandons the collect mid-flight;
+  `Start` is one-shot, so nothing in that process retries and the row stays
+  deletion-pending, RESTRICT-blocking its owner, until a *fresh* `Beehive` runs its
+  unconditional startup sweep over the same store.
+
+  Splitting the intervals **narrowed but did not close this**. The branch used to
+  be reachable whenever the reconcile tick was off — a common configuration, since
+  one knob governed everything — and is now gated on the GC interval specifically,
+  which defaults on and which nothing else has reason to disable. So the trigger is
+  rarer and more deliberate. (An earlier plan for that work claimed the split would
+  close this entry outright; it does not. The `collect` call and its inherited
+  cancellation are unchanged.)
 
   The fix is `context.WithoutCancel(ctx)` for the collect — finishing work the
   caller stopped waiting on, which is the trade this deliberately declined. That
@@ -238,7 +197,7 @@ tell "we decided against this for now" from "nobody thought of it."
   outright.
 
   The fix that fits is a **cross-kind sweeper**, the `pending_wake` analogue of the
-  global GC sweeper's `ListAllDeletionPendingIDs`: list rows with a nonzero count
+  global GC sweeper's `ListAllDeletionPending`: list rows with a nonzero count
   across all kinds, zero the ones whose kind has no registered reconciler, on the
   sweeper's existing cadence. Off the hot path, symmetric with machinery that already
   exists, and it reclaims the index entry. Deferred because it is new store surface
@@ -394,6 +353,64 @@ tell "we decided against this for now" from "nobody thought of it."
 
 ## Resolved
 
+- **Three periodic drivers instead of one, and all three dependency-waker loss
+  points repaired** — done, as one series. `resyncInterval` had been governing four
+  unrelated jobs: the per-kind reconcile tick, the global GC sweeper, event-log
+  retention, and `advanceGC`'s sync-vs-defer routing. Tuning the first moved the
+  other three, and setting it to 0 — a documented, supported way to say
+  "event-driven only" — silently disabled GC as well. Separately the tick was
+  owed-work-only, so "periodic resync is the correctness backstop" was false for
+  the case that mattered most: a *settled* dependent, reachable only by a
+  dependency wake, of which the waker dropped three kinds silently.
+
+  **The knobs.** `WithCatchupInterval` (30s, per-kind) drains what the store
+  records as owed — `ListUnsettledIDs` + `ListPendingWakeIDs`, bounded by what is
+  outstanding. `WithResyncInterval` (**0, off**, per-kind) re-dispatches every
+  object; opt-in because it scales with object count and the startup pass covers
+  the same ground once per process. Its *meaning changed* while keeping its name,
+  the one break that is not a compile error: an unchanged call now buys a full pass
+  at that cadence. `WithGCInterval` (30s, global) paces the sweeper.
+  `WithStartupResync` (true) replaces the `StartupReconcileStrategy` enum.
+
+  **Startup stopped being a strategy question.** `enqueueCatchup` runs
+  unconditionally and `WithStartupResync` only adds the full pass — which closes
+  the old `StartupReconcileNone` + `resync = 0` recovery hole structurally rather
+  than warning about it, and reverses the decision recorded below (see that entry).
+
+  **GC routes rather than collects.** `ListAllDeletionPendingIDs` became
+  `ListAllDeletionPending`, returning `[]Referrer`, because the sweeper needs each
+  row's kind: `collect` cannot clear a finalizer (it cascades, then returns while
+  any remain), so a registered kind must be *enqueued* for its controller and only
+  a client-only kind collected directly. That let `enqueueDeletionPending` and
+  `Store.ListDeletionPendingIDs` go entirely — a per-kind listing that only
+  duplicated the cross-kind sweep — which in turn made the index rekey possible
+  (see the entry above).
+
+  **The waker's three loss points**, all now logged at Warn and all repaired by
+  escalating the *catchup* ticker (not resync, which is off by default — a repair
+  hung off an opt-in knob would be dead where it is needed most): a failed
+  `ListIncomingRefs` arms one full pass (it cannot be narrower — the lookup that
+  failed is what would have named the dependents); a closed change stream and a
+  failed subscription each force every later pass, since they keep dropping changes
+  rather than having dropped one. `Beehive.resyncKindsNextTick`/`EveryTick` fan out
+  to **every** registered reconciler, because edges are cross-kind — an earlier
+  attempt kept the flags process-wide but consumed them per-kind, repairing one
+  arbitrary kind and silently spending the repair for the rest;
+  `TestDroppedWakeEscalatesEveryKind` registers two kinds to pin it. The
+  subscribe-failure message finally says something true: it used to claim "relying
+  on resync", which was false even before resync became opt-in.
+
+  **Two store breaks** (`ListAllDeletionPending`'s signature,
+  `ListDeletionPendingIDs`'s removal) plus the `WithResyncInterval` meaning change.
+  Taken deliberately; `type Store = storeapi.Store` is an alias, so the interface is
+  externally implementable and both are visible to embedders.
+
+  **What this does not do.** The full resync stays off by default, so an
+  unobserved wake loss is still bounded by a restart rather than by an interval
+  (see the mid-reconcile item above, re-filed against these defaults). And the race
+  detector never ran on any of it — this sandbox has no cgo compiler, and the
+  escalation flags are the series' only new cross-goroutine state.
+
 - **`idx_objects_deleting` made covering for its one remaining reader** — done.
   The index was `objects(deletion_requested_at) WHERE deletion_requested_at IS NOT
   NULL`, and its two readers both planned as `SEARCH … USING INDEX` plus
@@ -430,8 +447,21 @@ tell "we decided against this for now" from "nobody thought of it."
   new key the ordering is free, so it stays for test determinism at no cost.
 
 - **`StartupReconcileNone` + `resyncInterval = 0` silently disabled all crash
-  recovery for unsettled objects** — done, by **documenting the configuration and
-  making it announce itself, not by taking it away**. The behaviour is unchanged:
+  recovery for unsettled objects** — first resolved by documenting the
+  configuration and making it announce itself; **that decision was later reversed**
+  when the intervals were split (see the entry above). Startup now drains owed work
+  unconditionally, so the hole is closed structurally and the warning this entry
+  describes is gone along with the `StartupReconcileStrategy` enum. The reasoning
+  below is kept because it is why the *first* answer was documentation rather than
+  behaviour — the configuration was reachable and had a legitimate use, and the
+  alternative on the table then would have taken it away with nothing offered in
+  its place. The interval split changed that: there is no longer a configuration
+  being taken away, only a hole being closed.
+
+  The original resolution follows.
+
+  Resolved by **documenting the configuration and making it announce itself, not by
+  taking it away**. The behaviour is unchanged:
   `enqueueUnsettled` still runs only inside `reconciler.run`'s strategy switch or on
   a resync tick, so with the startup pass off and no ticker, an object a prior
   process left unconverged (crashed mid-reconcile, or created with
