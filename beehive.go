@@ -156,7 +156,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 			continue
 		}
 		bh.wg.Go(func() {
-			bh.runDependencyWaker(runCtx, w)
+			bh.runDependencyWaker(runCtx, r.gk, w)
 		})
 	}
 
@@ -259,11 +259,12 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 }
 
 // runDependencyWaker requeues dependents when a target changes, until ctx is
-// cancelled or the stream ends. The watcher is established by Start (events-only,
+// cancelled or the stream ends. gk is the kind being watched, carried for the log
+// on the stream-ended path — the Watcher does not report it. The watcher is established by Start (events-only,
 // no snapshot: the reconciler's own startup pass already covers existing objects).
 // The ctx.Done() arm is needed because a watcher's channel may never close on its
 // own.
-func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
+func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watcher) {
 	defer w.Close()
 	for {
 		select {
@@ -271,6 +272,11 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
 			return
 		case ev, ok := <-w.Changes():
 			if !ok {
+				// The stream ended without the control plane stopping (that arrives on
+				// ctx.Done above, and is not a loss). Nothing re-subscribes, so every
+				// future change on this kind now reaches no dependent at all.
+				bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for this kind for the life of the process",
+					"group", gk.Group, "kind", gk.Kind)
 				return
 			}
 			// Wake on any present-state change. We must handle Added, not just
@@ -292,6 +298,13 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w Watcher) {
 func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 	deps, err := bh.store.ListIncomingRefs(ctx, targetID, RelationDependsOn)
 	if err != nil {
+		// Every dependent of this target just missed this change. A dependent that
+		// has settled is invisible to every owed-work listing — its own generation
+		// never moved — so with no full pass configured the miss is permanent, not
+		// slow. Nothing here can name who was missed: the lookup that failed is
+		// exactly the one that would have said.
+		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for this change were dropped",
+			"targetID", targetID, "err", err)
 		return
 	}
 	for _, d := range deps {

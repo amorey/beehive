@@ -651,7 +651,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw) })
+	bh.wg.Go(func() { bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
@@ -705,7 +705,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, fw)
+		bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw)
 		close(done)
 	}()
 
@@ -758,7 +758,7 @@ func TestDependencyWakerStreamEnd(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw)
+		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
 		close(done)
 	}()
 
@@ -2714,4 +2714,64 @@ func TestDisabledBackstopsAnnounceThemselves(t *testing.T) {
 		assert.NotContains(t, out, "disabled",
 			"a default configuration must not narrate; resync-off is the default and would be noise")
 	})
+}
+
+// TestWakeDependentsListErrorLogs pins the first of the dependency waker's silent
+// loss points. When the dependents lookup fails, every dependent of that target
+// misses that change — and a dependent that has settled is invisible to every
+// owed-work listing, so with the full resync off by default the miss is permanent
+// rather than slow. Swallowing it silently is what made this a stuck-dependent bug
+// instead of a hiccup.
+func TestWakeDependentsListErrorLogs(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh := &Beehive{store: &errDepsStore{}, logger: logger}
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Contains(t, buf.String(), "dependents lookup failed",
+		"a dropped wake must not be silent")
+}
+
+// TestDependencyWakerStreamEndLogs pins the second. A closed change stream ends
+// the waker for the life of the process — nothing re-subscribes — so every future
+// change on that kind reaches no dependent at all. No reachable path closes the
+// channel short of store Close today, which makes this latent rather than live;
+// unlogged either way.
+func TestDependencyWakerStreamEndLogs(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+
+	assert.Contains(t, buf.String(), "dependency waker stopped",
+		"a dead waker must not be silent")
+}
+
+// TestDependencyWakerCancelDoesNotLog is the negative: an ordinary shutdown ends
+// every waker, and that is not a loss. Warning on it would put a line per kind in
+// every clean stop, training operators to ignore the one message that matters.
+func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+
+	cancel()
+	waitClosed(t, done, "waker to exit on cancel")
+
+	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 }
