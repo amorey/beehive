@@ -539,6 +539,110 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	}
 }
 
+// TestDependencyRequeueLostAcrossRestart pins the durability half of the
+// read-then-declare race: a wake that a process owes but never dispatches is
+// gone, because the only record of it was the in-memory work queue.
+//
+// The two repros above are about *deriving* the wake; this one is about
+// surviving it. Its diagnostic value lands once the edge-triggered wake exists:
+// at that point the out-of-band repro passes while this one still fails, and the
+// failure means exactly one thing — the signal was in-memory only. Until then it
+// fails for the same reason they do, which is why all three are skipped together.
+//
+// The crash is spelled as a stopped work queue rather than a killed process: the
+// change and the declaration both commit durably, and the wake they imply lands
+// on a queue whose addLocked returns early on q.stopped. From the store's side
+// that is indistinguishable from dying between the commit and the dispatch, and
+// it needs no goroutine timing to be deterministic.
+//
+// The restart runs with StartupReconcileNone, which is load-bearing twice over.
+// Under the default StartupReconcileAll the sweep reconciles everything and heals
+// the crash for reasons that have nothing to do with dependencies, so the test
+// would prove nothing. And a wake that is owed is not a spec-convergence
+// question, so recovering it must not be a startup *strategy* question either —
+// the fix has to reach the dependent under the strategy that asks for no startup
+// pass at all.
+func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
+	t.Skip("pins a known, unfixed race — see \"AddDependency's read-then-declare race\" in TODO.md")
+
+	ctx := context.Background()
+	// One store, two control planes: the rows outlive the process, the work queue
+	// does not. Owned by the test, since stop leaves the store open (see
+	// Beehive.stop) — which is what makes the restart possible.
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	gk := GroupKind{Kind: "Widget"}
+
+	// --- first process: settle the dependent on a not-Ready target ---
+	bh1, err := New(db)
+	require.NoError(t, err)
+	ctrl1 := &observedReadyController{observed: make(chan bool, 8)}
+	// Resync disabled here and on the restart: the wake must be what requeues the
+	// dependent, not a timer that happens to sweep it up.
+	cc, err := Register(bh1, gk, ctrl1, WithResyncInterval(0))
+	require.NoError(t, err)
+
+	client1 := NewClient[tSpec, tStatus](bh1, gk)
+	ctrl1.client = client1
+
+	target, err := client1.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client1.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
+
+	stop1, err := bh1.Start(ctx)
+	require.NoError(t, err)
+
+	select {
+	case ready := <-ctrl1.observed:
+		require.False(t, ready, "the startup pass reads the target before it goes Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's startup reconcile did not run")
+	}
+	require.NoError(t, stop1(ctx))
+
+	// --- the crash window: both writes commit, the wake reaches nobody ---
+	// The target changes and only then is the edge declared, so the change is
+	// already unclaimed when the edge appears — the out-of-band race. The
+	// ControllerClient outlives the control plane (it holds the store, not the
+	// loops), so the declaration commits normally; what it can no longer do is
+	// reach a running queue.
+	_, err = db.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID))
+
+	// --- second process over the same store ---
+	bh2, err := New(db)
+	require.NoError(t, err)
+	ctrl2 := &observedReadyController{
+		observed: make(chan bool, 8),
+		depID:    dep.ID,
+		targetID: target.ID,
+	}
+	_, err = Register(bh2, gk, ctrl2,
+		WithResyncInterval(0),
+		WithStartupReconcileStrategy(StartupReconcileNone))
+	require.NoError(t, err)
+	ctrl2.client = NewClient[tSpec, tStatus](bh2, gk)
+
+	stop2, err := bh2.Start(ctx)
+	require.NoError(t, err)
+	defer stop2(ctx)
+
+	// The edge is durably in place and the target's change is still unobserved, so
+	// the new process owes the dependent a reconcile that no live event will
+	// deliver — nothing is going to change again.
+	select {
+	case ready := <-ctrl2.observed:
+		assert.True(t, ready, "the recovered pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never reconciled after restart: the owed wake died with the process that owed it")
+	}
+}
+
 // TestStartToleratesWatchError verifies that a dependency-watch subscription
 // failure is non-fatal: Start (which now establishes the watch synchronously)
 // still succeeds and the controller runs — only the waker is skipped, and the

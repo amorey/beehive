@@ -115,6 +115,26 @@ tell "we decided against this for now" from "nobody thought of it."
   `TestDependencyRequeueRaceOnDeclare`; both fail deterministically at the requeue
   assertion, 3/3.
 
+  **Deriving the wake is only half of it; surviving it is the other half.** Any
+  guard that answers this race produces an in-memory requeue, and the work queue
+  does not outlive the process. A crash between the edge's commit and the dispatch
+  of the wake it implies leaves the edge durably in place, the dependent settled on
+  the stale read, and nothing anywhere recording that a reconcile is owed — the same
+  permanent, silent end state, now reachable even with a correct guard. Today the
+  default `StartupReconcileAll` hides this by sweeping everything on restart, so the
+  exposure is confined to `StartupReconcileUnsettled` and `StartupReconcileNone`
+  (`beehive.go:128` already names the latter as the strategy that breaks dependents
+  relying on dependency events). That confinement is an accident of the default
+  rather than a guarantee: recovering an owed wake is not a spec-convergence
+  question, so it should not be a startup-*strategy* question either. Pinned,
+  skipped, by `TestDependencyRequeueLostAcrossRestart`, which spells the crash as a
+  stopped work queue — both writes commit, and the wake lands on a queue whose
+  `addLocked` returns early on `q.stopped`, which from the store's side is
+  indistinguishable from dying between commit and dispatch, and needs no goroutine
+  timing to be deterministic. It fails at the post-restart assertion 3/3, and passes
+  if the restart is switched to `StartupReconcileAll`, which isolates the missing
+  signal from the restart scaffolding itself.
+
   **The obvious guard is not the cheap answer it looks like.** Waking `fromID` when
   the edge is new — pre-read via `ListOutgoingRefsByRelation` inside `AddDependency`'s
   existing `Within`, wake after commit when the target is absent from it — was
