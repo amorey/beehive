@@ -165,7 +165,13 @@ type Client[Spec, Status any] interface {
 	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
 
 	// Requeue requeues id for immediate reconcile. A latency hint, not a
-	// synchronous run; correctness rests on the periodic resync, not this.
+	// synchronous run: with the periodic resync enabled, correctness rests on that,
+	// not on this call.
+	//
+	// It is also the supported way to drive reconciles yourself when there is no
+	// resync to rest on — StartupReconcileNone with WithResyncInterval(0), where
+	// beehive resumes nothing and Store.ListUnsettledIDs reports what is owed. See
+	// StartupReconcileNone.
 	//
 	// By default it preserves id's retry backoff ladder: a requeue is the common
 	// event-driven nudge (config change, dependency update, manual poke) and

@@ -429,6 +429,20 @@ func (r *reconciler) run(ctx context.Context) {
 	if r.logger == nil {
 		r.logger = discardLogger
 	}
+	// StartupReconcileNone with the resync disabled leaves no automatic driver for
+	// spec convergence at all: enqueueUnsettled runs neither here nor on a tick, so
+	// an object a previous process left unconverged stays that way until something
+	// external requeues it. That is a supported configuration — the embedder drives
+	// reconciles on its own schedule via Store.ListUnsettledIDs + Client.Requeue —
+	// but it must not be *silent*, because the failure mode if it was reached by
+	// accident is a spec that is simply never actuated, with nothing to notice it.
+	// Warn rather than reject: the combination is deliberate for the embedder who
+	// wants it, and rejecting it would also force a periodic full-table sweep on
+	// the caller who explicitly asked for no timers.
+	if r.startupReconcile == StartupReconcileNone && r.resyncInterval <= 0 {
+		r.logger.WarnContext(ctx, "no automatic reconcile driver: startup reconcile is None and resync is disabled, so objects left unconverged by a previous process are not resumed; drive them with Store.ListUnsettledIDs + Client.Requeue",
+			"group", r.gk.Group, "kind", r.gk.Kind)
+	}
 	// Reconcile objects once at startup per the configured strategy. The default
 	// (StartupReconcileAll) re-applies persisted specs that a previous run left
 	// settled and gives controllers a chance to re-confirm process-scoped state
@@ -437,7 +451,8 @@ func (r *reconciler) run(ctx context.Context) {
 	// concern.
 	switch r.startupReconcile {
 	case StartupReconcileNone:
-		// No startup pass; the periodic resync and live events are the only drivers.
+		// No startup pass; live events, and whatever the embedder requeues itself,
+		// are the only drivers (plus the periodic resync when one is configured).
 	case StartupReconcileUnsettled:
 		r.enqueueUnsettled(ctx)
 	default: // StartupReconcileAll
@@ -446,8 +461,10 @@ func (r *reconciler) run(ctx context.Context) {
 	// Always resume in-progress deletions and owed dependency wakes at startup,
 	// independent of the spec strategy above: a process that crashed mid-delete must
 	// still drive those rows to removal, and one that crashed owing a dependency
-	// wake must still deliver it. Both are orthogonal to spec convergence; the work
-	// queue's set semantics coalesce any overlap with the pass above.
+	// wake must still deliver it. Both are store bookkeeping rather than spec
+	// convergence — a half-deleted row RESTRICT-blocks its owner, and an owed wake
+	// was explicitly stamped — so they are not the embedder's to drive even under
+	// None. The work queue's set semantics coalesce any overlap with the pass above.
 	r.enqueueDeletionPending(ctx)
 	r.enqueuePendingWake(ctx)
 

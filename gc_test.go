@@ -430,6 +430,13 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
+	// Settle it first, so enqueueDeletionPending really is the *only* path that can
+	// reach this row. A raw CreateObject leaves observed_generation NULL, which the
+	// startup resumption of owed work would pick up as unsettled — the row would
+	// then be removed for two reasons and this test would stop pinning either one.
+	// Deletion does not bump generation, so the row stays settled below.
+	_, err = store.UpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
+	require.NoError(t, err)
 	_, _, err = store.RequestDeletion(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
