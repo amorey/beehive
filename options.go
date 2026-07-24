@@ -286,6 +286,25 @@ func WithResyncInterval(d time.Duration) Option {
 	}
 }
 
+// WithGCInterval sets how often the global GC sweeper runs: it collects
+// deletion-pending objects (of every kind, including ones with no registered
+// controller) and applies event-log retention. A value <= 0 disables the periodic
+// sweep, leaving only the unconditional pass at startup.
+//
+// It is separate from the reconcile intervals on purpose. Removing dead rows and
+// re-dispatching live ones are different jobs with different costs, and a single
+// interval for both means tuning one moves the other. GC is also global rather
+// than per-kind — the sweeper covers kinds no controller watches — so this is
+// meaningful only at New; passed elsewhere it is ignored.
+func WithGCInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.gcInterval = d
+		}
+		return nil
+	}
+}
+
 // WithEventRetention bounds the per-object event log, enforced globally by the GC
 // sweeper on the startup + resync cadence. perObject > 0 caps each
 // (object, category) timeline to its newest perObject runs — a ring, so a flapping

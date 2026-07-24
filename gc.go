@@ -168,7 +168,7 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 // sweeper is its backstop, so we leave the object for the next sweep — keeping
 // the "events are a latency optimization, resync is the correctness backstop"
 // model and not running a recursive cascade inline on the caller's goroutine. But
-// a disabled resync reduces the sweeper to a single startup pass, so a
+// a disabled GC interval reduces the sweeper to a single startup pass, so a
 // client-only object deleted or cascade-freed afterward would strand forever, its
 // owned_by edge RESTRICT-blocking the owner's delete. In that one configuration
 // we collect synchronously here instead. Recursion terminates: each collect that
@@ -181,12 +181,12 @@ func (bh *Beehive) advanceGCNow(ctx context.Context, gk GroupKind, id ObjectID) 
 		r.enqueue(id)
 		return
 	}
-	if bh.resyncInterval > 0 {
-		return // the GC sweeper's resync tick is this kind's backstop
+	if bh.gcInterval > 0 {
+		return // the GC sweeper's own tick is this kind's backstop
 	}
 	// This runs on the caller's ctx, so a Delete (or freed-target wake) whose
 	// caller cancels right after committing RequestDeletion can abandon the collect
-	// mid-flight. With resync disabled this Beehive has no periodic sweeper left to
+	// mid-flight. With GC disabled this Beehive has no periodic sweeper left to
 	// retry, and Start is one-shot (a stopped Beehive cannot be restarted), so this
 	// instance will not collect the row again. Recovery happens only when the
 	// application constructs and starts a *fresh* Beehive over the same store, whose

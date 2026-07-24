@@ -266,7 +266,7 @@ func (s *gcTickStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, er
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
 	store := &gcTickStore{fakeStore: &fakeStore{}, swept: make(chan struct{}, 8)}
-	bh, err := New(store, WithResyncInterval(time.Millisecond))
+	bh, err := New(store, WithGCInterval(time.Millisecond))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())

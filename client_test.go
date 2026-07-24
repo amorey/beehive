@@ -937,12 +937,12 @@ func TestClientDeleteAdvancesGCOnlyAfterOuterCommit(t *testing.T) {
 		})
 	})
 
-	// With no controller and resync disabled, advanceGC collects inline — the one
+	// With no controller and no GC sweeper, advanceGC collects inline — the one
 	// branch that writes. Nested, those writes would join the caller's transaction.
 	t.Run("client-only kind defers the collect", func(t *testing.T) {
 		runCommitRollback(t, func(t *testing.T, commit bool) {
 			ctx := context.Background()
-			bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+			bh, err := New(newClientTestStore(t), WithGCInterval(0))
 			require.NoError(t, err)
 
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)

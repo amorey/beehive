@@ -532,7 +532,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 
 	// A short resync drives the deletion-pending backstop, which re-checks the
 	// owner once its child (and the owned_by edge) is gone.
-	bh, err := New(newClientTestStore(t), WithResyncInterval(5*time.Millisecond))
+	bh, err := New(newClientTestStore(t), WithGCInterval(5*time.Millisecond))
 	require.NoError(t, err)
 
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
@@ -571,7 +571,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), WithResyncInterval(5*time.Millisecond))
+	bh, err := New(newClientTestStore(t), WithGCInterval(5*time.Millisecond))
 	require.NoError(t, err)
 
 	// Only the owner kind has a controller; the child kind is client-only.
@@ -608,17 +608,17 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled is the resync-off
-// companion to TestIntegrationGCSweepsClientOnlyKind. With resync disabled the
-// global sweeper runs only its single startup pass, so a client-only object
+// TestIntegrationGCCollectsClientOnlyKindWithGCDisabled is the sweeper-off
+// companion to TestIntegrationGCSweepsClientOnlyKind. With the GC interval
+// disabled the global sweeper runs only its single startup pass, so a client-only object
 // deleted afterward has no backstop tick to collect it — it must be collected by
 // the event-driven path (synchronously, since it has no reconcile loop) or it
 // strands forever in deletion-pending state, its owned_by edge RESTRICT-blocking
 // the owner's delete.
-func TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled(t *testing.T) {
+func TestIntegrationGCCollectsClientOnlyKindWithGCDisabled(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	bh, err := New(newClientTestStore(t), WithGCInterval(0))
 	require.NoError(t, err)
 
 	// Only the owner kind has a controller; the child kind is client-only.
@@ -655,12 +655,12 @@ func TestIntegrationGCCollectsClientOnlyKindWithResyncDisabled(t *testing.T) {
 
 // TestIntegrationGCCollectsStandaloneClientOnlyDelete verifies that deleting an
 // unowned, unfinalized object of a client-only kind collects it immediately,
-// even with resync disabled. Nothing else frees it, so the Delete path's own
-// synchronous collect is the only thing that can.
+// even with the GC sweeper disabled. Nothing else frees it, so the Delete path's
+// own synchronous collect is the only thing that can.
 func TestIntegrationGCCollectsStandaloneClientOnlyDelete(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	bh, err := New(newClientTestStore(t), WithGCInterval(0))
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -722,4 +722,66 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	// The dependent is untouched.
 	_, err = client.Get(ctx, dep.ID)
 	require.NoError(t, err)
+}
+
+// gcSweepSignalStore reports each time the GC sweeper lists deletion-pending
+// rows, so a test can order its own writes against the sweeper's unconditional
+// startup pass instead of racing it.
+type gcSweepSignalStore struct {
+	Store
+	swept chan struct{}
+}
+
+func (s *gcSweepSignalStore) ListAllDeletionPendingIDs(ctx context.Context) ([]ObjectID, error) {
+	ids, err := s.Store.ListAllDeletionPendingIDs(ctx)
+	select {
+	case s.swept <- struct{}{}:
+	default:
+	}
+	return ids, err
+}
+
+// TestGCSweepsOnItsOwnInterval pins that garbage collection has a cadence of its
+// own, independent of the reconcile knobs. Collecting dead rows and re-confirming
+// live ones are different jobs with different costs, and one interval governing
+// both means tuning either moves the other — with the sharp edge that disabling
+// the reconcile tick silently disabled the GC sweeper too, stranding rows whose
+// owned_by edge then RESTRICT-blocks the owner forever.
+//
+// The row is marked deletion-pending only after the sweeper's startup pass has
+// provably run, and through the store rather than the client, so neither that
+// pass nor advanceGC's post-Delete wake can be what collects it: a periodic sweep
+// is the only path left. The kind has no registered controller, so nothing
+// dispatches a reconcile either.
+func TestGCSweepsOnItsOwnInterval(t *testing.T) {
+	ctx := context.Background()
+	real := newClientTestStore(t)
+	store := &gcSweepSignalStore{Store: real, swept: make(chan struct{}, 8)}
+
+	raw, err := real.CreateObject(ctx, &RawObject{
+		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	// Reconcile tick off, GC on: the sweeper must still run on its own timer.
+	bh, err := New(store, WithResyncInterval(0), WithGCInterval(10*time.Millisecond))
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	select {
+	case <-store.swept:
+	case <-time.After(testTimeout):
+		t.Fatal("sweeper never ran its startup pass")
+	}
+
+	_, _, err = real.RequestDeletion(ctx, clientTestGK, raw.ID)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		_, err := real.GetObjectMeta(ctx, raw.ID)
+		return errors.Is(err, ErrNotFound)
+	}, testTimeout, 5*time.Millisecond, "deletion-pending row was never collected: GC is still riding the reconcile interval")
 }

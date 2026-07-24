@@ -27,7 +27,10 @@ import (
 	"github.com/amorey/gobus/conflate"
 )
 
-const defaultResyncInterval = 30 * time.Second
+const (
+	defaultResyncInterval = 30 * time.Second
+	defaultGCInterval     = 30 * time.Second
+)
 
 type beehiveState uint8
 
@@ -43,7 +46,14 @@ const (
 type Beehive struct {
 	store          Store
 	resyncInterval time.Duration
-	concurrency    int // default worker count for all controllers; 0/1 = single-threaded
+	// gcInterval paces the global GC sweeper (deletion-pending collection and
+	// event-log retention). It is deliberately separate from the reconcile
+	// intervals: collecting dead rows and re-confirming live ones are different
+	// jobs with different costs, and one number governing both means tuning either
+	// moves the other. Zero disables the sweeper's periodic pass (the startup pass
+	// still runs).
+	gcInterval  time.Duration
+	concurrency int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper (see WithEventRetention).
 	// Zero on both disables the sweep — the log grows unbounded until configured.
 	eventRetentionPerObject int
@@ -169,11 +179,11 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 func (bh *Beehive) runGCSweeper(ctx context.Context) {
 	bh.sweepDeletionPending(ctx)
 	bh.sweepEventRetention(ctx)
-	if bh.resyncInterval <= 0 {
+	if bh.gcInterval <= 0 {
 		<-ctx.Done()
 		return
 	}
-	ticker := time.NewTicker(bh.resyncInterval)
+	ticker := time.NewTicker(bh.gcInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -306,6 +316,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 	bh := &Beehive{
 		store:          s,
 		resyncInterval: defaultResyncInterval,
+		gcInterval:     defaultGCInterval,
 		reconcilers:    make(map[GroupKind]*reconciler),
 		migrators:      make(map[GroupKind]Migrator),
 	}
