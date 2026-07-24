@@ -147,6 +147,13 @@ func resolveEvents(opts []EventOption) storeapi.EventQuery {
 // StartupReconcileStrategy selects which objects a controller reconciles once at
 // startup. The zero value is StartupReconcileAll, so the safe default holds for a
 // controller that never sets it.
+//
+// It governs the spec-convergence pass only. In-progress deletions and objects owed
+// a durable dependency wake are resumed at startup under every strategy, including
+// StartupReconcileNone: those are store bookkeeping rather than spec convergence —
+// a half-deleted row RESTRICT-blocks its owner until collected, and an owed wake was
+// explicitly stamped — so an embedder driving its own reconciles is not expected to
+// know about them.
 type StartupReconcileStrategy int
 
 const (
@@ -156,10 +163,29 @@ const (
 	StartupReconcileAll StartupReconcileStrategy = iota
 	// StartupReconcileUnsettled reconciles only objects whose spec has not yet
 	// converged — cheaper, but leaves process-scoped state unconfirmed until some
-	// other event wakes the object.
+	// other event wakes the object. This is the pass that resumes an object a
+	// previous process left unconverged (crashed mid-reconcile, or created and
+	// never settled), so it is the cheapest strategy that still recovers on restart.
 	StartupReconcileUnsettled
-	// StartupReconcileNone does no startup reconcile at all, leaving the periodic
-	// resync (and live events) as the only drivers.
+	// StartupReconcileNone does no startup reconcile at all, leaving live events
+	// and the periodic resync as the only drivers.
+	//
+	// Combined with a disabled resync (WithResyncInterval(0)) it leaves no automatic
+	// driver for spec convergence whatsoever: an object a previous process left
+	// unconverged is *not* resumed, and its spec is never actuated unless something
+	// requeues it. That combination is supported, for an embedder that wants to
+	// drive reconciles on its own schedule rather than beehive's — the store's
+	// ListUnsettledIDs reports exactly the objects owed a pass, and Client.Requeue
+	// dispatches one:
+	//
+	//	ids, err := store.ListUnsettledIDs(ctx, gk)
+	//	for _, id := range ids {
+	//		err := client.Requeue(ctx, id)
+	//	}
+	//
+	// Because the failure mode when it is reached by accident is silent, a
+	// controller starting in that configuration logs a warning naming it. Choose
+	// StartupReconcileUnsettled instead if you did not mean to take over recovery.
 	StartupReconcileNone
 )
 
@@ -243,6 +269,11 @@ func WithOnCreate(fn func(ctx context.Context)) Option {
 // WithResyncInterval sets the periodic resync interval for a controller. A
 // value <= 0 disables periodic resync, leaving the controller event-driven
 // only.
+//
+// The resync is what re-derives spec staleness (observed_generation < generation)
+// after startup, so disabling it alongside StartupReconcileNone leaves no automatic
+// driver for convergence at all — supported, but the embedder then owns recovery.
+// See StartupReconcileNone for the recipe and the warning that configuration logs.
 func WithResyncInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {

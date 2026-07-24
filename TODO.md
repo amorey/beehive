@@ -58,48 +58,6 @@ tell "we decided against this for now" from "nobody thought of it."
   default vs opt-in) wants a decision, not a guess. Revisit before making any
   further claim that resync backstops event delivery — today it does not.
 
-- **`StartupReconcileNone` + `resyncInterval = 0` silently disables all crash
-  recovery for unsettled objects** — known, not fixed. `enqueueUnsettled` — the only
-  path that re-derives `observed_generation < generation` — runs solely under
-  `StartupReconcileUnsettled`/`All` at startup (`reconciler.run`'s strategy switch) or
-  on a resync tick, and the tick's `resync` channel is nil when `resyncInterval <= 0`.
-  So with both knobs off, nothing ever enqueues an unsettled object. An object a prior
-  process left with `observed_generation < generation` — crashed mid-reconcile, or its
-  spec updated then the process died before the controller settled it — or a freshly
-  created object (`observed_generation IS NULL`) whose create wake was lost to the same
-  crash, is never reconciled on restart: its desired spec is simply never actuated, with
-  no error and no log. In-process new work is unaffected (`Create`/`Update` enqueue via
-  `wakeAfterCommit`); this is purely a restart-recovery hole, the spec-convergence
-  sibling of the dependency-wake durability fix (`pending_wake`, now resolved below).
-
-  It is the *combination* that breaks, not either setting alone. `StartupReconcileNone`
-  is documented as "leaving the periodic resync … as the only driver" — it presupposes
-  resync is on — and `resyncInterval = 0` removes exactly that driver. Each is
-  individually documented as dropping a backstop; together they contradict (None
-  delegates convergence to resync; resync is disabled), and nothing rejects or warns
-  about the contradiction. The silence is the defect.
-
-  What flags it as an oversight rather than a decision: startup already resumes
-  deletion-pending **unconditionally** (`reconciler.run`'s `enqueueDeletionPending`,
-  outside the strategy switch) on the reasoning that "a process that crashed mid-delete
-  must still drive those rows to removal." The identical argument applies verbatim to
-  unsettled objects — a process that crashed mid-reconcile must still drive them to
-  convergence — yet their resumption is gated behind the strategy. Crashed-mid-*delete*
-  is always recovered at startup; crashed-mid-*reconcile* is not, under None.
-
-  Two candidate fixes. (a) Enqueue unsettled at startup unconditionally, next to
-  `enqueueDeletionPending`, on the same "orthogonal to the spec strategy" reasoning —
-  small, and it makes None mean "no *full* re-confirm pass" rather than "no recovery at
-  all." (b) Reject or warn on the contradictory `None` + `resync = 0` combination at
-  `Start`. Deferred because it tangles with the resync-strategy item above (both are
-  about what the tick/startup must cover) and should land as one decision. It is
-  distinct from that item, though: that one is about *settled* dependents whose
-  generation never moves, this is about *unsettled* objects across a restart. Revisit
-  alongside the resync strategy, and note the parallel to the dependency-wake durability
-  fix (`pending_wake`, resolved): the two are the same crash-recovery gap for two
-  different signals, and candidate (a) is literally that fix's move — unconditional
-  startup/tick enqueue of a specific known-owed set — applied to unsettled objects.
-
 - **Three silent loss points in the dependency waker, none of them logged** —
   known, not fixed. Given the item above, a dropped dependency wake is permanent
   for the process, so each of these is a stuck-dependent bug rather than a latency
@@ -435,6 +393,68 @@ tell "we decided against this for now" from "nobody thought of it."
 
 ## Resolved
 
+- **`StartupReconcileNone` + `resyncInterval = 0` silently disabled all crash
+  recovery for unsettled objects** — done, by **documenting the configuration and
+  making it announce itself, not by taking it away**. The behaviour is unchanged:
+  `enqueueUnsettled` still runs only inside `reconciler.run`'s strategy switch or on
+  a resync tick, so with the startup pass off and no ticker, an object a prior
+  process left unconverged (crashed mid-reconcile, or created with
+  `observed_generation IS NULL`) is still not resumed by beehive. What changed is
+  that it is now a *choice* the caller can make and be told about:
+  `reconciler.run` logs a Warn at startup naming the configuration and the two
+  primitives that make it usable, and the `StartupReconcileNone`,
+  `WithResyncInterval` and `Client.Requeue` godocs carry the recipe.
+
+  **Why honoring it won.** The entry originally read this as a contradiction between
+  two knobs — and its own last line said "*the silence* is the defect", which turned
+  out to be the accurate diagnosis. Reaching the cell takes two explicit non-default
+  settings, and both primitives an embedder needs to drive convergence itself are
+  already public: `Store.ListUnsettledIDs` (via the `type Store = storeapi.Store`
+  alias, on the store the embedder opened and passed to `New`) reports exactly the
+  objects owed a pass, and `Client.Requeue` dispatches one. So the configuration
+  means "I reconcile on my own schedule", which is a real use — and the library
+  overriding two deliberately-set knobs would take it away with nothing offered in
+  its place. Pinned by `TestStartupReconcileNoneWithoutResyncDrivesNothing` (the
+  opt-out is honored), `TestStartupReconcileNoneWithoutResyncWarns` (it is not
+  silent), and `TestStartupReconcileNoneSelfDrivenRecovery`, which runs the
+  documented recipe end to end so the escape hatch can't quietly stop working.
+
+  **The alternative was built, then reverted** — recorded so it is not rebuilt.
+  Hoisting `enqueueUnsettled` out of the strategy switch (next to
+  `enqueueDeletionPending`/`enqueuePendingWake`) makes recovery unconditional and
+  reduces the strategy to "do you *also* sweep settled objects". It passes the whole
+  suite. Two things sank it. It deletes the only way to express "drive nothing
+  automatically" — `StartupReconcileNone` and `StartupReconcileUnsettled` become
+  behaviourally identical, and no coherent third meaning exists once owed work is
+  unconditional. And its justification assumed the caller had no way to recover the
+  objects themselves, which is false. The supporting argument that unsettled work is
+  "owed, like a deletion-pending row" is still true as far as it goes — it is why
+  those two *stay* unconditional even under `None` (a half-deleted row
+  RESTRICT-blocks its owner; an owed wake was explicitly stamped; neither is
+  something an embedder driving specs by hand would know to chase) — but it does not
+  extend to spec convergence, which is precisely what the strategy exists to let the
+  caller own.
+
+  Also examined: **rejecting the combination** at `Register`/`Start`. Rejected on
+  evidence — it is the repo's own technique for isolating one backstop under test
+  (`TestIntegrationGCResumesDanglingDeleteOnStartup`,
+  `TestDependencyRequeueLostAcrossRestart`), so banning it would make those tests
+  unwritable in the form that gives them meaning; and it forces a periodic
+  full-table sweep on the caller who explicitly asked for no timers.
+
+  One test change survives from the reverted attempt, kept on its own merits:
+  `TestIntegrationGCResumesDanglingDeleteOnStartup` built its row with a raw
+  `CreateObject` (`observed_generation` NULL) and now settles it first, so
+  `enqueueDeletionPending` being the only path that can reach the row is explicit
+  rather than incidental. Deletion does not undo it — `markForDeletion` leaves
+  `generation` alone.
+
+  Note what this does *not* resolve. The failure mode still exists for that one
+  configuration, now by design and with a warning attached; and the neighbouring
+  items above are untouched — the resync tick is still unsettled-only, so a settled
+  dependent whose generation never moves is reachable only by a dependency wake, and
+  a wake lost to one of the waker's three silent drops still heals never.
+
 - **`reconciler.enqueueFrom` logs its list error** — done. It was silent, on the
   reasoning that a failed resync list skips one tick and the next retries, so it
   self-heals on cadence. `enqueuePendingWake` broke that premise: at
@@ -503,10 +523,12 @@ tell "we decided against this for now" from "nobody thought of it."
   stays false in general. And it shares spec-convergence's coverage everywhere *but*
   the unconditional startup/tick enqueue — which is why it works under
   `StartupReconcileNone` + `resyncInterval=0` where plain unsettled recovery does not
-  (see "`StartupReconcileNone` + `resyncInterval = 0` silently disables all crash
-  recovery for unsettled objects"); a wake owed is a specific known-owed reconcile,
-  like a pending deletion, so unconditional resumption is justified where a broad
-  unsettled sweep would not be.
+  (see "`StartupReconcileNone` + `resyncInterval = 0` silently disabled all crash
+  recovery for unsettled objects" below, where honoring that opt-out for *spec*
+  convergence is the decision, and this stamp is one of the two signals deliberately
+  exempted from it); a wake owed is a specific known-owed reconcile, like a pending
+  deletion, so unconditional resumption is justified where a broad unsettled sweep
+  would not be.
 
   The **per-object `observed_cursor` watermark** stays the recorded stronger
   alternative: stamp the global `resource_version` as of the reconciler's load,
