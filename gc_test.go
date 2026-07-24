@@ -344,7 +344,7 @@ func TestCollectBreaksSelfDependency(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "self"})
 	require.NoError(t, err)
 	// A controller accidentally recorded a self-dependency.
-	require.NoError(t, bh.store.AddRef(ctx, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
 	gone, err := bh.collect(ctx, obj.ID)
@@ -371,8 +371,8 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
 	// A and B depend on each other: neither can be collected until the cycle breaks.
-	require.NoError(t, store.AddRef(ctx, a.ID, b.ID, RelationDependsOn))
-	require.NoError(t, store.AddRef(ctx, b.ID, a.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, b.ID, a.ID, RelationDependsOn))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -404,7 +404,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	// A finalizing dependent that points at obj — modeled as a self-dependency, so
 	// the referrer is itself deletion-pending the instant obj is deleted. Without
 	// the fix, the gate sees this edge, never clears the finalizer, and GC stalls.
-	require.NoError(t, store.AddRef(ctx, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, obj.ID, obj.ID, RelationDependsOn))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -690,7 +690,7 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 
 	// dep depends_on target (not owned: the dependent survives the target).
-	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	ctrl.mu.Lock()
 	ctrl.reader = client

@@ -251,7 +251,7 @@ func TestDependencyRequeue(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, store.AddRef(ctx, dep.ID, target.ID, "depends_on"))
+	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
 	_, err = store.SetCondition(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})

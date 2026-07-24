@@ -1324,17 +1324,11 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 	return nil
 }
 
-// AddRef inserts a (from_id, to_id, relation) edge. It neither bumps
-// resource_version nor emits — a ref is not a field of the object, so watchers
-// would see no diff — and joins the ambient transaction (if any) via conn.
-func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
-	_, err := s.AddRefResolved(ctx, fromID, toID, relation, 0) // no version claim
-	return err
-}
-
-// AddRefResolved is AddRef, reporting what its endpoint check and insert already
-// know (see storeapi.AddRefResult) — no extra query pays for any of it. Reporting
-// rather than interpreting keeps the wake policy in the beehive layer (see
+// AddRef inserts a (from_id, to_id, relation) edge and reports what its endpoint
+// check and insert already know (see storeapi.AddRefResult) — no extra query pays
+// for any of it. It neither bumps resource_version nor emits — a ref is not a
+// field of the object, so watchers would see no diff. Reporting rather than
+// interpreting keeps the wake policy in the beehive layer (see
 // ControllerClient.AddDependency).
 //
 // It self-wraps in Within like the other mutators, so the endpoint check and the
@@ -1345,7 +1339,7 @@ func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID
 // inserted) — which is the very window AddDependency exists to close. Relying on
 // the caller to supply the transaction, or on sqlite serializing writers on one
 // connection, would leave that as an unstated precondition of the guard.
-func (s *sqliteStore) AddRefResolved(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation, targetResourceVersion int64) (storeapi.AddRefResult, error) {
+func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation, targetResourceVersion int64) (storeapi.AddRefResult, error) {
 	var out storeapi.AddRefResult
 	err := s.Within(ctx, func(ctx context.Context) error {
 		// One round-trip, and without loading the row blobs. Joining the two rows

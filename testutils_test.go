@@ -161,11 +161,8 @@ func (s *fakeStore) GetLatestEvent(context.Context, ObjectID, string) (*RawEvent
 func (s *fakeStore) SweepEvents(context.Context, int, time.Duration) (int, error) {
 	panic("not implemented: fakeStore.SweepEvents")
 }
-func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
 	panic("not implemented: fakeStore.AddRef")
-}
-func (s *fakeStore) AddRefResolved(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
-	panic("not implemented: fakeStore.AddRefResolved")
 }
 func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
 	panic("not implemented: fakeStore.DeleteRef")
@@ -329,6 +326,15 @@ type reconcileCapture struct {
 func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
 	c.ch <- obj
 	return Result{}, nil
+}
+
+// addRef declares an edge for test scaffolding: it discards the endpoint metadata
+// AddRef reports and passes no version claim (0), so the common
+// require.NoError(t, addRef(...)) shape stays a one-liner. Tests that assert on
+// the AddRefResult, or on the version guard, call the method directly.
+func addRef(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
+	_, err := store.AddRef(ctx, from, to, relation, 0)
+	return err
 }
 
 // referrerIDs projects a Referrer slice to its ids, for assertions that care which

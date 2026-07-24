@@ -218,7 +218,7 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id O
 
 // AddDependency implements the contract documented on ControllerClient. The
 // relation is always "depends_on" (owner edges come from WithOwner at create
-// time). AddRefResolved is atomic on its own, and the version check now lives
+// time). AddRef is atomic on its own, and the version check now lives
 // inside it, so the Within here is not what makes either safe. It is the seam for
 // this method's own composition: the store call plus whatever else has to land
 // with it, joining a controller's Within when nested rather than opening a second
@@ -251,7 +251,7 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 		// The store rejects a version above the target's own before it inserts (see
 		// ErrTargetResourceVersionFuture), so a bad claim leaves no edge regardless
 		// of whose transaction this is running in.
-		res, err := c.bh.store.AddRefResolved(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
+		res, err := c.bh.store.AddRef(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
 		if err != nil {
 			return err
 		}

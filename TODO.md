@@ -211,6 +211,13 @@ tell "we decided against this for now" from "nobody thought of it."
   cadence even when resync is disabled — which is really the resync-strategy item
   above wearing a different hat.
 
+  Whichever is chosen, the owner's `DeletionRequestedAt` is already on the row
+  `AddRef` reads for its endpoint check — the same check that reports
+  `TargetResourceVersion` for the dependency guard. Adding it to `AddRefResult`
+  would let `insertObject` see the owner's lifecycle from the write it already
+  makes, rather than a second read, exactly as `AddDependency` reads the target's
+  version from that one call.
+
   Deferred because the window needs a finalizer-held owner *plus* disabled resync to
   become permanent, and because picking between reject / create-marked is a public API
   decision worth making alongside the resync-strategy item rather than ahead of it.
@@ -261,43 +268,6 @@ tell "we decided against this for now" from "nobody thought of it."
   query per silent write. Revisit when the next `Store` break is on the table
   anyway — the v0.17.0 `RequestDeletionBySlug` change was exactly such a moment and
   would have been the cheap time to take this with it.
-
-- **`Store` carries two methods for one operation: `AddRef` is a discard-wrapper
-  over `AddRefResolved`** — known, not fixed. `sqlite`'s `AddRef` is literally
-  `_, err := s.AddRefResolved(...)`, and each has exactly one production caller —
-  `AddRef` from `client.go`'s `insertObject` (the owner edge), `AddRefResolved` from
-  `ControllerClient.AddDependency`. The interface is one operation spelled twice.
-
-  The tax is on implementers, and it is not only boilerplate. Every `Store` and
-  every fake must stub both (`testutils_test.go` gained a panicking
-  `AddRefResolved`; `controller_test.go`'s `addRefTxTrackingStore` and
-  `failAddRefStore` had to be retargeted). The sharp part is the failure mode that
-  retargeting implies: **a test double that overrides only `AddRef` now silently
-  fails to intercept `AddDependency`**. It compiles, the embedded real store serves
-  the call, and the test passes while exercising nothing — the worst shape of test
-  bug, since it looks like coverage. Two of ours had to be moved by hand for exactly
-  this reason, and nothing stops the next one from being written against the wrong
-  method.
-
-  The fix is to drop `AddRef` from the interface and let `insertObject` discard the
-  extra returns. `storeapi` is `internal/`, so widening costs external consumers
-  nothing, and the mutator convention already points this way: every other mutator
-  returns the row it wrote, so an `AddRef` returning only `error` was the outlier
-  rather than `AddRefResolved` being a special case.
-
-  Deferred because the split was taken deliberately to avoid churning roughly forty
-  `require.NoError(t, store.AddRef(...))` one-liners into three-line forms across
-  `gc_test.go`, `client_test.go` and `sqlite/store_test.go` — tests that have
-  nothing to do with dependency wakes and read worse for it. That is a real cost,
-  but it is a one-time mechanical one paid against a standing hazard, which is the
-  trade to re-take rather than assume settled.
-
-  Revisit at the next ref-related test double, when the wrong-method trap would
-  actually spring; or when `AddRefResult` next grows — the `Create`-with-a-deleting-
-  owner item above wants `DeletionRequestedAt` on it, and widening a struct that two
-  interface methods disagree about is the point where the fork stops being free. A
-  cheap interim mitigation, if it stays deferred: a comment on `AddRef` in
-  `storeapi` naming `AddRefResolved` as the method doubles must hook.
 
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.

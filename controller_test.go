@@ -374,9 +374,9 @@ func (s *addRefTxTrackingStore) Within(ctx context.Context, fn func(context.Cont
 	return s.Store.Within(ctx, fn)
 }
 
-func (s *addRefTxTrackingStore) AddRefResolved(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.AddRefResult, error) {
+func (s *addRefTxTrackingStore) AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.AddRefResult, error) {
 	s.addRefInTx = s.depth > 0
-	return s.Store.AddRefResolved(ctx, fromID, toID, relation, targetRV)
+	return s.Store.AddRef(ctx, fromID, toID, relation, targetRV)
 }
 
 // TestControllerClientAddDependencyIsTransactional pins that AddDependency runs its
@@ -461,7 +461,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 	require.NoError(t, err)
 	// Declared straight through the store: the witness's edge is scaffolding, not a
 	// use of the guard under test.
-	require.NoError(t, store.AddRef(ctx, f.witness.ID, f.target.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, f.witness.ID, f.target.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -727,7 +727,7 @@ type failAddRefStore struct {
 	fakeStore
 }
 
-func (s *failAddRefStore) AddRefResolved(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
+func (s *failAddRefStore) AddRef(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
 	return storeapi.AddRefResult{}, errBoom
 }
 
@@ -902,7 +902,7 @@ func TestControllerClientReadRefs(t *testing.T) {
 	require.NoError(t, err)
 	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
-	require.NoError(t, store.AddRef(ctx, child.ID, owner.ID, RelationDependsOn))
+	require.NoError(t, addRef(ctx, store, child.ID, owner.ID, RelationDependsOn))
 
 	ref, ok, err := cc.GetOwner(ctx, child.ID)
 	require.NoError(t, err)
