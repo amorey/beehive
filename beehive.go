@@ -146,8 +146,8 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// runs, and that Modified event must not be published before the relevant
 	// waker is listening — otherwise dependents go unwoken under configurations
 	// that rely on dependency events (e.g. a settled dependent, which no owed-work
-	// listing can see, with every ticker disabled). A subscribe failure is non-fatal: that controller
-	// still resyncs on its own timer.
+	// listing can see, with every ticker disabled). A subscribe failure is
+	// non-fatal: that controller still resyncs on its own timer.
 	for _, r := range bh.order {
 		w, err := bh.store.WatchChanges(runCtx, r.gk)
 		if err != nil {
@@ -190,6 +190,12 @@ func (bh *Beehive) runGCSweeper(ctx context.Context) {
 	bh.sweepDeletionPending(ctx)
 	bh.sweepEventRetention(ctx)
 	if bh.gcInterval <= 0 {
+		// Warn, where the reconcile knobs only Info: this one leaves no recourse.
+		// Nothing on the public surface triggers collect, so an operator who reaches
+		// this by accident cannot make deletion progress by hand the way Requeue
+		// covers a disabled catchup — deletion-pending rows simply accumulate, each
+		// RESTRICT-blocking whatever owns it.
+		bh.log().WarnContext(ctx, "garbage collection disabled: deletion-pending rows are collected once at startup and never again; they will accumulate and block their owners' deletion")
 		<-ctx.Done()
 		return
 	}

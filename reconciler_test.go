@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -2668,5 +2669,49 @@ func TestStartupResyncReconcilesSettled(t *testing.T) {
 	t.Run("defaults to enabled", func(t *testing.T) {
 		got := newStartupHarness(t, seed)
 		assert.Equal(t, []ObjectID{settled}, got, "the safe default holds without the option")
+	})
+}
+
+// TestDisabledBackstopsAnnounceThemselves pins that turning a periodic driver off
+// is visible in the log. Each of these is a supported configuration, so none of
+// them is an error — but the failure mode when one is reached by accident (an
+// unset config field, a bad duration parse) is silence: work quietly stops being
+// re-derived and nothing says so. The level differs by what recourse the operator
+// has left.
+func TestDisabledBackstopsAnnounceThemselves(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+
+	start := func(t *testing.T, level slog.Level, opts ...Option) string {
+		t.Helper()
+		logger, buf := captureLogger(level)
+		opts = append(opts, WithLogger(logger))
+		bh, err := New(&fakeStore{}, opts...)
+		require.NoError(t, err)
+		_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+		stop, err := bh.Start(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stop(context.Background()))
+		return buf.String()
+	}
+
+	t.Run("catchup off is Info: the caller can still requeue", func(t *testing.T) {
+		out := start(t, slog.LevelInfo, WithCatchupInterval(0))
+		assert.Contains(t, out, "catchup disabled")
+		assert.Contains(t, out, "Requeue", "name the primitive that replaces it")
+	})
+
+	t.Run("gc off is Warn: nothing public collects a row", func(t *testing.T) {
+		// No public API triggers collect, so a disabled sweeper leaves the operator
+		// no way to make deletion progress — a strictly worse position than the
+		// other two, and the reason this one is louder.
+		out := start(t, slog.LevelWarn, WithGCInterval(0))
+		assert.Contains(t, out, "garbage collection disabled")
+	})
+
+	t.Run("the defaults say nothing", func(t *testing.T) {
+		out := start(t, slog.LevelInfo)
+		assert.NotContains(t, out, "disabled",
+			"a default configuration must not narrate; resync-off is the default and would be noise")
 	})
 }

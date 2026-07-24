@@ -459,7 +459,19 @@ func (r *reconciler) run(ctx context.Context) {
 			r.runWorker(ctx)
 		})
 	}
-	r.logger.Info("reconciler started", "workers", n, "resyncInterval", r.resyncInterval)
+	r.logger.Info("reconciler started", "workers", n,
+		"catchupInterval", r.catchupInterval, "resyncInterval", r.resyncInterval)
+	// Say so when a periodic driver is off. Each is a supported choice, so this is
+	// not an error — but reached by accident (an unset config field, a duration that
+	// failed to parse) the failure mode is silence: work quietly stops being
+	// re-derived and nothing reports it. Info, because the caller retains recourse.
+	//
+	// Resync-off is deliberately not logged: it is the default, so narrating it
+	// would put a line in every process's startup for the ordinary case.
+	if r.catchupInterval <= 0 {
+		r.logger.InfoContext(ctx, "catchup disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ListUnsettledIDs + Client.Requeue",
+			"group", r.gk.Group, "kind", r.gk.Kind)
+	}
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
 	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue,
 	// and close the schedule hub so live WatchSchedule streams end instead of hanging

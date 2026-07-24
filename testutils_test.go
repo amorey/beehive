@@ -15,9 +15,11 @@
 package beehive
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -60,6 +62,13 @@ func (m *fakeMigrator) ConvertStatus(from int, raw json.RawMessage) (json.RawMes
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
 // fail rather than block forever. Tests never rely on it to pace anything.
 const testTimeout = 2 * time.Second
+
+// captureLogger returns a logger that records everything at or above level into
+// the returned buffer, for tests asserting that a code path announces itself.
+func captureLogger(level slog.Level) (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})), &buf
+}
 
 // tSpec / tStatus are placeholder payload types. The lifecycle tests never
 // inspect them; they exist only to satisfy the generic signatures.
