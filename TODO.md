@@ -58,6 +58,46 @@ tell "we decided against this for now" from "nobody thought of it."
   default vs opt-in) wants a decision, not a guess. Revisit before making any
   further claim that resync backstops event delivery — today it does not.
 
+- **`StartupReconcileNone` + `resyncInterval = 0` silently disables all crash
+  recovery for unsettled objects** — known, not fixed. `enqueueUnsettled` — the only
+  path that re-derives `observed_generation < generation` — runs solely under
+  `StartupReconcileUnsettled`/`All` at startup (`reconciler.run`'s strategy switch) or
+  on a resync tick, and the tick's `resync` channel is nil when `resyncInterval <= 0`.
+  So with both knobs off, nothing ever enqueues an unsettled object. An object a prior
+  process left with `observed_generation < generation` — crashed mid-reconcile, or its
+  spec updated then the process died before the controller settled it — or a freshly
+  created object (`observed_generation IS NULL`) whose create wake was lost to the same
+  crash, is never reconciled on restart: its desired spec is simply never actuated, with
+  no error and no log. In-process new work is unaffected (`Create`/`Update` enqueue via
+  `wakeAfterCommit`); this is purely a restart-recovery hole, the spec-convergence
+  sibling of the dependency-wake durability item below.
+
+  It is the *combination* that breaks, not either setting alone. `StartupReconcileNone`
+  is documented as "leaving the periodic resync … as the only driver" — it presupposes
+  resync is on — and `resyncInterval = 0` removes exactly that driver. Each is
+  individually documented as dropping a backstop; together they contradict (None
+  delegates convergence to resync; resync is disabled), and nothing rejects or warns
+  about the contradiction. The silence is the defect.
+
+  What flags it as an oversight rather than a decision: startup already resumes
+  deletion-pending **unconditionally** (`reconciler.run`'s `enqueueDeletionPending`,
+  outside the strategy switch) on the reasoning that "a process that crashed mid-delete
+  must still drive those rows to removal." The identical argument applies verbatim to
+  unsettled objects — a process that crashed mid-reconcile must still drive them to
+  convergence — yet their resumption is gated behind the strategy. Crashed-mid-*delete*
+  is always recovered at startup; crashed-mid-*reconcile* is not, under None.
+
+  Two candidate fixes. (a) Enqueue unsettled at startup unconditionally, next to
+  `enqueueDeletionPending`, on the same "orthogonal to the spec strategy" reasoning —
+  small, and it makes None mean "no *full* re-confirm pass" rather than "no recovery at
+  all." (b) Reject or warn on the contradictory `None` + `resync = 0` combination at
+  `Start`. Deferred because it tangles with the resync-strategy item above (both are
+  about what the tick/startup must cover) and should land as one decision. It is
+  distinct from that item, though: that one is about *settled* dependents whose
+  generation never moves, this is about *unsettled* objects across a restart. Revisit
+  alongside the resync strategy, and note the parallel to the dependency-wake durability
+  hole — the two are the same crash-recovery gap for two different signals.
+
 - **Three silent loss points in the dependency waker, none of them logged** —
   known, not fixed. Given the item above, a dropped dependency wake is permanent
   for the process, so each of these is a stuck-dependent bug rather than a latency
