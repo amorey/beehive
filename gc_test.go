@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -213,15 +214,24 @@ func TestCollectDeleteObjectError(t *testing.T) {
 }
 
 // TestAdvanceGCSynchronousCollectFailureLogs covers the advanceGC branch that, for
-// a client-only kind with resync disabled, collects synchronously and logs a
-// warning when that collect fails. No controller is registered for the kind, and
-// resyncInterval is 0, so advanceGC takes the synchronous-collect path.
+// a client-only kind with GC disabled, collects synchronously and logs a warning
+// when that collect fails. No controller is registered for the kind, and
+// gcInterval is 0, so advanceGC takes the synchronous-collect path.
+//
+// The warning is asserted, not merely the absence of a panic: this path swallows
+// its error by design, so the log line is the only observable it has. It is also
+// the gate that used to be keyed on the resync interval — when GC grew its own
+// knob, the old option left the branch unreached and the test went quietly inert.
 func TestAdvanceGCSynchronousCollectFailureLogs(t *testing.T) {
-	bh, err := New(&collectFakeStore{markErr: errBoom}, WithResyncInterval(0))
+	bh, err := New(&collectFakeStore{markErr: errBoom}, WithGCInterval(0))
 	require.NoError(t, err)
-	// advanceGC swallows the error (it only logs); the call must not panic and must
-	// take the synchronous-collect branch (no reconciler, resync disabled).
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh.logger = logger
+
 	bh.advanceGC(context.Background(), GroupKind{Kind: "ClientOnly"}, 1)
+
+	assert.Contains(t, buf.String(), "synchronous collect of client-only object failed")
+	assert.Contains(t, buf.String(), "ClientOnly")
 }
 
 // gcFixture builds a Beehive over a real sqlite store plus a client, so collect
