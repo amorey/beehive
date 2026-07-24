@@ -1328,22 +1328,81 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 // resource_version nor emits — a ref is not a field of the object, so watchers
 // would see no diff — and joins the ambient transaction (if any) via conn.
 func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
-	// Confirm both endpoints exist for a clean ErrNotFound over a raw FK
-	// violation — in one round-trip, and without loading the row blobs.
-	var fromOK, toOK bool
-	if err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM objects WHERE id = ?), EXISTS(SELECT 1 FROM objects WHERE id = ?)`,
-		fromID, toID).Scan(&fromOK, &toOK); err != nil {
-		return err
-	}
-	if !fromOK || !toOK {
-		return storeapi.ErrNotFound
-	}
-	_, err := s.conn(ctx).ExecContext(ctx, `
-		INSERT INTO refs (from_id, to_id, relation) VALUES (?, ?, ?)
-		ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
-		fromID, toID, string(relation))
+	_, err := s.AddRefResolved(ctx, fromID, toID, relation, 0) // no version claim
 	return err
+}
+
+// AddRefResolved is AddRef, reporting what its endpoint check and insert already
+// know (see storeapi.AddRefResult) — no extra query pays for any of it. Reporting
+// rather than interpreting keeps the wake policy in the beehive layer (see
+// ControllerClient.AddDependency).
+//
+// It self-wraps in Within like the other mutators, so the endpoint check and the
+// insert are one atomic unit however it is called. That is what lets it report a
+// resource_version the caller can reason about: read as a separate statement, a
+// write to the target landing between the two would be invisible both to this
+// result (the version is already read) and to wakeDependents (the edge is not yet
+// inserted) — which is the very window AddDependency exists to close. Relying on
+// the caller to supply the transaction, or on sqlite serializing writers on one
+// connection, would leave that as an unstated precondition of the guard.
+func (s *sqliteStore) AddRefResolved(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation, targetResourceVersion int64) (storeapi.AddRefResult, error) {
+	var out storeapi.AddRefResult
+	err := s.Within(ctx, func(ctx context.Context) error {
+		// One round-trip, and without loading the row blobs. Joining the two rows
+		// rather than projecting each column as its own scalar subquery keeps this at
+		// one rowid seek per endpoint — SQLite does no common subexpression
+		// elimination, so "group" and kind as separate subqueries would seek the same
+		// row twice. Either endpoint missing yields no row at all, which is the clean
+		// ErrNotFound over a raw FK violation.
+		var group, kind string
+		var targetRV int64
+		err := s.conn(ctx).QueryRowContext(ctx, `
+			SELECT f."group", f.kind, t.resource_version
+			FROM objects f, objects t WHERE f.id = ? AND t.id = ?`,
+			fromID, toID).Scan(&group, &kind, &targetRV)
+		if errors.Is(err, sql.ErrNoRows) {
+			return storeapi.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		// Before the insert, so a rejected claim writes nothing at all. After it, the
+		// rollback would be the caller's to perform — and a caller nested in its own
+		// Within has no inner transaction to unwind, so a swallowed error would leave
+		// the edge behind.
+		if targetResourceVersion > targetRV {
+			return storeapi.ErrTargetResourceVersionFuture
+		}
+		res, err := s.conn(ctx).ExecContext(ctx, `
+			INSERT INTO refs (from_id, to_id, relation) VALUES (?, ?, ?)
+			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
+			fromID, toID, string(relation))
+		if err != nil {
+			return err
+		}
+		// DO NOTHING inserts no row on conflict, so the count distinguishes a new edge
+		// from one that was already declared. modernc caches the count and never
+		// errors here, yet this is the one RowsAffected site that checks: elsewhere a
+		// bad count would surface as a wrong return, while here it silently decides
+		// whether the dependent is woken at all, and a lost dependency wake is
+		// permanent and invisible. Failing also self-heals — it rolls the insert back,
+		// so a retry gets a clean answer instead of finding an edge that already
+		// exists with its wake skipped.
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		out = storeapi.AddRefResult{
+			From:                  storeapi.GroupKind{Group: group, Kind: kind},
+			TargetResourceVersion: targetRV,
+			Inserted:              n > 0,
+		}
+		return nil
+	})
+	if err != nil {
+		return storeapi.AddRefResult{}, err
+	}
+	return out, nil
 }
 
 // DeleteRef removes a (from_id, to_id, relation) edge; an absent edge is a

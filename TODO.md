@@ -79,6 +79,19 @@ tell "we decided against this for now" from "nobody thought of it."
       something that does not exist, and is the likely reason a reader would
       believe the gap is already handled.
 
+  **`AddDependency`'s guard does not cover these, by construction.** It would have
+  the evidence to: a dependent re-declaring its edge after a dropped wake passes the
+  version it read *before* the change, and the target's current version is already
+  past it. But the wake is gated on that call having created the edge, so a
+  re-declaration never fires it. Dropping that half to pick up the repair trades a
+  bounded miss for an unbounded one — a caller whose version never advances (cached
+  across passes) would then re-fire every pass, unthrottled, and unlike a missed wake
+  that spin is invisible to the caller and permanent for the process. The guard is
+  deliberately an intent recorder for the declare window, not a staleness detector;
+  what repairs a *lost* wake is a backstop that re-derives staleness, which is the
+  `observed_cursor` watermark recorded under the item above. Noted here so the
+  conjunction is not "simplified" away later on the reasoning that it is redundant.
+
   The fix for the first two is a `missedWake` flag that forces the next resync
   tick to enqueue everything for registered kinds — the targeted version of the
   item above, free in the normal case — plus logging at Warn. The third is a
@@ -86,117 +99,72 @@ tell "we decided against this for now" from "nobody thought of it."
   Deferred with them because the flag only means something once the tick can do a
   full pass.
 
-- **`AddDependency`'s read-then-declare race is unguarded, and invisible to the
-  resync backstop** — known, not fixed; a guard was built and reverted (see below).
-  A controller reads target T, decides, then declares the edge. A change to T
-  landing in that window reaches nobody: `wakeDependents` resolves dependents at the
-  instant of the change, and the edge did not exist yet. The dependent then settles
-  at `obj.Generation` on the stale read, so `ListUnsettledIDs` structurally cannot
-  see it (the resync item above), and it stays wrong until T changes again or the
-  process restarts — with no error, no condition, and no log line.
+- **A dependency wake is in-memory, so a crash between the edge's commit and the
+  requeue loses it** — known, not fixed. This is the durability half of the
+  read-then-declare race; the deriving half is fixed (`AddDependency`'s
+  `targetResourceVersion`, see CLAUDE.md, pinned by
+  `TestDependencyRequeueRaceOnDeclare` and its out-of-band mirror).
 
-  The window is sub-millisecond and opens *once per edge*: every later pass has the
-  edge in place and the waker covers it normally. What earns this an entry is the
-  consequence rather than the odds — it is the one failure mode here that is both
-  permanent and invisible to the mechanism advertised as the correctness backstop.
-  The exposure is also correlated rather than uniform: startup is when edges are
-  first declared *and* when their targets churn most.
+  The guard produces an ordinary `wakeAfterCommit` requeue — bounded to once per
+  edge by its edge-new ∧ target-moved conjunction — and the work queue does not
+  outlive the process. A crash between the edge's commit and the dispatch leaves
+  the edge durably in place, the dependent settled on the stale read, and nothing
+  anywhere recording that a reconcile is owed — the same permanent, silent end state
+  the race had, now reachable with a correct guard in place. It is not only a crash:
+  `q.stopped` makes `add` a no-op, so a wake registered during shutdown goes the same
+  way.
 
-  **The out-of-band spelling is the same hole, one notch wider.** `Register` hands
-  the embedding application a `ControllerClient`, so `AddDependency` can be called
-  from its own goroutines with no reconcile in flight. In-band the losing pass at
-  least runs to completion around the declaration; out-of-band the declaration is
-  all that happens, and it enqueues nothing — the edge appears with `fromID`
-  already settled at its generation, so a change that landed before the commit has
-  nobody to reach and nothing re-derives it. Any wake-on-new-edge guard would have
-  to cover this call site too, and the watermark scheme does so for free (the
-  backstop query does not care who declared the edge). Pinned, skipped, by
-  `TestDependencyRequeueRaceOnOutOfBandDeclare` alongside the in-band
-  `TestDependencyRequeueRaceOnDeclare`; both fail deterministically at the requeue
-  assertion, 3/3.
+  What makes this specific to dependency wakes is that every other in-memory wake has
+  a durable twin. A lost spec-write wake still leaves `generation >
+  observed_generation`, so the resync tick re-derives it. Dependency staleness leaves
+  no persisted trace at all.
 
-  **Deriving the wake is only half of it; surviving it is the other half.** Any
-  guard that answers this race produces an in-memory requeue, and the work queue
-  does not outlive the process. A crash between the edge's commit and the dispatch
-  of the wake it implies leaves the edge durably in place, the dependent settled on
-  the stale read, and nothing anywhere recording that a reconcile is owed — the same
-  permanent, silent end state, now reachable even with a correct guard. Today the
-  default `StartupReconcileAll` hides this by sweeping everything on restart, so the
-  exposure is confined to `StartupReconcileUnsettled` and `StartupReconcileNone`
-  (`beehive.go:128` already names the latter as the strategy that breaks dependents
-  relying on dependency events). That confinement is an accident of the default
-  rather than a guarantee: recovering an owed wake is not a spec-convergence
-  question, so it should not be a startup-*strategy* question either. Pinned,
-  skipped, by `TestDependencyRequeueLostAcrossRestart`, which spells the crash as a
-  stopped work queue — both writes commit, and the wake lands on a queue whose
-  `addLocked` returns early on `q.stopped`, which from the store's side is
-  indistinguishable from dying between commit and dispatch, and needs no goroutine
-  timing to be deterministic. It fails at the post-restart assertion 3/3, and passes
-  if the restart is switched to `StartupReconcileAll`, which isolates the missing
-  signal from the restart scaffolding itself.
+  Today the default `StartupReconcileAll` hides it by sweeping everything on restart,
+  so the exposure is confined to `StartupReconcileUnsettled` and
+  `StartupReconcileNone` (`beehive.go:128` already names the latter as the strategy
+  that breaks dependents relying on dependency events). That confinement is an
+  accident of the default rather than a guarantee: recovering an owed wake is not a
+  spec-convergence question, so it should not be a startup-*strategy* question
+  either. Pinned, skipped, by `TestDependencyRequeueLostAcrossRestart`, which spells
+  the crash as a stopped work queue — both writes commit and the wake lands on a
+  queue whose `addLocked` returns early on `q.stopped`, indistinguishable from dying
+  between commit and dispatch from the store's side, and deterministic without
+  goroutine timing. It fails at the post-restart assertion 3/3, and passes if the
+  restart is switched to `StartupReconcileAll`, which isolates the missing signal
+  from the restart scaffolding itself.
 
-  **The obvious guard is not the cheap answer it looks like.** Waking `fromID` when
-  the edge is new — pre-read via `ListOutgoingRefsByRelation` inside `AddDependency`'s
-  existing `Within`, wake after commit when the target is absent from it — was
-  implemented, reviewed, and reverted. Two problems. First, "new" ends up measured
-  against the *current transaction*, so a controller that clears and re-declares its
-  dependency set each pass (`DeleteDependency` then `AddDependency`) finds the
-  pre-read empty every time and wakes itself every time; nothing throttles the
-  result, since `typedController.reconcile` has no already-settled skip on the
-  dispatch path (that check lives only in `ListUnsettledIDs`) and `workQueue.addLocked`
-  has no rate limiter, so it reconciles at CPU speed. Routing the wake through
-  `addAfter` bounds that to the delay cadence but never converges. Second, and the
-  decisive one: the pre-read is paid on *every* `AddDependency` call, and the
-  level-triggered style means every dependent re-asserts its edges every reconcile
-  forever. On that path it always answers "already declared, don't wake" — so it is a
-  permanent extra indexed query per dependency per reconcile, bought to cover a
-  once-per-edge window. The re-assert and fan-out cases were fine (N new edges in one
-  pass register N post-commit hooks naming the same `fromID`, which collapse on the
-  `dirty` set to one requeue); the cost and the rebuild-deps spin are what sank it.
+  **Planned fix: a `pending_wake` token on `objects`.** Set inside `AddDependency`'s
+  transaction under the same comparison that fires the wake — so the durable record
+  and the edge commit together, with no window between them — and cleared by the pass
+  that serves it. `INTEGER NOT NULL DEFAULT 0`, 0 meaning nothing owed, read by a
+  partial index. It is a **CAS token, not a watermark**: the value is the target's
+  `resource_version` only because a monotone token was free, and the clear is
+  `WHERE id = ? AND pending_wake = ?` against the value read at load, so a flag
+  re-set during a pass survives that pass's clear. Nothing ever compares it to
+  another object's version. Enqueued at startup regardless of `startupReconcile` and
+  on the resync tick, cleared only on a successful pass, skipping the write entirely
+  when the loaded token is 0 — so an unflagged reconcile issues no statement.
 
-  **Proposed fix: a per-object dependency watermark, and no wake at all.** Record on
-  `objects` the store's `resource_version` as of when the reconciler *loaded* the
-  object. A backstop query joins `refs ⋈ objects` on `to_id` (the PK
-  `(from_id, to_id, relation)` already leads with `from_id`) and enqueues any
-  dependent whose target has a higher `resource_version`. One column suffices despite
-  N dependencies only because `resource_version_seq` is a single global cursor every
-  writer draws from — generations are per-object counters and are not comparable
-  across targets. This puts dependencies under the same "events are latency, resync is
-  correctness" rule as everything else, and needs no pre-read, no wake, and no API
-  change.
+  Note the scope this buys: it is a durable *wake*, not a derived backstop. It
+  recovers only signals something explicitly raised, so a wake lost because
+  `wakeDependents` swallowed its `ListIncomingRefs` error (see the item above) still
+  heals never, and the "resync is the correctness backstop" claim stays false in
+  general.
 
-  Two details carry it. Stamp the *load-time* rv, not "max rv among my deps" computed
-  at write time: deriving it inside the store re-inherits the original race, asserting
-  the dependent saw a change that landed after its read. And advance the watermark in
-  `UpdateStatus`, the moment the object settles — including on the content-no-op
-  branch, the carve-out `observed_generation` already has. That write site is what
-  avoids a *new* permanent-unsettled hazard: a stamp advanced by asserting an edge
-  would strand any controller that stops re-asserting, whereas every controller that
-  converges calls `UpdateStatus` by definition. The residual case — a controller that
-  never calls it at all — is already permanently unsettled (`observed_generation IS
-  NULL`), so it adds no condition that did not exist. The scheme over-flags: any
-  dependency change during a reconcile costs one extra pass even when the read
-  happened to be late enough. That is the self-healing-over-efficiency trade taken
-  elsewhere, and it strictly converges, since the watermark advances on every settle.
-
-  Other alternatives rejected. *Per-edge* `observed_generation` on `refs` works only
-  if the generation is controller-supplied (a store-derived stamp inherits the race
-  one level up), which means breaking `AddDependency`'s signature and taxing every
-  controller — and it is the variant that strands non-re-asserting controllers.
-  *Documenting that controllers should requeue themselves* turns a silent race into
-  documentation, and a controller doing it correctly needs its own pre-read of the
-  dependency set, while one doing it naively (`Requeue: true` unconditionally)
-  reproduces the spin above in user code. *Scoping "new" to the reconcile* (track
-  edges removed this pass on the existing `pendingWakes` collector and suppress the
-  wake for a delete-then-re-add) fixes the spin but not the pre-read cost, and not the
-  invisible-to-resync gap that is the actual defect.
-
-  Deferred because the fix is a schema migration plus a reconciler change plus a new
-  backstop query, to harden a race that fires once per edge. Revisit when the
-  resync-strategy item above is decided — these share a tick and should land as one
-  story — or sooner if a real controller is found that reads a target and settles on
-  it in the same pass that first declares the edge, which makes the hole live rather
-  than theoretical.
+  Alternatives considered and rejected. A **per-object `observed_cursor` watermark**
+  — stamp the global `resource_version` as of the reconciler's load, advance it on
+  every successful pass, and enqueue any dependent whose target's version exceeds it
+  — is the strictly stronger design, because it *derives* staleness instead of
+  recording an intent and therefore heals any lost wake, including the three above.
+  It costs a write on every successful pass where the token approach writes only when
+  something is owed, and it over-flags (a target change during a pass costs an extra
+  tick even when the read was late enough to have seen it). Keep it in mind if the
+  waker's silent loss points are ever taken on; it subsumes `pending_wake`. Storing
+  the cursor **per-edge on `refs`** looks cheaper still and is not: advanced only on
+  re-assert, a controller that declares an edge once and never re-asserts freezes its
+  cursor and the backstop query re-enqueues it every tick forever. *Documenting that
+  controllers should requeue themselves* turns a silent race into documentation, and
+  a controller doing it naively (`Requeue: true` unconditionally) spins.
 
 - **`Create` accepts a `WithOwner` naming an already-deleting owner, stranding both
   rows when resync is off** — known, not fixed. The ownership mirror of the
@@ -293,6 +261,43 @@ tell "we decided against this for now" from "nobody thought of it."
   query per silent write. Revisit when the next `Store` break is on the table
   anyway — the v0.17.0 `RequestDeletionBySlug` change was exactly such a moment and
   would have been the cheap time to take this with it.
+
+- **`Store` carries two methods for one operation: `AddRef` is a discard-wrapper
+  over `AddRefResolved`** — known, not fixed. `sqlite`'s `AddRef` is literally
+  `_, err := s.AddRefResolved(...)`, and each has exactly one production caller —
+  `AddRef` from `client.go`'s `insertObject` (the owner edge), `AddRefResolved` from
+  `ControllerClient.AddDependency`. The interface is one operation spelled twice.
+
+  The tax is on implementers, and it is not only boilerplate. Every `Store` and
+  every fake must stub both (`testutils_test.go` gained a panicking
+  `AddRefResolved`; `controller_test.go`'s `addRefTxTrackingStore` and
+  `failAddRefStore` had to be retargeted). The sharp part is the failure mode that
+  retargeting implies: **a test double that overrides only `AddRef` now silently
+  fails to intercept `AddDependency`**. It compiles, the embedded real store serves
+  the call, and the test passes while exercising nothing — the worst shape of test
+  bug, since it looks like coverage. Two of ours had to be moved by hand for exactly
+  this reason, and nothing stops the next one from being written against the wrong
+  method.
+
+  The fix is to drop `AddRef` from the interface and let `insertObject` discard the
+  extra returns. `storeapi` is `internal/`, so widening costs external consumers
+  nothing, and the mutator convention already points this way: every other mutator
+  returns the row it wrote, so an `AddRef` returning only `error` was the outlier
+  rather than `AddRefResolved` being a special case.
+
+  Deferred because the split was taken deliberately to avoid churning roughly forty
+  `require.NoError(t, store.AddRef(...))` one-liners into three-line forms across
+  `gc_test.go`, `client_test.go` and `sqlite/store_test.go` — tests that have
+  nothing to do with dependency wakes and read worse for it. That is a real cost,
+  but it is a one-time mechanical one paid against a standing hazard, which is the
+  trade to re-take rather than assume settled.
+
+  Revisit at the next ref-related test double, when the wrong-method trap would
+  actually spring; or when `AddRefResult` next grows — the `Create`-with-a-deleting-
+  owner item above wants `DeletionRequestedAt` on it, and widening a struct that two
+  interface methods disagree about is the point where the fork stops being free. A
+  cheap interim mitigation, if it stays deferred: a comment on `AddRef` in
+  `storeapi` naming `AddRefResolved` as the method doubles must hook.
 
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.

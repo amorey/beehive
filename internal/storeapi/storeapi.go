@@ -63,6 +63,15 @@ var ErrObservedGenerationFuture = errors.New("beehive: observed generation excee
 // convert already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
+// ErrTargetResourceVersionFuture is returned by AddRefResolved when the caller's
+// claimed version of the target exceeds the target's current one. An object's
+// version only moves forward, so a version above the target's own cannot have come
+// from reading it — the caller passed some other object's version, or some other
+// field. Checked before the insert, so a rejected call writes nothing: the sibling
+// of ErrObservedGenerationFuture, and the same argument — a caller can only report
+// what it could have observed.
+var ErrTargetResourceVersionFuture = errors.New("beehive: target resource version is ahead of the target")
+
 // ChangeType classifies a Change.
 type ChangeType string
 
@@ -184,6 +193,25 @@ const (
 	// RelationDependsOn: a change to the target requeues the dependent.
 	RelationDependsOn Relation = "depends_on"
 )
+
+// AddRefResult is what AddRefResolved observed while inserting an edge, all of
+// it a by-product of work AddRef already does — no extra query pays for any of
+// it. The store reports these; it does not act on them.
+type AddRefResult struct {
+	// From is the source object's GroupKind. Edges are cross-kind, so a caller
+	// routing a requeue to fromID cannot assume its own kind.
+	From GroupKind
+	// TargetResourceVersion is the target's version as of the edge's insertion —
+	// the check and the insert are one atomic unit — for a caller checking whether
+	// the target moved past the version it read. Were the two separable, a write to
+	// the target landing between them would be invisible both here and to a
+	// dependents lookup, which is the window such a caller is guarding against.
+	TargetResourceVersion int64
+	// Inserted reports whether this call created the edge; false means it was
+	// already there (the insert is idempotent). A caller acting on the *first*
+	// declaration of an edge — and only then — gates on this.
+	Inserted bool
+}
 
 // Referrer is an object pointing at a target through a ref edge, with the
 // GroupKind needed to route a requeue. ListIncomingRefs returns these.
@@ -420,6 +448,19 @@ type Store interface {
 	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on
 	// the object, so it bumps no version and emits no event.
 	AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+
+	// AddRefResolved is AddRef, additionally reporting what the endpoint check and
+	// the insert it already runs have in hand (see AddRefResult). Same contract as
+	// AddRef otherwise, including that the check and the insert are one atomic
+	// unit — an implementation must not leave them separable, since a caller reads
+	// TargetResourceVersion precisely to reason about writes racing the insert.
+	//
+	// targetResourceVersion is the caller's claimed version of toID, or 0 for no
+	// claim. A claim above toID's current version is rejected with
+	// ErrTargetResourceVersionFuture *before* the insert, so nothing is written —
+	// the rejection cannot depend on a caller unwinding a transaction it may be
+	// sharing with writes it means to keep.
+	AddRefResolved(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (AddRefResult, error)
 
 	// DeleteRef removes the (fromID, toID, relation) edge; an absent edge is a
 	// no-op. Like AddRef it bumps no version and emits no event.

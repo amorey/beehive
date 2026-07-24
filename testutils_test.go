@@ -164,6 +164,9 @@ func (s *fakeStore) SweepEvents(context.Context, int, time.Duration) (int, error
 func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation) error {
 	panic("not implemented: fakeStore.AddRef")
 }
+func (s *fakeStore) AddRefResolved(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
+	panic("not implemented: fakeStore.AddRefResolved")
+}
 func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
 	panic("not implemented: fakeStore.DeleteRef")
 }
@@ -315,4 +318,82 @@ func queuedIDs(q *workQueue) []ObjectID {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return append([]ObjectID(nil), q.items...)
+}
+
+// reconcileCapture is a Controller that reports every object it reconciles on a
+// channel, so a test can assert which objects a write or a wake requeued.
+type reconcileCapture struct {
+	ch chan *Object[tSpec, tStatus]
+}
+
+func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	c.ch <- obj
+	return Result{}, nil
+}
+
+// referrerIDs projects a Referrer slice to its ids, for assertions that care which
+// objects point at a target rather than how they were reached.
+func referrerIDs(refs []Referrer) []ObjectID {
+	ids := make([]ObjectID, 0, len(refs))
+	for _, r := range refs {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
+// wakeProbeStore signals every time someone asks who depends on targetID. The
+// race is between the *waker's lookup* and the edge's commit, not between the
+// change and the commit, so a test that wants the window deterministically has to
+// wait for this rather than assume the waker is done.
+//
+// It is keyed on (toID, relation), not on the caller — ListIncomingRefs is also
+// reached from ListDependents and the LoadDependents eager path, and nothing here
+// can tell those from the waker. So a token means "somebody looked", and a test
+// that wants "the waker looked" must resetLooked immediately before the write it
+// expects the waker to react to. Reading the target's dependents from a test's own
+// assertions bypasses the probe (use the embedded Store) rather than feeding it a
+// token that a later waitLooked would mistake for the waker's.
+type wakeProbeStore struct {
+	Store
+	targetID ObjectID
+	looked   chan struct{} // one send per targetID depends_on lookup
+}
+
+func (s *wakeProbeStore) ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error) {
+	refs, err := s.Store.ListIncomingRefs(ctx, toID, relation)
+	if toID == s.targetID && relation == RelationDependsOn {
+		// Non-blocking: this runs on the waker's goroutine, and a full buffer means
+		// no test is waiting. Blocking there would park the waker inside the store
+		// and hang the reconciler — a timeout in some unrelated test rather than a
+		// failure here.
+		select {
+		case s.looked <- struct{}{}:
+		default:
+		}
+	}
+	return refs, err
+}
+
+// resetLooked discards lookups recorded so far, so the next waitLooked can only
+// be satisfied by one that happens after this point. Call it immediately before
+// the write whose wake is under observation; without it a leftover token lets
+// waitLooked return before the waker has run, and the test then races the very
+// thing it means to pin.
+func (s *wakeProbeStore) resetLooked() {
+	for {
+		select {
+		case <-s.looked:
+		default:
+			return
+		}
+	}
+}
+
+// waitLooked blocks until targetID's dependents are resolved (see resetLooked).
+// With no edge declared yet that lookup comes back empty, so the change that
+// triggered it is unclaimed and any later requeue is attributable to the
+// declaration under test.
+func (s *wakeProbeStore) waitLooked(t *testing.T) {
+	t.Helper()
+	waitClosed(t, s.looked, "the dependency waker's lookup")
 }

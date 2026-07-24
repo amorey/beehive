@@ -2198,6 +2198,8 @@ func TestAddRefIdempotent(t *testing.T) {
 	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"), "re-adding an identical edge is a no-op")
 }
 
+// TestAddRefNonexistentEndpoint covers AddRefResolved's missing-endpoint path
+// too: AddRef delegates to it, so both run the same statement and branch.
 func TestAddRefNonexistentEndpoint(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -2210,6 +2212,55 @@ func TestAddRefNonexistentEndpoint(t *testing.T) {
 	err = store.AddRef(ctx, 9999, a.ID, "depends_on")
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "missing from_id yields ErrNotFound")
 	assert.Equal(t, 0, countRefs(t, store, 9999, a.ID, "depends_on"))
+}
+
+// TestAddRefResolvedReportsEndpoints pins what the endpoint check reports back:
+// the source's GroupKind (the edge is cross-kind, so a caller routing a wake to
+// fromID cannot assume its own kind) and the target's current resource_version,
+// which is what lets a caller tell that the target moved past the version it
+// read. Both must be the values as of the insert, in one round-trip.
+func TestAddRefResolvedReportsEndpoints(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+
+	res, err := store.AddRefResolved(ctx, a.ID, b.ID, "depends_on", 0)
+	require.NoError(t, err)
+	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "fromID's kind")
+	assert.Equal(t, b.ResourceVersion, res.TargetResourceVersion, "toID's resource_version as of the insert")
+	assert.True(t, res.Inserted, "this call created the edge")
+	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"))
+
+	// A later write to the target is reflected on re-declare, which is what makes
+	// the reported version usable as a moved-since-you-read signal.
+	updated, err := store.SetCondition(ctx, testGK, b.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+	require.Greater(t, updated.ResourceVersion, b.ResourceVersion)
+
+	res, err = store.AddRefResolved(ctx, a.ID, b.ID, "depends_on", 0)
+	require.NoError(t, err)
+	assert.Equal(t, updated.ResourceVersion, res.TargetResourceVersion, "re-declare reports the target's current version")
+	assert.False(t, res.Inserted, "the edge already existed; the insert was a no-op")
+}
+
+// TestAddRefResolvedRejectsFutureTargetVersion pins that the version claim is
+// checked before the insert, not after: a rejected call must leave no edge on its
+// own, since its caller may be sharing a transaction it fully intends to commit.
+func TestAddRefResolvedRejectsFutureTargetVersion(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+
+	_, err := store.AddRefResolved(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion+1)
+	assert.ErrorIs(t, err, beehive.ErrTargetResourceVersionFuture)
+	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"), "a rejected claim writes nothing")
+
+	// The target's own current version is the boundary, and is accepted.
+	_, err = store.AddRefResolved(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"))
 }
 
 func TestAddRefNoVersionBumpNoEvent(t *testing.T) {
