@@ -391,50 +391,43 @@ tell "we decided against this for now" from "nobody thought of it."
   that is the signal that the specific fixes have run out — or if the collector ever
   grows a watermark for another reason, which removes most of the work.
 
-- **`idx_objects_deleting` is not covering for either of its readers, and both
-  sort** — measured, not fixed, deliberately deferred to one decision. The index is
-  `objects(deletion_requested_at) WHERE deletion_requested_at IS NOT NULL`, and
-  `EXPLAIN QUERY PLAN` over a 5k-row table (50 deletion-pending, ANALYZEd) gives:
-
-  | query | plan |
-  |---|---|
-  | `ListAllDeletionPending` (global, kind included) | `SEARCH … USING INDEX idx_objects_deleting` + `USE TEMP B-TREE FOR ORDER BY` |
-  | `ListDeletionPendingIDs` (per-kind) | same: index search, table fetch, sort |
-
-  Neither is covering, and both sort — the index orders `(deletion_requested_at,
-  id)`, so `ORDER BY id` was never free. The sort predates the `ListAllDeletionPending`
-  change; the lost *covering* scan does not (`SELECT id` alone was
-  `COVERING INDEX`, since `id` is the rowid, and adding `group`/`kind` — which live
-  in the table — costs a row fetch per match). That regression is recorded in the
-  method's own comment rather than hidden.
-
-  Two candidates were measured, and they trade against each other:
-
-    - **A — `("group", kind) WHERE deletion_requested_at IS NOT NULL`.** Global:
-      covering scan, still sorts. Per-kind: seek + covering + **no sort**, because
-      entries order as `(group, kind, id)` and `id` is the rowid. Optimal for the
-      per-kind reader.
-    - **B — `(id, "group", kind) WHERE deletion_requested_at IS NOT NULL`.** Global:
-      covering scan, **no sort** — optimal. Per-kind: falls off the partial index
-      entirely onto `idx_objects_kind`, scanning every object of the kind and
-      filtering `deletion_requested_at` from the table. Clearly worse.
-
-  **Deferred because the reader set is mid-change, not because the answer is
-  unclear.** Removing `enqueueDeletionPending` from the reconciler retires
-  `ListDeletionPendingIDs`, leaving the global query as this index's only reader —
-  at which point B is unambiguously right and A's advantage is moot. Choosing now
-  would optimize for a query about to be deleted, and index changes cost a
-  migration file, so it is worth paying once against the final query set.
-
-  Also unmeasured: whether any of this is observable in wall-clock. The
-  deletion-pending set is small by construction (rows mid-deletion), so this is a
-  correctness-of-claim and tidiness item, not a known bottleneck. **Revisit once
-  `ListDeletionPendingIDs` is gone**: re-run the plan probe over the surviving
-  queries, expect to land on B, and while there check whether `ORDER BY id` earns
-  its keep at all — the sweeper only iterates and routes, so the ordering is for
-  test determinism rather than semantics.
 
 ## Resolved
+
+- **`idx_objects_deleting` made covering for its one remaining reader** — done.
+  The index was `objects(deletion_requested_at) WHERE deletion_requested_at IS NOT
+  NULL`, and its two readers both planned as `SEARCH … USING INDEX` plus
+  `USE TEMP B-TREE FOR ORDER BY` — not covering (a row fetch per match) and
+  sorting, because the key orders by `(deletion_requested_at, id)` rather than by
+  `id`. The lost *covering* scan arrived with `ListAllDeletionPending`, which added
+  `group`/`kind` to a `SELECT id` that had been index-only; the sort predates it.
+
+  Deferred at the time because the reader set was mid-change, and that was the
+  right call: retiring the reconciler's own deletion-pending backstop removed
+  `ListDeletionPendingIDs`, leaving the cross-kind sweeper query as the sole
+  reader — and the two candidates measured earlier traded against each other
+  precisely on that second reader. With it gone, candidate B is unambiguous.
+
+  `idx_objects_deleting` is rekeyed to `(id, "group", kind)`, same partial
+  `WHERE`, folded into `0001_init.sql` — pre-release, the schema is edited in
+  place rather than accreting migrations (`0001` has been amended six times), so
+  a fresh database is the only supported upgrade path. The sweeper query now plans as a plain `SCAN … USING INDEX`:
+  covering, and already in id order, so the sort disappears too. Re-probed with
+  5000 rows / 50 deletion-pending after `ANALYZE`. The only other consumer of the
+  index — the `from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS
+  NOT NULL)` semi-join in the finalizing-refs cleanup — still plans identically,
+  since `id` leads the new key.
+
+  The partial `WHERE` is what keeps the wider key cheap: only finalizing rows are
+  indexed, and `id`/`group`/`kind` are write-once, so entries are inserted when a
+  delete is requested and dropped when the row is collected, never updated between.
+
+  Still unmeasured, and deliberately so: whether any of this is observable in
+  wall-clock. The deletion-pending set is small by construction, so this was a
+  correctness-of-claim and tidiness fix, not a bottleneck anyone had hit. The
+  remaining question the earlier entry raised — whether `ORDER BY id` earns its
+  keep at all, since the sweeper only iterates and routes — is now moot: with the
+  new key the ordering is free, so it stays for test determinism at no cost.
 
 - **`StartupReconcileNone` + `resyncInterval = 0` silently disabled all crash
   recovery for unsettled objects** — done, by **documenting the configuration and

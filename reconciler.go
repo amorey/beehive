@@ -228,19 +228,8 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	r.enqueueFrom(ctx, "unsettled", r.store.ListUnsettledIDs)
 }
 
-// enqueueDeletionPending enqueues objects that are finalizing (deletion
-// requested, row not yet removed). It is the GC backstop: a delete bumps no
-// generation, so the unsettled resync never wakes it, and once an owner is
-// RESTRICT-blocked on a child nothing else re-checks it until the child is gone.
-func (r *reconciler) enqueueDeletionPending(ctx context.Context) {
-	if r.store == nil {
-		return
-	}
-	r.enqueueFrom(ctx, "deletion-pending", r.store.ListDeletionPendingIDs)
-}
-
 // enqueuePendingWake enqueues objects owed a durable dependency wake (see
-// pending_wake). It is the reconcile counterpart of enqueueDeletionPending: a
+// pending_wake). Like a pending deletion it is recorded, known-owed work: a
 // wake bumps no generation, so the unsettled resync never sees it, and its
 // in-memory requeue does not outlive the process — a crash between the token's
 // commit and the dispatch leaves a stranded dependent nothing else re-checks.
@@ -473,14 +462,17 @@ func (r *reconciler) run(ctx context.Context) {
 	default: // StartupReconcileAll
 		r.enqueueAll(ctx)
 	}
-	// Always resume in-progress deletions and owed dependency wakes at startup,
-	// independent of the spec strategy above: a process that crashed mid-delete must
-	// still drive those rows to removal, and one that crashed owing a dependency
-	// wake must still deliver it. Both are store bookkeeping rather than spec
-	// convergence — a half-deleted row RESTRICT-blocks its owner, and an owed wake
-	// was explicitly stamped — so they are not the embedder's to drive even under
-	// None. The work queue's set semantics coalesce any overlap with the pass above.
-	r.enqueueDeletionPending(ctx)
+	// Always resume owed dependency wakes at startup, independent of the spec
+	// strategy above: a process that crashed owing one must still deliver it. That
+	// is store bookkeeping rather than spec convergence — the wake was explicitly
+	// stamped — so it is not the embedder's to drive even under None. The work
+	// queue's set semantics coalesce any overlap with the pass above.
+	//
+	// In-progress deletions are *not* resumed here. They are the GC sweeper's, whose
+	// own unconditional startup pass routes them: a registered kind is enqueued so
+	// its controller can clear finalizers, a client-only kind collected directly
+	// (see sweepDeletionPending). Doing it in both places meant a per-kind listing
+	// that only ever duplicated what the sweeper already had to do cross-kind.
 	r.enqueuePendingWake(ctx)
 
 	n := max(r.concurrency, 1)

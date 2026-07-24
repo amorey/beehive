@@ -462,28 +462,14 @@ func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKin
 	return scanIDs(rows)
 }
 
-func (s *sqliteStore) ListDeletionPendingIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
-	// Matches the partial index idx ... WHERE deletion_requested_at IS NOT NULL.
-	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT id FROM objects
-		 WHERE "group" = ? AND kind = ? AND deletion_requested_at IS NOT NULL
-		 ORDER BY id`,
-		gk.Group, gk.Kind)
-	if err != nil {
-		return nil, err
-	}
-	return scanIDs(rows)
-}
-
 func (s *sqliteStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
-	// Kind-agnostic: same partial index as ListDeletionPendingIDs, no group/kind
-	// filter, so the global GC sweeper sees every finalizing object. The kind rides
-	// along because the sweeper routes on it (see the Store doc), and it is not
-	// free: selecting id alone is covered by idx_objects_deleting (id is the
-	// rowid), while group/kind live in the table, so this takes a row fetch per
-	// match. Accepted because the match set is the deletion-pending rows, which is
-	// small by construction and which the sweeper is about to act on individually
-	// anyway — a second query to resolve their kinds would cost strictly more.
+	// Kind-agnostic: no group/kind filter, so the global GC sweeper sees every
+	// finalizing object. The kind rides along because the sweeper routes on it
+	// (see the Store doc), and idx_objects_deleting is keyed to match — partial on
+	// deletion_requested_at IS NOT NULL, over (id, "group", kind) — so this is a
+	// covering scan already in id order: no row fetch, no sort. Keep the column
+	// list and the index key in step; dropping either group/kind or the ORDER BY
+	// out of alignment with it silently costs a table fetch or a temp B-tree.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id, "group", kind FROM objects
 		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`)

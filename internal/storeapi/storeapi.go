@@ -293,12 +293,6 @@ type Store interface {
 	// observed_generation doesn't match generation (not yet converged).
 	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
-	// ListDeletionPendingIDs returns the IDs of objects of kind gk that have been
-	// marked for deletion (DeletionRequestedAt set) but not yet physically
-	// removed. The GC backstop enqueues these so a delete makes progress without a
-	// spec change to wake it.
-	ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
 	// ListPendingWakeIDs returns the IDs of objects of kind gk owed a durable
 	// dependency wake (pending_wake != 0). The reconcile backstop enqueues these so
 	// a wake that outlived the process (its in-memory requeue lost to a crash) is
@@ -325,7 +319,7 @@ type Store interface {
 	// Bumps no resource_version and emits no event.
 	DecrementPendingWake(ctx context.Context, id ObjectID, observed int64) error
 
-	// ListAllDeletionPending is ListDeletionPendingIDs across every kind, returning
+	// ListAllDeletionPending returns every deletion-pending object, of every kind,
 	// each row's GroupKind alongside its id. The global GC sweeper is the sole
 	// caller and needs the kind to route: an object of a registered kind is
 	// enqueued so its controller can clear finalizers (a step collect cannot take),

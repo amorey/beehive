@@ -430,18 +430,20 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
-	// Settle it first, so enqueueDeletionPending really is the *only* path that can
-	// reach this row. A raw CreateObject leaves observed_generation NULL, which the
-	// startup resumption of owed work would pick up as unsettled — the row would
-	// then be removed for two reasons and this test would stop pinning either one.
-	// Deletion does not bump generation, so the row stays settled below.
+	// Settle it first, so the GC sweeper's startup pass really is the *only* path
+	// that can reach this row. A raw CreateObject leaves observed_generation NULL,
+	// which the startup resumption of owed work would pick up as unsettled — the row
+	// would then be removed for two reasons and this test would stop pinning either
+	// one. Deletion does not bump generation, so the row stays settled below.
 	_, err = store.UpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 	_, _, err = store.RequestDeletion(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
-	// A fresh Beehive with no spec-startup pass and resync disabled: the startup
-	// enqueueDeletionPending is the only thing that can drive this row to removal.
+	// A fresh Beehive with no spec-startup pass and resync disabled: the GC
+	// sweeper's unconditional startup pass is the only thing that can drive this row
+	// to removal. It is the sweeper's alone now — the reconciler no longer keeps a
+	// per-kind deletion-pending listing that duplicated it.
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{},
@@ -787,18 +789,19 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 }
 
 // startupProbeStore signals the two startup listings a test must order itself
-// against: the reconciler's own deletion-pending enqueue and the GC sweeper's
-// cross-kind pass. Both run in goroutines Start has only launched, not awaited,
-// so a test that marks a row deletion-pending right after Start is racing them —
-// and would pass or fail on timing rather than on the behavior under test.
+// against: the reconciler's own (pending-wake, the one enqueue it still runs
+// unconditionally) and the GC sweeper's cross-kind pass. Both run in goroutines
+// Start has only launched, not awaited, so a test that marks a row
+// deletion-pending right after Start is racing them — and would pass or fail on
+// timing rather than on the behavior under test.
 type startupProbeStore struct {
 	Store
-	reconcilerSwept chan struct{} // ListDeletionPendingIDs (per-kind, reconciler startup)
-	gcSwept         chan struct{} // ListAllDeletionPendingIDs (global, sweeper startup)
+	reconcilerSwept chan struct{} // ListPendingWakeIDs (per-kind, reconciler startup)
+	gcSwept         chan struct{} // ListAllDeletionPending (global, sweeper startup)
 }
 
-func (s *startupProbeStore) ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ListDeletionPendingIDs(ctx, gk)
+func (s *startupProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
 	select {
 	case s.reconcilerSwept <- struct{}{}:
 	default:

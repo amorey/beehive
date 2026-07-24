@@ -42,17 +42,6 @@ func (s *unsettledIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]
 	return s.ids, nil
 }
 
-// deletionPendingIDsStore is a fakeStore whose ListDeletionPendingIDs returns a
-// fixed slice, used to exercise the GC backstop enqueue without a real database.
-type deletionPendingIDsStore struct {
-	fakeStore
-	ids []ObjectID
-}
-
-func (s *deletionPendingIDsStore) ListDeletionPendingIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
-	return s.ids, nil
-}
-
 // pendingWakeIDsStore is a fakeStore whose ListPendingWakeIDs returns a fixed
 // slice, used to exercise the durable-wake backstop enqueue without a real
 // database — the sibling of unsettledIDsStore and deletionPendingIDsStore.
@@ -1041,23 +1030,8 @@ func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
 	assert.Empty(t, items, "a failed list enqueues nothing")
 }
 
-func TestEnqueueDeletionPending(t *testing.T) {
-	r := &reconciler{
-		store:      &deletionPendingIDsStore{ids: []ObjectID{7, 13}},
-		work:       newWorkQueue(),
-		backoffFor: make(map[ObjectID]time.Duration),
-	}
-
-	r.enqueueDeletionPending(context.Background())
-
-	r.work.mu.Lock()
-	items := append([]ObjectID(nil), r.work.items...)
-	r.work.mu.Unlock()
-	assert.Equal(t, []ObjectID{7, 13}, items)
-}
-
 // TestEnqueuePendingWake verifies that enqueuePendingWake enqueues exactly the IDs
-// returned by ListPendingWakeIDs, in order — the sibling of the two tests above.
+// returned by ListPendingWakeIDs, in order — the sibling of the test above.
 // Only its failed-list branch was covered (TestEnqueueFromListErrorSkipsPass), so
 // the helper whose whole purpose is not losing an owed wake was the one of the
 // three that could have stopped enqueuing anything without a test noticing.
