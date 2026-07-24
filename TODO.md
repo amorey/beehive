@@ -480,10 +480,11 @@ tell "we decided against this for now" from "nobody thought of it."
   objects owed a pass, and `Client.Requeue` dispatches one. So the configuration
   means "I reconcile on my own schedule", which is a real use — and the library
   overriding two deliberately-set knobs would take it away with nothing offered in
-  its place. Pinned by `TestStartupReconcileNoneWithoutResyncDrivesNothing` (the
-  opt-out is honored), `TestStartupReconcileNoneWithoutResyncWarns` (it is not
-  silent), and `TestStartupReconcileNoneSelfDrivenRecovery`, which runs the
-  documented recipe end to end so the escape hatch can't quietly stop working.
+  its place. Pinned today by `TestDisabledBackstopsAnnounceThemselves` (the opt-out
+  is honored and is not silent) and `TestSelfDrivenRecovery`, which runs the
+  documented recipe end to end so the escape hatch can't quietly stop working. (The
+  names above are post-rename; the entry's own prose predates the
+  `StartupReconcileStrategy` → `WithStartupResync` collapse.)
 
   **The alternative was built, then reverted** — recorded so it is not rebuilt.
   Hoisting `enqueueUnsettled` out of the strategy switch (next to

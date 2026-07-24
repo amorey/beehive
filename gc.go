@@ -122,7 +122,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		return false, err
 	}
 	for _, w := range toWake {
-		bh.advanceGC(ctx, GroupKind{Group: w.Group, Kind: w.Kind}, w.ID)
+		bh.advanceGC(ctx, w.GroupKind(), w.ID)
 	}
 	return deleted, nil
 }
@@ -174,15 +174,12 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 // we collect synchronously here instead. Recursion terminates: each collect that
 // deletes a row shrinks the object graph before waking the targets it freed.
 func (bh *Beehive) advanceGCNow(ctx context.Context, gk GroupKind, id ObjectID) {
-	bh.mu.Lock()
-	r, ok := bh.reconcilers[gk]
-	bh.mu.Unlock()
-	if ok {
-		r.enqueue(id)
-		return
-	}
 	if bh.gcInterval > 0 {
-		return // the GC sweeper's own tick is this kind's backstop
+		// A registered kind is requeued so its own loop runs collect; a client-only
+		// kind has none, and the sweeper's next tick is its backstop — which is
+		// exactly what enqueueIfRegistered's no-op arm leaves it to.
+		bh.enqueueIfRegistered(gk, id)
+		return
 	}
 	// This runs on the caller's ctx, so a Delete (or freed-target wake) whose
 	// caller cancels right after committing RequestDeletion can abandon the collect
@@ -194,7 +191,7 @@ func (bh *Beehive) advanceGCNow(ctx context.Context, gk GroupKind, id ObjectID) 
 	// every deletion-pending object of every kind, client-only included. Until then
 	// the row stays deletion-pending — in a long-running process that declines to
 	// detach the caller's cancellation, that strand persists for the process's life.
-	if _, err := bh.collect(ctx, id); err != nil {
+	if err := bh.advanceDeletion(ctx, gk, id); err != nil {
 		bh.log().Warn("gc: synchronous collect of client-only object failed; no GC sweeper to retry it",
 			"group", gk.Group, "kind", gk.Kind, "id", id, "err", err)
 	}

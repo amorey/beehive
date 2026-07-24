@@ -417,3 +417,50 @@ func (s *wakeProbeStore) waitLooked(t *testing.T) {
 	t.Helper()
 	waitClosed(t, s.looked, "the dependency waker's lookup")
 }
+
+// listProbeStore wraps a Store and signals each of the periodic listings a test
+// may need to order itself against: the reconciler's two owed-work listings and
+// the GC sweeper's cross-kind pass. Start only *launches* those loops, and their
+// startup passes drain the same sets a tick does — so a test that seeds work
+// around Start is racing them, and would pass or fail on timing rather than on
+// the behavior under test. Waiting for the relevant signal and only then seeding
+// leaves the driver under test as the sole possible cause.
+//
+// A nil channel means that listing isn't observed, so each test names only the
+// ones it orders against.
+type listProbeStore struct {
+	Store
+	unsettledListed chan struct{} // ListUnsettledIDs (per-kind)
+	wakeListed      chan struct{} // ListPendingWakeIDs (per-kind)
+	gcSwept         chan struct{} // ListAllDeletionPending (global)
+}
+
+// probeSignal reports one listing. The send is non-blocking so a late pass after
+// the test stops reading never wedges the goroutine that made it.
+func probeSignal(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (s *listProbeStore) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListUnsettledIDs(ctx, gk)
+	probeSignal(s.unsettledListed)
+	return ids, err
+}
+
+func (s *listProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
+	probeSignal(s.wakeListed)
+	return ids, err
+}
+
+func (s *listProbeStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
+	rows, err := s.Store.ListAllDeletionPending(ctx)
+	probeSignal(s.gcSwept)
+	return rows, err
+}

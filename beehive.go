@@ -126,7 +126,7 @@ func (bh *Beehive) resyncKindsEveryTick() {
 // any kind repairs dependents of that kind, whatever kind's waker was lost.
 func (bh *Beehive) hasPeriodicPass() bool {
 	for _, r := range bh.order {
-		if r.catchupInterval > 0 || r.resyncInterval > 0 {
+		if r.hasPeriodicPass() {
 			return true
 		}
 	}
@@ -276,21 +276,7 @@ func (bh *Beehive) sweepEventRetention(ctx context.Context) {
 }
 
 // sweepDeletionPending drives every deletion-pending object one step closer to
-// removal, routing on whether its kind has a controller — the same two arms
-// advanceGC uses.
-//
-// The routing is load-bearing, not an optimization. collect cannot clear a
-// finalizer: it cascades to owned children and then returns while any finalizer
-// remains, because releasing one is the controller's decision. So an object of a
-// registered kind must be *enqueued*, letting its reconcile loop run the
-// controller (which clears the finalizer and collects in the same pass); calling
-// collect on it directly would make no progress, on every sweep, forever. A
-// client-only kind has no reconcile loop to enqueue onto, so the sweeper collects
-// it here — which is the whole reason this global sweep exists.
-//
-// Both arms are safe to repeat: enqueue coalesces, and collect is a no-op while
-// finalizers or live referrers remain and idempotent if another path got there
-// first.
+// removal (see advanceDeletion for the routing).
 func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 	rows, err := bh.store.ListAllDeletionPending(ctx)
 	if err != nil {
@@ -298,15 +284,36 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 		return
 	}
 	for _, row := range rows {
-		gk := GroupKind{Group: row.Group, Kind: row.Kind}
-		if r, ok := bh.reconcilerFor(gk); ok {
-			r.enqueue(row.ID)
-			continue
-		}
 		// Best-effort: a benign ErrNotFound (already collected) or a transient
 		// error is retried on the next sweep.
-		_, _ = bh.collect(ctx, row.ID)
+		_ = bh.advanceDeletion(ctx, row.GroupKind(), row.ID)
 	}
+}
+
+// advanceDeletion drives one deletion-pending object a step closer to removal,
+// routing on whether its kind has a controller. It is the single home of that
+// routing: the global GC sweeper and advanceGCNow both come through here.
+//
+// The routing is load-bearing, not an optimization. collect cannot clear a
+// finalizer: it cascades to owned children and then returns while any finalizer
+// remains, because releasing one is the controller's decision. So an object of a
+// registered kind must be *enqueued*, letting its reconcile loop run the
+// controller (which clears the finalizer and collects in the same pass); calling
+// collect on it directly would make no progress, on every sweep, forever. A
+// client-only kind has no reconcile loop to enqueue onto, so it is collected
+// here — which is the whole reason the global sweep exists.
+//
+// Both arms are safe to repeat: enqueue coalesces, and collect is a no-op while
+// finalizers or live referrers remain and idempotent if another path got there
+// first. The collect error is returned rather than logged so each caller can
+// report it in its own terms; the enqueue arm always returns nil.
+func (bh *Beehive) advanceDeletion(ctx context.Context, gk GroupKind, id ObjectID) error {
+	if r, ok := bh.reconcilerFor(gk); ok {
+		r.enqueue(id)
+		return nil
+	}
+	_, err := bh.collect(ctx, id)
+	return err
 }
 
 // runDependencyWaker requeues dependents when a target changes, until ctx is
@@ -361,7 +368,7 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 		return
 	}
 	for _, d := range deps {
-		bh.enqueueIfRegistered(GroupKind{Group: d.Group, Kind: d.Kind}, d.ID)
+		bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 	}
 }
 

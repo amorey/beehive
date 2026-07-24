@@ -251,28 +251,11 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// gcTickStore signals every time the GC sweeper lists deletion-pending objects,
-// letting a test await the periodic tick (the second call onward) instead of
-// sleeping. The send is non-blocking so a late tick after the test stops reading
-// never wedges the sweeper goroutine.
-type gcTickStore struct {
-	*fakeStore
-	swept chan struct{}
-}
-
-func (s *gcTickStore) ListAllDeletionPending(context.Context) ([]storeapi.Referrer, error) {
-	select {
-	case s.swept <- struct{}{}:
-	default:
-	}
-	return nil, nil
-}
-
 // TestRunGCSweeperTicks covers runGCSweeper's periodic branch: after the startup
 // pass it sweeps again on every resync tick. The store signals each sweep, so the
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
-	store := &gcTickStore{fakeStore: &fakeStore{}, swept: make(chan struct{}, 8)}
+	store := &listProbeStore{Store: &fakeStore{}, gcSwept: make(chan struct{}, 8)}
 	bh, err := New(store, WithGCInterval(time.Millisecond))
 	require.NoError(t, err)
 
@@ -280,6 +263,6 @@ func TestRunGCSweeperTicks(t *testing.T) {
 	defer cancel()
 	go bh.runGCSweeper(ctx)
 
-	recv(t, store.swept) // startup pass
-	recv(t, store.swept) // a periodic tick
+	recv(t, store.gcSwept) // startup pass
+	recv(t, store.gcSwept) // a periodic tick
 }

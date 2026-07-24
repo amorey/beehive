@@ -726,23 +726,6 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// gcSweepSignalStore reports each time the GC sweeper lists deletion-pending
-// rows, so a test can order its own writes against the sweeper's unconditional
-// startup pass instead of racing it.
-type gcSweepSignalStore struct {
-	Store
-	swept chan struct{}
-}
-
-func (s *gcSweepSignalStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
-	rows, err := s.Store.ListAllDeletionPending(ctx)
-	select {
-	case s.swept <- struct{}{}:
-	default:
-	}
-	return rows, err
-}
-
 // TestGCSweepsOnItsOwnInterval pins that garbage collection has a cadence of its
 // own, independent of the reconcile knobs. Collecting dead rows and re-confirming
 // live ones are different jobs with different costs, and one interval governing
@@ -758,7 +741,7 @@ func (s *gcSweepSignalStore) ListAllDeletionPending(ctx context.Context) ([]stor
 func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	ctx := context.Background()
 	real := newClientTestStore(t)
-	store := &gcSweepSignalStore{Store: real, swept: make(chan struct{}, 8)}
+	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
 	raw, err := real.CreateObject(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
@@ -774,7 +757,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	defer stop(ctx)
 
 	select {
-	case <-store.swept:
+	case <-store.gcSwept:
 	case <-time.After(testTimeout):
 		t.Fatal("sweeper never ran its startup pass")
 	}
@@ -786,36 +769,6 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		_, err := real.GetObjectMeta(ctx, raw.ID)
 		return errors.Is(err, ErrNotFound)
 	}, testTimeout, 5*time.Millisecond, "deletion-pending row was never collected: GC is still riding the reconcile interval")
-}
-
-// startupProbeStore signals the two startup listings a test must order itself
-// against: the reconciler's own (pending-wake, the one enqueue it still runs
-// unconditionally) and the GC sweeper's cross-kind pass. Both run in goroutines
-// Start has only launched, not awaited, so a test that marks a row
-// deletion-pending right after Start is racing them — and would pass or fail on
-// timing rather than on the behavior under test.
-type startupProbeStore struct {
-	Store
-	reconcilerSwept chan struct{} // ListPendingWakeIDs (per-kind, reconciler startup)
-	gcSwept         chan struct{} // ListAllDeletionPending (global, sweeper startup)
-}
-
-func (s *startupProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
-	select {
-	case s.reconcilerSwept <- struct{}{}:
-	default:
-	}
-	return ids, err
-}
-
-func (s *startupProbeStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
-	rows, err := s.Store.ListAllDeletionPending(ctx)
-	select {
-	case s.gcSwept <- struct{}{}:
-	default:
-	}
-	return rows, err
 }
 
 // TestGCSweepDispatchesRegisteredKind pins that the GC sweep *routes* rather than
@@ -832,10 +785,10 @@ func (s *startupProbeStore) ListAllDeletionPending(ctx context.Context) ([]store
 func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	ctx := context.Background()
 	real := newClientTestStore(t)
-	store := &startupProbeStore{
-		Store:           real,
-		reconcilerSwept: make(chan struct{}, 8),
-		gcSwept:         make(chan struct{}, 8),
+	store := &listProbeStore{
+		Store:      real,
+		wakeListed: make(chan struct{}, 8),
+		gcSwept:    make(chan struct{}, 8),
 	}
 
 	bh, err := New(store, WithResyncInterval(0), WithGCInterval(10*time.Millisecond))
@@ -863,7 +816,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 		name string
 		ch   chan struct{}
 	}{
-		{"reconciler startup enqueue", store.reconcilerSwept},
+		{"reconciler startup enqueue", store.wakeListed},
 		{"gc sweeper startup pass", store.gcSwept},
 	} {
 		select {

@@ -2383,35 +2383,6 @@ func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
 }
 
-// catchupProbeStore signals the startup listings a catchup test must order itself
-// against. Start only *launches* the reconcile loop, and the startup pass drains
-// the same owed sets the tick does — so a test that seeds owed work before Start
-// (or right after it) is measuring the startup pass, not the tick. Waiting for
-// these signals and only then seeding leaves the tick as the sole possible cause.
-type catchupProbeStore struct {
-	Store
-	unsettledListed chan struct{}
-	wakeListed      chan struct{}
-}
-
-func (s *catchupProbeStore) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ListUnsettledIDs(ctx, gk)
-	select {
-	case s.unsettledListed <- struct{}{}:
-	default:
-	}
-	return ids, err
-}
-
-func (s *catchupProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
-	select {
-	case s.wakeListed <- struct{}{}:
-	default:
-	}
-	return ids, err
-}
-
 // wakeStampingStore is the store surface a catchup test needs: the Store contract
 // plus IncrementPendingWake, which is deliberately not on Store (see the comment
 // on reconcilePendingWakeHarness) but exists on the concrete sqlite store so a
@@ -2436,7 +2407,7 @@ func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore))
 		seed(real)
 	}
 
-	store := &catchupProbeStore{
+	store := &listProbeStore{
 		Store:           real,
 		unsettledListed: make(chan struct{}, 8),
 		wakeListed:      make(chan struct{}, 8),
@@ -2526,8 +2497,8 @@ func TestCatchupTickDispatchesOwedWake(t *testing.T) {
 // newSettledHarness starts a control plane over a real store holding one settled
 // object, with the catchup tick and GC off and no startup spec pass. A settled
 // object is invisible to every owed-work listing, so nothing but a full pass can
-// re-dispatch it — which is exactly what makes it the probe for resync. tune
-// configures the reconciler options (i.e. whether resync is on).
+// re-dispatch it — which is exactly what makes it the probe for resync. opts are
+// forwarded to Register (i.e. whether resync is on).
 func newSettledHarness(t *testing.T, opts ...Option) (ObjectID, <-chan ObjectID) {
 	t.Helper()
 	ctx := context.Background()

@@ -154,7 +154,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// freed target would otherwise strand, RESTRICT-blocking nothing else re-checks
 	// it — collects synchronously.
 	for _, tgt := range wakes.targets {
-		t.bh.advanceGC(ctx, GroupKind{Group: tgt.Group, Kind: tgt.Kind}, tgt.ID)
+		t.bh.advanceGC(ctx, tgt.GroupKind(), tgt.ID)
 	}
 	// GC runs in its own transaction over the controller's committed writes, so a
 	// finalizer the controller just cleared is visible.
@@ -251,6 +251,13 @@ func (r *reconciler) enqueuePendingWake(ctx context.Context) {
 		return
 	}
 	r.enqueueFrom(ctx, "pending-wake", r.store.ListPendingWakeIDs)
+}
+
+// hasPeriodicPass reports whether this reconciler has a periodic driver left for
+// an escalation (resyncNextTick / resyncEveryTick) to ride. Kept next to the
+// knobs it reads so the interval semantics stay inside the reconciler.
+func (r *reconciler) hasPeriodicPass() bool {
+	return r.catchupInterval > 0 || r.resyncInterval > 0
 }
 
 // resyncNextTick makes this reconciler's next catchup tick a full pass, once. For
@@ -471,7 +478,7 @@ func (r *reconciler) run(ctx context.Context) {
 	// correctness hole rather than a saving. In-progress deletions are the GC
 	// sweeper's, whose own unconditional startup pass routes them — a registered kind
 	// enqueued so its controller can clear finalizers, a client-only kind collected
-	// directly (see sweepDeletionPending). Doing that here too meant a per-kind
+	// directly (see advanceDeletion). Doing that here too meant a per-kind
 	// listing that only duplicated what the sweeper had to do cross-kind.
 	r.enqueueCatchup(ctx)
 	// The startup resync is the part that is a choice: a full pass re-confirms
@@ -517,22 +524,12 @@ func (r *reconciler) run(ctx context.Context) {
 		}
 	}()
 
-	// time.NewTicker panics on a non-positive interval, so guard it: a disabled
-	// resync means no ticker channel to select on.
-	var resync <-chan time.Time
-	if r.resyncInterval > 0 {
-		ticker := time.NewTicker(r.resyncInterval)
-		defer ticker.Stop()
-		resync = ticker.C
-	}
+	resync, stopResync := tickerChan(r.resyncInterval)
+	defer stopResync()
 	// The catchup tick is the cheap, frequent one: it drains only what the store
 	// records as owed, so it can run often without scaling with the object count.
-	var catchup <-chan time.Time
-	if r.catchupInterval > 0 {
-		ticker := time.NewTicker(r.catchupInterval)
-		defer ticker.Stop()
-		catchup = ticker.C
-	}
+	catchup, stopCatchup := tickerChan(r.catchupInterval)
+	defer stopCatchup()
 
 	for {
 		select {
@@ -545,20 +542,36 @@ func (r *reconciler) run(ctx context.Context) {
 			// listing can see. The escalation rides the catchup ticker rather than the
 			// resync one because resync is off by default — a repair that depended on
 			// an opt-in knob would not run where it is needed most.
-			full := r.tickResyncs()
-			r.logger.Debug("catchup tick", "fullPass", full)
-			if full {
-				r.enqueueAll(ctx)
-			} else {
-				r.enqueueCatchup(ctx)
-			}
+			r.tick(ctx, "catchup", r.tickResyncs())
 		case <-resync:
-			// The full pass: every object, converged or not. It subsumes the catchup
-			// set, so it stands in for it rather than running both.
-			r.logger.Debug("resync tick")
-			r.enqueueAll(ctx)
+			// The full pass: every object, converged or not.
+			r.tick(ctx, "resync", true)
 		}
 	}
+}
+
+// tickerChan returns the tick channel for a periodic driver, plus its stop func.
+// A non-positive interval means the driver is disabled: time.NewTicker would
+// panic, and a nil channel is the right no-op — it blocks forever in a select.
+func tickerChan(d time.Duration) (<-chan time.Time, func()) {
+	if d <= 0 {
+		return nil, func() {}
+	}
+	t := time.NewTicker(d)
+	return t.C, t.Stop
+}
+
+// tick runs one periodic driver's pass. full means every object of the kind,
+// converged or not; otherwise only the work the store records as owed. A full
+// pass subsumes the catchup set, so it stands in for it rather than running both
+// — which is why both drivers share this one body.
+func (r *reconciler) tick(ctx context.Context, driver string, full bool) {
+	r.logger.Debug("periodic tick", "driver", driver, "fullPass", full)
+	if full {
+		r.enqueueAll(ctx)
+		return
+	}
+	r.enqueueCatchup(ctx)
 }
 
 // runWorker is the per-goroutine reconcile loop. Multiple instances may run

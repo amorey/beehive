@@ -226,6 +226,11 @@ type Referrer struct {
 	Kind  string
 }
 
+// GroupKind is the kind to route a requeue (or a GC step) to.
+func (r Referrer) GroupKind() GroupKind {
+	return GroupKind{Group: r.Group, Kind: r.Kind}
+}
+
 // Store is the durable-store contract Beehive depends on internally. It is
 // non-generic and deals only in raw rows: the generic-to-non-generic boundary
 // lives one layer up, in the typedController adapter.
