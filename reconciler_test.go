@@ -601,9 +601,10 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 }
 
 // TestStartToleratesWatchError verifies that a dependency-watch subscription
-// failure is non-fatal: Start (which now establishes the watch synchronously)
-// still succeeds and the controller runs — only the waker is skipped, and the
-// controller still resyncs on its own timer.
+// failure is non-fatal: Start (which establishes the watch synchronously) still
+// succeeds and the controller runs — only the waker is skipped. What that skip
+// costs, and the escalation that pays for it, is
+// TestSubscribeFailureMessageMatchesCoverage.
 func TestStartToleratesWatchError(t *testing.T) {
 	bh, err := New(&watcherStore{err: errBoom}, WithResyncInterval(0))
 	require.NoError(t, err)
@@ -2900,4 +2901,47 @@ func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("escalation never reached the settled object")
 	}
+}
+
+// TestSubscribeFailureMessageMatchesCoverage covers the third of the waker's loss
+// points. The code there was always fine; the *message* was the defect — it said
+// "relying on resync", which was false even before resync became opt-in, because
+// the tick was owed-work-only and a settled dependent is exactly what that cannot
+// see. Rather than delete the promise, the failure now makes it true by escalating
+// the tick — and says which of the two situations the operator is in.
+//
+// The predicate is deliberately whether *any* kind has a catchup tick, not the
+// failing kind's: the escalation is cross-kind, so a tick on any kind repairs
+// dependents of that kind whatever kind's waker was lost. A per-kind test would
+// tell an operator to hand-drive recovery beehive is already providing, or promise
+// one it is not.
+func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+
+	start := func(t *testing.T, opts ...Option) (string, *Beehive) {
+		t.Helper()
+		logger, buf := captureLogger(slog.LevelWarn)
+		bh, err := New(&watcherStore{err: errBoom}, append(opts, WithLogger(logger))...)
+		require.NoError(t, err)
+		_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+		stop, err := bh.Start(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stop(context.Background()))
+		return buf.String(), bh
+	}
+
+	t.Run("with a tick, the promise is made true", func(t *testing.T) {
+		out, bh := start(t) // catchup on by default
+		assert.Contains(t, out, "escalating")
+		assert.True(t, bh.reconcilers[gk].resyncAlways.Load(),
+			"a waker that never started is a dead waker")
+	})
+
+	t.Run("with no tick, it says coverage is gone", func(t *testing.T) {
+		out, _ := start(t, WithCatchupInterval(0), WithResyncInterval(0))
+		assert.Contains(t, out, "no periodic pass to fall back on")
+		assert.Contains(t, out, "Requeue", "the caller owns recovery here, so name the primitive")
+		assert.NotContains(t, out, "escalating", "do not promise a repair that cannot run")
+	})
 }

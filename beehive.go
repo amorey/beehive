@@ -120,6 +120,19 @@ func (bh *Beehive) resyncKindsEveryTick() {
 	}
 }
 
+// hasPeriodicPass reports whether any registered reconciler still has a tick for
+// an escalation to ride. Asked across every kind rather than the failing one,
+// because the escalation is cross-kind too (see resyncKindsNextTick): a tick on
+// any kind repairs dependents of that kind, whatever kind's waker was lost.
+func (bh *Beehive) hasPeriodicPass() bool {
+	for _, r := range bh.order {
+		if r.catchupInterval > 0 || r.resyncInterval > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // log returns a non-nil logger. Start resolves bh.logger, but Stop (and tests
 // that drive state directly) may run before that, so guard against nil.
 func (bh *Beehive) log() *slog.Logger {
@@ -175,12 +188,22 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// waker is listening — otherwise dependents go unwoken under configurations
 	// that rely on dependency events (e.g. a settled dependent, which no owed-work
 	// listing can see, with every ticker disabled). A subscribe failure is
-	// non-fatal: that controller still resyncs on its own timer.
+	// non-fatal: it escalates every periodic pass to a full resync, which is the
+	// only thing that reaches a settled dependent (see the branch below).
 	for _, r := range bh.order {
 		w, err := bh.store.WatchChanges(runCtx, r.gk)
 		if err != nil {
-			bh.logger.Warn("dependency waker subscription failed; relying on resync",
-				"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
+			// A waker that never starts is a dead waker: no change on this kind will
+			// wake a dependent for the life of the process. This used to claim the
+			// resync covered it, which was never true — a settled dependent is exactly
+			// what an owed-work tick cannot see — so escalate to make it true, and
+			// report which situation the operator is actually in.
+			bh.resyncKindsEveryTick()
+			msg := "dependency waker subscription failed; escalating every periodic pass to a full resync so dependents still converge"
+			if !bh.hasPeriodicPass() {
+				msg = "dependency waker subscription failed and there is no periodic pass to fall back on; dependents will not be woken — drive them with Client.Requeue"
+			}
+			bh.logger.Warn(msg, "group", r.gk.Group, "kind", r.gk.Kind, "err", err)
 			continue
 		}
 		bh.wg.Go(func() {
