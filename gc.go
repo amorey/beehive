@@ -133,17 +133,23 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 // The post-commit hook is what makes it safe to call from inside a transaction —
 // Client.Delete nested in a controller's ControllerClient.Within, or collect's own
 // toWake loop when collect itself is nested. Running inline there would wake a
-// reconciler for an uncommitted deletion (a phantom wake if the caller rolls back)
-// and, on the synchronous branch below, run a cascade of physical deletes inside
-// the caller's transaction. Deferring costs nothing when there is no transaction:
-// AfterCommit runs the hook inline.
+// reconciler for an uncommitted deletion: a phantom wake if the caller rolls back,
+// and otherwise a controller reading a row whose tombstone is not visible yet.
+// Deferring costs nothing when there is no transaction: AfterCommit runs the hook
+// inline.
 //
 // Collection stays correct across the deferral because collect is level-triggered:
 // it re-reads DeletionRequestedAt, so if the caller rolled the deletion back there
 // is simply nothing to collect.
+//
+// Now that advanceGCNow only requeues, this is mechanically what wakeAfterCommit
+// does. The two are kept as separate names because they answer separate questions —
+// a spec write owes the object a reconcile, a deletion owes it a collect — and
+// advanceGCNow is where the second one's answer changes if it ever grows past a
+// requeue (a durable stamp, say, as pending_wake is for dependency wakes).
 func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
-	bh.store.AfterCommit(ctx, func(ctx context.Context) {
-		bh.advanceGCNow(ctx, gk, id)
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		bh.advanceGCNow(gk, id)
 	})
 }
 
@@ -160,39 +166,18 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 	bh.store.AfterCommit(ctx, func(context.Context) { bh.enqueueIfRegistered(gk, id) })
 }
 
-// advanceGCNow is advanceGC's body, run with no transaction in flight. It picks
-// the mechanism that fits the kind: a registered kind is requeued so its own
-// reconcile loop runs collect.
+// advanceGCNow is advanceGC's body, run with no transaction in flight. A
+// registered kind is requeued so its own reconcile loop runs collect; a
+// client-only kind has no loop to requeue onto, and the global sweeper's next
+// tick is its backstop — which is exactly what enqueueIfRegistered's no-op arm
+// leaves it to.
 //
-// A client-only kind has no reconcile loop. When resync is enabled the global GC
-// sweeper is its backstop, so we leave the object for the next sweep — keeping
-// the "events are a latency optimization, resync is the correctness backstop"
-// model and not running a recursive cascade inline on the caller's goroutine. But
-// a disabled GC interval reduces the sweeper to a single startup pass, so a
-// client-only object deleted or cascade-freed afterward would strand forever, its
-// owned_by edge RESTRICT-blocking the owner's delete. In that one configuration
-// we collect synchronously here instead. Recursion terminates: each collect that
-// deletes a row shrinks the object graph before waking the targets it freed.
-func (bh *Beehive) advanceGCNow(ctx context.Context, gk GroupKind, id ObjectID) {
-	if bh.gcInterval > 0 {
-		// A registered kind is requeued so its own loop runs collect; a client-only
-		// kind has none, and the sweeper's next tick is its backstop — which is
-		// exactly what enqueueIfRegistered's no-op arm leaves it to.
-		bh.enqueueIfRegistered(gk, id)
-		return
-	}
-	// This runs on the caller's ctx, so a Delete (or freed-target wake) whose
-	// caller cancels right after committing RequestDeletion can abandon the collect
-	// mid-flight. With GC disabled this Beehive has no periodic sweeper left to
-	// retry, and Start is one-shot (a stopped Beehive cannot be restarted), so this
-	// instance will not collect the row again. Recovery happens only when the
-	// application constructs and starts a *fresh* Beehive over the same store, whose
-	// unconditional startup GC sweep (runGCSweeper -> sweepDeletionPending) collects
-	// every deletion-pending object of every kind, client-only included. Until then
-	// the row stays deletion-pending — in a long-running process that declines to
-	// detach the caller's cancellation, that strand persists for the process's life.
-	if err := bh.advanceDeletion(ctx, gk, id); err != nil {
-		bh.log().Warn("gc: synchronous collect of client-only object failed; no GC sweeper to retry it",
-			"group", gk.Group, "kind", gk.Kind, "id", id, "err", err)
-	}
+// That backstop is unconditional, which is why this needs no second arm: the
+// sweeper always has a cadence (WithGCInterval rejects a non-positive interval),
+// so the wait is bounded by one tick. Collecting inline here instead would run a
+// recursive cascade of physical deletes on the caller's goroutine and ctx — so a
+// caller cancelling right after its commit could abandon the cascade mid-flight,
+// with nothing scheduled to resume it.
+func (bh *Beehive) advanceGCNow(gk GroupKind, id ObjectID) {
+	bh.enqueueIfRegistered(gk, id)
 }

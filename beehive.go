@@ -59,8 +59,9 @@ type Beehive struct {
 	// event-log retention). It is deliberately separate from the reconcile
 	// intervals: collecting dead rows and re-confirming live ones are different
 	// jobs with different costs, and one number governing both means tuning either
-	// moves the other. Zero disables the sweeper's periodic pass (the startup pass
-	// still runs).
+	// moves the other. Always positive when the Beehive came from New: WithGCInterval
+	// rejects a non-positive value (see its doc for why GC alone can't be disabled),
+	// so every error path in the sweeper has a next tick to retry on.
 	gcInterval  time.Duration
 	concurrency int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper (see WithEventRetention).
@@ -234,22 +235,22 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 // reconcile loop runs collect for its own kind; this sweeps every kind, so a
 // deletion-pending object of a client-only kind (no registered controller) is
 // still collected — otherwise it would strand and RESTRICT-block its owner's
-// delete forever. It sweeps once at startup and then on the resync cadence; a
-// disabled resync leaves only the startup pass, matching the per-controller
-// backstop.
+// delete forever. It sweeps once at startup and then on the GC cadence.
+//
+// Every failure inside a sweep is logged and swallowed, which is only sound
+// because there is always a next tick: WithGCInterval rejects a non-positive
+// interval, so a transient error costs one cadence of latency rather than
+// stranding a row for the life of the process.
 func (bh *Beehive) runGCSweeper(ctx context.Context) {
-	bh.sweepDeletionPending(ctx)
-	bh.sweepEventRetention(ctx)
 	if bh.gcInterval <= 0 {
-		// Warn, where the reconcile knobs only Info: this one leaves no recourse.
-		// Nothing on the public surface triggers collect, so an operator who reaches
-		// this by accident cannot make deletion progress by hand the way Requeue
-		// covers a disabled catchup — deletion-pending rows simply accumulate, each
-		// RESTRICT-blocking whatever owns it.
-		bh.log().WarnContext(ctx, "garbage collection disabled: deletion-pending rows are collected once at startup and never again; they will accumulate and block their owners' deletion")
-		<-ctx.Done()
+		// Unreachable through New — the default is positive and WithGCInterval rejects
+		// anything else. Guarded anyway so a Beehive assembled field-by-field (tests
+		// that want the sweeper's own enqueues out of the way) simply has no sweeper
+		// instead of panicking in NewTicker.
 		return
 	}
+	bh.sweepDeletionPending(ctx)
+	bh.sweepEventRetention(ctx)
 	ticker := time.NewTicker(bh.gcInterval)
 	defer ticker.Stop()
 	for {
@@ -291,8 +292,9 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 }
 
 // advanceDeletion drives one deletion-pending object a step closer to removal,
-// routing on whether its kind has a controller. It is the single home of that
-// routing: the global GC sweeper and advanceGCNow both come through here.
+// routing on whether its kind has a controller. The GC sweeper is its only caller
+// — the event-driven path (advanceGCNow) deliberately only requeues, leaving every
+// collect to run on the sweeper's goroutine rather than a caller's.
 //
 // The routing is load-bearing, not an optimization. collect cannot clear a
 // finalizer: it cascades to owned children and then returns while any finalizer
@@ -305,8 +307,8 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 //
 // Both arms are safe to repeat: enqueue coalesces, and collect is a no-op while
 // finalizers or live referrers remain and idempotent if another path got there
-// first. The collect error is returned rather than logged so each caller can
-// report it in its own terms; the enqueue arm always returns nil.
+// first. The collect error is returned rather than logged so the caller can report
+// it in its own terms; the enqueue arm always returns nil.
 func (bh *Beehive) advanceDeletion(ctx context.Context, gk GroupKind, id ObjectID) error {
 	if r, ok := bh.reconcilerFor(gk); ok {
 		r.enqueue(id)

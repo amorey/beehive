@@ -150,12 +150,13 @@ tell "we decided against this for now" from "nobody thought of it."
   **Unlike the `depends_on` race, this one self-heals whenever the GC sweeper runs.**
   `sweepDeletionPending` re-lists the still-pending owner and `collect` re-runs
   `MarkOwnedForDeletion`, which is explicitly built to be re-run and picks the new
-  child up; the exposure is one GC interval. Splitting the intervals narrowed the
-  permanent strand considerably: it used to follow from `resyncInterval = 0`, a
-  documented and commonly-used way to say "event-driven only", and is now confined to
-  `WithGCInterval(0)` — which defaults on and which nothing else has reason to
-  disable. (The repro above predates the split and was written against
-  `WithResyncInterval(0)`; re-run it against `WithGCInterval(0)`.) It is also *visible* where the dependency race is not: the
+  child up; the exposure is one GC interval, always — **there is no longer a
+  permanent-strand configuration at all.** It used to follow from `resyncInterval =
+  0`, a documented and commonly-used way to say "event-driven only"; splitting the
+  intervals confined it to `WithGCInterval(0)`, and rejecting a non-positive GC
+  interval (see Resolved) removed even that. (The repro above predates the split and
+  was written against `WithResyncInterval(0)`; it now needs a GC interval long enough
+  to observe the window rather than a disabled one.) It is also *visible* where the dependency race is not: the
   owner is observably stuck deletion-pending rather than silently settled on a stale
   read.
 
@@ -187,28 +188,6 @@ tell "we decided against this for now" from "nobody thought of it."
   itself hold a finalizer on, or when the resync strategy is settled. There is no test
   for it yet: the repro exists only as a throwaway, and `TestMarkOwnedForDeletionCascadesThenIsNoOp`
   re-cascades over a fixed child set, so it never adds a child between passes.
-
-- **`advanceGCNow`'s synchronous collect inherits the caller's cancellation** —
-  known, not fixed, and already documented inline. With **GC disabled**
-  (`WithGCInterval(0)`), a `Delete` (or freed-target wake) on a client-only kind
-  whose caller cancels immediately after commit abandons the collect mid-flight;
-  `Start` is one-shot, so nothing in that process retries and the row stays
-  deletion-pending, RESTRICT-blocking its owner, until a *fresh* `Beehive` runs its
-  unconditional startup sweep over the same store.
-
-  Splitting the intervals **narrowed but did not close this**. The branch used to
-  be reachable whenever the reconcile tick was off — a common configuration, since
-  one knob governed everything — and is now gated on the GC interval specifically,
-  which defaults on and which nothing else has reason to disable. So the trigger is
-  rarer and more deliberate. (An earlier plan for that work claimed the split would
-  close this entry outright; it does not. The `collect` call and its inherited
-  cancellation are unchanged.)
-
-  The fix is `context.WithoutCancel(ctx)` for the collect — finishing work the
-  caller stopped waiting on, which is the trade this deliberately declined. That
-  call predates the decision (recorded on the `UpdateStatus` handshake) to prefer
-  a slightly wasteful self-healing path over a silent strand, so it is worth
-  re-taking on those terms rather than left as settled. One line if so.
 
 - **A client-only dependent's `pending_wake` count is never reclaimed** — known, not
   fixed. Edges are deliberately cross-kind, so `AddDependency(clientOnlyID, target,
@@ -392,6 +371,45 @@ tell "we decided against this for now" from "nobody thought of it."
 
 
 ## Resolved
+
+- **GC can no longer be disabled, which deleted two strand bugs instead of patching
+  them** — done. `WithGCInterval(d <= 0)` now returns `ErrInvalidOption` (a new
+  sentinel: an option whose *value* is meaningless, checked before the target switch,
+  where `ErrConflictingOption` is about the value contradicting an argument the call
+  already carries).
+
+  **Why GC is the one interval that cannot be off.** The reconcile knobs accept 0
+  because the operator keeps a way through — `Client.Requeue` drives a pass by hand.
+  Nothing on the public surface triggers `collect`, and the sweeper is also the only
+  *cross-kind* driver, so a sweeper-less `Beehive` accumulates deletion-pending rows
+  with no recourse at all, each one's `owned_by` edge RESTRICT-blocking its owner's
+  delete. The old answer was a Warn at startup saying exactly that, which is a log
+  line reporting a configuration the library should not have accepted.
+
+  **Two open strands closed with the branch.** Review flagged that
+  `sweepDeletionPending`'s swallowed `ListAllDeletionPending` error left *no* startup
+  driver for finalizing rows once the per-kind `enqueueDeletionPending` was dropped —
+  true only with GC disabled, where the startup pass was the process's single
+  attempt. With a cadence guaranteed, "retry next sweep" is a true statement and a
+  transient failure costs one interval of latency. That also removed
+  `advanceGCNow`'s synchronous-collect arm, and with it the entry that used to sit
+  above about that collect inheriting the caller's cancellation (a `Delete` whose
+  caller cancels right after commit abandoning a cascade nothing retries). Both were
+  the same defect wearing two hats: work whose only retry was a pass that ran once.
+
+  **What went away:** the `<-ctx.Done()` park and its Warn in `runGCSweeper`;
+  `advanceGCNow`'s second arm (it is now just `enqueueIfRegistered`, so it needs no
+  `ctx`); `advanceDeletion`'s second caller — the routing is still one function, now
+  reached only by the sweeper, so every `collect` runs on the sweeper's goroutine
+  rather than a caller's; and three tests whose premise was the disabled mode.
+  `runGCSweeper` keeps a non-positive guard that returns immediately, unreachable
+  through `New` and documented as such: it exists so a `Beehive` assembled
+  field-by-field has no sweeper rather than panicking in `NewTicker`, which is what
+  the `withoutGCSweeper()` test helper uses.
+
+  **Cost:** a breaking change for anyone passing `WithGCInterval(0)` — the only
+  callers affected, since the default is 30s. A long interval expresses "collect
+  rarely"; there is deliberately no way to express "never".
 
 - **Three periodic drivers instead of one, and all three dependency-waker loss
   points repaired** — done, as one series. `resyncInterval` had been governing four

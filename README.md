@@ -117,7 +117,7 @@ Three independent cadences, because they are three different jobs with different
 
 The full resync is opt-in because it is the only one whose cost is unbounded by outstanding work. It is also the only one that reaches an object nothing has recorded as owing anything — process-scoped state a restart invalidated (a liveness condition reads as "verifying" until a controller in *this* process rewrites it), or a dependency wake lost for a reason nothing observed. The startup pass covers the same ground once per process, which is why the periodic form is not needed by default.
 
-Disabling a driver is supported and logged at startup: catchup and GC each say so if switched off, GC at `Warn` because nothing on the public surface triggers collection, so a disabled sweeper leaves no manual recourse the way `Client.Requeue` does for catchup.
+Disabling a driver is supported for the two reconcile cadences and logged at startup, so a knob left at 0 by accident is visible rather than silent. **GC is the exception: it cannot be disabled.** `WithGCInterval` rejects a non-positive interval with `ErrInvalidOption`, because nothing on the public surface triggers collection — where a disabled catchup still leaves `Client.Requeue`, a disabled sweeper leaves no recourse at all, and deletion-pending rows accumulate with each one's `owned_by` edge blocking its owner's deletion. It is also the only cross-kind driver, so a client-only kind has no reconcile loop to fall back on. A long interval says "collect rarely"; there is no way to say "never".
 
 ### GroupKind
 
@@ -521,7 +521,7 @@ func WithOwner(id ObjectID) Option                 // declare owned_by edge; own
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
 func WithCatchupInterval(d time.Duration) Option   // how often to drain recorded owed work (default: 30s; 0 disables)
 func WithResyncInterval(d time.Duration) Option    // how often to re-dispatch EVERY object (default: 0, off)
-func WithGCInterval(d time.Duration) Option        // how often to collect dead rows + prune the event log (default: 30s; New only)
+func WithGCInterval(d time.Duration) Option        // how often to collect dead rows + prune the event log (default: 30s; New only; must be > 0)
 func WithStartupResync(enabled bool) Option        // also re-dispatch settled objects once at startup (default: true)
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)

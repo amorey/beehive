@@ -2414,7 +2414,7 @@ func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore))
 	}
 	reconciled := make(chan ObjectID, 4)
 
-	bh, err := New(store, WithResyncInterval(0), WithGCInterval(0),
+	bh, err := New(store, WithResyncInterval(0), withoutGCSweeper(),
 		WithCatchupInterval(10*time.Millisecond))
 	require.NoError(t, err)
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
@@ -2516,7 +2516,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (ObjectID, <-chan ObjectID)
 	require.NoError(t, err)
 
 	reconciled := make(chan ObjectID, 4)
-	bh, err := New(store, WithCatchupInterval(0), WithGCInterval(0))
+	bh, err := New(store, WithCatchupInterval(0), withoutGCSweeper())
 	require.NoError(t, err)
 	opts = append(opts, WithStartupResync(false))
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
@@ -2575,7 +2575,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 	seed(store, gk)
 
 	reconciled := make(chan ObjectID, 8)
-	bh, err := New(store, WithCatchupInterval(0), WithResyncInterval(0), WithGCInterval(0))
+	bh, err := New(store, WithCatchupInterval(0), WithResyncInterval(0), withoutGCSweeper())
 	require.NoError(t, err)
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
 	require.NoError(t, err)
@@ -2645,11 +2645,15 @@ func TestStartupResyncReconcilesSettled(t *testing.T) {
 }
 
 // TestDisabledBackstopsAnnounceThemselves pins that turning a periodic driver off
-// is visible in the log. Each of these is a supported configuration, so none of
-// them is an error — but the failure mode when one is reached by accident (an
-// unset config field, a bad duration parse) is silence: work quietly stops being
-// re-derived and nothing says so. The level differs by what recourse the operator
-// has left.
+// is visible in the log. Both of these are supported configurations, so neither is
+// an error — but the failure mode when one is reached by accident (an unset config
+// field, a bad duration parse) is silence: work quietly stops being re-derived and
+// nothing says so.
+//
+// GC is the driver that is *not* here: it cannot be turned off at all, because it
+// is the one with no recourse left (see WithGCInterval), so the mistake is reported
+// as an error from New rather than a log line nobody reads
+// (TestWithGCIntervalRejectsNonPositive).
 func TestDisabledBackstopsAnnounceThemselves(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
@@ -2671,14 +2675,6 @@ func TestDisabledBackstopsAnnounceThemselves(t *testing.T) {
 		out := start(t, slog.LevelInfo, WithCatchupInterval(0))
 		assert.Contains(t, out, "catchup disabled")
 		assert.Contains(t, out, "Requeue", "name the primitive that replaces it")
-	})
-
-	t.Run("gc off is Warn: nothing public collects a row", func(t *testing.T) {
-		// No public API triggers collect, so a disabled sweeper leaves the operator
-		// no way to make deletion progress — a strictly worse position than the
-		// other two, and the reason this one is louder.
-		out := start(t, slog.LevelWarn, WithGCInterval(0))
-		assert.Contains(t, out, "garbage collection disabled")
 	})
 
 	t.Run("the defaults say nothing", func(t *testing.T) {
@@ -2894,7 +2890,7 @@ func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
 	// Catchup on (it carries the escalation), resync off, no startup pass: only an
 	// escalated catchup tick can reach a settled object.
 	bh, err := New(store, WithCatchupInterval(10*time.Millisecond),
-		WithResyncInterval(0), WithGCInterval(0))
+		WithResyncInterval(0), withoutGCSweeper())
 	require.NoError(t, err)
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
 		WithStartupResync(false))

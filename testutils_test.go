@@ -70,6 +70,21 @@ func captureLogger(level slog.Level) (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})), &buf
 }
 
+// withoutGCSweeper stops the global GC sweeper from starting, for tests that are
+// measuring some other driver's listings and want the sweeper's own enqueues out of
+// the picture. It sets the field directly because WithGCInterval rejects a
+// non-positive interval: production has no way to run without a sweeper (nothing
+// public collects a row, so disabling it strands deletion-pending rows for good),
+// and this is a test-only escape hatch, not that configuration being supported.
+func withoutGCSweeper() Option {
+	return func(target any) error {
+		if bh, ok := target.(*Beehive); ok {
+			bh.gcInterval = 0
+		}
+		return nil
+	}
+}
+
 // tSpec / tStatus are placeholder payload types. The lifecycle tests never
 // inspect them; they exist only to satisfy the generic signatures.
 type (

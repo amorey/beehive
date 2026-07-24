@@ -138,6 +138,33 @@ func TestWithGCIntervalDispatch(t *testing.T) {
 	require.NoError(t, WithGCInterval(time.Second)("unrelated"))
 }
 
+// TestWithGCIntervalRejectsNonPositive pins the one interval that cannot be turned
+// off. The reconcile knobs accept 0 as "off" because Client.Requeue still drives a
+// pass by hand, but nothing public triggers collect — so a sweeper-less Beehive
+// accumulates deletion-pending rows with no recourse, each RESTRICT-blocking its
+// owner's delete. Every swallowed error inside a sweep also assumes a next tick to
+// retry on, which is only true while this holds.
+func TestWithGCIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{gcInterval: time.Minute}
+			err := WithGCInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "WithGCInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.gcInterval, "a rejected option must not have written")
+
+			// Rejected wherever it is aimed: the value is nonsense independent of target,
+			// so a misdirected call must not carry the mistake silently.
+			require.ErrorIs(t, WithGCInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, WithGCInterval(d)("unrelated"), ErrInvalidOption)
+
+			// And it surfaces from New, which is where a real caller meets it.
+			_, err = New(&fakeStore{}, WithGCInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
+}
+
 func TestWithLoggerDispatch(t *testing.T) {
 	l := slog.New(slog.DiscardHandler)
 

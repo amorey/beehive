@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -34,6 +35,12 @@ type Option func(target any) error
 // aimed at a target it doesn't understand is ignored by design (see Option), while
 // a contradiction is a caller mistake whose effect would otherwise be invisible.
 var ErrConflictingOption = errors.New("beehive: option conflicts with an explicit argument")
+
+// ErrInvalidOption reports an option carrying a value that has no meaning — a
+// non-positive GC interval, for instance. Unlike ErrConflictingOption it is about
+// the argument alone, so it is returned regardless of the target the option lands
+// on: a value that means nothing at one call site means nothing at any of them.
+var ErrInvalidOption = errors.New("beehive: option value is invalid")
 
 // LoadOption selects a secondary lookup to fetch alongside an object on a read.
 // It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
@@ -279,16 +286,30 @@ func WithResyncInterval(d time.Duration) Option {
 
 // WithGCInterval sets how often the global GC sweeper runs: it collects
 // deletion-pending objects (of every kind, including ones with no registered
-// controller) and applies event-log retention. A value <= 0 disables the periodic
-// sweep, leaving only the unconditional pass at startup.
+// controller) and applies event-log retention.
 //
 // It is separate from the reconcile intervals on purpose. Removing dead rows and
 // re-dispatching live ones are different jobs with different costs, and a single
 // interval for both means tuning one moves the other. GC is also global rather
 // than per-kind — the sweeper covers kinds no controller watches — so this is
 // meaningful only at New; passed elsewhere it is ignored.
+//
+// Unlike the reconcile intervals, it cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption. Those two knobs pace work that has another way through —
+// Client.Requeue drives a reconcile by hand — but nothing on the public surface
+// triggers collect, so a sweeper-less Beehive would let deletion-pending rows
+// accumulate with no recourse, each one's owned_by edge RESTRICT-blocking its
+// owner's own deletion. It is also the only cross-kind driver: a client-only kind
+// has no reconcile loop to fall back on. A long interval expresses "collect
+// rarely"; there is no supported way to express "never".
 func WithGCInterval(d time.Duration) Option {
 	return func(target any) error {
+		// Checked before the target switch: the value is nonsense wherever it was
+		// aimed, and reporting that only for the target that happens to consume it
+		// would let a misdirected call carry the mistake silently.
+		if d <= 0 {
+			return fmt.Errorf("%w: WithGCInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
 		if t, ok := target.(*Beehive); ok {
 			t.gcInterval = d
 		}
