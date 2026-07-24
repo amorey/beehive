@@ -3391,7 +3391,7 @@ func TestListOutgoingRefsByRelationDBError(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestListAllDeletionPendingIDs(t *testing.T) {
+func TestListAllDeletionPending(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
@@ -3403,9 +3403,14 @@ func TestListAllDeletionPendingIDs(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	ids, err := store.ListAllDeletionPendingIDs(ctx)
+	rows, err := store.ListAllDeletionPending(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, []beehive.ObjectID{a.ID, b.ID}, ids, "every finalizing object, kind-agnostic")
+	// The kind rides along so the GC sweeper can route on it: a registered kind is
+	// enqueued for its controller, a client-only kind collected directly.
+	assert.Equal(t, []storeapi.Referrer{
+		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
+	}, rows, "every finalizing object, kind-agnostic, with its kind")
 }
 
 func TestDeletionPendingIDsDBError(t *testing.T) {
@@ -3414,7 +3419,7 @@ func TestDeletionPendingIDsDBError(t *testing.T) {
 	ctx := context.Background()
 	_, err := store.ListDeletionPendingIDs(ctx, testGK)
 	require.Error(t, err)
-	_, err = store.ListAllDeletionPendingIDs(ctx)
+	_, err = store.ListAllDeletionPending(ctx)
 	require.Error(t, err)
 }
 

@@ -475,15 +475,22 @@ func (s *sqliteStore) ListDeletionPendingIDs(ctx context.Context, gk storeapi.Gr
 	return scanIDs(rows)
 }
 
-func (s *sqliteStore) ListAllDeletionPendingIDs(ctx context.Context) ([]storeapi.ObjectID, error) {
+func (s *sqliteStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
 	// Kind-agnostic: same partial index as ListDeletionPendingIDs, no group/kind
-	// filter, so the global GC sweeper sees every finalizing object.
+	// filter, so the global GC sweeper sees every finalizing object. The kind rides
+	// along because the sweeper routes on it (see the Store doc), and it is not
+	// free: selecting id alone is covered by idx_objects_deleting (id is the
+	// rowid), while group/kind live in the table, so this takes a row fetch per
+	// match. Accepted because the match set is the deletion-pending rows, which is
+	// small by construction and which the sweeper is about to act on individually
+	// anyway — a second query to resolve their kinds would cost strictly more.
 	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL ORDER BY id`)
+		`SELECT id, "group", kind FROM objects
+		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
-	return scanIDs(rows)
+	return scanReferrers(rows)
 }
 
 func (s *sqliteStore) ListPendingWakeIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {

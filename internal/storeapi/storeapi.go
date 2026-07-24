@@ -325,12 +325,14 @@ type Store interface {
 	// Bumps no resource_version and emits no event.
 	DecrementPendingWake(ctx context.Context, id ObjectID, observed int64) error
 
-	// ListAllDeletionPendingIDs is ListDeletionPendingIDs across every kind. The
-	// global GC sweeper uses it to collect deletion-pending objects of kinds with
-	// no registered controller (client-only kinds), which the per-controller
-	// backstop never reaches and which could otherwise strand and RESTRICT-block
-	// an owner's delete forever.
-	ListAllDeletionPendingIDs(ctx context.Context) ([]ObjectID, error)
+	// ListAllDeletionPending is ListDeletionPendingIDs across every kind, returning
+	// each row's GroupKind alongside its id. The global GC sweeper is the sole
+	// caller and needs the kind to route: an object of a registered kind is
+	// enqueued so its controller can clear finalizers (a step collect cannot take),
+	// while a client-only kind — which no reconcile loop reaches, and which could
+	// otherwise strand and RESTRICT-block an owner's delete forever — is collected
+	// directly.
+	ListAllDeletionPending(ctx context.Context) ([]Referrer, error)
 
 	// ListIDs returns the IDs of every object of kind gk, ordered by id. The
 	// reconciler uses it to enqueue a full reconcile pass at startup, so

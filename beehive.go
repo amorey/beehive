@@ -208,20 +208,37 @@ func (bh *Beehive) sweepEventRetention(ctx context.Context) {
 	}
 }
 
-// sweepDeletionPending collects every deletion-pending object. collect is a
-// no-op while an object still holds finalizers or live referrers, and idempotent
-// if another path already collected it, so re-sweeping the registered kinds that
-// their own controllers handle is harmless.
+// sweepDeletionPending drives every deletion-pending object one step closer to
+// removal, routing on whether its kind has a controller — the same two arms
+// advanceGC uses.
+//
+// The routing is load-bearing, not an optimization. collect cannot clear a
+// finalizer: it cascades to owned children and then returns while any finalizer
+// remains, because releasing one is the controller's decision. So an object of a
+// registered kind must be *enqueued*, letting its reconcile loop run the
+// controller (which clears the finalizer and collects in the same pass); calling
+// collect on it directly would make no progress, on every sweep, forever. A
+// client-only kind has no reconcile loop to enqueue onto, so the sweeper collects
+// it here — which is the whole reason this global sweep exists.
+//
+// Both arms are safe to repeat: enqueue coalesces, and collect is a no-op while
+// finalizers or live referrers remain and idempotent if another path got there
+// first.
 func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
-	ids, err := bh.store.ListAllDeletionPendingIDs(ctx)
+	rows, err := bh.store.ListAllDeletionPending(ctx)
 	if err != nil {
 		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return
 	}
-	for _, id := range ids {
+	for _, row := range rows {
+		gk := GroupKind{Group: row.Group, Kind: row.Kind}
+		if r, ok := bh.reconcilerFor(gk); ok {
+			r.enqueue(row.ID)
+			continue
+		}
 		// Best-effort: a benign ErrNotFound (already collected) or a transient
 		// error is retried on the next sweep.
-		_, _ = bh.collect(ctx, id)
+		_, _ = bh.collect(ctx, row.ID)
 	}
 }
 

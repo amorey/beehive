@@ -732,13 +732,13 @@ type gcSweepSignalStore struct {
 	swept chan struct{}
 }
 
-func (s *gcSweepSignalStore) ListAllDeletionPendingIDs(ctx context.Context) ([]ObjectID, error) {
-	ids, err := s.Store.ListAllDeletionPendingIDs(ctx)
+func (s *gcSweepSignalStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
+	rows, err := s.Store.ListAllDeletionPending(ctx)
 	select {
 	case s.swept <- struct{}{}:
 	default:
 	}
-	return ids, err
+	return rows, err
 }
 
 // TestGCSweepsOnItsOwnInterval pins that garbage collection has a cadence of its
@@ -784,4 +784,96 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		_, err := real.GetObjectMeta(ctx, raw.ID)
 		return errors.Is(err, ErrNotFound)
 	}, testTimeout, 5*time.Millisecond, "deletion-pending row was never collected: GC is still riding the reconcile interval")
+}
+
+// startupProbeStore signals the two startup listings a test must order itself
+// against: the reconciler's own deletion-pending enqueue and the GC sweeper's
+// cross-kind pass. Both run in goroutines Start has only launched, not awaited,
+// so a test that marks a row deletion-pending right after Start is racing them —
+// and would pass or fail on timing rather than on the behavior under test.
+type startupProbeStore struct {
+	Store
+	reconcilerSwept chan struct{} // ListDeletionPendingIDs (per-kind, reconciler startup)
+	gcSwept         chan struct{} // ListAllDeletionPendingIDs (global, sweeper startup)
+}
+
+func (s *startupProbeStore) ListDeletionPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ListDeletionPendingIDs(ctx, gk)
+	select {
+	case s.reconcilerSwept <- struct{}{}:
+	default:
+	}
+	return ids, err
+}
+
+func (s *startupProbeStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
+	rows, err := s.Store.ListAllDeletionPending(ctx)
+	select {
+	case s.gcSwept <- struct{}{}:
+	default:
+	}
+	return rows, err
+}
+
+// TestGCSweepDispatchesRegisteredKind pins that the GC sweep *routes* rather than
+// only collecting. collect cannot clear a finalizer — it cascades, then returns
+// while any remain, because releasing a finalizer is the controller's decision.
+// So for a registered kind the sweep has to enqueue the object and let its
+// reconcile loop run the controller; calling collect directly makes no progress,
+// forever.
+//
+// Every other driver is removed: resync is off, the startup pass is None, and the
+// row is marked deletion-pending only after both startup listings have provably
+// run — so neither the reconciler's own startup enqueue nor the sweeper's startup
+// pass can be what dispatches it. A periodic GC sweep is the only path left.
+func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
+	ctx := context.Background()
+	real := newClientTestStore(t)
+	store := &startupProbeStore{
+		Store:           real,
+		reconcilerSwept: make(chan struct{}, 8),
+		gcSwept:         make(chan struct{}, 8),
+	}
+
+	bh, err := New(store, WithResyncInterval(0), WithGCInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	// The controller clears "gate" once the object is finalizing, which is the step
+	// only a reconcile can take.
+	_, err = Register(bh, clientTestGK, &finalizerClearingController{finalizer: "gate"},
+		WithStartupReconcileStrategy(StartupReconcileNone))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("gate"))
+	require.NoError(t, err)
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	for _, probe := range []struct {
+		name string
+		ch   chan struct{}
+	}{
+		{"reconciler startup enqueue", store.reconcilerSwept},
+		{"gc sweeper startup pass", store.gcSwept},
+	} {
+		select {
+		case <-probe.ch:
+		case <-time.After(testTimeout):
+			t.Fatalf("%s never ran", probe.name)
+		}
+	}
+
+	// Mark it deletion-pending through the store, so the client's own advanceGC
+	// wake isn't what drives this either.
+	_, _, err = real.RequestDeletion(ctx, clientTestGK, obj.ID)
+	require.NoError(t, err)
+
+	waitForDeletions(t, w, obj.ID)
 }

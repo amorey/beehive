@@ -253,7 +253,7 @@ type gcTickStore struct {
 	swept chan struct{}
 }
 
-func (s *gcTickStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
+func (s *gcTickStore) ListAllDeletionPending(context.Context) ([]storeapi.Referrer, error) {
 	select {
 	case s.swept <- struct{}{}:
 	default:

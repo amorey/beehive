@@ -119,7 +119,7 @@ func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, er
 func (s *fakeStore) ListDeletionPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListAllDeletionPendingIDs(context.Context) ([]ObjectID, error) {
+func (s *fakeStore) ListAllDeletionPending(context.Context) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
 func (s *fakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
