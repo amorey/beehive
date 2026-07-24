@@ -2421,6 +2421,37 @@ func TestListIncomingRefObjectsDBError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestAddRefResolvedEndpointReadDBError covers the endpoint read failing for a
+// reason that is not "no such row" — dropped table rather than missing endpoint,
+// so it must surface the driver error rather than ErrNotFound. BeginTx still
+// succeeds here, unlike closing the db, which fails before the read is reached.
+func TestAddRefResolvedEndpointReadDBError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	dropObjects(t, store)
+
+	_, err := store.AddRefResolved(ctx, a.ID, b.ID, "depends_on", 0)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, beehive.ErrNotFound, "a dropped table is not a missing endpoint")
+}
+
+// TestAddRefResolvedInsertDBError covers the insert failing after the endpoint
+// read succeeded: the refs table is gone, so both endpoints resolve and only the
+// write fails.
+func TestAddRefResolvedInsertDBError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE refs`)
+	require.NoError(t, err)
+
+	_, err = store.AddRefResolved(ctx, a.ID, b.ID, "depends_on", 0)
+	require.Error(t, err)
+}
+
 func TestAddRefDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()

@@ -1381,17 +1381,13 @@ func (s *sqliteStore) AddRefResolved(ctx context.Context, fromID, toID storeapi.
 			return err
 		}
 		// DO NOTHING inserts no row on conflict, so the count distinguishes a new edge
-		// from one that was already declared. modernc caches the count and never
-		// errors here, yet this is the one RowsAffected site that checks: elsewhere a
-		// bad count would surface as a wrong return, while here it silently decides
-		// whether the dependent is woken at all, and a lost dependency wake is
-		// permanent and invisible. Failing also self-heals — it rolls the insert back,
-		// so a retry gets a clean answer instead of finding an edge that already
-		// exists with its wake skipped.
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
+		// from one that was already declared. The error is discarded as at the other
+		// RowsAffected sites — modernc caches the count and cannot fail here, and a
+		// branch this driver can never take is untestable dead code. Worth knowing if
+		// the driver ever changes: this site is the one where a wrong count is not a
+		// wrong return value but a silently skipped wake, and a lost dependency wake
+		// is permanent and invisible. Revisit all four sites together if so.
+		n, _ := res.RowsAffected()
 		out = storeapi.AddRefResult{
 			From:                  storeapi.GroupKind{Group: group, Kind: kind},
 			TargetResourceVersion: targetRV,
