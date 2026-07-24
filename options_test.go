@@ -100,17 +100,17 @@ func TestWithConcurrencyDispatch(t *testing.T) {
 	require.NoError(t, WithConcurrency(1)("unrelated"))
 }
 
-func TestWithStartupReconcileStrategyDispatch(t *testing.T) {
-	bh := &Beehive{}
-	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileUnsettled)(bh))
-	assert.Equal(t, StartupReconcileUnsettled, bh.startupReconcile)
+func TestWithStartupResyncDispatch(t *testing.T) {
+	bh := &Beehive{startupResync: true}
+	require.NoError(t, WithStartupResync(false)(bh))
+	assert.False(t, bh.startupResync)
 
 	r := &reconciler{}
-	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileNone)(r))
-	assert.Equal(t, StartupReconcileNone, r.startupReconcile)
+	require.NoError(t, WithStartupResync(true)(r))
+	assert.True(t, r.startupResync)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithStartupReconcileStrategy(StartupReconcileAll)("unrelated"))
+	require.NoError(t, WithStartupResync(true)("unrelated"))
 }
 
 func TestWithCatchupIntervalDispatch(t *testing.T) {

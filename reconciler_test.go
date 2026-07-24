@@ -15,12 +15,9 @@
 package beehive
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -518,13 +515,11 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 // that is indistinguishable from dying between the commit and the dispatch, and
 // it needs no goroutine timing to be deterministic.
 //
-// The restart runs with StartupReconcileNone, which is load-bearing twice over.
-// Under the default StartupReconcileAll the sweep reconciles everything and heals
-// the crash for reasons that have nothing to do with dependencies, so the test
-// would prove nothing. And a wake that is owed is not a spec-convergence
-// question, so recovering it must not be a startup *strategy* question either —
-// the fix has to reach the dependent under the strategy that asks for no startup
-// pass at all.
+// The restart runs with WithStartupResync(false), which is load-bearing: under the
+// default full pass the startup sweep reconciles everything and heals the crash for
+// reasons that have nothing to do with dependencies, so the test would prove
+// nothing. What must reach the dependent is the owed-work drain, which startup runs
+// regardless — a wake that is owed is recorded work, not a re-confirm.
 func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	// One store, two control planes: the rows outlive the process, the work queue
@@ -585,7 +580,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	}
 	_, err = Register(bh2, gk, ctrl2,
 		WithResyncInterval(0),
-		WithStartupReconcileStrategy(StartupReconcileNone))
+		WithStartupResync(false))
 	require.NoError(t, err)
 	ctrl2.client = NewClient[tSpec, tStatus](bh2, gk)
 
@@ -788,10 +783,13 @@ func TestStartupEnqueuesAllNotJustUnsettled(t *testing.T) {
 		},
 	}
 	r := &reconciler{
-		adapter:          adapter,
-		store:            &allIDsStore{ids: []ObjectID{objID}},
-		work:             newWorkQueue(),
-		resyncInterval:   0,
+		adapter: adapter,
+		store:   &allIDsStore{ids: []ObjectID{objID}},
+		work:    newWorkQueue(),
+		// Set explicitly: unlike the strategy enum this replaced, a bool's zero
+		// value is the *off* state, so a reconciler built outside Register (as here)
+		// does not inherit New's true default.
+		startupResync:    true,
 		maxRetryInterval: time.Second,
 		backoffFor:       make(map[ObjectID]time.Duration),
 	}
@@ -826,79 +824,13 @@ func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tS
 	return Result{}, nil
 }
 
-// TestStartupReconcileNoneWithoutResyncDrivesNothing pins the opt-out:
-// StartupReconcileNone with the resync disabled means beehive drives no spec
-// convergence at all, not even for an object a previous process left unconverged.
-// That is deliberate — the embedder reconciles on its own schedule (see the
-// companion test below) — and the point of pinning it is that the obvious "fix",
-// resuming unsettled objects unconditionally at startup, would silently take the
-// configuration away from the caller who asked for it.
-//
-// The prior process is spelled as a row written straight to the store, so it
-// carries observed_generation IS NULL: what a process that created the object and
-// died before its controller settled it would leave behind.
-func TestStartupReconcileNoneWithoutResyncDrivesNothing(t *testing.T) {
-	ctx := context.Background()
-	store := newClientTestStore(t)
-	gk := GroupKind{Kind: "Widget"}
-
-	_, err := store.CreateObject(ctx, &RawObject{
-		Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-
-	bh, err := New(store, WithResyncInterval(0))
-	require.NoError(t, err)
-	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, gk, ctrl, WithStartupReconcileStrategy(StartupReconcileNone))
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	defer stop(ctx)
-
-	select {
-	case got := <-ctrl.reconciled:
-		t.Fatalf("object %d reconciled: the caller asked for no automatic driver and got one anyway", got)
-	case <-time.After(200 * time.Millisecond):
-	}
-}
-
-// TestStartupReconcileNoneWithoutResyncWarns verifies the configuration above
-// announces itself. Honoring the opt-out is only defensible because it is not
-// silent: reached by accident, the failure mode is a spec that is never actuated
-// with nothing to notice, so the warning is what separates "deliberate" from
-// "stranded". It names the two primitives that make the configuration usable.
-func TestStartupReconcileNoneWithoutResyncWarns(t *testing.T) {
-	ctx := context.Background()
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	bh, err := New(newClientTestStore(t), WithResyncInterval(0), WithLogger(logger))
-	require.NoError(t, err)
-	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, ctrl,
-		WithStartupReconcileStrategy(StartupReconcileNone))
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	require.NoError(t, stop(ctx)) // stop first: run logs the warning during startup
-
-	out := buf.String()
-	assert.Contains(t, out, "no automatic reconcile driver")
-	assert.Contains(t, out, "ListUnsettledIDs")
-	assert.Contains(t, out, "Requeue")
-}
-
-// TestStartupReconcileNoneSelfDrivenRecovery exercises the recipe the
-// StartupReconcileNone godoc hands the embedder who takes over recovery:
-// Store.ListUnsettledIDs reports exactly the objects owed a pass, and
-// Client.Requeue dispatches one. It is what makes honoring the opt-out reasonable
-// rather than a config with no correct use, so it is pinned as public surface: if
-// either primitive stops being reachable or stops reporting the unconverged row,
-// the documented escape hatch is gone.
-func TestStartupReconcileNoneSelfDrivenRecovery(t *testing.T) {
+// TestSelfDrivenRecovery pins the primitives an embedder uses to drive reconciles
+// on its own schedule: Store.ListUnsettledIDs reports exactly the objects owed a
+// pass, and Client.Requeue dispatches one. Startup now drains owed work itself, so
+// this is no longer the *only* way such an object gets reconciled — but it stays
+// pinned as public surface, because a deployment that turns every ticker off still
+// needs it for anything that falls behind after startup.
+func TestSelfDrivenRecovery(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	gk := GroupKind{Kind: "Widget"}
@@ -908,16 +840,25 @@ func TestStartupReconcileNoneSelfDrivenRecovery(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	bh, err := New(store, WithResyncInterval(0))
+	bh, err := New(store, WithCatchupInterval(0), WithResyncInterval(0))
 	require.NoError(t, err)
 	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, gk, ctrl, WithStartupReconcileStrategy(StartupReconcileNone))
+	_, err = Register(bh, gk, ctrl, WithStartupResync(false))
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
+
+	// Startup drains owed work regardless of the resync choice, so consume that
+	// dispatch first — otherwise it, not the requeue below, could satisfy the
+	// assertion.
+	select {
+	case <-ctrl.reconciled:
+	case <-time.After(testTimeout):
+		t.Fatal("startup did not drain the owed object")
+	}
 
 	// The embedder's own backstop, on whatever schedule it likes.
 	ids, err := store.ListUnsettledIDs(ctx, gk)
@@ -933,47 +874,42 @@ func TestStartupReconcileNoneSelfDrivenRecovery(t *testing.T) {
 	}
 }
 
-// TestStartupReconcileSkipsSettled verifies that the non-default strategies do
-// not reconcile a settled object at startup. allIDsStore reports the object via
-// ListIDs but not ListUnsettledIDs, so StartupReconcileUnsettled (empty unsettled
-// set) and StartupReconcileNone (no startup pass) both leave it untouched.
-func TestStartupReconcileSkipsSettled(t *testing.T) {
-	for _, strategy := range []StartupReconcileStrategy{StartupReconcileUnsettled, StartupReconcileNone} {
-		t.Run(fmt.Sprintf("strategy=%d", strategy), func(t *testing.T) {
-			reconciled := make(chan ObjectID, 1)
-			adapter := &fakeAdapter{
-				reconcileFn: func(_ context.Context, id ObjectID) (Result, error) {
-					select {
-					case reconciled <- id:
-					default:
-					}
-					return Result{}, nil
-				},
-			}
-			r := &reconciler{
-				adapter:          adapter,
-				store:            &allIDsStore{ids: []ObjectID{7}},
-				work:             newWorkQueue(),
-				resyncInterval:   0,
-				maxRetryInterval: time.Second,
-				startupReconcile: strategy,
-				backoffFor:       make(map[ObjectID]time.Duration),
-			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			done := runInBackground(r, ctx)
-
+// TestStartupResyncDisabledSkipsSettled is the unit-level twin of the
+// store-backed TestStartupResyncReconcilesSettled: allIDsStore reports the object
+// via ListIDs but not via any owed-work listing, so with the startup resync off
+// nothing enqueues it — the owed-work drain has nothing to drain.
+func TestStartupResyncDisabledSkipsSettled(t *testing.T) {
+	reconciled := make(chan ObjectID, 1)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) (Result, error) {
 			select {
-			case got := <-reconciled:
-				t.Fatalf("settled object %d reconciled despite strategy %d", got, strategy)
-			case <-time.After(200 * time.Millisecond):
+			case reconciled <- id:
+			default:
 			}
-
-			cancel()
-			waitClosed(t, done, "run to return after cancel")
-		})
+			return Result{}, nil
+		},
 	}
+	r := &reconciler{
+		adapter:          adapter,
+		store:            &allIDsStore{ids: []ObjectID{7}},
+		work:             newWorkQueue(),
+		maxRetryInterval: time.Second,
+		startupResync:    false,
+		backoffFor:       make(map[ObjectID]time.Duration),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(r, ctx)
+
+	select {
+	case got := <-reconciled:
+		t.Fatalf("settled object %d reconciled with the startup resync off", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	cancel()
+	waitClosed(t, done, "run to return after cancel")
 }
 
 // TestEnqueueNilStoreNoop verifies the enqueue helpers are no-ops (no panic)
@@ -1056,7 +992,7 @@ func TestEnqueuePendingWake(t *testing.T) {
 // the suite green. Owed wakes ride the catchup tick, not resync — a wake is
 // recorded work, which is what catchup exists to drain.
 //
-// StartupReconcileNone plus a store that withholds its owed IDs until the second
+// A disabled startup resync plus a store that withholds its owed IDs until the second
 // listing means neither the startup pass nor any other backstop can be what
 // enqueues the object — only a tick can.
 func TestCatchupTickEnqueuesPendingWake(t *testing.T) {
@@ -1078,7 +1014,7 @@ func TestCatchupTickEnqueuesPendingWake(t *testing.T) {
 		work:             newWorkQueue(),
 		catchupInterval:  time.Millisecond, // the tick is the code under test
 		maxRetryInterval: time.Second,
-		startupReconcile: StartupReconcileNone,
+		startupResync:    false,
 		backoffFor:       make(map[ObjectID]time.Duration),
 	}
 
@@ -2509,7 +2445,7 @@ func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore))
 		WithCatchupInterval(10*time.Millisecond))
 	require.NoError(t, err)
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
-		WithStartupReconcileStrategy(StartupReconcileNone))
+		WithStartupResync(false))
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -2517,7 +2453,7 @@ func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore))
 	t.Cleanup(func() { stop(context.Background()) })
 
 	// The startup pass runs enqueuePendingWake unconditionally; the unsettled
-	// listing only arrives via a tick under StartupReconcileNone, so waiting on
+	// listing only arrives via a tick with the startup resync off, so waiting on
 	// the wake signal is what proves startup is behind us.
 	select {
 	case <-store.wakeListed:
@@ -2609,7 +2545,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (ObjectID, <-chan ObjectID)
 	reconciled := make(chan ObjectID, 4)
 	bh, err := New(store, WithCatchupInterval(0), WithGCInterval(0))
 	require.NoError(t, err)
-	opts = append(opts, WithStartupReconcileStrategy(StartupReconcileNone))
+	opts = append(opts, WithStartupResync(false))
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
 	require.NoError(t, err)
 
@@ -2649,4 +2585,88 @@ func TestDefaultConfigDoesNotFullPass(t *testing.T) {
 		t.Fatalf("settled object %d was re-dispatched: the full pass is not opt-in", got)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// newStartupHarness starts a control plane with every periodic driver off, so the
+// startup pass is the only thing that can dispatch anything. seed runs before
+// Start. It returns the ids the controller reconciled, collected until the
+// channel is quiet.
+func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option) []ObjectID {
+	t.Helper()
+	ctx := context.Background()
+	gk := GroupKind{Kind: "Widget"}
+
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	seed(store, gk)
+
+	reconciled := make(chan ObjectID, 8)
+	bh, err := New(store, WithCatchupInterval(0), WithResyncInterval(0), WithGCInterval(0))
+	require.NoError(t, err)
+	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+
+	var got []ObjectID
+	for {
+		select {
+		case id := <-reconciled:
+			got = append(got, id)
+		case <-time.After(200 * time.Millisecond):
+			return got
+		}
+	}
+}
+
+// TestStartupAlwaysDrainsOwedWork pins that startup resumes work the store has
+// recorded as owed regardless of the resync choice. Declining it is not a
+// cheapness knob — an object a previous process left unconverged, or one owed a
+// durable wake, is *already* owed a pass, and with every ticker off nothing else
+// will ever run it. The knob governs only the full re-confirm pass below.
+func TestStartupAlwaysDrainsOwedWork(t *testing.T) {
+	ctx := context.Background()
+	var unsettled ObjectID
+	got := newStartupHarness(t, func(s Store, gk GroupKind) {
+		// Unconverged: observed_generation NULL, as a crash mid-reconcile leaves it.
+		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		unsettled = raw.ID
+	}, WithStartupResync(false))
+
+	assert.Equal(t, []ObjectID{unsettled}, got,
+		"owed work must be resumed even when the full startup pass is declined")
+}
+
+// TestStartupResyncReconcilesSettled is the other half: the knob's actual job is
+// the *settled* objects, which no owed-work listing can see. That pass is what
+// re-confirms process-scoped state a restart invalidated.
+func TestStartupResyncReconcilesSettled(t *testing.T) {
+	ctx := context.Background()
+	var settled ObjectID
+	seed := func(s Store, gk GroupKind) {
+		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		_, err = s.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		require.NoError(t, err)
+		settled = raw.ID
+	}
+
+	t.Run("enabled reconciles it", func(t *testing.T) {
+		got := newStartupHarness(t, seed, WithStartupResync(true))
+		assert.Equal(t, []ObjectID{settled}, got)
+	})
+
+	t.Run("disabled leaves it alone", func(t *testing.T) {
+		got := newStartupHarness(t, seed, WithStartupResync(false))
+		assert.Empty(t, got, "a settled object is owed nothing")
+	})
+
+	t.Run("defaults to enabled", func(t *testing.T) {
+		got := newStartupHarness(t, seed)
+		assert.Equal(t, []ObjectID{settled}, got, "the safe default holds without the option")
+	})
 }

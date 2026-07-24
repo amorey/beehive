@@ -144,51 +144,6 @@ func resolveEvents(opts []EventOption) storeapi.EventQuery {
 	return q
 }
 
-// StartupReconcileStrategy selects which objects a controller reconciles once at
-// startup. The zero value is StartupReconcileAll, so the safe default holds for a
-// controller that never sets it.
-//
-// It governs the spec-convergence pass only. In-progress deletions and objects owed
-// a durable dependency wake are resumed at startup under every strategy, including
-// StartupReconcileNone: those are store bookkeeping rather than spec convergence —
-// a half-deleted row RESTRICT-blocks its owner until collected, and an owed wake was
-// explicitly stamped — so an embedder driving its own reconciles is not expected to
-// know about them.
-type StartupReconcileStrategy int
-
-const (
-	// StartupReconcileAll reconciles every object at startup, settled or not. The
-	// full pass re-confirms process-scoped state such as liveness conditions,
-	// which read as "verifying" after a restart until a controller rewrites them.
-	StartupReconcileAll StartupReconcileStrategy = iota
-	// StartupReconcileUnsettled reconciles only objects whose spec has not yet
-	// converged — cheaper, but leaves process-scoped state unconfirmed until some
-	// other event wakes the object. This is the pass that resumes an object a
-	// previous process left unconverged (crashed mid-reconcile, or created and
-	// never settled), so it is the cheapest strategy that still recovers on restart.
-	StartupReconcileUnsettled
-	// StartupReconcileNone does no startup reconcile at all, leaving live events
-	// and the periodic resync as the only drivers.
-	//
-	// Combined with a disabled resync (WithResyncInterval(0)) it leaves no automatic
-	// driver for spec convergence whatsoever: an object a previous process left
-	// unconverged is *not* resumed, and its spec is never actuated unless something
-	// requeues it. That combination is supported, for an embedder that wants to
-	// drive reconciles on its own schedule rather than beehive's — the store's
-	// ListUnsettledIDs reports exactly the objects owed a pass, and Client.Requeue
-	// dispatches one:
-	//
-	//	ids, err := store.ListUnsettledIDs(ctx, gk)
-	//	for _, id := range ids {
-	//		err := client.Requeue(ctx, id)
-	//	}
-	//
-	// Because the failure mode when it is reached by accident is silent, a
-	// controller starting in that configuration logs a warning naming it. Choose
-	// StartupReconcileUnsettled instead if you did not mean to take over recovery.
-	StartupReconcileNone
-)
-
 // createOptions collects the per-object settings the create-time options apply.
 // Client.Create builds one, runs the options against it, and folds the result
 // into the new row (slug/finalizers) and its owner ref.
@@ -372,17 +327,31 @@ func WithMigrator(m Migrator) Option {
 	}
 }
 
-// WithStartupReconcileStrategy sets which objects a controller reconciles at
-// startup (see StartupReconcileStrategy). The default is StartupReconcileAll.
-// Passed to New it sets the default for all controllers; passed to Register it
-// overrides that default for one.
-func WithStartupReconcileStrategy(s StartupReconcileStrategy) Option {
+// WithStartupResync sets whether a controller re-dispatches *every* object once
+// at startup, converged ones included. The default is true.
+//
+// The pass re-confirms process-scoped state that a restart invalidated — liveness
+// conditions, for instance, read as "verifying" until a controller in this process
+// rewrites them — which no owed-work listing can see, because nothing in the store
+// records it as outstanding.
+//
+// It does not govern work that *is* recorded as owed. An object whose spec has not
+// converged, and one owed a durable dependency wake, are resumed at startup either
+// way: they are already owed a pass, and declining them is a correctness hole
+// rather than a saving. In-progress deletions are likewise resumed, by the GC
+// sweeper's own startup pass.
+//
+// Set it false for a large object set where the re-confirm is not worth its cost,
+// or where the embedder drives its own reconciles. Passed to New it sets the
+// default for all controllers; passed to Register it overrides that default for
+// one.
+func WithStartupResync(enabled bool) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.startupReconcile = s
+			t.startupResync = enabled
 		case *reconciler:
-			t.startupReconcile = s
+			t.startupResync = enabled
 		}
 		return nil
 	}

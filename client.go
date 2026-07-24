@@ -168,10 +168,10 @@ type Client[Spec, Status any] interface {
 	// synchronous run: with the periodic resync enabled, correctness rests on that,
 	// not on this call.
 	//
-	// It is also the supported way to drive reconciles yourself when there is no
-	// resync to rest on — StartupReconcileNone with WithResyncInterval(0), where
-	// beehive resumes nothing and Store.ListUnsettledIDs reports what is owed. See
-	// StartupReconcileNone.
+	// It is also the supported way to drive reconciles yourself when no ticker is
+	// configured — WithCatchupInterval(0) with WithResyncInterval(0), where startup
+	// drains owed work once and nothing re-derives it afterward.
+	// Store.ListUnsettledIDs reports what is owed.
 	//
 	// By default it preserves id's retry backoff ladder: a requeue is the common
 	// event-driven nudge (config change, dependency update, manual poke) and

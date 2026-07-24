@@ -447,7 +447,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{},
-		WithStartupReconcileStrategy(StartupReconcileNone))
+		WithStartupResync(false))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -843,7 +843,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	// The controller clears "gate" once the object is finalizing, which is the step
 	// only a reconcile can take.
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{finalizer: "gate"},
-		WithStartupReconcileStrategy(StartupReconcileNone))
+		WithStartupResync(false))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)

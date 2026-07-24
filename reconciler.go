@@ -191,8 +191,9 @@ type reconciler struct {
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
 	concurrency       int           // number of concurrent worker goroutines; 0/1 = single-threaded
-	// startupReconcile selects which objects get an initial reconcile when run starts.
-	startupReconcile StartupReconcileStrategy
+	// startupResync selects whether run also re-dispatches settled objects at
+	// startup; owed work is drained regardless.
+	startupResync bool
 	// migrator is the per-kind schema-version converter set by WithMigrator at
 	// Register; Register copies it into bh.migrators so the client path shares it.
 	// nil when the kind opted out.
@@ -235,7 +236,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 // commit and the dispatch leaves a stranded dependent nothing else re-checks.
 // Run unconditionally at startup (like deletion-pending, not gated by the spec
 // strategy): a wake owed is a specific known-owed reconcile, orthogonal to spec
-// convergence, so StartupReconcileNone must not suppress it.
+// convergence, so declining the startup resync must not suppress it.
 func (r *reconciler) enqueuePendingWake(ctx context.Context) {
 	if r.store == nil {
 		return
@@ -433,47 +434,23 @@ func (r *reconciler) run(ctx context.Context) {
 	if r.logger == nil {
 		r.logger = discardLogger
 	}
-	// StartupReconcileNone with the resync disabled leaves no automatic driver for
-	// spec convergence at all: enqueueUnsettled runs neither here nor on a tick, so
-	// an object a previous process left unconverged stays that way until something
-	// external requeues it. That is a supported configuration — the embedder drives
-	// reconciles on its own schedule via Store.ListUnsettledIDs + Client.Requeue —
-	// but it must not be *silent*, because the failure mode if it was reached by
-	// accident is a spec that is simply never actuated, with nothing to notice it.
-	// Warn rather than reject: the combination is deliberate for the embedder who
-	// wants it, and rejecting it would also force a periodic full-table sweep on
-	// the caller who explicitly asked for no timers.
-	if r.startupReconcile == StartupReconcileNone && r.resyncInterval <= 0 {
-		r.logger.WarnContext(ctx, "no automatic reconcile driver: startup reconcile is None and resync is disabled, so objects left unconverged by a previous process are not resumed; drive them with Store.ListUnsettledIDs + Client.Requeue",
-			"group", r.gk.Group, "kind", r.gk.Kind)
-	}
-	// Reconcile objects once at startup per the configured strategy. The default
-	// (StartupReconcileAll) re-applies persisted specs that a previous run left
-	// settled and gives controllers a chance to re-confirm process-scoped state
-	// (e.g. liveness conditions, which read as "verifying" until rewritten in this
-	// process). Resync ticks stay unsettled-only; staleness is purely a startup
-	// concern.
-	switch r.startupReconcile {
-	case StartupReconcileNone:
-		// No startup pass; live events, and whatever the embedder requeues itself,
-		// are the only drivers (plus the periodic resync when one is configured).
-	case StartupReconcileUnsettled:
-		r.enqueueUnsettled(ctx)
-	default: // StartupReconcileAll
+	// Drain the work the store records as owed, always: an object whose spec never
+	// converged (crashed mid-reconcile, or created and never settled) and one owed a
+	// durable dependency wake are both *already* owed a pass, so declining them is a
+	// correctness hole rather than a saving. In-progress deletions are the GC
+	// sweeper's, whose own unconditional startup pass routes them — a registered kind
+	// enqueued so its controller can clear finalizers, a client-only kind collected
+	// directly (see sweepDeletionPending). Doing that here too meant a per-kind
+	// listing that only duplicated what the sweeper had to do cross-kind.
+	r.enqueueCatchup(ctx)
+	// The startup resync is the part that is a choice: a full pass re-confirms
+	// process-scoped state a restart invalidated (liveness conditions read as
+	// "verifying" until this process rewrites them), which no owed-work listing can
+	// see. enqueueAll is a superset of the catchup set, so the overlap above is
+	// coalesced by the work queue rather than reconciled twice.
+	if r.startupResync {
 		r.enqueueAll(ctx)
 	}
-	// Always resume owed dependency wakes at startup, independent of the spec
-	// strategy above: a process that crashed owing one must still deliver it. That
-	// is store bookkeeping rather than spec convergence — the wake was explicitly
-	// stamped — so it is not the embedder's to drive even under None. The work
-	// queue's set semantics coalesce any overlap with the pass above.
-	//
-	// In-progress deletions are *not* resumed here. They are the GC sweeper's, whose
-	// own unconditional startup pass routes them: a registered kind is enqueued so
-	// its controller can clear finalizers, a client-only kind collected directly
-	// (see sweepDeletionPending). Doing it in both places meant a per-kind listing
-	// that only ever duplicated what the sweeper already had to do cross-kind.
-	r.enqueuePendingWake(ctx)
 
 	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup

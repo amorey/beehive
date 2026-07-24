@@ -67,8 +67,9 @@ type Beehive struct {
 	// Zero on both disables the sweep — the log grows unbounded until configured.
 	eventRetentionPerObject int
 	eventRetentionMaxAge    time.Duration
-	// startupReconcile is the default startup strategy copied into each reconciler.
-	startupReconcile StartupReconcileStrategy
+	// startupResync is the default startup full-pass choice copied into each
+	// reconciler. Its zero value is false, so New sets the true default explicitly.
+	startupResync bool
 	// logger and logLevel are the user-supplied logging config (nil logger =
 	// disabled). They stay raw until Start resolves them via resolveLogger; each
 	// reconciler inherits them as its own default (see Register).
@@ -144,8 +145,8 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// loop: a controller's startup reconcile can modify a target the instant it
 	// runs, and that Modified event must not be published before the relevant
 	// waker is listening — otherwise dependents go unwoken under configurations
-	// that rely on dependency events (e.g. a dependent with StartupReconcileNone
-	// and resync disabled). A subscribe failure is non-fatal: that controller
+	// that rely on dependency events (e.g. a settled dependent, which no owed-work
+	// listing can see, with every ticker disabled). A subscribe failure is non-fatal: that controller
 	// still resyncs on its own timer.
 	for _, r := range bh.order {
 		w, err := bh.store.WatchChanges(runCtx, r.gk)
@@ -341,6 +342,7 @@ func (bh *Beehive) stop(ctx context.Context) error {
 func New(s Store, opts ...Option) (*Beehive, error) {
 	bh := &Beehive{
 		store:           s,
+		startupResync:   true,
 		catchupInterval: defaultCatchupInterval,
 		resyncInterval:  defaultResyncInterval,
 		gcInterval:      defaultGCInterval,
@@ -379,7 +381,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
 		concurrency:      bh.concurrency,
-		startupReconcile: bh.startupReconcile,
+		startupResync:    bh.startupResync,
 		backoffFor:       make(map[ObjectID]time.Duration),
 		// Inherit the control plane's logging config as the default; the options
 		// below may override it for this controller.
