@@ -330,6 +330,14 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watch
 			return
 		case ev, ok := <-w.Changes():
 			if !ok {
+				// Stop closes the stream by cancelling this same ctx, so on shutdown
+				// both select arms are ready at once and Go may pick this one. Re-check
+				// before calling it a loss: escalating here would arm every later tick
+				// of a control plane that is going away, on a stream that ended
+				// normally.
+				if ctx.Err() != nil {
+					return
+				}
 				// The stream ended without the control plane stopping (that arrives on
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, so every
 				// future change on this kind now reaches no dependent at all.
