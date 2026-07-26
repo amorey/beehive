@@ -737,6 +737,29 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	waitClosed(t, done, "waker to exit")
 }
 
+// depsStore returns a fixed dependent set from ListIncomingRefs, so a test can
+// control the exact edges — and their order — that wakeDependents walks.
+type depsStore struct {
+	fakeStore
+	deps []Referrer
+}
+
+func (s *depsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
+	return s.deps, nil
+}
+
+// wakerFixture builds a Beehive whose store reports deps and whose reconcilers
+// are real enough to enqueue: one per kind, each with its own work queue, so a
+// caller can assert which kind's queue a wake landed in. newWorkQueue leaves
+// onSchedule nil, so nothing reaches the reconcilers' unset scheduleHub.
+func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]*reconciler) {
+	rs := make(map[GroupKind]*reconciler, len(kinds))
+	for _, gk := range kinds {
+		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
+	}
+	return &Beehive{store: &depsStore{deps: deps}, reconcilers: rs}, rs
+}
+
 // errDepsStore returns an error from ListIncomingRefs.
 type errDepsStore struct{ fakeStore }
 
