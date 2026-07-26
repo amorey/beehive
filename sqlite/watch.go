@@ -220,12 +220,15 @@ func (s *sqliteStore) emit(ctx context.Context, typ storeapi.ChangeType, raw *st
 	s.publish(gk, ev)
 }
 
-// publish sends ev to gk's hub, keyed by object id so per-object updates
-// coalesce. Send never blocks; a closed hub drops it.
+// publish sends ev to gk's hub and to the store-wide changeHub, keyed by object
+// id so per-object updates coalesce in both. Send never blocks; a closed hub
+// drops it, which is also what makes the unguarded changeHub send safe after
+// Close.
 func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawChange) {
 	if h := s.hubFor(gk); h != nil {
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
+	_ = s.changeHub.Sender().Send(ev.Object.ID, ev)
 }
 
 // emitEvent delivers a written run to event-log watchers: queued on the tx

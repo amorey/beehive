@@ -38,9 +38,18 @@ type sqliteStore struct {
 	processStart time.Time
 
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
-	// created lazily on first use. hubMu guards the maps and the closed flag.
+	// created lazily on first use. hubMu guards the maps, changeHub and the
+	// closed flag.
 	hubMu sync.RWMutex
 	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]
+	// changeHub is the store-wide twin of hubs: every object change, of every
+	// kind, keyed by the same globally unique ObjectID and coalesced by the same
+	// mergeChange. The dependency waker subscribes to it once instead of once per
+	// registered kind, which is the only way a target of a kind with no
+	// controller is observed at all. Created eagerly in open — there is exactly
+	// one and no key to look it up by, so making it lazy would cost the publish
+	// path (which runs on every object write) a second lock and map lookup.
+	changeHub *conflate.Hub[storeapi.ObjectID, storeapi.RawChange]
 	// eventHubs fan the event log out, one per GroupKind, keyed by run so a run's
 	// count-bumps conflate while distinct runs stay separate (see eventKey).
 	eventHubs map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]
@@ -84,6 +93,7 @@ func (s *sqliteStore) Close() error {
 		for _, h := range s.eventHubs {
 			h.Close()
 		}
+		s.changeHub.Close()
 		s.hubs = nil
 		s.eventHubs = nil
 	}

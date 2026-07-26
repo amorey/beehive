@@ -1113,3 +1113,34 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 	}))
 	assert.Equal(t, beehive.Added, seen.Type, "the hook must observe the already-published event")
 }
+
+// TestPublishReachesGlobalHub verifies every object write also lands on the
+// store-wide change hub, whatever its kind: it is the single stream the
+// dependency waker subscribes to, so a kind missing from it is a kind whose
+// dependents never wake.
+func TestPublishReachesGlobalHub(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	rx := store.changeHub.Receiver()
+	defer rx.Close()
+
+	first, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	otherGK := beehive.GroupKind{Kind: "Other"}
+	second, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	got := map[storeapi.ObjectID]storeapi.ChangeType{}
+	for range 2 {
+		ev, err := rx.Recv()
+		require.NoError(t, err)
+		got[ev.Key] = ev.Value.Type
+	}
+	assert.Equal(t, map[storeapi.ObjectID]storeapi.ChangeType{
+		first.ID:  beehive.Added,
+		second.ID: beehive.Added,
+	}, got, "both kinds reach the one global hub")
+}

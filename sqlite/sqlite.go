@@ -61,6 +61,7 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		processStart: fromMillis(toMillis(time.Now().UTC())),
 		hubs:         make(map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]),
 		eventHubs:    make(map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]),
+		changeHub:    conflate.New[storeapi.ObjectID](mergeChange),
 		done:         make(chan struct{}),
 	}, nil
 }
