@@ -17,6 +17,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1299,4 +1300,48 @@ func TestWatchChangeRefsCapsBatch(t *testing.T) {
 	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
 	assert.Len(t, recvBatch(t, w), changeRefBatchCap)
 	assert.Len(t, recvBatch(t, w), extra)
+}
+
+// TestWatchChangeRefsCoalescesRepeatWrites verifies the batch is drained from
+// the receiver, not from a buffer in front of it: repeated writes to one object
+// merge into its pending slot, so a hot object costs one entry per batch rather
+// than one per write. This is the property a buffered out channel would lose —
+// once a value has left the receiver it can no longer coalesce.
+func TestWatchChangeRefsCoalescesRepeatWrites(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedChangeRefStream(t, store)
+
+	obj, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	for i := range 5 {
+		_, _, err := store.UpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		require.NoError(t, err)
+	}
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	assert.Equal(t, []storeapi.ChangeRef{{ID: obj.ID, Type: beehive.Added}}, recvBatch(t, w),
+		"one create plus five updates conflate to one entry, still Added to a consumer that never saw it")
+	assertNoBatch(t, w, 200*time.Millisecond) // and nothing trails behind it
+}
+
+// TestWatchChangeRefsAnnihilatesTransient verifies an object born and deleted
+// while the consumer was behind produces nothing at all: it has no dependents
+// left to wake, and a lone tombstone would be pure noise. This is what bounds a
+// slow consumer's memory by the live key set rather than by churn.
+func TestWatchChangeRefsAnnihilatesTransient(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedChangeRefStream(t, store)
+
+	transient, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	require.NoError(t, store.DeleteObject(ctx, transient.ID))
+	survivor, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	assert.Equal(t, []storeapi.ChangeRef{{ID: survivor.ID, Type: beehive.Added}}, recvBatch(t, w),
+		"the transient object is dropped entirely")
+	assertNoBatch(t, w, 200*time.Millisecond)
 }
