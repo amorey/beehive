@@ -821,6 +821,55 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
+// TestSelfDependentObjectWakesOnSpecChange is the guard's safety argument, run
+// rather than asserted: a self-dependency can only mean "requeue me when I
+// change", and skipping the self-wake is safe because a spec write already
+// requeues the object through wakeAfterCommit, independently of any edge.
+//
+// It cannot detect a guard mis-implemented as a self-edge filter in
+// ListIncomingRefs — that path never consults refs, so this test stays green
+// while the read API silently loses the edge. TestClientListDependentsIncludesSelfEdge
+// is what catches that; this one only pins the wake.
+func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	reconciled := make(chan ObjectID, 8)
+	// Resync off: an arriving pass must be the write's own wake, not a tick.
+	_, err = Register(bh, gk, &idCapture{ch: reconciled},
+		WithResyncInterval(0), WithConcurrency(1))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, gk)
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.NoError(t, addRef(ctx, store, obj.ID, obj.ID, RelationDependsOn))
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+	require.Equal(t, obj.ID, recv(t, reconciled), "startup pass")
+
+	// A changed spec: the write must not be suppressed as an identical-byte no-op,
+	// or nothing would wake it and the test would pass for the wrong reason.
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+
+	assert.Equal(t, obj.ID, recv(t, reconciled), "a spec write wakes it without the self-edge")
+}
+
+// idCapture reports the id of each object it reconciles. It is cSpec-typed
+// because tSpec is empty, which would make every Update a byte-identical no-op.
+type idCapture struct{ ch chan ObjectID }
+
+func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+	c.ch <- obj.ID
+	return Result{}, nil
+}
+
 // errDepsStore returns an error from ListIncomingRefs.
 type errDepsStore struct{ fakeStore }
 
