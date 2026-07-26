@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -3385,4 +3386,54 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	require.NoError(t, err)
 	_, err = store.GetObject(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")
+}
+
+// TestSubscribeFailureReportsWholeProcess pins the blast radius the single
+// store-wide stream created. With a waker per registered kind, a failed
+// subscribe cost one kind's wakes and the message named that kind; there is now
+// one stream, so a failure costs every kind's — and an operator reading "for
+// this kind" would go looking for a scope that no longer exists. Two registered
+// kinds, one message, no kind named, and both reconcilers escalated.
+func TestSubscribeFailureReportsWholeProcess(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh, err := New(&watcherStore{err: errBoom}, WithLogger(logger))
+	require.NoError(t, err)
+	for _, kind := range []string{"Widget", "Gadget"} {
+		_, err := Register(bh, GroupKind{Kind: kind}, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+	}
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stop(context.Background()))
+
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "dependency waker subscription failed"),
+		"one stream, one warning — not one per registered kind")
+	assert.Contains(t, out, "for any kind", "the consequence is process-wide, so say so")
+	assert.NotContains(t, out, "kind=Widget", "there is no per-kind scope left to name")
+	for gk, r := range bh.reconcilers {
+		assert.True(t, r.resyncAlways.Load(), "every kind's later ticks are escalated: %v", gk)
+	}
+}
+
+// TestDeadWakerReportsWholeProcess is the same blast radius on the other loss
+// point: a stream that ends is the process's only stream, so no kind gets
+// dependency wakes again.
+func TestDeadWakerReportsWholeProcess(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeChangeRefWatcher()
+	bh := &Beehive{store: &watcherStore{refs: fw}, logger: logger}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), fw)
+		close(done)
+	}()
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+
+	out := buf.String()
+	assert.Contains(t, out, "for every kind")
+	assert.NotContains(t, out, "group=", "there is no per-kind scope left to name")
 }
