@@ -60,7 +60,7 @@ tell "we decided against this for now" from "nobody thought of it."
   dispatchable under any sane throttle.) `TestWakeDependentsTwoCycle` pins the
   waker's both-directions behaviour but is not the record either: it drives edges
   through a fake, so declare-time rejection never reaches it, and its wakes are
-  all first wakes. Specced in `specs/waker-cycle-spin.md`.
+  all first wakes.
 
 - **`DeleteBySlug` on an absent slug costs a write transaction** — known, not fixed.
   `RequestDeletionBySlug` opens `Within` (so `BEGIN IMMEDIATE`) and its first act

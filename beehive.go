@@ -402,7 +402,8 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 			// Self-edge: nothing here is owed a wake. A spec write requeues through
 			// wakeAfterCommit; a status or condition write is this object's own pass,
 			// which just ran. Waking it re-enqueues at full speed with nothing to
-			// converge it — see specs/waker-cycle-spin.md.
+			// converge it. Cycles of two or more still do; see the cycle entry in
+			// TODO.md.
 			continue
 		}
 		bh.enqueueIfRegistered(d.GroupKind(), d.ID)

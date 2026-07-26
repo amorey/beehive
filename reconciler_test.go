@@ -764,8 +764,8 @@ func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]
 // itself is woken by its own Modified, and the wake is what caused the write, so
 // nothing converges it. There is no tick, no backoff and no already-settled skip
 // on the path — the object is settled throughout, so every convergence signal
-// reports it as fine while it reconciles at full speed. See
-// specs/waker-cycle-spin.md.
+// reports it as fine while it reconciles at full speed. The cycle entry in
+// TODO.md covers the shape this guard does not fix.
 func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, rs := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
