@@ -1389,6 +1389,11 @@ func TestMarkOwnedForDeletionCascadesThenIsNoOp(t *testing.T) {
 
 // MarkOwnedForDeletion's child lookup must ride the idx_refs_to index, not scan
 // the refs table — that index alignment is the point of the single-query cascade.
+// COVERING is asserted too: refs is WITHOUT ROWID, so idx_refs_to implicitly
+// carries from_id and the probe never touches the table. That property lives in
+// the table's storage class, not the index definition, so dropping WITHOUT ROWID
+// would give it back with nothing in the schema looking different — this is the
+// only place that would notice.
 func TestMarkOwnedForDeletionUsesRefsIndex(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 	ctx := context.Background()
@@ -1410,7 +1415,8 @@ func TestMarkOwnedForDeletionUsesRefsIndex(t *testing.T) {
 		plan += detail + "\n"
 	}
 	require.NoError(t, rows.Err())
-	assert.Contains(t, plan, "idx_refs_to", "child lookup must use idx_refs_to:\n"+plan)
+	assert.Contains(t, plan, "COVERING INDEX idx_refs_to",
+		"child lookup must use idx_refs_to as a covering index:\n"+plan)
 }
 
 func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
