@@ -1345,3 +1345,65 @@ func TestWatchChangeRefsAnnihilatesTransient(t *testing.T) {
 		"the transient object is dropped entirely")
 	assertNoBatch(t, w, 200*time.Millisecond)
 }
+
+// TestWatchChangeRefsOnClosedStore verifies subscribing after Close fails
+// loudly rather than handing back a stream that can never fire.
+func TestWatchChangeRefsOnClosedStore(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	_, err = store.WatchChangeRefs(context.Background())
+	assert.ErrorIs(t, err, errStoreClosed)
+}
+
+// TestWatchChangeRefsClosesOnStoreClose verifies an open stream ends when the
+// store does, whether its goroutine is parked on a receive or on a send —
+// closing the hub wakes only the former, which is what s.done covers.
+func TestWatchChangeRefsClosesOnStoreClose(t *testing.T) {
+	t.Run("parked on receive", func(t *testing.T) {
+		store, err := OpenMemory()
+		require.NoError(t, err)
+
+		w, err := store.WatchChangeRefs(context.Background())
+		require.NoError(t, err)
+
+		require.NoError(t, store.Close())
+		select {
+		case _, ok := <-w.Batches():
+			assert.False(t, ok, "channel must close when the store closes")
+		case <-time.After(2 * time.Second):
+			t.Fatal("change-ref stream outlived its store")
+		}
+	})
+
+	t.Run("parked on send", func(t *testing.T) {
+		store := newRawStore(t)
+		exited := make(chan struct{})
+		store.afterStream = func() { close(exited) }
+		w := newParkedChangeRefStream(t, store)
+
+		require.NoError(t, store.Close())
+		<-exited
+		_, ok := <-w.Batches()
+		assert.False(t, ok, "channel must close when the store closes mid-send")
+	})
+}
+
+// TestWatchChangeRefsClosesOnCancel verifies the caller's context ends the
+// stream: a Beehive that stops must not leave a waker's goroutine behind.
+func TestWatchChangeRefsClosesOnCancel(t *testing.T) {
+	store := newRawStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w, err := store.WatchChangeRefs(ctx)
+	require.NoError(t, err)
+
+	cancel()
+	select {
+	case _, ok := <-w.Batches():
+		assert.False(t, ok, "channel must close when the caller's context is cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("change-ref stream outlived its context")
+	}
+}
