@@ -798,6 +798,29 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
 }
 
+// TestWakeDependentsTwoCycle records what the guard does *not* fix. Two objects
+// that depend on each other spin exactly as a self-edge did — A's emitted write
+// wakes B, B's wakes A — and nothing excludes them. See the cycle entry in
+// TODO.md for why that is deferred and what would fix it.
+//
+// This is not that entry's tripwire, and must not be mistaken for one: it
+// asserts ordinary waker behaviour that both candidate fixes preserve. A
+// declare-time reachability check never reaches here (the edges come from a
+// fake, not from AddDependency — TestAddDependencyAcceptsCycle is that
+// tripwire), and a work-queue rate limiter leaves a first wake immediately
+// dispatchable, which is all this test does.
+func TestWakeDependentsTwoCycle(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+
+	bhA, rsA := wakerFixture([]Referrer{{ID: 2, Kind: "Widget"}}, gk)
+	bhA.wakeDependents(context.Background(), 1)
+	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
+
+	bhB, rsB := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
+	bhB.wakeDependents(context.Background(), 2)
+	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
+}
+
 // errDepsStore returns an error from ListIncomingRefs.
 type errDepsStore struct{ fakeStore }
 

@@ -402,6 +402,37 @@ func TestControllerClientAddDependencyIsTransactional(t *testing.T) {
 		"AddDependency must wrap its endpoint check + insert in one transaction")
 }
 
+// TestAddDependencyAcceptsCycle records that beehive lets a caller declare a
+// cycle. It is the tripwire for the deferred fix in TODO.md's cycle entry: the
+// candidate that rejects a cycle-closing edge at declare time would make one of
+// these calls start returning an error, so whoever builds it trips a test that
+// states today's answer rather than discovering it.
+//
+// The waker's own cycle test cannot serve here — it drives edges through a fake,
+// so a declare-time check is invisible to it.
+//
+// A zero targetResourceVersion is "no opinion", which keeps this about acceptance
+// of the edge and out of the raced-declare guard's way.
+func TestAddDependencyAcceptsCycle(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+	client := NewClient[tSpec, tStatus](bh, gk)
+	a, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	b, err := client.Create(ctx, tSpec{})
+	require.NoError(t, err)
+
+	require.NoError(t, cc.AddDependency(ctx, a.ID, b.ID, 0))
+	require.NoError(t, cc.AddDependency(ctx, b.ID, a.ID, 0), "a cycle-closing edge is accepted today")
+	require.NoError(t, cc.AddDependency(ctx, a.ID, a.ID, 0), "and so is a self-edge")
+}
+
 // declareFixture is the shared setup for the targetResourceVersion tests: a
 // running control plane, a dependent, and a target.
 //
