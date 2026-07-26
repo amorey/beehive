@@ -760,6 +760,44 @@ func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]
 	return &Beehive{store: &depsStore{deps: deps}, reconcilers: rs}, rs
 }
 
+// TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
+// itself is woken by its own Modified, and the wake is what caused the write, so
+// nothing converges it. There is no tick, no backoff and no already-settled skip
+// on the path — the object is settled throughout, so every convergence signal
+// reports it as fine while it reconciles at full speed. See
+// specs/waker-cycle-spin.md.
+func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	bh, rs := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
+}
+
+// TestWakeDependentsSkipsSelfEdgeOnly pins the guard's shape, not just its
+// effect: written as a return it would drop every dependent listed after the
+// self-edge, and the self-edge's position is the store's to choose, not the
+// caller's. The second kind covers enqueueIfRegistered's routing — a wake goes to
+// the dependent's own reconciler, so asserting one queue would let a same-kind
+// answer pass for a routed one.
+func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+	gadget := GroupKind{Kind: "Gadget"}
+	// The self-edge is first: a return guard drops the two behind it.
+	deps := []Referrer{
+		{ID: 1, Kind: "Widget"},
+		{ID: 2, Kind: "Widget"},
+		{ID: 3, Kind: "Gadget"},
+	}
+	bh, rs := wakerFixture(deps, widget, gadget)
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
+	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
+}
+
 // errDepsStore returns an error from ListIncomingRefs.
 type errDepsStore struct{ fakeStore }
 
