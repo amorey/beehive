@@ -229,9 +229,6 @@ func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error)
 func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
 }
-func (s *fakeStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
-	return noopWatcher{}, nil
-}
 func (s *fakeStore) WatchChangeRefs(context.Context) (storeapi.ChangeRefWatcher, error) {
 	return noopChangeRefWatcher{}, nil
 }
@@ -264,9 +261,6 @@ func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, err
 	return s.w, s.err
 }
 func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
-	return s.w, s.err
-}
-func (s *watcherStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
 }
 func (s *watcherStore) WatchChangeRefs(context.Context) (ChangeRefWatcher, error) {

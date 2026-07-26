@@ -89,9 +89,9 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 // object that is already covered by the subscriber's snapshot (born in the
 // subscribe→snapshot race window), in which case the consumer must still see the
 // delete. The seenIDs guard in watch() drops tombstones for objects the consumer
-// truly never observed. WatchList/WatchChanges override this with
+// truly never observed. WatchList and WatchChangeRefs override this with
 // annihilatingMerge, which can drop such tombstones early (WatchList preserving
-// snapshot-covered deletes, WatchChanges preserving nothing).
+// snapshot-covered deletes, WatchChangeRefs preserving nothing).
 func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
 	hi := next
 	if prev.Object.ResourceVersion > next.Object.ResourceVersion {
@@ -121,7 +121,7 @@ type snapshotIDs map[storeapi.ObjectID]struct{}
 // blindly: a snapshot-covered object born in the subscribe→snapshot race window
 // also coalesces Added→Deleted, and its delete MUST survive. preserve reports the
 // ids whose delete must be kept; an Added→Deleted pair is annihilated only when
-// preserve is nil (WatchChanges has no snapshot, so nothing is pre-known) or
+// preserve is nil (WatchChangeRefs has no snapshot, so nothing is pre-known) or
 // preserve returns false for the id.
 func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawChange] {
 	return func(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
@@ -295,19 +295,10 @@ func (w *watcherImpl[V]) Batches() <-chan V { return w.out }
 func (w *watcherImpl[V]) Close()            { w.cancel() }
 
 func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
-	return s.watch(ctx, gk, nil, true, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
+	return s.watch(ctx, gk, nil, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
 		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
 			return s.ListObjects(ctx, gk)
 		})
-	})
-}
-
-func (s *sqliteStore) WatchChanges(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
-	// No snapshot, so the dedup floor is 0: a fresh receiver already starts at
-	// the current write position, and resource_version is always >= 1, so every
-	// event the receiver sees is genuinely post-subscribe and nothing is dropped.
-	return s.watch(ctx, gk, nil, false, func(context.Context) ([]*storeapi.RawObject, int64, error) {
-		return nil, 0, nil
 	})
 }
 
@@ -384,7 +375,7 @@ func (s *sqliteStore) WatchChangeRefs(ctx context.Context) (storeapi.ChangeRefWa
 
 func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.Watcher, error) {
 	filterID := id
-	return s.watch(ctx, gk, &filterID, true, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
+	return s.watch(ctx, gk, &filterID, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
 		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
 			raw, err := s.GetObject(ctx, id)
 			if errors.Is(err, storeapi.ErrNotFound) {
@@ -428,15 +419,16 @@ func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context)
 // watch subscribes to gk's hub, loads a snapshot, and returns a Watcher whose
 // stream is the snapshot (as Added events) followed by live events not already
 // covered by the snapshot. filterID, if non-nil, restricts live events to that
-// object. hasSnapshot must be true for WatchList/Watch (which take a real
-// snapshot) and false for WatchChanges (which skip the snapshot entirely).
+// object. Both callers (WatchList and Watch) take a real snapshot; the
+// snapshot-less stream is WatchChangeRefs, which subscribes to the store-wide
+// hub directly and shares none of this.
 //
 // The receiver is created BEFORE the snapshot is loaded so events that commit
 // during the load are buffered, not lost; events whose resource version is at or
 // below the snapshot's global high-water are then dropped as duplicates.
 //
-// When hasSnapshot is true, a seenIDs set tracks which objects the consumer has
-// been told about (via the snapshot or a live Added). It serves two roles:
+// A seenIDs set tracks which objects the consumer has been told about (via the
+// snapshot or a live Added). It serves two roles:
 //   - A race-window Added for object X followed by a post-snapshot Modified
 //     coalesces to Added in the buffer; seenIDs detects that the consumer already
 //     has X from the snapshot and promotes the type to Modified.
@@ -449,7 +441,6 @@ func (s *sqliteStore) watch(
 	ctx context.Context,
 	gk storeapi.GroupKind,
 	filterID *storeapi.ObjectID,
-	hasSnapshot bool,
 	loadSnapshot func(context.Context) ([]*storeapi.RawObject, int64, error),
 ) (storeapi.Watcher, error) {
 	h := s.hubFor(gk)
@@ -460,21 +451,17 @@ func (s *sqliteStore) watch(
 	// would leak as a live hub subscriber that buffers every object forever.
 	//   - Single-object watch: scope the subscription to that id so the receiver
 	//     never buffers unrelated objects (memory bounded by the one id).
-	//   - WatchList/WatchChanges: an annihilating merge so transient objects the
-	//     consumer never saw are dropped at enqueue (memory bounded by the live
-	//     key set, not by the count of distinct deleted ids a slow consumer falls
-	//     behind on). WatchList must preserve snapshot-covered deletes; WatchChanges
-	//     has no snapshot, so it annihilates every unobserved Added→Deleted pair.
+	//   - WatchList: an annihilating merge so transient objects the consumer never
+	//     saw are dropped at enqueue (memory bounded by the live key set, not by
+	//     the count of distinct deleted ids a slow consumer falls behind on), while
+	//     snapshot-covered deletes are preserved.
 	var rx *conflate.Receiver[storeapi.ObjectID, storeapi.RawChange]
 	var seed atomic.Pointer[snapshotIDs] // published to the merge once the snapshot is known
-	switch {
-	case filterID != nil:
+	if filterID != nil {
 		want := *filterID
 		rx = h.Receiver(h.WithKeyFilter(func(id storeapi.ObjectID) bool { return id == want }))
-	case hasSnapshot:
+	} else {
 		rx = h.Receiver(h.WithMerge(annihilatingMerge(snapshotPreserve(&seed))))
-	default:
-		rx = h.Receiver(h.WithMerge(annihilatingMerge(nil)))
 	}
 	if s.beforeSnapshot != nil {
 		s.beforeSnapshot() // test seam: inject events into the subscribe→snapshot window
@@ -488,7 +475,7 @@ func (s *sqliteStore) watch(
 	// object's delete (must survive) from a transient one's (annihilate). Stored
 	// before the stream goroutine starts; concurrent race-window enqueues that ran
 	// while seed was nil kept conservatively and are reconciled at delivery.
-	if hasSnapshot && filterID == nil {
+	if filterID == nil {
 		ids := make(snapshotIDs, len(snapshot))
 		for _, raw := range snapshot {
 			ids[raw.ID] = struct{}{}
@@ -522,12 +509,7 @@ func (s *sqliteStore) watch(
 		}
 		// seenIDs tracks every object ID the consumer has been told about, so
 		// the live stream can correct event types and drop orphan tombstones.
-		// Only used when there is a real snapshot; WatchChanges (hasSnapshot=false)
-		// streams raw live events and needs no correction.
-		var seenIDs map[storeapi.ObjectID]struct{}
-		if hasSnapshot {
-			seenIDs = make(map[storeapi.ObjectID]struct{}, len(snapshot))
-		}
+		seenIDs := make(map[storeapi.ObjectID]struct{}, len(snapshot))
 		// Emit the snapshot as Added events before streaming live events, then
 		// release it: the goroutine outlives the snapshot by the whole streaming
 		// lifetime, and holding the slice would pin every object's spec/status
@@ -554,27 +536,25 @@ func (s *sqliteStore) watch(
 			}
 			// No id filter here: a single-object watch uses an id-scoped receiver
 			// (see filterID above), so unrelated ids never reach this loop.
-			if seenIDs != nil {
-				switch ev.Type {
-				case storeapi.Added:
-					if _, ok := seenIDs[ev.Object.ID]; ok {
-						// Conflation promoted a race-window Added to Added, but the
-						// consumer already has this object from the snapshot.
-						ev.Type = storeapi.Modified
-					} else {
-						seenIDs[ev.Object.ID] = struct{}{}
-					}
-				case storeapi.Modified:
+			switch ev.Type {
+			case storeapi.Added:
+				if _, ok := seenIDs[ev.Object.ID]; ok {
+					// Conflation promoted a race-window Added to Added, but the
+					// consumer already has this object from the snapshot.
+					ev.Type = storeapi.Modified
+				} else {
 					seenIDs[ev.Object.ID] = struct{}{}
-				case storeapi.Deleted:
-					if _, ok := seenIDs[ev.Object.ID]; !ok {
-						// Object was born and died without the consumer ever observing
-						// it (race-window Added coalesced into this Deleted, but the
-						// object was not in the snapshot). Drop the orphan tombstone.
-						continue
-					}
-					delete(seenIDs, ev.Object.ID)
 				}
+			case storeapi.Modified:
+				seenIDs[ev.Object.ID] = struct{}{}
+			case storeapi.Deleted:
+				if _, ok := seenIDs[ev.Object.ID]; !ok {
+					// Object was born and died without the consumer ever observing
+					// it (race-window Added coalesced into this Deleted, but the
+					// object was not in the snapshot). Drop the orphan tombstone.
+					continue
+				}
+				delete(seenIDs, ev.Object.ID)
 			}
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably past the receive

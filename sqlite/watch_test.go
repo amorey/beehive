@@ -434,48 +434,6 @@ func TestWatchAfterCloseErrors(t *testing.T) {
 	require.ErrorIs(t, err, errStoreClosed)
 	_, err = store.Watch(context.Background(), testGK, 1)
 	require.ErrorIs(t, err, errStoreClosed)
-	_, err = store.WatchChanges(context.Background(), testGK)
-	require.ErrorIs(t, err, errStoreClosed)
-}
-
-// TestWatchChangesSkipsSnapshot verifies WatchChanges delivers no initial snapshot
-// for pre-existing objects, but does stream subsequent live changes.
-func TestWatchChangesSkipsSnapshot(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	// A pre-existing object: WatchList would replay it as Added; WatchChanges must not.
-	pre, err := store.CreateObject(ctx, newWatchObject())
-	require.NoError(t, err)
-
-	w, err := store.WatchChanges(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	assertNoEvent(t, w, 200*time.Millisecond)
-
-	// A live change to that object streams through.
-	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Modified, ev.Type)
-	assert.Equal(t, pre.ID, ev.Object.ID)
-}
-
-// TestWatchChangesStreamsLiveAdded verifies a newly created object reaches a
-// WatchChanges subscriber as an Added event (only the initial snapshot is skipped).
-func TestWatchChangesStreamsLiveAdded(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	w, err := store.WatchChanges(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-
-	created, err := store.CreateObject(ctx, newWatchObject())
-	require.NoError(t, err)
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Added, ev.Type)
-	assert.Equal(t, created.ID, ev.Object.ID)
 }
 
 // TestWatchSnapshotLoadError verifies a snapshot-load failure surfaces as an
@@ -739,7 +697,7 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 	assert.Equal(t, beehive.Deleted, got.Type)
 }
 
-// TestAnnihilatingMergeForEvents verifies the WatchChanges memory bound: with no
+// TestAnnihilatingMergeForEvents verifies the snapshot-less streams' memory bound: with no
 // snapshot to preserve (preserve == nil), every unobserved Added→Deleted pair is
 // annihilated, while a non-delete coalescence still survives.
 func TestAnnihilatingMergeForEvents(t *testing.T) {
@@ -1101,19 +1059,20 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	w, err := store.WatchChanges(ctx, testGK)
+	w, err := store.WatchChangeRefs(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
-	var seen storeapi.RawChange
+	var seen []storeapi.ChangeRef
 	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
 		if _, err := store.CreateObject(txCtx, newWatchObject()); err != nil {
 			return err
 		}
-		store.AfterCommit(txCtx, func(context.Context) { seen = recvEvent(t, w) })
+		store.AfterCommit(txCtx, func(context.Context) { seen = recvBatch(t, w) })
 		return nil
 	}))
-	assert.Equal(t, beehive.Added, seen.Type, "the hook must observe the already-published event")
+	require.Len(t, seen, 1)
+	assert.Equal(t, beehive.Added, seen[0].Type, "the hook must observe the already-published event")
 }
 
 // TestPublishReachesGlobalHub verifies every object write also lands on the
@@ -1405,5 +1364,20 @@ func TestWatchChangeRefsClosesOnCancel(t *testing.T) {
 		assert.False(t, ok, "channel must close when the caller's context is cancelled")
 	case <-time.After(2 * time.Second):
 		t.Fatal("change-ref stream outlived its context")
+	}
+}
+
+// assertChangeRefs collects want references off w — a burst may arrive as one
+// batch or several, which is the stream's business, not the caller's — and
+// asserts every one carries typ.
+func assertChangeRefs(t *testing.T, w storeapi.ChangeRefWatcher, want int, typ storeapi.ChangeType) {
+	t.Helper()
+	var got []storeapi.ChangeRef
+	for len(got) < want {
+		got = append(got, recvBatch(t, w)...)
+	}
+	assert.Len(t, got, want)
+	for _, ref := range got {
+		assert.Equal(t, typ, ref.Type)
 	}
 }

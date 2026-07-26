@@ -599,12 +599,6 @@ type Store interface {
 	// an Added snapshot, then all live changes for the kind.
 	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
 
-	// WatchChanges returns a Watcher for live changes to gk only — no initial
-	// snapshot. Use it when current state is already accounted for elsewhere and
-	// only subsequent changes matter (e.g. the dependency waker), to skip the
-	// snapshot build that WatchList would do on every subscribe.
-	WatchChanges(ctx context.Context, gk GroupKind) (Watcher, error)
-
 	// WatchChangeRefs returns a ChangeRefWatcher for live changes to every kind
 	// in the store — no initial snapshot, no rows, no kind filter. It is the
 	// dependency waker's stream: a depends_on edge may point at an object of any
