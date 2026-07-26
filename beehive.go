@@ -371,6 +371,12 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watch
 // wakeDependents requeues every object that depends_on targetID, each in its own
 // kind's reconciler. Over-eager wakes are harmless: unregistered kinds are
 // ignored and the work queue coalesces duplicates.
+//
+// It addresses dependents by bare id, both to skip the self-edge and to route
+// through d.GroupKind(), because an ObjectID is unique across every kind
+// (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
+// per-kind id scheme the self-edge compare would also need the GroupKind, or it
+// would silently drop a foreign object's wake.
 func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 	deps, err := bh.store.ListIncomingRefs(ctx, targetID, RelationDependsOn)
 	if err != nil {
@@ -392,6 +398,14 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 		return
 	}
 	for _, d := range deps {
+		if d.ID == targetID {
+			// Self-edge: nothing here is owed a wake. A spec write requeues through
+			// wakeAfterCommit; a status or condition write is this object's own pass,
+			// which just ran. Waking it re-enqueues at full speed with nothing to
+			// converge it. Cycles of two or more still do; see the cycle entry in
+			// TODO.md.
+			continue
+		}
 		bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 	}
 }

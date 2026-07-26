@@ -257,6 +257,34 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+// TestCollectDeletesSelfDependentObject pins the deadlock collect names the self
+// case for: a self-dependency is its own referrer, so refs' ON DELETE RESTRICT
+// would pin the row forever if DeleteFinalizingDependsOnRefs did not drop the
+// edge first. Verified by mutation — excluding from_id = to_id there leaves the
+// object undeletable.
+//
+// It is deliberately *not* the twin of TestClientListDependentsIncludesSelfEdge:
+// collect reads refs through HasIncomingRefs and DeleteFinalizingDependsOnRefs,
+// never ListIncomingRefs, so a self-edge filtered out of that call would leave
+// this path untouched. The two tests cover different consumers, not two halves of
+// one mistake.
+func TestCollectDeletesSelfDependentObject(t *testing.T) {
+	ctx := context.Background()
+	bh, client := gcFixture(t)
+
+	obj, err := client.Create(ctx, cSpec{Val: "self"})
+	require.NoError(t, err)
+	require.NoError(t, addRef(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+
+	gone, err := bh.collect(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.True(t, gone, "a self-dependency must not hold its own object open")
+
+	_, err = client.Get(ctx, obj.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestCollectKeepsFinalizedObject(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)

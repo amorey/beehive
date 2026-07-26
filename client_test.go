@@ -1942,6 +1942,36 @@ func TestClientGetOwner(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// TestClientListDependentsIncludesSelfEdge guards the wake guard against being
+// re-implemented one layer down. Skipping the self-edge is the waker's policy,
+// not the store's: filtering from_id = to_id out of ListIncomingRefs would also
+// suppress the wake, and would look like a tidier fix, but that call backs the
+// read API — so a self-dependency would silently vanish from ListDependents and
+// from the LoadDependents eager load. GC would not notice (it reads refs through
+// HasIncomingRefs and DeleteFinalizingDependsOnRefs, not this call), which is
+// what makes the mis-implementation quiet: only the read surface changes.
+func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	a, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.NoError(t, addRef(ctx, store, a.ID, a.ID, RelationDependsOn))
+
+	dependents, err := client.ListDependents(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents), "a self-dependency is still a dependency")
+
+	got, err := client.Get(ctx, a.ID, LoadDependents())
+	require.NoError(t, err)
+	loaded, err := got.ListDependents()
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(loaded), "and the eager load sees it too")
+}
+
 func TestClientListDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

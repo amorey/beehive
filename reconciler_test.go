@@ -737,6 +737,139 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	waitClosed(t, done, "waker to exit")
 }
 
+// depsStore returns a fixed dependent set from ListIncomingRefs, so a test can
+// control the exact edges — and their order — that wakeDependents walks.
+type depsStore struct {
+	fakeStore
+	deps []Referrer
+}
+
+func (s *depsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
+	return s.deps, nil
+}
+
+// wakerFixture builds a Beehive whose store reports deps and whose reconcilers
+// are real enough to enqueue: one per kind, each with its own work queue, so a
+// caller can assert which kind's queue a wake landed in. newWorkQueue leaves
+// onSchedule nil, so nothing reaches the reconcilers' unset scheduleHub.
+func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]*reconciler) {
+	rs := make(map[GroupKind]*reconciler, len(kinds))
+	for _, gk := range kinds {
+		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
+	}
+	return &Beehive{store: &depsStore{deps: deps}, reconcilers: rs}, rs
+}
+
+// TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
+// itself is woken by its own Modified, and the wake is what caused the write, so
+// nothing converges it. There is no tick, no backoff and no already-settled skip
+// on the path — the object is settled throughout, so every convergence signal
+// reports it as fine while it reconciles at full speed. The cycle entry in
+// TODO.md covers the shape this guard does not fix.
+func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	bh, rs := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
+}
+
+// TestWakeDependentsSkipsSelfEdgeOnly pins the guard's shape, not just its
+// effect: written as a return it would drop every dependent listed after the
+// self-edge, and the self-edge's position is the store's to choose, not the
+// caller's. The second kind covers enqueueIfRegistered's routing — a wake goes to
+// the dependent's own reconciler, so asserting one queue would let a same-kind
+// answer pass for a routed one.
+func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+	gadget := GroupKind{Kind: "Gadget"}
+	// The self-edge is first: a return guard drops the two behind it.
+	deps := []Referrer{
+		{ID: 1, Kind: "Widget"},
+		{ID: 2, Kind: "Widget"},
+		{ID: 3, Kind: "Gadget"},
+	}
+	bh, rs := wakerFixture(deps, widget, gadget)
+
+	bh.wakeDependents(context.Background(), 1)
+
+	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
+	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
+}
+
+// TestWakeDependentsTwoCycle records what the guard does *not* fix. Two objects
+// that depend on each other spin exactly as a self-edge did — A's emitted write
+// wakes B, B's wakes A — and nothing excludes them. See the cycle entry in
+// TODO.md for why that is deferred and what would fix it.
+//
+// This is not that entry's tripwire, and must not be mistaken for one: it
+// asserts ordinary waker behaviour that both candidate fixes preserve. A
+// declare-time reachability check never reaches here (the edges come from a
+// fake, not from AddDependency — TestAddDependencyAcceptsCycle is that
+// tripwire), and a work-queue rate limiter leaves a first wake immediately
+// dispatchable, which is all this test does.
+func TestWakeDependentsTwoCycle(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+
+	bhA, rsA := wakerFixture([]Referrer{{ID: 2, Kind: "Widget"}}, gk)
+	bhA.wakeDependents(context.Background(), 1)
+	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
+
+	bhB, rsB := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
+	bhB.wakeDependents(context.Background(), 2)
+	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
+}
+
+// TestSelfDependentObjectWakesOnSpecChange is the guard's safety argument, run
+// rather than asserted: a self-dependency can only mean "requeue me when I
+// change", and skipping the self-wake is safe because a spec write already
+// requeues the object through wakeAfterCommit, independently of any edge.
+//
+// It cannot detect a guard mis-implemented as a self-edge filter in
+// ListIncomingRefs — that path never consults refs, so this test stays green
+// while the read API silently loses the edge. TestClientListDependentsIncludesSelfEdge
+// is what catches that; this one only pins the wake.
+func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	gk := GroupKind{Kind: "Widget"}
+	reconciled := make(chan ObjectID, 8)
+	// Resync off: an arriving pass must be the write's own wake, not a tick.
+	_, err = Register(bh, gk, &idCapture{ch: reconciled},
+		WithResyncInterval(0), WithConcurrency(1))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, gk)
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.NoError(t, addRef(ctx, store, obj.ID, obj.ID, RelationDependsOn))
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { stop(ctx) })
+	require.Equal(t, obj.ID, recv(t, reconciled), "startup pass")
+
+	// A changed spec: the write must not be suppressed as an identical-byte no-op,
+	// or nothing would wake it and the test would pass for the wrong reason.
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+
+	assert.Equal(t, obj.ID, recv(t, reconciled), "a spec write wakes it without the self-edge")
+}
+
+// idCapture reports the id of each object it reconciles. It is cSpec-typed
+// because tSpec is empty, which would make every Update a byte-identical no-op.
+type idCapture struct{ ch chan ObjectID }
+
+func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+	c.ch <- obj.ID
+	return Result{}, nil
+}
+
 // errDepsStore returns an error from ListIncomingRefs.
 type errDepsStore struct{ fakeStore }
 
@@ -2890,6 +3023,48 @@ func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 	assert.Contains(t, buf.String(), "escalating")
 	assert.True(t, r1.resyncAlways.Load(), "a dead waker escalates every kind's later ticks")
 	assert.True(t, r2.resyncAlways.Load())
+}
+
+// shutdownCtx reports itself cancelled but never fires Done. Real shutdown
+// cancels the ctx *and* closes the stream, leaving both arms of the waker's
+// select ready at once — and Go picks among ready cases at random, so the
+// stream-ended arm's shutdown re-check is reached only by chance. That is a
+// branch whose whole reason for existing is an interleaving no test can request:
+// it was covered a few runs in ten and uncovered in the rest, which reads as
+// flaky coverage rather than as the untested guard it actually was.
+//
+// A Done that blocks forever leaves the closed-stream arm the only ready case,
+// which pins that interleaving exactly. Nothing else about the context is
+// faked — Err reports what a cancelled context reports, which is what the guard
+// reads.
+type shutdownCtx struct{ context.Context }
+
+func (shutdownCtx) Done() <-chan struct{} { return nil }
+func (shutdownCtx) Err() error            { return context.Canceled }
+
+// TestDeadWakerOnShutdownDoesNotEscalate is TestDeadWakerEscalatesEveryKind's
+// negative twin. Stop ends the stream by cancelling the same ctx the waker
+// selects on, so a stream that ends during shutdown is a normal exit, not a
+// dropped wake. Escalating there would arm every later tick of a control plane
+// that is going away, and it would do so on every clean Stop — which is how the
+// one message that matters gets trained out of an operator.
+func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	r1, r2 := &reconciler{}, &reconciler{}
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger, order: []*reconciler{r1, r2}}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(shutdownCtx{context.Background()}, GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on a stream ended by shutdown")
+
+	assert.Empty(t, buf.String(), "a stream ended by shutdown is not a dropped wake")
+	assert.False(t, r1.resyncAlways.Load(), "a control plane going away must not arm its later ticks")
+	assert.False(t, r2.resyncAlways.Load())
 }
 
 // TestEscalatedCatchupTickReconcilesSettled closes the loop end to end: an armed
