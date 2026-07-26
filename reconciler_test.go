@@ -3025,6 +3025,48 @@ func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 	assert.True(t, r2.resyncAlways.Load())
 }
 
+// shutdownCtx reports itself cancelled but never fires Done. Real shutdown
+// cancels the ctx *and* closes the stream, leaving both arms of the waker's
+// select ready at once — and Go picks among ready cases at random, so the
+// stream-ended arm's shutdown re-check is reached only by chance. That is a
+// branch whose whole reason for existing is an interleaving no test can request:
+// it was covered a few runs in ten and uncovered in the rest, which reads as
+// flaky coverage rather than as the untested guard it actually was.
+//
+// A Done that blocks forever leaves the closed-stream arm the only ready case,
+// which pins that interleaving exactly. Nothing else about the context is
+// faked — Err reports what a cancelled context reports, which is what the guard
+// reads.
+type shutdownCtx struct{ context.Context }
+
+func (shutdownCtx) Done() <-chan struct{} { return nil }
+func (shutdownCtx) Err() error            { return context.Canceled }
+
+// TestDeadWakerOnShutdownDoesNotEscalate is TestDeadWakerEscalatesEveryKind's
+// negative twin. Stop ends the stream by cancelling the same ctx the waker
+// selects on, so a stream that ends during shutdown is a normal exit, not a
+// dropped wake. Escalating there would arm every later tick of a control plane
+// that is going away, and it would do so on every clean Stop — which is how the
+// one message that matters gets trained out of an operator.
+func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeWatcher()
+	r1, r2 := &reconciler{}, &reconciler{}
+	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger, order: []*reconciler{r1, r2}}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(shutdownCtx{context.Background()}, GroupKind{Kind: "Widget"}, fw)
+		close(done)
+	}()
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on a stream ended by shutdown")
+
+	assert.Empty(t, buf.String(), "a stream ended by shutdown is not a dropped wake")
+	assert.False(t, r1.resyncAlways.Load(), "a control plane going away must not arm its later ticks")
+	assert.False(t, r2.resyncAlways.Load())
+}
+
 // TestEscalatedCatchupTickReconcilesSettled closes the loop end to end: an armed
 // escalation must actually reach a settled object, which is the only kind of
 // object the repair exists for — one that is owed nothing and therefore invisible
