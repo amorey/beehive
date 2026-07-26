@@ -5,6 +5,63 @@ here when it is a real defect or gap that we chose *not* to fix yet — not a
 wishlist. Each one records what would make it worth doing, so the next reader can
 tell "we decided against this for now" from "nobody thought of it."
 
+- **A dependency cycle of length ≥ 2 spins the waker at full speed** — known, not
+  fixed; the self-edge half *is* fixed. `wakeDependents` skips `from_id == to_id`
+  (see the guard's comment), so a self-dependency no longer re-enqueues itself.
+  Two objects that depend on each other still do: A's emitted write wakes B, B's
+  wakes A, with no rate limiter in `workQueue.addLocked` and no already-settled
+  skip on the dispatch path. Any write family the store emits sustains it —
+  changing status bytes, a byte-identical `UpdateStatus` at a generation the
+  object hasn't settled at, any non-no-op condition write (`bumpObjectAndEmit`),
+  `DeleteFinalizer` — so byte-stable status is not a defence. `RecordEvent` is the
+  exception: it bumps no object `resource_version`.
+
+  It costs more than background CPU. The store runs on a single connection, so
+  the spin's write transactions serialize every other writer in the process —
+  client writes, other kinds' reconciles, the GC sweeper, event retention — while
+  it also holds a reconcile worker slot, burns the global `resource_version`
+  counter, and drives every change watcher and `WatchSchedule` subscriber at
+  reconcile speed. All of it on a store where every object is converged and every
+  generation matches, so no convergence signal reports anything wrong.
+
+  Two candidate fixes. **Reachability at declare time** (reject an edge that
+  closes a cycle in `AddDependency`) is a recursive CTE on the single connection,
+  and the declare path is one pre-read away from the performance problem that sank
+  the earlier raced-declare guard — a reachability probe is strictly more
+  expensive than the read that was rejected. **A per-item minimum re-enqueue
+  interval on the work queue** — what controller-runtime does for this class —
+  bounds every cycle length, needs no reachability query, and costs nothing on the
+  hot path; it does not make a cycle converge, but turns "full speed forever" into
+  "one pass per interval forever", which removes the contention. It is **not** a
+  reuse of `addAfter`, whose newest-wins alarm would push the item out on every
+  fresh wake and starve it; it wants an oldest-wins watermark on `addLocked`, the
+  path every wake actually takes. Cost: that watermark, a new unanchored constant,
+  and an interaction with `Result.RequeueAfter` and backoff worked out. Evaluate
+  the rate limiter first.
+
+  Deferred on **fix cost**, not on likelihood: the self-edge is one comparison on
+  values the loop already holds, while the general case is either a recursive CTE
+  on the declare path or a new work-queue primitive. Likelihood points the other
+  way and this entry should not pretend otherwise — a self-edge requires naming
+  your own id, whereas a mutual dependency is what two independently-written
+  controllers fall into with neither author seeing both halves, which is why
+  `DeleteFinalizingDependsOnRefs` exists at all. Whether beehive should support
+  cycles is also unsettled, which is a reason not to guard hastily.
+
+  **Each candidate has its own tripwire, because no one test constrains both.**
+  For reachability, `TestAddDependencyAcceptsCycle` asserts that a cycle-closing
+  edge and a self-edge are both accepted today — the exact fact that fix would
+  change. For the rate limiter, the tripwires already exist in
+  `workqueue_test.go`: `TestWorkQueueNoConcurrentDispatch` and
+  `TestWorkQueueReaddAfterDone` both assert that the *second* dispatch of one id
+  is immediately available, which is precisely the latency a minimum interval
+  renegotiates. (`TestWorkQueueFIFO` and the dedup/ready tests are *not*
+  tripwires — they add distinct ids once each, and a first add stays immediately
+  dispatchable under any sane throttle.) `TestWakeDependentsTwoCycle` pins the
+  waker's both-directions behaviour but is not the record either: it drives edges
+  through a fake, so declare-time rejection never reaches it, and its wakes are
+  all first wakes. Specced in `specs/waker-cycle-spin.md`.
+
 - **`DeleteBySlug` on an absent slug costs a write transaction** — known, not fixed.
   `RequestDeletionBySlug` opens `Within` (so `BEGIN IMMEDIATE`) and its first act
   inside is `nextResourceVersion`, an `UPDATE` on the sequence — both before

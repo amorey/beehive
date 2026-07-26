@@ -334,8 +334,13 @@ to observe.
   (`client.go:565`), so filtering there silently changes what callers see.*
 - **A self-dependent finalizing object still collects.** `collect` handles this case
   explicitly today (`gc.go:90-92`, which still runs `DeleteFinalizingDependsOnRefs`
-  against the edge); assert the guard did not disturb it. This covers the other half of
-  the filter mis-implementation.
+  against the edge); assert the guard did not disturb it. *Corrected during
+  implementation: this is **not** the other half of the filter mis-implementation, as
+  an earlier draft claimed. `collect` reads refs through `HasIncomingRefs` and
+  `DeleteFinalizingDependsOnRefs`, never `ListIncomingRefs`, so a self-edge filtered
+  out of that call leaves this path green — verified by mutation. It fails only under
+  a mutation to its own query. The two tests cover different consumers, and
+  `TestClientListDependentsIncludesSelfEdge` is the sole detector of the filter.*
 - **Ordinary dependents are unaffected.** The existing dependency-wake tests,
   unchanged.
 
