@@ -299,3 +299,20 @@ func TestStartSubscribesOneChangeStream(t *testing.T) {
 
 	assert.Equal(t, int64(1), store.subscriptions.Load(), "one stream for the whole store, not one per kind")
 }
+
+// TestStartWithNoControllersSkipsWaker verifies a Beehive with nothing
+// registered opens no change stream. There is nothing to wake — every dependent
+// would land on enqueueIfRegistered's no-op arm — and the stream is not free: it
+// costs a refs query per change in the whole store, on the single connection
+// every writer shares.
+func TestStartWithNoControllersSkipsWaker(t *testing.T) {
+	store := &countingChangeStreamStore{}
+	bh, err := New(store)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	assert.Zero(t, store.subscriptions.Load(), "no controllers, no stream")
+}
