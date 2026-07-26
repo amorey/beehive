@@ -599,10 +599,8 @@ type Store interface {
 	// an Added snapshot, then all live changes for the kind.
 	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
 
-	// WatchChangeRefs returns a ChangeRefWatcher for live changes to every kind
-	// in the store — no initial snapshot, no rows, no kind filter. It is the
-	// dependency waker's stream: a depends_on edge may point at an object of any
-	// kind, including one with no registered controller, so a per-kind
-	// subscription cannot see every target.
+	// WatchChangeRefs returns a ChangeRefWatcher for live changes to every kind in
+	// the store — no initial snapshot, no rows, no kind filter. Batches of
+	// identity, for a consumer that routes by id and reads current state itself.
 	WatchChangeRefs(ctx context.Context) (ChangeRefWatcher, error)
 }

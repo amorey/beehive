@@ -270,60 +270,54 @@ func (s *watcherStore) WatchChangeRefs(context.Context) (ChangeRefWatcher, error
 	return s.refs, nil
 }
 
-// fakeWatcher is a controllable Watcher: push feeds a raw event, endStream ends
-// the stream, and Close signals the adapter goroutine's exit. It backs the
-// client adaptWatcher tests.
-type fakeWatcher struct {
-	ch        chan storeapi.RawChange
+// fakeStream is the shared body of the controllable watcher doubles: an
+// unbuffered channel of whatever the stream carries, plus a closed signal so a
+// test can synchronize on the consumer goroutine's exit instead of reading the
+// channel — which could itself satisfy a pending send and race the outcome.
+type fakeStream[V any] struct {
+	ch        chan V
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
+func newFakeStream[V any]() fakeStream[V] {
+	return fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
+}
+
+// Close is called by the consumer's defer on exit.
+func (w *fakeStream[V]) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
+
+// endStream closes the channel, signalling the stream has ended.
+func (w *fakeStream[V]) endStream() { close(w.ch) }
+
+// fakeWatcher is a controllable Watcher, backing the client adaptWatcher tests.
+type fakeWatcher struct{ fakeStream[storeapi.RawChange] }
+
 func newFakeWatcher() *fakeWatcher {
-	return &fakeWatcher{ch: make(chan storeapi.RawChange), closed: make(chan struct{})}
+	return &fakeWatcher{newFakeStream[storeapi.RawChange]()}
 }
 
 func (w *fakeWatcher) Changes() <-chan storeapi.RawChange { return w.ch }
-
-// Close (called by adaptWatcher's defer on exit) closes closed, letting tests
-// synchronize on goroutine exit instead of reading Changes — which could itself
-// satisfy a pending send and race the outcome.
-func (w *fakeWatcher) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
 
 // push delivers a raw event to the adapter goroutine.
 func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
 	w.ch <- storeapi.RawChange{Type: typ, Object: obj}
 }
 
-// endStream closes the event channel, signalling the stream has ended.
-func (w *fakeWatcher) endStream() { close(w.ch) }
-
-// fakeChangeRefWatcher is fakeWatcher's store-wide-stream twin: push feeds one
-// batch, endStream ends the stream, and Close signals the waker's exit. A batch
-// is the unit deliberately — the waker resolves a whole batch in one query, so a
-// double that could only deliver one reference at a time would hide that.
-type fakeChangeRefWatcher struct {
-	ch        chan []ChangeRef
-	closed    chan struct{}
-	closeOnce sync.Once
-}
+// fakeChangeRefWatcher is fakeWatcher's store-wide-stream twin, backing the
+// dependency-waker tests. A batch is the push unit deliberately — the waker
+// resolves a whole batch in one query, so a double that could only deliver one
+// reference at a time would hide that.
+type fakeChangeRefWatcher struct{ fakeStream[[]ChangeRef] }
 
 func newFakeChangeRefWatcher() *fakeChangeRefWatcher {
-	return &fakeChangeRefWatcher{ch: make(chan []ChangeRef), closed: make(chan struct{})}
+	return &fakeChangeRefWatcher{newFakeStream[[]ChangeRef]()}
 }
 
 func (w *fakeChangeRefWatcher) Batches() <-chan []ChangeRef { return w.ch }
 
-// Close (called by the waker's defer on exit) closes closed, letting tests
-// synchronize on goroutine exit instead of reading Batches — which could itself
-// satisfy a pending send and race the outcome.
-func (w *fakeChangeRefWatcher) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
-
 // push delivers one batch to the waker.
 func (w *fakeChangeRefWatcher) push(refs ...ChangeRef) { w.ch <- refs }
-
-// endStream closes the batch channel, signalling the stream has ended.
-func (w *fakeChangeRefWatcher) endStream() { close(w.ch) }
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.

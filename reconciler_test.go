@@ -746,31 +746,51 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	waitClosed(t, done, "waker to exit")
 }
 
-// depsStore returns a fixed dependent set for every target asked about, so a test can
-// control the exact edges — and their order — that the waker walks.
+// depsStore serves a per-target dependent set from the waker's batched lookup
+// and records what it was asked, so a test can control the exact edges — and
+// their order — that the waker walks, and assert that a batch of targets costs
+// one query rather than one per target.
 type depsStore struct {
 	fakeStore
-	deps []Referrer
+	deps  map[ObjectID][]Referrer
+	calls atomic.Int64
+	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
 func (s *depsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+	s.calls.Add(1)
+	s.seen = append(s.seen, slices.Clone(toIDs))
 	out := make(map[ObjectID][]Referrer, len(toIDs))
 	for _, id := range toIDs {
-		out[id] = s.deps
+		if deps, ok := s.deps[id]; ok {
+			out[id] = deps
+		}
 	}
 	return out, nil
 }
 
-// wakerFixture builds a Beehive whose store reports deps and whose reconcilers
-// are real enough to enqueue: one per kind, each with its own work queue, so a
-// caller can assert which kind's queue a wake landed in. newWorkQueue leaves
-// onSchedule nil, so nothing reaches the reconcilers' unset scheduleHub.
-func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]*reconciler) {
+// wakerFixture builds a Beehive whose store reports deps (keyed by target) and
+// whose reconcilers are real enough to enqueue: one per kind, each with its own
+// work queue, so a caller can assert which kind's queue a wake landed in.
+// newWorkQueue leaves onSchedule nil, so nothing reaches the reconcilers' unset
+// scheduleHub.
+func wakerFixture(deps map[ObjectID][]Referrer, kinds ...GroupKind) (*Beehive, *depsStore, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	for _, gk := range kinds {
 		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
 	}
-	return &Beehive{store: &depsStore{deps: deps}, reconcilers: rs}, rs
+	store := &depsStore{deps: deps}
+	return &Beehive{store: store, reconcilers: rs}, store, rs
+}
+
+// changed is the waker's input shape: the ids as Modified references, which is
+// what a target's change looks like on the store-wide stream.
+func changed(ids ...ObjectID) []ChangeRef {
+	refs := make([]ChangeRef, 0, len(ids))
+	for _, id := range ids {
+		refs = append(refs, ChangeRef{ID: id, Type: Modified})
+	}
+	return refs
 }
 
 // TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
@@ -781,9 +801,9 @@ func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]
 // TODO.md covers the shape this guard does not fix.
 func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, rs := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
+	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1})
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
 }
@@ -803,9 +823,9 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 		{ID: 2, Kind: "Widget"},
 		{ID: 3, Kind: "Gadget"},
 	}
-	bh, rs := wakerFixture(deps, widget, gadget)
+	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: deps}, widget, gadget)
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1})
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
@@ -825,12 +845,12 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
-	bhA, rsA := wakerFixture([]Referrer{{ID: 2, Kind: "Widget"}}, gk)
-	bhA.wakeDependentsBatch(context.Background(), []ObjectID{1})
+	bhA, _, rsA := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 2, Kind: "Widget"}}}, gk)
+	bhA.wakeDependentsBatch(context.Background(), changed(1))
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
-	bhB, rsB := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
-	bhB.wakeDependentsBatch(context.Background(), []ObjectID{2})
+	bhB, _, rsB := wakerFixture(map[ObjectID][]Referrer{2: {{ID: 1, Kind: "Widget"}}}, gk)
+	bhB.wakeDependentsBatch(context.Background(), changed(2))
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
@@ -894,7 +914,7 @@ func (*errDepsStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation
 // the target still reconciled, and the resync backstop will retry the waking.
 func TestWakeDependentsListError(t *testing.T) {
 	bh := &Beehive{store: &errDepsStore{}}
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1})
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 }
 
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
@@ -2840,7 +2860,7 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &errDepsStore{}, logger: logger}
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1})
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "dependents lookup failed",
 		"a dropped wake must not be silent")
@@ -2862,7 +2882,7 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bh.wakeDependentsBatch(ctx, []ObjectID{1})
+	bh.wakeDependentsBatch(ctx, changed(1))
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
@@ -3009,7 +3029,7 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 	r1, r2 := &reconciler{}, &reconciler{}
 	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1})
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "forcing a full resync pass")
 	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
@@ -3170,51 +3190,19 @@ func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
 	})
 }
 
-// batchDepsStore serves a per-target dependent set from GroupIncomingRefsByID
-// and counts the calls, so a test can assert that a batch of targets costs one
-// query rather than one per target.
-type batchDepsStore struct {
-	fakeStore
-	deps  map[ObjectID][]Referrer
-	calls atomic.Int64
-	seen  [][]ObjectID // the id slices each call was asked to resolve
-}
-
-func (s *batchDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
-	s.calls.Add(1)
-	s.seen = append(s.seen, slices.Clone(toIDs))
-	out := map[ObjectID][]Referrer{}
-	for _, id := range toIDs {
-		if deps, ok := s.deps[id]; ok {
-			out[id] = deps
-		}
-	}
-	return out, nil
-}
-
-// batchWakerFixture is wakerFixture's batched twin: deps is keyed by target id.
-func batchWakerFixture(deps map[ObjectID][]Referrer, kinds ...GroupKind) (*Beehive, *batchDepsStore, map[GroupKind]*reconciler) {
-	rs := make(map[GroupKind]*reconciler, len(kinds))
-	for _, gk := range kinds {
-		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
-	}
-	store := &batchDepsStore{deps: deps}
-	return &Beehive{store: store, reconcilers: rs}, store, rs
-}
-
 // TestWakeDependentsBatchOneQuery verifies a batch of changed targets resolves
 // in a single refs query. The store runs on one connection, so the waker's reads
 // serialize against every writer in the process — per-burst instead of
 // per-change is what keeps a hot kind from taxing them.
 func TestWakeDependentsBatchOneQuery(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, store, rs := batchWakerFixture(map[ObjectID][]Referrer{
+	bh, store, rs := wakerFixture(map[ObjectID][]Referrer{
 		1: {{ID: 10, Kind: "Widget"}},
 		2: {{ID: 20, Kind: "Widget"}},
 		3: {{ID: 30, Kind: "Widget"}},
 	}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1, 2, 3})
+	bh.wakeDependentsBatch(context.Background(), changed(1, 2, 3))
 
 	assert.Equal(t, int64(1), store.calls.Load(), "one query for the whole batch")
 	assert.Equal(t, []ObjectID{10, 20, 30}, rs[gk].work.items)
@@ -3226,11 +3214,11 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 // single connection, and a repeated dependent is a wasted reconcile.
 func TestWakeDependentsBatchDedups(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, store, rs := batchWakerFixture(map[ObjectID][]Referrer{
+	bh, store, rs := wakerFixture(map[ObjectID][]Referrer{
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1, 1, 1})
+	bh.wakeDependentsBatch(context.Background(), changed(1, 1, 1))
 
 	require.Len(t, store.seen, 1)
 	assert.Equal(t, []ObjectID{1}, store.seen[0], "the repeated target is asked about once")
@@ -3243,12 +3231,12 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 // by 1's change while being skipped for its own.
 func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, _, rs := batchWakerFixture(map[ObjectID][]Referrer{
+	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{
 		1: {{ID: 2, Kind: "Widget"}},
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), []ObjectID{1, 2})
+	bh.wakeDependentsBatch(context.Background(), changed(1, 2))
 
 	assert.Equal(t, []ObjectID{2}, rs[gk].work.items, "woken for 1's change, skipped for its own")
 }
@@ -3269,9 +3257,7 @@ var clientOnlyGK = GroupKind{Kind: "Config"}
 func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, chan *Object[tSpec, tStatus], func()) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
+	store := newClientTestStore(t)
 
 	bh, err := New(store, WithGCInterval(time.Hour))
 	require.NoError(t, err)

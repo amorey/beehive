@@ -427,6 +427,20 @@ tell "we decided against this for now" from "nobody thought of it."
   grows a watermark for another reason, which removes most of the work.
 
 
+- **The store keeps two hubs carrying the same changes** — known, not fixed.
+  `hubs[gk]` (keyed `ObjectID`, carrying `RawChange`) and `changeHub` (keyed
+  `ObjectID`, carrying the projected `changeRef`) are fed by the same `publish`,
+  so every object write pays two `Send`s and `Close` has one more hub to tear
+  down. One hub keyed `struct{GroupKind; ObjectID}` would serve all three
+  consumers — `WatchList(gk)` filtering on the kind half, `Watch(gk, id)` on the
+  whole key (it already filters by id alone, since ids are globally unique), and
+  `WatchChangeRefs` not filtering at all — with conflation granularity unchanged.
+  Deferred because the value types have deliberately diverged: the store-wide
+  stream must not carry `*RawObject` (it would pin blobs), so a single hub means
+  either giving the snapshot watchers the projection and re-reading rows, or
+  giving the waker the blobs back. Worth revisiting if a third consumer appears,
+  or if `conflate` grows a value-projecting receiver.
+
 ## Resolved
 
 - **Dependency targets of client-only kinds got no waker at all** — done.

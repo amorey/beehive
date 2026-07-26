@@ -31,32 +31,46 @@ import (
 
 var errWatchBoom = errors.New("boom")
 
+// recvOrFail waits for the next value on ch, failing the test if the channel
+// closes or nothing arrives within the failsafe timeout. what names the stream
+// in the failure message.
+func recvOrFail[V any](t *testing.T, ch <-chan V, what string) V {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			t.Fatalf("%s channel closed unexpectedly", what)
+		}
+		return v
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
+	}
+}
+
+// assertNoRecv fails if any value arrives on ch within d (or if it closes).
+func assertNoRecv[V any](t *testing.T, ch <-chan V, d time.Duration, what string) {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if ok {
+			t.Fatalf("unexpected %s: %+v", what, v)
+		}
+		t.Fatalf("%s channel closed unexpectedly", what)
+	case <-time.After(d):
+	}
+}
+
 // recvLogEvent waits for the next event-log run on w, failing on timeout/close.
 func recvLogEvent(t *testing.T, w storeapi.EventWatcher) storeapi.Event {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Events():
-		if !ok {
-			t.Fatal("event watcher channel closed unexpectedly")
-		}
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for log event")
-		panic("unreachable")
-	}
+	return recvOrFail(t, w.Events(), "log event")
 }
 
 // assertNoLogEvent fails if any event-log run arrives on w within d.
 func assertNoLogEvent(t *testing.T, w storeapi.EventWatcher, d time.Duration) {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Events():
-		if ok {
-			t.Fatalf("unexpected log event: %+v", ev)
-		}
-		t.Fatal("event watcher channel closed unexpectedly")
-	case <-time.After(d):
-	}
+	assertNoRecv(t, w.Events(), d, "log event")
 }
 
 // mergeEvent keeps the higher-resource-version run, so a slow subscriber
@@ -212,33 +226,16 @@ func TestWatchEventsFiltersLiveByCategory(t *testing.T) {
 	assert.Equal(t, "ProbeFailed", got.Reason)
 }
 
-// recvEvent waits for the next event on w, failing the test if none arrives or
-// the channel closes within the failsafe timeout.
+// recvEvent waits for the next object change on w, failing on timeout/close.
 func recvEvent(t *testing.T, w beehive.Watcher) storeapi.RawChange {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Changes():
-		if !ok {
-			t.Fatal("watcher channel closed unexpectedly")
-		}
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for event")
-		panic("unreachable")
-	}
+	return recvOrFail(t, w.Changes(), "change event")
 }
 
-// assertNoEvent fails if any event arrives on w within d.
+// assertNoEvent fails if any object change arrives on w within d.
 func assertNoEvent(t *testing.T, w beehive.Watcher, d time.Duration) {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Changes():
-		if ok {
-			t.Fatalf("unexpected event: %+v", ev)
-		}
-		t.Fatal("watcher channel closed unexpectedly")
-	case <-time.After(d):
-	}
+	assertNoRecv(t, w.Changes(), d, "change event")
 }
 
 // assertWatcherClosed fails if w's channel does not close within the timeout.
@@ -1078,7 +1075,8 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 // TestPublishReachesGlobalHub verifies every object write also lands on the
 // store-wide change hub, whatever its kind: it is the single stream the
 // dependency waker subscribes to, so a kind missing from it is a kind whose
-// dependents never wake.
+// dependents never wake. The hub carries the projection (see changeRef), not the
+// row — a pending RawChange would pin that object's blobs.
 func TestPublishReachesGlobalHub(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -1098,7 +1096,7 @@ func TestPublishReachesGlobalHub(t *testing.T) {
 	for range 2 {
 		ev, err := rx.Recv()
 		require.NoError(t, err)
-		got[ev.Key] = ev.Value.Type
+		got[ev.Key] = ev.Value.typ
 	}
 	assert.Equal(t, map[storeapi.ObjectID]storeapi.ChangeType{
 		first.ID:  beehive.Added,
@@ -1109,29 +1107,13 @@ func TestPublishReachesGlobalHub(t *testing.T) {
 // recvBatch waits for the next change-ref batch on w, failing on timeout/close.
 func recvBatch(t *testing.T, w storeapi.ChangeRefWatcher) []storeapi.ChangeRef {
 	t.Helper()
-	select {
-	case batch, ok := <-w.Batches():
-		if !ok {
-			t.Fatal("change-ref watcher channel closed unexpectedly")
-		}
-		return batch
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a change-ref batch")
-		panic("unreachable")
-	}
+	return recvOrFail(t, w.Batches(), "change-ref batch")
 }
 
 // assertNoBatch fails if any change-ref batch arrives on w within d.
 func assertNoBatch(t *testing.T, w storeapi.ChangeRefWatcher, d time.Duration) {
 	t.Helper()
-	select {
-	case batch, ok := <-w.Batches():
-		if ok {
-			t.Fatalf("unexpected change-ref batch: %+v", batch)
-		}
-		t.Fatal("change-ref watcher channel closed unexpectedly")
-	case <-time.After(d):
-	}
+	assertNoRecv(t, w.Batches(), d, "change-ref batch")
 }
 
 // TestWatchChangeRefsStreamsLiveChanges verifies a live write reaches the
