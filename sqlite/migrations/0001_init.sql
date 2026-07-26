@@ -155,10 +155,18 @@ CREATE TABLE refs (
     -- depends_on `to` going NotReady ⇒ `from` requeued automatically by Beehive
     relation TEXT NOT NULL CHECK (relation IN ('owned_by', 'depends_on')),
 
+    -- WITHOUT ROWID: every column is in the key, so a rowid table would store each
+    -- edge twice — once in the table, once in the automatic index enforcing this
+    -- key. Here the key *is* the table. It also makes idx_refs_to below covering.
     PRIMARY KEY (from_id, to_id, relation)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
--- Answers "who points at X?" for cascade-GC and wake-dependents.
+-- Answers "who points at X?" for cascade-GC and wake-dependents. Reads from_id,
+-- which the index appears not to hold — but a secondary index on a WITHOUT ROWID
+-- table identifies rows by primary key, so this is really (to_id, relation,
+-- from_id) and the probe never touches the table. The covering property lives in
+-- the table's storage class, not here: dropping WITHOUT ROWID silently reinstates
+-- a row fetch per edge with this line looking unchanged.
 CREATE INDEX idx_refs_to ON refs(to_id, relation);
 
 -- ============================================================

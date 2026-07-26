@@ -1406,10 +1406,11 @@ func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID
 			return storeapi.ErrTargetResourceVersionFuture
 		}
 		// The durable wake stamp, on the same side of the insert as the rejection
-		// above and for the same reason. Its NOT EXISTS is the edge-new test, a
-		// covering probe on the refs primary key — one statement, no extra
-		// round-trip, and the *only* place edge-newness is decided, so there is no
-		// second derivation of it to fall out of agreement with.
+		// above and for the same reason. Its NOT EXISTS is the edge-new test, a probe
+		// straight down the refs primary key — which, refs being WITHOUT ROWID, is
+		// the table itself, so it is one statement with no extra round-trip. And it
+		// is the *only* place edge-newness is decided, so there is no second
+		// derivation of it to fall out of agreement with.
 		var stamped bool
 		if targetResourceVersion > 0 && targetRV > targetResourceVersion {
 			res, err := s.conn(ctx).ExecContext(ctx, `
