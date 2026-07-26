@@ -6,7 +6,7 @@ wishlist. Each one records what would make it worth doing, so the next reader ca
 tell "we decided against this for now" from "nobody thought of it."
 
 - **A dependency cycle of length ≥ 2 spins the waker at full speed** — known, not
-  fixed; the self-edge half *is* fixed. `wakeDependents` skips `from_id == to_id`
+  fixed; the self-edge half *is* fixed. `wakeDependentsBatch` skips `from_id == to_id`
   (see the guard's comment), so a self-dependency no longer re-enqueues itself.
   Two objects that depend on each other still do: A's emitted write wakes B, B's
   wakes A, with no rate limiter in `workQueue.addLocked` and no already-settled
@@ -428,6 +428,39 @@ tell "we decided against this for now" from "nobody thought of it."
 
 
 ## Resolved
+
+- **Dependency targets of client-only kinds got no waker at all** — done.
+  `Start` subscribed one waker per *registered* kind, but a `depends_on` edge may
+  point at an object of any kind, including one used through `Client` with no
+  `Register`. Changes to such a target reached no waker: not a dropped wake, none
+  attempted, so nothing in healthy operation repaired it, and only
+  `WithStartupResync` covered it — at the *next process start*. The sharper case
+  had no cover at all: `refs.to_id` is `ON DELETE RESTRICT`, so deleting such a
+  target only sets a tombstone, and with no dependent woken to drop the edge the
+  row stays deletion-pending while the GC sweeper retries it every tick, forever.
+
+  The fix is one store-wide stream: `Store.WatchChangeRefs(ctx)` replaces the
+  per-kind `WatchChanges(gk)` (which had no other caller), and `Start` runs a
+  single waker over it. It is the only option that cannot go stale — any per-kind
+  subscription list has to be computed from something (the registered set, the
+  kinds present at `Start`, the kinds currently referenced by an edge), and each
+  of those misses a case. Routing needed no change: dependents were always
+  enqueued by their own kind through `enqueueIfRegistered`.
+
+  Two costs came with it and are paid inside the same change. The stream carries
+  `ChangeRef{ID, Type}` rather than `RawChange`, because it sees every write in
+  the process and an undelivered `*RawObject` pins that row's blobs; and its
+  feeder drains the receiver with `TryRecv`, so a burst costs one
+  `GroupIncomingRefsByID` rather than one `ListIncomingRefs` per change — the
+  store is single-connection, so the waker's reads serialize against every
+  writer. Draining at the receiver rather than through a buffered channel is what
+  keeps conflation alive to the handoff.
+
+  What it does *not* fix: both waker failure branches are now process-wide (one
+  lost subscription or one ended stream kills dependency wakes for every kind),
+  and two `Beehive`s on one store each observe the other's kinds — filtered
+  correctly, but paid for in refs queries. Spec and TDD plan in
+  `specs/0a-client-only-target-waker.md`.
 
 - **GC can no longer be disabled, which deleted two strand bugs instead of patching
   them** — done. `WithGCInterval(d <= 0)` now returns `ErrInvalidOption` (a new
