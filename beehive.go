@@ -378,7 +378,32 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watch
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
 func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
-	deps, err := bh.store.ListIncomingRefs(ctx, targetID, RelationDependsOn)
+	bh.wakeDependentsBatch(ctx, []ObjectID{targetID})
+}
+
+// wakeDependentsBatch is wakeDependents over many targets at once, in one refs
+// query. Batching is not just an optimization here: the store runs on a single
+// connection, so every lookup the waker makes serializes against every writer in
+// the process — one query per burst of changes rather than one per change is
+// what keeps a write-heavy kind from taxing them all.
+//
+// Duplicate ids are collapsed before the query: the store's conflating hub
+// already coalesces per object, but the wake policy must not depend on how its
+// input was produced.
+func (bh *Beehive) wakeDependentsBatch(ctx context.Context, targetIDs []ObjectID) {
+	ids := make([]ObjectID, 0, len(targetIDs))
+	seen := make(map[ObjectID]struct{}, len(targetIDs))
+	for _, id := range targetIDs {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	byTarget, err := bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		// Shutdown cancels this same ctx, so a change already dequeued when Stop
 		// lands fails here for no reason of its own. Escalating would arm a full
@@ -387,26 +412,28 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 		if ctx.Err() != nil {
 			return
 		}
-		// Every dependent of this target just missed this change. A dependent that
-		// has settled is invisible to every owed-work listing — its own generation
-		// never moved — so with no full pass configured the miss is permanent, not
-		// slow. Nothing here can name who was missed: the lookup that failed is
-		// exactly the one that would have said.
-		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for this change were dropped, forcing a full resync pass",
-			"targetID", targetID, "err", err)
+		// Every dependent of these targets just missed their changes. A dependent
+		// that has settled is invisible to every owed-work listing — its own
+		// generation never moved — so with no full pass configured the miss is
+		// permanent, not slow. Nothing here can name who was missed: the lookup
+		// that failed is exactly the one that would have said.
+		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for these changes were dropped, forcing a full resync pass",
+			"targetIDs", ids, "err", err)
 		bh.resyncKindsNextTick()
 		return
 	}
-	for _, d := range deps {
-		if d.ID == targetID {
-			// Self-edge: nothing here is owed a wake. A spec write requeues through
-			// wakeAfterCommit; a status or condition write is this object's own pass,
-			// which just ran. Waking it re-enqueues at full speed with nothing to
-			// converge it. Cycles of two or more still do; see the cycle entry in
-			// TODO.md.
-			continue
+	for _, targetID := range ids {
+		for _, d := range byTarget[targetID] {
+			if d.ID == targetID {
+				// Self-edge: nothing here is owed a wake. A spec write requeues through
+				// wakeAfterCommit; a status or condition write is this object's own pass,
+				// which just ran. Waking it re-enqueues at full speed with nothing to
+				// converge it. Cycles of two or more still do; see the cycle entry in
+				// TODO.md.
+				continue
+			}
+			bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 		}
-		bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 	}
 }
 

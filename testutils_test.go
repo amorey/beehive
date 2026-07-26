@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -390,7 +391,7 @@ func refObjectIDs(refs []Ref) []ObjectID {
 // change and the commit, so a test that wants the window deterministically has to
 // wait for this rather than assume the waker is done.
 //
-// It is keyed on (toID, relation), not on the caller — ListIncomingRefs is also
+// It is keyed on (toID, relation), not on the caller — the same lookups are also
 // reached from ListDependents and the LoadDependents eager path, and nothing here
 // can tell those from the waker. So a token means "somebody looked", and a test
 // that wants "the waker looked" must resetLooked immediately before the write it
@@ -405,17 +406,35 @@ type wakeProbeStore struct {
 
 func (s *wakeProbeStore) ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error) {
 	refs, err := s.Store.ListIncomingRefs(ctx, toID, relation)
-	if toID == s.targetID && relation == RelationDependsOn {
-		// Non-blocking: this runs on the waker's goroutine, and a full buffer means
-		// no test is waiting. Blocking there would park the waker inside the store
-		// and hang the reconciler — a timeout in some unrelated test rather than a
-		// failure here.
-		select {
-		case s.looked <- struct{}{}:
-		default:
-		}
+	if toID == s.targetID {
+		s.note(relation)
 	}
 	return refs, err
+}
+
+// GroupIncomingRefsByID is the waker's own lookup (it resolves a whole batch of
+// changed targets in one query), so the probe has to cover it too — otherwise a
+// test waiting on "the waker looked" would wait forever.
+func (s *wakeProbeStore) GroupIncomingRefsByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error) {
+	refs, err := s.Store.GroupIncomingRefsByID(ctx, toIDs, relation)
+	if slices.Contains(toIDs, s.targetID) {
+		s.note(relation)
+	}
+	return refs, err
+}
+
+// note records one depends_on lookup for the target. Non-blocking: it runs on
+// the waker's goroutine, and a full buffer means no test is waiting. Blocking
+// there would park the waker inside the store and hang the reconciler — a
+// timeout in some unrelated test rather than a failure here.
+func (s *wakeProbeStore) note(relation Relation) {
+	if relation != RelationDependsOn {
+		return
+	}
+	select {
+	case s.looked <- struct{}{}:
+	default:
+	}
 }
 
 // resetLooked discards lookups recorded so far, so the next waitLooked can only
