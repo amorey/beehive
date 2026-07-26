@@ -173,7 +173,7 @@ tell "we decided against this for now" from "nobody thought of it."
   the restart path already handles.
 
   Deferred as a *durable* fix because it is not local to this timing. Stamping
-  `pending_wake` in `wakeDependents` would make every target change a write per
+  `pending_wake` in `wakeDependentsBatch` would make every target change a write per
   dependent on the wake path — the cost `pending_wake` avoids today by riding a
   write `AddRef` was already doing — and the decrement is per-pass, so a
   stamp-per-change would need the same count-not-flag reasoning re-derived against
@@ -195,7 +195,7 @@ tell "we decided against this for now" from "nobody thought of it."
   owner can never be physically collected.
 
   Nothing event-driven recovers it. `AddRef` bumps no `resource_version` and emits
-  nothing, so no watcher fires; `wakeDependents` reads only `depends_on` and would
+  nothing, so no watcher fires; `wakeDependentsBatch` reads only `depends_on` and would
   ignore the edge regardless; the child's own `collect` returns at the
   `DeletionRequestedAt == nil` early-out because *it* is not finalizing; and the owner
   is re-woken by `collect`'s `toWake` referents only when a child row is physically
@@ -470,10 +470,20 @@ tell "we decided against this for now" from "nobody thought of it."
   writer. Draining at the receiver rather than through a buffered channel is what
   keeps conflation alive to the handoff.
 
-  What it does *not* fix: both waker failure branches are now process-wide (one
-  lost subscription or one ended stream kills dependency wakes for every kind),
-  and two `Beehive`s on one store each observe the other's kinds — filtered
-  correctly, but paid for in refs queries. Spec and TDD plan in
+  What it does *not* fix, and what it costs. Both waker failure branches are now
+  process-wide: one lost subscription or one ended stream kills dependency wakes
+  for every kind. Two `Beehive`s on one store each observe the other's kinds —
+  filtered correctly, but paid for in refs queries. And **the single waker
+  goroutine is a process-wide head-of-line block**: K independent wakers became
+  one, so a slow `GroupIncomingRefsByID` — which queues behind writers on the
+  single connection — now delays wakes for *every* kind, where before it delayed
+  only its own. Batching was the agreed mitigation and it bounds throughput
+  (O(bursts) queries, not O(changes)), but it does not bound *latency*: a batch
+  still waits for the query ahead of it. Accepted deliberately — the alternative
+  is per-kind wakers, which is the defect. If it ever bites, the shape is a small
+  pool of drain goroutines over the one subscription, partitioned by target id so
+  a kind's wakes stay ordered; unbuilt, and not worth the concurrency until a
+  workload shows the stall. Spec and TDD plan in
   `specs/0a-client-only-target-waker.md`.
 
 - **GC can no longer be disabled, which deleted two strand bugs instead of patching
@@ -551,7 +561,7 @@ tell "we decided against this for now" from "nobody thought of it."
   **The waker's three loss points**, all now logged at Warn and all repaired by
   escalating the *catchup* ticker (not resync, which is off by default — a repair
   hung off an opt-in knob would be dead where it is needed most): a failed
-  `ListIncomingRefs` arms one full pass (it cannot be narrower — the lookup that
+  `GroupIncomingRefsByID` arms one full pass (it cannot be narrower — the lookup that
   failed is what would have named the dependents); a closed change stream and a
   failed subscription each force every later pass, since they keep dropping changes
   rather than having dropped one. `Beehive.resyncKindsNextTick`/`EveryTick` fan out
@@ -747,7 +757,7 @@ tell "we decided against this for now" from "nobody thought of it."
 
   Two things it deliberately does *not* do. It is a durable *wake*, not a derived
   backstop: it recovers only signals something explicitly raised, so a wake lost
-  because `wakeDependents` swallowed its `ListIncomingRefs` error (see "Three silent
+  because `wakeDependentsBatch` swallowed its refs-lookup error (see "Three silent
   loss points" above) still heals never, and "resync is the correctness backstop"
   stays false in general. And it shares spec-convergence's coverage everywhere *but*
   the unconditional startup/tick enqueue — which is why it works under

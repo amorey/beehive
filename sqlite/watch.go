@@ -97,9 +97,10 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 // object that is already covered by the subscriber's snapshot (born in the
 // subscribe→snapshot race window), in which case the consumer must still see the
 // delete. The seenIDs guard in watch() drops tombstones for objects the consumer
-// truly never observed. WatchList and WatchChangeRefs override this with
-// annihilatingMerge, which can drop such tombstones early (WatchList preserving
-// snapshot-covered deletes, WatchChangeRefs preserving nothing).
+// truly never observed. WatchList overrides this with annihilatingMerge, which
+// can drop such tombstones early while preserving snapshot-covered ones. The
+// store-wide stream shares neither: it carries changeRef, and mergeChangeRef is
+// its own policy.
 func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
 	hi := next
 	if prev.Object.ResourceVersion > next.Object.ResourceVersion {
@@ -159,16 +160,16 @@ type snapshotIDs map[storeapi.ObjectID]struct{}
 // bounded by the live key set instead of growing one tombstone per transient id
 // in a high-churn kind. mergeChange (the shared default) cannot do this
 // blindly: a snapshot-covered object born in the subscribe→snapshot race window
-// also coalesces Added→Deleted, and its delete MUST survive. preserve reports the
-// ids whose delete must be kept; an Added→Deleted pair is annihilated only when
-// preserve is nil (WatchChangeRefs has no snapshot, so nothing is pre-known) or
-// preserve returns false for the id.
+// also coalesces Added→Deleted, and its delete MUST survive. preserve, which is
+// required, reports the ids whose delete must be kept.
+//
+// Only WatchList reaches this. The snapshot-less consumer is the store-wide
+// stream, whose annihilation lives in mergeChangeRef — unconditional there,
+// because it has no snapshot to preserve deletes for.
 func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawChange] {
 	return func(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
-		if prev.Type == storeapi.Added && next.Type == storeapi.Deleted {
-			if preserve == nil || !preserve(next.Object.ID) {
-				return storeapi.RawChange{}, false // unobserved transient: annihilate
-			}
+		if prev.Type == storeapi.Added && next.Type == storeapi.Deleted && !preserve(next.Object.ID) {
+			return storeapi.RawChange{}, false // unobserved transient: annihilate
 		}
 		return mergeChange(prev, next)
 	}

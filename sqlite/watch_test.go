@@ -694,28 +694,35 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 	assert.Equal(t, beehive.Deleted, got.Type)
 }
 
-// TestAnnihilatingMergeForEvents verifies the snapshot-less streams' memory bound: with no
-// snapshot to preserve (preserve == nil), every unobserved Added→Deleted pair is
-// annihilated, while a non-delete coalescence still survives.
-func TestAnnihilatingMergeForEvents(t *testing.T) {
-	merge := annihilatingMerge(nil)
-	const id storeapi.ObjectID = 7
-	added := storeapi.RawChange{Type: beehive.Added,
-		Object: &storeapi.RawObject{ID: id, ResourceVersion: 1}}
-	deleted := storeapi.RawChange{Type: beehive.Deleted,
-		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
-	modified := storeapi.RawChange{Type: beehive.Modified,
-		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
+// TestMergeChangeRefAnnihilates verifies the store-wide stream's memory bound:
+// it has no snapshot, so nothing is pre-known and every unobserved Added→Deleted
+// pair is annihilated, while a non-delete coalescence still survives as Added at
+// the latest version. This is the snapshot-less half of the policy
+// annihilatingMerge covers for WatchList.
+func TestMergeChangeRefAnnihilates(t *testing.T) {
+	added := changeRef{typ: beehive.Added, rv: 1}
+	deleted := changeRef{typ: beehive.Deleted, rv: 2}
+	modified := changeRef{typ: beehive.Modified, rv: 2}
 
 	// Unobserved create→delete: dropped entirely.
-	_, keep := merge(added, deleted)
+	_, keep := mergeChangeRef(added, deleted)
 	assert.False(t, keep)
 
-	// Create→modify still coalesces and survives (kept as Added, latest body).
-	got, keep := merge(added, modified)
+	// Create→modify still coalesces and survives (kept as Added, latest version).
+	got, keep := mergeChangeRef(added, modified)
 	require.True(t, keep)
-	assert.Equal(t, beehive.Added, got.Type)
-	assert.EqualValues(t, 2, got.Object.ResourceVersion)
+	assert.Equal(t, beehive.Added, got.typ)
+	assert.EqualValues(t, 2, got.rv)
+
+	// An observed object's delete is a real tombstone, not noise.
+	got, keep = mergeChangeRef(modified, deleted)
+	require.True(t, keep)
+	assert.Equal(t, beehive.Deleted, got.typ)
+
+	// Conflation is version-ordered, not arrival-ordered.
+	got, keep = mergeChangeRef(changeRef{typ: beehive.Modified, rv: 5}, modified)
+	require.True(t, keep)
+	assert.EqualValues(t, 5, got.rv)
 }
 
 // TestWatchSnapshotRaceModifiedNotAdded verifies that when a race-window Added
