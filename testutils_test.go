@@ -231,6 +231,9 @@ func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 func (s *fakeStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
 }
+func (s *fakeStore) WatchChangeRefs(context.Context) (storeapi.ChangeRefWatcher, error) {
+	return noopChangeRefWatcher{}, nil
+}
 func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
 	panic("not implemented: fakeStore.WatchEvents")
 }
@@ -240,6 +243,12 @@ type noopWatcher struct{}
 
 func (noopWatcher) Changes() <-chan storeapi.RawChange { return nil }
 func (noopWatcher) Close()                             {}
+
+// noopChangeRefWatcher is noopWatcher's store-wide-stream twin.
+type noopChangeRefWatcher struct{}
+
+func (noopChangeRefWatcher) Batches() <-chan []storeapi.ChangeRef { return nil }
+func (noopChangeRefWatcher) Close()                               {}
 
 // watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
 // error, so client-layer tests can drive the typed-adapter goroutine directly.

@@ -1144,3 +1144,91 @@ func TestPublishReachesGlobalHub(t *testing.T) {
 		second.ID: beehive.Added,
 	}, got, "both kinds reach the one global hub")
 }
+
+// recvBatch waits for the next change-ref batch on w, failing on timeout/close.
+func recvBatch(t *testing.T, w storeapi.ChangeRefWatcher) []storeapi.ChangeRef {
+	t.Helper()
+	select {
+	case batch, ok := <-w.Batches():
+		if !ok {
+			t.Fatal("change-ref watcher channel closed unexpectedly")
+		}
+		return batch
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a change-ref batch")
+		panic("unreachable")
+	}
+}
+
+// assertNoBatch fails if any change-ref batch arrives on w within d.
+func assertNoBatch(t *testing.T, w storeapi.ChangeRefWatcher, d time.Duration) {
+	t.Helper()
+	select {
+	case batch, ok := <-w.Batches():
+		if ok {
+			t.Fatalf("unexpected change-ref batch: %+v", batch)
+		}
+		t.Fatal("change-ref watcher channel closed unexpectedly")
+	case <-time.After(d):
+	}
+}
+
+// TestWatchChangeRefsStreamsLiveChanges verifies a live write reaches the
+// store-wide stream as an id-and-type reference.
+func TestWatchChangeRefsStreamsLiveChanges(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchChangeRefs(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	created, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ChangeRef{{ID: created.ID, Type: beehive.Added}}, recvBatch(t, w))
+}
+
+// TestWatchChangeRefsSpansKinds verifies the stream is store-wide: one
+// subscription observes changes to a kind it was never told about, which is the
+// whole point — a dependency target may be of a kind with no controller.
+func TestWatchChangeRefsSpansKinds(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchChangeRefs(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	first, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	second, err := store.CreateObject(ctx, &beehive.RawObject{Kind: "Other", Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	got := map[storeapi.ObjectID]bool{}
+	for len(got) < 2 {
+		for _, ref := range recvBatch(t, w) {
+			got[ref.ID] = true
+		}
+	}
+	assert.Equal(t, map[storeapi.ObjectID]bool{first.ID: true, second.ID: true}, got)
+}
+
+// TestWatchChangeRefsSkipsSnapshot verifies the stream has no initial snapshot:
+// existing objects are already accounted for by the reconciler's startup pass,
+// and replaying them would make every restart a full wake storm.
+func TestWatchChangeRefsSkipsSnapshot(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pre, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, err := store.WatchChangeRefs(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+	assertNoBatch(t, w, 200*time.Millisecond)
+
+	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ChangeRef{{ID: pre.ID, Type: beehive.Modified}}, recvBatch(t, w))
+}

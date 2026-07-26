@@ -291,6 +291,7 @@ type watcherImpl[V any] struct {
 // (V = Event). Each instantiation is only ever used through its own interface.
 func (w *watcherImpl[V]) Changes() <-chan V { return w.out }
 func (w *watcherImpl[V]) Events() <-chan V  { return w.out }
+func (w *watcherImpl[V]) Batches() <-chan V { return w.out }
 func (w *watcherImpl[V]) Close()            { w.cancel() }
 
 func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
@@ -308,6 +309,56 @@ func (s *sqliteStore) WatchChanges(ctx context.Context, gk storeapi.GroupKind) (
 	return s.watch(ctx, gk, nil, false, func(context.Context) ([]*storeapi.RawObject, int64, error) {
 		return nil, 0, nil
 	})
+}
+
+// WatchChangeRefs streams every kind's live changes as blob-free references.
+// Like WatchChanges it takes no snapshot, so the dedup floor is 0 — a fresh
+// receiver starts at the current write position and everything it sees is
+// genuinely post-subscribe.
+//
+// The receiver takes annihilatingMerge(nil): with no snapshot nothing is
+// pre-known, so an object born and deleted before the consumer ever saw it is
+// dropped rather than delivered as a lone tombstone, which is what bounds a slow
+// consumer's memory by the live key set instead of by churn.
+func (s *sqliteStore) WatchChangeRefs(ctx context.Context) (storeapi.ChangeRefWatcher, error) {
+	s.hubMu.Lock()
+	closed := s.closed
+	s.hubMu.Unlock()
+	if closed {
+		return nil, errStoreClosed
+	}
+	rx := s.changeHub.Receiver(s.changeHub.WithMerge(annihilatingMerge(nil)))
+
+	wctx, cancel := context.WithCancel(ctx)
+	w := &watcherImpl[[]storeapi.ChangeRef]{out: make(chan []storeapi.ChangeRef), cancel: cancel}
+	go func() {
+		// Registered first so it runs last (after out is closed), letting tests
+		// await exit without reading out.
+		if s.afterStream != nil {
+			defer s.afterStream()
+		}
+		defer close(w.out)
+		defer rx.Close()
+		for {
+			wev, err := rx.RecvContext(wctx)
+			if err != nil {
+				return // ctx cancelled, watcher closed, or hub closed
+			}
+			// Project to a reference here, at the receive: this is where the
+			// *RawObject — and the spec/status blobs it points at — is released.
+			batch := []storeapi.ChangeRef{{ID: wev.Key, Type: wev.Value.Type}}
+			select {
+			case w.out <- batch:
+			case <-wctx.Done():
+				return
+			case <-s.done:
+				// A parked send is only woken by closing done; closing the hub wakes
+				// a receive.
+				return
+			}
+		}
+	}()
+	return w, nil
 }
 
 func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.Watcher, error) {

@@ -98,6 +98,27 @@ type Watcher interface {
 	Close()
 }
 
+// ChangeRef is a change stripped to what a consumer that only routes by
+// identity needs: which object changed, and how. It carries no *RawObject on
+// purpose — the store-wide stream sees every write in the process, and holding
+// a row would pin its spec and status blobs for as long as the value is
+// undelivered.
+type ChangeRef struct {
+	ID   ObjectID
+	Type ChangeType
+}
+
+// ChangeRefWatcher is a subscription to the store-wide change stream. Batches
+// yields the changes that were ready together, coalesced per object — a burst
+// of writes arrives as one slice with one entry per distinct object, so a
+// consumer that resolves each entry against the store pays per burst rather
+// than per write. The channel closes when the watcher is closed or its store
+// shuts down; Close is idempotent.
+type ChangeRefWatcher interface {
+	Batches() <-chan []ChangeRef
+	Close()
+}
+
 // EventWatcher is a subscription to one object's event log: the current runs
 // (the snapshot) followed by live runs, each an aggregated Event. Unlike Watcher
 // there are no tombstones — a run only appears or updates — so a lagging
@@ -583,4 +604,11 @@ type Store interface {
 	// only subsequent changes matter (e.g. the dependency waker), to skip the
 	// snapshot build that WatchList would do on every subscribe.
 	WatchChanges(ctx context.Context, gk GroupKind) (Watcher, error)
+
+	// WatchChangeRefs returns a ChangeRefWatcher for live changes to every kind
+	// in the store — no initial snapshot, no rows, no kind filter. It is the
+	// dependency waker's stream: a depends_on edge may point at an object of any
+	// kind, including one with no registered controller, so a per-kind
+	// subscription cannot see every target.
+	WatchChangeRefs(ctx context.Context) (ChangeRefWatcher, error)
 }
