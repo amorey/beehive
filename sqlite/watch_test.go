@@ -17,6 +17,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1231,4 +1232,71 @@ func TestWatchChangeRefsSkipsSnapshot(t *testing.T) {
 	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ChangeRef{{ID: pre.ID, Type: beehive.Modified}}, recvBatch(t, w))
+}
+
+// newParkedChangeRefStream returns a change-ref watcher whose goroutine is
+// provably parked on its send: out is unbuffered by design, so one write is
+// enough to park it, and the beforeLiveSend seam reports the instant it is about
+// to block. Writes made after that pile up in the receiver — where they still
+// conflate — until the caller reads. The parking write's own batch is the first
+// one the caller must consume.
+func newParkedChangeRefStream(t *testing.T, store *sqliteStore) storeapi.ChangeRefWatcher {
+	t.Helper()
+	parked := make(chan struct{})
+	var once sync.Once
+	store.beforeLiveSend = func() { once.Do(func() { close(parked) }) }
+
+	w, err := store.WatchChangeRefs(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+
+	_, err = store.CreateObject(context.Background(), newWatchObject())
+	require.NoError(t, err)
+	select {
+	case <-parked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("change-ref stream never parked on its send")
+	}
+	return w
+}
+
+// TestWatchChangeRefsBatchesBurst verifies a burst of writes drains as one
+// batch: the waker resolves each entry against the store, so per-burst instead
+// of per-write is what keeps a hot kind from taxing every writer.
+func TestWatchChangeRefsBatchesBurst(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedChangeRefStream(t, store)
+
+	var want []storeapi.ObjectID
+	for range 3 {
+		obj, err := store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+		want = append(want, obj.ID)
+	}
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	var got []storeapi.ObjectID
+	for _, ref := range recvBatch(t, w) {
+		got = append(got, ref.ID)
+	}
+	assert.Equal(t, want, got, "the whole burst arrives as one batch, in first-touch order")
+}
+
+// TestWatchChangeRefsCapsBatch verifies a batch is bounded: with more ready than
+// the cap, the first batch is exactly the cap and the rest follow in the next.
+func TestWatchChangeRefsCapsBatch(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedChangeRefStream(t, store)
+
+	const extra = 2
+	for range changeRefBatchCap + extra {
+		_, err := store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+	}
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	assert.Len(t, recvBatch(t, w), changeRefBatchCap)
+	assert.Len(t, recvBatch(t, w), extra)
 }

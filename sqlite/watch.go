@@ -311,6 +311,12 @@ func (s *sqliteStore) WatchChanges(ctx context.Context, gk storeapi.GroupKind) (
 	})
 }
 
+// changeRefBatchCap bounds how many references one batch carries. It bounds the
+// slice, not retained memory: what a lagging consumer holds is its receiver's
+// pending set, which conflates per object and so is bounded by the store's live
+// key set either way.
+const changeRefBatchCap = 64
+
 // WatchChangeRefs streams every kind's live changes as blob-free references.
 // Like WatchChanges it takes no snapshot, so the dedup floor is 0 — a fresh
 // receiver starts at the current write position and everything it sees is
@@ -347,6 +353,21 @@ func (s *sqliteStore) WatchChangeRefs(ctx context.Context) (storeapi.ChangeRefWa
 			// Project to a reference here, at the receive: this is where the
 			// *RawObject — and the spec/status blobs it points at — is released.
 			batch := []storeapi.ChangeRef{{ID: wev.Key, Type: wev.Value.Type}}
+			// Drain whatever else is already pending. Taking it from the receiver
+			// rather than from a buffered out channel is what keeps conflation
+			// intact up to this point: until a value is popped, another write to the
+			// same object merges into its slot, so a burst of writes to one object
+			// costs one entry, not one per write.
+			for len(batch) < changeRefBatchCap {
+				next, err := rx.TryRecv()
+				if err != nil {
+					break // drained, or the hub closed (the next Recv reports it)
+				}
+				batch = append(batch, storeapi.ChangeRef{ID: next.Key, Type: next.Value.Type})
+			}
+			if s.beforeLiveSend != nil {
+				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park
+			}
 			select {
 			case w.out <- batch:
 			case <-wctx.Done():
