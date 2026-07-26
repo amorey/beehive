@@ -429,12 +429,12 @@ tell "we decided against this for now" from "nobody thought of it."
 
 - **The store keeps two hubs carrying the same changes** — known, not fixed.
   `hubs[gk]` (keyed `ObjectID`, carrying `RawChange`) and `changeHub` (keyed
-  `ObjectID`, carrying the projected `changeRef`) are fed by the same `publish`,
+  `ObjectID`, carrying the projected `pendingChange`) are fed by the same `publish`,
   so every object write pays two `Send`s and `Close` has one more hub to tear
   down. One hub keyed `struct{GroupKind; ObjectID}` would serve all three
   consumers — `WatchList(gk)` filtering on the kind half, `Watch(gk, id)` on the
   whole key (it already filters by id alone, since ids are globally unique), and
-  `WatchChangeRefs` not filtering at all — with conflation granularity unchanged.
+  `WatchObjectChanges` not filtering at all — with conflation granularity unchanged.
   Deferred because the value types have deliberately diverged: the store-wide
   stream must not carry `*RawObject` (it would pin blobs), so a single hub means
   either giving the snapshot watchers the projection and re-reading rows, or
@@ -453,7 +453,7 @@ tell "we decided against this for now" from "nobody thought of it."
   target only sets a tombstone, and with no dependent woken to drop the edge the
   row stays deletion-pending while the GC sweeper retries it every tick, forever.
 
-  The fix is one store-wide stream: `Store.WatchChangeRefs(ctx)` replaces the
+  The fix is one store-wide stream: `Store.WatchObjectChanges(ctx)` replaces the
   per-kind `WatchChanges(gk)` (which had no other caller), and `Start` runs a
   single waker over it. It is the only option that cannot go stale — any per-kind
   subscription list has to be computed from something (the registered set, the
@@ -462,7 +462,7 @@ tell "we decided against this for now" from "nobody thought of it."
   enqueued by their own kind through `enqueueIfRegistered`.
 
   Two costs came with it and are paid inside the same change. The stream carries
-  `ChangeRef{ID, Type}` rather than `RawChange`, because it sees every write in
+  `ObjectChange{ID, Type}` rather than `RawChange`, because it sees every write in
   the process and an undelivered `*RawObject` pins that row's blobs; and its
   feeder drains the receiver with `TryRecv`, so a burst costs one
   `GroupIncomingRefsByID` rather than one `ListIncomingRefs` per change — the

@@ -95,20 +95,20 @@ carries change *references*, not rows:
 ```go
 // internal/storeapi — replaces Store.WatchChanges(ctx, gk)
 
-// ChangeRef is everything the waker uses from a change: the id to resolve
+// ObjectChange is everything the waker uses from a change: the id to resolve
 // dependents for, and the type it filters on. Deliberately blob-free.
-type ChangeRef struct {
+type ObjectChange struct {
     ID   ObjectID
     Type ChangeType
 }
 
-type ChangeRefWatcher interface {
-    Batches() <-chan []ChangeRef
+type ObjectChangeWatcher interface {
+    Batches() <-chan []ObjectChange
     Close()
 }
 
 // Store
-WatchChangeRefs(ctx context.Context) (ChangeRefWatcher, error)
+WatchObjectChanges(ctx context.Context) (ObjectChangeWatcher, error)
 ```
 
 `Client.Watch`/`WatchList` are untouched; this is the internal object-*change* stream only,
@@ -119,7 +119,7 @@ Implementation is the existing `watch` machinery with the per-kind hub swapped f
 global one, no snapshot (as `WatchChanges` already does: `hasSnapshot=false`, so no
 `seenIDs` correction and a dedup floor of 0), and a different feeder loop: block on
 `rx.Recv`, then drain with `conflate.Receiver.TryRecv` until empty or a bounded batch cap,
-projecting each value to `ChangeRef` and sending the slice on an **unbuffered** channel.
+projecting each value to `ObjectChange` and sending the slice on an **unbuffered** channel.
 
 `Start` then runs one waker instead of K, and `wakeDependents` needs no change to its
 routing at all — it already resolves dependents by edge and routes each through
@@ -174,7 +174,7 @@ Two costs land together, and both are cured by the same change:
 - `Store.GroupIncomingRefsByID(ctx, toIDs, relation) map[ObjectID][]Referrer`
   (`internal/storeapi/storeapi.go:532`) already exists and is exactly the batched shape;
   the eager `List` loader is its current caller. `ListIncomingRefs` stays for GC.
-- The waker receives a `[]ChangeRef` batch, filters to `Added`/`Modified`, issues **one**
+- The waker receives a `[]ObjectChange` batch, filters to `Added`/`Modified`, issues **one**
   `GroupIncomingRefsByID` and walks the result — self-edge skip and `enqueueIfRegistered`
   per dependent, unchanged. Dedup is free: the ids go into a set.
 
@@ -193,7 +193,7 @@ something — is wrong twice over, and `watch.go` is already explicit about the 
   hub exists for, and it defeats the batching too: the batch would be N repeats of one id.
 
 Draining with `TryRecv` inside the feeder keeps conflation intact right up to the handoff
-(the hub still holds one latest value per id) and lets the projection to `ChangeRef` throw
+(the hub still holds one latest value per id) and lets the projection to `ObjectChange` throw
 the blob away before anything is buffered. What crosses the channel is a slice of two-word
 structs, one per distinct object, and the channel itself stays unbuffered. Memory is
 bounded by the receiver's live-key set — which is store-wide now, so say it plainly: one
@@ -304,20 +304,20 @@ latency guarantee.
 
 Mechanical, but they gate everything above:
 
-- `fakeStore.WatchChanges` (`testutils_test.go:231`) — becomes `WatchChangeRefs(ctx)`,
-  defaulting to a never-firing `ChangeRefWatcher` the way `noopWatcher` does today.
+- `fakeStore.WatchChanges` (`testutils_test.go:231`) — becomes `WatchObjectChanges(ctx)`,
+  defaulting to a never-firing `ObjectChangeWatcher` the way `noopWatcher` does today.
 - `watcherStore.WatchChanges` (`testutils_test.go:258`) — same rename; this is the double
   that injects a subscribe failure, so it is what the §3.3 test drives
   (`watcherStore{err: …}`, as `client_test.go:1457` already does for `New`). Its preset
   watcher field changes type, and `fakeWatcher` needs a batch-shaped twin whose `push`
-  feeds `[]ChangeRef` — the existing one stays for the `Client.Watch` adapter tests, which
+  feeds `[]ObjectChange` — the existing one stays for the `Client.Watch` adapter tests, which
   are unaffected.
 - `fakeStore.GroupIncomingRefsByID` — currently a `panic("not implemented")` stub in the
   fill-in-as-needed set; the burst test needs it implemented plus a call counter.
 - `sqlite/watch_test.go` and `sqlite/store_test.go` callers of
   `store.WatchChanges(ctx, testGK)` — more than a signature change now: they assert on
   `RawChange` values (`TestWatchChangesSkipsSnapshot`, `TestWatchChangesStreamsLiveAdded`
-  and friends) and must move to `[]ChangeRef` batches. Two contracts also genuinely
+  and friends) and must move to `[]ObjectChange` batches. Two contracts also genuinely
   changed, so re-read rather than mechanically port: a store-wide stream no longer filters
   by kind, so any assertion that *another kind's* change is absent is asserting the old
   behavior; and no test can inspect an object's spec/status off this stream any more,

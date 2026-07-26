@@ -99,7 +99,7 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 // delete. The seenIDs guard in watch() drops tombstones for objects the consumer
 // truly never observed. WatchList overrides this with annihilatingMerge, which
 // can drop such tombstones early while preserving snapshot-covered ones. The
-// store-wide stream shares neither: it carries changeRef, and mergeChangeRef is
+// store-wide stream shares neither: it carries pendingChange, and mergePendingChange is
 // its own policy.
 func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
 	hi := next
@@ -116,24 +116,24 @@ func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
 	return storeapi.RawChange{Type: typ, Object: hi.Object}, true
 }
 
-// changeRef is what the store-wide hub carries. Identity is already the hub key,
+// pendingChange is what the store-wide hub carries. Identity is already the hub key,
 // so the value holds only the lifecycle type and the resource_version conflation
 // compares on — deliberately not a RawChange: this hub sees every write in the
 // process, and a pending *RawObject would pin that row's spec and status blobs
 // until the value is delivered.
-type changeRef struct {
+type pendingChange struct {
 	typ storeapi.ChangeType
 	rv  int64
 }
 
-// mergeChangeRef is mergeChange plus annihilation, over the projected value. The
+// mergePendingChange is mergeChange plus annihilation, over the projected value. The
 // store-wide stream has no snapshot, so nothing is pre-known: an Added the
 // consumer never saw, coalescing with a Deleted, is a transient object it has no
 // reason to hear about at all — dropping the slot is what bounds a slow
 // consumer's memory by the live key set instead of by churn.
-func mergeChangeRef(prev, next changeRef) (changeRef, bool) {
+func mergePendingChange(prev, next pendingChange) (pendingChange, bool) {
 	if prev.typ == storeapi.Added && next.typ == storeapi.Deleted {
-		return changeRef{}, false // unobserved transient: annihilate
+		return pendingChange{}, false // unobserved transient: annihilate
 	}
 	hi := next
 	if prev.rv > next.rv {
@@ -164,7 +164,7 @@ type snapshotIDs map[storeapi.ObjectID]struct{}
 // required, reports the ids whose delete must be kept.
 //
 // Only WatchList reaches this. The snapshot-less consumer is the store-wide
-// stream, whose annihilation lives in mergeChangeRef — unconditional there,
+// stream, whose annihilation lives in mergePendingChange — unconditional there,
 // because it has no snapshot to preserve deletes for.
 func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawChange] {
 	return func(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
@@ -269,8 +269,8 @@ func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawChange) {
 	if h := s.hubFor(gk); h != nil {
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
-	// The store-wide hub carries the projection, not the row: see changeRef.
-	_ = s.changeHub.Sender().Send(ev.Object.ID, changeRef{typ: ev.Type, rv: ev.Object.ResourceVersion})
+	// The store-wide hub carries the projection, not the row: see pendingChange.
+	_ = s.changeHub.Sender().Send(ev.Object.ID, pendingChange{typ: ev.Type, rv: ev.Object.ResourceVersion})
 }
 
 // emitEvent delivers a written run to event-log watchers: queued on the tx
@@ -359,25 +359,25 @@ func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (sto
 	})
 }
 
-// changeRefBatchCap bounds how many references one batch carries. It bounds the
+// objectChangeBatchCap bounds how many references one batch carries. It bounds the
 // slice, not retained memory: what a lagging consumer holds is its receiver's
 // pending set, which conflates per object and so is bounded by the store's live
 // key set either way.
-const changeRefBatchCap = 64
+const objectChangeBatchCap = 64
 
-// WatchChangeRefs streams every kind's live changes as blob-free references. It
+// WatchObjectChanges streams every kind's live changes as blob-free references. It
 // takes no snapshot, so the dedup floor is 0 — a fresh receiver starts at the
 // current write position and everything it sees is genuinely post-subscribe —
-// and the hub's own mergeChangeRef both conflates and annihilates, so no
+// and the hub's own mergePendingChange both conflates and annihilates, so no
 // per-receiver merge is needed.
-func (s *sqliteStore) WatchChangeRefs(ctx context.Context) (storeapi.ChangeRefWatcher, error) {
+func (s *sqliteStore) WatchObjectChanges(ctx context.Context) (storeapi.ObjectChangeWatcher, error) {
 	if s.isClosed() {
 		return nil, errStoreClosed
 	}
 	rx := s.changeHub.Receiver()
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := &watcherImpl[[]storeapi.ChangeRef]{out: make(chan []storeapi.ChangeRef), cancel: cancel}
+	w := &watcherImpl[[]storeapi.ObjectChange]{out: make(chan []storeapi.ObjectChange), cancel: cancel}
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -391,18 +391,18 @@ func (s *sqliteStore) WatchChangeRefs(ctx context.Context) (storeapi.ChangeRefWa
 			if err != nil {
 				return // ctx cancelled, watcher closed, or hub closed
 			}
-			batch := []storeapi.ChangeRef{{ID: wev.Key, Type: wev.Value.typ}}
+			batch := []storeapi.ObjectChange{{ID: wev.Key, Type: wev.Value.typ}}
 			// Drain whatever else is already pending. Taking it from the receiver
 			// rather than from a buffered out channel is what keeps conflation
 			// intact up to this point: until a value is popped, another write to the
 			// same object merges into its slot, so a burst of writes to one object
 			// costs one entry, not one per write.
-			for len(batch) < changeRefBatchCap {
+			for len(batch) < objectChangeBatchCap {
 				next, err := rx.TryRecv()
 				if err != nil {
 					break // drained, or the hub closed (the next Recv reports it)
 				}
-				batch = append(batch, storeapi.ChangeRef{ID: next.Key, Type: next.Value.typ})
+				batch = append(batch, storeapi.ObjectChange{ID: next.Key, Type: next.Value.typ})
 			}
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park
@@ -462,7 +462,7 @@ func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context)
 // stream is the snapshot (as Added events) followed by live events not already
 // covered by the snapshot. filterID, if non-nil, restricts live events to that
 // object. Both callers (WatchList and Watch) take a real snapshot; the
-// snapshot-less stream is WatchChangeRefs, which subscribes to the store-wide
+// snapshot-less stream is WatchObjectChanges, which subscribes to the store-wide
 // hub directly and shares none of this.
 //
 // The receiver is created BEFORE the snapshot is loaded so events that commit

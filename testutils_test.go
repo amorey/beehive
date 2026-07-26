@@ -229,8 +229,8 @@ func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error)
 func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
 }
-func (s *fakeStore) WatchChangeRefs(context.Context) (storeapi.ChangeRefWatcher, error) {
-	return noopChangeRefWatcher{}, nil
+func (s *fakeStore) WatchObjectChanges(context.Context) (storeapi.ObjectChangeWatcher, error) {
+	return noopObjectChangeWatcher{}, nil
 }
 func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
 	panic("not implemented: fakeStore.WatchEvents")
@@ -242,19 +242,19 @@ type noopWatcher struct{}
 func (noopWatcher) Changes() <-chan storeapi.RawChange { return nil }
 func (noopWatcher) Close()                             {}
 
-// noopChangeRefWatcher is noopWatcher's store-wide-stream twin.
-type noopChangeRefWatcher struct{}
+// noopObjectChangeWatcher is noopWatcher's store-wide-stream twin.
+type noopObjectChangeWatcher struct{}
 
-func (noopChangeRefWatcher) Batches() <-chan []storeapi.ChangeRef { return nil }
-func (noopChangeRefWatcher) Close()                               {}
+func (noopObjectChangeWatcher) Batches() <-chan []storeapi.ObjectChange { return nil }
+func (noopObjectChangeWatcher) Close()                                  {}
 
 // watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
 // error, so client-layer tests can drive the typed-adapter goroutine directly.
 type watcherStore struct {
 	fakeStore
-	w    Watcher
-	refs ChangeRefWatcher // served by WatchChangeRefs, for the dependency waker
-	err  error
+	w       Watcher
+	changes ObjectChangeWatcher // served by WatchObjectChanges, for the dependency waker
+	err     error
 }
 
 func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
@@ -263,11 +263,11 @@ func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, err
 func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
 }
-func (s *watcherStore) WatchChangeRefs(context.Context) (ChangeRefWatcher, error) {
+func (s *watcherStore) WatchObjectChanges(context.Context) (ObjectChangeWatcher, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.refs, nil
+	return s.changes, nil
 }
 
 // fakeStream is the shared body of the controllable watcher doubles: an
@@ -304,20 +304,20 @@ func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
 	w.ch <- storeapi.RawChange{Type: typ, Object: obj}
 }
 
-// fakeChangeRefWatcher is fakeWatcher's store-wide-stream twin, backing the
+// fakeObjectChangeWatcher is fakeWatcher's store-wide-stream twin, backing the
 // dependency-waker tests. A batch is the push unit deliberately — the waker
 // resolves a whole batch in one query, so a double that could only deliver one
 // reference at a time would hide that.
-type fakeChangeRefWatcher struct{ fakeStream[[]ChangeRef] }
+type fakeObjectChangeWatcher struct{ fakeStream[[]ObjectChange] }
 
-func newFakeChangeRefWatcher() *fakeChangeRefWatcher {
-	return &fakeChangeRefWatcher{newFakeStream[[]ChangeRef]()}
+func newFakeObjectChangeWatcher() *fakeObjectChangeWatcher {
+	return &fakeObjectChangeWatcher{newFakeStream[[]ObjectChange]()}
 }
 
-func (w *fakeChangeRefWatcher) Batches() <-chan []ChangeRef { return w.ch }
+func (w *fakeObjectChangeWatcher) Batches() <-chan []ObjectChange { return w.ch }
 
 // push delivers one batch to the waker.
-func (w *fakeChangeRefWatcher) push(refs ...ChangeRef) { w.ch <- refs }
+func (w *fakeObjectChangeWatcher) push(refs ...ObjectChange) { w.ch <- refs }
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.

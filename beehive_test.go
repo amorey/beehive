@@ -275,9 +275,9 @@ type countingChangeStreamStore struct {
 	subscriptions atomic.Int64
 }
 
-func (s *countingChangeStreamStore) WatchChangeRefs(context.Context) (storeapi.ChangeRefWatcher, error) {
+func (s *countingChangeStreamStore) WatchObjectChanges(context.Context) (storeapi.ObjectChangeWatcher, error) {
 	s.subscriptions.Add(1)
-	return noopChangeRefWatcher{}, nil
+	return noopObjectChangeWatcher{}, nil
 }
 
 // TestStartSubscribesOneChangeStream verifies the waker rides a single

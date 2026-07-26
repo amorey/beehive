@@ -646,9 +646,9 @@ func (s *blockingDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []Obj
 // enqueueIfRegistered mid-event must not deadlock against Stop, even with an
 // unbounded Stop context.
 func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
-	fw := newFakeChangeRefWatcher()
+	fw := newFakeObjectChangeWatcher()
 	store := &blockingDepsStore{
-		watcherStore: watcherStore{refs: fw},
+		watcherStore: watcherStore{changes: fw},
 		entered:      make(chan struct{}),
 		release:      make(chan struct{}),
 	}
@@ -663,7 +663,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
-	fw.push(ChangeRef{ID: 1, Type: Modified})
+	fw.push(ObjectChange{ID: 1, Type: Modified})
 	<-store.entered
 
 	stopped := make(chan struct{})
@@ -707,9 +707,9 @@ func (s *recordingDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []Ob
 // over-wake harmless. Deleted is still ignored (a gone object has no dependents
 // to requeue).
 func TestDependencyWakerWakesOnChange(t *testing.T) {
-	fw := newFakeChangeRefWatcher()
+	fw := newFakeObjectChangeWatcher()
 	calls := make(chan ObjectID, 1)
-	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{refs: fw}, calls: calls}}
+	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{changes: fw}, calls: calls}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -719,7 +719,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		close(done)
 	}()
 
-	fw.push(ChangeRef{ID: 1, Type: Added})
+	fw.push(ObjectChange{ID: 1, Type: Added})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(1), id, "Added event wakes dependents (a coalesced create+modify)")
@@ -727,7 +727,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Added event did not trigger a wake")
 	}
 
-	fw.push(ChangeRef{ID: 2, Type: Modified})
+	fw.push(ObjectChange{ID: 2, Type: Modified})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(2), id, "Modified event wakes dependents of the changed object")
@@ -735,7 +735,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Modified event did not trigger a wake")
 	}
 
-	fw.push(ChangeRef{ID: 3, Type: Deleted})
+	fw.push(ObjectChange{ID: 3, Type: Deleted})
 	select {
 	case <-calls:
 		t.Fatal("Deleted event triggered a dependents wake")
@@ -785,10 +785,10 @@ func wakerFixture(deps map[ObjectID][]Referrer, kinds ...GroupKind) (*Beehive, *
 
 // changed is the waker's input shape: the ids as Modified references, which is
 // what a target's change looks like on the store-wide stream.
-func changed(ids ...ObjectID) []ChangeRef {
-	refs := make([]ChangeRef, 0, len(ids))
+func changed(ids ...ObjectID) []ObjectChange {
+	refs := make([]ObjectChange, 0, len(ids))
 	for _, id := range ids {
-		refs = append(refs, ChangeRef{ID: id, Type: Modified})
+		refs = append(refs, ObjectChange{ID: id, Type: Modified})
 	}
 	return refs
 }
@@ -920,8 +920,8 @@ func TestWakeDependentsListError(t *testing.T) {
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
 // ends (channel closed), not only on context cancellation.
 func TestDependencyWakerStreamEnd(t *testing.T) {
-	fw := newFakeChangeRefWatcher()
-	bh := &Beehive{store: &watcherStore{refs: fw}}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}}
 
 	done := make(chan struct{})
 	go func() {
@@ -2896,8 +2896,8 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 // unlogged either way.
 func TestDependencyWakerStreamEndLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeChangeRefWatcher()
-	bh := &Beehive{store: &watcherStore{refs: fw}, logger: logger}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
 
 	done := make(chan struct{})
 	go func() {
@@ -2917,8 +2917,8 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 // clean stop, training operators to ignore the one message that matters.
 func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeChangeRefWatcher()
-	bh := &Beehive{store: &watcherStore{refs: fw}, logger: logger}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -3042,9 +3042,9 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 // of death and strand everything after it.
 func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeChangeRefWatcher()
+	fw := newFakeObjectChangeWatcher()
 	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{refs: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger, order: []*reconciler{r1, r2}}
 
 	done := make(chan struct{})
 	go func() {
@@ -3084,9 +3084,9 @@ func (shutdownCtx) Err() error            { return context.Canceled }
 // one message that matters gets trained out of an operator.
 func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeChangeRefWatcher()
+	fw := newFakeObjectChangeWatcher()
 	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{refs: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger, order: []*reconciler{r1, r2}}
 
 	done := make(chan struct{})
 	go func() {
@@ -3408,8 +3408,8 @@ func TestSubscribeFailureReportsWholeProcess(t *testing.T) {
 // dependency wakes again.
 func TestDeadWakerReportsWholeProcess(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeChangeRefWatcher()
-	bh := &Beehive{store: &watcherStore{refs: fw}, logger: logger}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
 
 	done := make(chan struct{})
 	go func() {

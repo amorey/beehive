@@ -41,24 +41,24 @@ arrive.
 
 ---
 
-## Cycle 2 — `WatchChangeRefs` streams blob-free change references
+## Cycle 2 — `WatchObjectChanges` streams blob-free change references
 
 **Goal:** the new store surface exists and delivers ids, not rows.
 
-**Red** — `sqlite/watch_test.go`: `TestWatchChangeRefsStreamsLiveChanges` (one write → one
-batch of one `ChangeRef{ID, Added}`), `TestWatchChangeRefsSpansKinds` (one subscription sees
-two kinds), `TestWatchChangeRefsSkipsSnapshot` (a pre-existing object produces nothing — the
+**Red** — `sqlite/watch_test.go`: `TestWatchObjectChangesStreamsLiveChanges` (one write → one
+batch of one `ObjectChange{ID, Added}`), `TestWatchObjectChangesSpansKinds` (one subscription sees
+two kinds), `TestWatchObjectChangesSkipsSnapshot` (a pre-existing object produces nothing — the
 contract `TestWatchChangesSkipsSnapshot` pins today).
-*Fails to compile: no `WatchChangeRefs`.*
+*Fails to compile: no `WatchObjectChanges`.*
 
 **Green:**
-- `internal/storeapi`: `ChangeRef{ID ObjectID; Type ChangeType}`,
-  `ChangeRefWatcher{ Batches() <-chan []ChangeRef; Close() }`, and
-  `Store.WatchChangeRefs(ctx) (ChangeRefWatcher, error)`. **Leave `WatchChanges(gk)` in
+- `internal/storeapi`: `ObjectChange{ID ObjectID; Type ChangeType}`,
+  `ObjectChangeWatcher{ Batches() <-chan []ObjectChange; Close() }`, and
+  `Store.WatchObjectChanges(ctx) (ObjectChangeWatcher, error)`. **Leave `WatchChanges(gk)` in
   place** — cycle 10 removes it, once nothing calls it.
 - `sqlite`: subscribe to `changeHub` with `annihilatingMerge(nil)`; no snapshot, so the
   dedup floor is 0 exactly as `WatchChanges` documents (`sqlite/watch.go:301-308`). Feeder
-  goroutine receives one value, projects it to a `ChangeRef` — **this is where `Object` is
+  goroutine receives one value, projects it to a `ObjectChange` — **this is where `Object` is
   dropped and the blob released** — and sends a one-element slice on an **unbuffered**
   channel, using the existing `send`-with-`wctx`/`s.done` pattern.
 - Wire the `afterStream` seam so tests can await goroutine exit without reading `out`.
@@ -73,14 +73,14 @@ Batching is *not* in this cycle. One-element slices are the honest minimum that 
 
 **Goal:** the property spec §3.2 exists for — O(bursts), not O(changes).
 
-**Red** — `sqlite/watch_test.go`: `TestWatchChangeRefsBatchesBurst` (park the consumer,
+**Red** — `sqlite/watch_test.go`: `TestWatchObjectChangesBatchesBurst` (park the consumer,
 write N distinct objects, then read: **one** batch with all N) and
-`TestWatchChangeRefsCapsBatch` (with more than the cap ready, the first batch is exactly the
+`TestWatchObjectChangesCapsBatch` (with more than the cap ready, the first batch is exactly the
 cap and the rest follow).
 *Fails: N batches of one.*
 
 **Green:** after the blocking `RecvContext`, drain with `rx.TryRecv()` until empty or
-`changeRefBatchCap`, appending projections. Add the unexported `changeRefBatchCap = 64` with
+`objectChangeBatchCap`, appending projections. Add the unexported `objectChangeBatchCap = 64` with
 a comment that it bounds *slice length*, not retained blobs — the memory bound is the
 receiver's live-key set, which is now store-wide.
 
@@ -92,9 +92,9 @@ receiver's live-key set, which is now store-wide.
 
 **Goal:** the property that rules out the buffered-channel design.
 
-**Red** — `sqlite/watch_test.go`: `TestWatchChangeRefsCoalescesRepeatWrites` (park the
+**Red** — `sqlite/watch_test.go`: `TestWatchObjectChangesCoalescesRepeatWrites` (park the
 consumer, write the *same* object N times, read: one batch, **one** entry, latest type) and
-`TestWatchChangeRefsAnnihilatesTransient` (create-then-delete an object the consumer never
+`TestWatchObjectChangesAnnihilatesTransient` (create-then-delete an object the consumer never
 saw: no entry).
 
 *Expect these to pass on arrival if cycle 3 was implemented correctly — they are
@@ -113,7 +113,7 @@ commit message.
 
 **Goal:** lifecycle parity with the watchers it sits beside.
 
-**Red** — `sqlite/watch_test.go`: `TestWatchChangeRefsClosedStore` (after `Close` →
+**Red** — `sqlite/watch_test.go`: `TestWatchObjectChangesClosedStore` (after `Close` →
 `errStoreClosed`), plus an open stream's channel closing on `Close` and on caller ctx
 cancel.
 *Fails: whichever arm the cycle-2 feeder didn't cover.*
@@ -173,14 +173,14 @@ subscription cannot move separately.
 *(1)–(3) fail by timeout: no waker exists for T's kind. (4) fails with 3.*
 
 **Green:**
-- Doubles: `fakeStore.WatchChangeRefs` → a never-firing `noopChangeRefWatcher`;
-  `fakeChangeRefWatcher` (a `fakeWatcher` twin whose `push` takes `...ChangeRef`);
-  `watcherStore` gains the `ChangeRefWatcher` + error it serves. The existing `fakeWatcher`
+- Doubles: `fakeStore.WatchObjectChanges` → a never-firing `noopObjectChangeWatcher`;
+  `fakeObjectChangeWatcher` (a `fakeWatcher` twin whose `push` takes `...ObjectChange`);
+  `watcherStore` gains the `ObjectChangeWatcher` + error it serves. The existing `fakeWatcher`
   stays for the `Client.Watch` adapter tests.
-- `runDependencyWaker(ctx, w ChangeRefWatcher)` — the `gk` parameter goes (it existed only
+- `runDependencyWaker(ctx, w ObjectChangeWatcher)` — the `gk` parameter goes (it existed only
   for the per-kind log line). The loop filters `Added`/`Modified` into an id set and calls
   `wakeDependentsBatch`.
-- `Start` (`beehive.go:195-214`): one `WatchChangeRefs(runCtx)`, one failure branch, one
+- `Start` (`beehive.go:195-214`): one `WatchObjectChanges(runCtx)`, one failure branch, one
   `bh.wg.Go` — still before the `r.run` loop, which is the ordering constraint `Start`
   already documents.
 - Delete single-id `wakeDependents` and port its callers to one-element slices:
@@ -198,7 +198,7 @@ subscription cannot move separately.
 ## Cycle 8 — no controllers, no subscription
 
 **Red** — `beehive_test.go`: `TestStartWithNoControllersSkipsWaker` — zero registered
-controllers ⇒ zero `WatchChangeRefs` calls.
+controllers ⇒ zero `WatchObjectChanges` calls.
 *Fails: one subscription that pays a refs query per change only to reach
 `enqueueIfRegistered`'s no-op arm (spec §3.4).*
 
@@ -210,7 +210,7 @@ controllers ⇒ zero `WatchChangeRefs` calls.
 
 **Red** — `reconciler_test.go`/`beehive_test.go`, asserting on log output as the existing
 log tests do: `TestChangeStreamSubscribeFailureEscalates` (with
-`watcherStore{changeRefErr: errBoom}`: the warning fires **once**, names the whole-process
+`watcherStore{pendingChangeErr: errBoom}`: the warning fires **once**, names the whole-process
 consequence, and arms `resyncKindsEveryTick` on **every** reconciler; plus the
 `!hasPeriodicPass()` variant) and the stream-ended twin for `beehive.go:346-356`.
 *Fails: K warnings with per-kind wording, or one warning still saying "for this kind".*
@@ -241,7 +241,7 @@ comment, but it belongs in this diff.
 
 - `CLAUDE.md`: the waker paragraph ("one waker per registered kind") and the watch-surface
   enumeration both change — one store-wide, batch-drained, blob-free change stream;
-  surfaces are `WatchChangeRefs` (internal), `Client.Watch`/`WatchList`, `WatchEvents`,
+  surfaces are `WatchObjectChanges` (internal), `Client.Watch`/`WatchList`, `WatchEvents`,
   `WatchSchedule`.
 - `TODO.md`: drop anything superseded.
 - `README.md`: only if it documents the per-kind waker.
@@ -253,10 +253,10 @@ comment, but it belongs in this diff.
 One per cycle, each green:
 
 1. `feat(sqlite): publish object changes to a store-wide conflating hub`
-2. `feat(store): add WatchChangeRefs, a blob-free change stream`
+2. `feat(store): add WatchObjectChanges, a blob-free change stream`
 3. `perf(sqlite): drain change refs in batches`
 4. `test(sqlite): pin that batching preserves per-object conflation`
-5. `fix(sqlite): close change-ref streams on store close and ctx cancel`
+5. `fix(sqlite): close object-change streams on store close and ctx cancel`
 6. `refactor(waker): resolve many targets' dependents in one query`
 7. `fix(waker)!: subscribe one store-wide change stream instead of one per kind`
 8. `perf(controller): skip the waker when no controllers are registered`

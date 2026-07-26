@@ -321,7 +321,7 @@ func (bh *Beehive) startDependencyWaker(runCtx context.Context) {
 	if len(bh.order) == 0 {
 		return
 	}
-	w, err := bh.store.WatchChangeRefs(runCtx)
+	w, err := bh.store.WatchObjectChanges(runCtx)
 	if err != nil {
 		// A waker that never starts is a dead waker: no change anywhere in the store
 		// will wake a dependent for the life of the process — every kind's, not one
@@ -346,7 +346,7 @@ func (bh *Beehive) startDependencyWaker(runCtx context.Context) {
 // covers existing objects), and it arrives in batches — a burst of changes costs
 // one refs query rather than one per change. The ctx.Done() arm is needed
 // because a watcher's channel may never close on its own.
-func (bh *Beehive) runDependencyWaker(ctx context.Context, w ChangeRefWatcher) {
+func (bh *Beehive) runDependencyWaker(ctx context.Context, w ObjectChangeWatcher) {
 	defer w.Close()
 	for {
 		select {
@@ -399,7 +399,7 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w ChangeRefWatcher) {
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (bh *Beehive) wakeDependentsBatch(ctx context.Context, batch []ChangeRef) {
+func (bh *Beehive) wakeDependentsBatch(ctx context.Context, batch []ObjectChange) {
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
 		if ref.Type != Added && ref.Type != Modified {

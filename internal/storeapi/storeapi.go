@@ -98,24 +98,26 @@ type Watcher interface {
 	Close()
 }
 
-// ChangeRef is a change stripped to what a consumer that only routes by
-// identity needs: which object changed, and how. It carries no *RawObject on
-// purpose — the store-wide stream sees every write in the process, and holding
-// a row would pin its spec and status blobs for as long as the value is
-// undelivered.
-type ChangeRef struct {
+// ObjectChange is a change stripped to what a consumer that only routes by
+// identity needs: which object changed, and how. The id is the object's, not a
+// change's — changes are not addressable here — so this is an object reference
+// annotated with what happened to it, and a consumer reads current state itself.
+// It carries no *RawObject on purpose: the store-wide stream sees every write in
+// the process, and holding a row would pin its spec and status blobs for as long
+// as the value is undelivered.
+type ObjectChange struct {
 	ID   ObjectID
 	Type ChangeType
 }
 
-// ChangeRefWatcher is a subscription to the store-wide change stream. Batches
+// ObjectChangeWatcher is a subscription to the store-wide change stream. Batches
 // yields the changes that were ready together, coalesced per object — a burst
 // of writes arrives as one slice with one entry per distinct object, so a
 // consumer that resolves each entry against the store pays per burst rather
 // than per write. The channel closes when the watcher is closed or its store
 // shuts down; Close is idempotent.
-type ChangeRefWatcher interface {
-	Batches() <-chan []ChangeRef
+type ObjectChangeWatcher interface {
+	Batches() <-chan []ObjectChange
 	Close()
 }
 
@@ -599,8 +601,8 @@ type Store interface {
 	// an Added snapshot, then all live changes for the kind.
 	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
 
-	// WatchChangeRefs returns a ChangeRefWatcher for live changes to every kind in
+	// WatchObjectChanges returns an ObjectChangeWatcher for live changes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.
-	WatchChangeRefs(ctx context.Context) (ChangeRefWatcher, error)
+	WatchObjectChanges(ctx context.Context) (ObjectChangeWatcher, error)
 }

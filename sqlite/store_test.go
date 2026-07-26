@@ -1355,7 +1355,7 @@ func TestMarkOwnedForDeletionCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, addRef(ctx, store, childB, owner, beehive.RelationOwnedBy))
 
 	// Watch live changes only (no snapshot) so each cascade's events are isolated.
-	w, err := store.WatchChangeRefs(ctx)
+	w, err := store.WatchObjectChanges(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1363,7 +1363,7 @@ func TestMarkOwnedForDeletionCascadesThenIsNoOp(t *testing.T) {
 	got, err := store.MarkOwnedForDeletion(ctx, owner)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	assertChangeRefs(t, w, 2, beehive.Modified)
+	assertObjectChanges(t, w, 2, beehive.Modified)
 	a1, err := store.GetObjectMeta(ctx, childA)
 	require.NoError(t, err)
 	require.NotNil(t, a1.DeletionRequestedAt, "child A marked for deletion")

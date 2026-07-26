@@ -44,10 +44,10 @@ type sqliteStore struct {
 	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]
 	// changeHub is the store-wide twin of hubs: every object change, of every kind,
 	// keyed by the same globally unique ObjectID, carrying the projection rather
-	// than the row (see changeRef). Created eagerly in open — there is exactly one
+	// than the row (see pendingChange). Created eagerly in open — there is exactly one
 	// and no key to look it up by, so making it lazy would cost the publish path
 	// (which runs on every object write) a second lock and map lookup.
-	changeHub *conflate.Hub[storeapi.ObjectID, changeRef]
+	changeHub *conflate.Hub[storeapi.ObjectID, pendingChange]
 	// eventHubs fan the event log out, one per GroupKind, keyed by run so a run's
 	// count-bumps conflate while distinct runs stay separate (see eventKey).
 	eventHubs map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]
