@@ -68,6 +68,14 @@ type Watcher = storeapi.Watcher
 // store's WatchEvents. The client decodes its raw runs into public Events.
 type EventWatcher = storeapi.EventWatcher
 
+// ChangeRefWatcher is a subscription to the store-wide change stream, returned
+// by the store's WatchChangeRefs. It is internal machinery for the dependency
+// waker, which needs only identity — hence batches of blob-free ChangeRefs.
+type ChangeRefWatcher = storeapi.ChangeRefWatcher
+
+// ChangeRef names one changed object and how it changed, with no row attached.
+type ChangeRef = storeapi.ChangeRef
+
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType
 

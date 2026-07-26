@@ -255,8 +255,9 @@ func (noopChangeRefWatcher) Close()                               {}
 // error, so client-layer tests can drive the typed-adapter goroutine directly.
 type watcherStore struct {
 	fakeStore
-	w   Watcher
-	err error
+	w    Watcher
+	refs ChangeRefWatcher // served by WatchChangeRefs, for the dependency waker
+	err  error
 }
 
 func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
@@ -267,6 +268,12 @@ func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 }
 func (s *watcherStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
+}
+func (s *watcherStore) WatchChangeRefs(context.Context) (ChangeRefWatcher, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.refs, nil
 }
 
 // fakeWatcher is a controllable Watcher: push feeds a raw event, endStream ends
@@ -296,6 +303,33 @@ func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
 
 // endStream closes the event channel, signalling the stream has ended.
 func (w *fakeWatcher) endStream() { close(w.ch) }
+
+// fakeChangeRefWatcher is fakeWatcher's store-wide-stream twin: push feeds one
+// batch, endStream ends the stream, and Close signals the waker's exit. A batch
+// is the unit deliberately — the waker resolves a whole batch in one query, so a
+// double that could only deliver one reference at a time would hide that.
+type fakeChangeRefWatcher struct {
+	ch        chan []ChangeRef
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newFakeChangeRefWatcher() *fakeChangeRefWatcher {
+	return &fakeChangeRefWatcher{ch: make(chan []ChangeRef), closed: make(chan struct{})}
+}
+
+func (w *fakeChangeRefWatcher) Batches() <-chan []ChangeRef { return w.ch }
+
+// Close (called by the waker's defer on exit) closes closed, letting tests
+// synchronize on goroutine exit instead of reading Batches — which could itself
+// satisfy a pending send and race the outcome.
+func (w *fakeChangeRefWatcher) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
+
+// push delivers one batch to the waker.
+func (w *fakeChangeRefWatcher) push(refs ...ChangeRef) { w.ch <- refs }
+
+// endStream closes the batch channel, signalling the stream has ended.
+func (w *fakeChangeRefWatcher) endStream() { close(w.ch) }
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.

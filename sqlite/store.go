@@ -1373,7 +1373,7 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 // wake stamp and the insert are one atomic unit however it is called. That is
 // what makes the claim decidable at all: read as a separate statement, a write to
 // the target landing between the version read and the insert would be invisible
-// both here and to wakeDependents (the edge is not yet inserted) — which is the
+// both here and to the dependency waker (the edge is not yet inserted) — which is the
 // very window AddDependency exists to close. Relying on the caller to supply the
 // transaction, or on sqlite serializing writers on one connection, would leave
 // that as an unstated precondition of the guard.

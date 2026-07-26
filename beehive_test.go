@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -265,4 +266,36 @@ func TestRunGCSweeperTicks(t *testing.T) {
 
 	recv(t, store.gcSwept) // startup pass
 	recv(t, store.gcSwept) // a periodic tick
+}
+
+// countingChangeStreamStore counts change-stream subscriptions, so a test can
+// assert how many the control plane opens.
+type countingChangeStreamStore struct {
+	fakeStore
+	subscriptions atomic.Int64
+}
+
+func (s *countingChangeStreamStore) WatchChangeRefs(context.Context) (storeapi.ChangeRefWatcher, error) {
+	s.subscriptions.Add(1)
+	return noopChangeRefWatcher{}, nil
+}
+
+// TestStartSubscribesOneChangeStream verifies the waker rides a single
+// store-wide subscription rather than one per registered kind. The count is the
+// point: a per-kind stream can only ever see the kinds that have controllers,
+// which is exactly the set a dependency target need not belong to.
+func TestStartSubscribesOneChangeStream(t *testing.T) {
+	store := &countingChangeStreamStore{}
+	bh, err := New(store)
+	require.NoError(t, err)
+	for _, kind := range []string{"Widget", "Gadget", "Gizmo"} {
+		_, err := Register(bh, GroupKind{Kind: kind}, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+	}
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	assert.Equal(t, int64(1), store.subscriptions.Load(), "one stream for the whole store, not one per kind")
 }
