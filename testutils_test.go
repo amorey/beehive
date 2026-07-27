@@ -230,6 +230,9 @@ func (s *fakeStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*Objects
 func (s *fakeStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
 	return deadSubscription[storeapi.RawObjectChange](), nil
 }
+func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
+	panic("not implemented: fakeStore.ObjectWritesListSince")
+}
 func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	return deadSubscription[[]storeapi.ObjectWrite](), 0, nil
 }

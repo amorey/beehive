@@ -629,6 +629,14 @@ type Store interface {
 	// an Added snapshot, then all live changes for the kind.
 	ObjectsWatchList(ctx context.Context, gk GroupKind) (*ObjectsSubscription, error)
 
+	// ObjectWritesListSince returns the live writes above afterRV in cursor order,
+	// at most limit of them — the blob-free, kind-agnostic replay twin of
+	// ObjectWritesSubscribe, for a consumer resuming from a watermark. Rows are
+	// reported Modified: what happened to a row that changed unobserved is no longer
+	// known, and a replaying consumer re-reads current state anyway. A row deleted
+	// during the outage is absent rather than an error.
+	ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+
 	// ObjectWritesSubscribe returns a subscription to live writes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.

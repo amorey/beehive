@@ -533,6 +533,42 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
+// ObjectWritesListSince replays the writes a stalled consumer missed: live rows
+// above afterRV, in cursor order, at most limit of them. The blob-free twin of the
+// store-wide write stream, for a consumer resuming from a watermark rather than
+// re-deriving state — so it selects no spec or status, and is covered by
+// idx_objects_rv.
+//
+// Kind-agnostic, like the stream: a depends_on edge may point at a kind with no
+// controller, so a per-kind query could not name every target whose change was
+// dropped. Ordered by resource_version so the caller can page by taking the last
+// row's version as its next cursor and advance a watermark per page.
+//
+// Rows are reported Modified rather than carrying a real lifecycle type: the store
+// no longer knows what happened to a row that changed while nobody was listening,
+// and a replaying consumer is level-triggered — it re-reads current state. A row
+// deleted during the outage is simply absent (see the type's own note on why that
+// cannot strand a dependent).
+func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT id, resource_version FROM objects
+		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
+		afterRV, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var writes []storeapi.ObjectWrite
+	for rows.Next() {
+		w := storeapi.ObjectWrite{Type: storeapi.Modified}
+		if err := rows.Scan(&w.ID, &w.ResourceVersion); err != nil {
+			return nil, err
+		}
+		writes = append(writes, w)
+	}
+	return writes, rows.Err()
+}
+
 // scanIDs collects the single id column of a SELECT id query, closing rows.
 func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	defer rows.Close()
