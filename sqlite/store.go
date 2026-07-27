@@ -470,7 +470,7 @@ func (s *sqliteStore) ObjectsListUnsettledIDs(ctx context.Context, gk storeapi.G
 	return scanIDs(rows)
 }
 
-func (s *sqliteStore) DeletionsListPending(ctx context.Context) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.Referrer, error) {
 	// Kind-agnostic: no group/kind filter, so the global GC sweeper sees every
 	// finalizing object. The kind rides along because the sweeper routes on it
 	// (see the Store doc), and idx_objects_deleting is keyed to match — partial on
@@ -595,7 +595,7 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 		// Identical spec *at the same schema version*: nothing changed, so don't
 		// bump generation/resource_version or emit. A bump would falsely unsettle a
 		// converged object and trigger a needless reconcile, and the event would show
-		// watchers a spurious diff (mirrors DeletionsRequest's idempotent no-op).
+		// watchers a spurious diff (mirrors DeletionRequestsCreate's idempotent no-op).
 		//
 		// The version gate is what makes the byte compare meaningful. Convert-on-read
 		// leaves old rows tagged at the version they were written in, so a caller at a
@@ -909,7 +909,7 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 			return err
 		}
 		// No-op suppression: an identical condition carries the same resource_version,
-		// so emitting would show watchers a spurious diff (mirrors DeletionsRequest).
+		// so emitting would show watchers a spurious diff (mirrors DeletionRequestsCreate).
 		existing, err := s.getCondition(ctx, id, cond.Type)
 		if err != nil {
 			return err
@@ -1269,31 +1269,31 @@ func (s *sqliteStore) requestDeletion(
 	return result, changed, err
 }
 
-// DeletionsRequest marks id within gk. The kind is folded into the write, so a
+// DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
 // foreign id matches no row and the re-read reports ErrWrongKind.
-func (s *sqliteStore) DeletionsRequest(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
-// DeletionsRequestBySlug marks the gk row holding slug. The slug rides in the
-// UPDATE's own WHERE the way the kind does for DeletionsRequest, so the resolve and
+// DeletionRequestsCreateBySlug marks the gk row holding slug. The slug rides in the
+// UPDATE's own WHERE the way the kind does for DeletionRequestsCreate, so the resolve and
 // the mark are one statement: atomic, and a round trip cheaper than the alternative
-// of wrapping a ObjectsGetBySlug + DeletionsRequest pair in a Within — which matters
+// of wrapping a ObjectsGetBySlug + DeletionRequestsCreate pair in a Within — which matters
 // on a store that runs every caller through one connection.
-func (s *sqliteStore) DeletionsRequestBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowBySlug(ctx, gk, slug) },
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
-// DeletionsMarkOwned cascades deletion to ownerID's owned children. One indexed
+// DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children. One indexed
 // pass over the owned_by edge (idx_refs_to) reads each child's deletion state;
 // markForDeletion then stamps only those not already deleting. So a re-cascade over
 // an already-deleting subtree (the steady-state resync) is a lone SELECT — no
 // writes, no events. It returns every owned child for requeue, deleting or not.
-func (s *sqliteStore) DeletionsMarkOwned(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.Referrer, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM refs r JOIN objects o ON o.id = r.from_id

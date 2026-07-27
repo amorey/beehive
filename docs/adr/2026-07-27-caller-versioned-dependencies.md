@@ -114,7 +114,7 @@ the store cannot know registration, so the caller would have to resolve `fromID`
 kind *before* the call — the per-declare pre-read that sank the earlier guard — and
 it would bake in a fact that changes between runs, losing the wake outright for a
 kind that gains a controller later. A cross-kind sweeper (the `pending_wake`
-analogue of the global GC sweeper's `DeletionsListPending`) is the shape that
+analogue of the global GC sweeper's `DeletionRequestsList`) is the shape that
 would reclaim it off the hot path; it is unbuilt, and in TODO.md.
 
 That is also what keeps the policy out of the store: the in-memory requeue

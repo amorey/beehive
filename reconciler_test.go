@@ -1605,7 +1605,7 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	// request its deletion so the reconcile sees a deletion-pending poison row.
 	raw, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte("not-json")})
 	require.NoError(t, err)
-	_, _, err = store.DeletionsRequest(ctx, gk, raw.ID)
+	_, _, err = store.DeletionRequestsCreate(ctx, gk, raw.ID)
 	require.NoError(t, err)
 
 	var called bool
@@ -1758,7 +1758,7 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	require.NoError(t, err)
 	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
 	require.NoError(t, err)
-	_, _, err = s.DeletionsRequest(ctx, GroupKind{Kind: "Widget"}, raw.ID)
+	_, _, err = s.DeletionRequestsCreate(ctx, GroupKind{Kind: "Widget"}, raw.ID)
 	require.NoError(t, err)
 
 	tc := &typedController[tSpec, tStatus]{
@@ -2028,7 +2028,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		Kind: clientTestGK.Kind, Spec: specJSON, Finalizers: []string{"f"},
 	})
 	require.NoError(t, err)
-	_, _, err = s.DeletionsRequest(ctx, clientTestGK, raw.ID)
+	_, _, err = s.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	bh := &Beehive{store: s}

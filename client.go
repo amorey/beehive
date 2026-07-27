@@ -800,12 +800,12 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	// DeletionsRequest emits the Modified event itself, and only on a real state
+	// DeletionRequestsCreate emits the Modified event itself, and only on a real state
 	// change — an idempotent retry carries the same resource_version, so emitting
 	// would show watchers a spurious diff. It folds this client's kind into the
 	// write, so a foreign id can't be deleted through this client; hideWrongKind
 	// keeps that foreign id invisible.
-	_, _, err := c.bh.store.DeletionsRequest(ctx, c.gk, id)
+	_, _, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
@@ -823,7 +823,7 @@ func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string
 	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
 	// The one place a slug delete departs from Delete, which reports a missing id.
-	obj, _, err := c.bh.store.DeletionsRequestBySlug(ctx, c.gk, slug)
+	obj, _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone

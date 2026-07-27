@@ -42,7 +42,7 @@ spans kinds with no controller.
 `sweepDeletionPending` **routes** rather than collecting: a registered kind is
 enqueued (only a reconcile can clear a finalizer — `collect` cascades then returns
 while any remain), a client-only kind is collected directly. That is why
-`DeletionsListPending` returns `[]Referrer`, not ids. The routing lives in one
+`DeletionRequestsList` returns `[]Referrer`, not ids. The routing lives in one
 place, `advanceDeletion`, and the sweeper is its only caller: the event-driven
 path (`advanceGCNow`) *only* requeues, so a client-only kind is always left for
 the sweeper's next tick (`enqueueIfRegistered`'s no-op arm) and every `collect`
@@ -61,7 +61,7 @@ owner's delete.
 That invariant is load-bearing *inside* the sweeper too: every failure there is
 logged and swallowed on the promise of a next tick, which is only true while a
 cadence is guaranteed. Under the old startup-only mode, a swallowed
-`DeletionsListPending` error was the process's single attempt, stranding rows
+`DeletionRequestsList` error was the process's single attempt, stranding rows
 for its lifetime. Requiring a cadence deleted that hole, `advanceGCNow`'s
 synchronous-collect arm, and that arm's caller-cancellation strand (a cascade
 abandoned mid-flight with nothing scheduled to resume it) in one move.

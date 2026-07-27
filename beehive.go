@@ -256,7 +256,7 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 // deletionPendingSweep drives every deletion-pending object one step closer to
 // removal (see advanceDeletion for the routing).
 func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
-	rows, err := bh.store.DeletionsListPending(ctx)
+	rows, err := bh.store.DeletionRequestsList(ctx)
 	if err != nil {
 		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return

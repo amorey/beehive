@@ -70,7 +70,7 @@ The tax is a verb in the middle on qualified lists (`ObjectsListUnsettledIDs`,
 `RefsListOutgoingByRelation`). The alternative, qualifier-before-verb, reads worse;
 it is paid on about six methods.
 
-Two judgment calls worth recording, since both have a defensible other answer:
+Three judgment calls worth recording, since each has a defensible other answer:
 
 - **`OwnersGet` for an at-most-one relation.** The prefix names the family (the store
   holds many owners), the verb carries cardinality. Folding all four relations under
@@ -81,6 +81,19 @@ Two judgment calls worth recording, since both have a defensible other answer:
 - **`ObjectsListByIncomingRef`** files under `Objects`, away from the `Refs*` family it
   is conceptually adjacent to. It returns objects, not refs, and forcing that question
   is the point — but it is the one method that loses a neighbour.
+- **`DeletionRequests*`, and `From` instead of `By` on its cascade.** The family sets
+  `deletion_requested_at` and never removes a row — the hard delete is `ObjectsDelete`
+  — so naming it `Deletions*` gave one word two families, and the one that deletes
+  nothing had the better claim on it. Being a column rather than a table is no
+  objection here; `Wakes*` (`objects.pending_wake`) is the same shape. `Pending` then
+  drops out of the list method, since a request is only ever cleared by the delete
+  itself. The cascade breaks the `By…` qualifier pattern (`BySlug`, `ByRelation`,
+  `ByIncomingRef`, all naming the key you pass) and reads
+  `DeletionRequestsCreateFromOwner`: `By` also means *agency* in English, and unlike a
+  slug an owner is animate, so `CreateByOwner` invites the wrong reading — the owner
+  is what is being deleted, not the actor. `From` keeps the sense of "derived from an
+  owner id" and answers the question `CreateOwned` leaves open, whether the owner
+  itself gets a request. It does not.
 
 Left undone: `EventsSubscription` still carries a bare `Event`, so a consumer cannot
 tell a new run from a count-bump on an existing one — the one place a log does face

@@ -63,7 +63,7 @@ tell "we decided against this for now" from "nobody thought of it."
   all first wakes.
 
 - **`DeleteBySlug` on an absent slug costs a write transaction** — known, not fixed.
-  `DeletionsRequestBySlug` opens `Within` (so `BEGIN IMMEDIATE`) and its first act
+  `DeletionRequestsCreateBySlug` opens `Within` (so `BEGIN IMMEDIATE`) and its first act
   inside is `nextResourceVersion`, an `UPDATE` on the sequence — both before
   anything is known to match. A slug no row holds therefore costs a write
   transaction, a sequence write, the zero-row `UPDATE`, the re-read, and a
@@ -84,7 +84,7 @@ tell "we decided against this for now" from "nobody thought of it."
   and its no-op branch would answer outside a transaction where the id-keyed
   sibling answers inside one — a divergence worth more thought than the saving
   justifies right now. Revisit if a profile shows absent-path deletes are hot, or
-  if `DeletionsRequest` ever gets the same treatment (its absent path has always
+  if `DeletionRequestsCreate` ever gets the same treatment (its absent path has always
   had this shape, so the probe would belong in `requestDeletion` for both).
 
 - **A standing waker escalation runs a full pass at the *catchup* cadence,
@@ -189,7 +189,7 @@ tell "we decided against this for now" from "nobody thought of it."
   after the *cascade*. `insertObject` checks nothing about the owner's lifecycle, and
   `RefsAdd` only verifies both endpoints exist — never that the target is live — so a
   child created against an owner that is already deletion-pending, and whose
-  `DeletionsMarkOwned` pass has already run, is born live and unmarked under a
+  `DeletionRequestsCreateFromOwner` pass has already run, is born live and unmarked under a
   finalizing owner. Its `owned_by` edge is an unconditional live claim in
   `RefsHasIncoming` (only deletion-pending `depends_on` sources are excluded), so the
   owner can never be physically collected.
@@ -206,7 +206,7 @@ tell "we decided against this for now" from "nobody thought of it."
 
   **Unlike the `depends_on` race, this one self-heals whenever the GC sweeper runs.**
   `sweepDeletionPending` re-lists the still-pending owner and `collect` re-runs
-  `DeletionsMarkOwned`, which is explicitly built to be re-run and picks the new
+  `DeletionRequestsCreateFromOwner`, which is explicitly built to be re-run and picks the new
   child up; the exposure is one GC interval, always — **there is no longer a
   permanent-strand configuration at all.** It used to follow from `resyncInterval =
   0`, a documented and commonly-used way to say "event-driven only"; splitting the
@@ -273,7 +273,7 @@ tell "we decided against this for now" from "nobody thought of it."
   outright.
 
   The fix that fits is a **cross-kind sweeper**, the `pending_wake` analogue of the
-  global GC sweeper's `DeletionsListPending`: list rows with a nonzero count
+  global GC sweeper's `DeletionRequestsList`: list rows with a nonzero count
   across all kinds, zero the ones whose kind has no registered reconciler, on the
   sweeper's existing cadence. Off the hot path, symmetric with machinery that already
   exists, and it reclaims the index entry. Deferred because it is new store surface
@@ -329,7 +329,7 @@ tell "we decided against this for now" from "nobody thought of it."
   Deferred because `type Store = storeapi.Store` is an alias, so any of these is a
   break on an externally-implementable interface, and the saving is one indexed
   query per silent write. Revisit when the next `Store` break is on the table
-  anyway — the v0.17.0 `DeletionsRequestBySlug` change was exactly such a moment and
+  anyway — the v0.17.0 `DeletionRequestsCreateBySlug` change was exactly such a moment and
   would have been the cheap time to take this with it.
 
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
@@ -501,7 +501,7 @@ tell "we decided against this for now" from "nobody thought of it."
   line reporting a configuration the library should not have accepted.
 
   **Two open strands closed with the branch.** Review flagged that
-  `sweepDeletionPending`'s swallowed `DeletionsListPending` error left *no* startup
+  `sweepDeletionPending`'s swallowed `DeletionRequestsList` error left *no* startup
   driver for finalizing rows once the per-kind `enqueueDeletionPending` was dropped —
   true only with GC disabled, where the startup pass was the process's single
   attempt. With a cadence guaranteed, "retry next sweep" is a true statement and a
@@ -550,7 +550,7 @@ tell "we decided against this for now" from "nobody thought of it."
   than warning about it, and reverses the decision recorded below (see that entry).
 
   **GC routes rather than collects.** `ListAllDeletionPendingIDs` became
-  `DeletionsListPending`, returning `[]Referrer`, because the sweeper needs each
+  `DeletionRequestsList`, returning `[]Referrer`, because the sweeper needs each
   row's kind: `collect` cannot clear a finalizer (it cascades, then returns while
   any remain), so a registered kind must be *enqueued* for its controller and only
   a client-only kind collected directly. That let `enqueueDeletionPending` and
@@ -572,7 +572,7 @@ tell "we decided against this for now" from "nobody thought of it."
   subscribe-failure message finally says something true: it used to claim "relying
   on resync", which was false even before resync became opt-in.
 
-  **Two store breaks** (`DeletionsListPending`'s signature,
+  **Two store breaks** (`DeletionRequestsList`'s signature,
   `ListDeletionPendingIDs`'s removal) plus the `WithResyncInterval` meaning change.
   Taken deliberately; `type Store = storeapi.Store` is an alias, so the interface is
   externally implementable and both are visible to embedders.
@@ -588,7 +588,7 @@ tell "we decided against this for now" from "nobody thought of it."
   NULL`, and its two readers both planned as `SEARCH … USING INDEX` plus
   `USE TEMP B-TREE FOR ORDER BY` — not covering (a row fetch per match) and
   sorting, because the key orders by `(deletion_requested_at, id)` rather than by
-  `id`. The lost *covering* scan arrived with `DeletionsListPending`, which added
+  `id`. The lost *covering* scan arrived with `DeletionRequestsList`, which added
   `group`/`kind` to a `SELECT id` that had been index-only; the sort predates it.
 
   Deferred at the time because the reader set was mid-change, and that was the
@@ -782,18 +782,18 @@ tell "we decided against this for now" from "nobody thought of it."
   never re-asserts freezes its cursor and the backstop re-enqueues it every tick
   forever.
 
-- **Slug-keyed delete as a store mutator (`DeletionsRequestBySlug`)** — done.
+- **Slug-keyed delete as a store mutator (`DeletionRequestsCreateBySlug`)** — done.
   `Client.DeleteBySlug` previously resolved the slug with `ObjectsGetBySlug` and then
   delegated to the id-keyed `Delete`: two statements with a window between them, in
   which the row could be collected and the slug retaken, leaving the call to report
   nil against a live row it never touched. It now calls a slug-keyed mutator that
   folds the slug into the `UPDATE`'s own `WHERE`, the way the kind already rode in
-  for `DeletionsRequest`, so the resolve and the mark are one atomic statement.
+  for `DeletionRequestsCreate`, so the resolve and the mark are one atomic statement.
 
   The enabling change was generalizing `markForDeletion`'s key predicate: it took an
   id plus an `extraWhere` for guards, and now takes the caller's whole row predicate
   (`id = ?` plus scope for the two id-keyed callers, `group`/`kind`/`slug` for the new
-  one). `DeletionsMarkOwned` — the GC cascade — shares that mutator and moved with
+  one). `DeletionRequestsCreateFromOwner` — the GC cascade — shares that mutator and moved with
   it. Beyond atomicity this drops two round trips (5 queries to 3 on the success
   path) and *halves* the row materialization rather than removing it: the old code
   pulled `objectColumns` plus conditions twice — once for the resolve, once from the

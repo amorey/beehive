@@ -141,7 +141,7 @@ func (s *fakeStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, erro
 func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) DeletionsListPending(context.Context) ([]storeapi.Referrer, error) {
+func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.Referrer, error) {
 	return nil, nil
 }
 func (s *fakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
@@ -159,11 +159,11 @@ func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, in
 func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
-func (s *fakeStore) DeletionsRequest(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.DeletionsRequest")
+func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreate")
 }
-func (s *fakeStore) DeletionsRequestBySlug(context.Context, GroupKind, string) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.DeletionsRequestBySlug")
+func (s *fakeStore) DeletionRequestsCreateBySlug(context.Context, GroupKind, string) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreateBySlug")
 }
 func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
 	panic("not implemented: fakeStore.ConditionsSet")
@@ -174,8 +174,8 @@ func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, strin
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")
 }
-func (s *fakeStore) DeletionsMarkOwned(context.Context, ObjectID) ([]storeapi.Referrer, error) {
-	panic("not implemented: fakeStore.DeletionsMarkOwned")
+func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
 func (s *fakeStore) EventsRecord(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
 	panic("not implemented: fakeStore.EventsRecord")
@@ -498,7 +498,7 @@ type listProbeStore struct {
 	Store
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
 	wakeListed      chan struct{} // WakesListPendingIDs (per-kind)
-	gcSwept         chan struct{} // DeletionsListPending (global)
+	gcSwept         chan struct{} // DeletionRequestsList (global)
 }
 
 // probeSignal reports one listing. The send is non-blocking so a late pass after
@@ -525,8 +525,8 @@ func (s *listProbeStore) WakesListPendingIDs(ctx context.Context, gk GroupKind) 
 	return ids, err
 }
 
-func (s *listProbeStore) DeletionsListPending(ctx context.Context) ([]storeapi.Referrer, error) {
-	rows, err := s.Store.DeletionsListPending(ctx)
+func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.Referrer, error) {
+	rows, err := s.Store.DeletionRequestsList(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
 }

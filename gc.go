@@ -75,8 +75,8 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Cascade deletion to owned children, requeuing them all (see
-		// DeletionsMarkOwned for the steady-state single-read path).
-		children, err := bh.store.DeletionsMarkOwned(ctx, id)
+		// DeletionRequestsCreateFromOwner for the steady-state single-read path).
+		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
 		if err != nil {
 			return err
 		}

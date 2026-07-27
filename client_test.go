@@ -1192,7 +1192,7 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, pending.ID, got.ID)
 	assert.Equal(t, pending.DeletionRequestedAt, got.DeletionRequestedAt)
-	// DeletionsRequest reports no change, so no write and no Modified event: the
+	// DeletionRequestsCreate reports no change, so no write and no Modified event: the
 	// resource_version is the tell.
 	assert.Equal(t, pending.ResourceVersion, got.ResourceVersion)
 }
@@ -1357,7 +1357,7 @@ type requestDeletionBySlugErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionBySlugErrorStore) DeletionsRequestBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
+func (s *requestDeletionBySlugErrorStore) DeletionRequestsCreateBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
 	return nil, false, errBoom
 }
 

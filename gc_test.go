@@ -139,7 +139,7 @@ type collectFakeStore struct {
 	fakeStore
 	finalizers      []string // on the collected object
 	getMetaErr      error    // ObjectsGetMeta
-	markErr         error    // DeletionsMarkOwned
+	markErr         error    // DeletionRequestsCreateFromOwner
 	dropDependsErr  error    // RefsDeleteFinalizingDependsOn
 	hasRefs         bool     // RefsHasIncoming result
 	hasRefsErr      error    // RefsHasIncoming error
@@ -154,7 +154,7 @@ func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawO
 	now := time.Now()
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) DeletionsMarkOwned(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.Referrer, error) {
 	return nil, s.markErr
 }
 func (s *collectFakeStore) RefsDeleteFinalizingDependsOn(context.Context, ObjectID) error {
@@ -177,7 +177,7 @@ func TestCollectGetObjectMetaError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-func TestCollectDeletionsMarkOwnedError(t *testing.T) {
+func TestCollectDeletionRequestsCreateFromOwnerError(t *testing.T) {
 	bh, err := New(&collectFakeStore{markErr: errBoom})
 	require.NoError(t, err)
 	_, err = bh.gcCollect(context.Background(), 1)
@@ -214,7 +214,7 @@ func TestCollectDeleteObjectError(t *testing.T) {
 }
 
 // gcFixture builds a Beehive over a real sqlite store plus a client, so collect
-// tests can exercise real DeletionsRequest/ObjectsDelete/ref semantics. No
+// tests can exercise real DeletionRequestsCreate/ObjectsDelete/ref semantics. No
 // controller is started: collect is driven directly. The default resync is left
 // enabled, so collect's post-commit wakes for this client-only kind defer to the
 // (idle) sweeper rather than recursively collecting synchronously — letting these
@@ -454,7 +454,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// one. Deletion does not bump generation, so the row stays settled below.
 	_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, _, err = store.DeletionsRequest(ctx, clientTestGK, raw.ID)
+	_, _, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	// A fresh Beehive with no spec-startup pass and resync disabled: the GC
@@ -667,7 +667,7 @@ type sweepFailStore struct {
 	rows []Referrer
 }
 
-func (s *sweepFailStore) DeletionsListPending(context.Context) ([]Referrer, error) {
+func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]Referrer, error) {
 	return s.rows, nil
 }
 
@@ -790,7 +790,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		t.Fatal("sweeper never ran its startup pass")
 	}
 
-	_, _, err = real.DeletionsRequest(ctx, clientTestGK, raw.ID)
+	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -856,7 +856,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	// Mark it deletion-pending through the store, so the client's own gcAdvance
 	// wake isn't what drives this either.
-	_, _, err = real.DeletionsRequest(ctx, clientTestGK, obj.ID)
+	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)
 
 	waitForDeletions(t, w, obj.ID)

@@ -274,7 +274,7 @@ func (r Referrer) GroupKind() GroupKind {
 // id, resource_version, and timestamps without a re-read. A nil error therefore
 // guarantees a non-nil object, and callers dereference it unguarded — including
 // on the idempotent no-op paths, where the row is unchanged but still returned
-// (DeletionsRequest and DeletionsRequestBySlug with changed=false). An
+// (DeletionRequestsCreate and DeletionRequestsCreateBySlug with changed=false). An
 // implementation that returns (nil, nil) is broken, not a case to handle.
 type Store interface {
 	io.Closer
@@ -323,39 +323,40 @@ type Store interface {
 	// with ErrNotFound.
 	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) (*RawObject, error)
 
-	// DeletionsListPending returns every deletion-pending object, of every kind,
+	// DeletionRequestsCreate requests an object's deletion by setting
+	// DeletionRequestedAt; the row lingers until its finalizers clear, so this
+	// creates the request and never the deletion itself (ObjectsDelete does that).
+	// changed is true only when this call was the one that set the flag;
+	// repeat calls are idempotent and return changed=false. Scoped to gk: an id
+	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
+	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
+
+	// DeletionRequestsCreateBySlug is DeletionRequestsCreate keyed by slug within
+	// gk: the slug is folded into the write itself, so the resolve and the stamp
+	// are one atomic statement rather than a lookup wrapped in a transaction with
+	// the write. Both are race-free; this one costs a round trip less, which a
+	// single-connection store feels. Semantics otherwise match
+	// DeletionRequestsCreate: changed is true only when this call set the flag, a
+	// repeat is idempotent with changed=false, and ErrNotFound means no object of
+	// gk holds the slug (there is no ErrWrongKind — a foreign kind's slug is
+	// simply not found, since slugs are unique per kind rather than globally).
+	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
+
+	// DeletionRequestsCreateFromOwner is the GC cascade as one command: it requests
+	// deletion of every object that owned_by ownerID and returns them all to
+	// requeue. It stamps (and emits a Modified for) only children not already
+	// deletion-pending, so a re-cascade over an already-deleting subtree is a
+	// single read — no per-child write every sweep.
+	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]Referrer, error)
+
+	// DeletionRequestsList returns every deletion-pending object, of every kind,
 	// each row's GroupKind alongside its id. The global GC sweeper is the sole
 	// caller and needs the kind to route: an object of a registered kind is
 	// enqueued so its controller can clear finalizers (a step collect cannot take),
 	// while a client-only kind — which no reconcile loop reaches, and which could
 	// otherwise strand and RESTRICT-block an owner's delete forever — is collected
 	// directly.
-	DeletionsListPending(ctx context.Context) ([]Referrer, error)
-
-	// DeletionsMarkOwned is the GC cascade as one command: it marks every object
-	// that owned_by ownerID for deletion and returns them all to requeue. It stamps
-	// (and emits a Modified for) only children not already deletion-pending, so a
-	// re-cascade over an already-deleting subtree is a single read — no per-child
-	// write every sweep.
-	DeletionsMarkOwned(ctx context.Context, ownerID ObjectID) ([]Referrer, error)
-
-	// DeletionsRequest marks an object for deletion by setting
-	// DeletionRequestedAt; the row lingers until its finalizers clear.
-	// changed is true only when this call was the one that set the flag;
-	// repeat calls are idempotent and return changed=false. Scoped to gk: an id
-	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	DeletionsRequest(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
-
-	// DeletionsRequestBySlug is DeletionsRequest keyed by slug within gk: the slug is
-	// folded into the write itself, so the resolve and the mark are one atomic
-	// statement rather than a lookup wrapped in a transaction with the write. Both
-	// are race-free; this one costs a round trip less, which a single-connection
-	// store feels. Semantics otherwise match DeletionsRequest: changed is true only
-	// when this call set the flag, a repeat is idempotent with changed=false, and
-	// ErrNotFound means no object of gk holds the slug (there is no ErrWrongKind —
-	// a foreign kind's slug is simply not found, since slugs are unique per kind
-	// rather than globally).
-	DeletionsRequestBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
+	DeletionRequestsList(ctx context.Context) ([]Referrer, error)
 
 	// EventsGetLatest returns the most recent run in id's category timeline, or nil
 	// if that timeline has no events. Reads by object id only (not kind-scoped).

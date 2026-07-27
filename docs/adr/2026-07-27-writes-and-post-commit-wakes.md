@@ -49,14 +49,14 @@ GC is the caller's only way forward.
 ### `DeleteBySlug` is `GetOrCreate`'s remove-side partner
 
 It is the one slug-keyed write that needs no client-side `Within`: the store
-resolves and marks in a single statement via `DeletionsRequestBySlug`, which folds
-the slug into the `UPDATE`'s `WHERE` exactly as `DeletionsRequest` folds in the
+resolves and marks in a single statement via `DeletionRequestsCreateBySlug`, which folds
+the slug into the `UPDATE`'s `WHERE` exactly as `DeletionRequestsCreate` folds in the
 kind.
 
 That is why `markForDeletion` takes the caller's **whole row predicate** rather
 than an id plus an `extraWhere` — one statement template, key supplied per caller
-(`id = ?` + scope for `DeletionsRequest`, bare `id = ?` for the
-`DeletionsMarkOwned` cascade, the group/kind/slug triple for the slug path); a
+(`id = ?` + scope for `DeletionRequestsCreate`, bare `id = ?` for the
+`DeletionRequestsCreateFromOwner` cascade, the group/kind/slug triple for the slug path); a
 new keying is a call-site change, not a second copy of the statement.
 
 The mark-or-reread protocol above it is shared too (`requestDeletion`, taking the
@@ -79,7 +79,7 @@ whole GC follow-up (`advanceGCNow`) as the hook. So the spec event precedes the
 wake.
 
 The wake is **gated on a real change**: `ObjectsUpdateSpec` returns `(obj, changed, err)`
-(mirroring `DeletionsRequest`), and `Update` / `CreateOrUpdate` skip the wake when
+(mirroring `DeletionRequestsCreate`), and `Update` / `CreateOrUpdate` skip the wake when
 identical bytes made the write a no-op — otherwise the wake would be the only
 signal claiming something happened, and a controller re-applying its own kind's
 spec each pass would spin.

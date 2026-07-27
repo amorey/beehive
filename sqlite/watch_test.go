@@ -320,9 +320,9 @@ func TestNestedWithinSingleFlush(t *testing.T) {
 	assertNoEvent(t, w, 200*time.Millisecond) // only one flush
 }
 
-// TestDeletionsRequestIdempotentNoEvent verifies the second (idempotent) Delete
+// TestDeletionRequestsCreateIdempotentNoEvent verifies the second (idempotent) Delete
 // emits no event.
-func TestDeletionsRequestIdempotentNoEvent(t *testing.T) {
+func TestDeletionRequestsCreateIdempotentNoEvent(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -337,13 +337,13 @@ func TestDeletionsRequestIdempotentNoEvent(t *testing.T) {
 	snap := recvEvent(t, w)
 	assert.Equal(t, beehive.Added, snap.Type)
 
-	_, changed, err := store.DeletionsRequest(ctx, testGK, obj.ID)
+	_, changed, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.True(t, changed)
 	ev := recvEvent(t, w)
 	assert.Equal(t, beehive.Modified, ev.Type)
 
-	_, changed, err = store.DeletionsRequest(ctx, testGK, obj.ID)
+	_, changed, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.False(t, changed)
 	assertNoEvent(t, w, 200*time.Millisecond)
@@ -777,7 +777,7 @@ func TestWatchBornAndDiedBeforeSnapshotUnobserved(t *testing.T) {
 	store.beforeSnapshot = func() {
 		obj, err := store.ObjectsCreate(ctx, newWatchObject())
 		require.NoError(t, err)
-		// Delete without going through DeletionsRequest; the freshly created
+		// Delete without going through DeletionRequestsCreate; the freshly created
 		// object has no finalizers or referrers, so it can be removed directly.
 		require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
 	}
