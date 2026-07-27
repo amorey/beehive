@@ -653,7 +653,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.dependencyWakerRun(ctx, fw.sub) })
+	bh.wg.Go(func() { wakerOf(bh).run(ctx, fw.sub) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
@@ -709,7 +709,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(ctx, fw.sub)
+		wakerOf(bh).run(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -797,7 +797,7 @@ func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1))
 
 	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
 }
@@ -819,7 +819,7 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	}
 	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: deps}, widget, gadget)
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1))
 
 	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
@@ -840,11 +840,11 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
 	bhA, _, rsA := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 2, Kind: "Widget"}}}, gk)
-	bhA.dependentsWake(context.Background(), changed(1))
+	wakerOf(bhA).wakeDependents(context.Background(), changed(1))
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
 	bhB, _, rsB := wakerFixture(map[ObjectID][]ObjectRef{2: {{ID: 1, Kind: "Widget"}}}, gk)
-	bhB.dependentsWake(context.Background(), changed(2))
+	wakerOf(bhB).wakeDependents(context.Background(), changed(2))
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
@@ -908,7 +908,7 @@ func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relatio
 // the target still reconciled, and the resync backstop will retry the waking.
 func TestWakeDependentsListError(t *testing.T) {
 	bh := &Beehive{store: &errDepsStore{}}
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1))
 }
 
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
@@ -919,7 +919,7 @@ func TestDependencyWakerStreamEnd(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -2844,7 +2844,7 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &errDepsStore{}, logger: logger}
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "dependents lookup failed",
 		"a dropped wake must not be silent")
@@ -2866,7 +2866,7 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bh.dependentsWake(ctx, changed(1))
+	wakerOf(bh).wakeDependents(ctx, changed(1))
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
@@ -2885,7 +2885,7 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -2907,7 +2907,7 @@ func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(ctx, fw.sub)
+		wakerOf(bh).run(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -3013,7 +3013,7 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 	r1, r2 := &reconciler{}, &reconciler{}
 	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "forcing a full resync pass")
 	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
@@ -3032,7 +3032,7 @@ func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3074,7 +3074,7 @@ func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(shutdownCtx{context.Background()}, fw.sub)
+		wakerOf(bh).run(shutdownCtx{context.Background()}, fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3186,7 +3186,7 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 		3: {{ID: 30, Kind: "Widget"}},
 	}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1, 2, 3))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1, 2, 3))
 
 	assert.Equal(t, int64(1), store.calls.Load(), "one query for the whole batch")
 	assert.Equal(t, []ObjectID{10, 20, 30}, rs[gk].work.items)
@@ -3202,7 +3202,7 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1, 1, 1))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1, 1, 1))
 
 	require.Len(t, store.seen, 1)
 	assert.Equal(t, []ObjectID{1}, store.seen[0], "the repeated target is asked about once")
@@ -3220,7 +3220,7 @@ func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1, 2))
+	wakerOf(bh).wakeDependents(context.Background(), changed(1, 2))
 
 	assert.Equal(t, []ObjectID{2}, rs[gk].work.items, "woken for 1's change, skipped for its own")
 }
@@ -3397,7 +3397,7 @@ func TestDeadWakerReportsWholeProcess(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()

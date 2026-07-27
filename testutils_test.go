@@ -567,3 +567,13 @@ func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.O
 	probeSignal(s.gcSwept)
 	return rows, err
 }
+
+// wakerOf returns bh's dependency waker, wiring one on demand. New does this, but
+// most waker tests build a Beehive literal to control exactly which collaborators
+// exist, so they have no waker until they ask for one.
+func wakerOf(bh *Beehive) *waker {
+	if bh.waker == nil {
+		bh.waker = &waker{bh: bh}
+	}
+	return bh.waker
+}
