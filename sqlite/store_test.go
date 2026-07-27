@@ -633,7 +633,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	settled, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -771,7 +771,7 @@ func TestUpdateStatusIdenticalStatusIsNoOp(t *testing.T) {
 	first, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -797,7 +797,7 @@ func TestUpdateStatusChangedStatusWrites(t *testing.T) {
 	first, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -875,7 +875,7 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -933,7 +933,7 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 	require.NotNil(t, settled.ObservedGeneration)
 	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -1017,7 +1017,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	settled, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -1063,7 +1063,7 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 	settled, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -1100,7 +1100,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, settled.StatusVersion)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -1355,7 +1355,7 @@ func TestDeletionsMarkOwnedCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, addRef(ctx, store, childB, owner, beehive.RelationOwnedBy))
 
 	// Watch live changes only (no snapshot) so each cascade's events are isolated.
-	w, err := store.WatchObjectChanges(ctx)
+	w, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1427,7 +1427,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -1459,7 +1459,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -2440,7 +2440,7 @@ func TestRefsAddNoVersionBumpNoEvent(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	// Drain the snapshot Added events for the two pre-existing objects.
@@ -2479,7 +2479,7 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	require.NoError(t, store.RefsDelete(ctx, a.ID, b.ID, "depends_on"))
 	require.NoError(t, store.RefsDelete(ctx, a.ID, 9999, "depends_on"))
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
@@ -2755,7 +2755,7 @@ func TestSetConditionEmitsAndBumpsResourceVersion(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "watched")
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	// Drain the snapshot Added for the pre-existing object.
@@ -2779,7 +2779,7 @@ func TestSetConditionNoOpSuppressed(t *testing.T) {
 	first, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"})
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -2801,7 +2801,7 @@ func TestDeleteCondition(t *testing.T) {
 	_, err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Healthy", Status: "True"})
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -2821,7 +2821,7 @@ func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "absent")
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
@@ -2843,7 +2843,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	_, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	w, err := store.WatchList(ctx, testGK)
+	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
 	defer w.Close()
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot

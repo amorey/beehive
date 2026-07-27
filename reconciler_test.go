@@ -646,9 +646,9 @@ func (s *blockingDepsStore) RefsGroupIncomingByID(_ context.Context, toIDs []Obj
 // enqueueIfRegistered mid-event must not deadlock against Stop, even with an
 // unbounded Stop context.
 func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
-	fw := newFakeObjectChangeWatcher()
+	fw := newFakeWriteStream()
 	store := &blockingDepsStore{
-		watcherStore: watcherStore{changes: fw},
+		watcherStore: watcherStore{writes: fw},
 		entered:      make(chan struct{}),
 		release:      make(chan struct{}),
 	}
@@ -659,11 +659,11 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw) })
+	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw.sub) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
-	fw.push(ObjectChange{ID: 1, Type: Modified})
+	fw.push(ObjectWrite{ID: 1, Type: Modified})
 	<-store.entered
 
 	stopped := make(chan struct{})
@@ -707,19 +707,19 @@ func (s *recordingDepsStore) RefsGroupIncomingByID(_ context.Context, toIDs []Ob
 // over-wake harmless. Deleted is still ignored (a gone object has no dependents
 // to requeue).
 func TestDependencyWakerWakesOnChange(t *testing.T) {
-	fw := newFakeObjectChangeWatcher()
+	fw := newFakeWriteStream()
 	calls := make(chan ObjectID, 1)
-	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{changes: fw}, calls: calls}}
+	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{writes: fw}, calls: calls}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, fw)
+		bh.runDependencyWaker(ctx, fw.sub)
 		close(done)
 	}()
 
-	fw.push(ObjectChange{ID: 1, Type: Added})
+	fw.push(ObjectWrite{ID: 1, Type: Added})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(1), id, "Added event wakes dependents (a coalesced create+modify)")
@@ -727,7 +727,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Added event did not trigger a wake")
 	}
 
-	fw.push(ObjectChange{ID: 2, Type: Modified})
+	fw.push(ObjectWrite{ID: 2, Type: Modified})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(2), id, "Modified event wakes dependents of the changed object")
@@ -735,7 +735,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Modified event did not trigger a wake")
 	}
 
-	fw.push(ObjectChange{ID: 3, Type: Deleted})
+	fw.push(ObjectWrite{ID: 3, Type: Deleted})
 	select {
 	case <-calls:
 		t.Fatal("Deleted event triggered a dependents wake")
@@ -785,10 +785,10 @@ func wakerFixture(deps map[ObjectID][]Referrer, kinds ...GroupKind) (*Beehive, *
 
 // changed is the waker's input shape: the ids as Modified references, which is
 // what a target's change looks like on the store-wide stream.
-func changed(ids ...ObjectID) []ObjectChange {
-	refs := make([]ObjectChange, 0, len(ids))
+func changed(ids ...ObjectID) []ObjectWrite {
+	refs := make([]ObjectWrite, 0, len(ids))
 	for _, id := range ids {
-		refs = append(refs, ObjectChange{ID: id, Type: Modified})
+		refs = append(refs, ObjectWrite{ID: id, Type: Modified})
 	}
 	return refs
 }
@@ -920,12 +920,12 @@ func TestWakeDependentsListError(t *testing.T) {
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
 // ends (channel closed), not only on context cancellation.
 func TestDependencyWakerStreamEnd(t *testing.T) {
-	fw := newFakeObjectChangeWatcher()
-	bh := &Beehive{store: &watcherStore{changes: fw}}
+	fw := newFakeWriteStream()
+	bh := &Beehive{store: &watcherStore{writes: fw}}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw)
+		bh.runDependencyWaker(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -2896,12 +2896,12 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 // unlogged either way.
 func TestDependencyWakerStreamEndLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeObjectChangeWatcher()
-	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
+	fw := newFakeWriteStream()
+	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw)
+		bh.runDependencyWaker(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -2917,13 +2917,13 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 // clean stop, training operators to ignore the one message that matters.
 func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeObjectChangeWatcher()
-	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
+	fw := newFakeWriteStream()
+	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, fw)
+		bh.runDependencyWaker(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -3042,13 +3042,13 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 // of death and strand everything after it.
 func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeObjectChangeWatcher()
+	fw := newFakeWriteStream()
 	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger, order: []*reconciler{r1, r2}}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw)
+		bh.runDependencyWaker(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3084,13 +3084,13 @@ func (shutdownCtx) Err() error            { return context.Canceled }
 // one message that matters gets trained out of an operator.
 func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeObjectChangeWatcher()
+	fw := newFakeWriteStream()
 	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger, order: []*reconciler{r1, r2}}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(shutdownCtx{context.Background()}, fw)
+		bh.runDependencyWaker(shutdownCtx{context.Background()}, fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3408,12 +3408,12 @@ func TestSubscribeFailureReportsWholeProcess(t *testing.T) {
 // dependency wakes again.
 func TestDeadWakerReportsWholeProcess(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeObjectChangeWatcher()
-	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
+	fw := newFakeWriteStream()
+	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw)
+		bh.runDependencyWaker(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()

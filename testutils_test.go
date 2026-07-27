@@ -220,104 +220,105 @@ func (s *fakeStore) RefsHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 
-// Watch/WatchList default to a noopWatcher (never fires, no-op Close) rather
+// ObjectsWatch/ObjectsWatchList default to a dead subscription (never fires, no-op Close) rather
 // than panicking, so client tests that only exercise the snapshot or
 // registration error paths reach their target without each fake overriding them.
-func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
-	return noopWatcher{}, nil
+func (s *fakeStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
+	return deadSubscription[storeapi.RawObjectChange](), nil
 }
-func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
-	return noopWatcher{}, nil
+func (s *fakeStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
+	return deadSubscription[storeapi.RawObjectChange](), nil
 }
-func (s *fakeStore) WatchObjectChanges(context.Context) (storeapi.ObjectChangeWatcher, error) {
-	return noopObjectChangeWatcher{}, nil
+func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+	return deadSubscription[[]storeapi.ObjectWrite](), nil
 }
-func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
-	panic("not implemented: fakeStore.WatchEvents")
+func (s *fakeStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
+	panic("not implemented: fakeStore.EventsWatch")
 }
 
-// noopWatcher is a Watcher whose event stream never fires; Close is a no-op.
-type noopWatcher struct{}
+// deadSubscription is a subscription whose stream never fires and whose Close
+// does nothing — a nil channel blocks forever, which is what "never fires" means
+// to a select.
+func deadSubscription[V any]() *storeapi.Subscription[V] {
+	return storeapi.NewSubscription[V](nil, func() {})
+}
 
-func (noopWatcher) Changes() <-chan storeapi.RawChange { return nil }
-func (noopWatcher) Close()                             {}
-
-// noopObjectChangeWatcher is noopWatcher's store-wide-stream twin.
-type noopObjectChangeWatcher struct{}
-
-func (noopObjectChangeWatcher) Batches() <-chan []storeapi.ObjectChange { return nil }
-func (noopObjectChangeWatcher) Close()                                  {}
-
-// watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
+// watcherStore is a fakeStore whose object watches return a preset stream and
 // error, so client-layer tests can drive the typed-adapter goroutine directly.
 type watcherStore struct {
 	fakeStore
-	w       Watcher
-	changes ObjectChangeWatcher // served by WatchObjectChanges, for the dependency waker
-	err     error
+	w      *fakeObjectStream
+	writes *fakeWriteStream // served by ObjectWritesSubscribe, for the dependency waker
+	err    error
 }
 
-func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
-	return s.w, s.err
-}
-func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
-	return s.w, s.err
-}
-func (s *watcherStore) WatchObjectChanges(context.Context) (ObjectChangeWatcher, error) {
+func (s *watcherStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.changes, nil
+	return s.w.sub, nil
+}
+func (s *watcherStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.w.sub, nil
+}
+func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.writes.sub, nil
 }
 
-// fakeStream is the shared body of the controllable watcher doubles: an
+// fakeStream is the shared body of the controllable subscription doubles: an
 // unbuffered channel of whatever the stream carries, plus a closed signal so a
 // test can synchronize on the consumer goroutine's exit instead of reading the
 // channel — which could itself satisfy a pending send and race the outcome.
+// sub is the read side handed to the code under test; Subscription.Close is
+// idempotent, so the signal needs no Once of its own.
 type fakeStream[V any] struct {
-	ch        chan V
-	closed    chan struct{}
-	closeOnce sync.Once
+	ch     chan V
+	closed chan struct{}
+	sub    *storeapi.Subscription[V]
 }
 
 func newFakeStream[V any]() fakeStream[V] {
-	return fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
+	s := fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
+	s.sub = storeapi.NewSubscription[V](s.ch, func() { close(s.closed) })
+	return s
 }
-
-// Close is called by the consumer's defer on exit.
-func (w *fakeStream[V]) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
 
 // endStream closes the channel, signalling the stream has ended.
 func (w *fakeStream[V]) endStream() { close(w.ch) }
 
-// fakeWatcher is a controllable Watcher, backing the client adaptWatcher tests.
-type fakeWatcher struct{ fakeStream[storeapi.RawChange] }
-
-func newFakeWatcher() *fakeWatcher {
-	return &fakeWatcher{newFakeStream[storeapi.RawChange]()}
+// fakeObjectStream is a controllable ObjectsSubscription, backing the client
+// adaptWatcher tests.
+type fakeObjectStream struct {
+	fakeStream[storeapi.RawObjectChange]
 }
 
-func (w *fakeWatcher) Changes() <-chan storeapi.RawChange { return w.ch }
-
-// push delivers a raw event to the adapter goroutine.
-func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
-	w.ch <- storeapi.RawChange{Type: typ, Object: obj}
+func newFakeObjectStream() *fakeObjectStream {
+	return &fakeObjectStream{newFakeStream[storeapi.RawObjectChange]()}
 }
 
-// fakeObjectChangeWatcher is fakeWatcher's store-wide-stream twin, backing the
+// push delivers a raw change to the adapter goroutine.
+func (w *fakeObjectStream) push(typ ChangeType, obj *RawObject) {
+	w.ch <- storeapi.RawObjectChange{Type: typ, Object: obj}
+}
+
+// fakeWriteStream is fakeObjectStream's store-wide twin, backing the
 // dependency-waker tests. A batch is the push unit deliberately — the waker
 // resolves a whole batch in one query, so a double that could only deliver one
-// reference at a time would hide that.
-type fakeObjectChangeWatcher struct{ fakeStream[[]ObjectChange] }
+// write at a time would hide that.
+type fakeWriteStream struct{ fakeStream[[]ObjectWrite] }
 
-func newFakeObjectChangeWatcher() *fakeObjectChangeWatcher {
-	return &fakeObjectChangeWatcher{newFakeStream[[]ObjectChange]()}
+func newFakeWriteStream() *fakeWriteStream {
+	return &fakeWriteStream{newFakeStream[[]ObjectWrite]()}
 }
 
-func (w *fakeObjectChangeWatcher) Batches() <-chan []ObjectChange { return w.ch }
-
 // push delivers one batch to the waker.
-func (w *fakeObjectChangeWatcher) push(refs ...ObjectChange) { w.ch <- refs }
+func (w *fakeWriteStream) push(writes ...ObjectWrite) { w.ch <- writes }
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.

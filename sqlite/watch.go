@@ -24,7 +24,7 @@ import (
 	"github.com/amorey/gobus/conflate"
 )
 
-// errStoreClosed is returned by Watch/WatchList once the store has been closed.
+// errStoreClosed is returned by Watch/ObjectsWatchList once the store has been closed.
 var errStoreClosed = errors.New("beehive/sqlite: store is closed")
 
 // isClosed reports whether Close has run. The flag is guarded by hubMu, the same
@@ -39,7 +39,7 @@ func (s *sqliteStore) isClosed() bool {
 // nil if the store is closed. Hub lookup is not a hot path (the store
 // serializes writes on a single connection), so a single write lock is simpler
 // than double-checked locking and avoids a race-only, untestable branch.
-func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.ObjectID, storeapi.RawChange] {
+func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.ObjectID, storeapi.RawObjectChange] {
 	s.hubMu.Lock()
 	defer s.hubMu.Unlock()
 	if s.closed {
@@ -97,11 +97,11 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 // object that is already covered by the subscriber's snapshot (born in the
 // subscribe→snapshot race window), in which case the consumer must still see the
 // delete. The seenIDs guard in watch() drops tombstones for objects the consumer
-// truly never observed. WatchList overrides this with annihilatingMerge, which
+// truly never observed. ObjectsWatchList overrides this with annihilatingMerge, which
 // can drop such tombstones early while preserving snapshot-covered ones. The
-// store-wide stream shares neither: it carries pendingChange, and mergePendingChange is
+// store-wide stream shares neither: it carries writeSignal, and writeSignalMerge is
 // its own policy.
-func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
+func mergeChange(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange, bool) {
 	hi := next
 	if prev.Object.ResourceVersion > next.Object.ResourceVersion {
 		hi = prev
@@ -113,27 +113,27 @@ func mergeChange(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
 	if prev.Type == storeapi.Added {
 		typ = storeapi.Added // still new to the consumer
 	}
-	return storeapi.RawChange{Type: typ, Object: hi.Object}, true
+	return storeapi.RawObjectChange{Type: typ, Object: hi.Object}, true
 }
 
-// pendingChange is what the store-wide hub carries. Identity is already the hub key,
+// writeSignal is what the store-wide hub carries. Identity is already the hub key,
 // so the value holds only the lifecycle type and the resource_version conflation
-// compares on — deliberately not a RawChange: this hub sees every write in the
+// compares on — deliberately not a RawObjectChange: this hub sees every write in the
 // process, and a pending *RawObject would pin that row's spec and status blobs
 // until the value is delivered.
-type pendingChange struct {
+type writeSignal struct {
 	typ storeapi.ChangeType
 	rv  int64
 }
 
-// mergePendingChange is mergeChange plus annihilation, over the projected value. The
+// writeSignalMerge is mergeChange plus annihilation, over the projected value. The
 // store-wide stream has no snapshot, so nothing is pre-known: an Added the
 // consumer never saw, coalescing with a Deleted, is a transient object it has no
 // reason to hear about at all — dropping the slot is what bounds a slow
 // consumer's memory by the live key set instead of by churn.
-func mergePendingChange(prev, next pendingChange) (pendingChange, bool) {
+func writeSignalMerge(prev, next writeSignal) (writeSignal, bool) {
 	if prev.typ == storeapi.Added && next.typ == storeapi.Deleted {
-		return pendingChange{}, false // unobserved transient: annihilate
+		return writeSignal{}, false // unobserved transient: annihilate
 	}
 	hi := next
 	if prev.rv > next.rv {
@@ -163,13 +163,13 @@ type snapshotIDs map[storeapi.ObjectID]struct{}
 // also coalesces Added→Deleted, and its delete MUST survive. preserve, which is
 // required, reports the ids whose delete must be kept.
 //
-// Only WatchList reaches this. The snapshot-less consumer is the store-wide
-// stream, whose annihilation lives in mergePendingChange — unconditional there,
+// Only ObjectsWatchList reaches this. The snapshot-less consumer is the store-wide
+// stream, whose annihilation lives in writeSignalMerge — unconditional there,
 // because it has no snapshot to preserve deletes for.
-func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawChange] {
-	return func(prev, next storeapi.RawChange) (storeapi.RawChange, bool) {
+func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawObjectChange] {
+	return func(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange, bool) {
 		if prev.Type == storeapi.Added && next.Type == storeapi.Deleted && !preserve(next.Object.ID) {
-			return storeapi.RawChange{}, false // unobserved transient: annihilate
+			return storeapi.RawObjectChange{}, false // unobserved transient: annihilate
 		}
 		return mergeChange(prev, next)
 	}
@@ -194,7 +194,7 @@ func snapshotPreserve(seed *atomic.Pointer[snapshotIDs]) func(storeapi.ObjectID)
 // pendingEvent is a watch event awaiting its transaction's commit.
 type pendingEvent struct {
 	gk storeapi.GroupKind
-	ev storeapi.RawChange
+	ev storeapi.RawObjectChange
 }
 
 // pendingEventRow is an event-log run awaiting its transaction's commit.
@@ -254,23 +254,23 @@ func gkOf(raw *storeapi.RawObject) storeapi.GroupKind {
 // publishes immediately.
 func (s *sqliteStore) emit(ctx context.Context, typ storeapi.ChangeType, raw *storeapi.RawObject) {
 	gk := gkOf(raw)
-	ev := storeapi.RawChange{Type: typ, Object: raw}
+	ev := storeapi.RawObjectChange{Type: typ, Object: raw}
 	if st, ok := txFrom(ctx); ok && st.coll.add(pendingEvent{gk: gk, ev: ev}) {
 		return
 	}
 	s.publish(gk, ev)
 }
 
-// publish sends ev to gk's hub and to the store-wide changeHub, keyed by object
+// publish sends ev to gk's hub and to the store-wide writeHub, keyed by object
 // id so per-object updates coalesce in both. Send never blocks; a closed hub
-// drops it, which is also what makes the unguarded changeHub send safe after
+// drops it, which is also what makes the unguarded writeHub send safe after
 // Close.
-func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawChange) {
+func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawObjectChange) {
 	if h := s.hubFor(gk); h != nil {
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
-	// The store-wide hub carries the projection, not the row: see pendingChange.
-	_ = s.changeHub.Sender().Send(ev.Object.ID, pendingChange{typ: ev.Type, rv: ev.Object.ResourceVersion})
+	// The store-wide hub carries the projection, not the row: see writeSignal.
+	_ = s.writeHub.Sender().Send(ev.Object.ID, writeSignal{typ: ev.Type, rv: ev.Object.ResourceVersion})
 }
 
 // emitEvent delivers a written run to event-log watchers: queued on the tx
@@ -319,28 +319,32 @@ func (s *sqliteStore) flush(coll *eventCollector) {
 	}
 }
 
-// watcherImpl streams a snapshot followed by live items on out. A merge
-// goroutine owns out and the receiver; Close cancels its context, which makes
-// the goroutine exit, close the receiver, and close out. V is the streamed item
-// type — RawChange for object watches, Event for the event log.
-type watcherImpl[V any] struct {
+// stream is the store side of a subscription: the channel a merge goroutine owns
+// and the cancel that releases it. The goroutine exits on cancel, closes the
+// receiver, and closes out. V is the streamed item type — RawObjectChange for
+// object watches, Event for the event log, []ObjectWrite for the write stream.
+type stream[V any] struct {
 	out    chan V
 	cancel context.CancelFunc
 }
 
-// Changes and Events are the same accessor under the two interface names the
-// shared impl satisfies: Watcher.Changes (V = RawChange) and EventWatcher.Events
-// (V = Event). Each instantiation is only ever used through its own interface.
-func (w *watcherImpl[V]) Changes() <-chan V { return w.out }
-func (w *watcherImpl[V]) Events() <-chan V  { return w.out }
-func (w *watcherImpl[V]) Batches() <-chan V { return w.out }
-func (w *watcherImpl[V]) Close()            { w.cancel() }
+func newStream[V any](cancel context.CancelFunc) *stream[V] {
+	return &stream[V]{out: make(chan V), cancel: cancel}
+}
+
+// subscription hands the caller the read side. One accessor, one name: the three
+// stream-specific interfaces this used to satisfy differed only in what they
+// called it, which is why the impl once carried Changes/Events/Batches over the
+// same channel.
+func (w *stream[V]) subscription() *storeapi.Subscription[V] {
+	return storeapi.NewSubscription(w.out, w.cancel)
+}
 
 // send delivers v, or reports false if a reader never takes it because the
 // stream's context was cancelled (wctx) or the store was closed (storeDone). The
 // store-close arm matters when no one is reading: closing the hub only wakes a
 // receive, not a parked send.
-func (w *watcherImpl[V]) send(wctx context.Context, storeDone <-chan struct{}, v V) bool {
+func (w *stream[V]) send(wctx context.Context, storeDone <-chan struct{}, v V) bool {
 	select {
 	case w.out <- v:
 		return true
@@ -351,7 +355,7 @@ func (w *watcherImpl[V]) send(wctx context.Context, storeDone <-chan struct{}, v
 	}
 }
 
-func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
+func (s *sqliteStore) ObjectsWatchList(ctx context.Context, gk storeapi.GroupKind) (*storeapi.ObjectsSubscription, error) {
 	return s.watch(ctx, gk, nil, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
 		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
 			return s.ObjectsList(ctx, gk)
@@ -359,25 +363,25 @@ func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (sto
 	})
 }
 
-// objectChangeBatchCap bounds how many references one batch carries. It bounds the
+// writeBatchCap bounds how many references one batch carries. It bounds the
 // slice, not retained memory: what a lagging consumer holds is its receiver's
 // pending set, which conflates per object and so is bounded by the store's live
 // key set either way.
-const objectChangeBatchCap = 64
+const writeBatchCap = 64
 
-// WatchObjectChanges streams every kind's live changes as blob-free references. It
+// ObjectWritesSubscribe streams every kind's live changes as blob-free references. It
 // takes no snapshot, so the dedup floor is 0 — a fresh receiver starts at the
 // current write position and everything it sees is genuinely post-subscribe —
-// and the hub's own mergePendingChange both conflates and annihilates, so no
+// and the hub's own writeSignalMerge both conflates and annihilates, so no
 // per-receiver merge is needed.
-func (s *sqliteStore) WatchObjectChanges(ctx context.Context) (storeapi.ObjectChangeWatcher, error) {
+func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.ObjectWritesSubscription, error) {
 	if s.isClosed() {
 		return nil, errStoreClosed
 	}
-	rx := s.changeHub.Receiver()
+	rx := s.writeHub.Receiver()
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := &watcherImpl[[]storeapi.ObjectChange]{out: make(chan []storeapi.ObjectChange), cancel: cancel}
+	w := newStream[[]storeapi.ObjectWrite](cancel)
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -391,18 +395,18 @@ func (s *sqliteStore) WatchObjectChanges(ctx context.Context) (storeapi.ObjectCh
 			if err != nil {
 				return // ctx cancelled, watcher closed, or hub closed
 			}
-			batch := []storeapi.ObjectChange{{ID: wev.Key, Type: wev.Value.typ}}
+			batch := []storeapi.ObjectWrite{{ID: wev.Key, Type: wev.Value.typ}}
 			// Drain whatever else is already pending. Taking it from the receiver
 			// rather than from a buffered out channel is what keeps conflation
 			// intact up to this point: until a value is popped, another write to the
 			// same object merges into its slot, so a burst of writes to one object
 			// costs one entry, not one per write.
-			for len(batch) < objectChangeBatchCap {
+			for len(batch) < writeBatchCap {
 				next, err := rx.TryRecv()
 				if err != nil {
 					break // drained, or the hub closed (the next Recv reports it)
 				}
-				batch = append(batch, storeapi.ObjectChange{ID: next.Key, Type: next.Value.typ})
+				batch = append(batch, storeapi.ObjectWrite{ID: next.Key, Type: next.Value.typ})
 			}
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park
@@ -412,10 +416,10 @@ func (s *sqliteStore) WatchObjectChanges(ctx context.Context) (storeapi.ObjectCh
 			}
 		}
 	}()
-	return w, nil
+	return w.subscription(), nil
 }
 
-func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.Watcher, error) {
+func (s *sqliteStore) ObjectsWatch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.ObjectsSubscription, error) {
 	filterID := id
 	return s.watch(ctx, gk, &filterID, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
 		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
@@ -458,11 +462,11 @@ func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context)
 	return objs, hw, nil
 }
 
-// watch subscribes to gk's hub, loads a snapshot, and returns a Watcher whose
+// watch subscribes to gk's hub, loads a snapshot, and returns a subscription whose
 // stream is the snapshot (as Added events) followed by live events not already
 // covered by the snapshot. filterID, if non-nil, restricts live events to that
-// object. Both callers (WatchList and Watch) take a real snapshot; the
-// snapshot-less stream is WatchObjectChanges, which subscribes to the store-wide
+// object. Both callers (ObjectsWatchList and Watch) take a real snapshot; the
+// snapshot-less stream is ObjectWritesSubscribe, which subscribes to the store-wide
 // hub directly and shares none of this.
 //
 // The receiver is created BEFORE the snapshot is loaded so events that commit
@@ -484,7 +488,7 @@ func (s *sqliteStore) watch(
 	gk storeapi.GroupKind,
 	filterID *storeapi.ObjectID,
 	loadSnapshot func(context.Context) ([]*storeapi.RawObject, int64, error),
-) (storeapi.Watcher, error) {
+) (*storeapi.ObjectsSubscription, error) {
 	h := s.hubFor(gk)
 	if h == nil {
 		return nil, errStoreClosed
@@ -493,11 +497,11 @@ func (s *sqliteStore) watch(
 	// would leak as a live hub subscriber that buffers every object forever.
 	//   - Single-object watch: scope the subscription to that id so the receiver
 	//     never buffers unrelated objects (memory bounded by the one id).
-	//   - WatchList: an annihilating merge so transient objects the consumer never
+	//   - ObjectsWatchList: an annihilating merge so transient objects the consumer never
 	//     saw are dropped at enqueue (memory bounded by the live key set, not by
 	//     the count of distinct deleted ids a slow consumer falls behind on), while
 	//     snapshot-covered deletes are preserved.
-	var rx *conflate.Receiver[storeapi.ObjectID, storeapi.RawChange]
+	var rx *conflate.Receiver[storeapi.ObjectID, storeapi.RawObjectChange]
 	var seed atomic.Pointer[snapshotIDs] // published to the merge once the snapshot is known
 	if filterID != nil {
 		want := *filterID
@@ -526,7 +530,7 @@ func (s *sqliteStore) watch(
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := &watcherImpl[storeapi.RawChange]{out: make(chan storeapi.RawChange), cancel: cancel}
+	w := newStream[storeapi.RawObjectChange](cancel)
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -535,7 +539,7 @@ func (s *sqliteStore) watch(
 		}
 		defer close(w.out)
 		defer rx.Close()
-		send := func(ev storeapi.RawChange) bool { return w.send(wctx, s.done, ev) }
+		send := func(ev storeapi.RawObjectChange) bool { return w.send(wctx, s.done, ev) }
 		// seenIDs tracks every object ID the consumer has been told about, so
 		// the live stream can correct event types and drop orphan tombstones.
 		seenIDs := make(map[storeapi.ObjectID]struct{}, len(snapshot))
@@ -545,7 +549,7 @@ func (s *sqliteStore) watch(
 		// blobs until the watcher closes.
 		for _, raw := range snapshot {
 			seenIDs[raw.ID] = struct{}{}
-			if !send(storeapi.RawChange{Type: storeapi.Added, Object: raw}) {
+			if !send(storeapi.RawObjectChange{Type: storeapi.Added, Object: raw}) {
 				return
 			}
 		}
@@ -593,7 +597,7 @@ func (s *sqliteStore) watch(
 			}
 		}
 	}()
-	return w, nil
+	return w.subscription(), nil
 }
 
 // eventMatchesQuery reports whether a live run passes q's field filters. Limit
@@ -617,11 +621,11 @@ func eventMatchesQuery(ev storeapi.Event, q storeapi.EventQuery) bool {
 	return true
 }
 
-// WatchEvents streams id's event log within gk: the runs matching q as a
+// EventsWatch streams id's event log within gk: the runs matching q as a
 // snapshot, then live runs. The receiver is created before the snapshot loads so
 // runs committed during the load are buffered, not lost; a run already reflected
 // in the snapshot (resource_version at or below its high-water) is then dropped.
-func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, q storeapi.EventQuery) (storeapi.EventWatcher, error) {
+func (s *sqliteStore) EventsWatch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, q storeapi.EventQuery) (*storeapi.EventsSubscription, error) {
 	h := s.eventHubFor(gk)
 	if h == nil {
 		return nil, errStoreClosed
@@ -660,7 +664,7 @@ func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := &watcherImpl[storeapi.Event]{out: make(chan storeapi.Event), cancel: cancel}
+	w := newStream[storeapi.Event](cancel)
 	go func() {
 		if s.afterStream != nil {
 			defer s.afterStream()
@@ -704,5 +708,5 @@ func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id
 			}
 		}
 	}()
-	return w, nil
+	return w.subscription(), nil
 }

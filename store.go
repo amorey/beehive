@@ -59,23 +59,24 @@ const (
 	RelationDependsOn = storeapi.RelationDependsOn
 )
 
-// Watcher is a closeable subscription to a kind's change stream, returned by the
-// store's Watch/WatchList. The client decodes its raw events into the typed
-// Change[Spec, Status] surface.
-type Watcher = storeapi.Watcher
+// ObjectsSubscription is a closeable subscription to a kind's change stream,
+// returned by the store's ObjectsWatch/ObjectsWatchList. The client decodes its
+// raw changes into the typed ObjectChange[Spec, Status] surface.
+type ObjectsSubscription = storeapi.ObjectsSubscription
 
-// EventWatcher is a subscription to one object's event log, returned by the
-// store's WatchEvents. The client decodes its raw runs into public Events.
-type EventWatcher = storeapi.EventWatcher
+// EventsSubscription is a subscription to one object's event log, returned by the
+// store's EventsWatch. The client decodes its raw runs into public Events.
+type EventsSubscription = storeapi.EventsSubscription
 
-// ObjectChangeWatcher is a subscription to the store-wide change stream, returned
-// by the store's WatchObjectChanges. It is internal machinery for the dependency
-// waker, which needs only identity — hence batches of blob-free ObjectChanges.
-type ObjectChangeWatcher = storeapi.ObjectChangeWatcher
+// ObjectWritesSubscription is a subscription to the store-wide write stream,
+// returned by the store's ObjectWritesSubscribe. It is internal machinery for the
+// dependency waker, which needs only identity — hence batches of blob-free
+// ObjectWrites.
+type ObjectWritesSubscription = storeapi.ObjectWritesSubscription
 
-// ObjectChange names one changed object and how it changed, with no row
-// attached. The id is the object's — a change has no identity of its own.
-type ObjectChange = storeapi.ObjectChange
+// ObjectWrite names one written object and how it changed, with no row attached.
+// The id is the object's — a write has no identity of its own.
+type ObjectWrite = storeapi.ObjectWrite
 
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType

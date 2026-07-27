@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -81,53 +82,64 @@ const (
 	Deleted  ChangeType = "Deleted"
 )
 
-// RawChange is the untyped change a Watcher delivers. The client decodes it
+// RawObjectChange is the untyped change an ObjectsSubscription delivers. The client decodes it
 // into the generic, user-facing Change[Spec, Status]; the name carries the
 // "Raw" prefix (like RawObject) to avoid colliding with that generic type.
-type RawChange struct {
+type RawObjectChange struct {
 	Type   ChangeType
 	Object *RawObject
 }
 
-// Watcher is a subscription to a kind's change stream. Changes yields the current
-// state as Added changes (the snapshot) followed by live changes, until the
-// watcher is closed or its store shuts down, at which point the channel closes.
-// Close releases the subscription and is safe to call more than once.
-type Watcher interface {
-	Changes() <-chan RawChange
-	Close()
+// Subscription is a closeable stream of V, the shape every store watch returns.
+// Changes yields items until the subscription is closed or its store shuts down,
+// at which point the channel closes; Close releases the subscription and is safe
+// to call more than once.
+//
+// It is concrete rather than one interface per stream: the three it replaced
+// differed only in the name of their single accessor, which forced the sqlite
+// implementation to hang three method names on one channel to satisfy them all.
+// A backend builds one with NewSubscription.
+type Subscription[V any] struct {
+	ch    <-chan V
+	close func()
+	once  sync.Once
 }
 
-// ObjectChange is a change stripped to what a consumer that only routes by
+// NewSubscription wraps a stream's channel and its release function. close is
+// called at most once however many times Close is.
+func NewSubscription[V any](ch <-chan V, close func()) *Subscription[V] {
+	return &Subscription[V]{ch: ch, close: close}
+}
+
+func (s *Subscription[V]) Changes() <-chan V { return s.ch }
+func (s *Subscription[V]) Close()            { s.once.Do(s.close) }
+
+// ObjectsSubscription is a subscription to a kind's change stream: the current
+// state as Added changes (the snapshot) followed by live changes.
+type ObjectsSubscription = Subscription[RawObjectChange]
+
+// EventsSubscription is a subscription to one object's event log: the current
+// runs (the snapshot) followed by live runs, each an aggregated Event. Unlike
+// ObjectsSubscription there are no tombstones — a run only appears or updates —
+// so a lagging subscriber converges to each run's latest count/window.
+type EventsSubscription = Subscription[Event]
+
+// ObjectWritesSubscription is a subscription to the store-wide write stream. It
+// yields the writes that were ready together, coalesced per object — a burst
+// arrives as one slice with one entry per distinct object, so a consumer that
+// resolves each entry against the store pays per burst rather than per write.
+type ObjectWritesSubscription = Subscription[[]ObjectWrite]
+
+// ObjectWrite is a change stripped to what a consumer that only routes by
 // identity needs: which object changed, and how. The id is the object's, not a
 // change's — changes are not addressable here — so this is an object reference
 // annotated with what happened to it, and a consumer reads current state itself.
 // It carries no *RawObject on purpose: the store-wide stream sees every write in
 // the process, and holding a row would pin its spec and status blobs for as long
 // as the value is undelivered.
-type ObjectChange struct {
+type ObjectWrite struct {
 	ID   ObjectID
 	Type ChangeType
-}
-
-// ObjectChangeWatcher is a subscription to the store-wide change stream. Batches
-// yields the changes that were ready together, coalesced per object — a burst
-// of writes arrives as one slice with one entry per distinct object, so a
-// consumer that resolves each entry against the store pays per burst rather
-// than per write. The channel closes when the watcher is closed or its store
-// shuts down; Close is idempotent.
-type ObjectChangeWatcher interface {
-	Batches() <-chan []ObjectChange
-	Close()
-}
-
-// EventWatcher is a subscription to one object's event log: the current runs
-// (the snapshot) followed by live runs, each an aggregated Event. Unlike Watcher
-// there are no tombstones — a run only appears or updates — so a lagging
-// subscriber converges to each run's latest count/window. Close is idempotent.
-type EventWatcher interface {
-	Events() <-chan Event
-	Close()
 }
 
 // Condition is the untyped form of a single condition row. Status is one of
@@ -587,22 +599,22 @@ type Store interface {
 	// ObjectsListUnsettledIDs: an object can be spec-converged yet still owe a wake.
 	WakesListPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
-	// Watch returns a Watcher for the single object id of kind gk: its current
+	// ObjectsWatch returns a subscription to the single object id of kind gk: its current
 	// state (if any) as an Added snapshot, then live changes filtered to that id.
-	Watch(ctx context.Context, gk GroupKind, id ObjectID) (Watcher, error)
+	ObjectsWatch(ctx context.Context, gk GroupKind, id ObjectID) (*ObjectsSubscription, error)
 
-	// WatchEvents subscribes to id's event log within gk: the runs matching q as a
+	// EventsWatch subscribes to id's event log within gk: the runs matching q as a
 	// snapshot (oldest-first), then live runs. q filters both the snapshot and the
 	// live stream (Limit bounds only the snapshot). Runs conflate per run id, so a
 	// lagging subscriber converges to each run's latest state.
-	WatchEvents(ctx context.Context, gk GroupKind, id ObjectID, q EventQuery) (EventWatcher, error)
+	EventsWatch(ctx context.Context, gk GroupKind, id ObjectID, q EventQuery) (*EventsSubscription, error)
 
-	// WatchList returns a Watcher for every object of kind gk: the current set as
+	// ObjectsWatchList returns a subscription to every object of kind gk: the current set as
 	// an Added snapshot, then all live changes for the kind.
-	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
+	ObjectsWatchList(ctx context.Context, gk GroupKind) (*ObjectsSubscription, error)
 
-	// WatchObjectChanges returns an ObjectChangeWatcher for live changes to every kind in
+	// ObjectWritesSubscribe returns a subscription to live writes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.
-	WatchObjectChanges(ctx context.Context) (ObjectChangeWatcher, error)
+	ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, error)
 }

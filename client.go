@@ -835,7 +835,7 @@ func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context) (<-chan Change
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	w, err := c.bh.store.WatchList(ctx, c.gk)
+	w, err := c.bh.store.ObjectsWatchList(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}
@@ -846,7 +846,7 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-ch
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	w, err := c.bh.store.Watch(ctx, c.gk, id)
+	w, err := c.bh.store.ObjectsWatch(ctx, c.gk, id)
 	if err != nil {
 		return nil, err
 	}
@@ -858,7 +858,7 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-ch
 // filtering) into typed Changes. It forwards on the returned channel until
 // ctx is cancelled, the watcher's stream ends, or an event fails to decode; the
 // channel closes and the watcher is released on exit.
-func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) <-chan Change[Spec, Status] {
+func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w *ObjectsSubscription) <-chan Change[Spec, Status] {
 	out := make(chan Change[Spec, Status])
 	// The migrator is invariant for the watcher's lifetime; resolve it once rather
 	// than re-locking the registry on every event.
@@ -919,26 +919,26 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	w, err := c.bh.store.WatchEvents(ctx, c.gk, id, resolveEvents(opts))
+	w, err := c.bh.store.EventsWatch(ctx, c.gk, id, resolveEvents(opts))
 	if err != nil {
 		return nil, err
 	}
-	return adaptEventWatcher(ctx, w), nil
+	return adaptEventStream(ctx, w), nil
 }
 
-// adaptEventWatcher forwards a store EventWatcher's raw runs as public Events
+// adaptEventStream forwards a store EventsSubscription's raw runs as public Events
 // until ctx is cancelled or the stream ends, then closes the channel and releases
 // the watcher. Simpler than adaptWatcher: event runs carry no Spec/Status to
 // decode, so there is no migrator and no per-event quarantine — it needs nothing
 // from the client, so it is a free function.
-func adaptEventWatcher(ctx context.Context, w EventWatcher) <-chan Event {
+func adaptEventStream(ctx context.Context, w *EventsSubscription) <-chan Event {
 	out := make(chan Event)
 	go func() {
 		defer close(out)
 		defer w.Close()
 		for {
 			select {
-			case ev, ok := <-w.Events():
+			case ev, ok := <-w.Changes():
 				if !ok {
 					return
 				}

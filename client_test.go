@@ -1493,7 +1493,7 @@ func TestClientListRawToTypedError(t *testing.T) {
 // closing the typed channel. A following good event still flows.
 func TestClientAdaptWatcherConversionError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	w := newFakeWatcher()
+	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
 	ch, err := client.WatchList(context.Background())
@@ -1515,7 +1515,7 @@ func TestClientAdaptWatcherConversionError(t *testing.T) {
 // forwarded as a typed Change, and cancelling the context closes the channel.
 func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	w := newFakeWatcher()
+	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1546,7 +1546,7 @@ func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
 // adapter but never read downstream, then the context is cancelled.
 func TestClientAdaptWatcherSendParkCtxDone(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	w := newFakeWatcher()
+	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1578,7 +1578,7 @@ func TestClientAdaptWatcherSendParkCtxDone(t *testing.T) {
 // when the underlying store watcher's stream ends.
 func TestClientAdaptWatcherClosesWhenStreamEnds(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	w := newFakeWatcher()
+	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
 	ch, err := client.WatchList(context.Background())
@@ -2737,7 +2737,7 @@ func (eventErrStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) 
 func (eventErrStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	return nil, errBoom
 }
-func (eventErrStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
+func (eventErrStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
 	return nil, errBoom
 }
 func (eventErrStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
@@ -2784,18 +2784,19 @@ func TestClientListEventsEmpty(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-// fakeEventWatcher is a controllable EventWatcher for adaptEventWatcher tests.
-type fakeEventWatcher struct{ ch chan RawEvent }
+// fakeEventStream is a controllable EventsSubscription for adaptEventStream tests.
+type fakeEventStream struct{ ch chan RawEvent }
 
-func (w *fakeEventWatcher) Events() <-chan RawEvent { return w.ch }
-func (w *fakeEventWatcher) Close()                  {}
+func (w *fakeEventStream) sub() *EventsSubscription {
+	return storeapi.NewSubscription[RawEvent](w.ch, func() {})
+}
 
-// adaptEventWatcher closes its output when the source stream ends, when ctx is
+// adaptEventStream closes its output when the source stream ends, when ctx is
 // cancelled while waiting, and when ctx is cancelled mid-send.
-func TestAdaptEventWatcher(t *testing.T) {
+func TestAdaptEventStream(t *testing.T) {
 	t.Run("closes when the stream ends", func(t *testing.T) {
-		w := &fakeEventWatcher{ch: make(chan RawEvent)}
-		out := adaptEventWatcher(context.Background(), w)
+		w := &fakeEventStream{ch: make(chan RawEvent)}
+		out := adaptEventStream(context.Background(), w.sub())
 		close(w.ch)
 		_, ok := <-out
 		assert.False(t, ok)
@@ -2803,8 +2804,8 @@ func TestAdaptEventWatcher(t *testing.T) {
 
 	t.Run("exits when ctx cancelled while waiting", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		w := &fakeEventWatcher{ch: make(chan RawEvent)} // never sends or closes
-		out := adaptEventWatcher(ctx, w)
+		w := &fakeEventStream{ch: make(chan RawEvent)} // never sends or closes
+		out := adaptEventStream(ctx, w.sub())
 		cancel()
 		_, ok := <-out
 		assert.False(t, ok)
@@ -2812,8 +2813,8 @@ func TestAdaptEventWatcher(t *testing.T) {
 
 	t.Run("exits when ctx cancelled mid-send", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		w := &fakeEventWatcher{ch: make(chan RawEvent)} // unbuffered
-		out := adaptEventWatcher(ctx, w)
+		w := &fakeEventStream{ch: make(chan RawEvent)} // unbuffered
+		out := adaptEventStream(ctx, w.sub())
 		// This send returns only once the goroutine has received the event, so it is
 		// then parked on `out <- ev` (nothing reads out). Cancelling makes the inner
 		// select take ctx.Done.
