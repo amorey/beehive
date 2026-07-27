@@ -558,7 +558,9 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, 
 		return nil, err
 	}
 	defer rows.Close()
-	var writes []storeapi.ObjectWrite
+	// Capped: limit is the caller's, and a large one must not preallocate for rows
+	// the store may not have.
+	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
 	for rows.Next() {
 		w := storeapi.ObjectWrite{Type: storeapi.Modified}
 		if err := rows.Scan(&w.ID, &w.ResourceVersion); err != nil {

@@ -87,6 +87,21 @@ tell "we decided against this for now" from "nobody thought of it."
   if `DeletionRequestsCreate` ever gets the same treatment (its absent path has always
   had this shape, so the probe would belong in `requestDeletion` for both).
 
+- **`ObjectWritesListSince` synthesizes `ObjectWrite.Type`** — known, deliberate, and
+  a trap for the second consumer. The replay query returns live rows, and the store no
+  longer knows what happened to a row that changed while nobody was listening, so every
+  row comes back `Modified`. That is a value the waker's own filter
+  (`ref.Type != Added && ref.Type != Modified`) needs in order to let the row through,
+  not a fact the store observed.
+
+  Reusing `ObjectWrite` rather than minting a near-duplicate two-field type was the
+  right trade at one consumer, and the lie is documented at the interface, the
+  implementation and the field. But it is documented rather than unrepresentable, which
+  is the opposite of the argument the same change makes for the subscribe cursor. The
+  fix, if a second consumer appears: return `{ID, ResourceVersion}` only and make the
+  waker's "replayed rows are live by construction" assumption explicit at its own call
+  site. Not worth a new type for two fields today.
+
 - **A crash during a waker outage strands a settled dependent, and no in-memory
   recovery can fix it** — analyzed, not fixed, and deliberately scoped out of the
   watermark recovery that shipped (see

@@ -262,15 +262,11 @@ func (r *reconciler) enqueueCatchup(ctx context.Context) {
 // already settled. Used once at startup so controllers can re-confirm
 // process-scoped state (e.g. liveness conditions, which a prior process's writes
 // leave reading as "verifying") that the unsettled-only resync would never wake.
-// It reports whether the listing succeeded, so a caller that spent a one-shot
-// escalation on this pass can tell that the pass never happened.
-func (r *reconciler) enqueueAll(ctx context.Context) bool {
+func (r *reconciler) enqueueAll(ctx context.Context) {
 	if r.store == nil {
-		// Nothing to list, so nothing was lost — reporting failure here would re-arm
-		// an escalation that can never run.
-		return true
+		return
 	}
-	return r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
+	r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
 }
 
 // log returns a non-nil logger, guarding reconcilers built outside Register (e.g.
@@ -293,24 +289,18 @@ func (r *reconciler) log() *slog.Logger {
 // startup pass was the only one, and a lost reconcile-owed listing defers every
 // recorded owed wake to the next process start, the one path whose whole point is
 // not losing them. The full pass ("all") rides the resync tick, which is off by
-// default, so a failure there usually has no second chance in this process at all —
-// hence the return value, which lets a caller that spent a one-shot escalation on
-// the pass re-arm it. Silence made all of that indistinguishable from "nothing was
-// owed".
-//
-// It reports whether the listing succeeded (an empty result is still a success:
-// nothing was owed).
-func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(context.Context, GroupKind) ([]ObjectID, error)) bool {
+// default, so a failure there usually has no second chance in this process at all.
+// Silence made all of that indistinguishable from "nothing was owed".
+func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(context.Context, GroupKind) ([]ObjectID, error)) {
 	ids, err := list(ctx, r.gk)
 	if err != nil {
 		r.log().WarnContext(ctx, "failed to list objects to enqueue; this pass is skipped",
 			"source", source, "group", r.gk.Group, "kind", r.gk.Kind, "err", err)
-		return false
+		return
 	}
 	for _, id := range ids {
 		r.enqueue(id)
 	}
-	return true
 }
 
 // backoffNext returns the next retry delay for id and doubles it for next time,
@@ -541,17 +531,13 @@ func tickerChan(d time.Duration) (<-chan time.Time, func()) {
 // converged or not; otherwise only the work the store records as owed. A full
 // pass subsumes the catchup set, so it stands in for it rather than running both
 // — which is why both drivers share this one body.
-//
-// It reports whether a full pass completed its listing. A non-full pass always
-// reports true: its listings retry on their own next tick and no one-shot was
-// spent on them, so a failure there must not be mistaken for a lost escalation.
-func (r *reconciler) tick(ctx context.Context, driver string, full bool) bool {
+func (r *reconciler) tick(ctx context.Context, driver string, full bool) {
 	r.logger.Debug("periodic tick", "driver", driver, "fullPass", full)
 	if full {
-		return r.enqueueAll(ctx)
+		r.enqueueAll(ctx)
+		return
 	}
 	r.enqueueCatchup(ctx)
-	return true
 }
 
 // runWorker is the per-goroutine reconcile loop. Multiple instances may run
