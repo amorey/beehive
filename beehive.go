@@ -310,6 +310,13 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 // they need no synchronisation.
 type waker struct {
 	bh *Beehive
+
+	// watermark is the highest resource_version this waker has consumed. It is the
+	// resume point for a recovery: the store-wide cursor is globally monotonic and
+	// never reused, so "everything above this" names exactly what was missed. Owned
+	// by the waker goroutine — seeded by start before it launches, advanced by
+	// wakeDependents — so it needs no synchronisation.
+	watermark int64
 }
 
 // start launches the single waker over one store-wide change
@@ -332,7 +339,7 @@ func (dw *waker) start(runCtx context.Context) {
 	if len(dw.bh.order) == 0 {
 		return
 	}
-	w, _, err := dw.bh.store.ObjectWritesSubscribe(runCtx)
+	w, cursor, err := dw.bh.store.ObjectWritesSubscribe(runCtx)
 	if err != nil {
 		// A waker that never starts is a dead waker: no change anywhere in the store
 		// will wake a dependent for the life of the process — every kind's, not one
@@ -348,6 +355,9 @@ func (dw *waker) start(runCtx context.Context) {
 		dw.bh.logger.Warn(msg, "err", err)
 		return
 	}
+	// Seeded before the goroutine launches, so the field is written by the caller
+	// and read by the waker with the Go call between them.
+	dw.watermark = cursor
 	dw.bh.wg.Go(func() { dw.run(runCtx, w) })
 }
 
@@ -413,6 +423,12 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) {
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
+		// Every reference advances the cursor, including the ones with nothing to
+		// wake. Deletes carry no dependents and the hub annihilates transients, so on
+		// a delete-heavy store those are most of the traffic — a watermark that only
+		// moved on wakeable changes would trail arbitrarily far behind and turn a
+		// bounded replay into a whole-table scan.
+		dw.watermark = max(dw.watermark, ref.ResourceVersion)
 		if ref.Type != Added && ref.Type != Modified {
 			continue
 		}

@@ -787,6 +787,65 @@ func changed(ids ...ObjectID) []ObjectWrite {
 	return refs
 }
 
+// changedAt is changed with explicit resource versions, for the watermark: the
+// live stream annotates every reference with the version of the write behind it.
+func changedAt(versions ...int64) []ObjectWrite {
+	refs := make([]ObjectWrite, 0, len(versions))
+	for i, rv := range versions {
+		refs = append(refs, ObjectWrite{ID: ObjectID(i + 1), Type: Modified, ResourceVersion: rv})
+	}
+	return refs
+}
+
+// The waker records how far it has got, so a later recovery can resume from there
+// instead of re-deriving the world. Highest version in the batch, because
+// conflation means one reference already stands for several writes.
+func TestWakeDependentsAdvancesWatermark(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+
+	dw.wakeDependents(context.Background(), changedAt(7, 4))
+	assert.EqualValues(t, 7, dw.watermark, "the highest version in the batch, not the last")
+
+	dw.wakeDependents(context.Background(), changedAt(11))
+	assert.EqualValues(t, 11, dw.watermark)
+}
+
+// A batch the waker has nothing to do with still moves the cursor. Deletes carry
+// no dependents to wake, and the hub annihilates transients outright, so on a
+// delete-heavy store these are most of the traffic — leaving the watermark parked
+// behind them would turn a bounded replay into a whole-table scan.
+func TestWakeDependentsAdvancesWatermarkOnNoOpBatch(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+
+	dw.wakeDependents(context.Background(), []ObjectWrite{{ID: 1, Type: Deleted, ResourceVersion: 9}})
+
+	assert.EqualValues(t, 9, dw.watermark, "a batch with nothing to wake is still consumed")
+}
+
+// The watermark starts where the stream does. Subscribing reports that cursor, so
+// a recovery before the first batch replays from the subscribe point rather than
+// from zero — which would be the whole table.
+func TestWakerStartSeedsWatermarkFromSubscribeCursor(t *testing.T) {
+	fw := newFakeWriteStream()
+	store := &watcherStore{writes: fw, writesCursor: 42}
+	gk := GroupKind{Kind: "Widget"}
+	bh := &Beehive{
+		store:       store,
+		reconcilers: map[GroupKind]*reconciler{gk: {gk: gk, work: newWorkQueue()}},
+	}
+	bh.order = []*reconciler{bh.reconcilers[gk]}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dw := wakerOf(bh)
+	dw.start(ctx)
+	t.Cleanup(func() { cancel(); bh.wg.Wait() })
+
+	assert.EqualValues(t, 42, dw.watermark, "the cursor the subscription started from")
+}
+
 // TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
 // itself is woken by its own Modified, and the wake is what caused the write, so
 // nothing converges it. There is no tick, no backoff and no already-settled skip
