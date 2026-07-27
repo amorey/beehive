@@ -1,7 +1,14 @@
 # Rename `pending_wake` to `reconcile_owed`
 
-**Status: proposed, not built.** Independent — nothing else in `specs/` depends on it,
-and nothing here changes behaviour.
+**Status: built** — `7bbd6f0`, `895d827`, `0928321`, `9c0d7dd`, in the four cycles the
+test plan implies. Independent — nothing else in `specs/` depends on it, and nothing
+here changes behaviour.
+
+Two names landed differently from the table below, both in tests where the mechanical
+substitution produced no English: `TestReconcileDrainsMultiplePendingWakes` became
+`TestReconcileDrainsMultipleOwedPasses` and
+`TestReconcilePendingWakeSurvivesConcurrentWake` became
+`TestReconcileOwedSurvivesConcurrentIncrement`.
 
 ---
 
