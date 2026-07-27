@@ -401,6 +401,10 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 				// their dependents, which is the loss this branch exists to prevent.
 				for !dw.replay(ctx) {
 					if !dw.backoff(ctx, attempt) {
+						// Giving up on this subscription without handing it to run, which
+						// is what would otherwise have closed it. Whoever abandons the
+						// stream releases it.
+						w.Close()
 						return
 					}
 					attempt++

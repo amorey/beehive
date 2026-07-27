@@ -3766,10 +3766,16 @@ func TestWakerReplayRetryOnResubscribeStopsOnShutdown(t *testing.T) {
 		stopping.fire()
 		return false // the replay retry: the control plane is going away
 	}
-	store.nextStream(t).endStream()
+	first := store.nextStream(t)
+	first.endStream()
+	second := store.nextStream(t) // the subscription it gives up on
 
 	stopping.wait(t, "the waker to reach its replay retry")
 	store.bh.wg.Wait()
+
+	// Abandoning a subscription still releases it: this exit does not go through
+	// run, which is what closes the stream on every other path.
+	waitClosed(t, second.closed, "the abandoned subscription to be released")
 }
 
 // resubscribeShutdownStore fails the second subscribe *and* cancels, which is what

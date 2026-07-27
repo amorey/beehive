@@ -292,8 +292,10 @@ func (s *sqliteStore) publishEvent(gk storeapi.GroupKind, ev storeapi.Event) {
 }
 
 // flush publishes a committed transaction's buffered events (object changes then
-// event-log runs), then runs its post-commit hooks — a hook that wakes a
-// reconciler must not run before the events it should follow.
+// event-log runs) and returns its post-commit hooks for the caller to run after
+// them — a hook that wakes a reconciler must not run before the events it should
+// follow. Within runs them once it has released publishMu; see the note at the
+// return below for why they cannot run here.
 //
 // The buffers are taken under the lock and the callbacks run without it: a hook
 // runs code from the layer above this store and may re-enter it, so holding the
