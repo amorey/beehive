@@ -9,7 +9,7 @@
 The dependency waker (see
 [one store-wide change stream](2026-07-27-store-wide-dependency-change-stream.md))
 can lose wakes in three ways. A lost wake leaves a settled dependent that no
-listing can name: `ListUnsettledIDs` structurally cannot see it, and with resync
+listing can name: `ObjectsListUnsettledIDs` structurally cannot see it, and with resync
 off by default nothing else reaches it.
 
 ## Decision
@@ -18,7 +18,7 @@ All three loss points log at Warn and arm an escalation:
 
 | loss point | escalation |
 |---|---|
-| `wakeDependentsBatch`' failed `GroupIncomingRefsByID` | `resyncNextTick` — one full pass |
+| `dependentsWake`' failed `EdgesGroupIncomingByID` | `resyncNextTick` — one full pass |
 | a closed change stream | `resyncEveryTick` |
 | a failed subscription | `resyncEveryTick` |
 
@@ -43,7 +43,7 @@ is needed most.
 
 `tickResyncs` consumes the one-shot before the listing, so `enqueueAll` /
 `enqueueFrom` report success, and the catchup arm re-arms via `resyncNextTick()`
-when the full pass could not list. Otherwise a transient `ListIDs` failure would
+when the full pass could not list. Otherwise a transient `ObjectsListIDs` failure would
 swallow the repair permanently (`TestFailedEscalatedPassRearmsOneShot`).
 
 ### Escalation fans out to every registered kind

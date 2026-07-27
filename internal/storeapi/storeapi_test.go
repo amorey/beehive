@@ -20,15 +20,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestReferrerGroupKind pins the projection every requeue/GC caller routes on:
-// the two kind columns a Referrer carries, and nothing else — the id is the
+// TestObjectRefGroupKind pins the projection every requeue/GC caller routes on:
+// the two kind columns an ObjectRef carries, and nothing else — the id is the
 // payload, not part of the routing key.
-func TestReferrerGroupKind(t *testing.T) {
-	r := Referrer{ID: 7, Group: "apps", Kind: "Widget"}
+func TestObjectRefGroupKind(t *testing.T) {
+	r := ObjectRef{ID: 7, Group: "apps", Kind: "Widget"}
 	assert.Equal(t, GroupKind{Group: "apps", Kind: "Widget"}, r.GroupKind())
 
 	// The empty group is the core group, not a missing value: it must survive the
 	// projection rather than being normalized away.
-	core := Referrer{ID: 8, Kind: "Widget"}
+	core := ObjectRef{ID: 8, Kind: "Widget"}
 	assert.Equal(t, GroupKind{Kind: "Widget"}, core.GroupKind())
 }

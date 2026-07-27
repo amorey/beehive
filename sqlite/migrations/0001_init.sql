@@ -136,13 +136,13 @@ CREATE TABLE conditions (
 CREATE INDEX idx_conditions_object ON conditions(object_id);
 
 -- ============================================================
--- refs
+-- edges
 -- Dependency-tree edges. Both endpoints are hard integer FKs
 -- into objects(id) — ids are never reused, so stale targets
 -- are impossible by construction.
 -- ============================================================
 
-CREATE TABLE refs (
+CREATE TABLE edges (
     -- dependent / child.  ON DELETE CASCADE: removing the child drops its outgoing edges.
     from_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
 
@@ -157,7 +157,7 @@ CREATE TABLE refs (
 
     -- WITHOUT ROWID: every column is in the key, so a rowid table would store each
     -- edge twice — once in the table, once in the automatic index enforcing this
-    -- key. Here the key *is* the table. It also makes idx_refs_to below covering.
+    -- key. Here the key *is* the table. It also makes idx_edges_to below covering.
     PRIMARY KEY (from_id, to_id, relation)
 ) STRICT, WITHOUT ROWID;
 
@@ -167,7 +167,7 @@ CREATE TABLE refs (
 -- from_id) and the probe never touches the table. The covering property lives in
 -- the table's storage class, not here: dropping WITHOUT ROWID silently reinstates
 -- a row fetch per edge with this line looking unchanged.
-CREATE INDEX idx_refs_to ON refs(to_id, relation);
+CREATE INDEX idx_edges_to ON edges(to_id, relation);
 
 -- ============================================================
 -- events

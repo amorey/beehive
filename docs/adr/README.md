@@ -21,7 +21,7 @@ a new record and mark the old one `Superseded by <file>`.
 
 ## Index
 
-- [refs WITHOUT ROWID](2026-07-26-refs-without-rowid.md)
+- [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [One store-wide change stream for the dependency waker](2026-07-27-store-wide-dependency-change-stream.md)
 - [Three independent periodic drivers](2026-07-27-periodic-reconcile-drivers.md)
 - [Dependency-wake failures escalate the catchup tick](2026-07-27-dependency-wake-escalation.md)
@@ -33,3 +33,4 @@ a new record and mark the old one `Superseded by <file>`.
 - [Secondary lookups (owner/dependencies/dependents/owned)](2026-07-27-secondary-lookups.md)
 - [Events API](2026-07-27-events-api.md)
 - [Schedule watch](2026-07-27-schedule-watch.md)
+- [NounsVerb method naming and the watch return shape](2026-07-27-noun-verb-naming.md)

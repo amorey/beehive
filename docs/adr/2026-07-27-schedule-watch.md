@@ -5,15 +5,15 @@
 
 ## Context
 
-`Client.WatchSchedule(id)` / `GetSchedule(id)` observe an object's next-requeue time
+`Client.SchedulesWatch(id)` / `SchedulesGet(id)` observe an object's next-requeue time
 live: the reschedules (`addAfter` backoff / `RequeueAfter`, `requeueNow`, dispatch,
 external `add`s from resync, dependency wakes, or `Requeue`) that bump no generation
-and no `resource_version`, and so never fire the object `Watch`. No other signal
+and no `resource_version`, and so never fire the object `ObjectsWatch`. No other signal
 captures them.
 
 ## Decision
 
-Unlike `WatchEvents`, this lives **entirely in the beehive/reconciler layer, not the
+Unlike `EventsWatch`, this lives **entirely in the beehive/reconciler layer, not the
 sqlite store**: the schedule *is* the in-memory `workQueue` state (`dirty` /
 `alarms`), so there is no store, migration, or `storeapi` involvement — it reuses
 `gobus/conflate` (the external `github.com/amorey/gobus` bus library) directly.
@@ -39,10 +39,10 @@ annihilation — and wires `onSchedule = r.publishSchedule`, so the reconciler o
 
 ### Subscribe without a cursor
 
-`WatchSchedule` registers the hub receiver and reads the snapshot **atomically under
+`SchedulesWatch` registers the hub receiver and reads the snapshot **atomically under
 `q.mu`** (`workQueue.subscribeSchedule`, which runs an opaque `subscribe func()`
 under the lock), closing the subscribe→snapshot race with no high-water cursor: all
-state is one in-memory lock, versus `WatchEvents`' DB+hub that needs
+state is one in-memory lock, versus `EventsWatch`' DB+hub that needs
 `snapshotHighWaterRV` dedup.
 
 ### Teardown
@@ -53,18 +53,18 @@ its hubs. A subscriber `ctx` closes its own stream independently.
 
 ### Client-only kinds
 
-`GetSchedule` (the point read) folds unknown / foreign / client-only to a zero
+`SchedulesGet` (the point read) folds unknown / foreign / client-only to a zero
 `Schedule` plus nil error, via a no-store, no-kind-guard read of
 `reconciler.nextRequeueAt`. There is no public bare-`time.Time` getter — the
 `Schedule` struct is the sole read shape, leaving room for the reserved trigger
 field.
 
-`WatchSchedule` instead returns `ErrNoController` for a client-only kind: a live
+`SchedulesWatch` instead returns `ErrNoController` for a client-only kind: a live
 stream that can never emit should say so rather than hang.
 
 ## Naming
 
-A third watch surface alongside the object-change streams (`Client.Watch` /
-`WatchList`, and the waker's `WatchObjectChanges`) and `WatchEvents` (the log). A
+A third watch surface alongside the object-change streams (`Client.ObjectsWatch` /
+`ObjectsWatchList`, and the waker's `ObjectWritesSubscribe`) and `EventsWatch` (the log). A
 schedule is a single mutable *future* gauge, deliberately **not** routed through the
 append-only, retained event log.

@@ -1,21 +1,21 @@
 # Declaring a dependency is caller-versioned, and the wake has a durable twin
 
 - **Status:** Accepted — implemented in `controller.go` (policy), `sqlite/store.go`
-  (`AddRef`, `pending_wake`), `reconciler.go` (drain).
+  (`EdgesAdd`, `pending_wake`), `reconciler.go` (drain).
 - **Date:** 2026-07-27 (recorded retroactively)
 
 ## Context
 
 A controller reads target T, decides, then declares the edge — and a change to T
-landing in that window reaches nobody, since `wakeDependentsBatch` resolves
+landing in that window reaches nobody, since `dependentsWake` resolves
 dependents at the instant of the change and the edge did not exist yet. The
 dependent then settles at its own generation on the stale read, where
-`ListUnsettledIDs` structurally cannot see it.
+`ObjectsListUnsettledIDs` structurally cannot see it.
 
-## Decision: `AddDependency(…, targetResourceVersion)`
+## Decision: `DependenciesAdd(…, targetResourceVersion)`
 
 The caller passes **the version of T its decision was based on**, and
-`AddDependency` requeues `fromID` when **both** halves hold:
+`DependenciesAdd` requeues `fromID` when **both** halves hold:
 
 1. this call created the edge, **and**
 2. T's current `resource_version` has moved past the version passed.
@@ -45,7 +45,7 @@ only move forward, so it cannot have come from reading T, and an edge whose guar
 can never fire must not persist. The check sits next to the read that knows T's
 version, exactly as `UpdateStatus` rejects a future `observedGeneration`.
 
-Checking it *after* in `AddDependency` would make the guarantee conditional on the
+Checking it *after* in `DependenciesAdd` would make the guarantee conditional on the
 caller: a nested `Within` is a bare `fn(ctx)` with no transaction of its own, so
 returning an error unwinds nothing, and a caller that logs and carries on would
 commit the edge inside its own transaction.
@@ -56,16 +56,16 @@ from an old read, a freshly re-read one from a decision made this instant).
 
 ### Neither half costs a query
 
-`AddRef` returns an `AddRefResult` projecting `fromID`'s `GroupKind` and `toID`'s
+`EdgesAdd` returns an `EdgesAddResult` projecting `fromID`'s `GroupKind` and `toID`'s
 `resource_version` from the endpoint check it already runs. A *pre-read* for
 edge-newness is exactly what sank the earlier guard.
 
-`AddRef` **self-wraps in `Within`** like the other mutators: reporting a
+`EdgesAdd` **self-wraps in `Within`** like the other mutators: reporting a
 `resource_version` from a statement that a write could land behind before the edge
 is inserted would recreate this very window — invisible to the result *and* to
-`wakeDependentsBatch` — so the atomicity is the store's to guarantee, not an
+`dependentsWake` — so the atomicity is the store's to guarantee, not an
 unstated precondition on the caller or on sqlite's single-writer serialization.
-(`AddRef` returns the endpoint metadata to every caller; the owner-edge path in
+(`EdgesAdd` returns the endpoint metadata to every caller; the owner-edge path in
 `insertObject` discards it and passes a `0` version claim.)
 
 The store still interprets nothing — the wake policy lives in `controller.go`. The
@@ -80,12 +80,12 @@ out-of-band call where `Register` hands the application a `ControllerClient`.
 The conjunction increments `objects.pending_wake`, so a process that dies between
 the commit and the in-memory requeue leaves a persisted "reconcile owed".
 
-### The stamp is inside `AddRef`, and *before* the insert
+### The stamp is inside `EdgesAdd`, and *before* the insert
 
-Reported back as `AddRefResult.WakeStamped`, which the requeue gates on instead of
-recomputing the conjunction. Sequencing it as a second store call after `AddRef`
+Reported back as `EdgesAddResult.WakeStamped`, which the requeue gates on instead of
+recomputing the conjunction. Sequencing it as a second store call after `EdgesAdd`
 returned is the shape a reviewer caught: a nested `Within` unwinds nothing, so a
-caller who handled `AddDependency`'s error would commit the edge with no wake — the
+caller who handled `DependenciesAdd`'s error would commit the edge with no wake — the
 stranded dependent this whole guard exists to prevent.
 
 Ordering is the only guarantee available under the no-savepoint nesting contract,
@@ -93,28 +93,28 @@ and it points the residual failure the harmless way: a stamp with no edge is one
 spurious owed wake that drains back to 0, where an edge with no stamp is invisible
 forever.
 
-The stamp's own `WHERE … NOT EXISTS (SELECT 1 FROM refs …)` is the **sole**
-edge-new test — a probe straight down the refs primary key, which is the table
-itself since `refs` is `WITHOUT ROWID` (see
-[refs WITHOUT ROWID](2026-07-26-refs-without-rowid.md)) — no pre-read, and no
-second derivation (the old `AddRefResult.Inserted`) left to fall out of agreement
+The stamp's own `WHERE … NOT EXISTS (SELECT 1 FROM edges …)` is the **sole**
+edge-new test — a probe straight down the edges primary key, which is the table
+itself since `edges` is `WITHOUT ROWID` (see
+[edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)) — no pre-read, and no
+second derivation (the old `EdgesAddResult.Inserted`) left to fall out of agreement
 with it.
 
 ### The stamp is not gated on `fromID`'s kind being registered
 
 A client-only dependent never drains its count and nothing scans it either
-(`ListPendingWakeIDs` is per-kind, called only by that kind's reconciler), so the
+(`WakesListPendingIDs` is per-kind, called only by that kind's reconciler), so the
 count is *unread* — not free: it is a permanent nonzero column and index entry, and
 re-declaring an edge (delete + re-add) with a stale claim increments it again, so it
 can grow. What it costs when that kind later gains a controller is bounded to **one**
 spurious pass, since the reconcile subtracts the whole observed count.
 
-Gating is not the cheap alternative it looks: the stamp is SQL inside `AddRef`, and
+Gating is not the cheap alternative it looks: the stamp is SQL inside `EdgesAdd`, and
 the store cannot know registration, so the caller would have to resolve `fromID`'s
 kind *before* the call — the per-declare pre-read that sank the earlier guard — and
 it would bake in a fact that changes between runs, losing the wake outright for a
 kind that gains a controller later. A cross-kind sweeper (the `pending_wake`
-analogue of the global GC sweeper's `ListAllDeletionPending`) is the shape that
+analogue of the global GC sweeper's `DeletionRequestsList`) is the shape that
 would reclaim it off the hot path; it is unbuilt, and in TODO.md.
 
 That is also what keeps the policy out of the store: the in-memory requeue
@@ -127,11 +127,11 @@ with `blockObjectUpdates`' `BEFORE UPDATE ON objects` trigger — `RAISE(ABORT)`
 undoes the statement, not the transaction, so the outer caller *can* swallow and
 commit, which is the whole point.
 
-`IncrementPendingWake` is deliberately **not on the `Store` interface** — `AddRef`
-is production's only wake producer and `DecrementPendingWake` its only consumer, so
+`WakesIncrement` is deliberately **not on the `Store` interface** — `EdgesAdd`
+is production's only wake producer and `WakesDecrement` its only consumer, so
 a standalone increment would be surface the declare path *cannot* use correctly (it
 can't be made atomic with the edge) and nothing else uses at all. Leaving it off
-makes "the stamp rides `AddRef`" a compile-time property instead of something a test
+makes "the stamp rides `EdgesAdd`" a compile-time property instead of something a test
 polices; it survives on the concrete sqlite store so tests can seed a count without
 staging the whole declare race, and is where a future non-edge producer would hook
 in. `TestAddDependencyStampRidesAddRef` now pins only the half that isn't
@@ -143,7 +143,7 @@ rollback boundary — is in TODO.md, unbuilt.
 ### `pending_wake` is a count, not a flag
 
 `typedController.reconcile` subtracts, on a successful pass, **the count it loaded**
-(`DecrementPendingWake(id, observed)`, floored at 0).
+(`WakesDecrement(id, observed)`, floored at 0).
 
 A count rather than a single token is what survives the reviewer-surfaced case — a
 wake owed *while an earlier one is being reconciled*: increments landing after the
@@ -164,10 +164,10 @@ would spin against a store that keeps failing.
 
 ### The backstop
 
-`ListPendingWakeIDs` over the partial index
+`WakesListPendingIDs` over the partial index
 `idx_objects_pending_wake WHERE pending_wake != 0`. An owed wake is orthogonal to
 spec convergence (a spec-settled object can still owe one), so it is *not* folded
-into `ListUnsettledIDs` but sits beside it in `enqueueCatchup`, which runs
+into `ObjectsListUnsettledIDs` but sits beside it in `enqueueCatchup`, which runs
 unconditionally at startup and on each catchup tick — so declining the startup
 resync does not suppress recovery.
 

@@ -5,26 +5,26 @@
 
 ## Context
 
-Ref edges are read on request, never folded into the object's blob-bearing
+ObjectRef edges are read on request, never folded into the object's blob-bearing
 `SELECT` — a one-to-many join would re-send the spec/status JSON per edge.
 
 ## Decision: two paths, one set of loaders
 
 - **Eager** — per-call `LoadOption`s on `Get` / `GetBySlug` / `List` /
-  `ListOwnedObjects` (`resolveLoads` → `LoadSet` bitset; `loadObjectRelated` for
+  `OwnedObjectsList` (`resolveLoads` → `LoadSet` bitset; `loadObjectRelated` for
   one object, `loadListRelated` for a `List` — one batched `…ByIDs` query per
   relation, not per object).
-- **Lazy** — `Client.GetOwner` / `ListDependencies` / `ListDependents` /
-  `ListOwned`, and the same quartet on `ControllerClient`, since a `Reconcile` has
+- **Lazy** — `Client.OwnersGet` / `DependenciesList` / `DependentsList` /
+  `OwnedList`, and the same quartet on `ControllerClient`, since a `Reconcile` has
   no read call site to pass options to.
 
 Both issue the same secondary query; eager just attaches the result and batches
 across a list.
 
-Store primitives: the relation-filtered `ListOutgoingRefsByRelation` (single) and
-the batched `GroupOutgoingRefsByID` / `GroupIncomingRefsByID` (returning a
-`map[id][]Referrer`, not a slice — hence `Group…ByID`, not `List…`; one shared
-`refsByIDs` helper, routeCol/joinCol swapped). The unfiltered `ListOutgoingRefs`
+Store primitives: the relation-filtered `EdgesListOutgoingByRelation` (single) and
+the batched `EdgesGroupOutgoingByID` / `EdgesGroupIncomingByID` (returning a
+`map[id][]ObjectRef`, not a slice — hence `Group…ByID`, not `List…`; one shared
+`edgesByIDs` helper, routeCol/joinCol swapped). The unfiltered `EdgesListOutgoing`
 stays for GC.
 
 There is no standing default-loads option: per-call plus lazy cover every case
@@ -32,10 +32,10 @@ without a "queries you didn't use" footgun.
 
 ## `owned` is the inverse of `owner`
 
-`GetOwner` / `LoadOwner` read the *outgoing* `owned_by` edge
-(`ListOutgoingRefsByRelation` / `GroupOutgoingRefsByID`).
-`ListOwned` / `LoadOwned` / `Object.ListOwned` read the *incoming* `owned_by` edges
-(`ListIncomingRefs` / `GroupIncomingRefsByID`) — the owner's children — exactly as
+`OwnersGet` / `LoadOwner` read the *outgoing* `owned_by` edge
+(`EdgesListOutgoingByRelation` / `EdgesGroupOutgoingByID`).
+`OwnedList` / `LoadOwned` / `Object.Owned` read the *incoming* `owned_by` edges
+(`EdgesListIncoming` / `EdgesGroupIncomingByID`) — the owner's children — exactly as
 `dependents` inverts `dependencies` over `depends_on`.
 
 `owner` is single (`WithOwner` sets one), so `fetchOwnerRef` takes the first
@@ -49,25 +49,25 @@ The related data lives in **unexported** `Object` fields (`owner` / `dependencie
 `ErrNotLoaded` when the relation wasn't requested — so a forgotten `Load*()` fails
 loudly instead of looking empty.
 
-**Accessor verb tracks cardinality** — `Get` for the at-most-one owner, `List` for
-the zero-or-more relations — so the `Object` accessors and the `Client` /
-`ControllerClient` lazy lookups spell each relation identically:
+**The return type carries cardinality**, so the `Object` accessors need no verb at
+all (they are bare nouns — `Owner()`, `Dependencies()`) while the `Client` /
+`ControllerClient` lazy lookups spell the same relations with one (`OwnersGet`,
+`DependenciesList`):
 
-- `GetOwner() (Ref, bool, error)` — bool = owner present, folding away ownerless;
+- `Owner() (ObjectRef, bool, error)` — bool = owner present, folding away ownerless;
   err = not loaded.
-- `ListDependencies()` / `ListDependents()` / `ListOwned() ([]Ref, error)` —
-  loaded-empty is an empty slice plus nil err; no bool, since not-loaded is an
-  error now, not an empty.
+- `Dependencies()` / `Dependents()` / `Owned() ([]ObjectRef, error)` — loaded-empty is an
+  empty slice plus nil err; no bool, since not-loaded is an error now, not an empty.
 
-## `Client.ListOwnedObjects` is the typed counterpart of `ListOwned`
+## `Client.OwnedObjectsList` is the typed counterpart of `OwnedList`
 
 It returns the decoded `[]*Object[Spec, Status]` children of *this client's kind*,
-where `ListOwned` returns untyped refs across every owned kind.
+where `OwnedList` returns untyped refs across every owned kind.
 
 It is deliberately not a fifth lazy ref lookup: the kind filter and the row read
-fold into one store primitive, `ListIncomingRefObjects(gk, toID, relation)`, so the
+fold into one store primitive, `ObjectsListByIncomingEdge(gk, toID, relation)`, so the
 Go-side `ref.Kind` filter and the `Get`-per-child the untyped shape forces on
-callers never happen. Its contract otherwise tracks `ListOwned`'s (see the godoc),
+callers never happen. Its contract otherwise tracks `OwnedList`'s (see the godoc),
 and it takes `List`'s `LoadOption`s through the same `loadListRelated` — a list read
 whose children can't be eager-loaded would just push the per-child `Get` back one
 level.
@@ -80,17 +80,17 @@ which is exactly why that surface's quartet is untyped refs.
 
 `listObjectsWhere(tail, args…)`: the blob-bearing `SELECT` runs the internal WHERE
 fragment **once**, and the batched conditions read (`conditionsByIDs`, chunked under
-`idChunkSize` like `refsByIDs`) keys off the ids it returned.
+`idChunkSize` like `edgesByIDs`) keys off the ids it returned.
 
 Re-running the predicate for the conditions half would be a skew bug, not a shared
 seam — the two statements aren't in one transaction, so a concurrent ref/object
 write between them could drop the conditions of a row already scanned. Keying off
-the ids also avoids paying the refs semi-join twice. An empty result skips the
+the ids also avoids paying the edges semi-join twice. An empty result skips the
 conditions round-trip.
 
-`ListObjects` supplies the kind tail; `ListIncomingRefObjects` a kind tail plus
-`o.id IN (SELECT from_id FROM refs …)` — a **semi-join, not a join**. Written as a
+`ObjectsList` supplies the kind tail; `ObjectsListByIncomingEdge` a kind tail plus
+`o.id IN (SELECT from_id FROM edges …)` — a **semi-join, not a join**. Written as a
 join, the planner drives from `idx_objects_kind` (which already satisfies
-`ORDER BY o.id`) and probes `refs` once per object *of the kind*; `IN (SELECT …)`
-lets `idx_refs_to` drive, so the work scales with the owner's children instead of
+`ORDER BY o.id`) and probes `edges` once per object *of the kind*; `IN (SELECT …)`
+lets `idx_edges_to` drive, so the work scales with the owner's children instead of
 the table.

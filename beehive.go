@@ -187,7 +187,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// listening — otherwise dependents go unwoken under configurations that rely
 	// on dependency events (e.g. a settled dependent, which no owed-work listing
 	// can see, with every ticker disabled).
-	bh.startDependencyWaker(runCtx)
+	bh.dependencyWakerStart(runCtx)
 
 	// Now launch the reconcile loops.
 	for _, r := range bh.order {
@@ -200,7 +200,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// kinds, which no per-controller backstop reaches. Counted in wg so Stop
 	// drains it.
 	bh.wg.Go(func() {
-		bh.runGCSweeper(runCtx)
+		bh.gcSweeperRun(runCtx)
 	})
 
 	bh.state = beehiveRunning
@@ -208,7 +208,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	return func(stopCtx context.Context) error { return bh.stop(stopCtx) }, nil
 }
 
-// runGCSweeper is the global garbage-collection backstop. The per-controller
+// gcSweeperRun is the global garbage-collection backstop. The per-controller
 // reconcile loop runs collect for its own kind; this sweeps every kind, so a
 // deletion-pending object of a client-only kind (no registered controller) is
 // still collected — otherwise it would strand and RESTRICT-block its owner's
@@ -218,7 +218,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 // because there is always a next tick: WithGCInterval rejects a non-positive
 // interval, so a transient error costs one cadence of latency rather than
 // stranding a row for the life of the process.
-func (bh *Beehive) runGCSweeper(ctx context.Context) {
+func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 	if bh.gcInterval <= 0 {
 		// Unreachable through New — the default is positive and WithGCInterval rejects
 		// anything else. Guarded anyway so a Beehive assembled field-by-field (tests
@@ -226,8 +226,8 @@ func (bh *Beehive) runGCSweeper(ctx context.Context) {
 		// instead of panicking in NewTicker.
 		return
 	}
-	bh.sweepDeletionPending(ctx)
-	bh.sweepEventRetention(ctx)
+	bh.deletionPendingSweep(ctx)
+	bh.eventRetentionSweep(ctx)
 	ticker := time.NewTicker(bh.gcInterval)
 	defer ticker.Stop()
 	for {
@@ -235,28 +235,28 @@ func (bh *Beehive) runGCSweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			bh.sweepDeletionPending(ctx)
-			bh.sweepEventRetention(ctx)
+			bh.deletionPendingSweep(ctx)
+			bh.eventRetentionSweep(ctx)
 		}
 	}
 }
 
-// sweepEventRetention trims the event log to the configured retention (see
+// eventRetentionSweep trims the event log to the configured retention (see
 // WithEventRetention). It is a no-op unless a bound is set, and best-effort: a
 // failed sweep is retried on the next cadence tick.
-func (bh *Beehive) sweepEventRetention(ctx context.Context) {
+func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 	if bh.eventRetentionPerObject <= 0 && bh.eventRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.SweepEvents(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
+	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }
 
-// sweepDeletionPending drives every deletion-pending object one step closer to
+// deletionPendingSweep drives every deletion-pending object one step closer to
 // removal (see advanceDeletion for the routing).
-func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
-	rows, err := bh.store.ListAllDeletionPending(ctx)
+func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
+	rows, err := bh.store.DeletionRequestsList(ctx)
 	if err != nil {
 		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return
@@ -267,14 +267,14 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 		// so a row that fails every time would otherwise strand silently and
 		// RESTRICT-block its owner's delete forever. ErrNotFound is the benign
 		// already-collected race and stays quiet.
-		if err := bh.advanceDeletion(ctx, row.GroupKind(), row.ID); err != nil && !errors.Is(err, ErrNotFound) {
+		if err := bh.deletionAdvance(ctx, row.GroupKind(), row.ID); err != nil && !errors.Is(err, ErrNotFound) {
 			bh.logger.Warn("gc sweep: collecting object failed; retry next sweep",
 				"group", row.Group, "kind", row.Kind, "id", row.ID, "err", err)
 		}
 	}
 }
 
-// advanceDeletion drives one deletion-pending object a step closer to removal,
+// deletionAdvance drives one deletion-pending object a step closer to removal,
 // routing on whether its kind has a controller. The GC sweeper is its only caller
 // — the event-driven path (advanceGCNow) deliberately only requeues, leaving every
 // collect to run on the sweeper's goroutine rather than a caller's.
@@ -292,16 +292,16 @@ func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
 // finalizers or live referrers remain and idempotent if another path got there
 // first. The collect error is returned rather than logged so the caller can report
 // it in its own terms; the enqueue arm always returns nil.
-func (bh *Beehive) advanceDeletion(ctx context.Context, gk GroupKind, id ObjectID) error {
+func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectID) error {
 	if r, ok := bh.reconcilerFor(gk); ok {
 		r.enqueue(id)
 		return nil
 	}
-	_, err := bh.collect(ctx, id)
+	_, err := bh.gcCollect(ctx, id)
 	return err
 }
 
-// startDependencyWaker launches the single waker over one store-wide change
+// dependencyWakerStart launches the single waker over one store-wide change
 // stream. Driving requeues off change-events (which the store suppresses for
 // no-ops) rather than off every reconcile means a steady state stops waking and
 // cycles settle.
@@ -315,13 +315,13 @@ func (bh *Beehive) advanceDeletion(ctx context.Context, gk GroupKind, id ObjectI
 // dependent's own kind.
 //
 // With no registered controllers there is nothing to wake, and the stream is not
-// free: it would pay a refs query per change in the whole store only to reach
+// free: it would pay a edges query per change in the whole store only to reach
 // enqueueIfRegistered's no-op arm.
-func (bh *Beehive) startDependencyWaker(runCtx context.Context) {
+func (bh *Beehive) dependencyWakerStart(runCtx context.Context) {
 	if len(bh.order) == 0 {
 		return
 	}
-	w, err := bh.store.WatchObjectChanges(runCtx)
+	w, err := bh.store.ObjectWritesSubscribe(runCtx)
 	if err != nil {
 		// A waker that never starts is a dead waker: no change anywhere in the store
 		// will wake a dependent for the life of the process — every kind's, not one
@@ -337,22 +337,22 @@ func (bh *Beehive) startDependencyWaker(runCtx context.Context) {
 		bh.logger.Warn(msg, "err", err)
 		return
 	}
-	bh.wg.Go(func() { bh.runDependencyWaker(runCtx, w) })
+	bh.wg.Go(func() { bh.dependencyWakerRun(runCtx, w) })
 }
 
-// runDependencyWaker requeues dependents when a target changes, until ctx is
+// dependencyWakerRun requeues dependents when a target changes, until ctx is
 // cancelled or the stream ends. The stream is store-wide and established by
 // Start (events-only, no snapshot: the reconciler's own startup pass already
 // covers existing objects), and it arrives in batches — a burst of changes costs
-// one refs query rather than one per change. The ctx.Done() arm is needed
+// one edges query rather than one per change. The ctx.Done() arm is needed
 // because a watcher's channel may never close on its own.
-func (bh *Beehive) runDependencyWaker(ctx context.Context, w ObjectChangeWatcher) {
+func (bh *Beehive) dependencyWakerRun(ctx context.Context, w *ObjectWritesSubscription) {
 	defer w.Close()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case batch, ok := <-w.Batches():
+		case batch, ok := <-w.Changes():
 			if !ok {
 				// Stop closes the stream by cancelling this same ctx, so on shutdown
 				// both select arms are ready at once and Go may pick this one. Re-check
@@ -370,16 +370,16 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w ObjectChangeWatcher
 				bh.resyncKindsEveryTick()
 				return
 			}
-			bh.wakeDependentsBatch(ctx, batch)
+			bh.dependentsWake(ctx, batch)
 		}
 	}
 }
 
-// wakeDependentsBatch requeues every object that depends_on one of targetIDs,
+// dependentsWake requeues every object that depends_on one of targetIDs,
 // each in its own kind's reconciler. Over-eager wakes are harmless: unregistered
 // kinds are ignored and the work queue coalesces duplicates.
 //
-// It resolves the whole batch in one refs query, which is not merely an
+// It resolves the whole batch in one edges query, which is not merely an
 // optimization: the store runs on a single connection, so every lookup the waker
 // makes serializes against every writer in the process — and the waker sees every
 // change in the store, not just the registered kinds'. One query per burst rather
@@ -399,7 +399,7 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, w ObjectChangeWatcher
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (bh *Beehive) wakeDependentsBatch(ctx context.Context, batch []ObjectChange) {
+func (bh *Beehive) dependentsWake(ctx context.Context, batch []ObjectWrite) {
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
 		if ref.Type != Added && ref.Type != Modified {
@@ -412,7 +412,7 @@ func (bh *Beehive) wakeDependentsBatch(ctx context.Context, batch []ObjectChange
 	if len(ids) == 0 {
 		return
 	}
-	byTarget, err := bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
+	byTarget, err := bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		// Shutdown cancels this same ctx, so a change already dequeued when Stop
 		// lands fails here for no reason of its own. Escalating would arm a full
@@ -529,7 +529,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		gk:               gk,
 		store:            bh.store,
 		work:             newWorkQueue(),
-		scheduleHub:      conflate.New[ObjectID](mergeSchedule),
+		scheduleHub:      conflate.New[ObjectID](scheduleMerge),
 		catchupInterval:  bh.catchupInterval,
 		resyncInterval:   bh.resyncInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
@@ -541,8 +541,8 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		logger:   bh.logger,
 		logLevel: bh.logLevel,
 	}
-	// Feed the work queue's schedule changes into the hub (see publishSchedule).
-	r.work.onSchedule = r.publishSchedule
+	// Feed the work queue's schedule changes into the hub (see schedulePublish).
+	r.work.onSchedule = r.schedulePublish
 	// Build the client once here so it's allocated per kind, not per reconcile,
 	// and hand the same instance to both the adapter and the caller.
 	client := &controllerClientImpl[Status]{bh: bh, gk: gk}
@@ -594,8 +594,8 @@ func (bh *Beehive) migratorFor(gk GroupKind) Migrator {
 }
 
 // reconcilerFor returns the reconciler registered for gk, if one exists. The
-// client's Requeue reaches the per-kind work queue through it, and GetSchedule /
-// WatchSchedule read schedule state through it; a client-only kind (no Register)
+// client's Requeue reaches the per-kind work queue through it, and SchedulesGet /
+// SchedulesWatch read schedule state through it; a client-only kind (no Register)
 // has none.
 func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 	bh.mu.Lock()

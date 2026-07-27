@@ -17,13 +17,13 @@ package beehive
 import "context"
 
 // pendingWakes collects ref targets to requeue after Reconcile returns. A
-// ControllerClient call that frees a target (DeleteDependency) registers it here;
+// ControllerClient call that frees a target (DependenciesDelete) registers it here;
 // typedController.reconcile drains it once Reconcile returns (the freeing write has
 // already committed). It rides on the context so the long-lived, shared
 // ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
 // runs on one goroutine, so the slice needs no locking.
 type pendingWakes struct {
-	targets []Referrer
+	targets []ObjectRef
 }
 
 type pendingWakesKey struct{}
@@ -40,9 +40,9 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 	return w
 }
 
-// collect is the garbage-collection step for a single object, run after its
+// gcCollect is the garbage-collection step for a single object, run after its
 // controller's Reconcile returns (see typedController.reconcile) and on the global
-// GC sweep (see sweepDeletionPending). It runs in its own transaction. It is a no-op
+// GC sweep (see deletionPendingSweep). It runs in its own transaction. It is a no-op
 // unless the object is finalizing.
 //
 // Two things happen for a finalizing object:
@@ -50,7 +50,7 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 //   - Cascade: every object that owns_by this one is itself marked for deletion
 //     and requeued, so deleting an owner tears its children down with it.
 //   - Physical delete: once the object has no finalizers left AND nothing still
-//     references it, its row is removed. The refs table's ON DELETE RESTRICT
+//     references it, its row is removed. The edges table's ON DELETE RESTRICT
 //     makes that ordering mandatory — an owner cannot be removed while a child
 //     still points at it — and ON DELETE CASCADE on the child side means
 //     removing the last child drops the edge that was blocking the owner. The
@@ -58,14 +58,14 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 //
 // The whole step runs in one transaction so the cascade writes and the delete
 // commit together; the watch events they emit publish only on commit.
-func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err error) {
+func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	// toWake accumulates objects to requeue after the transaction commits: the
 	// cascaded children, plus (when the row is removed) the targets it was holding
 	// open. Waking post-commit means a rollback never leaves a phantom enqueue,
 	// matching the dependency waker's post-commit pattern.
-	var toWake []Referrer
+	var toWake []ObjectRef
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
-		obj, err := bh.store.GetObjectMeta(ctx, id)
+		obj, err := bh.store.ObjectsGetMeta(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -75,8 +75,8 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		}
 
 		// Cascade deletion to owned children, requeuing them all (see
-		// MarkOwnedForDeletion for the steady-state single-read path).
-		children, err := bh.store.MarkOwnedForDeletion(ctx, id)
+		// DeletionRequestsCreateFromOwner for the steady-state single-read path).
+		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -90,12 +90,12 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		// depends_on edges before the referrer gate, or two deletion-pending objects
 		// that depend on each other (or a self-dependency) would each hold the
 		// other's RESTRICT forever. owned_by edges are left for the cascade.
-		if err := bh.store.DeleteFinalizingDependsOnRefs(ctx, id); err != nil {
+		if err := bh.store.EdgesDeleteFinalizingDependsOn(ctx, id); err != nil {
 			return err
 		}
 		// Still referenced (owned children or live dependents): RESTRICT forbids the
 		// delete. Leave the row; a referrer's own removal will wake us (below).
-		referenced, err := bh.store.HasIncomingRefs(ctx, id)
+		referenced, err := bh.store.EdgesHasIncoming(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -107,11 +107,11 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		// unblock a deletion-pending target RESTRICT was holding. Capture those
 		// targets before the delete so we can wake them — the event-driven path that
 		// lets a cascade finish without waiting on the next GC sweep.
-		referents, err := bh.store.ListOutgoingRefs(ctx, id)
+		referents, err := bh.store.EdgesListOutgoing(ctx, id)
 		if err != nil {
 			return err
 		}
-		if err := bh.store.DeleteObject(ctx, id); err != nil {
+		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
 			return err
 		}
 		toWake = append(toWake, referents...)
@@ -122,12 +122,12 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		return false, err
 	}
 	for _, w := range toWake {
-		bh.advanceGC(ctx, w.GroupKind(), w.ID)
+		bh.gcAdvance(ctx, w.GroupKind(), w.ID)
 	}
 	return deleted, nil
 }
 
-// advanceGC moves (gk, id) forward toward collection after a deletion-related
+// gcAdvance moves (gk, id) forward toward collection after a deletion-related
 // change, once the caller's transaction (if any) has committed.
 //
 // The post-commit hook is what makes it safe to call from inside a transaction —
@@ -147,15 +147,15 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 // a spec write owes the object a reconcile, a deletion owes it a collect — and
 // advanceGCNow is where the second one's answer changes if it ever grows past a
 // requeue (a durable stamp, say, as pending_wake is for dependency wakes).
-func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
+func (bh *Beehive) gcAdvance(ctx context.Context, gk GroupKind, id ObjectID) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
-		bh.advanceGCNow(gk, id)
+		bh.gcAdvanceNow(gk, id)
 	})
 }
 
 // wakeAfterCommit schedules a reconciler wake for gk/id once the ambient
 // transaction commits and its watch events are out — the wake sibling of
-// advanceGC, kept non-generic here rather than on the typed client. Registering
+// gcAdvance, kept non-generic here rather than on the typed client. Registering
 // on the store rather than enqueuing after Within is what keeps the ordering
 // under nesting: a caller may have wrapped the write in ControllerClient.Within,
 // and the nested Within returns while that outer transaction is still open — so a
@@ -166,7 +166,7 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 	bh.store.AfterCommit(ctx, func(context.Context) { bh.enqueueIfRegistered(gk, id) })
 }
 
-// advanceGCNow is advanceGC's body, run with no transaction in flight. A
+// gcAdvanceNow is gcAdvance's body, run with no transaction in flight. A
 // registered kind is requeued so its own reconcile loop runs collect; a
 // client-only kind has no loop to requeue onto, and the global sweeper's next
 // tick is its backstop — which is exactly what enqueueIfRegistered's no-op arm
@@ -178,6 +178,6 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 // recursive cascade of physical deletes on the caller's goroutine and ctx — so a
 // caller cancelling right after its commit could abandon the cascade mid-flight,
 // with nothing scheduled to resume it.
-func (bh *Beehive) advanceGCNow(gk GroupKind, id ObjectID) {
+func (bh *Beehive) gcAdvanceNow(gk GroupKind, id ObjectID) {
 	bh.enqueueIfRegistered(gk, id)
 }

@@ -56,7 +56,7 @@ so a kind can't be migrated on one path but not the other.
 ### Quarantine
 
 A convert error, a downgrade, or a post-convert `json.Unmarshal` error are all
-decode failures. `List` and `adaptWatcher` (the live watch) skip-and-log the bad
+decode failures. `List` and `adaptObjectStream` (the live watch) skip-and-log the bad
 row and continue rather than aborting the whole list or killing the stream;
 `Get` / `GetBySlug` still return the error.
 

@@ -29,10 +29,11 @@ type GroupKind = storeapi.GroupKind
 // ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = storeapi.ObjectID
 
-// Ref identifies a related object reached through a ref edge — an owner, a
+// ObjectRef identifies a related object reached through an edge — an owner, a
 // dependency, or a dependent — carrying the GroupKind needed to address it. It
-// is the same shape the store returns for every edge query.
-type Ref = storeapi.Referrer
+// is a reference to the object, not the edge itself: the store's Edges* family
+// deals in edges, and every one of its queries returns this same shape.
+type ObjectRef = storeapi.ObjectRef
 
 // LoadSet is a bitset of secondary lookups (owner, dependencies, dependents,
 // owned) to fetch alongside an object. The zero value loads nothing; reads OR in the
@@ -63,7 +64,7 @@ type Object[Spec, Status any] struct {
 	Slug                *string
 	Spec                Spec
 	Status              *Status
-	Generation          int64      // bumped on every Spec write not provably a no-op (see UpdateSpec)
+	Generation          int64      // bumped on every Spec write not provably a no-op (see ObjectsUpdateSpec)
 	ObservedGeneration  *int64     // Generation the controller last reconciled; nil until first reconcile
 	ObservedAt          *time.Time // when ObservedGeneration was recorded; not a reconcile heartbeat
 	ResourceVersion     int64      // bumped on every write, for optimistic concurrency
@@ -75,14 +76,14 @@ type Object[Spec, Status any] struct {
 
 	// Related data, populated only for the lookups a read requested (see LoadSet).
 	// A nil/empty field is ambiguous on its own — which loaded records what was
-	// actually fetched, so the GetOwner/ListDependencies/ListDependents/ListOwned
+	// actually fetched, so the OwnersGet/DependenciesList/DependentsList/OwnedList
 	// accessors distinguish "loaded and empty" from "never asked". These fields are
 	// unexported; reach for the accessors, never the backing storage.
-	owner        *Ref    // the owning object, if any
-	dependencies []Ref   // objects this one depends on
-	dependents   []Ref   // objects that depend on this one
-	owned        []Ref   // objects this one owns
-	events       []Event // the object's event-log runs
+	owner        *ObjectRef  // the owning object, if any
+	dependencies []ObjectRef // objects this one depends on
+	dependents   []ObjectRef // objects that depend on this one
+	owned        []ObjectRef // objects this one owns
+	events       []Event     // the object's event-log runs
 	loaded       LoadSet
 }
 
@@ -92,53 +93,53 @@ type Object[Spec, Status any] struct {
 // missing object, so it is kept distinct from a present-but-empty result.
 var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
 
-// GetOwner returns the object's owner. It errors with ErrNotLoaded if LoadOwner()
+// Owner returns the object's owner. It errors with ErrNotLoaded if LoadOwner()
 // was not passed to the read. Otherwise ok reports presence — false when the
-// object has no owner. (Use the lazy Client.GetOwner to fetch on demand instead.)
-func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) {
+// object has no owner. (Use the lazy Client.Owner to fetch on demand instead.)
+func (o *Object[Spec, Status]) Owner() (ObjectRef, bool, error) {
 	if o.loaded&LoadOwnerBit == 0 {
-		return Ref{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
+		return ObjectRef{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
 	}
 	if o.owner == nil {
-		return Ref{}, false, nil
+		return ObjectRef{}, false, nil
 	}
 	return *o.owner, true, nil
 }
 
-// ListDependencies returns the objects this one depends on, or ErrNotLoaded if
+// Dependencies returns the objects this one depends on, or ErrNotLoaded if
 // LoadDependencies() was not passed to the read. A loaded-but-empty result is an
 // empty slice with a nil error.
-func (o *Object[Spec, Status]) ListDependencies() ([]Ref, error) {
+func (o *Object[Spec, Status]) Dependencies() ([]ObjectRef, error) {
 	if o.loaded&LoadDependenciesBit == 0 {
 		return nil, fmt.Errorf("%w: dependencies (pass LoadDependencies())", ErrNotLoaded)
 	}
 	return o.dependencies, nil
 }
 
-// ListDependents returns the objects that depend on this one, or ErrNotLoaded if
+// Dependents returns the objects that depend on this one, or ErrNotLoaded if
 // LoadDependents() was not passed to the read.
-func (o *Object[Spec, Status]) ListDependents() ([]Ref, error) {
+func (o *Object[Spec, Status]) Dependents() ([]ObjectRef, error) {
 	if o.loaded&LoadDependentsBit == 0 {
 		return nil, fmt.Errorf("%w: dependents (pass LoadDependents())", ErrNotLoaded)
 	}
 	return o.dependents, nil
 }
 
-// ListOwned returns the objects this one owns (its incoming owned_by edges), or
+// Owned returns the objects this one owns (its incoming owned_by edges), or
 // ErrNotLoaded if LoadOwned() was not passed to the read. A loaded-but-empty
 // result is an empty slice with a nil error.
-func (o *Object[Spec, Status]) ListOwned() ([]Ref, error) {
+func (o *Object[Spec, Status]) Owned() ([]ObjectRef, error) {
 	if o.loaded&LoadOwnedBit == 0 {
 		return nil, fmt.Errorf("%w: owned (pass LoadOwned())", ErrNotLoaded)
 	}
 	return o.owned, nil
 }
 
-// ListEvents returns the object's event-log runs, newest-first, or ErrNotLoaded
+// Events returns the object's event-log runs, newest-first, or ErrNotLoaded
 // if LoadEvents() was not passed to the read. A loaded-but-empty log is an empty
-// slice with a nil error. (Use the lazy Client.ListEvents to fetch on demand, or
+// slice with a nil error. (Use the lazy Client.Events to fetch on demand, or
 // to filter/limit.)
-func (o *Object[Spec, Status]) ListEvents() ([]Event, error) {
+func (o *Object[Spec, Status]) Events() ([]Event, error) {
 	if o.loaded&LoadEventsBit == 0 {
 		return nil, fmt.Errorf("%w: events (pass LoadEvents())", ErrNotLoaded)
 	}
@@ -154,12 +155,12 @@ type Result struct {
 
 // Schedule reports when an object is next due to reconcile. It is a struct rather
 // than a bare time.Time so fields can be added without a breaking change — a
-// reschedule watcher (Client.WatchSchedule) observes this value as a gauge.
+// reschedule watcher (Client.SchedulesWatch) observes this value as a gauge.
 type Schedule struct {
 	// NextRequeueAt is when the reconcile loop has scheduled the object to be
 	// requeued, or the zero time when nothing is scheduled. It reflects only per-id
 	// timers (backoff, RequeueAfter, an immediate enqueue), not the periodic resync
-	// or event-driven wakes. Reported by Client.GetSchedule and WatchSchedule.
+	// or event-driven wakes. Reported by Client.SchedulesGet and SchedulesWatch.
 	NextRequeueAt time.Time
 	// Reserved: a future Trigger/Reason enum (backoff vs success-cadence vs manual
 	// poke) may be added here. Not populated yet.
@@ -200,7 +201,7 @@ const (
 )
 
 // EventSpec is the caller-supplied portion of an event, passed to
-// ControllerClient.RecordEvent. It excludes the store-owned run fields (id,
+// ControllerClient.EventsRecord. It excludes the store-owned run fields (id,
 // count, window) so a caller can't set them. Consecutive emissions sharing
 // (Category, Type, Reason) coalesce into one run; Message and Detail are sampled
 // (latest wins), not part of that key.

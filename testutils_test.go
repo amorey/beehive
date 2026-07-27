@@ -120,204 +120,205 @@ func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) 
 // AfterCommit runs inline: the fake never opens a transaction, so there is no
 // commit to wait for.
 func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
-func (s *fakeStore) CreateObject(context.Context, *RawObject) (*RawObject, error) {
-	panic("not implemented: fakeStore.CreateObject")
+func (s *fakeStore) ObjectsCreate(context.Context, *RawObject) (*RawObject, error) {
+	panic("not implemented: fakeStore.ObjectsCreate")
 }
-func (s *fakeStore) GetObject(context.Context, ObjectID) (*RawObject, error) {
-	panic("not implemented: fakeStore.GetObject")
+func (s *fakeStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.ObjectsGet")
 }
-func (s *fakeStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
-	panic("not implemented: fakeStore.GetObjectMeta")
+func (s *fakeStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.ObjectsGetMeta")
 }
-func (s *fakeStore) GetObjectBySlug(context.Context, GroupKind, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.GetObjectBySlug")
+func (s *fakeStore) ObjectsGetBySlug(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.ObjectsGetBySlug")
 }
-func (s *fakeStore) ListObjects(context.Context, GroupKind) ([]*RawObject, error) {
+func (s *fakeStore) ObjectsList(context.Context, GroupKind) ([]*RawObject, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *fakeStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListAllDeletionPending(context.Context) ([]storeapi.Referrer, error) {
+func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *fakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
-	panic("not implemented: fakeStore.DecrementPendingWake")
+func (s *fakeStore) WakesDecrement(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.WakesDecrement")
 }
-func (s *fakeStore) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.UpdateSpec")
+func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }
-func (s *fakeStore) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) (*RawObject, error) {
+func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) (*RawObject, error) {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
-func (s *fakeStore) DeleteFinalizer(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.DeleteFinalizer")
+func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.FinalizersDelete")
 }
-func (s *fakeStore) RequestDeletion(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.RequestDeletion")
+func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreate")
 }
-func (s *fakeStore) RequestDeletionBySlug(context.Context, GroupKind, string) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.RequestDeletionBySlug")
+func (s *fakeStore) DeletionRequestsCreateBySlug(context.Context, GroupKind, string) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreateBySlug")
 }
-func (s *fakeStore) SetCondition(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
-	panic("not implemented: fakeStore.SetCondition")
+func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
+	panic("not implemented: fakeStore.ConditionsSet")
 }
-func (s *fakeStore) DeleteCondition(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.DeleteCondition")
+func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.ConditionsDelete")
 }
-func (s *fakeStore) DeleteObject(context.Context, ObjectID) error {
-	panic("not implemented: fakeStore.DeleteObject")
+func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
+	panic("not implemented: fakeStore.ObjectsDelete")
 }
-func (s *fakeStore) MarkOwnedForDeletion(context.Context, ObjectID) ([]storeapi.Referrer, error) {
-	panic("not implemented: fakeStore.MarkOwnedForDeletion")
+func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
-func (s *fakeStore) RecordEvent(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
-	panic("not implemented: fakeStore.RecordEvent")
+func (s *fakeStore) EventsRecord(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
+	panic("not implemented: fakeStore.EventsRecord")
 }
-func (s *fakeStore) ListEvents(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
-	panic("not implemented: fakeStore.ListEvents")
+func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
+	panic("not implemented: fakeStore.EventsList")
 }
-func (s *fakeStore) GetLatestEvent(context.Context, ObjectID, string) (*RawEvent, error) {
-	panic("not implemented: fakeStore.GetLatestEvent")
+func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
+	panic("not implemented: fakeStore.EventsGetLatest")
 }
-func (s *fakeStore) SweepEvents(context.Context, int, time.Duration) (int, error) {
-	panic("not implemented: fakeStore.SweepEvents")
+func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
+	panic("not implemented: fakeStore.EventsSweep")
 }
-func (s *fakeStore) AddRef(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
-	panic("not implemented: fakeStore.AddRef")
+func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.EdgesAddResult, error) {
+	panic("not implemented: fakeStore.EdgesAdd")
 }
-func (s *fakeStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
-	panic("not implemented: fakeStore.DeleteRef")
+func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
+	panic("not implemented: fakeStore.EdgesDelete")
 }
-func (s *fakeStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *fakeStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return nil, nil
 }
-func (s *fakeStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListOutgoingRefs(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) ListOutgoingRefsByRelation(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {
+func (s *fakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
 	return nil
 }
-func (s *fakeStore) HasIncomingRefs(context.Context, ObjectID) (bool, error) {
+func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 
-// Watch/WatchList default to a noopWatcher (never fires, no-op Close) rather
+// ObjectsWatch/ObjectsWatchList default to a dead subscription (never fires, no-op Close) rather
 // than panicking, so client tests that only exercise the snapshot or
 // registration error paths reach their target without each fake overriding them.
-func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
-	return noopWatcher{}, nil
+func (s *fakeStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
+	return deadSubscription[storeapi.RawObjectChange](), nil
 }
-func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
-	return noopWatcher{}, nil
+func (s *fakeStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
+	return deadSubscription[storeapi.RawObjectChange](), nil
 }
-func (s *fakeStore) WatchObjectChanges(context.Context) (storeapi.ObjectChangeWatcher, error) {
-	return noopObjectChangeWatcher{}, nil
+func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+	return deadSubscription[[]storeapi.ObjectWrite](), nil
 }
-func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
-	panic("not implemented: fakeStore.WatchEvents")
+func (s *fakeStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
+	panic("not implemented: fakeStore.EventsWatch")
 }
 
-// noopWatcher is a Watcher whose event stream never fires; Close is a no-op.
-type noopWatcher struct{}
+// deadSubscription is a subscription whose stream never fires and whose Close
+// does nothing — a nil channel blocks forever, which is what "never fires" means
+// to a select.
+func deadSubscription[V any]() *storeapi.Subscription[V] {
+	return storeapi.NewSubscription[V](nil, func() {})
+}
 
-func (noopWatcher) Changes() <-chan storeapi.RawChange { return nil }
-func (noopWatcher) Close()                             {}
-
-// noopObjectChangeWatcher is noopWatcher's store-wide-stream twin.
-type noopObjectChangeWatcher struct{}
-
-func (noopObjectChangeWatcher) Batches() <-chan []storeapi.ObjectChange { return nil }
-func (noopObjectChangeWatcher) Close()                                  {}
-
-// watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
+// watcherStore is a fakeStore whose object watches return a preset stream and
 // error, so client-layer tests can drive the typed-adapter goroutine directly.
 type watcherStore struct {
 	fakeStore
-	w       Watcher
-	changes ObjectChangeWatcher // served by WatchObjectChanges, for the dependency waker
-	err     error
+	w      *fakeObjectStream
+	writes *fakeWriteStream // served by ObjectWritesSubscribe, for the dependency waker
+	err    error
 }
 
-func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
-	return s.w, s.err
-}
-func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
-	return s.w, s.err
-}
-func (s *watcherStore) WatchObjectChanges(context.Context) (ObjectChangeWatcher, error) {
+func (s *watcherStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.changes, nil
+	return s.w.sub, nil
+}
+func (s *watcherStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.w.sub, nil
+}
+func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.writes.sub, nil
 }
 
-// fakeStream is the shared body of the controllable watcher doubles: an
+// fakeStream is the shared body of the controllable subscription doubles: an
 // unbuffered channel of whatever the stream carries, plus a closed signal so a
 // test can synchronize on the consumer goroutine's exit instead of reading the
 // channel — which could itself satisfy a pending send and race the outcome.
+// sub is the read side handed to the code under test; Subscription.Close is
+// idempotent, so the signal needs no Once of its own.
 type fakeStream[V any] struct {
-	ch        chan V
-	closed    chan struct{}
-	closeOnce sync.Once
+	ch     chan V
+	closed chan struct{}
+	sub    *storeapi.Subscription[V]
 }
 
 func newFakeStream[V any]() fakeStream[V] {
-	return fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
+	s := fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
+	s.sub = storeapi.NewSubscription[V](s.ch, func() { close(s.closed) })
+	return s
 }
-
-// Close is called by the consumer's defer on exit.
-func (w *fakeStream[V]) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
 
 // endStream closes the channel, signalling the stream has ended.
 func (w *fakeStream[V]) endStream() { close(w.ch) }
 
-// fakeWatcher is a controllable Watcher, backing the client adaptWatcher tests.
-type fakeWatcher struct{ fakeStream[storeapi.RawChange] }
-
-func newFakeWatcher() *fakeWatcher {
-	return &fakeWatcher{newFakeStream[storeapi.RawChange]()}
+// fakeObjectStream is a controllable ObjectsSubscription, backing the client
+// adaptObjectStream tests.
+type fakeObjectStream struct {
+	fakeStream[storeapi.RawObjectChange]
 }
 
-func (w *fakeWatcher) Changes() <-chan storeapi.RawChange { return w.ch }
-
-// push delivers a raw event to the adapter goroutine.
-func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
-	w.ch <- storeapi.RawChange{Type: typ, Object: obj}
+func newFakeObjectStream() *fakeObjectStream {
+	return &fakeObjectStream{newFakeStream[storeapi.RawObjectChange]()}
 }
 
-// fakeObjectChangeWatcher is fakeWatcher's store-wide-stream twin, backing the
+// push delivers a raw change to the adapter goroutine.
+func (w *fakeObjectStream) push(typ ChangeType, obj *RawObject) {
+	w.ch <- storeapi.RawObjectChange{Type: typ, Object: obj}
+}
+
+// fakeWriteStream is fakeObjectStream's store-wide twin, backing the
 // dependency-waker tests. A batch is the push unit deliberately — the waker
 // resolves a whole batch in one query, so a double that could only deliver one
-// reference at a time would hide that.
-type fakeObjectChangeWatcher struct{ fakeStream[[]ObjectChange] }
+// write at a time would hide that.
+type fakeWriteStream struct{ fakeStream[[]ObjectWrite] }
 
-func newFakeObjectChangeWatcher() *fakeObjectChangeWatcher {
-	return &fakeObjectChangeWatcher{newFakeStream[[]ObjectChange]()}
+func newFakeWriteStream() *fakeWriteStream {
+	return &fakeWriteStream{newFakeStream[[]ObjectWrite]()}
 }
 
-func (w *fakeObjectChangeWatcher) Batches() <-chan []ObjectChange { return w.ch }
-
 // push delivers one batch to the waker.
-func (w *fakeObjectChangeWatcher) push(refs ...ObjectChange) { w.ch <- refs }
+func (w *fakeWriteStream) push(writes ...ObjectWrite) { w.ch <- writes }
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.
@@ -387,20 +388,20 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 	return Result{}, nil
 }
 
-// addRef declares an edge for test scaffolding: it discards the endpoint metadata
-// AddRef reports and passes no version claim (0), so the common
-// require.NoError(t, addRef(...)) shape stays a one-liner. Tests that assert on
-// the AddRefResult, or on the version guard, call the method directly.
-func addRef(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
-	_, err := store.AddRef(ctx, from, to, relation, 0)
+// addEdge declares an edge for test scaffolding: it discards the endpoint metadata
+// EdgesAdd reports and passes no version claim (0), so the common
+// require.NoError(t, addEdge(...)) shape stays a one-liner. Tests that assert on
+// the EdgesAddResult, or on the version guard, call the method directly.
+func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
+	_, err := store.EdgesAdd(ctx, from, to, relation, 0)
 	return err
 }
 
-// refObjectIDs projects a Ref/Referrer slice to its ids, for assertions that care
+// objectRefIDs projects an ObjectRef slice to its ids, for assertions that care
 // which objects are on the far end of an edge rather than how they were reached.
-// Ref and Referrer are both aliases of storeapi.Referrer, so one projection serves
-// the owner/dependency lookups and the incoming-ref lookups alike.
-func refObjectIDs(refs []Ref) []ObjectID {
+// One projection serves the owner/dependency lookups and the incoming-edge
+// lookups alike, since every Edges* query returns this same shape.
+func objectRefIDs(refs []ObjectRef) []ObjectID {
 	var ids []ObjectID
 	for _, r := range refs {
 		ids = append(ids, r.ID)
@@ -414,7 +415,7 @@ func refObjectIDs(refs []Ref) []ObjectID {
 // wait for this rather than assume the waker is done.
 //
 // It is keyed on (toID, relation), not on the caller — the same lookups are also
-// reached from ListDependents and the LoadDependents eager path, and nothing here
+// reached from DependentsList and the LoadDependents eager path, and nothing here
 // can tell those from the waker. So a token means "somebody looked", and a test
 // that wants "the waker looked" must resetLooked immediately before the write it
 // expects the waker to react to. Reading the target's dependents from a test's own
@@ -426,19 +427,19 @@ type wakeProbeStore struct {
 	looked   chan struct{} // one send per targetID depends_on lookup
 }
 
-func (s *wakeProbeStore) ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error) {
-	refs, err := s.Store.ListIncomingRefs(ctx, toID, relation)
+func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error) {
+	refs, err := s.Store.EdgesListIncoming(ctx, toID, relation)
 	if toID == s.targetID {
 		s.note(relation)
 	}
 	return refs, err
 }
 
-// GroupIncomingRefsByID is the waker's own lookup (it resolves a whole batch of
+// EdgesGroupIncomingByID is the waker's own lookup (it resolves a whole batch of
 // changed targets in one query), so the probe has to cover it too — otherwise a
 // test waiting on "the waker looked" would wait forever.
-func (s *wakeProbeStore) GroupIncomingRefsByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error) {
-	refs, err := s.Store.GroupIncomingRefsByID(ctx, toIDs, relation)
+func (s *wakeProbeStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error) {
+	refs, err := s.Store.EdgesGroupIncomingByID(ctx, toIDs, relation)
 	if slices.Contains(toIDs, s.targetID) {
 		s.note(relation)
 	}
@@ -495,9 +496,9 @@ func (s *wakeProbeStore) waitLooked(t *testing.T) {
 // ones it orders against.
 type listProbeStore struct {
 	Store
-	unsettledListed chan struct{} // ListUnsettledIDs (per-kind)
-	wakeListed      chan struct{} // ListPendingWakeIDs (per-kind)
-	gcSwept         chan struct{} // ListAllDeletionPending (global)
+	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
+	wakeListed      chan struct{} // WakesListPendingIDs (per-kind)
+	gcSwept         chan struct{} // DeletionRequestsList (global)
 }
 
 // probeSignal reports one listing. The send is non-blocking so a late pass after
@@ -512,20 +513,20 @@ func probeSignal(ch chan struct{}) {
 	}
 }
 
-func (s *listProbeStore) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ListUnsettledIDs(ctx, gk)
+func (s *listProbeStore) ObjectsListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ObjectsListUnsettledIDs(ctx, gk)
 	probeSignal(s.unsettledListed)
 	return ids, err
 }
 
-func (s *listProbeStore) ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ListPendingWakeIDs(ctx, gk)
+func (s *listProbeStore) WakesListPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.WakesListPendingIDs(ctx, gk)
 	probeSignal(s.wakeListed)
 	return ids, err
 }
 
-func (s *listProbeStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
-	rows, err := s.Store.ListAllDeletionPending(ctx)
+func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
+	rows, err := s.Store.DeletionRequestsList(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
 }
