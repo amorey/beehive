@@ -15,7 +15,7 @@ volume.
 Fan out through a per-kind **conflating hub** (`conflate`, from the external
 `github.com/amorey/gobus` library). Each receiver keeps the *latest* event per
 object id in first-touch order, and a `Send` for an already-pending id coalesces
-into that slot via a merge callback (`mergeChange`).
+into that slot via a merge callback (`changeMerge`).
 
 A slow watcher therefore converges to each object's current state — a delete
 carries the store's real final row — instead of dropping events. There is no ring,
@@ -35,7 +35,7 @@ create-then-delete annihilation); the hub stays generic.
 ## The store-wide hub
 
 Alongside the per-kind hubs, `publish` also sends to one store-wide `changeHub`
-under the same `ObjectID` key and the same `mergeChange` — `objects.id` is one
+under the same `ObjectID` key and the same `changeMerge` — `objects.id` is one
 `AUTOINCREMENT` PK for the whole table, so a global hub conflates per object
 exactly as the per-kind ones do.
 

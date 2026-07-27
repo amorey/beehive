@@ -68,7 +68,7 @@ Harness: `modernc.org/sqlite`, `SetMaxOpenConns(1)`, in-memory, 100k objects wit
 | query | before | after | delta |
 |---|---|---|---|
 | `SELECT from_id FROM refs WHERE to_id=? AND relation=?` (refs only) | 166 ms | 108 ms | **−35%** |
-| `ListIncomingRefs` (the real shape — joins `objects`) | 379 ms | 305 ms | **−20%** |
+| `RefsListIncoming` (the real shape — joins `objects`) | 379 ms | 305 ms | **−20%** |
 | database page count | 21276 | 17576 | **−17%** |
 
 **Quote the −20%, not the −35%, for anything beehive runs.** Every real consumer
@@ -78,14 +78,14 @@ reachable only by a caller that wants ids and nothing else. The page-count figur
 likewise scales with spec payload size: it is the `refs` table roughly halving,
 measured against 400-byte specs.
 
-Helped: `ListIncomingRefs` in the dependency waker, the batched
-`GroupIncomingRefsByID` / `GroupOutgoingRefsByID` loaders, and
-`ListIncomingRefObjects`. Also the GC cascade's `HasIncomingRefs`, but for a
+Helped: `RefsListIncoming` in the dependency waker, the batched
+`RefsGroupIncomingByID` / `RefsGroupOutgoingByID` loaders, and
+`ObjectsListByIncomingRef`. Also the GC cascade's `RefsHasIncoming`, but for a
 smaller reason — its `refs` side becomes covering, while the
 `deletion_requested_at` subquery it also runs rides the partial
 `idx_objects_deleting` and was already cheap (3 ms / 200 calls at 50k objects);
 don't expect it to move. Not measurably helped: single-object lookups like
-`GetOwner`, where one extra row fetch is lost in the noise. Writes should improve
+`OwnersGet`, where one extra row fetch is lost in the noise. Writes should improve
 in principle — one B-tree insert instead of two — but this was not measured.
 
 ### Query plans
@@ -98,17 +98,17 @@ after and diffing:
 
 | statement | before | after |
 |---|---|---|
-| `ListOutgoingRefs` | `COVERING INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
-| `ListOutgoingRefsByRelation` | `COVERING INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
-| `AddRef` wake-stamp probe | `COVERING INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
-| `DeleteRef` | `INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
-| `ListIncomingRefs` | `INDEX idx_refs_to` | `COVERING INDEX idx_refs_to` |
-| `ListIncomingRefObjects` | `INDEX idx_refs_to` | `COVERING INDEX idx_refs_to` |
-| `HasIncomingRefs` | `INDEX idx_refs_to` | `COVERING INDEX idx_refs_to` |
+| `RefsListOutgoing` | `COVERING INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
+| `RefsListOutgoingByRelation` | `COVERING INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
+| `RefsAdd` wake-stamp probe | `COVERING INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
+| `RefsDelete` | `INDEX sqlite_autoindex_refs_1` | `PRIMARY KEY` |
+| `RefsListIncoming` | `INDEX idx_refs_to` | `COVERING INDEX idx_refs_to` |
+| `ObjectsListByIncomingRef` | `INDEX idx_refs_to` | `COVERING INDEX idx_refs_to` |
+| `RefsHasIncoming` | `INDEX idx_refs_to` | `COVERING INDEX idx_refs_to` |
 
 The outgoing side losing `COVERING` is a wash by construction, not a regression:
 the automatic index those statements used *is* the table now, so the same key
-search runs against one B-tree instead of two. `DeleteRef` was the one statement
+search runs against one B-tree instead of two. `RefsDelete` was the one statement
 not already covering, so it gains outright.
 
 ### The covering property is now invisible in the schema
@@ -144,7 +144,7 @@ Three commits on `refactor/refs--without-rowid`, built red/green:
 1. Tightened `TestMarkOwnedForDeletionUsesRefsIndex` to assert `COVERING`. Red,
    failing with `SEARCH r USING INDEX idx_refs_to (to_id=? AND relation=?)`.
 2. `) STRICT, WITHOUT ROWID;` plus the migration comments. Green, full suite clean.
-3. Reworded the `AddRef` wake-stamp comment in `sqlite/store.go` (and its twin in
+3. Reworded the `RefsAdd` wake-stamp comment in `sqlite/store.go` (and its twin in
    CLAUDE.md), which had described the probe as "a covering probe on the refs
    primary key" — accurate before, wrong once the primary key *is* the table.
 

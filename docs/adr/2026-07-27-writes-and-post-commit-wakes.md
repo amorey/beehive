@@ -43,43 +43,43 @@ changed after review.)
 
 `GetOrCreate`'s found branch does *no* write, which is the whole point: a
 deletion-pending row comes back with its tombstone intact rather than being
-resurrected by an `UpdateSpec`, and it still holds `UNIQUE(slug)`, so waiting for
+resurrected by an `ObjectsUpdateSpec`, and it still holds `UNIQUE(slug)`, so waiting for
 GC is the caller's only way forward.
 
 ### `DeleteBySlug` is `GetOrCreate`'s remove-side partner
 
 It is the one slug-keyed write that needs no client-side `Within`: the store
-resolves and marks in a single statement via `RequestDeletionBySlug`, which folds
-the slug into the `UPDATE`'s `WHERE` exactly as `RequestDeletion` folds in the
+resolves and marks in a single statement via `DeletionsRequestBySlug`, which folds
+the slug into the `UPDATE`'s `WHERE` exactly as `DeletionsRequest` folds in the
 kind.
 
 That is why `markForDeletion` takes the caller's **whole row predicate** rather
 than an id plus an `extraWhere` — one statement template, key supplied per caller
-(`id = ?` + scope for `RequestDeletion`, bare `id = ?` for the
-`MarkOwnedForDeletion` cascade, the group/kind/slug triple for the slug path); a
+(`id = ?` + scope for `DeletionsRequest`, bare `id = ?` for the
+`DeletionsMarkOwned` cascade, the group/kind/slug triple for the slug path); a
 new keying is a call-site change, not a second copy of the statement.
 
 The mark-or-reread protocol above it is shared too (`requestDeletion`, taking the
 predicate plus a `reread` closure): `markForDeletion`'s `ErrNotFound` can't
 distinguish already-deleting from out-of-scope from gone, and the reread that
 resolves it — and supplies the current row the no-op path still needs for
-`advanceGC` — is the only part that differs between the two entry points.
+`gcAdvance` — is the only part that differs between the two entry points.
 
 Its `ErrNotFound` is therefore unambiguous — nothing of this kind holds the slug —
 and the client folds it to `nil`, the one place a slug delete departs from
 `Delete`, which reports a missing id. All `DeleteBySlug` still runs itself is
-`advanceGC` (pinned by `TestClientDeleteBySlugAdvancesGC`).
+`gcAdvance` (pinned by `TestClientDeleteBySlugAdvancesGC`).
 
 ## Wakes run after the outermost commit
 
 Every client write path registers its wake through `Store.AfterCommit`:
 `Create` / `CreateOrUpdate` / `GetOrCreate` / `Update` via
-`clientImpl.wakeAfterCommit`, and `Delete` via `advanceGC`, which registers the
+`clientImpl.wakeAfterCommit`, and `Delete` via `gcAdvance`, which registers the
 whole GC follow-up (`advanceGCNow`) as the hook. So the spec event precedes the
 wake.
 
-The wake is **gated on a real change**: `UpdateSpec` returns `(obj, changed, err)`
-(mirroring `RequestDeletion`), and `Update` / `CreateOrUpdate` skip the wake when
+The wake is **gated on a real change**: `ObjectsUpdateSpec` returns `(obj, changed, err)`
+(mirroring `DeletionsRequest`), and `Update` / `CreateOrUpdate` skip the wake when
 identical bytes made the write a no-op — otherwise the wake would be the only
 signal claiming something happened, and a controller re-applying its own kind's
 spec each pass would spin.
