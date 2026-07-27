@@ -273,10 +273,12 @@ func TestRunGCSweeperTicks(t *testing.T) {
 type countingChangeStreamStore struct {
 	fakeStore
 	subscriptions atomic.Int64
+	subscribed    *signal
 }
 
 func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	s.subscriptions.Add(1)
+	s.subscribed.fire()
 	return deadSubscription[[]storeapi.ObjectWrite](), 0, nil
 }
 
@@ -285,7 +287,7 @@ func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*Obj
 // point: a per-kind stream can only ever see the kinds that have controllers,
 // which is exactly the set a dependency target need not belong to.
 func TestStartSubscribesOneChangeStream(t *testing.T) {
-	store := &countingChangeStreamStore{}
+	store := &countingChangeStreamStore{subscribed: newSignal()}
 	bh, err := New(store)
 	require.NoError(t, err)
 	for _, kind := range []string{"Widget", "Gadget", "Gizmo"} {
@@ -295,7 +297,9 @@ func TestStartSubscribesOneChangeStream(t *testing.T) {
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	defer stop(context.Background())
+	// The waker subscribes on its own goroutine now, so await it rather than racing it.
+	store.subscribed.wait(t, "the waker to subscribe")
+	require.NoError(t, stop(context.Background()))
 
 	assert.Equal(t, int64(1), store.subscriptions.Load(), "one stream for the whole store, not one per kind")
 }
@@ -306,7 +310,7 @@ func TestStartSubscribesOneChangeStream(t *testing.T) {
 // costs a edges query per change in the whole store, on the single connection
 // every writer shares.
 func TestStartWithNoControllersSkipsWaker(t *testing.T) {
-	store := &countingChangeStreamStore{}
+	store := &countingChangeStreamStore{subscribed: newSignal()}
 	bh, err := New(store)
 	require.NoError(t, err)
 

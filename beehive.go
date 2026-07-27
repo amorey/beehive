@@ -314,10 +314,28 @@ type waker struct {
 	// watermark is the highest resource_version this waker has consumed. It is the
 	// resume point for a recovery: the store-wide cursor is globally monotonic and
 	// never reused, so "everything above this" names exactly what was missed. Owned
-	// by the waker goroutine — seeded by start before it launches, advanced by
-	// wakeDependents — so it needs no synchronisation.
+	// by the waker goroutine — seeded by serve, advanced by wakeDependents — so it
+	// needs no synchronisation.
 	watermark int64
+
+	// wait replaces the retry delay when set. The recovery loop is the only thing
+	// standing between a dropped subscription and a control plane that has silently
+	// stopped honouring depends_on, so tests have to drive it — and they must do that
+	// without waiting on a real interval, which would be the sleep-paced test the
+	// conventions rule out.
+	wait func(ctx context.Context, d time.Duration) bool
 }
+
+const (
+	// wakerRetryBase is the first resubscribe delay; wakerRetryCap bounds every
+	// later one. The ceiling is on the interval and never on the number of attempts:
+	// a waker that gave up is the dead waker this recovery exists to kill, reached by
+	// a slower route. A store unhappy enough to fail a subscription will fail the
+	// next one too, and a tight loop against its single connection makes the outage
+	// worse.
+	wakerRetryBase = 100 * time.Millisecond
+	wakerRetryCap  = 30 * time.Second
+)
 
 // start launches the single waker over one store-wide change
 // stream. Driving requeues off change-events (which the store suppresses for
@@ -339,26 +357,85 @@ func (dw *waker) start(runCtx context.Context) {
 	if len(dw.bh.order) == 0 {
 		return
 	}
-	w, cursor, err := dw.bh.store.ObjectWritesSubscribe(runCtx)
-	if err != nil {
-		// A waker that never starts is a dead waker: no change anywhere in the store
-		// will wake a dependent for the life of the process — every kind's, not one
-		// kind's, since this is the process's only stream. This used to claim the
-		// resync covered it, which was never true — a settled dependent is exactly
-		// what an owed-work tick cannot see — so escalate to make it true, and report
-		// which situation the operator is actually in.
-		dw.bh.resyncKindsEveryTick()
-		msg := "dependency waker subscription failed; no dependency wakes will be delivered for any kind, so escalating every periodic pass to a full resync to converge dependents"
-		if !dw.bh.hasPeriodicPass() {
-			msg = "dependency waker subscription failed and there is no periodic pass to fall back on; no dependency wakes will be delivered for any kind — drive them with Client.Requeue"
+	dw.bh.wg.Go(func() { dw.serve(runCtx) })
+}
+
+// serve keeps a subscription alive for the life of the control plane, replaying
+// whatever each gap swallowed. It is the driver the watermark needs: a cursor says
+// where to resume, but something has to still be running to decide to. Nothing was
+// before — a failed subscribe returned, and a closed stream ended the loop — so
+// both losses were permanent, repaired only by escalating a periodic pass that at
+// the default configuration may not exist.
+//
+// The first subscription seeds the watermark from its own cursor: nothing has been
+// missed yet, and the reconciler's startup pass covers what already exists. Every
+// later one replays from the watermark instead and ignores the cursor it is handed,
+// which is the point of holding one. A first attempt that failed leaves the
+// watermark at zero, so the eventual replay covers everything — expensive, but it
+// is the one case where writes really could have been missed before any cursor was
+// known.
+func (dw *waker) serve(ctx context.Context) {
+	var attempt int
+	// resume distinguishes the first subscription, which has missed nothing and can
+	// simply take its cursor, from every later one, which has a gap below it and must
+	// replay instead. A failed first attempt sets it too: writes really could have
+	// been missed before any cursor was known, so the eventual replay starts at zero.
+	var resume bool
+	for ctx.Err() == nil {
+		w, cursor, err := dw.bh.store.ObjectWritesSubscribe(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return // shutdown, not a loss
+			}
+			// Every change in the store is reaching no dependent while this holds, for
+			// every kind — this is the process's only stream.
+			dw.bh.log().WarnContext(ctx, "dependency waker subscription failed; retrying, and dependency wakes are not being delivered for any kind until it succeeds",
+				"attempt", attempt+1, "err", err)
+			resume = true
+			if !dw.backoff(ctx, attempt) {
+				return
+			}
+			attempt++
+			continue
 		}
-		dw.bh.logger.Warn(msg, "err", err)
-		return
+		if resume {
+			dw.replay(ctx)
+		} else {
+			dw.watermark = cursor
+		}
+		resume = true
+		if dw.run(ctx, w) {
+			attempt = 0 // the stream did deliver: this is a fresh outage, not a run of them
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		// The stream ended on its own. Back off before resubscribing for the same
+		// reason a failed subscribe does: a store that closes streams as fast as it
+		// hands them out would otherwise spin against its single connection.
+		if !dw.backoff(ctx, attempt) {
+			return
+		}
+		attempt++
 	}
-	// Seeded before the goroutine launches, so the field is written by the caller
-	// and read by the waker with the Go call between them.
-	dw.watermark = cursor
-	dw.bh.wg.Go(func() { dw.run(runCtx, w) })
+}
+
+// backoff waits before the next resubscribe attempt, reporting false if the
+// control plane went away first. The delay doubles to wakerRetryCap and stays
+// there; the caller keeps trying regardless of how many attempts that takes.
+func (dw *waker) backoff(ctx context.Context, attempt int) bool {
+	d := min(wakerRetryBase<<min(attempt, 16), wakerRetryCap)
+	if dw.wait != nil {
+		return dw.wait(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // replayPageCap bounds one replay page. Sized like the live stream's batch cap so
@@ -405,12 +482,13 @@ func (dw *waker) replay(ctx context.Context) bool {
 // covers existing objects), and it arrives in batches — a burst of changes costs
 // one edges query rather than one per change. The ctx.Done() arm is needed
 // because a watcher's channel may never close on its own.
-func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
+func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 	defer w.Close()
+	delivered := false
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return delivered
 		case batch, ok := <-w.Changes():
 			if !ok {
 				// Stop closes the stream by cancelling this same ctx, so on shutdown
@@ -419,7 +497,7 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 				// of a control plane that is going away, on a stream that ended
 				// normally.
 				if ctx.Err() != nil {
-					return
+					return delivered
 				}
 				// The stream ended without the control plane stopping (that arrives on
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
@@ -427,8 +505,9 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 				// now reaches no dependent at all.
 				dw.bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for every kind for the life of the process; escalating every catchup tick to a full resync pass")
 				dw.bh.resyncKindsEveryTick()
-				return
+				return delivered
 			}
+			delivered = true
 			if !dw.wakeDependents(ctx, batch) {
 				// The batch was dropped and the watermark still points below it, so the
 				// changes are recoverable by re-reading them. Retry before consuming
