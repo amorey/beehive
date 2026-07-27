@@ -632,5 +632,11 @@ type Store interface {
 	// ObjectWritesSubscribe returns a subscription to live writes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.
-	ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, error)
+	//
+	// The int64 is the cursor the stream starts from: every write committed before
+	// the call is at or below it, and every write the stream delivers is above it.
+	// Returned here rather than as a separate read so the two cannot be ordered
+	// wrongly — a cursor read before the subscription exists would leave a window
+	// whose writes reach neither.
+	ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, int64, error)
 }

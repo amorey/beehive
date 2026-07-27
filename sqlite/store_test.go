@@ -1355,7 +1355,7 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, childB, owner, beehive.RelationOwnedBy))
 
 	// Watch live changes only (no snapshot) so each cascade's events are isolated.
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 

@@ -230,8 +230,8 @@ func (s *fakeStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*Objects
 func (s *fakeStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
 	return deadSubscription[storeapi.RawObjectChange](), nil
 }
-func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
-	return deadSubscription[[]storeapi.ObjectWrite](), nil
+func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
+	return deadSubscription[[]storeapi.ObjectWrite](), 0, nil
 }
 func (s *fakeStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
 	panic("not implemented: fakeStore.EventsWatch")
@@ -250,7 +250,10 @@ type watcherStore struct {
 	fakeStore
 	w      *fakeObjectStream
 	writes *fakeWriteStream // served by ObjectWritesSubscribe, for the dependency waker
-	err    error
+	// writesCursor is the starting cursor ObjectWritesSubscribe reports, for tests
+	// that drive the waker's resume position.
+	writesCursor int64
+	err          error
 }
 
 func (s *watcherStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
@@ -265,11 +268,11 @@ func (s *watcherStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSub
 	}
 	return s.w.sub, nil
 }
-func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	if s.err != nil {
-		return nil, s.err
+		return nil, 0, s.err
 	}
-	return s.writes.sub, nil
+	return s.writes.sub, s.writesCursor, nil
 }
 
 // fakeStream is the shared body of the controllable subscription doubles: an

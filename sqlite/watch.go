@@ -374,11 +374,25 @@ const writeBatchCap = 64
 // current write position and everything it sees is genuinely post-subscribe —
 // and the hub's own writeSignalMerge both conflates and annihilates, so no
 // per-receiver merge is needed.
-func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.ObjectWritesSubscription, error) {
+//
+// It also returns the cursor the stream starts from, for a consumer that resumes
+// from a watermark rather than re-deriving state. Returning it here rather than
+// exposing a separate cursor read is what makes the ordering unrepresentable: the
+// receiver is registered first, so a write landing between the two is either already
+// in the receiver or above the returned value. The reverse order would leave a
+// window whose writes reach neither, which is the same hazard snapshotAt's
+// same-transaction read exists to close for the per-kind streams.
+func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.ObjectWritesSubscription, int64, error) {
 	if s.isClosed() {
-		return nil, errStoreClosed
+		return nil, 0, errStoreClosed
 	}
 	rx := s.writeHub.Receiver()
+
+	cursor, err := currentResourceVersion(ctx, s.conn(ctx))
+	if err != nil {
+		rx.Close()
+		return nil, 0, err
+	}
 
 	wctx, cancel := context.WithCancel(ctx)
 	w := newStream[[]storeapi.ObjectWrite](cancel)
@@ -416,7 +430,7 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 			}
 		}
 	}()
-	return w.subscription(), nil
+	return w.subscription(), cursor, nil
 }
 
 func (s *sqliteStore) ObjectsWatch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.ObjectsSubscription, error) {

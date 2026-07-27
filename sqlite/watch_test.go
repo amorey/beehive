@@ -1063,7 +1063,7 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1129,7 +1129,7 @@ func TestObjectWritesSubscribeStreamsLiveChanges(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1137,6 +1137,33 @@ func TestObjectWritesSubscribeStreamsLiveChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
 		{ID: created.ID, Type: beehive.Added, ResourceVersion: created.ResourceVersion},
+	}, recvBatch(t, w))
+}
+
+// TestObjectWritesSubscribeReturnsStartingCursor verifies subscribing hands back the
+// cursor the stream starts from, so a consumer never has to read it separately. The
+// two bounds together are the contract: the cursor covers every write committed
+// before the call, and every write after it arrives strictly above the cursor. A
+// separate read could span a write belonging to neither, which is why this is a
+// return value and not a rule.
+func TestObjectWritesSubscribeReturnsStartingCursor(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	before, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, cursor, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+	assert.GreaterOrEqual(t, cursor, before.ResourceVersion,
+		"the cursor covers writes the stream will not replay")
+
+	after, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+	assert.Greater(t, after.ResourceVersion, cursor, "a later write is strictly above the cursor")
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: after.ID, Type: beehive.Added, ResourceVersion: after.ResourceVersion},
 	}, recvBatch(t, w))
 }
 
@@ -1148,7 +1175,7 @@ func TestObjectWritesSubscribeCarriesResourceVersion(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1166,7 +1193,7 @@ func TestObjectWritesSubscribeSpansKinds(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1194,7 +1221,7 @@ func TestObjectWritesSubscribeSkipsSnapshot(t *testing.T) {
 	pre, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 	assertNoBatch(t, w, 200*time.Millisecond)
@@ -1219,7 +1246,7 @@ func newParkedObjectChangeStream(t *testing.T, store *sqliteStore) *storeapi.Obj
 	parkedTx, parkedRx := oneshot.New[struct{}]()
 	store.beforeLiveSend = func() { _ = parkedTx.Send(struct{}{}) }
 
-	w, err := store.ObjectWritesSubscribe(context.Background())
+	w, _, err := store.ObjectWritesSubscribe(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
@@ -1331,7 +1358,7 @@ func TestObjectWritesSubscribeOnClosedStore(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.Close())
 
-	_, err = store.ObjectWritesSubscribe(context.Background())
+	_, _, err = store.ObjectWritesSubscribe(context.Background())
 	assert.ErrorIs(t, err, errStoreClosed)
 }
 
@@ -1343,7 +1370,7 @@ func TestObjectWritesSubscribeClosesOnStoreClose(t *testing.T) {
 		store, err := OpenMemory()
 		require.NoError(t, err)
 
-		w, err := store.ObjectWritesSubscribe(context.Background())
+		w, _, err := store.ObjectWritesSubscribe(context.Background())
 		require.NoError(t, err)
 
 		require.NoError(t, store.Close())
@@ -1374,7 +1401,7 @@ func TestObjectWritesSubscribeClosesOnCancel(t *testing.T) {
 	store := newRawStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 
 	cancel()

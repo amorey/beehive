@@ -275,9 +275,9 @@ type countingChangeStreamStore struct {
 	subscriptions atomic.Int64
 }
 
-func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	s.subscriptions.Add(1)
-	return deadSubscription[[]storeapi.ObjectWrite](), nil
+	return deadSubscription[[]storeapi.ObjectWrite](), 0, nil
 }
 
 // TestStartSubscribesOneChangeStream verifies the waker rides a single

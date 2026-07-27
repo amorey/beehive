@@ -321,7 +321,7 @@ func (bh *Beehive) dependencyWakerStart(runCtx context.Context) {
 	if len(bh.order) == 0 {
 		return
 	}
-	w, err := bh.store.ObjectWritesSubscribe(runCtx)
+	w, _, err := bh.store.ObjectWritesSubscribe(runCtx)
 	if err != nil {
 		// A waker that never starts is a dead waker: no change anywhere in the store
 		// will wake a dependent for the life of the process — every kind's, not one
