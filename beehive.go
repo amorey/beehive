@@ -287,6 +287,10 @@ type waker struct {
 	// for it to step over.
 	seen int64
 
+	// now replaces the clock when set, so a test can decide how long a stream
+	// appeared to last without one actually lasting that long.
+	now func() time.Time
+
 	// waitRetry replaces the retry delay when set. The recovery loop is the only thing
 	// standing between a dropped subscription and a control plane that has silently
 	// stopped honouring depends_on, so tests have to drive it — and they must do that
@@ -411,11 +415,18 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 				}
 			}
 			seeded = true
-			if dw.run(ctx, w) {
-				// Reset only when the stream actually got work through. A stream that
-				// delivers one batch and closes, over and over, is a run of outages, not
-				// a fresh one each time — resetting on mere delivery would pin it at the
-				// backoff floor.
+			started := dw.clock()
+			dw.run(ctx, w)
+			// Reset only when the stream outlived the pause we would have taken for it.
+			// "It delivered something" is not that test: a store handing out a
+			// subscription, sending one batch and closing it again would satisfy it every
+			// round, hold attempt at zero, and loop at the 100ms floor — a subscribe, a
+			// replay and an edges query ten times a second on the connection every writer
+			// shares, which is the hammering the backoff exists to stop. Duration says
+			// what progress cannot: a stream that ran longer than the retry it would have
+			// cost was a working stream, however quiet, and one that did not was a flap,
+			// however busy.
+			if dw.clock().Sub(started) > retryDelay(attempt) {
 				attempt = 0
 			}
 			if ctx.Err() != nil {
@@ -435,12 +446,25 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 // backoff waits before the next resubscribe attempt, reporting false if the
 // control plane went away first. The delay doubles to wakerRetryCap and stays
 // there; the caller keeps trying regardless of how many attempts that takes.
+// clock reads the waker's notion of now, which tests replace.
+func (dw *waker) clock() time.Time {
+	if dw.now != nil {
+		return dw.now()
+	}
+	return time.Now()
+}
+
+// retryDelay is the pause before retry number attempt, doubling to wakerRetryCap.
+//
+// The inner min is an overflow guard, not a second cap: attempt is unbounded (the
+// loop never gives up), and shifting past 63 wraps to a negative duration, which a
+// timer fires immediately — turning the backoff into the spin it exists to prevent.
+func retryDelay(attempt int) time.Duration {
+	return min(wakerRetryBase<<min(attempt, 16), wakerRetryCap)
+}
+
 func (dw *waker) backoff(ctx context.Context, attempt int) bool {
-	// The inner min is an overflow guard, not a second cap: attempt is unbounded
-	// (the loop never gives up), and shifting past 63 wraps to a negative duration,
-	// which a timer fires immediately — turning the backoff into the spin it exists
-	// to prevent.
-	d := min(wakerRetryBase<<min(attempt, 16), wakerRetryCap)
+	d := retryDelay(attempt)
 	if dw.waitRetry != nil {
 		return dw.waitRetry(ctx, d)
 	}
@@ -501,23 +525,19 @@ func (dw *waker) replay(ctx context.Context) bool {
 	}
 }
 
-// run consumes one subscription until ctx is cancelled or the stream ends,
-// reporting whether it got any work through — which is what tells serve a fresh
-// outage from a run of them.
-//
-// It requeues dependents when a target changes, until ctx is
+// run consumes one subscription until ctx is cancelled or the stream ends. It
+// requeues dependents when a target changes, until ctx is
 // cancelled or the stream ends. The stream is store-wide and established by
 // Start (events-only, no snapshot: the reconciler's own startup pass already
 // covers existing objects), and it arrives in batches — a burst of changes costs
 // one edges query rather than one per change. The ctx.Done() arm is needed
 // because a watcher's channel may never close on its own.
-func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
+func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 	defer w.Close()
-	progressed := false
 	for {
 		select {
 		case <-ctx.Done():
-			return progressed
+			return
 		case batch, ok := <-w.Changes():
 			if !ok {
 				// Stop closes the stream by cancelling this same ctx, so on shutdown
@@ -526,14 +546,14 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 				// of a control plane that is going away, on a stream that ended
 				// normally.
 				if ctx.Err() != nil {
-					return progressed
+					return
 				}
 				// The stream ended without the control plane stopping (that arrives on
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
 				// the process's only change stream, so until it is back no change of any
 				// kind reaches a dependent.
 				dw.bh.log().Warn("dependency waker change stream ended for every kind; resubscribing and replaying the changes it missed")
-				return progressed
+				return
 			}
 			// A batch shorter than the cap means the drain ended on an empty receiver,
 			// so everything published so far has reached us and the highest version
@@ -543,9 +563,7 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 			if len(batch) < writeBatchCap {
 				commit = commitDrained
 			}
-			if dw.dependentsWake(ctx, batch, commit) {
-				progressed = true
-			} else {
+			if !dw.dependentsWake(ctx, batch, commit) {
 				// The batch was dropped and the watermark still points below it, so the
 				// changes are recoverable by re-reading them. Keep replaying until one
 				// gets through, before consuming anything further: taking the next batch
@@ -560,10 +578,9 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 				// connection that is already struggling.
 				for attempt := 0; !dw.replay(ctx); attempt++ {
 					if !dw.backoff(ctx, attempt) {
-						return progressed
+						return
 					}
 				}
-				progressed = true
 			}
 		}
 	}

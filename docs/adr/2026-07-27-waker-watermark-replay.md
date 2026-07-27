@@ -88,6 +88,14 @@ A waker that gave up is the dead waker this replaces, reached by a slower route.
 goes through an injectable seam because the retry loop is now the only recovery path, so
 tests must drive it — and must do so without waiting on a real interval.
 
+The counter resets on **duration, not on progress**: a stream resets the backoff only if
+it outlived the pause that round would have cost. "It delivered something" cannot be the
+test — a store that hands out a subscription, sends one batch and closes it again
+satisfies that every round, holding the delay at its floor and resubscribing ten times a
+second on the connection every writer shares. Duration says what progress cannot: a
+stream that ran longer than the retry it would have cost was a working stream, however
+quiet, and one that did not was a flap, however busy.
+
 ## Consequences
 
 Three properties this rests on, each asserted rather than assumed:

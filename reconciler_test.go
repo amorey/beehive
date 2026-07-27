@@ -1094,7 +1094,15 @@ func (s *recoveringStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []Ob
 // for tests that assert on what the waker reports.
 func recoveringFixtureLogged(t *testing.T, failures int64, logger *slog.Logger) (*recoveringStore, *reconciler, func()) {
 	t.Helper()
-	return recoveringFixtureWith(t, failures, logger)
+	return recoveringFixtureWith(t, failures, logger, nil)
+}
+
+// recoveringFixtureTuned is recoveringFixture with the waker's seams set *before* it
+// starts. They cannot be assigned afterwards: the waker reads them on its own
+// goroutine from the moment start returns.
+func recoveringFixtureTuned(t *testing.T, failures int64, configure func(*waker)) (*recoveringStore, *reconciler, func()) {
+	t.Helper()
+	return recoveringFixtureWith(t, failures, nil, configure)
 }
 
 // recoveringFixture wires a started waker over a store that can fail subscriptions
@@ -1102,10 +1110,10 @@ func recoveringFixtureLogged(t *testing.T, failures int64, logger *slog.Logger) 
 // interval. The dependency is fixed: object 7 is the target, 8 its dependent.
 func recoveringFixture(t *testing.T, failures int64) (*recoveringStore, *reconciler, func()) {
 	t.Helper()
-	return recoveringFixtureWith(t, failures, nil)
+	return recoveringFixtureWith(t, failures, nil, nil)
 }
 
-func recoveringFixtureWith(t *testing.T, failures int64, logger *slog.Logger) (*recoveringStore, *reconciler, func()) {
+func recoveringFixtureWith(t *testing.T, failures int64, logger *slog.Logger, configure func(*waker)) (*recoveringStore, *reconciler, func()) {
 	t.Helper()
 	gk := GroupKind{Kind: "Widget"}
 	store := &recoveringStore{
@@ -1126,6 +1134,9 @@ func recoveringFixtureWith(t *testing.T, failures int64, logger *slog.Logger) (*
 	ctx, cancel := context.WithCancel(context.Background())
 	dw := wakerOf(bh)
 	dw.waitRetry = func(context.Context, time.Duration) bool { return true }
+	if configure != nil {
+		configure(dw)
+	}
 	dw.start(ctx)
 	// Draining the waker is every caller's barrier: once it has exited, the requeues
 	// it made have landed.
@@ -1214,6 +1225,83 @@ func TestWakerRetriesFailedReplayOnResubscribe(t *testing.T) {
 	drain()
 
 	assert.Contains(t, r.work.items, ObjectID(8), "the dependent the failed replay owed")
+}
+
+// A stream that flaps — handed over, one batch, closed, repeatedly — must keep
+// backing off. Its predecessor reset the counter on "the stream delivered
+// something", which such a store satisfies every round, so the delay stayed at the
+// floor and the waker resubscribed ten times a second, each round costing a
+// subscribe, a replay and an edges query on the connection every writer shares.
+func TestWakerFlappingStreamKeepsBackingOff(t *testing.T) {
+	var mu sync.Mutex
+	var delays []time.Duration
+	enough := newSignal()
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		// A frozen clock: every stream lasts no time at all, so no round can have
+		// outlived the pause it cost.
+		dw.now = func() time.Time { return time.Unix(0, 0) }
+		dw.waitRetry = func(_ context.Context, d time.Duration) bool {
+			mu.Lock()
+			delays = append(delays, d)
+			n := len(delays)
+			mu.Unlock()
+			if n >= 6 {
+				enough.fire()
+			}
+			return true
+		}
+	})
+	defer drain()
+
+	go func() {
+		for st := range store.ready {
+			st.endStream() // handed over, then dead: the flap
+		}
+	}()
+
+	enough.wait(t, "six rounds of a flapping stream")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Greater(t, delays[5], delays[0], "a flapping stream must not hold the delay at the floor")
+}
+
+// A stream that ran longer than the pause it would have cost was a working stream,
+// however quiet it was, so the next outage starts fresh rather than inheriting a
+// history that is no longer true.
+func TestWakerHealthyStreamResetsBackoff(t *testing.T) {
+	var mu sync.Mutex
+	var delays []time.Duration
+	enough := newSignal()
+	var reads atomic.Int64
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		// The clock jumps an hour on every read, so the gap serve measures across run
+		// — two reads — always dwarfs the retry that round would have cost.
+		dw.now = func() time.Time { return time.Unix(0, 0).Add(time.Duration(reads.Add(1)) * time.Hour) }
+		dw.waitRetry = func(_ context.Context, d time.Duration) bool {
+			mu.Lock()
+			delays = append(delays, d)
+			n := len(delays)
+			mu.Unlock()
+			if n >= 4 {
+				enough.fire()
+			}
+			return true
+		}
+	})
+	defer drain()
+
+	go func() {
+		for st := range store.ready {
+			st.endStream()
+		}
+	}()
+
+	enough.wait(t, "four long-lived streams")
+	mu.Lock()
+	defer mu.Unlock()
+	for i, d := range delays {
+		assert.Equal(t, wakerRetryBase, d, "round %d inherited a history that is no longer true", i)
+	}
 }
 
 // The retry interval grows but is capped, and the loop never stops trying. An
@@ -3690,16 +3778,16 @@ func TestWakerSubscribeFailureOnShutdownIsSilent(t *testing.T) {
 // reports the cancellation, and there is nothing left to repair for a control plane
 // that is going away.
 func TestWakerReplayRetryStopsOnShutdown(t *testing.T) {
-	store, _, drain := recoveringFixture(t, 0)
+	stopping := newSignal()
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		dw.waitRetry = func(context.Context, time.Duration) bool {
+			stopping.fire()
+			return false // "the control plane went away"
+		}
+	})
 	defer drain()
 
 	store.failListings.Store(true) // every replay fails, so it can only end by shutting down
-	stopping := newSignal()
-	dw := wakerOf(store.bh)
-	dw.waitRetry = func(context.Context, time.Duration) bool {
-		stopping.fire()
-		return false // "the control plane went away"
-	}
 	store.nextStream(t).endStream()
 
 	stopping.wait(t, "the waker to reach its retry pause")
@@ -3752,20 +3840,20 @@ func TestWakerRepairsFailedLiveBatchInPlace(t *testing.T) {
 // stream-ended pause has to let it through first, so the two backoffs are told
 // apart by which one is being asked.
 func TestWakerReplayRetryOnResubscribeStopsOnShutdown(t *testing.T) {
-	store, _, drain := recoveringFixture(t, 0)
+	stopping := newSignal()
+	var pauses atomic.Int64
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		dw.waitRetry = func(context.Context, time.Duration) bool {
+			if pauses.Add(1) == 1 {
+				return true // the stream-ended pause: let it resubscribe
+			}
+			stopping.fire()
+			return false // the replay retry: the control plane is going away
+		}
+	})
 	defer drain()
 
 	store.failListings.Store(true) // every replay fails, so only shutdown ends it
-	stopping := newSignal()
-	dw := wakerOf(store.bh)
-	var pauses atomic.Int64
-	dw.waitRetry = func(context.Context, time.Duration) bool {
-		if pauses.Add(1) == 1 {
-			return true // the stream-ended pause: let it resubscribe
-		}
-		stopping.fire()
-		return false // the replay retry: the control plane is going away
-	}
 	first := store.nextStream(t)
 	first.endStream()
 	second := store.nextStream(t) // the subscription it gives up on
