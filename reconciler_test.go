@@ -32,18 +32,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// unsettledIDsStore is a fakeStore whose ListUnsettledIDs returns a fixed slice
+// unsettledIDsStore is a fakeStore whose ObjectsListUnsettledIDs returns a fixed slice
 // of IDs, used to exercise enqueueUnsettled without a real SQLite database.
 type unsettledIDsStore struct {
 	fakeStore
 	ids []ObjectID
 }
 
-func (s *unsettledIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+func (s *unsettledIDsStore) ObjectsListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
-// pendingWakeIDsStore is a fakeStore whose ListPendingWakeIDs returns a fixed
+// pendingWakeIDsStore is a fakeStore whose WakesListPendingIDs returns a fixed
 // slice, used to exercise the durable-wake backstop enqueue without a real
 // database — the sibling of unsettledIDsStore and deletionPendingIDsStore.
 type pendingWakeIDsStore struct {
@@ -51,7 +51,7 @@ type pendingWakeIDsStore struct {
 	ids []ObjectID
 }
 
-func (s *pendingWakeIDsStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *pendingWakeIDsStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
@@ -68,7 +68,7 @@ type tickOnlyPendingWakeStore struct {
 	calls int
 }
 
-func (s *tickOnlyPendingWakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *tickOnlyPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -86,10 +86,10 @@ type allIDsStore struct {
 	ids []ObjectID
 }
 
-func (s *allIDsStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+func (s *allIDsStore) ObjectsListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *allIDsStore) ListIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+func (s *allIDsStore) ObjectsListIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
@@ -281,7 +281,7 @@ func TestDependencyRequeue(t *testing.T) {
 	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
-	_, err = store.SetCondition(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = store.ConditionsSet(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	select {
@@ -295,7 +295,7 @@ func TestDependencyRequeue(t *testing.T) {
 // dependentController is the dependent in the read-then-declare repros. Every
 // pass reads the target, reports the target's Ready state as that pass saw it,
 // and settles at obj.Generation — the settle being what hides a missed wake from
-// the resync backstop, since ListUnsettledIDs then sees a converged object.
+// the resync backstop, since ObjectsListUnsettledIDs then sees a converged object.
 //
 // afterRead, when set, runs between the read and the settle. That is where the
 // in-band race lives: the controller declares the edge there, and the test parks
@@ -331,7 +331,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 		}
 	}
 	// Settling at obj.Generation is what hides a missed wake from the resync
-	// backstop: ListUnsettledIDs sees a converged object.
+	// backstop: ObjectsListUnsettledIDs sees a converged object.
 	if err := cc.UpdateStatus(ctx, c.depID, obj.Generation, tStatus{}); err != nil {
 		return Result{}, err
 	}
@@ -404,7 +404,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	// dependents — with no edge yet, that lookup comes back empty and the change
 	// is now permanently unclaimed. Only then let the declaration commit.
 	store.resetLooked()
-	_, err = store.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	store.waitLooked(t)
 	close(proceed)
@@ -485,7 +485,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// makes the window deterministic: with no edge yet it comes back empty, so the
 	// change is already unclaimed by the time AddDependency commits.
 	store.resetLooked()
-	_, err = store.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	store.waitLooked(t)
 	// target is the application's read of the target, taken before the change
@@ -570,7 +570,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// ControllerClient outlives the control plane (it holds the store, not the
 	// loops), so the declaration commits normally; what it can no longer do is
 	// reach a running queue.
-	_, err = db.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, target.ResourceVersion))
 
@@ -629,7 +629,7 @@ type blockingDepsStore struct {
 	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
 }
 
-func (s *blockingDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+func (s *blockingDepsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
 	s.entered <- struct{}{}
 	<-s.release
 	// One referrer for an unregistered kind: enough to make the waker re-enter
@@ -693,7 +693,7 @@ type recordingDepsStore struct {
 	calls chan ObjectID
 }
 
-func (s *recordingDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+func (s *recordingDepsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
 	for _, id := range toIDs {
 		s.calls <- id
 	}
@@ -757,7 +757,7 @@ type depsStore struct {
 	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *depsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+func (s *depsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
 	s.calls.Add(1)
 	s.seen = append(s.seen, slices.Clone(toIDs))
 	out := make(map[ObjectID][]Referrer, len(toIDs))
@@ -860,7 +860,7 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 // requeues the object through wakeAfterCommit, independently of any edge.
 //
 // It cannot detect a guard mis-implemented as a self-edge filter in
-// ListIncomingRefs — that path never consults refs, so this test stays green
+// RefsListIncoming — that path never consults refs, so this test stays green
 // while the read API silently loses the edge. TestClientListDependentsIncludesSelfEdge
 // is what catches that; this one only pins the wake.
 func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
@@ -906,7 +906,7 @@ func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], ob
 // errDepsStore returns an error from the refs lookup.
 type errDepsStore struct{ fakeStore }
 
-func (*errDepsStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (*errDepsStore) RefsGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
 	return nil, errBoom
 }
 
@@ -935,7 +935,7 @@ func TestDependencyWakerStreamEnd(t *testing.T) {
 
 // TestStartupEnqueuesAllNotJustUnsettled verifies that run's startup enqueue
 // reconciles every object, not only unsettled ones. A settled object (empty
-// ListUnsettledIDs) must still be reconciled at startup so a controller can
+// ObjectsListUnsettledIDs) must still be reconciled at startup so a controller can
 // re-confirm process-scoped state like liveness conditions. With resync
 // disabled, the startup enqueue is the only thing that could drive it.
 func TestStartupEnqueuesAllNotJustUnsettled(t *testing.T) {
@@ -993,7 +993,7 @@ func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tS
 }
 
 // TestSelfDrivenRecovery pins the primitives an embedder uses to drive reconciles
-// on its own schedule: Store.ListUnsettledIDs reports exactly the objects owed a
+// on its own schedule: Store.ObjectsListUnsettledIDs reports exactly the objects owed a
 // pass, and Client.Requeue dispatches one. Startup now drains owed work itself, so
 // this is no longer the *only* way such an object gets reconciled — but it stays
 // pinned as public surface, because a deployment that turns every ticker off still
@@ -1003,7 +1003,7 @@ func TestSelfDrivenRecovery(t *testing.T) {
 	store := newClientTestStore(t)
 	gk := GroupKind{Kind: "Widget"}
 
-	raw, err := store.CreateObject(ctx, &RawObject{
+	raw, err := store.ObjectsCreate(ctx, &RawObject{
 		Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1029,9 +1029,9 @@ func TestSelfDrivenRecovery(t *testing.T) {
 	}
 
 	// The embedder's own backstop, on whatever schedule it likes.
-	ids, err := store.ListUnsettledIDs(ctx, gk)
+	ids, err := store.ObjectsListUnsettledIDs(ctx, gk)
 	require.NoError(t, err)
-	require.Equal(t, []ObjectID{raw.ID}, ids, "the unconverged row is what ListUnsettledIDs reports")
+	require.Equal(t, []ObjectID{raw.ID}, ids, "the unconverged row is what ObjectsListUnsettledIDs reports")
 	require.NoError(t, client.Requeue(ctx, raw.ID))
 
 	select {
@@ -1044,7 +1044,7 @@ func TestSelfDrivenRecovery(t *testing.T) {
 
 // TestStartupResyncDisabledSkipsSettled is the unit-level twin of the
 // store-backed TestStartupResyncReconcilesSettled: allIDsStore reports the object
-// via ListIDs but not via any owed-work listing, so with the startup resync off
+// via ObjectsListIDs but not via any owed-work listing, so with the startup resync off
 // nothing enqueues it — the owed-work drain has nothing to drain.
 func TestStartupResyncDisabledSkipsSettled(t *testing.T) {
 	reconciled := make(chan ObjectID, 1)
@@ -1089,7 +1089,7 @@ func TestEnqueueNilStoreNoop(t *testing.T) {
 }
 
 // TestEnqueueUnsettledEnqueuesReturnedIDs verifies that enqueueUnsettled enqueues
-// exactly the IDs returned by ListUnsettledIDs, in order.
+// exactly the IDs returned by ObjectsListUnsettledIDs, in order.
 func TestEnqueueUnsettledEnqueuesReturnedIDs(t *testing.T) {
 	r := &reconciler{
 		store:      &unsettledIDsStore{ids: []ObjectID{42, 99}},
@@ -1112,7 +1112,7 @@ type errPendingWakeStore struct {
 	fakeStore
 }
 
-func (s *errPendingWakeStore) ListPendingWakeIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *errPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, errBoom
 }
 
@@ -1135,7 +1135,7 @@ func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
 }
 
 // TestEnqueuePendingWake verifies that enqueuePendingWake enqueues exactly the IDs
-// returned by ListPendingWakeIDs, in order — the sibling of the test above.
+// returned by WakesListPendingIDs, in order — the sibling of the test above.
 // Only its failed-list branch was covered (TestEnqueueFromListErrorSkipsPass), so
 // the helper whose whole purpose is not losing an owed wake was the one of the
 // three that could have stopped enqueuing anything without a test noticing.
@@ -1439,14 +1439,14 @@ func TestNextBackoffCaps(t *testing.T) {
 	assert.Equal(t, 50*time.Millisecond, second)
 }
 
-// listCallStore signals a channel each time ListUnsettledIDs is called, so the
+// listCallStore signals a channel each time ObjectsListUnsettledIDs is called, so the
 // test can wait for the resync tick to fire without using time.Sleep.
 type listCallStore struct {
 	fakeStore
 	callCh chan struct{}
 }
 
-func (s *listCallStore) ListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+func (s *listCallStore) ObjectsListUnsettledIDs(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	select {
 	case s.callCh <- struct{}{}:
 	default:
@@ -1517,14 +1517,14 @@ func TestRawToTypedStatusUnmarshalError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// getObjectBadSpecStore is a Store whose GetObject returns a RawObject with
+// getObjectBadSpecStore is a Store whose ObjectsGet returns a RawObject with
 // invalid spec JSON, exercising the rawToTyped error path inside
 // typedController.reconcile. Within is inherited from fakeStore (inline passthrough).
 type getObjectBadSpecStore struct {
 	fakeStore
 }
 
-func (s *getObjectBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *getObjectBadSpecStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json")}, nil
 }
 
@@ -1558,11 +1558,11 @@ type owedBadSpecStore struct {
 	decremented bool
 }
 
-func (s *owedBadSpecStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *owedBadSpecStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), PendingWake: 2}, nil
 }
 
-func (s *owedBadSpecStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+func (s *owedBadSpecStore) WakesDecrement(context.Context, ObjectID, int64) error {
 	s.decremented = true
 	return nil
 }
@@ -1603,9 +1603,9 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 
 	// Inject an undecodable row directly (a valid create can always decode), then
 	// request its deletion so the reconcile sees a deletion-pending poison row.
-	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte("not-json")})
+	raw, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte("not-json")})
 	require.NoError(t, err)
-	_, _, err = store.RequestDeletion(ctx, gk, raw.ID)
+	_, _, err = store.DeletionsRequest(ctx, gk, raw.ID)
 	require.NoError(t, err)
 
 	var called bool
@@ -1620,12 +1620,12 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	assert.Equal(t, Result{}, res)
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 
-	_, err = store.GetObject(ctx, raw.ID)
+	_, err = store.ObjectsGet(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound, "the finalizer-free deleting poison row must be collected, not stranded")
 }
 
 // undecodableDeletingCollectErrorStore returns an undecodable, deletion-pending
-// row from GetObject, and errors from GetObjectMeta so that collect (which reads
+// row from ObjectsGet, and errors from ObjectsGetMeta so that collect (which reads
 // meta first) fails. This exercises the GC-error leg of the quarantine: a poison
 // deleting row whose collect fails must surface the error for retry, not swallow
 // it as a no-op success.
@@ -1633,12 +1633,12 @@ type undecodableDeletingCollectErrorStore struct {
 	fakeStore
 }
 
-func (s *undecodableDeletingCollectErrorStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *undecodableDeletingCollectErrorStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
 	deletedAt := time.Unix(1, 0)
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), DeletionRequestedAt: &deletedAt}, nil
 }
 
-func (s *undecodableDeletingCollectErrorStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
+func (s *undecodableDeletingCollectErrorStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1659,14 +1659,14 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
 
-// getObjectErrorStore returns an error from GetObject to exercise path A in
-// typedController.reconcile (the GetObject error before rawToTyped). Within is
+// getObjectErrorStore returns an error from ObjectsGet to exercise path A in
+// typedController.reconcile (the ObjectsGet error before rawToTyped). Within is
 // inherited from fakeStore (inline passthrough).
 type getObjectErrorStore struct {
 	fakeStore
 }
 
-func (s *getObjectErrorStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
+func (s *getObjectErrorStore) ObjectsGet(_ context.Context, _ ObjectID) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1682,14 +1682,14 @@ func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// notFoundStore returns ErrNotFound from GetObject, modeling an object that was
+// notFoundStore returns ErrNotFound from ObjectsGet, modeling an object that was
 // already collected (by a prior pass, a cascade, or the backstop) between its
 // enqueue and this reconcile.
 type notFoundStore struct {
 	fakeStore
 }
 
-func (s *notFoundStore) GetObject(_ context.Context, _ ObjectID) (*RawObject, error) {
+func (s *notFoundStore) ObjectsGet(_ context.Context, _ ObjectID) (*RawObject, error) {
 	return nil, ErrNotFound
 }
 
@@ -1725,7 +1725,7 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	raw, err := s.CreateObject(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
 	require.NoError(t, err)
 
 	tc := &typedController[tSpec, tStatus]{
@@ -1756,9 +1756,9 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	raw, err := s.CreateObject(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
 	require.NoError(t, err)
-	_, _, err = s.RequestDeletion(ctx, GroupKind{Kind: "Widget"}, raw.ID)
+	_, _, err = s.DeletionsRequest(ctx, GroupKind{Kind: "Widget"}, raw.ID)
 	require.NoError(t, err)
 
 	tc := &typedController[tSpec, tStatus]{
@@ -1772,7 +1772,7 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, Result{}, result, "requeue dropped because the row was collected")
 
-	_, err = s.GetObject(ctx, raw.ID)
+	_, err = s.ObjectsGet(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -1785,7 +1785,7 @@ func TestTypedControllerReconcile(t *testing.T) {
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	raw, err := s.CreateObject(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: "Widget", Spec: specJSON})
 	require.NoError(t, err)
 
 	bh := &Beehive{store: s}
@@ -1839,7 +1839,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	raw, err := s.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
 	require.NoError(t, err)
 
 	bh := &Beehive{store: s}
@@ -1858,7 +1858,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	_, rerr := tc.reconcile(ctx, raw.ID)
 	require.ErrorIs(t, rerr, errBoom, "the reconcile error still surfaces for retry")
 
-	got, err := s.GetObject(ctx, raw.ID)
+	got, err := s.ObjectsGet(ctx, raw.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status, "the status write committed despite the reconcile error")
 	assert.NotNil(t, got.ObservedGeneration)
@@ -1870,7 +1870,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 // mutator); the returned count always reads the real store underneath it.
 // reconcilePendingWakeHarness returns the pieces the durable-wake tests need,
 // including owe: seeding an owed wake goes through the concrete store, since
-// IncrementPendingWake is deliberately absent from the Store interface (AddRef is
+// WakesIncrement is deliberately absent from the Store interface (RefsAdd is
 // production's only producer). A closure rather than the store itself because the
 // concrete type is unexported in package sqlite and so cannot be named here.
 func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
@@ -1882,7 +1882,7 @@ func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedCo
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	raw, err := s.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
 	require.NoError(t, err)
 
 	var store Store = s
@@ -1899,11 +1899,11 @@ func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedCo
 	}
 	count := func(t *testing.T) int64 {
 		t.Helper()
-		got, err := s.GetObject(ctx, raw.ID)
+		got, err := s.ObjectsGet(ctx, raw.ID)
 		require.NoError(t, err)
 		return got.PendingWake
 	}
-	owe := func() error { return s.IncrementPendingWake(ctx, raw.ID) }
+	owe := func() error { return s.WakesIncrement(ctx, raw.ID) }
 	return tc, inner, raw.ID, count, owe
 }
 
@@ -1987,15 +1987,15 @@ type failDecrementPendingWakeStore struct {
 	Store
 }
 
-func (s *failDecrementPendingWakeStore) DecrementPendingWake(context.Context, ObjectID, int64) error {
+func (s *failDecrementPendingWakeStore) WakesDecrement(context.Context, ObjectID, int64) error {
 	return errBoom
 }
 
-// TestReconcileDecrementPendingWakeErrorIsNonFatal pins that a failed decrement does
+// TestReconcileWakesDecrementErrorIsNonFatal pins that a failed decrement does
 // not fail the reconcile: the count stays up and the backstop re-enqueues (a
 // harmless extra pass), so shadowing the successful reconcile with the decrement
 // error would be strictly worse.
-func TestReconcileDecrementPendingWakeErrorIsNonFatal(t *testing.T) {
+func TestReconcileWakesDecrementErrorIsNonFatal(t *testing.T) {
 	ctx := context.Background()
 	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, func(s Store) Store {
 		return &failDecrementPendingWakeStore{Store: s}
@@ -2024,11 +2024,11 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	raw, err := s.CreateObject(ctx, &RawObject{
+	raw, err := s.ObjectsCreate(ctx, &RawObject{
 		Kind: clientTestGK.Kind, Spec: specJSON, Finalizers: []string{"f"},
 	})
 	require.NoError(t, err)
-	_, _, err = s.RequestDeletion(ctx, clientTestGK, raw.ID)
+	_, _, err = s.DeletionsRequest(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	bh := &Beehive{store: s}
@@ -2046,7 +2046,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 
 	_, _ = tc.reconcile(ctx, raw.ID)
 
-	_, err = s.GetObject(ctx, raw.ID)
+	_, err = s.ObjectsGet(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound,
 		"the committed finalizer clear must let GC collect the row even though reconcile errored")
 }
@@ -2483,7 +2483,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	// Insert an object before beehive starts (simulating a previous process run).
 	specJSON, err := json.Marshal(cSpec{Val: "pre-existing"})
 	require.NoError(t, err)
-	_, err = store.CreateObject(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	_, err = store.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
 	require.NoError(t, err)
 
 	bh, err := New(store, WithResyncInterval(0))
@@ -2550,12 +2550,12 @@ func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
 }
 
 // wakeStampingStore is the store surface a catchup test needs: the Store contract
-// plus IncrementPendingWake, which is deliberately not on Store (see the comment
+// plus WakesIncrement, which is deliberately not on Store (see the comment
 // on reconcilePendingWakeHarness) but exists on the concrete sqlite store so a
 // test can seed an owed wake without staging the whole declare race.
 type wakeStampingStore interface {
 	Store
-	IncrementPendingWake(context.Context, ObjectID) error
+	WakesIncrement(context.Context, ObjectID) error
 }
 
 // newCatchupHarness starts a control plane whose only periodic driver is the
@@ -2617,7 +2617,7 @@ func TestCatchupTickDispatchesOwedWork(t *testing.T) {
 
 	// An object a prior process left unconverged: written straight through the
 	// store, so observed_generation is NULL and nothing has dispatched it.
-	raw, err := real.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	raw, err := real.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 	require.NoError(t, err)
 
 	select {
@@ -2641,16 +2641,16 @@ func TestCatchupTickDispatchesOwedWake(t *testing.T) {
 	// be what dispatches it.
 	var id ObjectID
 	real, reconciled := newCatchupHarness(t, gk, func(s wakeStampingStore) {
-		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		raw, err := s.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		_, err = s.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		_, err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
 		id = raw.ID
 	})
 
 	// Now owed a wake, the way a crash between a target's commit and the
 	// dependent's dispatch leaves it.
-	require.NoError(t, real.IncrementPendingWake(ctx, id))
+	require.NoError(t, real.WakesIncrement(ctx, id))
 
 	select {
 	case got := <-reconciled:
@@ -2674,11 +2674,11 @@ func newSettledHarness(t *testing.T, opts ...Option) (ObjectID, <-chan ObjectID)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Close() })
 
-	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	raw, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	// Settled before Start: observed_generation == generation, so it is owed
 	// nothing and no catchup listing will ever return it.
-	_, err = store.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+	_, err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 
 	reconciled := make(chan ObjectID, 4)
@@ -2771,7 +2771,7 @@ func TestStartupAlwaysDrainsOwedWork(t *testing.T) {
 	var unsettled ObjectID
 	got := newStartupHarness(t, func(s Store, gk GroupKind) {
 		// Unconverged: observed_generation NULL, as a crash mid-reconcile leaves it.
-		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		raw, err := s.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 		require.NoError(t, err)
 		unsettled = raw.ID
 	}, WithStartupResync(false))
@@ -2787,9 +2787,9 @@ func TestStartupResyncReconcilesSettled(t *testing.T) {
 	ctx := context.Background()
 	var settled ObjectID
 	seed := func(s Store, gk GroupKind) {
-		raw, err := s.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+		raw, err := s.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		_, err = s.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		_, err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
 		settled = raw.ID
 	}
@@ -2977,7 +2977,7 @@ type errListIDsStore struct {
 	calls chan struct{}
 }
 
-func (s *errListIDsStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *errListIDsStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	// Non-blocking: the ticker keeps firing, so a report the test isn't waiting
 	// for is dropped rather than parking run's loop past cancellation.
 	select {
@@ -2990,7 +2990,7 @@ func (s *errListIDsStore) ListIDs(context.Context, GroupKind) ([]ObjectID, error
 // TestFailedEscalatedPassRearmsOneShot pins the other half of the one-shot's
 // contract: it is spent on a full pass that *ran*, not merely on one that was
 // attempted. tickResyncs consumes the flag before the listing, so a transient
-// ListIDs failure used to swallow the repair permanently — and with resync off by
+// ObjectsListIDs failure used to swallow the repair permanently — and with resync off by
 // default nothing else reaches the settled dependents a dropped wake stranded.
 func TestFailedEscalatedPassRearmsOneShot(t *testing.T) {
 	store := &errListIDsStore{calls: make(chan struct{}, 1)}
@@ -3112,9 +3112,9 @@ func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
 	store, err := sqlite.OpenMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Close() })
-	raw, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	raw, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 	require.NoError(t, err)
-	_, err = store.UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+	_, err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 
 	reconciled := make(chan ObjectID, 4)
@@ -3305,7 +3305,7 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	awaitReconcile(t, reconciled, dep.ID, "the dependent's creation reconcile did not run")
 	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
-	_, err = store.SetCondition(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	awaitReconcile(t, reconciled, dep.ID,
@@ -3332,7 +3332,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
-	_, err = store.SetCondition(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	awaitReconcile(t, reconciled, dep.ID,
@@ -3367,10 +3367,10 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
-	require.NoError(t, store.DeleteRef(ctx, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, store.RefsDelete(ctx, dep.ID, target.ID, RelationDependsOn))
 	_, err = bh.collect(ctx, target.ID)
 	require.NoError(t, err)
-	_, err = store.GetObject(ctx, target.ID)
+	_, err = store.ObjectsGet(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")
 }
 

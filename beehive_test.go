@@ -35,10 +35,10 @@ func TestSweepEventRetention(t *testing.T) {
 	ctx := context.Background()
 
 	gk := GroupKind{Kind: "Widget"}
-	obj, err := store.CreateObject(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
+	obj, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	for _, r := range []string{"R1", "R2", "R3", "R4"} {
-		_, err := store.RecordEvent(ctx, gk, obj.ID, RawEvent{Category: "c", Type: "Normal", Reason: r})
+		_, err := store.EventsRecord(ctx, gk, obj.ID, RawEvent{Category: "c", Type: "Normal", Reason: r})
 		require.NoError(t, err)
 	}
 
@@ -46,7 +46,7 @@ func TestSweepEventRetention(t *testing.T) {
 		bh, err := New(store)
 		require.NoError(t, err)
 		bh.sweepEventRetention(ctx)
-		got, err := store.ListEvents(ctx, obj.ID, storeapi.EventQuery{})
+		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 4)
 	})
@@ -54,14 +54,14 @@ func TestSweepEventRetention(t *testing.T) {
 	t.Run("store error is logged, not fatal", func(t *testing.T) {
 		bad, err := New(eventErrStore{newClientTestStore(t)}, WithEventRetention(2, time.Hour))
 		require.NoError(t, err)
-		bad.sweepEventRetention(ctx) // SweepEvents errors → warn branch, must not panic
+		bad.sweepEventRetention(ctx) // EventsSweep errors → warn branch, must not panic
 	})
 
 	t.Run("caps per object", func(t *testing.T) {
 		bh, err := New(store, WithEventRetention(2, 0))
 		require.NoError(t, err)
 		bh.sweepEventRetention(ctx)
-		got, err := store.ListEvents(ctx, obj.ID, storeapi.EventQuery{})
+		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
 	})

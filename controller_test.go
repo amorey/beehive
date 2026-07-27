@@ -70,14 +70,14 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		require.NoError(t, err)
 
 		// Spec write (Create) stamped the spec version; status untouched (still 0).
-		raw, err := store.GetObject(ctx, obj.ID)
+		raw, err := store.ObjectsGet(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "Create stamps the migrator's spec version")
 		assert.Equal(t, 0, raw.StatusVersion, "no status written yet")
 
 		// Controller status write stamps the status version, spec unchanged.
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
-		raw, err = store.GetObject(ctx, obj.ID)
+		raw, err = store.ObjectsGet(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "status write must not touch spec version")
 		assert.Equal(t, 9, raw.StatusVersion, "UpdateStatus stamps the migrator's status version")
@@ -96,7 +96,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-		raw, err := store.GetObject(ctx, obj.ID)
+		raw, err := store.ObjectsGet(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Zero(t, raw.SpecVersion, "no migrator => spec version stays 0")
 		assert.Zero(t, raw.StatusVersion, "no migrator => status version stays 0")
@@ -237,7 +237,7 @@ func TestControllerClientRecordEvent(t *testing.T) {
 		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
 	}))
 
-	run, err := bh.store.GetLatestEvent(ctx, obj.ID, "connection")
+	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "connection")
 	require.NoError(t, err)
 	require.NotNil(t, run)
 	assert.Equal(t, "Warning", run.Type)
@@ -298,7 +298,7 @@ func TestControllerClientRecordEventWithinRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, sentinel)
 
-	run, err := bh.store.GetLatestEvent(ctx, obj.ID, "c")
+	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "c")
 	require.NoError(t, err)
 	assert.Nil(t, run, "a RecordEvent inside a rolled-back Within must not persist")
 }
@@ -349,12 +349,12 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, cc.AddDependency(ctx, from.ID, to.ID, to.ResourceVersion))
-	deps, err := bh.store.ListIncomingRefs(ctx, to.ID, RelationDependsOn)
+	deps, err := bh.store.RefsListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []Referrer{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
 	require.NoError(t, cc.DeleteDependency(ctx, from.ID, to.ID))
-	deps, err = bh.store.ListIncomingRefs(ctx, to.ID, RelationDependsOn)
+	deps, err = bh.store.RefsListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
@@ -374,14 +374,14 @@ func (s *addRefTxTrackingStore) Within(ctx context.Context, fn func(context.Cont
 	return s.Store.Within(ctx, fn)
 }
 
-func (s *addRefTxTrackingStore) AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.AddRefResult, error) {
+func (s *addRefTxTrackingStore) RefsAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.RefsAddResult, error) {
 	s.addRefInTx = s.depth > 0
-	return s.Store.AddRef(ctx, fromID, toID, relation, targetRV)
+	return s.Store.RefsAdd(ctx, fromID, toID, relation, targetRV)
 }
 
 // TestControllerClientAddDependencyIsTransactional pins that AddDependency runs its
 // endpoint existence check and the ref insert in one transaction (like
-// DeleteDependency). AddRef checks then inserts as separate statements, so without
+// DeleteDependency). RefsAdd checks then inserts as separate statements, so without
 // the transaction a delete interleaving between them would leak a raw FK error
 // instead of the store's ErrNotFound contract.
 func TestControllerClientAddDependencyIsTransactional(t *testing.T) {
@@ -454,7 +454,7 @@ type declareFixture struct {
 	// change: the waker requeues from its own lookup's results, so the witness
 	// reconciling is an effect that cannot precede that lookup — and it proves dep
 	// was absent from it. Watching the lookup itself cannot show that; a probe on
-	// ListIncomingRefs sees a call, not which change it is for, so one already in
+	// RefsListIncoming sees a call, not which change it is for, so one already in
 	// flight is indistinguishable from the one under test.
 	witness    *Object[tSpec, tStatus]
 	reconciled chan *Object[tSpec, tStatus] // dep's kind only
@@ -515,7 +515,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 func (f *declareFixture) moveTarget(t *testing.T) int64 {
 	t.Helper()
 	before := f.target.ResourceVersion
-	_, err := f.store.SetCondition(context.Background(), f.targetGK, f.target.ID,
+	_, err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	require.Equal(t, f.witness.ID, recv(t, f.reconciled).ID,
@@ -587,7 +587,7 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 	err := f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1)
 	require.ErrorIs(t, err, ErrTargetResourceVersionFuture)
 
-	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.RefsListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration leaves no edge")
 	f.requireNotRequeued(t)
@@ -596,7 +596,7 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 	require.NoError(t, f.cc.AddDependency(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
 }
 
-// TestAddDependencyStampRidesAddRef pins that the durable stamp is not a second
+// TestAddDependencyStampRidesRefsAdd pins that the durable stamp is not a second
 // store call sequenced after the edge. Were it one, a caller nested in its own
 // Within could handle this method's error and commit the edge with no wake — a
 // dependent stranded on a stale read, the very race the version claim closes —
@@ -604,9 +604,9 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 //
 // That the stamp *cannot* be a second call is now structural: the Store interface
 // carries no standalone increment, so nothing on this path could issue one. What
-// remains to check is the other half — that folding it into AddRef actually stamps —
+// remains to check is the other half — that folding it into RefsAdd actually stamps —
 // which is what the two assertions below do: edge and wake land together.
-func TestAddDependencyStampRidesAddRef(t *testing.T) {
+func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	ctx := context.Background()
 	real := newClientTestStore(t)
 
@@ -623,19 +623,19 @@ func TestAddDependencyStampRidesAddRef(t *testing.T) {
 	require.NoError(t, err)
 
 	stale := target.ResourceVersion
-	_, err = real.SetCondition(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	_, err = real.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	// Conjunction fires: new edge, target moved past stale.
 	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, stale))
 
-	refs, err := real.ListIncomingRefs(ctx, target.ID, RelationDependsOn)
+	refs, err := real.RefsListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, refObjectIDs(refs), "the edge landed")
 
-	owed, err := real.ListPendingWakeIDs(ctx, gk)
+	owed, err := real.WakesListPendingIDs(ctx, gk)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside AddRef")
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside RefsAdd")
 }
 
 // TestAddDependencyRejectsFutureResourceVersionNested is the rejection's harder
@@ -655,7 +655,7 @@ func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.RefsListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration must leave no edge, committed or not")
 }
@@ -710,7 +710,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errBoom)
 
-	refs, err := f.store.ListIncomingRefs(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.RefsListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "the rolled-back declaration left no edge")
 	f.requireNotRequeued(t)
@@ -783,7 +783,7 @@ type failHasIncomingRefsStore struct {
 	fakeStore
 }
 
-func (s *failHasIncomingRefsStore) HasIncomingRefs(context.Context, ObjectID) (bool, error) {
+func (s *failHasIncomingRefsStore) RefsHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, errBoom
 }
 
@@ -800,8 +800,8 @@ type failAddRefStore struct {
 	fakeStore
 }
 
-func (s *failAddRefStore) AddRef(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.AddRefResult, error) {
-	return storeapi.AddRefResult{}, errBoom
+func (s *failAddRefStore) RefsAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.RefsAddResult, error) {
+	return storeapi.RefsAddResult{}, errBoom
 }
 
 func TestControllerClientAddDependencyStoreError(t *testing.T) {
@@ -812,7 +812,7 @@ func TestControllerClientAddDependencyStoreError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// kindTStore runs Within inline and answers GetObject with a row of kind "T", so
+// kindTStore runs Within inline and answers ObjectsGet with a row of kind "T", so
 // tests reach the write path under test. Embed it in a double that overrides the
 // specific write.
 type kindTStore struct {
@@ -822,7 +822,7 @@ type kindTStore struct {
 func (s *kindTStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }
-func (s *kindTStore) GetObject(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *kindTStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
 	return &RawObject{ID: id, Kind: "T"}, nil
 }
 
@@ -831,7 +831,7 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) UpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) (*RawObject, error) {
+func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -856,16 +856,16 @@ func TestControllerClientUpdateStatusStoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// failDeleteRefStore returns an error from DeleteRef (Within runs fn inline).
+// failDeleteRefStore returns an error from RefsDelete (Within runs fn inline).
 type failDeleteRefStore struct {
 	fakeStore
 }
 
-func (s *failDeleteRefStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *failDeleteRefStore) RefsDelete(context.Context, ObjectID, ObjectID, Relation) error {
 	return errBoom
 }
 
-// TestControllerClientDeleteDependencyDeleteRefError covers the DeleteRef failure
+// TestControllerClientDeleteDependencyDeleteRefError covers the RefsDelete failure
 // branch: the edge removal itself fails, so the whole DeleteDependency errors.
 func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 	bh, err := New(&failDeleteRefStore{})
@@ -875,8 +875,8 @@ func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// metaDeleteDepStore lets a DeleteDependency test control what GetObjectMeta
-// returns after the edge is dropped. DeleteRef succeeds; the rest defaults to the
+// metaDeleteDepStore lets a DeleteDependency test control what ObjectsGetMeta
+// returns after the edge is dropped. RefsDelete succeeds; the rest defaults to the
 // fakeStore (Within inline, no-ops).
 type metaDeleteDepStore struct {
 	fakeStore
@@ -884,15 +884,15 @@ type metaDeleteDepStore struct {
 	metaErr error
 }
 
-func (s *metaDeleteDepStore) DeleteRef(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *metaDeleteDepStore) RefsDelete(context.Context, ObjectID, ObjectID, Relation) error {
 	return nil
 }
-func (s *metaDeleteDepStore) GetObjectMeta(context.Context, ObjectID) (*RawObject, error) {
+func (s *metaDeleteDepStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
 	return s.meta, s.metaErr
 }
 
 // TestControllerClientDeleteDependencyTargetGone covers the post-edge re-check
-// when the target is already gone: GetObjectMeta reports ErrNotFound, which is
+// when the target is already gone: ObjectsGetMeta reports ErrNotFound, which is
 // swallowed (nothing to wake). The wake collector must be present to reach it.
 func TestControllerClientDeleteDependencyTargetGone(t *testing.T) {
 	bh, err := New(&metaDeleteDepStore{metaErr: ErrNotFound})
@@ -905,7 +905,7 @@ func TestControllerClientDeleteDependencyTargetGone(t *testing.T) {
 	assert.Empty(t, wakes.targets, "a gone target schedules no wake")
 }
 
-// TestControllerClientDeleteDependencyMetaError covers GetObjectMeta failing with
+// TestControllerClientDeleteDependencyMetaError covers ObjectsGetMeta failing with
 // a non-ErrNotFound error after the edge is dropped: it propagates out.
 func TestControllerClientDeleteDependencyMetaError(t *testing.T) {
 	bh, err := New(&metaDeleteDepStore{metaErr: errBoom})
@@ -951,14 +951,14 @@ func TestControllerClientDeleteDependencyTargetAliveNotFinalizing(t *testing.T) 
 
 // TestControllerClientDeleteDependencyNoWakesOutsideReconcile covers the early
 // return when there's no collector on the ctx (called outside a reconcile):
-// GetObjectMeta is never reached, so even a panicking GetObjectMeta is fine.
+// ObjectsGetMeta is never reached, so even a panicking ObjectsGetMeta is fine.
 func TestControllerClientDeleteDependencyNoWakesOutsideReconcile(t *testing.T) {
 	bh, err := New(&metaDeleteDepStore{metaErr: errBoom})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
 
 	// No withPendingWakes: pendingWakesFrom(ctx) is nil, so it returns before the
-	// GetObjectMeta call that would otherwise fail.
+	// ObjectsGetMeta call that would otherwise fail.
 	require.NoError(t, cc.DeleteDependency(context.Background(), 1, 2))
 }
 

@@ -65,7 +65,7 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 	// matching the dependency waker's post-commit pattern.
 	var toWake []Referrer
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
-		obj, err := bh.store.GetObjectMeta(ctx, id)
+		obj, err := bh.store.ObjectsGetMeta(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -75,8 +75,8 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		}
 
 		// Cascade deletion to owned children, requeuing them all (see
-		// MarkOwnedForDeletion for the steady-state single-read path).
-		children, err := bh.store.MarkOwnedForDeletion(ctx, id)
+		// DeletionsMarkOwned for the steady-state single-read path).
+		children, err := bh.store.DeletionsMarkOwned(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -90,12 +90,12 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		// depends_on edges before the referrer gate, or two deletion-pending objects
 		// that depend on each other (or a self-dependency) would each hold the
 		// other's RESTRICT forever. owned_by edges are left for the cascade.
-		if err := bh.store.DeleteFinalizingDependsOnRefs(ctx, id); err != nil {
+		if err := bh.store.RefsDeleteFinalizingDependsOn(ctx, id); err != nil {
 			return err
 		}
 		// Still referenced (owned children or live dependents): RESTRICT forbids the
 		// delete. Leave the row; a referrer's own removal will wake us (below).
-		referenced, err := bh.store.HasIncomingRefs(ctx, id)
+		referenced, err := bh.store.RefsHasIncoming(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -107,11 +107,11 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		// unblock a deletion-pending target RESTRICT was holding. Capture those
 		// targets before the delete so we can wake them — the event-driven path that
 		// lets a cascade finish without waiting on the next GC sweep.
-		referents, err := bh.store.ListOutgoingRefs(ctx, id)
+		referents, err := bh.store.RefsListOutgoing(ctx, id)
 		if err != nil {
 			return err
 		}
-		if err := bh.store.DeleteObject(ctx, id); err != nil {
+		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
 			return err
 		}
 		toWake = append(toWake, referents...)

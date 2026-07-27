@@ -131,42 +131,42 @@ func waitForDeletions(t *testing.T, w <-chan Change[cSpec, cStatus], want ...Obj
 }
 
 // collectFakeStore drives collect's transaction body with controllable results
-// so each store-call error branch can be exercised in isolation. GetObjectMeta
+// so each store-call error branch can be exercised in isolation. ObjectsGetMeta
 // returns a finalizing object (so collect proceeds past the live-object guard);
 // the per-method hooks default to success and are overridden per test. Within
 // runs fn inline (from the embedded fakeStore), so all of collect runs here.
 type collectFakeStore struct {
 	fakeStore
 	finalizers      []string // on the collected object
-	getMetaErr      error    // GetObjectMeta
-	markErr         error    // MarkOwnedForDeletion
-	dropDependsErr  error    // DeleteFinalizingDependsOnRefs
+	getMetaErr      error    // ObjectsGetMeta
+	markErr         error    // DeletionsMarkOwned
+	dropDependsErr  error    // RefsDeleteFinalizingDependsOn
 	hasRefs         bool     // HasIncomingRefs result
 	hasRefsErr      error    // HasIncomingRefs error
-	outgoingErr     error    // ListOutgoingRefs error
-	deleteObjectErr error    // DeleteObject error
+	outgoingErr     error    // RefsListOutgoing error
+	deleteObjectErr error    // ObjectsDelete error
 }
 
-func (s *collectFakeStore) GetObjectMeta(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawObject, error) {
 	if s.getMetaErr != nil {
 		return nil, s.getMetaErr
 	}
 	now := time.Now()
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) MarkOwnedForDeletion(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *collectFakeStore) DeletionsMarkOwned(context.Context, ObjectID) ([]storeapi.Referrer, error) {
 	return nil, s.markErr
 }
-func (s *collectFakeStore) DeleteFinalizingDependsOnRefs(context.Context, ObjectID) error {
+func (s *collectFakeStore) RefsDeleteFinalizingDependsOn(context.Context, ObjectID) error {
 	return s.dropDependsErr
 }
-func (s *collectFakeStore) HasIncomingRefs(context.Context, ObjectID) (bool, error) {
+func (s *collectFakeStore) RefsHasIncoming(context.Context, ObjectID) (bool, error) {
 	return s.hasRefs, s.hasRefsErr
 }
-func (s *collectFakeStore) ListOutgoingRefs(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *collectFakeStore) RefsListOutgoing(context.Context, ObjectID) ([]storeapi.Referrer, error) {
 	return nil, s.outgoingErr
 }
-func (s *collectFakeStore) DeleteObject(context.Context, ObjectID) error {
+func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	return s.deleteObjectErr
 }
 
@@ -177,7 +177,7 @@ func TestCollectGetObjectMetaError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-func TestCollectMarkOwnedForDeletionError(t *testing.T) {
+func TestCollectDeletionsMarkOwnedError(t *testing.T) {
 	bh, err := New(&collectFakeStore{markErr: errBoom})
 	require.NoError(t, err)
 	_, err = bh.collect(context.Background(), 1)
@@ -199,7 +199,7 @@ func TestCollectHasIncomingRefsError(t *testing.T) {
 }
 
 func TestCollectListOutgoingRefsError(t *testing.T) {
-	// hasRefs false so collect proceeds to the delete prep where ListOutgoingRefs runs.
+	// hasRefs false so collect proceeds to the delete prep where RefsListOutgoing runs.
 	bh, err := New(&collectFakeStore{outgoingErr: errBoom})
 	require.NoError(t, err)
 	_, err = bh.collect(context.Background(), 1)
@@ -214,7 +214,7 @@ func TestCollectDeleteObjectError(t *testing.T) {
 }
 
 // gcFixture builds a Beehive over a real sqlite store plus a client, so collect
-// tests can exercise real RequestDeletion/DeleteObject/ref semantics. No
+// tests can exercise real DeletionsRequest/ObjectsDelete/ref semantics. No
 // controller is started: collect is driven directly. The default resync is left
 // enabled, so collect's post-commit wakes for this client-only kind defer to the
 // (idle) sweeper rather than recursively collecting synchronously — letting these
@@ -259,13 +259,13 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 
 // TestCollectDeletesSelfDependentObject pins the deadlock collect names the self
 // case for: a self-dependency is its own referrer, so refs' ON DELETE RESTRICT
-// would pin the row forever if DeleteFinalizingDependsOnRefs did not drop the
+// would pin the row forever if RefsDeleteFinalizingDependsOn did not drop the
 // edge first. Verified by mutation — excluding from_id = to_id there leaves the
 // object undeletable.
 //
 // It is deliberately *not* the twin of TestClientListDependentsIncludesSelfEdge:
-// collect reads refs through HasIncomingRefs and DeleteFinalizingDependsOnRefs,
-// never ListIncomingRefs, so a self-edge filtered out of that call would leave
+// collect reads refs through HasIncomingRefs and RefsDeleteFinalizingDependsOn,
+// never RefsListIncoming, so a self-edge filtered out of that call would leave
 // this path untouched. The two tests cover different consumers, not two halves of
 // one mistake.
 func TestCollectDeletesSelfDependentObject(t *testing.T) {
@@ -443,18 +443,18 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// Simulate a crash mid-delete: a deletion-pending row is already in the durable
 	// store before any control plane runs. (Written through the store directly, so
 	// no reconcile has touched it.)
-	raw, err := store.CreateObject(ctx, &RawObject{
+	raw, err := store.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	// Settle it first, so the GC sweeper's startup pass really is the *only* path
-	// that can reach this row. A raw CreateObject leaves observed_generation NULL,
+	// that can reach this row. A raw ObjectsCreate leaves observed_generation NULL,
 	// which the startup resumption of owed work would pick up as unsettled — the row
 	// would then be removed for two reasons and this test would stop pinning either
 	// one. Deletion does not bump generation, so the row stays settled below.
-	_, err = store.UpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
+	_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, _, err = store.RequestDeletion(ctx, clientTestGK, raw.ID)
+	_, _, err = store.DeletionsRequest(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	// A fresh Beehive with no spec-startup pass and resync disabled: the GC
@@ -667,7 +667,7 @@ type sweepFailStore struct {
 	rows []Referrer
 }
 
-func (s *sweepFailStore) ListAllDeletionPending(context.Context) ([]Referrer, error) {
+func (s *sweepFailStore) DeletionsListPending(context.Context) ([]Referrer, error) {
 	return s.rows, nil
 }
 
@@ -771,7 +771,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	real := newClientTestStore(t)
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
-	raw, err := real.CreateObject(ctx, &RawObject{
+	raw, err := real.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -790,11 +790,11 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		t.Fatal("sweeper never ran its startup pass")
 	}
 
-	_, _, err = real.RequestDeletion(ctx, clientTestGK, raw.ID)
+	_, _, err = real.DeletionsRequest(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		_, err := real.GetObjectMeta(ctx, raw.ID)
+		_, err := real.ObjectsGetMeta(ctx, raw.ID)
 		return errors.Is(err, ErrNotFound)
 	}, testTimeout, 5*time.Millisecond, "deletion-pending row was never collected: GC is still riding the reconcile interval")
 }
@@ -856,7 +856,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	// Mark it deletion-pending through the store, so the client's own advanceGC
 	// wake isn't what drives this either.
-	_, _, err = real.RequestDeletion(ctx, clientTestGK, obj.ID)
+	_, _, err = real.DeletionsRequest(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)
 
 	waitForDeletions(t, w, obj.ID)

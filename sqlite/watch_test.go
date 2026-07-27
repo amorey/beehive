@@ -113,9 +113,9 @@ func TestWatchEventsSnapshotThenLive(t *testing.T) {
 	ctx := context.Background()
 	id := newEventObject(t, store)
 
-	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
-	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Connected"})
+	_, err = store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{})
@@ -125,7 +125,7 @@ func TestWatchEventsSnapshotThenLive(t *testing.T) {
 	assert.Equal(t, "ProbeFailed", recvLogEvent(t, w).Reason, "snapshot oldest-first")
 	assert.Equal(t, "Connected", recvLogEvent(t, w).Reason)
 
-	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "TLSHandshake"})
+	_, err = store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "TLSHandshake"})
 	require.NoError(t, err)
 	assert.Equal(t, "TLSHandshake", recvLogEvent(t, w).Reason, "streamed live after the snapshot")
 }
@@ -142,9 +142,9 @@ func TestWatchEventsDropsRaceWindowRunsForDeletedObject(t *testing.T) {
 	// the run is buffered in the receiver, but the FK cascade removes it before the
 	// snapshot reads, so ListEvents (and the object scope-check) see it gone.
 	store.beforeSnapshot = func() {
-		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+		_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 		require.NoError(t, err)
-		require.NoError(t, store.DeleteObject(ctx, id))
+		require.NoError(t, store.ObjectsDelete(ctx, id))
 	}
 
 	w, err := store.WatchEvents(ctx, testGK, id, storeapi.EventQuery{})
@@ -161,7 +161,7 @@ func TestWatchEventsScopesSnapshotToKind(t *testing.T) {
 	ctx := context.Background()
 	id := newEventObject(t, store) // belongs to testGK
 
-	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	// Watch the same id under a different kind: the snapshot must be empty, not the
@@ -185,9 +185,9 @@ func TestWatchEventsLimitDoesNotDropRaceWindowRuns(t *testing.T) {
 	// high-water. With Limit 1 the snapshot carries only the newest (Second); the
 	// older run (First) is excluded by the limit and must arrive live.
 	store.beforeSnapshot = func() {
-		_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "First"})
+		_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "First"})
 		require.NoError(t, err)
-		_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Second"})
+		_, err = store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Second"})
 		require.NoError(t, err)
 	}
 
@@ -216,9 +216,9 @@ func TestWatchEventsFiltersLiveByCategory(t *testing.T) {
 
 	// An out-of-category emission must be skipped, so the first delivered run is
 	// the connection one that follows it.
-	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "Synced"})
+	_, err = store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "Synced"})
 	require.NoError(t, err)
-	_, err = store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	got := recvLogEvent(t, w)
@@ -269,7 +269,7 @@ func TestWithinFlushesAfterCommit(t *testing.T) {
 	defer w.Close()
 
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
-		_, err := store.CreateObject(ctx, newWatchObject())
+		_, err := store.ObjectsCreate(ctx, newWatchObject())
 		return err
 	}))
 
@@ -288,7 +288,7 @@ func TestWithinRollbackDiscardsEvents(t *testing.T) {
 	defer w.Close()
 
 	err = store.Within(ctx, func(ctx context.Context) error {
-		if _, err := store.CreateObject(ctx, newWatchObject()); err != nil {
+		if _, err := store.ObjectsCreate(ctx, newWatchObject()); err != nil {
 			return err
 		}
 		return errWatchBoom
@@ -310,7 +310,7 @@ func TestNestedWithinSingleFlush(t *testing.T) {
 
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
 		return store.Within(ctx, func(ctx context.Context) error {
-			_, err := store.CreateObject(ctx, newWatchObject())
+			_, err := store.ObjectsCreate(ctx, newWatchObject())
 			return err
 		})
 	}))
@@ -320,13 +320,13 @@ func TestNestedWithinSingleFlush(t *testing.T) {
 	assertNoEvent(t, w, 200*time.Millisecond) // only one flush
 }
 
-// TestRequestDeletionIdempotentNoEvent verifies the second (idempotent) Delete
+// TestDeletionsRequestIdempotentNoEvent verifies the second (idempotent) Delete
 // emits no event.
-func TestRequestDeletionIdempotentNoEvent(t *testing.T) {
+func TestDeletionsRequestIdempotentNoEvent(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK)
@@ -337,13 +337,13 @@ func TestRequestDeletionIdempotentNoEvent(t *testing.T) {
 	snap := recvEvent(t, w)
 	assert.Equal(t, beehive.Added, snap.Type)
 
-	_, changed, err := store.RequestDeletion(ctx, testGK, obj.ID)
+	_, changed, err := store.DeletionsRequest(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.True(t, changed)
 	ev := recvEvent(t, w)
 	assert.Equal(t, beehive.Modified, ev.Type)
 
-	_, changed, err = store.RequestDeletion(ctx, testGK, obj.ID)
+	_, changed, err = store.DeletionsRequest(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.False(t, changed)
 	assertNoEvent(t, w, 200*time.Millisecond)
@@ -356,7 +356,7 @@ func TestWatchDedupesSnapshotResourceVersion(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	store.beforeSnapshot = func() {
@@ -380,7 +380,7 @@ func TestWatchStreamsLiveAfterSnapshot(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK)
@@ -388,7 +388,7 @@ func TestWatchStreamsLiveAfterSnapshot(t *testing.T) {
 	defer w.Close()
 	recvEvent(t, w) // drain snapshot Added
 
-	_, _, err = store.UpdateSpec(ctx, testGK, obj.ID, []byte(`{"v":2}`), 0)
+	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
@@ -401,9 +401,9 @@ func TestWatchFiltersByID(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj1, err := store.CreateObject(ctx, newWatchObject())
+	obj1, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
-	obj2, err := store.CreateObject(ctx, newWatchObject())
+	obj2, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	w, err := store.Watch(ctx, testGK, obj1.ID)
@@ -412,9 +412,9 @@ func TestWatchFiltersByID(t *testing.T) {
 	snap := recvEvent(t, w) // snapshot Added for obj1 only
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
-	_, _, err = store.UpdateSpec(ctx, testGK, obj2.ID, []byte(`{"v":2}`), 0) // filtered out
+	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, obj2.ID, []byte(`{"v":2}`), 0) // filtered out
 	require.NoError(t, err)
-	_, _, err = store.UpdateSpec(ctx, testGK, obj1.ID, []byte(`{"v":2}`), 0) // delivered
+	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, obj1.ID, []byte(`{"v":2}`), 0) // delivered
 	require.NoError(t, err)
 
 	ev := recvEvent(t, w)
@@ -435,7 +435,7 @@ func TestWatchAfterCloseErrors(t *testing.T) {
 
 // TestWatchSnapshotLoadError verifies a snapshot-load failure surfaces as an
 // error (and the receiver is released). beforeSnapshot closes the db so the
-// ListObjects snapshot query fails.
+// ObjectsList snapshot query fails.
 func TestWatchSnapshotLoadError(t *testing.T) {
 	store, err := OpenMemory()
 	require.NoError(t, err)
@@ -468,7 +468,7 @@ func TestWatchClosesOnStoreCloseWhileParkedOnSend(t *testing.T) {
 	store.afterStream = func() { close(exited) }
 	ctx := context.Background()
 
-	_, err := store.CreateObject(ctx, newWatchObject()) // snapshot has one item
+	_, err := store.ObjectsCreate(ctx, newWatchObject()) // snapshot has one item
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK) // goroutine parks on the snapshot send
@@ -486,7 +486,7 @@ func TestDeleteObjectEmitsDeleted(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK)
@@ -494,7 +494,7 @@ func TestDeleteObjectEmitsDeleted(t *testing.T) {
 	defer w.Close()
 	recvEvent(t, w) // drain snapshot Added
 
-	require.NoError(t, store.DeleteObject(ctx, obj.ID))
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
 
 	ev := recvEvent(t, w)
 	assert.Equal(t, beehive.Deleted, ev.Type)
@@ -536,7 +536,7 @@ func TestWatchSnapshotSendCtxDone(t *testing.T) {
 	store.afterStream = func() { close(exited) }
 	ctx, cancel := context.WithCancel(context.Background())
 
-	_, err := store.CreateObject(ctx, newWatchObject()) // snapshot has one item
+	_, err := store.ObjectsCreate(ctx, newWatchObject()) // snapshot has one item
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK)
@@ -556,7 +556,7 @@ func TestWatchCoalescesRapidUpdates(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject()) // rv1
+	obj, err := store.ObjectsCreate(ctx, newWatchObject()) // rv1
 	require.NoError(t, err)
 
 	w, err := store.Watch(ctx, testGK, obj.ID) // snapshot high-water = rv1
@@ -592,7 +592,7 @@ func TestWatchDeliversRealDeleteBodyWhenSlow(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	obj, err := store.CreateObject(ctx, newWatchObject()) // rv1
+	obj, err := store.ObjectsCreate(ctx, newWatchObject()) // rv1
 	require.NoError(t, err)
 
 	w, err := store.WatchList(ctx, testGK)
@@ -633,7 +633,7 @@ func TestWatchSnapshotRaceDeleteNotLost(t *testing.T) {
 	var created *storeapi.RawObject
 	store.beforeSnapshot = func() {
 		var err error
-		created, err = store.CreateObject(ctx, newWatchObject())
+		created, err = store.ObjectsCreate(ctx, newWatchObject())
 		require.NoError(t, err)
 	}
 
@@ -736,7 +736,7 @@ func TestWatchSnapshotRaceModifiedNotAdded(t *testing.T) {
 	var created *storeapi.RawObject
 	store.beforeSnapshot = func() {
 		var err error
-		created, err = store.CreateObject(ctx, newWatchObject())
+		created, err = store.ObjectsCreate(ctx, newWatchObject())
 		require.NoError(t, err)
 	}
 
@@ -775,11 +775,11 @@ func TestWatchBornAndDiedBeforeSnapshotUnobserved(t *testing.T) {
 	ctx := context.Background()
 
 	store.beforeSnapshot = func() {
-		obj, err := store.CreateObject(ctx, newWatchObject())
+		obj, err := store.ObjectsCreate(ctx, newWatchObject())
 		require.NoError(t, err)
-		// Delete without going through RequestDeletion; the freshly created
+		// Delete without going through DeletionsRequest; the freshly created
 		// object has no finalizers or referrers, so it can be removed directly.
-		require.NoError(t, store.DeleteObject(ctx, obj.ID))
+		require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
 	}
 
 	w, err := store.WatchList(ctx, testGK)
@@ -850,7 +850,7 @@ func dropObjectsTable(t *testing.T, store *sqliteStore) {
 }
 
 // TestSnapshotAtLoadError covers snapshotAt's load-error branch: the transaction
-// opens (BeginTx succeeds) but the snapshot's ListObjects fails because the
+// opens (BeginTx succeeds) but the snapshot's ObjectsList fails because the
 // objects table is gone, so the error surfaces from load, not from BeginTx.
 func TestSnapshotAtLoadError(t *testing.T) {
 	store := newRawStore(t)
@@ -860,8 +860,8 @@ func TestSnapshotAtLoadError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestWatchGetObjectInnerError covers Watch's snapshot GetObject error branch
-// (the non-ErrNotFound path): the transaction opens, then GetObject fails on the
+// TestWatchGetObjectInnerError covers Watch's snapshot ObjectsGet error branch
+// (the non-ErrNotFound path): the transaction opens, then ObjectsGet fails on the
 // missing objects table — distinct from a closed-db failure that aborts at BeginTx.
 func TestWatchGetObjectInnerError(t *testing.T) {
 	store := newRawStore(t)
@@ -966,7 +966,7 @@ func TestWatchEventsSnapshotSendCtxDone(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	id := newEventObject(t, store)
-	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+	_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
 	require.NoError(t, err)
 
 	exited := make(chan struct{})
@@ -1013,7 +1013,7 @@ func TestWatchEventsSendStoreClose(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	id := newEventObject(t, store)
-	_, err := store.RecordEvent(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
+	_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
 	require.NoError(t, err)
 
 	exited := make(chan struct{})
@@ -1069,7 +1069,7 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 
 	var seen []storeapi.ObjectChange
 	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
-		if _, err := store.CreateObject(txCtx, newWatchObject()); err != nil {
+		if _, err := store.ObjectsCreate(txCtx, newWatchObject()); err != nil {
 			return err
 		}
 		store.AfterCommit(txCtx, func(context.Context) { seen = recvBatch(t, w) })
@@ -1091,10 +1091,10 @@ func TestPublishReachesGlobalHub(t *testing.T) {
 	rx := store.changeHub.Receiver()
 	defer rx.Close()
 
-	first, err := store.CreateObject(ctx, newWatchObject())
+	first, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 	otherGK := beehive.GroupKind{Kind: "Other"}
-	second, err := store.CreateObject(ctx, &beehive.RawObject{
+	second, err := store.ObjectsCreate(ctx, &beehive.RawObject{
 		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1133,7 +1133,7 @@ func TestWatchObjectChangesStreamsLiveChanges(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Close()
 
-	created, err := store.CreateObject(ctx, newWatchObject())
+	created, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectChange{{ID: created.ID, Type: beehive.Added}}, recvBatch(t, w))
 }
@@ -1149,9 +1149,9 @@ func TestWatchObjectChangesSpansKinds(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Close()
 
-	first, err := store.CreateObject(ctx, newWatchObject())
+	first, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
-	second, err := store.CreateObject(ctx, &beehive.RawObject{Kind: "Other", Spec: []byte(`{}`)})
+	second, err := store.ObjectsCreate(ctx, &beehive.RawObject{Kind: "Other", Spec: []byte(`{}`)})
 	require.NoError(t, err)
 
 	got := map[storeapi.ObjectID]bool{}
@@ -1170,7 +1170,7 @@ func TestWatchObjectChangesSkipsSnapshot(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	pre, err := store.CreateObject(ctx, newWatchObject())
+	pre, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	w, err := store.WatchObjectChanges(ctx)
@@ -1178,7 +1178,7 @@ func TestWatchObjectChangesSkipsSnapshot(t *testing.T) {
 	defer w.Close()
 	assertNoBatch(t, w, 200*time.Millisecond)
 
-	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
+	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectChange{{ID: pre.ID, Type: beehive.Modified}}, recvBatch(t, w))
 }
@@ -1199,7 +1199,7 @@ func newParkedObjectChangeStream(t *testing.T, store *sqliteStore) storeapi.Obje
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
-	_, err = store.CreateObject(context.Background(), newWatchObject())
+	_, err = store.ObjectsCreate(context.Background(), newWatchObject())
 	require.NoError(t, err)
 	select {
 	case <-parked:
@@ -1219,7 +1219,7 @@ func TestWatchObjectChangesBatchesBurst(t *testing.T) {
 
 	var want []storeapi.ObjectID
 	for range 3 {
-		obj, err := store.CreateObject(ctx, newWatchObject())
+		obj, err := store.ObjectsCreate(ctx, newWatchObject())
 		require.NoError(t, err)
 		want = append(want, obj.ID)
 	}
@@ -1241,7 +1241,7 @@ func TestWatchObjectChangesCapsBatch(t *testing.T) {
 
 	const extra = 2
 	for range objectChangeBatchCap + extra {
-		_, err := store.CreateObject(ctx, newWatchObject())
+		_, err := store.ObjectsCreate(ctx, newWatchObject())
 		require.NoError(t, err)
 	}
 
@@ -1260,10 +1260,10 @@ func TestWatchObjectChangesCoalescesRepeatWrites(t *testing.T) {
 	ctx := context.Background()
 	w := newParkedObjectChangeStream(t, store)
 
-	obj, err := store.CreateObject(ctx, newWatchObject())
+	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 	for i := range 5 {
-		_, _, err := store.UpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
 		require.NoError(t, err)
 	}
 
@@ -1282,10 +1282,10 @@ func TestWatchObjectChangesAnnihilatesTransient(t *testing.T) {
 	ctx := context.Background()
 	w := newParkedObjectChangeStream(t, store)
 
-	transient, err := store.CreateObject(ctx, newWatchObject())
+	transient, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
-	require.NoError(t, store.DeleteObject(ctx, transient.ID))
-	survivor, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, store.ObjectsDelete(ctx, transient.ID))
+	survivor, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
 	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")

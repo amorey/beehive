@@ -354,7 +354,7 @@ func (w *watcherImpl[V]) send(wctx context.Context, storeDone <-chan struct{}, v
 func (s *sqliteStore) WatchList(ctx context.Context, gk storeapi.GroupKind) (storeapi.Watcher, error) {
 	return s.watch(ctx, gk, nil, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
 		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-			return s.ListObjects(ctx, gk)
+			return s.ObjectsList(ctx, gk)
 		})
 	})
 }
@@ -419,7 +419,7 @@ func (s *sqliteStore) Watch(ctx context.Context, gk storeapi.GroupKind, id store
 	filterID := id
 	return s.watch(ctx, gk, &filterID, func(ctx context.Context) ([]*storeapi.RawObject, int64, error) {
 		return s.snapshotAt(ctx, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-			raw, err := s.GetObject(ctx, id)
+			raw, err := s.ObjectsGet(ctx, id)
 			if errors.Is(err, storeapi.ErrNotFound) {
 				return nil, nil // not found yet: empty snapshot, stream the Added when it lands
 			}
@@ -647,7 +647,7 @@ func (s *sqliteStore) WatchEvents(ctx context.Context, gk storeapi.GroupKind, id
 			return err
 		}
 		if objectExists {
-			if snapshot, err = s.ListEvents(ctx, id, q); err != nil {
+			if snapshot, err = s.EventsList(ctx, id, q); err != nil {
 				return err
 			}
 		}

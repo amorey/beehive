@@ -171,7 +171,7 @@ type Client[Spec, Status any] interface {
 	// It is also the supported way to drive reconciles yourself when no ticker is
 	// configured — WithCatchupInterval(0) with WithResyncInterval(0), where startup
 	// drains owed work once and nothing re-derives it afterward.
-	// Store.ListUnsettledIDs reports what is owed.
+	// Store.ObjectsListUnsettledIDs reports what is owed.
 	//
 	// By default it preserves id's retry backoff ladder: a requeue is the common
 	// event-driven nudge (config change, dependency update, manual poke) and
@@ -280,7 +280,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 // each caller has already populated from its single source (WithSlug for Create,
 // the positional argument for CreateOrUpdate/GetOrCreate).
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
-	raw, err := c.bh.store.CreateObject(ctx, &RawObject{
+	raw, err := c.bh.store.ObjectsCreate(ctx, &RawObject{
 		Group:       c.gk.Group,
 		Kind:        c.gk.Kind,
 		Slug:        co.slug,
@@ -292,10 +292,10 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte
 		return nil, err
 	}
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it
-	// via ListIncomingRefs(owner, RelationOwnedBy). No version claim and no wake
+	// via RefsListIncoming(owner, RelationOwnedBy). No version claim and no wake
 	// stamp: an owner edge carries no read this call could be racing.
 	if co.owner != nil {
-		if _, err := c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
+		if _, err := c.bh.store.RefsAdd(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -321,7 +321,7 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, id ObjectI
 // doesn't round-trip rolls the write back rather than committing a row the process
 // can't read (see Create), and then registers the post-commit reconcile wake — but
 // only when changed is true. The wake is gated because a no-op write (an identical
-// spec, which UpdateSpec collapses) emits nothing; waking anyway would be the lone
+// spec, which ObjectsUpdateSpec collapses) emits nothing; waking anyway would be the lone
 // signal claiming something happened and, for a controller re-applying its own
 // kind's spec each pass, a self-sustaining reconcile loop. Keeping this contract in
 // one place is the update-path counterpart to signalCreated on the create paths.
@@ -340,7 +340,7 @@ func (c *clientImpl[Spec, Status]) decodeAndWake(ctx context.Context, raw *RawOb
 // updates the existing object carrying that slug, or creates one with that slug
 // if none exists. Wrapping the read-then-write in Within makes the upsert atomic,
 // so concurrent callers can't both insert the same slug — the second sees the
-// first's row and updates instead. Re-applying the same spec is a no-op (UpdateSpec
+// first's row and updates instead. Re-applying the same spec is a no-op (ObjectsUpdateSpec
 // suppresses the generation bump on equal bytes).
 //
 // It drives the store mutators directly rather than composing Create/Update so
@@ -354,12 +354,12 @@ func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug stri
 	}
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 		var raw *RawObject
 		changed := true // the create branch always changes something
 		switch {
 		case err == nil:
-			raw, changed, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+			raw, changed, err = c.bh.store.ObjectsUpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		case errors.Is(err, ErrNotFound):
 			// No opts on this surface, so the row carries no finalizers and no owner.
 			raw, err = c.insertObject(ctx, b, &createOptions{slug: &slug})
@@ -406,7 +406,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	// TOCTOU: the loser of a concurrent create observes the winner's row instead
 	// of failing on the slug's UNIQUE constraint.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 		if err == nil {
 			// Found: return the existing row as-is (live or deletion-pending; never
 			// mutated). A pre-existing poison row is not ours to roll back, so its
@@ -458,17 +458,17 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	if err != nil {
 		return nil, err
 	}
-	// UpdateSpec self-wraps in Within; wrapping it here lets the decode join that
+	// ObjectsUpdateSpec self-wraps in Within; wrapping it here lets the decode join that
 	// same transaction, so a spec that doesn't round-trip rolls the write back (see
 	// Create), keeping the prior good spec instead of committing a row the process
 	// can't read. Outside a caller's Within this is a standalone tx; nested in one it
 	// joins, and the wake defers to that outer commit either way.
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		// UpdateSpec folds this client's kind into the write, so a foreign id is
+		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
 		// rejected at the store (no separate read-then-write to keep atomic);
 		// hideWrongKind keeps that foreign id invisible to this single-kind client.
-		raw, changed, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		if err = c.hideWrongKind(err); err != nil {
 			return err
 		}
@@ -499,10 +499,10 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads .
 // scopedGet loads id and confirms it belongs to this client's kind. A Client is
 // the surface for a single resource kind, so an id naming an object of another
 // kind must be invisible here — reads, updates, and deletes through this client
-// must never touch another controller's rows. On the read path GetObject isn't
+// must never touch another controller's rows. On the read path ObjectsGet isn't
 // kind-scoped, so the client checks here, reporting ErrNotFound for a foreign id.
 func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
-	raw, err := c.bh.store.GetObject(ctx, id)
+	raw, err := c.bh.store.ObjectsGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +524,7 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 }
 
 func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
-	raw, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+	raw, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +554,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnerBit
 	}
 	if set&LoadDependenciesBit != 0 {
-		deps, err := store.ListOutgoingRefsByRelation(ctx, obj.ID, RelationDependsOn)
+		deps, err := store.RefsListOutgoingByRelation(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -562,7 +562,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependenciesBit
 	}
 	if set&LoadDependentsBit != 0 {
-		dependents, err := store.ListIncomingRefs(ctx, obj.ID, RelationDependsOn)
+		dependents, err := store.RefsListIncoming(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -570,7 +570,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependentsBit
 	}
 	if set&LoadOwnedBit != 0 {
-		owned, err := store.ListIncomingRefs(ctx, obj.ID, RelationOwnedBy)
+		owned, err := store.RefsListIncoming(ctx, obj.ID, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -578,7 +578,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnedBit
 	}
 	if set&LoadEventsBit != 0 {
-		raw, err := store.ListEvents(ctx, obj.ID, storeapi.EventQuery{})
+		raw, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
 		if err != nil {
 			return err
 		}
@@ -591,7 +591,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 // fetchOwnerRef resolves id's single owned_by edge. Owner is single (WithOwner
 // sets one), so the first row is the owner and ok is false when there is none.
 func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (Ref, bool, error) {
-	owners, err := store.ListOutgoingRefsByRelation(ctx, id, RelationOwnedBy)
+	owners, err := store.RefsListOutgoingByRelation(ctx, id, RelationOwnedBy)
 	if err != nil {
 		return Ref{}, false, err
 	}
@@ -602,7 +602,7 @@ func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (Ref, bool, er
 }
 
 func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ListObjects(ctx, c.gk)
+	raws, err := c.bh.store.ObjectsList(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}
@@ -646,7 +646,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		ids[i] = o.ID
 	}
 	if set&LoadOwnerBit != 0 {
-		byID, err := c.bh.store.GroupOutgoingRefsByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.RefsGroupOutgoingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -659,7 +659,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependenciesBit != 0 {
-		byID, err := c.bh.store.GroupOutgoingRefsByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.RefsGroupOutgoingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -669,7 +669,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependentsBit != 0 {
-		byID, err := c.bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.RefsGroupIncomingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -679,7 +679,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadOwnedBit != 0 {
-		byID, err := c.bh.store.GroupIncomingRefsByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.RefsGroupIncomingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -694,7 +694,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		// batching. Each object's log is retention-bounded; for large lists or
 		// filtered reads, prefer the lazy Client.ListEvents.
 		for _, o := range objs {
-			raw, err := c.bh.store.ListEvents(ctx, o.ID, storeapi.EventQuery{})
+			raw, err := c.bh.store.EventsList(ctx, o.ID, storeapi.EventQuery{})
 			if err != nil {
 				return err
 			}
@@ -718,21 +718,21 @@ func (c *clientImpl[Spec, Status]) GetOwner(ctx context.Context, id ObjectID) (R
 }
 
 func (c *clientImpl[Spec, Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListOutgoingRefsByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.RefsListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
+	return c.bh.store.RefsListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
+	return c.bh.store.RefsListIncoming(ctx, id, RelationOwnedBy)
 }
 
 // The kind filter lives in the store statement's WHERE, so foreign-kind children
 // never reach Go. See the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ListIncomingRefObjects(ctx, c.gk, ownerID, RelationOwnedBy)
+	raws, err := c.bh.store.ObjectsListByIncomingRef(ctx, c.gk, ownerID, RelationOwnedBy)
 	if err != nil {
 		return nil, err
 	}
@@ -797,12 +797,12 @@ func (c *clientImpl[Spec, Status]) WatchSchedule(ctx context.Context, id ObjectI
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	// RequestDeletion emits the Modified event itself, and only on a real state
+	// DeletionsRequest emits the Modified event itself, and only on a real state
 	// change — an idempotent retry carries the same resource_version, so emitting
 	// would show watchers a spurious diff. It folds this client's kind into the
 	// write, so a foreign id can't be deleted through this client; hideWrongKind
 	// keeps that foreign id invisible.
-	_, _, err := c.bh.store.RequestDeletion(ctx, c.gk, id)
+	_, _, err := c.bh.store.DeletionsRequest(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
@@ -820,7 +820,7 @@ func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string
 	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
 	// The one place a slug delete departs from Delete, which reports a missing id.
-	obj, _, err := c.bh.store.RequestDeletionBySlug(ctx, c.gk, slug)
+	obj, _, err := c.bh.store.DeletionsRequestBySlug(ctx, c.gk, slug)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
@@ -897,7 +897,7 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 // ListEvents reads id's runs and maps them to public Events. It reads by id
 // (not kind-scoped), like the ref lookups.
 func (c *clientImpl[Spec, Status]) ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.ListEvents(ctx, id, resolveEvents(opts))
+	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -905,7 +905,7 @@ func (c *clientImpl[Spec, Status]) ListEvents(ctx context.Context, id ObjectID, 
 }
 
 func (c *clientImpl[Spec, Status]) GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error) {
-	raw, err := c.bh.store.GetLatestEvent(ctx, id, category)
+	raw, err := c.bh.store.EventsGetLatest(ctx, id, category)
 	if err != nil {
 		return Event{}, false, err
 	}

@@ -42,7 +42,7 @@ var ErrNotFound = storeapi.ErrNotFound
 // violation (a controller must pass the generation it received in Reconcile).
 var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
 
-// ErrSchemaVersionDowngrade is returned by UpdateSpec/UpdateStatus when the
+// ErrSchemaVersionDowngrade is returned by ObjectsUpdateSpec/UpdateStatus when the
 // caller's schema version is lower than the one stamped on the row — the
 // write-side twin of the read path's refusal to decode data a newer build wrote.
 var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade

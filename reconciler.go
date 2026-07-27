@@ -72,7 +72,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	wakes := &pendingWakes{}
 	ctx = withPendingWakes(ctx, wakes)
 
-	raw, err := t.bh.store.GetObject(ctx, id)
+	raw, err := t.bh.store.ObjectsGet(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// The queued object is already gone (collected by a prior pass, a cascade,
 		// or the backstop between enqueue and now). Nothing to reconcile — a no-op
@@ -101,7 +101,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// never do, so it correctly waits for a fixed build.
 		//
 		// This re-WARNs each time the catchup tick re-enqueues the unsettled poison row
-		// (it never settles, so ListUnsettledIDs keeps returning it): a bad row is an
+		// (it never settles, so ObjectsListUnsettledIDs keeps returning it): a bad row is an
 		// ongoing operational fault, and a recurring warning at that coarse cadence keeps
 		// it visible rather than logging once and going silent.
 		//
@@ -144,7 +144,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// stays up and the backstop retries it, whereas requeueing on the error would
 	// spin against a store that keeps failing.
 	if reconcileErr == nil && raw.PendingWake != 0 {
-		if err := t.bh.store.DecrementPendingWake(ctx, id, raw.PendingWake); err != nil {
+		if err := t.bh.store.WakesDecrement(ctx, id, raw.PendingWake); err != nil {
 			log.WarnContext(ctx, "failed to decrement pending-wake count; backstop will retry", "err", err)
 		}
 	}
@@ -235,7 +235,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "unsettled", r.store.ListUnsettledIDs)
+	r.enqueueFrom(ctx, "unsettled", r.store.ObjectsListUnsettledIDs)
 }
 
 // enqueuePendingWake enqueues objects owed a durable dependency wake (see
@@ -250,7 +250,7 @@ func (r *reconciler) enqueuePendingWake(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "pending-wake", r.store.ListPendingWakeIDs)
+	r.enqueueFrom(ctx, "pending-wake", r.store.WakesListPendingIDs)
 }
 
 // hasPeriodicPass reports whether this reconciler has a periodic driver left for
@@ -308,7 +308,7 @@ func (r *reconciler) enqueueAll(ctx context.Context) bool {
 		// an escalation that can never run.
 		return true
 	}
-	return r.enqueueFrom(ctx, "all", r.store.ListIDs)
+	return r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
 }
 
 // log returns a non-nil logger, guarding reconcilers built outside Register (e.g.
@@ -522,7 +522,7 @@ func (r *reconciler) run(ctx context.Context) {
 	// Resync-off is deliberately not logged: it is the default, so narrating it
 	// would put a line in every process's startup for the ordinary case.
 	if r.catchupInterval <= 0 {
-		r.logger.InfoContext(ctx, "catchup disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ListUnsettledIDs + Client.Requeue",
+		r.logger.InfoContext(ctx, "catchup disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ObjectsListUnsettledIDs + Client.Requeue",
 			"group", r.gk.Group, "kind", r.gk.Kind)
 	}
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left

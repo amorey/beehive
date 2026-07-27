@@ -159,11 +159,11 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
-	_, err = store.CreateObject(ctx, &RawObject{
+	_, err = store.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.CreateObject(ctx, &RawObject{
+	good, err := store.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
@@ -189,11 +189,11 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
-	_, err = store.CreateObject(ctx, &RawObject{
+	_, err = store.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.CreateObject(ctx, &RawObject{
+	good, err := store.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
@@ -312,7 +312,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
 
 	// The owner ref is recorded child -> owner, so the owner sees the child.
-	refs, err := store.ListIncomingRefs(ctx, owner.ID, RelationOwnedBy)
+	refs, err := store.RefsListIncoming(ctx, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	assert.Equal(t, child.ID, refs[0].ID)
@@ -590,7 +590,7 @@ func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 
 	// Nothing committed: the slug is still absent, so a second attempt takes the
 	// create branch again (not the found branch) and likewise rolls back.
-	_, err = store.GetObjectBySlug(ctx, gk, "w1")
+	_, err = store.ObjectsGetBySlug(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 	_, created, err = client.GetOrCreate(ctx, "w1", badDecodeSpec{Val: "b"})
 	require.Error(t, err)
@@ -618,7 +618,7 @@ func TestClientCreateRollsBackOnDecodeError(t *testing.T) {
 	assert.Nil(t, obj)
 	assert.Empty(t, queuedIDs(r.work), "a rolled-back create must not wake the reconciler")
 
-	_, err = store.GetObjectBySlug(ctx, gk, "w1")
+	_, err = store.ObjectsGetBySlug(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 }
 
@@ -693,7 +693,7 @@ func TestClientCreateOrUpdateRollsBackOnDecodeError(t *testing.T) {
 	// leaving the slug free for a later good create.
 	_, err = client.CreateOrUpdate(ctx, "w2", conditionalBadSpec{Val: "bad", Bad: true})
 	require.Error(t, err)
-	_, err = store.GetObjectBySlug(ctx, gk, "w2")
+	_, err = store.ObjectsGetBySlug(ctx, gk, "w2")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 }
 
@@ -848,7 +848,7 @@ func TestClientWritesWakeOnlyAfterOuterCommit(t *testing.T) {
 	}
 }
 
-// TestClientNoOpUpdateDoesNotWake pins the wake to a real row change. UpdateSpec
+// TestClientNoOpUpdateDoesNotWake pins the wake to a real row change. ObjectsUpdateSpec
 // suppresses an identical-bytes write entirely — no generation bump, no
 // resource_version bump, no event — so a wake would be the lone signal claiming
 // something happened. It also closes a spin: a controller that idempotently
@@ -1071,7 +1071,7 @@ func TestClientGetBySlugFound(t *testing.T) {
 	// Create a named object via the store directly (client.Create uses nil slug).
 	specJSON, err := json.Marshal(cSpec{Val: "hello"})
 	require.NoError(t, err)
-	raw, err := store.CreateObject(ctx, &RawObject{
+	raw, err := store.ObjectsCreate(ctx, &RawObject{
 		Group: clientTestGK.Group, Kind: clientTestGK.Kind,
 		Slug: new("myobj"), Spec: specJSON,
 	})
@@ -1192,7 +1192,7 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, pending.ID, got.ID)
 	assert.Equal(t, pending.DeletionRequestedAt, got.DeletionRequestedAt)
-	// RequestDeletion reports no change, so no write and no Modified event: the
+	// DeletionsRequest reports no change, so no write and no Modified event: the
 	// resource_version is the tell.
 	assert.Equal(t, pending.ResourceVersion, got.ResourceVersion)
 }
@@ -1306,49 +1306,49 @@ func TestRawToTypedDecodesNullSpecTombstone(t *testing.T) {
 	require.Error(t, err)
 }
 
-// createBadJSONStore returns bad JSON from CreateObject so rawToTyped fails.
+// createBadJSONStore returns bad JSON from ObjectsCreate so rawToTyped fails.
 type createBadJSONStore struct {
 	fakeStore
 }
 
-func (s *createBadJSONStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createBadJSONStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
-// errorCreateObjectStore returns an error from CreateObject.
-type errorCreateObjectStore struct {
+// errorObjectsCreateStore returns an error from ObjectsCreate.
+type errorObjectsCreateStore struct {
 	fakeStore
 }
 
-func (s *errorCreateObjectStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *errorObjectsCreateStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
 	return nil, errBoom
 }
 
-// updateBadJSONStore returns bad JSON from UpdateSpec so rawToTyped fails.
+// updateBadJSONStore returns bad JSON from ObjectsUpdateSpec so rawToTyped fails.
 type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, true, nil
 }
 
-// errorUpdateSpecStore returns an error from UpdateSpec.
+// errorUpdateSpecStore returns an error from ObjectsUpdateSpec.
 type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) UpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
 	return nil, false, errBoom
 }
 
-// slugErrorStore returns a non-NotFound error from GetObjectBySlug, driving
+// slugErrorStore returns a non-NotFound error from ObjectsGetBySlug, driving
 // CreateOrUpdate's default (read-error) branch.
 type slugErrorStore struct {
 	fakeStore
 }
 
-func (s *slugErrorStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *slugErrorStore) ObjectsGetBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1357,22 +1357,22 @@ type requestDeletionBySlugErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionBySlugErrorStore) RequestDeletionBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
+func (s *requestDeletionBySlugErrorStore) DeletionsRequestBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
 	return nil, false, errBoom
 }
 
 // createOrUpdateBadJSONStore drives CreateOrUpdate's rawToTyped error path: the
-// slug is absent (NotFound) so the create branch runs, and CreateObject returns
+// slug is absent (NotFound) so the create branch runs, and ObjectsCreate returns
 // undecodable spec bytes.
 type createOrUpdateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *createOrUpdateBadJSONStore) GetObjectBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *createOrUpdateBadJSONStore) ObjectsGetBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, ErrNotFound
 }
 
-func (s *createOrUpdateBadJSONStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createOrUpdateBadJSONStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -1383,27 +1383,27 @@ type createErrorStore struct {
 	createOrUpdateBadJSONStore
 }
 
-func (s *createErrorStore) CreateObject(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createErrorStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
 	return nil, errBoom
 }
 
-// errorListObjectsStore returns an error from ListObjects.
+// errorListObjectsStore returns an error from ObjectsList.
 type errorListObjectsStore struct {
 	fakeStore
 }
 
-func (s *errorListObjectsStore) ListObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
+func (s *errorListObjectsStore) ObjectsList(_ context.Context, _ GroupKind) ([]*RawObject, error) {
 	return nil, errBoom
 }
 
-// badJSONStore is a fakeStore whose ListObjects returns a RawObject with invalid
+// badJSONStore is a fakeStore whose ObjectsList returns a RawObject with invalid
 // spec JSON, used to drive the rawToTyped error path inside client.List.
 type badJSONStore struct {
 	fakeStore
 	gk GroupKind
 }
 
-func (s *badJSONStore) ListObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
+func (s *badJSONStore) ObjectsList(_ context.Context, _ GroupKind) ([]*RawObject, error) {
 	return []*RawObject{{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}}, nil
 }
 
@@ -1419,7 +1419,7 @@ func newWatchClient(t *testing.T, store Store, gk GroupKind) Client[tSpec, tStat
 }
 
 func TestClientCreateStoreError(t *testing.T) {
-	bh, err := New(&errorCreateObjectStore{})
+	bh, err := New(&errorObjectsCreateStore{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
 	_, err = client.Create(context.Background(), tSpec{})
@@ -1944,11 +1944,11 @@ func TestClientGetOwner(t *testing.T) {
 
 // TestClientListDependentsIncludesSelfEdge guards the wake guard against being
 // re-implemented one layer down. Skipping the self-edge is the waker's policy,
-// not the store's: filtering from_id = to_id out of ListIncomingRefs would also
+// not the store's: filtering from_id = to_id out of RefsListIncoming would also
 // suppress the wake, and would look like a tidier fix, but that call backs the
 // read API — so a self-dependency would silently vanish from ListDependents and
 // from the LoadDependents eager load. GC would not notice (it reads refs through
-// HasIncomingRefs and DeleteFinalizingDependsOnRefs, not this call), which is
+// HasIncomingRefs and RefsDeleteFinalizingDependsOn, not this call), which is
 // what makes the mis-implementation quiet: only the read surface changes.
 func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	ctx := context.Background()
@@ -2132,7 +2132,7 @@ type ownedObjectsErrorStore struct {
 	fakeStore
 }
 
-func (*ownedObjectsErrorStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (*ownedObjectsErrorStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -2153,7 +2153,7 @@ type ownedObjectsBadJSONStore struct {
 	gk GroupKind
 }
 
-func (s *ownedObjectsBadJSONStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsBadJSONStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return []*RawObject{
 		{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")},
 		{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)},
@@ -2179,11 +2179,11 @@ type ownedObjectsLoadErrorStore struct {
 	gk GroupKind
 }
 
-func (s *ownedObjectsLoadErrorStore) ListIncomingRefObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsLoadErrorStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
 }
 
-func (*ownedObjectsLoadErrorStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (*ownedObjectsLoadErrorStore) RefsGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
 	return nil, errBoom
 }
 
@@ -2242,14 +2242,14 @@ type countingStore struct {
 	incomingByIDs int
 }
 
-func (s *countingStore) GroupOutgoingRefsByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
+func (s *countingStore) RefsGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
 	s.outgoingByIDs++
-	return s.Store.GroupOutgoingRefsByID(ctx, ids, rel)
+	return s.Store.RefsGroupOutgoingByID(ctx, ids, rel)
 }
 
-func (s *countingStore) GroupIncomingRefsByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
+func (s *countingStore) RefsGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
 	s.incomingByIDs++
-	return s.Store.GroupIncomingRefsByID(ctx, ids, rel)
+	return s.Store.RefsGroupIncomingByID(ctx, ids, rel)
 }
 
 func TestClientListWithLoadOwnerBatches(t *testing.T) {
@@ -2400,16 +2400,16 @@ type refErrorStore struct {
 	Store
 }
 
-func (refErrorStore) ListOutgoingRefsByRelation(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (refErrorStore) RefsListOutgoingByRelation(context.Context, ObjectID, Relation) ([]Referrer, error) {
 	return nil, errBoom
 }
-func (refErrorStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (refErrorStore) RefsListIncoming(context.Context, ObjectID, Relation) ([]Referrer, error) {
 	return nil, errBoom
 }
-func (refErrorStore) GroupOutgoingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (refErrorStore) RefsGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
 	return nil, errBoom
 }
-func (refErrorStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (refErrorStore) RefsGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
 	return nil, errBoom
 }
 
@@ -2465,10 +2465,10 @@ type getBadJSONStore struct {
 	gk GroupKind
 }
 
-func (s *getBadJSONStore) GetObject(context.Context, ObjectID) (*RawObject, error) {
+func (s *getBadJSONStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
 	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
 }
-func (s *getBadJSONStore) GetObjectBySlug(context.Context, GroupKind, string) (*RawObject, error) {
+func (s *getBadJSONStore) ObjectsGetBySlug(context.Context, GroupKind, string) (*RawObject, error) {
 	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
 }
 
@@ -2731,16 +2731,16 @@ type eventErrStore struct {
 	Store
 }
 
-func (eventErrStore) ListEvents(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
+func (eventErrStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
 	return nil, errBoom
 }
-func (eventErrStore) GetLatestEvent(context.Context, ObjectID, string) (*RawEvent, error) {
+func (eventErrStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	return nil, errBoom
 }
 func (eventErrStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
 	return nil, errBoom
 }
-func (eventErrStore) SweepEvents(context.Context, int, time.Duration) (int, error) {
+func (eventErrStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
 	return 0, errBoom
 }
 
@@ -2902,7 +2902,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
-	_, err = store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	plain, err := client.Get(ctx, obj.ID)
@@ -2931,9 +2931,9 @@ func TestClientListLoadsEvents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	_, err = store.RecordEvent(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	_, err = store.EventsRecord(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
-	_, err = store.RecordEvent(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
+	_, err = store.EventsRecord(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
 	require.NoError(t, err)
 
 	objs, err := client.List(ctx, LoadEvents())
@@ -2961,7 +2961,7 @@ func TestClientListEvents(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := func(cat, typ, reason string) {
-		_, err := store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
+		_, err := store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
 		require.NoError(t, err)
 	}
 	rec("connection", "Warning", "ProbeFailed")
@@ -2992,7 +2992,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	_, err = store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	got, ok, err := client.GetLatestEvent(ctx, obj.ID, "connection")
@@ -3022,7 +3022,7 @@ func TestClientWatchEvents(t *testing.T) {
 	ch, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
 
-	_, err = store.RecordEvent(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	select {

@@ -248,7 +248,7 @@ func (bh *Beehive) sweepEventRetention(ctx context.Context) {
 	if bh.eventRetentionPerObject <= 0 && bh.eventRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.SweepEvents(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
+	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }
@@ -256,7 +256,7 @@ func (bh *Beehive) sweepEventRetention(ctx context.Context) {
 // sweepDeletionPending drives every deletion-pending object one step closer to
 // removal (see advanceDeletion for the routing).
 func (bh *Beehive) sweepDeletionPending(ctx context.Context) {
-	rows, err := bh.store.ListAllDeletionPending(ctx)
+	rows, err := bh.store.DeletionsListPending(ctx)
 	if err != nil {
 		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return
@@ -412,7 +412,7 @@ func (bh *Beehive) wakeDependentsBatch(ctx context.Context, batch []ObjectChange
 	if len(ids) == 0 {
 		return
 	}
-	byTarget, err := bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
+	byTarget, err := bh.store.RefsGroupIncomingByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		// Shutdown cancels this same ctx, so a change already dequeued when Stop
 		// lands fails here for no reason of its own. Escalating would arm a full

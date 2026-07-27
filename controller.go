@@ -83,7 +83,7 @@ type ControllerClient[Status any] interface {
 	// read and the declaration reaches nobody — the dependency waker resolves
 	// dependents at the instant of the change, and the edge does not exist yet —
 	// and the dependent then settles at its own generation on the stale read,
-	// where ListUnsettledIDs structurally cannot see it. So if toID has moved past
+	// where ObjectsListUnsettledIDs structurally cannot see it. So if toID has moved past
 	// targetResourceVersion by the time the edge commits, fromID is requeued: it
 	// declared a dependency on a version that is already superseded.
 	//
@@ -168,12 +168,12 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	}
 	// The store's UpdateStatus emits the Modified event into its transaction's
 	// collector, so it's published only after the write commits.
-	_, err = c.bh.store.UpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
+	_, err = c.bh.store.ObjectsUpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
 	return err
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	_, err := c.bh.store.SetCondition(ctx, c.gk, id, storeapi.Condition{
+	_, err := c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
 		Reason:   condition.Reason,
@@ -184,7 +184,7 @@ func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id Obje
 }
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	_, err := c.bh.store.DeleteCondition(ctx, c.gk, id, conditionType)
+	_, err := c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType)
 	return err
 }
 
@@ -201,7 +201,7 @@ func (c *controllerClientImpl[Status]) RecordEvent(ctx context.Context, id Objec
 			return err
 		}
 	}
-	_, err := c.bh.store.RecordEvent(ctx, c.gk, id, storeapi.Event{
+	_, err := c.bh.store.EventsRecord(ctx, c.gk, id, storeapi.Event{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,
@@ -212,23 +212,23 @@ func (c *controllerClientImpl[Status]) RecordEvent(ctx context.Context, id Objec
 }
 
 func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
-	_, err := c.bh.store.DeleteFinalizer(ctx, c.gk, id, finalizer)
+	_, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
 	return err
 }
 
 // AddDependency implements the contract documented on ControllerClient. The
 // relation is always "depends_on" (owner edges come from WithOwner at create
-// time). Both writes — the edge and the durable wake stamp — live inside AddRef,
+// time). Both writes — the edge and the durable wake stamp — live inside RefsAdd,
 // which is atomic on its own, so the Within here is not what makes either safe;
 // it is only the seam for this method's own composition, joining a controller's
 // Within when nested rather than opening a second transaction.
 //
 // They are in the store rather than sequenced here precisely because a nested
-// Within unwinds nothing: a stamp issued as a second call after AddRef returned
+// Within unwinds nothing: a stamp issued as a second call after RefsAdd returned
 // would leave a caller who handles this method's error free to commit the edge
 // without it — a dependent stranded on a stale read, which is the race this
 // method exists to close. Ordering inside one store call is the guarantee (see
-// AddRef), and WakeStamped reports what it did rather than having the conjunction
+// RefsAdd), and WakeStamped reports what it did rather than having the conjunction
 // recomputed here, where the two halves could drift apart.
 //
 // The wake is a conjunction — the edge is new *and* the target moved — and both
@@ -253,7 +253,7 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 		// The store rejects a version above the target's own before it inserts (see
 		// ErrTargetResourceVersionFuture), so a bad claim leaves no edge regardless
 		// of whose transaction this is running in.
-		res, err := c.bh.store.AddRef(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
+		res, err := c.bh.store.RefsAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
 		if err != nil {
 			return err
 		}
@@ -273,7 +273,7 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 
 func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fromID, toID ObjectID) error {
 	return c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if err := c.bh.store.DeleteRef(ctx, fromID, toID, RelationDependsOn); err != nil {
+		if err := c.bh.store.RefsDelete(ctx, fromID, toID, RelationDependsOn); err != nil {
 			return err
 		}
 		// Removing the edge can unblock toID's physical deletion (refs are RESTRICT).
@@ -284,7 +284,7 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fro
 		if wakes == nil {
 			return nil
 		}
-		target, err := c.bh.store.GetObjectMeta(ctx, toID)
+		target, err := c.bh.store.ObjectsGetMeta(ctx, toID)
 		if errors.Is(err, ErrNotFound) {
 			return nil // target already gone
 		}
@@ -310,19 +310,19 @@ func (c *controllerClientImpl[Status]) GetOwner(ctx context.Context, id ObjectID
 }
 
 func (c *controllerClientImpl[Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListOutgoingRefsByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.RefsListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
+	return c.bh.store.RefsListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
+	return c.bh.store.RefsListIncoming(ctx, id, RelationOwnedBy)
 }
 
 func (c *controllerClientImpl[Status]) HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error) {
-	return c.bh.store.HasIncomingRefs(ctx, id)
+	return c.bh.store.RefsHasIncoming(ctx, id)
 }
 
 // Within opens a transaction and runs fn under it; the ControllerClient writes fn
