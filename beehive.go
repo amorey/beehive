@@ -295,6 +295,18 @@ type waker struct {
 	waitRetry func(ctx context.Context, d time.Duration) bool
 }
 
+// commitRule says how far a processed batch lets the watermark move. The three
+// cases differ because the two delivery paths make different promises: the live
+// stream is in first-touch order and may leave changes queued below a batch, while
+// a replay page is version-ordered and complete up to its own last row.
+type commitRule int
+
+const (
+	commitStaged  commitRule = iota // a full live batch: record the high, move nothing
+	commitDrained                   // a short live batch: the receiver was empty
+	commitOrdered                   // a replay page: complete up to its own high
+)
+
 const (
 	// wakerRetryBase is the first resubscribe delay; wakerRetryCap bounds every
 	// later one. The ceiling is on the interval and never on the number of attempts:
@@ -348,6 +360,9 @@ func (dw *waker) start(runCtx context.Context) {
 // been missed before any cursor was known.
 func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor int64, err error) {
 	var attempt int
+	// seeded says a cursor has been taken. Distinct from "watermark != 0", which a
+	// legitimately-zero cursor cannot express.
+	var seeded bool
 	for round := 0; ctx.Err() == nil; round++ {
 		if round > 0 {
 			w, cursor, err = dw.bh.store.ObjectWritesSubscribe(ctx)
@@ -362,9 +377,24 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 			dw.bh.log().WarnContext(ctx, "dependency waker subscription failed; retrying, and dependency wakes are not being delivered for any kind until it succeeds",
 				"attempt", attempt+1, "err", err)
 		default:
-			if round == 0 {
+			switch {
+			case !seeded && round == 0:
 				dw.watermark, dw.seen = cursor, cursor
-			} else {
+			case !seeded:
+				// The first subscribe failed, so no cursor was ever known and a replay
+				// would start at zero — every live object, paged, with an edges lookup
+				// each, on the connection every writer shares. That is the whole-world
+				// pass this design replaced, bought with one transient error, so take
+				// this cursor instead and say plainly what it skips: changes made during
+				// the outage are not replayed. The reconciler's startup pass covers them
+				// unless it was turned off (see WithStartupResync).
+				dw.bh.log().WarnContext(ctx, "dependency waker subscribed after an initial failure; changes made before it are not replayed, and the startup pass is what covers them",
+					"cursor", cursor)
+				dw.watermark, dw.seen = cursor, cursor
+			default:
+				// A new stream: nothing staged against the old one can be trusted against
+				// this one, so the staging area restarts from the cursor itself.
+				dw.seen = dw.watermark
 				// Keep replaying until one gets through, exactly as the in-run path does.
 				// Dropping a failed replay would leave the watermark below the gap while
 				// the live stream carried it past — and those changes would never wake
@@ -376,6 +406,7 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 					attempt++
 				}
 			}
+			seeded = true
 			if dw.run(ctx, w) {
 				// Reset only when the stream actually got work through. A stream that
 				// delivers one batch and closes, over and over, is a run of outages, not
@@ -453,7 +484,7 @@ func (dw *waker) replay(ctx context.Context) bool {
 		}
 		// dependentsWake advances the watermark itself, which is what makes the next
 		// page start where this one ended.
-		if !dw.dependentsWake(ctx, page, true) {
+		if !dw.dependentsWake(ctx, page, commitOrdered) {
 			return false
 		}
 		if len(page) < replayPageCap {
@@ -504,7 +535,11 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 			// so everything published so far has reached us and the highest version
 			// seen is a safe resume point. A full batch may have left changes queued
 			// below it (first-touch order), so it stages instead.
-			if dw.dependentsWake(ctx, batch, len(batch) < writeBatchCap) {
+			commit := commitStaged
+			if len(batch) < writeBatchCap {
+				commit = commitDrained
+			}
+			if dw.dependentsWake(ctx, batch, commit) {
 				progressed = true
 			} else {
 				// The batch was dropped and the watermark still points below it, so the
@@ -554,15 +589,18 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, safe bool) bool {
+func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit commitRule) bool {
 	var high int64
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
-		// Every reference counts toward the cursor, including the ones with nothing to
-		// wake. Deletes carry no dependents and the hub annihilates transients, so on
-		// a delete-heavy store those are most of the traffic — a watermark that only
-		// moved on wakeable changes would trail arbitrarily far behind and turn a
-		// bounded replay into a whole-table scan.
+		// Every reference that *arrives* counts toward the cursor, including the ones
+		// with nothing to wake: a delete carries no dependents, but its version is
+		// still a version this consumer has accounted for, and on a delete-heavy store
+		// those are most of what arrives. A cursor that moved only on wakeable changes
+		// would trail arbitrarily far behind and turn a bounded replay into a
+		// whole-table scan. (A transient the consumer never observed does not arrive at
+		// all — writeSignalMerge annihilates the slot — so its version is simply never
+		// accounted for, and the next arrival's higher version covers it.)
 		high = max(high, ref.ResourceVersion)
 		if ref.Type != Added && ref.Type != Modified {
 			continue
@@ -577,8 +615,17 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, safe b
 		return false
 	}
 	dw.seen = max(dw.seen, high)
-	if safe {
+	switch commit {
+	case commitDrained:
+		// The receiver was empty, so everything published so far has reached us and
+		// been processed — including whatever earlier full batches staged in seen.
 		dw.watermark = dw.seen
+	case commitOrdered:
+		// A replay page: version-ordered and complete, so everything up to this page's
+		// own high is done — but nothing above it is, whatever seen may hold from an
+		// earlier live batch. Jumping to seen here would step over the range between,
+		// which is precisely the range seen exists to keep out of the cursor.
+		dw.watermark = max(dw.watermark, high)
 	}
 	return true
 }

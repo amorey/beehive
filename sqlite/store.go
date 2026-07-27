@@ -275,6 +275,26 @@ func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.ChangeType, 
 }
 
 func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
+	// Self-wrapping is what keeps publication in commit order: Within holds
+	// publishMu across commit-and-publish, and outside it changeEmit publishes
+	// inline, so two concurrent direct calls could draw versions 100 and 101 and
+	// publish them the other way round. A consumer reading those versions as a
+	// cursor — the dependency waker does — would then step over 100 and never
+	// replay it. Store is public, so the guarantee cannot rest on every caller
+	// happening to be inside a transaction already; a nested Within is free.
+	var created *storeapi.RawObject
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		created, err = s.objectsCreate(ctx, obj)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+func (s *sqliteStore) objectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
 	finalizers := marshalFinalizers(obj.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
@@ -591,9 +611,7 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, 
 	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
 	for rows.Next() {
 		w := storeapi.ObjectWrite{Type: storeapi.Modified}
-		if err := rows.Scan(&w.ID, &w.ResourceVersion); err != nil {
-			return nil, err
-		}
+		_ = rows.Scan(&w.ID, &w.ResourceVersion) // two INTEGER columns into int64 never error
 		writes = append(writes, w)
 	}
 	return writes, rows.Err()
@@ -1404,6 +1422,12 @@ func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, owner
 }
 
 func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) error {
+	// Self-wrapped for the same reason as ObjectsCreate: publication order is
+	// commit order only inside Within.
+	return s.Within(ctx, func(ctx context.Context) error { return s.objectsDelete(ctx, id) })
+}
+
+func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {

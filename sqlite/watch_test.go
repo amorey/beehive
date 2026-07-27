@@ -1431,3 +1431,16 @@ func assertObjectChanges(t *testing.T, w *storeapi.ObjectWritesSubscription, wan
 		assert.Equal(t, typ, ref.Type)
 	}
 }
+
+// The cursor is read after the receiver is registered, so a store that cannot
+// answer for it must release the receiver rather than hand back a subscription
+// with no resume point.
+func TestObjectWritesSubscribeCursorReadFailure(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close() // the store itself is still open, so the read is what fails
+
+	w, cursor, err := store.ObjectWritesSubscribe(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, w)
+	assert.Zero(t, cursor)
+}

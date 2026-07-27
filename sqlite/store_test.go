@@ -3518,3 +3518,44 @@ func TestResourceVersionMonotonicInCommitOrder(t *testing.T) {
 	require.NoError(t, err)
 	assert.Greater(t, after.ResourceVersion, prev, "a delete cannot make the cursor regress")
 }
+
+// A non-positive limit is rejected rather than passed through: SQLite reads a
+// negative LIMIT as unbounded, which is the opposite of what such a caller asked
+// for, and the preallocation below it would panic on a negative capacity.
+func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	_, err := store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	for _, limit := range []int{0, -1} {
+		got, err := store.ObjectWritesListSince(ctx, 0, limit)
+		require.NoError(t, err)
+		assert.Empty(t, got, "limit %d asks for nothing, not for everything", limit)
+	}
+}
+
+// ObjectsCreate and ObjectsDelete draw the resource version inside their own
+// transaction, so a failure there aborts the write with nothing published. Dropping
+// the sequence is the only way in: a closed database fails at BeginTx instead,
+// before the version is ever drawn.
+func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("create", func(t *testing.T) {
+		store := newRawStore(t)
+		_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+		require.NoError(t, err)
+		_, err = store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+		require.Error(t, err)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		store := newRawStore(t)
+		obj, err := store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		_, err = store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+		require.NoError(t, err)
+		require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+	})
+}

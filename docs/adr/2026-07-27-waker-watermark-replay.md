@@ -53,6 +53,12 @@ already held. So the highest version in a batch says nothing about what is still
 queued below it, and taking it as a resume point would step over changes that were
 never processed. A full batch stages its high-water mark instead; a short one commits it.
 
+A **replay page** commits differently again: it is version-ordered and complete up to
+its own last row, so it advances the cursor by *that* row — never by the staged value,
+which may sit far above it. Committing the staged value on a replay page would step
+over the whole range between, which is exactly the range staging exists to keep out of
+the cursor.
+
 On a failed lookup the waker stops consuming and retries from the watermark. That keeps
 the cursor a scalar and removes the second hazard by construction: batches do not arrive
 version-ordered across a failure either, so advancing on receipt would let a later batch
@@ -101,6 +107,13 @@ Three properties this rests on, each asserted rather than assumed:
   frees the target — but a row that vanished had no dependents left to strand.
 - **Coalescing is not loss.** The hub delivers the latest state per object and the waker is
   level-triggered, so replaying "object X changed" once equals replaying it five times.
+
+**Not covered: changes made before the first successful subscribe.** If the initial
+subscribe fails, no cursor was ever taken, so the only honest resume point is zero —
+and replaying from zero is the whole-world pass this design replaces, bought with one
+transient error. The waker takes the first cursor it can get and warns that changes
+before it are not replayed; the reconciler's startup pass is what covers them, unless
+`WithStartupResync(false)` turned it off.
 
 **Not covered: a crash during an outage.** The watermark is in memory, and persisting it
 would not fix this — a watermark records *delivery*, while what must survive a restart is
