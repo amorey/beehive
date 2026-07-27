@@ -37,7 +37,7 @@ func newTestStore(t *testing.T) beehive.Store {
 }
 
 // newEventObject creates a bare object of testGK and returns its id, for the
-// RecordEvent tests to hang events off.
+// EventsRecord tests to hang events off.
 func newEventObject(t *testing.T, store beehive.Store) storeapi.ObjectID {
 	t.Helper()
 	obj, err := store.ObjectsCreate(context.Background(), &beehive.RawObject{
@@ -145,7 +145,7 @@ func TestRecordEventCategoriesIndependent(t *testing.T) {
 	assert.Equal(t, 2, conn2.Count)
 }
 
-// RecordEvent is kind-scoped like the other id-keyed mutators: a foreign id is
+// EventsRecord is kind-scoped like the other id-keyed mutators: a foreign id is
 // ErrWrongKind, a missing id is ErrNotFound, and neither writes a row.
 func TestRecordEventScoped(t *testing.T) {
 	store := newTestStore(t)
@@ -402,7 +402,7 @@ func breakEventRowRead(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
-// RecordEvent surfaces store faults from each of its steps.
+// EventsRecord surfaces store faults from each of its steps.
 func TestRecordEventStoreErrors(t *testing.T) {
 	ctx := context.Background()
 	ev := storeapi.Event{Category: "c", Type: "Normal", Reason: "R"}
@@ -3031,7 +3031,7 @@ func TestConditionAssemblyError(t *testing.T) {
 
 // TestConditionResourceVersionError drops the resource_version sequence so the
 // post-write version bump fails. It covers that error branch in both
-// SetCondition and DeleteCondition, and asserts the write is atomic with the
+// ConditionsSet and ConditionsDelete, and asserts the write is atomic with the
 // bump: when the bump fails, the condition change is rolled back rather than
 // left applied without a version bump or watch event.
 func TestConditionResourceVersionError(t *testing.T) {
@@ -3051,15 +3051,15 @@ func TestConditionResourceVersionError(t *testing.T) {
 	got, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	ready := findCondition(got.Conditions, "Ready")
-	require.NotNil(t, ready, "rolled-back SetCondition must not delete the prior condition")
-	assert.Equal(t, "True", ready.Status, "rolled-back SetCondition must not apply the changed status")
+	require.NotNil(t, ready, "rolled-back ConditionsSet must not delete the prior condition")
+	assert.Equal(t, "True", ready.Status, "rolled-back ConditionsSet must not apply the changed status")
 
 	// A delete whose version bump fails likewise rolls back, leaving the row.
 	_, err = store.ConditionsDelete(ctx, testGK, obj.ID, "Ready")
 	require.Error(t, err)
 	got, err = store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
-	assert.NotNil(t, findCondition(got.Conditions, "Ready"), "rolled-back DeleteCondition must leave the condition in place")
+	assert.NotNil(t, findCondition(got.Conditions, "Ready"), "rolled-back ConditionsDelete must leave the condition in place")
 }
 
 func TestGetConditionScanError(t *testing.T) {
@@ -3069,7 +3069,7 @@ func TestGetConditionScanError(t *testing.T) {
 
 	breakConditionRowRead(t, store, obj.ID)
 
-	// The object row reads fine, but SetCondition's getCondition pre-read hits the
+	// The object row reads fine, but ConditionsSet's getCondition pre-read hits the
 	// unreadable row and fails before any write.
 	_, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
@@ -3225,7 +3225,7 @@ func TestUpdateStatusHandshakeResourceVersionError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestDeleteConditionScopedReadError covers DeleteCondition's scoped-read error
+// TestDeleteConditionScopedReadError covers ConditionsDelete's scoped-read error
 // branch: BeginTx succeeds, but the objects table is gone so the read fails.
 func TestDeleteConditionScopedReadError(t *testing.T) {
 	store := newRawStore(t)
@@ -3237,7 +3237,7 @@ func TestDeleteConditionScopedReadError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestDeleteConditionDeleteExecError covers DeleteCondition's DELETE-exec error
+// TestDeleteConditionDeleteExecError covers ConditionsDelete's DELETE-exec error
 // branch: the object read succeeds but the conditions table is gone.
 func TestDeleteConditionDeleteExecError(t *testing.T) {
 	store := newRawStore(t)
@@ -3249,7 +3249,7 @@ func TestDeleteConditionDeleteExecError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestDeleteFinalizerResourceVersionError covers DeleteFinalizer's
+// TestDeleteFinalizerResourceVersionError covers FinalizersDelete's
 // nextResourceVersion branch: a present finalizer is removed (a real change),
 // then the version bump fails.
 func TestDeleteFinalizerResourceVersionError(t *testing.T) {

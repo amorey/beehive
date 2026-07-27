@@ -68,7 +68,7 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	log := t.log().With("id", id)
 	// Controller-client calls that free a ref target register it here; we requeue
-	// them after Reconcile returns (see DeleteDependency).
+	// them after Reconcile returns (see DependenciesDelete).
 	wakes := &pendingWakes{}
 	ctx = withPendingWakes(ctx, wakes)
 
@@ -148,7 +148,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 			log.WarnContext(ctx, "failed to decrement pending-wake count; backstop will retry", "err", err)
 		}
 	}
-	// Advance any targets the controller freed via DeleteDependency, so a
+	// Advance any targets the controller freed via DependenciesDelete, so a
 	// now-unreferenced deletion-pending target is re-examined without waiting on the GC
 	// sweep. advanceGC (not enqueueIfRegistered) rather than a plain wake because the
 	// follow-up a deletion owes is a collect, not a reconcile — it routes by the

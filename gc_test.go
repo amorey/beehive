@@ -29,7 +29,7 @@ import (
 
 // depDroppingController models a dependent that outlives its target: it depends
 // on targetID and, the moment that target starts finalizing, releases the edge
-// (DeleteDependency) so the target can be collected. The dependent itself is
+// (DependenciesDelete) so the target can be collected. The dependent itself is
 // never deleted.
 type depDroppingController struct {
 	mu       sync.Mutex
@@ -53,7 +53,7 @@ func (c *depDroppingController) Reconcile(ctx context.Context, cc ControllerClie
 		return Result{}, err
 	}
 	if target.DeletionRequestedAt != nil {
-		return Result{}, cc.DeleteDependency(ctx, depID, targetID)
+		return Result{}, cc.DependenciesDelete(ctx, depID, targetID)
 	}
 	return Result{}, nil
 }
@@ -71,14 +71,14 @@ func (c *finalizerClearingController) Reconcile(ctx context.Context, client Cont
 	}
 	for _, f := range obj.Finalizers {
 		if f == c.finalizer {
-			return Result{}, client.DeleteFinalizer(ctx, obj.ID, c.finalizer)
+			return Result{}, client.FinalizersDelete(ctx, obj.ID, c.finalizer)
 		}
 	}
 	return Result{}, nil
 }
 
 // hasIncomingRefsGatingController models the documented finalizer workflow: an
-// object holding `finalizer` clears it only once HasIncomingRefs reports no live
+// object holding `finalizer` clears it only once RefsHasIncoming reports no live
 // claim, so a shared resource outlives its last real user. Objects that don't
 // hold the finalizer are left for GC directly.
 type hasIncomingRefsGatingController struct {
@@ -98,11 +98,11 @@ func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, cc Cont
 	if !held {
 		return Result{}, nil
 	}
-	referenced, err := cc.HasIncomingRefs(ctx, obj.ID)
+	referenced, err := cc.RefsHasIncoming(ctx, obj.ID)
 	if err != nil || referenced {
 		return Result{}, err // a live user remains; keep the finalizer
 	}
-	return Result{}, cc.DeleteFinalizer(ctx, obj.ID, c.finalizer)
+	return Result{}, cc.FinalizersDelete(ctx, obj.ID, c.finalizer)
 }
 
 // waitForDeletions consumes w until it has seen a Deleted event for every id in
@@ -141,8 +141,8 @@ type collectFakeStore struct {
 	getMetaErr      error    // ObjectsGetMeta
 	markErr         error    // DeletionsMarkOwned
 	dropDependsErr  error    // RefsDeleteFinalizingDependsOn
-	hasRefs         bool     // HasIncomingRefs result
-	hasRefsErr      error    // HasIncomingRefs error
+	hasRefs         bool     // RefsHasIncoming result
+	hasRefsErr      error    // RefsHasIncoming error
 	outgoingErr     error    // RefsListOutgoing error
 	deleteObjectErr error    // ObjectsDelete error
 }
@@ -264,7 +264,7 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 // object undeletable.
 //
 // It is deliberately *not* the twin of TestClientListDependentsIncludesSelfEdge:
-// collect reads refs through HasIncomingRefs and RefsDeleteFinalizingDependsOn,
+// collect reads refs through RefsHasIncoming and RefsDeleteFinalizingDependsOn,
 // never RefsListIncoming, so a self-edge filtered out of that call would leave
 // this path untouched. The two tests cover different consumers, not two halves of
 // one mistake.

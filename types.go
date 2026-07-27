@@ -75,7 +75,7 @@ type Object[Spec, Status any] struct {
 
 	// Related data, populated only for the lookups a read requested (see LoadSet).
 	// A nil/empty field is ambiguous on its own — which loaded records what was
-	// actually fetched, so the GetOwner/ListDependencies/ListDependents/ListOwned
+	// actually fetched, so the OwnersGet/DependenciesList/DependentsList/OwnedList
 	// accessors distinguish "loaded and empty" from "never asked". These fields are
 	// unexported; reach for the accessors, never the backing storage.
 	owner        *Ref    // the owning object, if any
@@ -200,7 +200,7 @@ const (
 )
 
 // EventSpec is the caller-supplied portion of an event, passed to
-// ControllerClient.RecordEvent. It excludes the store-owned run fields (id,
+// ControllerClient.EventsRecord. It excludes the store-owned run fields (id,
 // count, window) so a caller can't set them. Consecutive emissions sharing
 // (Category, Type, Reason) coalesce into one run; Message and Detail are sampled
 // (latest wins), not part of that key.

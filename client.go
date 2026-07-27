@@ -75,7 +75,7 @@ type Client[Spec, Status any] interface {
 	// lacks the owner or finalizers you passed keeps lacking them, and created=false
 	// is the only signal you get. Do not read created=false as "exists and matches
 	// opts": a caller depending on the owner edge (for cascade collection, say) must
-	// check it with LoadOwner()/GetOwner and reconcile the difference itself.
+	// check it with LoadOwner()/OwnersGet and reconcile the difference itself.
 	// Beehive can't adopt the row for you — owner is single, so adding the edge to a
 	// row that already has a different owner would produce a two-owner object, and
 	// picking a winner is caller policy.
@@ -111,34 +111,34 @@ type Client[Spec, Status any] interface {
 	Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error)
 	WatchList(ctx context.Context) (<-chan Change[Spec, Status], error)
 
-	// GetOwner returns id's owner, if any. ok reports presence: false (with a nil
+	// OwnersGet returns id's owner, if any. ok reports presence: false (with a nil
 	// error) when the object simply has no owner. The lazy counterpart to
 	// LoadOwner() — fetch the owner only when it is actually needed.
 	//
-	// This and the three ListDependencies/ListDependents/ListOwned lookups read
+	// This and the three DependenciesList/DependentsList/OwnedList lookups read
 	// their edge query directly and do not kind-scope id: passing another kind's
 	// id reads that kind's edges, and a missing id reads empty — neither reports
 	// ErrNotFound. Reserve them for ids this client owns.
-	GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
-	// ListDependencies returns the objects id depends on (its outgoing depends_on
+	OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
+	// DependenciesList returns the objects id depends on (its outgoing depends_on
 	// edges). The lazy counterpart to LoadDependencies().
-	ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
-	// ListDependents returns the objects that depend on id (incoming depends_on).
+	DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error)
+	// DependentsList returns the objects that depend on id (incoming depends_on).
 	// The lazy counterpart to LoadDependents().
-	ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
-	// ListOwned returns the objects id owns (its incoming owned_by edges). The
+	DependentsList(ctx context.Context, id ObjectID) ([]Ref, error)
+	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
-	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
+	OwnedList(ctx context.Context, id ObjectID) ([]Ref, error)
 
 	// ListOwnedObjects returns the objects owned by ownerID that belong to THIS
-	// client's kind, fully decoded — the typed, kind-scoped form of ListOwned
+	// client's kind, fully decoded — the typed, kind-scoped form of OwnedList
 	// (which returns untyped Refs across every owned kind, leaving the caller to
 	// filter by Kind and Get each child through that kind's client). Ownership is
 	// the owned_by edge (child -> owner), so these are ownerID's children of this
-	// kind, ordered by id as ListOwned is.
+	// kind, ordered by id as OwnedList is.
 	//
 	// ownerID need not be this client's kind — it is the owner, typically another
-	// kind — and like ListOwned it is not kind-scoped or existence-checked: an
+	// kind — and like OwnedList it is not kind-scoped or existence-checked: an
 	// owner with no children of this kind, and an ownerID that doesn't exist, both
 	// read empty rather than ErrNotFound. A deletion-pending child is included;
 	// whether to skip it is the caller's call (check DeletionRequestedAt).
@@ -713,19 +713,19 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 // kind's edges and a missing id reads empty — neither surfaces as ErrNotFound —
 // so passing another kind's id through this single-kind client is silent misuse
 // rather than a clean error.
-func (c *clientImpl[Spec, Status]) GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error) {
+func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
-func (c *clientImpl[Spec, Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *clientImpl[Spec, Status]) DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error) {
 	return c.bh.store.RefsListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
-func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *clientImpl[Spec, Status]) DependentsList(ctx context.Context, id ObjectID) ([]Ref, error) {
 	return c.bh.store.RefsListIncoming(ctx, id, RelationDependsOn)
 }
 
-func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) ([]Ref, error) {
 	return c.bh.store.RefsListIncoming(ctx, id, RelationOwnedBy)
 }
 

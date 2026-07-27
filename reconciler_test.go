@@ -340,7 +340,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 }
 
 // TestDependencyRequeueRaceOnDeclare pins the read-then-declare race: a change to
-// the target that lands after the dependent read it but before AddDependency
+// the target that lands after the dependent read it but before DependenciesAdd
 // commits reaches nobody — the waker resolves dependents at the instant of
 // the change, and the edge did not exist yet. The dependent is left holding a
 // stale read with no error, no condition, and (because it settled at its own
@@ -370,7 +370,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 		})
 		// The version the read above reflects — not a fresh one, which would claim
 		// to have seen changes this pass did not.
-		return cc.AddDependency(ctx, ctrl.depID, ctrl.targetID, target.ResourceVersion)
+		return cc.DependenciesAdd(ctx, ctrl.depID, ctrl.targetID, target.ResourceVersion)
 	}
 	// Resync disabled so the dependency waker is the only thing that can requeue
 	// the dependent — the backstop must not paper over the miss.
@@ -422,7 +422,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	case ready := <-ctrl.observed:
 		assert.True(t, ready, "the requeued pass observes the target's change")
 	case <-time.After(testTimeout):
-		t.Fatal("dependent was never requeued: the target's change landed between its read and AddDependency")
+		t.Fatal("dependent was never requeued: the target's change landed between its read and DependenciesAdd")
 	}
 }
 
@@ -433,7 +433,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 // target — so no reconcile is in flight to carry the miss, and the hole is a
 // notch wider than the in-band one. In-band, the pass that loses the change at
 // least runs to completion around the declaration; here the declaration is the
-// only thing that happens, and AddDependency enqueues nothing: the edge appears
+// only thing that happens, and DependenciesAdd enqueues nothing: the edge appears
 // with fromID already settled, so a change that landed before the commit reaches
 // nobody and nothing re-derives it. With resync disabled the dependent holds a
 // stale read forever, with no error, no condition and no log line.
@@ -483,7 +483,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// The application changes the target and only then declares the edge — the
 	// out-of-band spelling of read-then-declare. Waiting for the waker's lookup
 	// makes the window deterministic: with no edge yet it comes back empty, so the
-	// change is already unclaimed by the time AddDependency commits.
+	// change is already unclaimed by the time DependenciesAdd commits.
 	store.resetLooked()
 	_, err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
@@ -491,7 +491,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// target is the application's read of the target, taken before the change
 	// above — so the version it carries is the one the decision to depend was
 	// based on, and the target has since moved past it.
-	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, target.ResourceVersion))
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID, target.ResourceVersion))
 
 	// The edge is in place and the target's change is still unobserved, so the
 	// dependent must be reconciled again and see Ready.
@@ -499,7 +499,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	case ready := <-ctrl.observed:
 		assert.True(t, ready, "the requeued pass observes the target's change")
 	case <-time.After(testTimeout):
-		t.Fatal("dependent was never requeued: the target changed before the out-of-band AddDependency declared the edge")
+		t.Fatal("dependent was never requeued: the target changed before the out-of-band DependenciesAdd declared the edge")
 	}
 }
 
@@ -572,7 +572,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// reach a running queue.
 	_, err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID, target.ResourceVersion))
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID, target.ResourceVersion))
 
 	// --- second process over the same store ---
 	bh2, err := New(db)
@@ -839,7 +839,7 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 // This is not that entry's tripwire, and must not be mistaken for one: it
 // asserts ordinary waker behaviour that both candidate fixes preserve. A
 // declare-time reachability check never reaches here (the edges come from a
-// fake, not from AddDependency — TestAddDependencyAcceptsCycle is that
+// fake, not from DependenciesAdd — TestAddDependencyAcceptsCycle is that
 // tripwire), and a work-queue rate limiter leaves a first wake immediately
 // dispatchable, which is all this test does.
 func TestWakeDependentsTwoCycle(t *testing.T) {
@@ -1708,7 +1708,7 @@ func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 }
 
 // notFoundReturningController returns ErrNotFound from its own reconcile logic —
-// e.g. an AddDependency to a target that was deleted. That is a real failure to
+// e.g. an DependenciesAdd to a target that was deleted. That is a real failure to
 // retry, not the "queued object already gone" no-op.
 type notFoundReturningController struct{}
 
@@ -2037,7 +2037,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		bh:     bh,
 		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
-			if err := cc.DeleteFinalizer(ctx, obj.ID, "f"); err != nil {
+			if err := cc.FinalizersDelete(ctx, obj.ID, "f"); err != nil {
 				return Result{}, err
 			}
 			return Result{}, errBoom
@@ -2114,7 +2114,7 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 		c.deleteOne.Do(func() { close(c.deleted) })
 		// Clear the finalizer so GC can collect the row now that the deletion has
 		// been observed (idempotent: re-clearing a gone finalizer is a no-op).
-		if err := client.DeleteFinalizer(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
+		if err := client.FinalizersDelete(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
 			return Result{}, err
 		}
 		return Result{}, nil
@@ -2398,7 +2398,7 @@ type conditionSettingController struct {
 }
 
 func (c *conditionSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
-	if err := client.SetCondition(ctx, obj.ID, Condition{
+	if err := client.ConditionsSet(ctx, obj.ID, Condition{
 		Type: "Ready", Status: ConditionTrue, Reason: "Provisioned",
 	}); err != nil {
 		return Result{}, err
@@ -2453,7 +2453,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	ctrl := &funcController{
 		signal: make(chan struct{}),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
-			_ = cc.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
+			_ = cc.ConditionsSet(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
 			return Result{}, errBoom
 		},
 	}

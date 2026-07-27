@@ -143,8 +143,8 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // Read-modify-write atomicity rests on the DSN's _txlock=immediate: BeginTx
 // issues BEGIN IMMEDIATE, so a transaction holds the sole WAL write lock from
 // BEGIN through Commit, before its first read. No other writer can commit in
-// between, so a compare-then-write (ObjectsUpdateSpec's no-op suppression, SetCondition,
-// DeleteFinalizer, …) can't act on a stale snapshot, independent of pool size.
+// between, so a compare-then-write (ObjectsUpdateSpec's no-op suppression, ConditionsSet,
+// FinalizersDelete, …) can't act on a stale snapshot, independent of pool size.
 // This only covers compound writes routed through Within; a read then a separate
 // write on the bare pool is not atomic, so keep multi-statement mutations here.
 //
@@ -640,7 +640,7 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 }
 
 // ObjectsUpdateStatus skips the status write when the incoming bytes equal the stored
-// ones, mirroring ObjectsUpdateSpec/DeleteFinalizer/DeleteCondition: no resource_version
+// ones, mirroring ObjectsUpdateSpec/FinalizersDelete/ConditionsDelete: no resource_version
 // bump, no updated_at touch, no Modified event — a watcher would otherwise see a
 // spurious diff, and downstream controllers that wake dependents off a status
 // Modified would reconcile for nothing on every unchanged health poll.
@@ -944,12 +944,12 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 }
 
 func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.RawObject, error) {
-	// Within keeps the delete and the version bump atomic (see SetCondition).
+	// Within keeps the delete and the version bump atomic (see ConditionsSet).
 	var result *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary up front (symmetric with
-		// SetCondition); the conditions table carries no group/kind to fold into
+		// ConditionsSet); the conditions table carries no group/kind to fold into
 		// the DELETE, so the gate is the object read.
 		obj, err := s.getObjectRowScoped(ctx, gk, id)
 		if err != nil {
@@ -1012,11 +1012,11 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 }
 
 // latestEventKey returns just the run key (id, type, reason) of the newest run
-// for (id, category), or ok=false if that timeline is empty. RecordEvent needs
+// for (id, category), or ok=false if that timeline is empty. EventsRecord needs
 // only the key to decide extend-vs-append, so it deliberately does not decode the
 // full row (unlike GetLatestEvent): probing the columns it is about to discard
 // would let a decode fault in an older run mask — rather than surface through —
-// the write RecordEvent is about to make.
+// the write EventsRecord is about to make.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
@@ -1038,7 +1038,7 @@ func (s *sqliteStore) EventsRecord(ctx context.Context, gk storeapi.GroupKind, i
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrNotFound/ErrWrongKind), like
-		// SetCondition — the events table carries no group/kind to fold in.
+		// ConditionsSet — the events table carries no group/kind to fold in.
 		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
 			return err
 		}
@@ -1184,7 +1184,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		}
 		remaining, removed := removeFinalizer(obj.Finalizers, finalizer)
 		// Absent finalizer: nothing changed, so don't bump resource_version or emit
-		// — a watcher would otherwise see a spurious diff (mirrors DeleteCondition).
+		// — a watcher would otherwise see a spurious diff (mirrors ConditionsDelete).
 		if !removed {
 			result, err = s.attachConditions(ctx, obj)
 			return err
@@ -1363,7 +1363,7 @@ func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) e
 
 // RefsAdd inserts a (from_id, to_id, relation) edge, stamping an owed dependency
 // wake when the caller's version claim says the target moved under it (see
-// storeapi.Store.RefsAdd for the contract, and ControllerClient.AddDependency for
+// storeapi.Store.RefsAdd for the contract, and ControllerClient.DependenciesAdd for
 // what the claim means). It neither bumps resource_version nor emits — a ref is
 // not a field of the object, so watchers would see no diff.
 //
@@ -1372,7 +1372,7 @@ func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) e
 // what makes the claim decidable at all: read as a separate statement, a write to
 // the target landing between the version read and the insert would be invisible
 // both here and to the dependency waker (the edge is not yet inserted) — which is the
-// very window AddDependency exists to close. Relying on the caller to supply the
+// very window DependenciesAdd exists to close. Relying on the caller to supply the
 // transaction, or on sqlite serializing writers on one connection, would leave
 // that as an unstated precondition of the guard.
 //

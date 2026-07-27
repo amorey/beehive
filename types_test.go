@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// GetOwner errors with ErrNotLoaded when unloaded; once loaded, ok reports
+// OwnersGet errors with ErrNotLoaded when unloaded; once loaded, ok reports
 // presence and folds away the loaded-but-ownerless case.
 func TestObjectGetOwner(t *testing.T) {
 	owner := Ref{ID: 7, Kind: "Cluster"}
@@ -50,7 +50,7 @@ func TestObjectGetOwner(t *testing.T) {
 	})
 }
 
-// ListDependencies errors with ErrNotLoaded when unloaded; a loaded-but-empty
+// DependenciesList errors with ErrNotLoaded when unloaded; a loaded-but-empty
 // result is an empty slice with a nil error.
 func TestObjectListDependencies(t *testing.T) {
 	deps := []Ref{{ID: 1}, {ID: 2}}

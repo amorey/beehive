@@ -157,7 +157,7 @@ func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, in
 	panic("not implemented: fakeStore.UpdateStatus")
 }
 func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.DeleteFinalizer")
+	panic("not implemented: fakeStore.FinalizersDelete")
 }
 func (s *fakeStore) DeletionsRequest(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.DeletionsRequest")
@@ -166,10 +166,10 @@ func (s *fakeStore) DeletionsRequestBySlug(context.Context, GroupKind, string) (
 	panic("not implemented: fakeStore.DeletionsRequestBySlug")
 }
 func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
-	panic("not implemented: fakeStore.SetCondition")
+	panic("not implemented: fakeStore.ConditionsSet")
 }
 func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.DeleteCondition")
+	panic("not implemented: fakeStore.ConditionsDelete")
 }
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")
@@ -178,7 +178,7 @@ func (s *fakeStore) DeletionsMarkOwned(context.Context, ObjectID) ([]storeapi.Re
 	panic("not implemented: fakeStore.DeletionsMarkOwned")
 }
 func (s *fakeStore) EventsRecord(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
-	panic("not implemented: fakeStore.RecordEvent")
+	panic("not implemented: fakeStore.EventsRecord")
 }
 func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
 	panic("not implemented: fakeStore.ListEvents")
@@ -415,7 +415,7 @@ func refObjectIDs(refs []Ref) []ObjectID {
 // wait for this rather than assume the waker is done.
 //
 // It is keyed on (toID, relation), not on the caller — the same lookups are also
-// reached from ListDependents and the LoadDependents eager path, and nothing here
+// reached from DependentsList and the LoadDependents eager path, and nothing here
 // can tell those from the waker. So a token means "somebody looked", and a test
 // that wants "the waker looked" must resetLooked immediately before the write it
 // expects the waker to react to. Reading the target's dependents from a test's own

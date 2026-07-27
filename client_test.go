@@ -950,7 +950,7 @@ func TestClientGetOrCreateWithOwner(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, created)
 
-	owned, err := client.ListOwned(ctx, owner.ID)
+	owned, err := client.OwnedList(ctx, owner.ID)
 	require.NoError(t, err)
 	require.Len(t, owned, 1)
 	assert.Equal(t, child.ID, owned[0].ID)
@@ -1925,19 +1925,19 @@ func TestClientGetOwner(t *testing.T) {
 	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
 
-	got, ok, err := client.GetOwner(ctx, child.ID)
+	got, ok, err := client.OwnersGet(ctx, child.ID)
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, Ref{ID: owner.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}, got)
 
 	// An ownerless object reports absence, not an error.
-	_, ok, err = client.GetOwner(ctx, owner.ID)
+	_, ok, err = client.OwnersGet(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	// A missing id is not kind-validated (no scopedGet guard): it reads as
 	// ownerless rather than ErrNotFound — the speed-for-isolation trade.
-	_, ok, err = client.GetOwner(ctx, 99999)
+	_, ok, err = client.OwnersGet(ctx, 99999)
 	require.NoError(t, err)
 	assert.False(t, ok)
 }
@@ -1946,9 +1946,9 @@ func TestClientGetOwner(t *testing.T) {
 // re-implemented one layer down. Skipping the self-edge is the waker's policy,
 // not the store's: filtering from_id = to_id out of RefsListIncoming would also
 // suppress the wake, and would look like a tidier fix, but that call backs the
-// read API — so a self-dependency would silently vanish from ListDependents and
+// read API — so a self-dependency would silently vanish from DependentsList and
 // from the LoadDependents eager load. GC would not notice (it reads refs through
-// HasIncomingRefs and RefsDeleteFinalizingDependsOn, not this call), which is
+// RefsHasIncoming and RefsDeleteFinalizingDependsOn, not this call), which is
 // what makes the mis-implementation quiet: only the read surface changes.
 func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	ctx := context.Background()
@@ -1961,7 +1961,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, addRef(ctx, store, a.ID, a.ID, RelationDependsOn))
 
-	dependents, err := client.ListDependents(ctx, a.ID)
+	dependents, err := client.DependentsList(ctx, a.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents), "a self-dependency is still a dependency")
 
@@ -1990,17 +1990,17 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
 	require.NoError(t, addRef(ctx, store, a.ID, c.ID, RelationDependsOn))
 
-	deps, err := client.ListDependencies(ctx, a.ID)
+	deps, err := client.DependenciesList(ctx, a.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{b.ID, c.ID}, refObjectIDs(deps))
 
 	// b's dependents include a.
-	dependents, err := client.ListDependents(ctx, b.ID)
+	dependents, err := client.DependentsList(ctx, b.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
 
 	// No edges -> empty, no error.
-	none, err := client.ListDependencies(ctx, b.ID)
+	none, err := client.DependenciesList(ctx, b.ID)
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
@@ -2019,12 +2019,12 @@ func TestClientListOwned(t *testing.T) {
 	c2, err := client.Create(ctx, cSpec{Val: "c2"}, WithOwner(owner.ID))
 	require.NoError(t, err)
 
-	owned, err := client.ListOwned(ctx, owner.ID)
+	owned, err := client.OwnedList(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{c1.ID, c2.ID}, refObjectIDs(owned))
 
 	// A child owns nothing -> empty, no error.
-	none, err := client.ListOwned(ctx, c1.ID)
+	none, err := client.OwnedList(ctx, c1.ID)
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
@@ -2113,7 +2113,7 @@ func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
 
 	got, err := widgets.ListOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
-	require.Len(t, got, 1, "deletion-pending children are included, as in ListOwned")
+	require.Len(t, got, 1, "deletion-pending children are included, as in OwnedList")
 	assert.Equal(t, child.ID, got[0].ID)
 	assert.NotNil(t, got[0].DeletionRequestedAt)
 }
@@ -2121,7 +2121,7 @@ func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
 func TestClientListOwnedObjectsUnknownOwner(t *testing.T) {
 	ctx, _, widgets, _, _ := ownedObjectsFixture(t)
 
-	// Like ListOwned, it reads edges: a missing owner is empty, not ErrNotFound.
+	// Like OwnedList, it reads edges: a missing owner is empty, not ErrNotFound.
 	got, err := widgets.ListOwnedObjects(ctx, 99999)
 	require.NoError(t, err)
 	assert.Empty(t, got)
@@ -2447,13 +2447,13 @@ func TestClientLazyRefsMissingIDReadsEmpty(t *testing.T) {
 
 	// The lazy lookups drop the scopedGet kind guard for speed, so a missing id
 	// reads as empty rather than ErrNotFound (matching the ControllerClient quartet).
-	deps, err := client.ListDependencies(ctx, 99999)
+	deps, err := client.DependenciesList(ctx, 99999)
 	require.NoError(t, err)
 	assert.Empty(t, deps)
-	dependents, err := client.ListDependents(ctx, 99999)
+	dependents, err := client.DependentsList(ctx, 99999)
 	require.NoError(t, err)
 	assert.Empty(t, dependents)
-	owned, err := client.ListOwned(ctx, 99999)
+	owned, err := client.OwnedList(ctx, 99999)
 	require.NoError(t, err)
 	assert.Empty(t, owned)
 }
@@ -2826,7 +2826,7 @@ func TestAdaptEventStream(t *testing.T) {
 }
 
 // The motivating use case, end-to-end through the public API: a flapping cluster's
-// connection-probe outcomes emitted via ControllerClient.RecordEvent render as the
+// connection-probe outcomes emitted via ControllerClient.EventsRecord render as the
 // aggregated, newest-first timeline the health panel shows.
 func TestEventsConnectionPanelTimeline(t *testing.T) {
 	ctx := context.Background()
@@ -2843,7 +2843,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
 		for i := 0; i < n; i++ {
-			require.NoError(t, cc.RecordEvent(ctx, cluster.ID, EventSpec{
+			require.NoError(t, cc.EventsRecord(ctx, cluster.ID, EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: msg, Detail: detail,
 			}))
 		}

@@ -45,7 +45,7 @@ var ErrInvalidOption = errors.New("beehive: option value is invalid")
 // LoadOption selects a secondary lookup to fetch alongside an object on a read.
 // It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
 // List), composing into a LoadSet. Lazy fetching is the alternative — omit the
-// selector and call Client.GetOwner/ListDependencies when the data is needed.
+// selector and call Client.OwnersGet/DependenciesList when the data is needed.
 type LoadOption func(*LoadSet)
 
 // LoadOwner selects the object's owner (its outgoing owned_by edge).

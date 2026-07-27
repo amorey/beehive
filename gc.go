@@ -17,7 +17,7 @@ package beehive
 import "context"
 
 // pendingWakes collects ref targets to requeue after Reconcile returns. A
-// ControllerClient call that frees a target (DeleteDependency) registers it here;
+// ControllerClient call that frees a target (DependenciesDelete) registers it here;
 // typedController.reconcile drains it once Reconcile returns (the freeing write has
 // already committed). It rides on the context so the long-lived, shared
 // ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
