@@ -483,8 +483,8 @@ tell "we decided against this for now" from "nobody thought of it."
   is per-kind wakers, which is the defect. If it ever bites, the shape is a small
   pool of drain goroutines over the one subscription, partitioned by target id so
   a kind's wakes stay ordered; unbuilt, and not worth the concurrency until a
-  workload shows the stall. Spec and TDD plan in
-  `specs/0a-client-only-target-waker.md`.
+  workload shows the stall. Full rationale in
+  `docs/adr/2026-07-27-store-wide-dependency-change-stream.md`.
 
 - **GC can no longer be disabled, which deleted two strand bugs instead of patching
   them** — done. `WithGCInterval(d <= 0)` now returns `ErrInvalidOption` (a new
