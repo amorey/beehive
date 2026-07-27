@@ -1,0 +1,96 @@
+# Secondary lookups: owner / dependencies / dependents / owned
+
+- **Status:** Accepted — implemented in `client.go`, `types.go`, `sqlite/store.go`.
+- **Date:** 2026-07-27 (recorded retroactively)
+
+## Context
+
+Ref edges are read on request, never folded into the object's blob-bearing
+`SELECT` — a one-to-many join would re-send the spec/status JSON per edge.
+
+## Decision: two paths, one set of loaders
+
+- **Eager** — per-call `LoadOption`s on `Get` / `GetBySlug` / `List` /
+  `ListOwnedObjects` (`resolveLoads` → `LoadSet` bitset; `loadObjectRelated` for
+  one object, `loadListRelated` for a `List` — one batched `…ByIDs` query per
+  relation, not per object).
+- **Lazy** — `Client.GetOwner` / `ListDependencies` / `ListDependents` /
+  `ListOwned`, and the same quartet on `ControllerClient`, since a `Reconcile` has
+  no read call site to pass options to.
+
+Both issue the same secondary query; eager just attaches the result and batches
+across a list.
+
+Store primitives: the relation-filtered `ListOutgoingRefsByRelation` (single) and
+the batched `GroupOutgoingRefsByID` / `GroupIncomingRefsByID` (returning a
+`map[id][]Referrer`, not a slice — hence `Group…ByID`, not `List…`; one shared
+`refsByIDs` helper, routeCol/joinCol swapped). The unfiltered `ListOutgoingRefs`
+stays for GC.
+
+There is no standing default-loads option: per-call plus lazy cover every case
+without a "queries you didn't use" footgun.
+
+## `owned` is the inverse of `owner`
+
+`GetOwner` / `LoadOwner` read the *outgoing* `owned_by` edge
+(`ListOutgoingRefsByRelation` / `GroupOutgoingRefsByID`).
+`ListOwned` / `LoadOwned` / `Object.ListOwned` read the *incoming* `owned_by` edges
+(`ListIncomingRefs` / `GroupIncomingRefsByID`) — the owner's children — exactly as
+`dependents` inverts `dependencies` over `depends_on`.
+
+`owner` is single (`WithOwner` sets one), so `fetchOwnerRef` takes the first
+`owned_by` edge; `owned` is naturally many.
+
+## Accessors gate on what was loaded
+
+The related data lives in **unexported** `Object` fields (`owner` / `dependencies` /
+`dependents` / `owned`); callers reach it only through the accessors.
+`Object.loaded` (a `LoadSet`) records what was fetched; the accessors return
+`ErrNotLoaded` when the relation wasn't requested — so a forgotten `Load*()` fails
+loudly instead of looking empty.
+
+**Accessor verb tracks cardinality** — `Get` for the at-most-one owner, `List` for
+the zero-or-more relations — so the `Object` accessors and the `Client` /
+`ControllerClient` lazy lookups spell each relation identically:
+
+- `GetOwner() (Ref, bool, error)` — bool = owner present, folding away ownerless;
+  err = not loaded.
+- `ListDependencies()` / `ListDependents()` / `ListOwned() ([]Ref, error)` —
+  loaded-empty is an empty slice plus nil err; no bool, since not-loaded is an
+  error now, not an empty.
+
+## `Client.ListOwnedObjects` is the typed counterpart of `ListOwned`
+
+It returns the decoded `[]*Object[Spec, Status]` children of *this client's kind*,
+where `ListOwned` returns untyped refs across every owned kind.
+
+It is deliberately not a fifth lazy ref lookup: the kind filter and the row read
+fold into one store primitive, `ListIncomingRefObjects(gk, toID, relation)`, so the
+Go-side `ref.Kind` filter and the `Get`-per-child the untyped shape forces on
+callers never happen. Its contract otherwise tracks `ListOwned`'s (see the godoc),
+and it takes `List`'s `LoadOption`s through the same `loadListRelated` — a list read
+whose children can't be eager-loaded would just push the per-child `Get` back one
+level.
+
+It has no `ControllerClient` twin because it can't: `ControllerClient[Status]`
+carries no `Spec` parameter, so `[]*Object[Spec, Status]` is inexpressible there —
+which is exactly why that surface's quartet is untyped refs.
+
+## The store's two multi-row object reads share one predicate seam
+
+`listObjectsWhere(tail, args…)`: the blob-bearing `SELECT` runs the internal WHERE
+fragment **once**, and the batched conditions read (`conditionsByIDs`, chunked under
+`idChunkSize` like `refsByIDs`) keys off the ids it returned.
+
+Re-running the predicate for the conditions half would be a skew bug, not a shared
+seam — the two statements aren't in one transaction, so a concurrent ref/object
+write between them could drop the conditions of a row already scanned. Keying off
+the ids also avoids paying the refs semi-join twice. An empty result skips the
+conditions round-trip.
+
+`ListObjects` supplies the kind tail; `ListIncomingRefObjects` a kind tail plus
+`o.id IN (SELECT from_id FROM refs …)` — a **semi-join, not a join**. Written as a
+join, the planner drives from `idx_objects_kind` (which already satisfies
+`ORDER BY o.id`) and probes `refs` once per object *of the kind*; `IN (SELECT …)`
+lets `idx_refs_to` drive, so the work scales with the owner's children instead of
+the table.
