@@ -68,6 +68,15 @@ type Watcher = storeapi.Watcher
 // store's WatchEvents. The client decodes its raw runs into public Events.
 type EventWatcher = storeapi.EventWatcher
 
+// ObjectChangeWatcher is a subscription to the store-wide change stream, returned
+// by the store's WatchObjectChanges. It is internal machinery for the dependency
+// waker, which needs only identity — hence batches of blob-free ObjectChanges.
+type ObjectChangeWatcher = storeapi.ObjectChangeWatcher
+
+// ObjectChange names one changed object and how it changed, with no row
+// attached. The id is the object's — a change has no identity of its own.
+type ObjectChange = storeapi.ObjectChange
+
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType
 

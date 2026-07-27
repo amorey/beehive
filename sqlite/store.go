@@ -38,9 +38,16 @@ type sqliteStore struct {
 	processStart time.Time
 
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
-	// created lazily on first use. hubMu guards the maps and the closed flag.
+	// created lazily on first use. hubMu guards the maps, changeHub and the
+	// closed flag.
 	hubMu sync.RWMutex
 	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]
+	// changeHub is the store-wide twin of hubs: every object change, of every kind,
+	// keyed by the same globally unique ObjectID, carrying the projection rather
+	// than the row (see pendingChange). Created eagerly in open — there is exactly one
+	// and no key to look it up by, so making it lazy would cost the publish path
+	// (which runs on every object write) a second lock and map lookup.
+	changeHub *conflate.Hub[storeapi.ObjectID, pendingChange]
 	// eventHubs fan the event log out, one per GroupKind, keyed by run so a run's
 	// count-bumps conflate while distinct runs stay separate (see eventKey).
 	eventHubs map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]
@@ -84,6 +91,7 @@ func (s *sqliteStore) Close() error {
 		for _, h := range s.eventHubs {
 			h.Close()
 		}
+		s.changeHub.Close()
 		s.hubs = nil
 		s.eventHubs = nil
 	}
@@ -1363,7 +1371,7 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 // wake stamp and the insert are one atomic unit however it is called. That is
 // what makes the claim decidable at all: read as a separate statement, a write to
 // the target landing between the version read and the insert would be invisible
-// both here and to wakeDependents (the edge is not yet inserted) — which is the
+// both here and to the dependency waker (the edge is not yet inserted) — which is the
 // very window AddDependency exists to close. Relying on the caller to supply the
 // transaction, or on sqlite serializing writers on one connection, would leave
 // that as an unstated precondition of the guard.

@@ -19,7 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -338,7 +341,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 
 // TestDependencyRequeueRaceOnDeclare pins the read-then-declare race: a change to
 // the target that lands after the dependent read it but before AddDependency
-// commits reaches nobody — wakeDependents resolves dependents at the instant of
+// commits reaches nobody — the waker resolves dependents at the instant of
 // the change, and the edge did not exist yet. The dependent is left holding a
 // stale read with no error, no condition, and (because it settled at its own
 // generation) nothing for the resync backstop to notice.
@@ -617,21 +620,25 @@ func TestStartToleratesWatchError(t *testing.T) {
 	_ = stop(context.Background())
 }
 
-// blockingDepsStore parks the dependency waker inside ListIncomingRefs — after it
+// blockingDepsStore parks the dependency waker inside its refs lookup — after it
 // has read a Modified event but before it re-enters Beehive's mutex via
 // enqueueIfRegistered — so a test can drive a precise interleaving with Stop.
 type blockingDepsStore struct {
 	watcherStore
-	entered chan struct{} // closed-by-send when the waker reaches ListIncomingRefs
+	entered chan struct{} // closed-by-send when the waker reaches the refs lookup
 	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
 }
 
-func (s *blockingDepsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (s *blockingDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
 	s.entered <- struct{}{}
 	<-s.release
 	// One referrer for an unregistered kind: enough to make the waker re-enter
 	// bh.mu via enqueueIfRegistered (the registration check happens after Lock).
-	return []Referrer{{ID: 1, Kind: "Widget"}}, nil
+	out := map[ObjectID][]Referrer{}
+	for _, id := range toIDs {
+		out[id] = []Referrer{{ID: 1, Kind: "Widget"}}
+	}
+	return out, nil
 }
 
 // TestStopDoesNotDeadlockWithActiveWaker guards the invariant that Stop never
@@ -639,9 +646,9 @@ func (s *blockingDepsStore) ListIncomingRefs(context.Context, ObjectID, Relation
 // enqueueIfRegistered mid-event must not deadlock against Stop, even with an
 // unbounded Stop context.
 func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
-	fw := newFakeWatcher()
+	fw := newFakeObjectChangeWatcher()
 	store := &blockingDepsStore{
-		watcherStore: watcherStore{w: fw},
+		watcherStore: watcherStore{changes: fw},
 		entered:      make(chan struct{}),
 		release:      make(chan struct{}),
 	}
@@ -652,11 +659,11 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw) })
+	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
-	fw.push(Modified, &RawObject{ID: 1})
+	fw.push(ObjectChange{ID: 1, Type: Modified})
 	<-store.entered
 
 	stopped := make(chan struct{})
@@ -678,7 +685,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 	}
 }
 
-// recordingDepsStore reports ListIncomingRefs calls on a channel and serves a preset
+// recordingDepsStore reports the targets each refs lookup asks about on a channel and serves a preset
 // watcher (via the embedded watcherStore), so a test can observe exactly which
 // events drive a wake.
 type recordingDepsStore struct {
@@ -686,8 +693,10 @@ type recordingDepsStore struct {
 	calls chan ObjectID
 }
 
-func (s *recordingDepsStore) ListIncomingRefs(_ context.Context, toID ObjectID, _ Relation) ([]Referrer, error) {
-	s.calls <- toID
+func (s *recordingDepsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+	for _, id := range toIDs {
+		s.calls <- id
+	}
 	return nil, nil
 }
 
@@ -698,19 +707,19 @@ func (s *recordingDepsStore) ListIncomingRefs(_ context.Context, toID ObjectID, 
 // over-wake harmless. Deleted is still ignored (a gone object has no dependents
 // to requeue).
 func TestDependencyWakerWakesOnChange(t *testing.T) {
-	fw := newFakeWatcher()
+	fw := newFakeObjectChangeWatcher()
 	calls := make(chan ObjectID, 1)
-	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{w: fw}, calls: calls}}
+	bh := &Beehive{store: &recordingDepsStore{watcherStore: watcherStore{changes: fw}, calls: calls}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw)
+		bh.runDependencyWaker(ctx, fw)
 		close(done)
 	}()
 
-	fw.push(Added, &RawObject{ID: 1})
+	fw.push(ObjectChange{ID: 1, Type: Added})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(1), id, "Added event wakes dependents (a coalesced create+modify)")
@@ -718,7 +727,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Added event did not trigger a wake")
 	}
 
-	fw.push(Modified, &RawObject{ID: 2})
+	fw.push(ObjectChange{ID: 2, Type: Modified})
 	select {
 	case id := <-calls:
 		assert.Equal(t, ObjectID(2), id, "Modified event wakes dependents of the changed object")
@@ -726,7 +735,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 		t.Fatal("Modified event did not trigger a wake")
 	}
 
-	fw.push(Deleted, &RawObject{ID: 3})
+	fw.push(ObjectChange{ID: 3, Type: Deleted})
 	select {
 	case <-calls:
 		t.Fatal("Deleted event triggered a dependents wake")
@@ -737,27 +746,51 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	waitClosed(t, done, "waker to exit")
 }
 
-// depsStore returns a fixed dependent set from ListIncomingRefs, so a test can
-// control the exact edges — and their order — that wakeDependents walks.
+// depsStore serves a per-target dependent set from the waker's batched lookup
+// and records what it was asked, so a test can control the exact edges — and
+// their order — that the waker walks, and assert that a batch of targets costs
+// one query rather than one per target.
 type depsStore struct {
 	fakeStore
-	deps []Referrer
+	deps  map[ObjectID][]Referrer
+	calls atomic.Int64
+	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *depsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
-	return s.deps, nil
+func (s *depsStore) GroupIncomingRefsByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+	s.calls.Add(1)
+	s.seen = append(s.seen, slices.Clone(toIDs))
+	out := make(map[ObjectID][]Referrer, len(toIDs))
+	for _, id := range toIDs {
+		if deps, ok := s.deps[id]; ok {
+			out[id] = deps
+		}
+	}
+	return out, nil
 }
 
-// wakerFixture builds a Beehive whose store reports deps and whose reconcilers
-// are real enough to enqueue: one per kind, each with its own work queue, so a
-// caller can assert which kind's queue a wake landed in. newWorkQueue leaves
-// onSchedule nil, so nothing reaches the reconcilers' unset scheduleHub.
-func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]*reconciler) {
+// wakerFixture builds a Beehive whose store reports deps (keyed by target) and
+// whose reconcilers are real enough to enqueue: one per kind, each with its own
+// work queue, so a caller can assert which kind's queue a wake landed in.
+// newWorkQueue leaves onSchedule nil, so nothing reaches the reconcilers' unset
+// scheduleHub.
+func wakerFixture(deps map[ObjectID][]Referrer, kinds ...GroupKind) (*Beehive, *depsStore, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	for _, gk := range kinds {
 		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
 	}
-	return &Beehive{store: &depsStore{deps: deps}, reconcilers: rs}, rs
+	store := &depsStore{deps: deps}
+	return &Beehive{store: store, reconcilers: rs}, store, rs
+}
+
+// changed is the waker's input shape: the ids as Modified references, which is
+// what a target's change looks like on the store-wide stream.
+func changed(ids ...ObjectID) []ObjectChange {
+	refs := make([]ObjectChange, 0, len(ids))
+	for _, id := range ids {
+		refs = append(refs, ObjectChange{ID: id, Type: Modified})
+	}
+	return refs
 }
 
 // TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
@@ -768,9 +801,9 @@ func wakerFixture(deps []Referrer, kinds ...GroupKind) (*Beehive, map[GroupKind]
 // TODO.md covers the shape this guard does not fix.
 func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, rs := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
+	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
-	bh.wakeDependents(context.Background(), 1)
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
 }
@@ -790,9 +823,9 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 		{ID: 2, Kind: "Widget"},
 		{ID: 3, Kind: "Gadget"},
 	}
-	bh, rs := wakerFixture(deps, widget, gadget)
+	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: deps}, widget, gadget)
 
-	bh.wakeDependents(context.Background(), 1)
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
@@ -812,12 +845,12 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
-	bhA, rsA := wakerFixture([]Referrer{{ID: 2, Kind: "Widget"}}, gk)
-	bhA.wakeDependents(context.Background(), 1)
+	bhA, _, rsA := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 2, Kind: "Widget"}}}, gk)
+	bhA.wakeDependentsBatch(context.Background(), changed(1))
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
-	bhB, rsB := wakerFixture([]Referrer{{ID: 1, Kind: "Widget"}}, gk)
-	bhB.wakeDependents(context.Background(), 2)
+	bhB, _, rsB := wakerFixture(map[ObjectID][]Referrer{2: {{ID: 1, Kind: "Widget"}}}, gk)
+	bhB.wakeDependentsBatch(context.Background(), changed(2))
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
@@ -870,10 +903,10 @@ func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], ob
 	return Result{}, nil
 }
 
-// errDepsStore returns an error from ListIncomingRefs.
+// errDepsStore returns an error from the refs lookup.
 type errDepsStore struct{ fakeStore }
 
-func (*errDepsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (*errDepsStore) GroupIncomingRefsByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
 	return nil, errBoom
 }
 
@@ -881,18 +914,18 @@ func (*errDepsStore) ListIncomingRefs(context.Context, ObjectID, Relation) ([]Re
 // the target still reconciled, and the resync backstop will retry the waking.
 func TestWakeDependentsListError(t *testing.T) {
 	bh := &Beehive{store: &errDepsStore{}}
-	bh.wakeDependents(context.Background(), 1)
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 }
 
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
 // ends (channel closed), not only on context cancellation.
 func TestDependencyWakerStreamEnd(t *testing.T) {
-	fw := newFakeWatcher()
-	bh := &Beehive{store: &watcherStore{w: fw}}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		bh.runDependencyWaker(context.Background(), fw)
 		close(done)
 	}()
 
@@ -2827,7 +2860,7 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &errDepsStore{}, logger: logger}
 
-	bh.wakeDependents(context.Background(), 1)
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "dependents lookup failed",
 		"a dropped wake must not be silent")
@@ -2849,25 +2882,26 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bh.wakeDependents(ctx, 1)
+	bh.wakeDependentsBatch(ctx, changed(1))
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
 }
 
 // TestDependencyWakerStreamEndLogs pins the second. A closed change stream ends
-// the waker for the life of the process — nothing re-subscribes — so every future
-// change on that kind reaches no dependent at all. No reachable path closes the
+// the waker for the life of the process — nothing re-subscribes, and it is the
+// process's only stream — so every future change to every kind reaches no
+// dependent at all. No reachable path closes the
 // channel short of store Close today, which makes this latent rather than live;
 // unlogged either way.
 func TestDependencyWakerStreamEndLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWatcher()
-	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		bh.runDependencyWaker(context.Background(), fw)
 		close(done)
 	}()
 
@@ -2879,17 +2913,17 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 }
 
 // TestDependencyWakerCancelDoesNotLog is the negative: an ordinary shutdown ends
-// every waker, and that is not a loss. Warning on it would put a line per kind in
-// every clean stop, training operators to ignore the one message that matters.
+// the waker, and that is not a loss. Warning on it would put a line in every
+// clean stop, training operators to ignore the one message that matters.
 func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWatcher()
-	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger}
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, GroupKind{Kind: "Widget"}, fw)
+		bh.runDependencyWaker(ctx, fw)
 		close(done)
 	}()
 
@@ -2995,7 +3029,7 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 	r1, r2 := &reconciler{}, &reconciler{}
 	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
 
-	bh.wakeDependents(context.Background(), 1)
+	bh.wakeDependentsBatch(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "forcing a full resync pass")
 	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
@@ -3008,13 +3042,13 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 // of death and strand everything after it.
 func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWatcher()
+	fw := newFakeObjectChangeWatcher()
 	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger, order: []*reconciler{r1, r2}}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), GroupKind{Kind: "Widget"}, fw)
+		bh.runDependencyWaker(context.Background(), fw)
 		close(done)
 	}()
 	fw.endStream()
@@ -3050,13 +3084,13 @@ func (shutdownCtx) Err() error            { return context.Canceled }
 // one message that matters gets trained out of an operator.
 func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWatcher()
+	fw := newFakeObjectChangeWatcher()
 	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{w: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger, order: []*reconciler{r1, r2}}
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(shutdownCtx{context.Background()}, GroupKind{Kind: "Widget"}, fw)
+		bh.runDependencyWaker(shutdownCtx{context.Background()}, fw)
 		close(done)
 	}()
 	fw.endStream()
@@ -3154,4 +3188,238 @@ func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
 		assert.Contains(t, out, "Requeue", "the caller owns recovery here, so name the primitive")
 		assert.NotContains(t, out, "escalating", "do not promise a repair that cannot run")
 	})
+}
+
+// TestWakeDependentsBatchOneQuery verifies a batch of changed targets resolves
+// in a single refs query. The store runs on one connection, so the waker's reads
+// serialize against every writer in the process — per-burst instead of
+// per-change is what keeps a hot kind from taxing them.
+func TestWakeDependentsBatchOneQuery(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	bh, store, rs := wakerFixture(map[ObjectID][]Referrer{
+		1: {{ID: 10, Kind: "Widget"}},
+		2: {{ID: 20, Kind: "Widget"}},
+		3: {{ID: 30, Kind: "Widget"}},
+	}, gk)
+
+	bh.wakeDependentsBatch(context.Background(), changed(1, 2, 3))
+
+	assert.Equal(t, int64(1), store.calls.Load(), "one query for the whole batch")
+	assert.Equal(t, []ObjectID{10, 20, 30}, rs[gk].work.items)
+}
+
+// TestWakeDependentsBatchDedups verifies the waker does not ask twice about one
+// target. The store's conflating hub already coalesces per object, but the wake
+// policy must not lean on that: a repeated id is a wasted round-trip on the
+// single connection, and a repeated dependent is a wasted reconcile.
+func TestWakeDependentsBatchDedups(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	bh, store, rs := wakerFixture(map[ObjectID][]Referrer{
+		1: {{ID: 10, Kind: "Widget"}},
+	}, gk)
+
+	bh.wakeDependentsBatch(context.Background(), changed(1, 1, 1))
+
+	require.Len(t, store.seen, 1)
+	assert.Equal(t, []ObjectID{1}, store.seen[0], "the repeated target is asked about once")
+	assert.Equal(t, []ObjectID{10}, rs[gk].work.items)
+}
+
+// TestWakeDependentsBatchSkipsSelfEdgePerTarget verifies the self-edge skip is
+// evaluated against the target each dependent set belongs to, not against the
+// batch as a whole: object 2 depends on itself *and* on 1, so it must be woken
+// by 1's change while being skipped for its own.
+func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{
+		1: {{ID: 2, Kind: "Widget"}},
+		2: {{ID: 2, Kind: "Widget"}},
+	}, gk)
+
+	bh.wakeDependentsBatch(context.Background(), changed(1, 2))
+
+	assert.Equal(t, []ObjectID{2}, rs[gk].work.items, "woken for 1's change, skipped for its own")
+}
+
+// clientOnlyGK is a kind used through Client with no Register: it has no
+// reconciler, so nothing in bh.order names it. A depends_on edge may still point
+// at one of its objects — configuration, secrets, any "reference data" the
+// application writes and controllers read.
+var clientOnlyGK = GroupKind{Kind: "Config"}
+
+// newClientOnlyTargetFixture builds the shape the defect lives in: one
+// registered kind D, one client-only kind T, an edge D depends_on T, and D
+// already settled. Every periodic driver that could paper over a missed wake is
+// disabled — no startup resync, no resync tick, and a catchup interval far
+// beyond the test — so the only thing that can requeue D is the dependency
+// waker. The GC sweeper's interval cannot be disabled, so it is set long enough
+// to never fire on its own; tests that need a sweep drive it directly.
+func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, chan *Object[tSpec, tStatus], func()) {
+	t.Helper()
+	ctx := context.Background()
+	store := newClientTestStore(t)
+
+	bh, err := New(store, WithGCInterval(time.Hour))
+	require.NoError(t, err)
+	reconciled := make(chan *Object[tSpec, tStatus], 16)
+	_, err = Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{ch: reconciled},
+		WithResyncInterval(0),
+		WithCatchupInterval(time.Hour),
+		WithStartupResync(false))
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	return bh, store, reconciled, func() { _ = stop(ctx) }
+}
+
+// awaitReconcile waits for a reconcile of id, ignoring any others.
+func awaitReconcile(t *testing.T, ch chan *Object[tSpec, tStatus], id ObjectID, msg string) {
+	t.Helper()
+	for {
+		select {
+		case obj := <-ch:
+			if obj.ID == id {
+				return
+			}
+		case <-time.After(testTimeout):
+			t.Fatal(msg)
+		}
+	}
+}
+
+// TestClientOnlyTargetWakesDependent is the defect: a depends_on edge may point
+// at an object of a kind with no controller, and a per-registered-kind waker
+// never observes it. Not a dropped wake — none is ever attempted, so no amount
+// of healthy operation repairs it. With every periodic driver disabled, the
+// dependent must still be requeued when its client-only target changes.
+func TestClientOnlyTargetWakesDependent(t *testing.T) {
+	ctx := context.Background()
+	bh, store, reconciled, stop := newClientOnlyTargetFixture(t)
+	defer stop()
+
+	dep, err := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"}).Create(ctx, tSpec{})
+	require.NoError(t, err)
+	target, err := NewClient[tSpec, tStatus](bh, clientOnlyGK).Create(ctx, tSpec{})
+	require.NoError(t, err)
+	awaitReconcile(t, reconciled, dep.ID, "the dependent's creation reconcile did not run")
+	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	_, err = store.SetCondition(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	awaitReconcile(t, reconciled, dep.ID,
+		"the dependent was never woken: its target's kind has no controller, so no waker observed the change")
+}
+
+// TestClientOnlyTargetCreatedAfterStart is the same defect for a target whose
+// kind has no objects at all when Start runs. It is the discriminating case
+// against subscribing per kind *present in the store at Start*: that option
+// passes the test above and fails this one, which is an ordinary shape for a
+// client-only kind.
+func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
+	ctx := context.Background()
+	bh, store, reconciled, stop := newClientOnlyTargetFixture(t)
+	defer stop()
+
+	dep, err := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"}).Create(ctx, tSpec{})
+	require.NoError(t, err)
+	awaitReconcile(t, reconciled, dep.ID, "the dependent's creation reconcile did not run")
+
+	// The kind's first object is born after Start, so nothing observable at
+	// subscribe time could have named it.
+	target, err := NewClient[tSpec, tStatus](bh, clientOnlyGK).Create(ctx, tSpec{})
+	require.NoError(t, err)
+	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	_, err = store.SetCondition(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	awaitReconcile(t, reconciled, dep.ID,
+		"the dependent was never woken for a target kind whose first object appeared after Start")
+}
+
+// TestClientOnlyTargetDeletionUnwedges is the unrecoverable half of the defect.
+// refs.to_id is ON DELETE RESTRICT, so a target with dependents cannot be
+// physically removed: Delete sets the tombstone and emits Modified, and only the
+// dependents' own reconciles can drop the edge that blocks collection. With no
+// waker for the target's kind that Modified reaches nobody, so the row stays
+// deletion-pending and the GC sweeper retries it forever with no way to
+// progress — and unlike the case above, no configuration recovers it inside a
+// running process.
+func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
+	ctx := context.Background()
+	bh, store, reconciled, stop := newClientOnlyTargetFixture(t)
+	defer stop()
+
+	widget := GroupKind{Kind: "Widget"}
+	dep, err := NewClient[tSpec, tStatus](bh, widget).Create(ctx, tSpec{})
+	require.NoError(t, err)
+	targetClient := NewClient[tSpec, tStatus](bh, clientOnlyGK)
+	target, err := targetClient.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	awaitReconcile(t, reconciled, dep.ID, "the dependent's creation reconcile did not run")
+	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	awaitReconcile(t, reconciled, dep.ID,
+		"the dependent was never woken by its target's tombstone, so nothing can drop the edge that RESTRICT-blocks collection")
+
+	// The wake is only half the story: with the edge dropped, the target must
+	// actually collect rather than stay deletion-pending forever.
+	require.NoError(t, store.DeleteRef(ctx, dep.ID, target.ID, RelationDependsOn))
+	_, err = bh.collect(ctx, target.ID)
+	require.NoError(t, err)
+	_, err = store.GetObject(ctx, target.ID)
+	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")
+}
+
+// TestSubscribeFailureReportsWholeProcess pins the blast radius the single
+// store-wide stream created. With a waker per registered kind, a failed
+// subscribe cost one kind's wakes and the message named that kind; there is now
+// one stream, so a failure costs every kind's — and an operator reading "for
+// this kind" would go looking for a scope that no longer exists. Two registered
+// kinds, one message, no kind named, and both reconcilers escalated.
+func TestSubscribeFailureReportsWholeProcess(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh, err := New(&watcherStore{err: errBoom}, WithLogger(logger))
+	require.NoError(t, err)
+	for _, kind := range []string{"Widget", "Gadget"} {
+		_, err := Register(bh, GroupKind{Kind: kind}, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+	}
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stop(context.Background()))
+
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "dependency waker subscription failed"),
+		"one stream, one warning — not one per registered kind")
+	assert.Contains(t, out, "for any kind", "the consequence is process-wide, so say so")
+	assert.NotContains(t, out, "kind=Widget", "there is no per-kind scope left to name")
+	for gk, r := range bh.reconcilers {
+		assert.True(t, r.resyncAlways.Load(), "every kind's later ticks are escalated: %v", gk)
+	}
+}
+
+// TestDeadWakerReportsWholeProcess is the same blast radius on the other loss
+// point: a stream that ends is the process's only stream, so no kind gets
+// dependency wakes again.
+func TestDeadWakerReportsWholeProcess(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	fw := newFakeObjectChangeWatcher()
+	bh := &Beehive{store: &watcherStore{changes: fw}, logger: logger}
+
+	done := make(chan struct{})
+	go func() {
+		bh.runDependencyWaker(context.Background(), fw)
+		close(done)
+	}()
+	fw.endStream()
+	waitClosed(t, done, "waker to exit on stream end")
+
+	out := buf.String()
+	assert.Contains(t, out, "for every kind")
+	assert.NotContains(t, out, "group=", "there is no per-kind scope left to name")
 }

@@ -6,7 +6,7 @@ wishlist. Each one records what would make it worth doing, so the next reader ca
 tell "we decided against this for now" from "nobody thought of it."
 
 - **A dependency cycle of length ≥ 2 spins the waker at full speed** — known, not
-  fixed; the self-edge half *is* fixed. `wakeDependents` skips `from_id == to_id`
+  fixed; the self-edge half *is* fixed. `wakeDependentsBatch` skips `from_id == to_id`
   (see the guard's comment), so a self-dependency no longer re-enqueues itself.
   Two objects that depend on each other still do: A's emitted write wakes B, B's
   wakes A, with no rate limiter in `workQueue.addLocked` and no already-settled
@@ -173,7 +173,7 @@ tell "we decided against this for now" from "nobody thought of it."
   the restart path already handles.
 
   Deferred as a *durable* fix because it is not local to this timing. Stamping
-  `pending_wake` in `wakeDependents` would make every target change a write per
+  `pending_wake` in `wakeDependentsBatch` would make every target change a write per
   dependent on the wake path — the cost `pending_wake` avoids today by riding a
   write `AddRef` was already doing — and the decrement is per-pass, so a
   stamp-per-change would need the same count-not-flag reasoning re-derived against
@@ -195,7 +195,7 @@ tell "we decided against this for now" from "nobody thought of it."
   owner can never be physically collected.
 
   Nothing event-driven recovers it. `AddRef` bumps no `resource_version` and emits
-  nothing, so no watcher fires; `wakeDependents` reads only `depends_on` and would
+  nothing, so no watcher fires; `wakeDependentsBatch` reads only `depends_on` and would
   ignore the edge regardless; the child's own `collect` returns at the
   `DeletionRequestedAt == nil` early-out because *it* is not finalizing; and the owner
   is re-woken by `collect`'s `toWake` referents only when a child row is physically
@@ -427,7 +427,64 @@ tell "we decided against this for now" from "nobody thought of it."
   grows a watermark for another reason, which removes most of the work.
 
 
+- **The store keeps two hubs carrying the same changes** — known, not fixed.
+  `hubs[gk]` (keyed `ObjectID`, carrying `RawChange`) and `changeHub` (keyed
+  `ObjectID`, carrying the projected `pendingChange`) are fed by the same `publish`,
+  so every object write pays two `Send`s and `Close` has one more hub to tear
+  down. One hub keyed `struct{GroupKind; ObjectID}` would serve all three
+  consumers — `WatchList(gk)` filtering on the kind half, `Watch(gk, id)` on the
+  whole key (it already filters by id alone, since ids are globally unique), and
+  `WatchObjectChanges` not filtering at all — with conflation granularity unchanged.
+  Deferred because the value types have deliberately diverged: the store-wide
+  stream must not carry `*RawObject` (it would pin blobs), so a single hub means
+  either giving the snapshot watchers the projection and re-reading rows, or
+  giving the waker the blobs back. Worth revisiting if a third consumer appears,
+  or if `conflate` grows a value-projecting receiver.
+
 ## Resolved
+
+- **Dependency targets of client-only kinds got no waker at all** — done.
+  `Start` subscribed one waker per *registered* kind, but a `depends_on` edge may
+  point at an object of any kind, including one used through `Client` with no
+  `Register`. Changes to such a target reached no waker: not a dropped wake, none
+  attempted, so nothing in healthy operation repaired it, and only
+  `WithStartupResync` covered it — at the *next process start*. The sharper case
+  had no cover at all: `refs.to_id` is `ON DELETE RESTRICT`, so deleting such a
+  target only sets a tombstone, and with no dependent woken to drop the edge the
+  row stays deletion-pending while the GC sweeper retries it every tick, forever.
+
+  The fix is one store-wide stream: `Store.WatchObjectChanges(ctx)` replaces the
+  per-kind `WatchChanges(gk)` (which had no other caller), and `Start` runs a
+  single waker over it. It is the only option that cannot go stale — any per-kind
+  subscription list has to be computed from something (the registered set, the
+  kinds present at `Start`, the kinds currently referenced by an edge), and each
+  of those misses a case. Routing needed no change: dependents were always
+  enqueued by their own kind through `enqueueIfRegistered`.
+
+  Two costs came with it and are paid inside the same change. The stream carries
+  `ObjectChange{ID, Type}` rather than `RawChange`, because it sees every write in
+  the process and an undelivered `*RawObject` pins that row's blobs; and its
+  feeder drains the receiver with `TryRecv`, so a burst costs one
+  `GroupIncomingRefsByID` rather than one `ListIncomingRefs` per change — the
+  store is single-connection, so the waker's reads serialize against every
+  writer. Draining at the receiver rather than through a buffered channel is what
+  keeps conflation alive to the handoff.
+
+  What it does *not* fix, and what it costs. Both waker failure branches are now
+  process-wide: one lost subscription or one ended stream kills dependency wakes
+  for every kind. Two `Beehive`s on one store each observe the other's kinds —
+  filtered correctly, but paid for in refs queries. And **the single waker
+  goroutine is a process-wide head-of-line block**: K independent wakers became
+  one, so a slow `GroupIncomingRefsByID` — which queues behind writers on the
+  single connection — now delays wakes for *every* kind, where before it delayed
+  only its own. Batching was the agreed mitigation and it bounds throughput
+  (O(bursts) queries, not O(changes)), but it does not bound *latency*: a batch
+  still waits for the query ahead of it. Accepted deliberately — the alternative
+  is per-kind wakers, which is the defect. If it ever bites, the shape is a small
+  pool of drain goroutines over the one subscription, partitioned by target id so
+  a kind's wakes stay ordered; unbuilt, and not worth the concurrency until a
+  workload shows the stall. Full rationale in
+  `docs/adr/2026-07-27-store-wide-dependency-change-stream.md`.
 
 - **GC can no longer be disabled, which deleted two strand bugs instead of patching
   them** — done. `WithGCInterval(d <= 0)` now returns `ErrInvalidOption` (a new
@@ -504,7 +561,7 @@ tell "we decided against this for now" from "nobody thought of it."
   **The waker's three loss points**, all now logged at Warn and all repaired by
   escalating the *catchup* ticker (not resync, which is off by default — a repair
   hung off an opt-in knob would be dead where it is needed most): a failed
-  `ListIncomingRefs` arms one full pass (it cannot be narrower — the lookup that
+  `GroupIncomingRefsByID` arms one full pass (it cannot be narrower — the lookup that
   failed is what would have named the dependents); a closed change stream and a
   failed subscription each force every later pass, since they keep dropping changes
   rather than having dropped one. `Beehive.resyncKindsNextTick`/`EveryTick` fan out
@@ -700,7 +757,7 @@ tell "we decided against this for now" from "nobody thought of it."
 
   Two things it deliberately does *not* do. It is a durable *wake*, not a derived
   backstop: it recovers only signals something explicitly raised, so a wake lost
-  because `wakeDependents` swallowed its `ListIncomingRefs` error (see "Three silent
+  because `wakeDependentsBatch` swallowed its refs-lookup error (see "Three silent
   loss points" above) still heals never, and "resync is the correctness backstop"
   stays false in general. And it shares spec-convergence's coverage everywhere *but*
   the unconditional startup/tick enqueue — which is why it works under
