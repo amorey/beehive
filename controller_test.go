@@ -633,7 +633,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, objectRefIDs(refs), "the edge landed")
 
-	owed, err := real.WakesListPendingIDs(ctx, gk)
+	owed, err := real.ReconcileOwedListIDs(ctx, gk)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
 }

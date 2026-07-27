@@ -43,24 +43,24 @@ func (s *unsettledIDsStore) ObjectsListUnsettledIDs(_ context.Context, _ GroupKi
 	return s.ids, nil
 }
 
-// pendingWakeIDsStore is a fakeStore whose WakesListPendingIDs returns a fixed
+// reconcileOwedIDsStore is a fakeStore whose ReconcileOwedListIDs returns a fixed
 // slice, used to exercise the durable-wake backstop enqueue without a real
 // database — the sibling of unsettledIDsStore and deletionPendingIDsStore.
-type pendingWakeIDsStore struct {
+type reconcileOwedIDsStore struct {
 	fakeStore
 	ids []ObjectID
 }
 
-func (s *pendingWakeIDsStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *reconcileOwedIDsStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
-// tickOnlyPendingWakeStore reports its owed wakes from the second call onward, so
+// tickOnlyReconcileOwedStore reports its owed wakes from the second call onward, so
 // the startup enqueue sees an empty set and only a resync tick can supply the IDs.
 // That is what makes the tick observable: the two calls are otherwise identical,
 // and a test that let the startup pass answer would pass with the tick's enqueue
 // deleted.
-type tickOnlyPendingWakeStore struct {
+type tickOnlyReconcileOwedStore struct {
 	fakeStore
 	ids []ObjectID
 
@@ -68,7 +68,7 @@ type tickOnlyPendingWakeStore struct {
 	calls int
 }
 
-func (s *tickOnlyPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *tickOnlyReconcileOwedStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -1105,14 +1105,14 @@ func TestEnqueueUnsettledEnqueuesReturnedIDs(t *testing.T) {
 	assert.Equal(t, []ObjectID{42, 99}, items)
 }
 
-// errPendingWakeStore fails the durable-wake listing, so a test can drive
+// errReconcileOwedStore fails the durable-wake listing, so a test can drive
 // enqueueFrom's skipped-pass branch — the one whose silence used to be
 // indistinguishable from "nothing was owed".
-type errPendingWakeStore struct {
+type errReconcileOwedStore struct {
 	fakeStore
 }
 
-func (s *errPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *errReconcileOwedStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, errBoom
 }
 
@@ -1121,12 +1121,12 @@ func (s *errPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([
 // one the new warn would panic on if it reached r.logger directly.
 func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
 	r := &reconciler{
-		store:      &errPendingWakeStore{},
+		store:      &errReconcileOwedStore{},
 		work:       newWorkQueue(),
 		backoffFor: make(map[ObjectID]time.Duration),
 	}
 
-	r.enqueuePendingWake(context.Background()) // r.logger is nil: must warn, not panic
+	r.enqueueReconcileOwed(context.Background()) // r.logger is nil: must warn, not panic
 
 	r.work.mu.Lock()
 	items := append([]ObjectID(nil), r.work.items...)
@@ -1134,19 +1134,19 @@ func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
 	assert.Empty(t, items, "a failed list enqueues nothing")
 }
 
-// TestEnqueuePendingWake verifies that enqueuePendingWake enqueues exactly the IDs
-// returned by WakesListPendingIDs, in order — the sibling of the test above.
+// TestEnqueueReconcileOwed verifies that enqueueReconcileOwed enqueues exactly the IDs
+// returned by ReconcileOwedListIDs, in order — the sibling of the test above.
 // Only its failed-list branch was covered (TestEnqueueFromListErrorSkipsPass), so
 // the helper whose whole purpose is not losing an owed wake was the one of the
 // three that could have stopped enqueuing anything without a test noticing.
-func TestEnqueuePendingWake(t *testing.T) {
+func TestEnqueueReconcileOwed(t *testing.T) {
 	r := &reconciler{
-		store:      &pendingWakeIDsStore{ids: []ObjectID{5, 8}},
+		store:      &reconcileOwedIDsStore{ids: []ObjectID{5, 8}},
 		work:       newWorkQueue(),
 		backoffFor: make(map[ObjectID]time.Duration),
 	}
 
-	r.enqueuePendingWake(context.Background())
+	r.enqueueReconcileOwed(context.Background())
 
 	r.work.mu.Lock()
 	items := append([]ObjectID(nil), r.work.items...)
@@ -1154,8 +1154,8 @@ func TestEnqueuePendingWake(t *testing.T) {
 	assert.Equal(t, []ObjectID{5, 8}, items)
 }
 
-// TestCatchupTickEnqueuesPendingWake covers run's *tick* call to
-// enqueuePendingWake at the unit level, with no store: the restart test that pins
+// TestCatchupTickEnqueuesReconcileOwed covers run's *tick* call to
+// enqueueReconcileOwed at the unit level, with no store: the restart test that pins
 // durable-wake recovery disables every ticker, so deleting the tick's enqueue left
 // the suite green. Owed wakes ride the catchup tick, not resync — a wake is
 // recorded work, which is what catchup exists to drain.
@@ -1163,7 +1163,7 @@ func TestEnqueuePendingWake(t *testing.T) {
 // A disabled startup resync plus a store that withholds its owed IDs until the second
 // listing means neither the startup pass nor any other backstop can be what
 // enqueues the object — only a tick can.
-func TestCatchupTickEnqueuesPendingWake(t *testing.T) {
+func TestCatchupTickEnqueuesReconcileOwed(t *testing.T) {
 	const owedID = ObjectID(21)
 
 	reconciled := make(chan ObjectID, 1)
@@ -1178,7 +1178,7 @@ func TestCatchupTickEnqueuesPendingWake(t *testing.T) {
 	}
 	r := &reconciler{
 		adapter:          adapter,
-		store:            &tickOnlyPendingWakeStore{ids: []ObjectID{owedID}},
+		store:            &tickOnlyReconcileOwedStore{ids: []ObjectID{owedID}},
 		work:             newWorkQueue(),
 		catchupInterval:  time.Millisecond, // the tick is the code under test
 		maxRetryInterval: time.Second,
@@ -1559,22 +1559,22 @@ type owedBadSpecStore struct {
 }
 
 func (s *owedBadSpecStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
-	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), PendingWake: 2}, nil
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), ReconcileOwed: 2}, nil
 }
 
-func (s *owedBadSpecStore) WakesDecrement(context.Context, ObjectID, int64) error {
+func (s *owedBadSpecStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
 	s.decremented = true
 	return nil
 }
 
-// TestTypedControllerReconcileQuarantineKeepsPendingWake pins that quarantining an
+// TestTypedControllerReconcileQuarantineKeepsReconcileOwed pins that quarantining an
 // undecodable row does not drain its owed wake. The pass never reached the
 // controller, so the wake is still owed; draining it would silently discard a real
 // obligation and leave the dependent stale with nothing recording it. The count is
 // meant to outlive the poison and be serviced by the first pass that can decode —
 // so a future refactor must not "fix" this by hoisting the decrement above the
 // quarantine return.
-func TestTypedControllerReconcileQuarantineKeepsPendingWake(t *testing.T) {
+func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 	store := &owedBadSpecStore{}
 	bh := &Beehive{store: store}
 	tc := &typedController[cSpec, cStatus]{
@@ -1864,16 +1864,16 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	assert.NotNil(t, got.ObservedGeneration)
 }
 
-// reconcilePendingWakeHarness builds a typedController over a real store, driven
+// reconcileOwedHarness builds a typedController over a real store, driven
 // synchronously so the decrement has run by the time reconcile returns. wrap, if
 // non-nil, decorates the store the controller writes through (to inject a failing
 // mutator); the returned count always reads the real store underneath it.
-// reconcilePendingWakeHarness returns the pieces the durable-wake tests need,
+// reconcileOwedHarness returns the pieces the durable-wake tests need,
 // including owe: seeding an owed wake goes through the concrete store, since
-// WakesIncrement is deliberately absent from the Store interface (EdgesAdd is
+// ReconcileOwedIncrement is deliberately absent from the Store interface (EdgesAdd is
 // production's only producer). A closure rather than the store itself because the
 // concrete type is unexported in package sqlite and so cannot be named here.
-func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
+func reconcileOwedHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
 	t.Helper()
 	ctx := context.Background()
 	s, err := sqlite.OpenMemory()
@@ -1901,18 +1901,18 @@ func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedCo
 		t.Helper()
 		got, err := s.ObjectsGet(ctx, raw.ID)
 		require.NoError(t, err)
-		return got.PendingWake
+		return got.ReconcileOwed
 	}
-	owe := func() error { return s.WakesIncrement(ctx, raw.ID) }
+	owe := func() error { return s.ReconcileOwedIncrement(ctx, raw.ID) }
 	return tc, inner, raw.ID, count, owe
 }
 
-// TestReconcileDecrementsPendingWake pins the durable-wake decrement: a successful
+// TestReconcileDecrementsReconcileOwed pins the durable-wake decrement: a successful
 // pass services one owed wake (count down by one), and a failed pass leaves the
 // count owed for the backstop to retry.
-func TestReconcileDecrementsPendingWake(t *testing.T) {
+func TestReconcileDecrementsReconcileOwed(t *testing.T) {
 	ctx := context.Background()
-	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+	tc, inner, id, count, owe := reconcileOwedHarness(t, nil)
 
 	// Success decrements the owed count to zero.
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
@@ -1933,15 +1933,15 @@ func TestReconcileDecrementsPendingWake(t *testing.T) {
 	assert.Equal(t, int64(1), count(t), "a failed pass leaves the wake owed")
 }
 
-// TestReconcileDrainsMultiplePendingWakes pins that one pass services every wake
+// TestReconcileDrainsMultipleOwedPasses pins that one pass services every wake
 // it observed, not just one. A crashed process can leave a count above 1; the
 // backstop enqueues that row exactly once (the work queue coalesces), so a pass
 // that subtracted only 1 would strand the remainder with nothing to re-enqueue it —
 // indefinitely when resync is disabled, and one per tick otherwise. Subtracting the
 // observed count drains it in the single pass the backstop scheduled.
-func TestReconcileDrainsMultiplePendingWakes(t *testing.T) {
+func TestReconcileDrainsMultipleOwedPasses(t *testing.T) {
 	ctx := context.Background()
-	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+	tc, inner, id, count, owe := reconcileOwedHarness(t, nil)
 
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, nil
@@ -1957,8 +1957,8 @@ func TestReconcileDrainsMultiplePendingWakes(t *testing.T) {
 	assert.Zero(t, count(t), "one recovery pass drains every wake it observed")
 }
 
-// TestReconcilePendingWakeSurvivesConcurrentWake pins the condition the reviewer
-// surfaced, and the reason pending_wake is a count rather than a single token: a
+// TestReconcileOwedSurvivesConcurrentIncrement pins the condition the reviewer
+// surfaced, and the reason reconcile_owed is a count rather than a single token: a
 // second wake owed *while a reconcile is already servicing an earlier one* must not
 // be lost. Under the reverted design (the token was the target's resource_version)
 // two wakes for the same unchanged target shared a value, so the reconcile's clear
@@ -1966,9 +1966,9 @@ func TestReconcileDrainsMultiplePendingWakes(t *testing.T) {
 // lost it entirely. As a +1/-1 count it cannot: the mid-pass increment outlives the
 // pass's subtraction (it lands above the count that pass observed), leaving the
 // object owed and re-enqueued by the backstop.
-func TestReconcilePendingWakeSurvivesConcurrentWake(t *testing.T) {
+func TestReconcileOwedSurvivesConcurrentIncrement(t *testing.T) {
 	ctx := context.Background()
-	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, nil)
+	tc, inner, id, count, owe := reconcileOwedHarness(t, nil)
 
 	// The pass is servicing one owed wake; a second is owed during it.
 	inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
@@ -1981,24 +1981,24 @@ func TestReconcilePendingWakeSurvivesConcurrentWake(t *testing.T) {
 		"the wake owed during the pass is not clobbered by the pass's decrement")
 }
 
-// failDecrementPendingWakeStore fails the durable-wake decrement while delegating
+// failDecrementReconcileOwedStore fails the durable-wake decrement while delegating
 // the rest, so a test can exercise the reconciler's log-and-continue branch.
-type failDecrementPendingWakeStore struct {
+type failDecrementReconcileOwedStore struct {
 	Store
 }
 
-func (s *failDecrementPendingWakeStore) WakesDecrement(context.Context, ObjectID, int64) error {
+func (s *failDecrementReconcileOwedStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
 	return errBoom
 }
 
-// TestReconcileWakesDecrementErrorIsNonFatal pins that a failed decrement does
+// TestReconcileReconcileOwedDecrementErrorIsNonFatal pins that a failed decrement does
 // not fail the reconcile: the count stays up and the backstop re-enqueues (a
 // harmless extra pass), so shadowing the successful reconcile with the decrement
 // error would be strictly worse.
-func TestReconcileWakesDecrementErrorIsNonFatal(t *testing.T) {
+func TestReconcileReconcileOwedDecrementErrorIsNonFatal(t *testing.T) {
 	ctx := context.Background()
-	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, func(s Store) Store {
-		return &failDecrementPendingWakeStore{Store: s}
+	tc, inner, id, count, owe := reconcileOwedHarness(t, func(s Store) Store {
+		return &failDecrementReconcileOwedStore{Store: s}
 	})
 	require.NoError(t, owe())
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
@@ -2550,12 +2550,12 @@ func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
 }
 
 // wakeStampingStore is the store surface a catchup test needs: the Store contract
-// plus WakesIncrement, which is deliberately not on Store (see the comment
-// on reconcilePendingWakeHarness) but exists on the concrete sqlite store so a
+// plus ReconcileOwedIncrement, which is deliberately not on Store (see the comment
+// on reconcileOwedHarness) but exists on the concrete sqlite store so a
 // test can seed an owed wake without staging the whole declare race.
 type wakeStampingStore interface {
 	Store
-	WakesIncrement(context.Context, ObjectID) error
+	ReconcileOwedIncrement(context.Context, ObjectID) error
 }
 
 // newCatchupHarness starts a control plane whose only periodic driver is the
@@ -2576,7 +2576,7 @@ func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore))
 	store := &listProbeStore{
 		Store:           real,
 		unsettledListed: make(chan struct{}, 8),
-		wakeListed:      make(chan struct{}, 8),
+		owedListed:      make(chan struct{}, 8),
 	}
 	reconciled := make(chan ObjectID, 4)
 
@@ -2591,11 +2591,11 @@ func newCatchupHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore))
 	require.NoError(t, err)
 	t.Cleanup(func() { stop(context.Background()) })
 
-	// The startup pass runs enqueuePendingWake unconditionally; the unsettled
+	// The startup pass runs enqueueReconcileOwed unconditionally; the unsettled
 	// listing only arrives via a tick with the startup resync off, so waiting on
 	// the wake signal is what proves startup is behind us.
 	select {
-	case <-store.wakeListed:
+	case <-store.owedListed:
 	case <-time.After(testTimeout):
 		t.Fatal("startup pass never listed pending wakes")
 	}
@@ -2650,7 +2650,7 @@ func TestCatchupTickDispatchesOwedWake(t *testing.T) {
 
 	// Now owed a wake, the way a crash between a target's commit and the
 	// dependent's dispatch leaves it.
-	require.NoError(t, real.WakesIncrement(ctx, id))
+	require.NoError(t, real.ReconcileOwedIncrement(ctx, id))
 
 	select {
 	case got := <-reconciled:

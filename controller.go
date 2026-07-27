@@ -228,7 +228,7 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // would leave a caller who handles this method's error free to commit the edge
 // without it — a dependent stranded on a stale read, which is the race this
 // method exists to close. Ordering inside one store call is the guarantee (see
-// EdgesAdd), and WakeStamped reports what it did rather than having the conjunction
+// EdgesAdd), and ReconcileOwedStamped reports what it did rather than having the conjunction
 // recomputed here, where the two halves could drift apart.
 //
 // The wake is a conjunction — the edge is new *and* the target moved — and both
@@ -246,7 +246,7 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // it post-commit, so it can't reach a controller before the edge it is about, or
 // at all if the transaction rolls back. It is in-memory, and deliberately the
 // expendable half: a process that dies before it runs still finds the stamp on
-// restart, and the backstop that drains pending_wake makes the reconcile happen
+// restart, and the backstop that drains reconcile_owed makes the reconcile happen
 // late rather than never.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error {
 	return c.bh.store.Within(ctx, func(ctx context.Context) error {
@@ -257,10 +257,10 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 		if err != nil {
 			return err
 		}
-		if res.WakeStamped {
-			// The durable half already landed with the edge (pending_wake is a count of
+		if res.ReconcileOwedStamped {
+			// The durable half already landed with the edge (reconcile_owed is a count of
 			// outstanding wakes, decremented by the reconcile that services one, so a
-			// wake owed mid-pass is not lost — see the pending_wake column). This is the
+			// wake owed mid-pass is not lost — see the reconcile_owed column). This is the
 			// latency half: the in-memory requeue, so the dependent reconciles now rather
 			// than waiting for the backstop. It self-gates on registration via
 			// enqueueIfRegistered — which is also why the stamp doesn't need gating: an

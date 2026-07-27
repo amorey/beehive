@@ -105,12 +105,12 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// ongoing operational fault, and a recurring warning at that coarse cadence keeps
 		// it visible rather than logging once and going silent.
 		//
-		// Returning here also leaves any owed pending_wake count standing, which is
+		// Returning here also leaves any owed reconcile_owed count standing, which is
 		// deliberate, not an oversight of the early return: the wake is owed because a
 		// dependency moved, and this pass did not service it — the controller never
 		// saw the object. Draining it would be exactly the silent discard the
 		// quarantine is written to avoid, and would leave the dependent stale with no
-		// record that a reconcile was owed. The cost is that the pending-wake backstop
+		// record that a reconcile was owed. The cost is that the reconcile-owed backstop
 		// re-enqueues this row (and re-warns) until the bytes decode again, which is
 		// the same recurring-visibility trade as above, and it self-clears the moment a
 		// fixed build lets the pass run to the decrement below.
@@ -143,9 +143,9 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// write when nothing was owed. A failed subtraction is not fatal: the count
 	// stays up and the backstop retries it, whereas requeueing on the error would
 	// spin against a store that keeps failing.
-	if reconcileErr == nil && raw.PendingWake != 0 {
-		if err := t.bh.store.WakesDecrement(ctx, id, raw.PendingWake); err != nil {
-			log.WarnContext(ctx, "failed to decrement pending-wake count; backstop will retry", "err", err)
+	if reconcileErr == nil && raw.ReconcileOwed != 0 {
+		if err := t.bh.store.ReconcileOwedDecrement(ctx, id, raw.ReconcileOwed); err != nil {
+			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
 		}
 	}
 	// Advance any targets the controller freed via DependenciesDelete, so a
@@ -238,19 +238,19 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	r.enqueueFrom(ctx, "unsettled", r.store.ObjectsListUnsettledIDs)
 }
 
-// enqueuePendingWake enqueues objects owed a durable dependency wake (see
-// pending_wake). Like a pending deletion it is recorded, known-owed work: a
+// enqueueReconcileOwed enqueues objects owed a durable dependency wake (see
+// reconcile_owed). Like a pending deletion it is recorded, known-owed work: a
 // wake bumps no generation, so the unsettled listing never sees it, and its
 // in-memory requeue does not outlive the process — a crash between the token's
 // commit and the dispatch leaves a stranded dependent nothing else re-checks.
 // Run unconditionally at startup (like deletion-pending, not gated by the spec
 // strategy): a wake owed is a specific known-owed reconcile, orthogonal to spec
 // convergence, so declining the startup resync must not suppress it.
-func (r *reconciler) enqueuePendingWake(ctx context.Context) {
+func (r *reconciler) enqueueReconcileOwed(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "pending-wake", r.store.WakesListPendingIDs)
+	r.enqueueFrom(ctx, "reconcile-owed", r.store.ReconcileOwedListIDs)
 }
 
 // hasPeriodicPass reports whether this reconciler has a periodic driver left for
@@ -293,7 +293,7 @@ func (r *reconciler) tickResyncs() bool {
 // which backstop lost its pass (see its doc).
 func (r *reconciler) enqueueCatchup(ctx context.Context) {
 	r.enqueueUnsettled(ctx)
-	r.enqueuePendingWake(ctx)
+	r.enqueueReconcileOwed(ctx)
 }
 
 // enqueueAll enqueues every object of the kind, including ones whose spec is
@@ -327,8 +327,8 @@ func (r *reconciler) log() *slog.Logger {
 //
 // A failed list is logged, not retried: source names which backstop lost its pass,
 // because what that costs differs sharply. The two catchup listings (unsettled,
-// pending-wake) retry on the next catchup tick — unless catchup is off, where the
-// startup pass was the only one, and a lost pending-wake listing defers every
+// reconcile-owed) retry on the next catchup tick — unless catchup is off, where the
+// startup pass was the only one, and a lost reconcile-owed listing defers every
 // recorded owed wake to the next process start, the one path whose whole point is
 // not losing them. The full pass ("all") rides the resync tick, which is off by
 // default, so a failure there usually has no second chance in this process at all —

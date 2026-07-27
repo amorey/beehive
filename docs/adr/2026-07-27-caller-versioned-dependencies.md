@@ -1,7 +1,7 @@
 # Declaring a dependency is caller-versioned, and the wake has a durable twin
 
 - **Status:** Accepted — implemented in `controller.go` (policy), `sqlite/store.go`
-  (`EdgesAdd`, `pending_wake`), `reconciler.go` (drain).
+  (`EdgesAdd`, `reconcile_owed`), `reconciler.go` (drain).
 - **Date:** 2026-07-27 (recorded retroactively)
 
 ## Context
@@ -77,12 +77,12 @@ out-of-band call where `Register` hands the application a `ControllerClient`.
 
 ## The wake has a durable twin so a crash can't lose it
 
-The conjunction increments `objects.pending_wake`, so a process that dies between
+The conjunction increments `objects.reconcile_owed`, so a process that dies between
 the commit and the in-memory requeue leaves a persisted "reconcile owed".
 
 ### The stamp is inside `EdgesAdd`, and *before* the insert
 
-Reported back as `EdgesAddResult.WakeStamped`, which the requeue gates on instead of
+Reported back as `EdgesAddResult.ReconcileOwedStamped`, which the requeue gates on instead of
 recomputing the conjunction. Sequencing it as a second store call after `EdgesAdd`
 returned is the shape a reviewer caught: a nested `Within` unwinds nothing, so a
 caller who handled `DependenciesAdd`'s error would commit the edge with no wake — the
@@ -103,7 +103,7 @@ with it.
 ### The stamp is not gated on `fromID`'s kind being registered
 
 A client-only dependent never drains its count and nothing scans it either
-(`WakesListPendingIDs` is per-kind, called only by that kind's reconciler), so the
+(`ReconcileOwedListIDs` is per-kind, called only by that kind's reconciler), so the
 count is *unread* — not free: it is a permanent nonzero column and index entry, and
 re-declaring an edge (delete + re-add) with a stale claim increments it again, so it
 can grow. What it costs when that kind later gains a controller is bounded to **one**
@@ -113,7 +113,7 @@ Gating is not the cheap alternative it looks: the stamp is SQL inside `EdgesAdd`
 the store cannot know registration, so the caller would have to resolve `fromID`'s
 kind *before* the call — the per-declare pre-read that sank the earlier guard — and
 it would bake in a fact that changes between runs, losing the wake outright for a
-kind that gains a controller later. A cross-kind sweeper (the `pending_wake`
+kind that gains a controller later. A cross-kind sweeper (the `reconcile_owed`
 analogue of the global GC sweeper's `DeletionRequestsList`) is the shape that
 would reclaim it off the hot path; it is unbuilt, and in TODO.md.
 
@@ -127,8 +127,8 @@ with `blockObjectUpdates`' `BEFORE UPDATE ON objects` trigger — `RAISE(ABORT)`
 undoes the statement, not the transaction, so the outer caller *can* swallow and
 commit, which is the whole point.
 
-`WakesIncrement` is deliberately **not on the `Store` interface** — `EdgesAdd`
-is production's only wake producer and `WakesDecrement` its only consumer, so
+`ReconcileOwedIncrement` is deliberately **not on the `Store` interface** — `EdgesAdd`
+is production's only wake producer and `ReconcileOwedDecrement` its only consumer, so
 a standalone increment would be surface the declare path *cannot* use correctly (it
 can't be made atomic with the edge) and nothing else uses at all. Leaving it off
 makes "the stamp rides `EdgesAdd`" a compile-time property instead of something a test
@@ -140,10 +140,10 @@ structural: that folding the stamp in actually stamps.
 A general fix for the class — SAVEPOINTs making every nested `Within` a real
 rollback boundary — is in TODO.md, unbuilt.
 
-### `pending_wake` is a count, not a flag
+### `reconcile_owed` is a count, not a flag
 
 `typedController.reconcile` subtracts, on a successful pass, **the count it loaded**
-(`WakesDecrement(id, observed)`, floored at 0).
+(`ReconcileOwedDecrement(id, observed)`, floored at 0).
 
 A count rather than a single token is what survives the reviewer-surfaced case — a
 wake owed *while an earlier one is being reconciled*: increments landing after the
@@ -164,8 +164,8 @@ would spin against a store that keeps failing.
 
 ### The backstop
 
-`WakesListPendingIDs` over the partial index
-`idx_objects_pending_wake WHERE pending_wake != 0`. An owed wake is orthogonal to
+`ReconcileOwedListIDs` over the partial index
+`idx_objects_reconcile_owed WHERE reconcile_owed != 0`. An owed wake is orthogonal to
 spec convergence (a spec-settled object can still owe one), so it is *not* folded
 into `ObjectsListUnsettledIDs` but sits beside it in `enqueueCatchup`, which runs
 unconditionally at startup and on each catchup tick — so declining the startup
@@ -173,4 +173,4 @@ resync does not suppress recovery.
 
 Pinned end-to-end by `TestDependencyRequeueLostAcrossRestart` (one store, two
 `Beehive`s, restart under `WithStartupResync(false)` + `resyncInterval=0`) and, for
-the concurrent-wake case, `TestReconcilePendingWakeSurvivesConcurrentWake`.
+the concurrent-wake case, `TestReconcileOwedSurvivesConcurrentIncrement`.
