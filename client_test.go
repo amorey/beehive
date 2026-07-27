@@ -896,7 +896,7 @@ func TestClientNoOpUpdateDoesNotWake(t *testing.T) {
 }
 
 // TestClientDeleteAdvancesGCOnlyAfterOuterCommit covers Delete, whose follow-up is
-// advanceGC rather than a plain wake. It must wait for the outer commit for the same
+// gcAdvance rather than a plain wake. It must wait for the outer commit for the same
 // reason every other write's wake does: a reconciler woken mid-transaction would
 // either read a row whose tombstone is not visible yet, or be woken for a deletion
 // the caller then rolls back.
@@ -1197,7 +1197,7 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	assert.Equal(t, pending.ResourceVersion, got.ResourceVersion)
 }
 
-// advanceGC's registered-kind branch: the object must be handed to its controller
+// gcAdvance's registered-kind branch: the object must be handed to its controller
 // to clear finalizers, the one part of Delete's tail DeleteBySlug still runs itself
 // now that the store resolves and marks in one statement. A slug that matches no
 // row must wake nobody.
@@ -2540,7 +2540,7 @@ func TestClientRequeue(t *testing.T) {
 			// Drain the enqueue Create produced, and seed a backoff entry so the
 			// requeue's effect on the ladder is observable.
 			drainQueue(r.work)
-			seeded := r.nextBackoff(obj.ID)
+			seeded := r.backoffNext(obj.ID)
 			require.NotZero(t, seeded, "precondition: backoff seeded")
 
 			require.NoError(t, client.Requeue(ctx, obj.ID, tt.opts...))

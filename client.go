@@ -793,7 +793,7 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 	if !ok {
 		return nil, ErrNoController
 	}
-	return r.watchSchedule(ctx, id), nil
+	return r.scheduleWatch(ctx, id), nil
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
@@ -810,7 +810,7 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// deletion-pending object to the controller to clear finalizers. A client-only
 	// kind has no controller to hand it to, so it falls to the global GC sweeper —
 	// whose cadence is guaranteed, since WithGCInterval refuses to be disabled.
-	c.bh.advanceGC(ctx, c.gk, id)
+	c.bh.gcAdvance(ctx, c.gk, id)
 	return nil
 }
 
@@ -827,7 +827,7 @@ func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string
 		}
 		return err
 	}
-	c.bh.advanceGC(ctx, c.gk, obj.ID) // unconditionally, as in Delete
+	c.bh.gcAdvance(ctx, c.gk, obj.ID) // unconditionally, as in Delete
 	return nil
 }
 
@@ -839,7 +839,7 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan
 	if err != nil {
 		return nil, err
 	}
-	return c.adaptWatcher(ctx, w), nil
+	return c.adaptObjectStream(ctx, w), nil
 }
 
 func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (<-chan *ObjectChange[Spec, Status], error) {
@@ -850,15 +850,15 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 	if err != nil {
 		return nil, err
 	}
-	return c.adaptWatcher(ctx, w), nil
+	return c.adaptObjectStream(ctx, w), nil
 }
 
-// adaptWatcher decodes a store Watcher's raw events (the snapshot's Added events
+// adaptObjectStream decodes a store Watcher's raw events (the snapshot's Added events
 // followed by live changes — the store owns snapshotting, dedup, and id
 // filtering) into typed Changes. It forwards on the returned channel until
 // ctx is cancelled, the watcher's stream ends, or an event fails to decode; the
 // channel closes and the watcher is released on exit.
-func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w *ObjectsSubscription) <-chan *ObjectChange[Spec, Status] {
+func (c *clientImpl[Spec, Status]) adaptObjectStream(ctx context.Context, w *ObjectsSubscription) <-chan *ObjectChange[Spec, Status] {
 	out := make(chan *ObjectChange[Spec, Status])
 	// The migrator is invariant for the watcher's lifetime; resolve it once rather
 	// than re-locking the registry on every event.
@@ -928,7 +928,7 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 
 // adaptEventStream forwards a store EventsSubscription's raw runs as public Events
 // until ctx is cancelled or the stream ends, then closes the channel and releases
-// the watcher. Simpler than adaptWatcher: event runs carry no Spec/Status to
+// the watcher. Simpler than adaptObjectStream: event runs carry no Spec/Status to
 // decode, so there is no migrator and no per-event quarantine — it needs nothing
 // from the client, so it is a free function.
 func adaptEventStream(ctx context.Context, w *EventsSubscription) <-chan Event {

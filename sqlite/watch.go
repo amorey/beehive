@@ -47,7 +47,7 @@ func (s *sqliteStore) hubFor(gk storeapi.GroupKind) *conflate.Hub[storeapi.Objec
 	}
 	h := s.hubs[gk]
 	if h == nil {
-		h = conflate.New[storeapi.ObjectID](mergeChange)
+		h = conflate.New[storeapi.ObjectID](changeMerge)
 		s.hubs[gk] = h
 	}
 	return h
@@ -63,7 +63,7 @@ func (s *sqliteStore) eventHubFor(gk storeapi.GroupKind) *conflate.Hub[eventKey,
 	}
 	h := s.eventHubs[gk]
 	if h == nil {
-		h = conflate.New[eventKey](mergeEvent)
+		h = conflate.New[eventKey](eventMerge)
 		s.eventHubs[gk] = h
 	}
 	return h
@@ -78,17 +78,17 @@ type eventKey struct {
 	EventID  storeapi.EventID
 }
 
-// mergeEvent coalesces a run's pending event with a newer one: resource_version
+// eventMerge coalesces a run's pending event with a newer one: resource_version
 // is globally monotonic, so the higher-versioned row is the newer run state.
 // There are no tombstones, so it never drops the slot.
-func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
+func eventMerge(prev, next storeapi.Event) (storeapi.Event, bool) {
 	if prev.ResourceVersion > next.ResourceVersion {
 		return prev, true
 	}
 	return next, true
 }
 
-// mergeChange coalesces a receiver's undelivered pending event for an object
+// changeMerge coalesces a receiver's undelivered pending event for an object
 // with a newly published one. The store's resource_version is a global monotonic
 // cursor, so the higher-versioned event is always the newer lifecycle state.
 // A surviving update keeps Added type when prev was Added (it is still "new" to
@@ -97,11 +97,11 @@ func mergeEvent(prev, next storeapi.Event) (storeapi.Event, bool) {
 // object that is already covered by the subscriber's snapshot (born in the
 // subscribe→snapshot race window), in which case the consumer must still see the
 // delete. The seenIDs guard in watch() drops tombstones for objects the consumer
-// truly never observed. ObjectsWatchList overrides this with annihilatingMerge, which
+// truly never observed. ObjectsWatchList overrides this with transientDropMerge, which
 // can drop such tombstones early while preserving snapshot-covered ones. The
 // store-wide stream shares neither: it carries writeSignal, and writeSignalMerge is
 // its own policy.
-func mergeChange(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange, bool) {
+func changeMerge(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange, bool) {
 	hi := next
 	if prev.Object.ResourceVersion > next.Object.ResourceVersion {
 		hi = prev
@@ -126,7 +126,7 @@ type writeSignal struct {
 	rv  int64
 }
 
-// writeSignalMerge is mergeChange plus annihilation, over the projected value. The
+// writeSignalMerge is changeMerge plus annihilation, over the projected value. The
 // store-wide stream has no snapshot, so nothing is pre-known: an Added the
 // consumer never saw, coalescing with a Deleted, is a transient object it has no
 // reason to hear about at all — dropping the slot is what bounds a slow
@@ -153,12 +153,12 @@ func writeSignalMerge(prev, next writeSignal) (writeSignal, bool) {
 // the snapshot is loaded.
 type snapshotIDs map[storeapi.ObjectID]struct{}
 
-// annihilatingMerge is a per-receiver merge that extends mergeChange with one
+// transientDropMerge is a per-receiver merge that extends changeMerge with one
 // annihilation: when an undelivered pending Added coalesces with a Deleted, the
 // consumer was never told the object existed, so the resulting tombstone is pure
 // noise — drop the slot entirely. This is what keeps a slow consumer's memory
 // bounded by the live key set instead of growing one tombstone per transient id
-// in a high-churn kind. mergeChange (the shared default) cannot do this
+// in a high-churn kind. changeMerge (the shared default) cannot do this
 // blindly: a snapshot-covered object born in the subscribe→snapshot race window
 // also coalesces Added→Deleted, and its delete MUST survive. preserve, which is
 // required, reports the ids whose delete must be kept.
@@ -166,12 +166,12 @@ type snapshotIDs map[storeapi.ObjectID]struct{}
 // Only ObjectsWatchList reaches this. The snapshot-less consumer is the store-wide
 // stream, whose annihilation lives in writeSignalMerge — unconditional there,
 // because it has no snapshot to preserve deletes for.
-func annihilatingMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawObjectChange] {
+func transientDropMerge(preserve func(storeapi.ObjectID) bool) conflate.Merge[storeapi.RawObjectChange] {
 	return func(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange, bool) {
 		if prev.Type == storeapi.Added && next.Type == storeapi.Deleted && !preserve(next.Object.ID) {
 			return storeapi.RawObjectChange{}, false // unobserved transient: annihilate
 		}
-		return mergeChange(prev, next)
+		return changeMerge(prev, next)
 	}
 }
 
@@ -249,23 +249,23 @@ func gkOf(raw *storeapi.RawObject) storeapi.GroupKind {
 	return storeapi.GroupKind{Group: raw.Group, Kind: raw.Kind}
 }
 
-// emit delivers an event for the written row. Inside a transaction it queues on
+// changeEmit delivers an event for the written row. Inside a transaction it queues on
 // the ambient collector (flushed after commit by Within); outside one it
 // publishes immediately.
-func (s *sqliteStore) emit(ctx context.Context, typ storeapi.ChangeType, raw *storeapi.RawObject) {
+func (s *sqliteStore) changeEmit(ctx context.Context, typ storeapi.ChangeType, raw *storeapi.RawObject) {
 	gk := gkOf(raw)
 	ev := storeapi.RawObjectChange{Type: typ, Object: raw}
 	if st, ok := txFrom(ctx); ok && st.coll.add(pendingEvent{gk: gk, ev: ev}) {
 		return
 	}
-	s.publish(gk, ev)
+	s.changePublish(gk, ev)
 }
 
-// publish sends ev to gk's hub and to the store-wide writeHub, keyed by object
+// changePublish sends ev to gk's hub and to the store-wide writeHub, keyed by object
 // id so per-object updates coalesce in both. Send never blocks; a closed hub
 // drops it, which is also what makes the unguarded writeHub send safe after
 // Close.
-func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawObjectChange) {
+func (s *sqliteStore) changePublish(gk storeapi.GroupKind, ev storeapi.RawObjectChange) {
 	if h := s.hubFor(gk); h != nil {
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
@@ -273,10 +273,10 @@ func (s *sqliteStore) publish(gk storeapi.GroupKind, ev storeapi.RawObjectChange
 	_ = s.writeHub.Sender().Send(ev.Object.ID, writeSignal{typ: ev.Type, rv: ev.Object.ResourceVersion})
 }
 
-// emitEvent delivers a written run to event-log watchers: queued on the tx
+// eventEmit delivers a written run to event-log watchers: queued on the tx
 // collector inside a transaction (flushed after commit by Within), published
 // immediately otherwise. Mirrors emit.
-func (s *sqliteStore) emitEvent(ctx context.Context, gk storeapi.GroupKind, ev *storeapi.Event) {
+func (s *sqliteStore) eventEmit(ctx context.Context, gk storeapi.GroupKind, ev *storeapi.Event) {
 	if st, ok := txFrom(ctx); ok && st.coll.addEventRow(pendingEventRow{gk: gk, ev: *ev}) {
 		return
 	}
@@ -309,7 +309,7 @@ func (s *sqliteStore) flush(coll *eventCollector) {
 	coll.mu.Unlock()
 
 	for _, p := range events {
-		s.publish(p.gk, p.ev)
+		s.changePublish(p.gk, p.ev)
 	}
 	for _, p := range logRows {
 		s.publishEvent(p.gk, p.ev)
@@ -479,7 +479,7 @@ func (s *sqliteStore) snapshotAt(ctx context.Context, load func(context.Context)
 //     coalesces to Added in the buffer; seenIDs detects that the consumer already
 //     has X from the snapshot and promotes the type to Modified.
 //   - A race-window Added for X followed by a post-snapshot Deleted coalesces to
-//     Deleted (mergeChange never annihilates, to preserve real tombstones for
+//     Deleted (changeMerge never annihilates, to preserve real tombstones for
 //     snapshot-covered objects); if X was in the snapshot seenIDs lets it through,
 //     otherwise it is dropped — the object was born and died without the consumer
 //     ever observing it, and emitting a lone Deleted would be spurious.
@@ -507,7 +507,7 @@ func (s *sqliteStore) watch(
 		want := *filterID
 		rx = h.Receiver(h.WithKeyFilter(func(id storeapi.ObjectID) bool { return id == want }))
 	} else {
-		rx = h.Receiver(h.WithMerge(annihilatingMerge(snapshotPreserve(&seed))))
+		rx = h.Receiver(h.WithMerge(transientDropMerge(snapshotPreserve(&seed))))
 	}
 	if s.beforeSnapshot != nil {
 		s.beforeSnapshot() // test seam: inject events into the subscribe→snapshot window

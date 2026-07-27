@@ -79,14 +79,14 @@ func (q *workQueue) addLocked(id ObjectID) {
 		q.signal()
 	}
 	// else in flight: leave it dirty; done will re-queue it, not dispatchable now.
-	q.emitScheduleLocked(id)
+	q.scheduleEmitLocked(id)
 }
 
-// emitScheduleLocked publishes id's current schedule to onSchedule. Caller holds
+// scheduleEmitLocked publishes id's current schedule to onSchedule. Caller holds
 // mu. It carries no dedup memory: callers invoke it only at genuine transitions of
 // the dirty/alarms state (which are the sole source of truth for the schedule), so
 // no consecutive emit repeats a value. See addLocked/get/addAfter.
-func (q *workQueue) emitScheduleLocked(id ObjectID) {
+func (q *workQueue) scheduleEmitLocked(id ObjectID) {
 	if q.onSchedule == nil {
 		return
 	}
@@ -127,7 +127,7 @@ func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	// alarm (nextRequeueAt prefers queued), so only emit the fire time when the id
 	// isn't already queued for immediate dispatch.
 	if _, dirty := q.dirty[id]; !dirty {
-		q.emitScheduleLocked(id)
+		q.scheduleEmitLocked(id)
 	}
 }
 
@@ -177,13 +177,13 @@ func (q *workQueue) nextRequeueAt(id ObjectID) (time.Time, bool) {
 	return q.nextRequeueAtLocked(id)
 }
 
-// subscribeSchedule runs subscribe — which registers a schedule hub receiver —
+// scheduleSubscribe runs subscribe — which registers a schedule hub receiver —
 // and reads id's current next-requeue time atomically under mu. Holding mu across
 // both means no emit can interleave between the snapshot and the subscription, so
 // the receiver captures every change strictly after the returned snapshot (a gauge
 // consumer that briefly sees a value twice just reconverges). Returns the zero time
 // when nothing is scheduled — the caller folds that into an empty Schedule anyway.
-func (q *workQueue) subscribeSchedule(id ObjectID, subscribe func()) time.Time {
+func (q *workQueue) scheduleSubscribe(id ObjectID, subscribe func()) time.Time {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	subscribe()
@@ -233,7 +233,7 @@ func (q *workQueue) get() (ObjectID, bool) {
 		q.signal()
 	}
 	// Dispatch clears the dirty slot: absent a future alarm, the id is now unscheduled.
-	q.emitScheduleLocked(id)
+	q.scheduleEmitLocked(id)
 	return id, true
 }
 

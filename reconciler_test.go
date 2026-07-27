@@ -200,7 +200,7 @@ func TestReconcilerClearsBackoffOnSuccess(t *testing.T) {
 	r.enqueue(1)
 	waitClosed(t, succeeded, "retry reconcile to succeed")
 	cancel()
-	waitClosed(t, done, "run to exit") // worker's clearBackoff has run by now
+	waitClosed(t, done, "run to exit") // worker's backoffClear has run by now
 
 	r.backoffMu.Lock()
 	remaining := len(r.backoffFor)
@@ -659,7 +659,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.runDependencyWaker(ctx, fw.sub) })
+	bh.wg.Go(func() { bh.dependencyWakerRun(ctx, fw.sub) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
@@ -715,7 +715,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, fw.sub)
+		bh.dependencyWakerRun(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -803,7 +803,7 @@ func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), changed(1))
+	bh.dependentsWake(context.Background(), changed(1))
 
 	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
 }
@@ -825,7 +825,7 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	}
 	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: deps}, widget, gadget)
 
-	bh.wakeDependentsBatch(context.Background(), changed(1))
+	bh.dependentsWake(context.Background(), changed(1))
 
 	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
@@ -846,11 +846,11 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
 	bhA, _, rsA := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 2, Kind: "Widget"}}}, gk)
-	bhA.wakeDependentsBatch(context.Background(), changed(1))
+	bhA.dependentsWake(context.Background(), changed(1))
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
 	bhB, _, rsB := wakerFixture(map[ObjectID][]Referrer{2: {{ID: 1, Kind: "Widget"}}}, gk)
-	bhB.wakeDependentsBatch(context.Background(), changed(2))
+	bhB.dependentsWake(context.Background(), changed(2))
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
@@ -914,7 +914,7 @@ func (*errDepsStore) RefsGroupIncomingByID(context.Context, []ObjectID, Relation
 // the target still reconciled, and the resync backstop will retry the waking.
 func TestWakeDependentsListError(t *testing.T) {
 	bh := &Beehive{store: &errDepsStore{}}
-	bh.wakeDependentsBatch(context.Background(), changed(1))
+	bh.dependentsWake(context.Background(), changed(1))
 }
 
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
@@ -925,7 +925,7 @@ func TestDependencyWakerStreamEnd(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw.sub)
+		bh.dependencyWakerRun(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -1379,13 +1379,13 @@ func TestReconcilerNoConcurrentReconcileOfSameID(t *testing.T) {
 }
 
 func TestNextBackoffDefaultBase(t *testing.T) {
-	// When baseRetryInterval is 0, nextBackoff falls back to defaultBaseRetryInterval.
+	// When baseRetryInterval is 0, backoffNext falls back to defaultBaseRetryInterval.
 	r := &reconciler{
 		backoffFor:       make(map[ObjectID]time.Duration),
 		maxRetryInterval: time.Minute,
 		// baseRetryInterval left as zero
 	}
-	d := r.nextBackoff(1)
+	d := r.backoffNext(1)
 	assert.Equal(t, defaultBaseRetryInterval, d)
 }
 
@@ -1395,9 +1395,9 @@ func TestNextBackoffDoubles(t *testing.T) {
 		maxRetryInterval:  time.Minute,
 		baseRetryInterval: 10 * time.Millisecond,
 	}
-	first := r.nextBackoff(1)
+	first := r.backoffNext(1)
 	assert.Equal(t, 10*time.Millisecond, first)
-	second := r.nextBackoff(1) // cur != 0, so it doubles
+	second := r.backoffNext(1) // cur != 0, so it doubles
 	assert.Equal(t, 20*time.Millisecond, second)
 }
 
@@ -1413,17 +1413,17 @@ func TestReconcilerRequeueBackoffLadder(t *testing.T) {
 		baseRetryInterval: 10 * time.Millisecond,
 	}
 	// A failing reconcile climbs the ladder twice: 10ms → 20ms.
-	assert.Equal(t, 10*time.Millisecond, r.nextBackoff(1))
-	assert.Equal(t, 20*time.Millisecond, r.nextBackoff(1))
+	assert.Equal(t, 10*time.Millisecond, r.backoffNext(1))
+	assert.Equal(t, 20*time.Millisecond, r.backoffNext(1))
 
 	// requeue without reset preserves the ladder, so the next failure continues
 	// from where it was: 20ms → 40ms, not back to base.
 	r.requeue(1, false)
-	assert.Equal(t, 40*time.Millisecond, r.nextBackoff(1), "requeue(reset=false) must not reset the ladder")
+	assert.Equal(t, 40*time.Millisecond, r.backoffNext(1), "requeue(reset=false) must not reset the ladder")
 
 	// requeue with reset restarts the ladder from base.
 	r.requeue(1, true)
-	assert.Equal(t, 10*time.Millisecond, r.nextBackoff(1), "requeue(reset=true) must restart the ladder from base")
+	assert.Equal(t, 10*time.Millisecond, r.backoffNext(1), "requeue(reset=true) must restart the ladder from base")
 }
 
 func TestNextBackoffCaps(t *testing.T) {
@@ -1432,10 +1432,10 @@ func TestNextBackoffCaps(t *testing.T) {
 		maxRetryInterval:  50 * time.Millisecond,
 		baseRetryInterval: 40 * time.Millisecond,
 	}
-	first := r.nextBackoff(1)
+	first := r.backoffNext(1)
 	assert.Equal(t, 40*time.Millisecond, first)
 	// 40ms * 2 = 80ms > 50ms cap → capped at 50ms.
-	second := r.nextBackoff(1)
+	second := r.backoffNext(1)
 	assert.Equal(t, 50*time.Millisecond, second)
 }
 
@@ -2278,19 +2278,19 @@ func TestIntegrationWatchScheduleClosesOnCtxCancel(t *testing.T) {
 func TestMergeSchedule(t *testing.T) {
 	prev := Schedule{NextRequeueAt: time.Unix(1, 0)}
 
-	got, keep := mergeSchedule(prev, Schedule{NextRequeueAt: time.Unix(2, 0)})
+	got, keep := scheduleMerge(prev, Schedule{NextRequeueAt: time.Unix(2, 0)})
 	assert.True(t, keep)
 	assert.Equal(t, time.Unix(2, 0), got.NextRequeueAt)
 
 	// The unscheduled zero is kept, not annihilated.
-	got, keep = mergeSchedule(prev, Schedule{})
+	got, keep = scheduleMerge(prev, Schedule{})
 	assert.True(t, keep)
 	assert.True(t, got.NextRequeueAt.IsZero())
 }
 
 // TestWatchScheduleSnapshotSendCtxDone covers the snapshot-send arm exiting on
 // context cancellation: no one reads the channel, so the goroutine parks on the
-// snapshot send and takes ctx.Done. Exit is awaited via afterWatchSchedule rather
+// snapshot send and takes ctx.Done. Exit is awaited via afterScheduleWatch rather
 // than reading the channel, which would let the send succeed and mask the arm.
 func TestWatchScheduleSnapshotSendCtxDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2305,7 +2305,7 @@ func TestWatchScheduleSnapshotSendCtxDone(t *testing.T) {
 
 	r := bh.reconcilers[clientTestGK]
 	exited := make(chan struct{})
-	r.afterWatchSchedule = func() { close(exited) }
+	r.afterScheduleWatch = func() { close(exited) }
 
 	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2336,7 +2336,7 @@ func TestWatchScheduleLiveSendCtxDone(t *testing.T) {
 	drainQueue(r.work)
 
 	exited := make(chan struct{})
-	r.afterWatchSchedule = func() { close(exited) }
+	r.afterScheduleWatch = func() { close(exited) }
 
 	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2502,7 +2502,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 
 // TestReconcilerRequeueNow verifies requeueNow cancels any pending delayed retry
 // timer and makes the id immediately dispatchable, while preserving the backoff
-// ladder (clearing is the caller's separate clearBackoff step).
+// ladder (clearing is the caller's separate backoffClear step).
 func TestReconcilerRequeueNow(t *testing.T) {
 	r := &reconciler{
 		work:              newWorkQueue(),
@@ -2511,7 +2511,7 @@ func TestReconcilerRequeueNow(t *testing.T) {
 		backoffFor:        make(map[ObjectID]time.Duration),
 	}
 	// Simulate a failed reconcile: a backoff entry and a far-future retry timer.
-	seeded := r.nextBackoff(1)
+	seeded := r.backoffNext(1)
 	r.work.addAfter(1, time.Hour)
 	require.NotZero(t, r.backoffFor[1], "precondition: backoff seeded")
 	require.NotNil(t, r.work.alarms[1], "precondition: retry timer scheduled")
@@ -2860,7 +2860,7 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &errDepsStore{}, logger: logger}
 
-	bh.wakeDependentsBatch(context.Background(), changed(1))
+	bh.dependentsWake(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "dependents lookup failed",
 		"a dropped wake must not be silent")
@@ -2882,7 +2882,7 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bh.wakeDependentsBatch(ctx, changed(1))
+	bh.dependentsWake(ctx, changed(1))
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
@@ -2901,7 +2901,7 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw.sub)
+		bh.dependencyWakerRun(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -2923,7 +2923,7 @@ func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(ctx, fw.sub)
+		bh.dependencyWakerRun(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -3029,7 +3029,7 @@ func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
 	r1, r2 := &reconciler{}, &reconciler{}
 	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
 
-	bh.wakeDependentsBatch(context.Background(), changed(1))
+	bh.dependentsWake(context.Background(), changed(1))
 
 	assert.Contains(t, buf.String(), "forcing a full resync pass")
 	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
@@ -3048,7 +3048,7 @@ func TestDeadWakerEscalatesEveryKind(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw.sub)
+		bh.dependencyWakerRun(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3090,7 +3090,7 @@ func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(shutdownCtx{context.Background()}, fw.sub)
+		bh.dependencyWakerRun(shutdownCtx{context.Background()}, fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3202,7 +3202,7 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 		3: {{ID: 30, Kind: "Widget"}},
 	}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), changed(1, 2, 3))
+	bh.dependentsWake(context.Background(), changed(1, 2, 3))
 
 	assert.Equal(t, int64(1), store.calls.Load(), "one query for the whole batch")
 	assert.Equal(t, []ObjectID{10, 20, 30}, rs[gk].work.items)
@@ -3218,7 +3218,7 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), changed(1, 1, 1))
+	bh.dependentsWake(context.Background(), changed(1, 1, 1))
 
 	require.Len(t, store.seen, 1)
 	assert.Equal(t, []ObjectID{1}, store.seen[0], "the repeated target is asked about once")
@@ -3236,7 +3236,7 @@ func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)
 
-	bh.wakeDependentsBatch(context.Background(), changed(1, 2))
+	bh.dependentsWake(context.Background(), changed(1, 2))
 
 	assert.Equal(t, []ObjectID{2}, rs[gk].work.items, "woken for 1's change, skipped for its own")
 }
@@ -3368,7 +3368,7 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
 	require.NoError(t, store.RefsDelete(ctx, dep.ID, target.ID, RelationDependsOn))
-	_, err = bh.collect(ctx, target.ID)
+	_, err = bh.gcCollect(ctx, target.ID)
 	require.NoError(t, err)
 	_, err = store.ObjectsGet(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")
@@ -3413,7 +3413,7 @@ func TestDeadWakerReportsWholeProcess(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.runDependencyWaker(context.Background(), fw.sub)
+		bh.dependencyWakerRun(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()

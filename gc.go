@@ -40,9 +40,9 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 	return w
 }
 
-// collect is the garbage-collection step for a single object, run after its
+// gcCollect is the garbage-collection step for a single object, run after its
 // controller's Reconcile returns (see typedController.reconcile) and on the global
-// GC sweep (see sweepDeletionPending). It runs in its own transaction. It is a no-op
+// GC sweep (see deletionPendingSweep). It runs in its own transaction. It is a no-op
 // unless the object is finalizing.
 //
 // Two things happen for a finalizing object:
@@ -58,7 +58,7 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 //
 // The whole step runs in one transaction so the cascade writes and the delete
 // commit together; the watch events they emit publish only on commit.
-func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err error) {
+func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	// toWake accumulates objects to requeue after the transaction commits: the
 	// cascaded children, plus (when the row is removed) the targets it was holding
 	// open. Waking post-commit means a rollback never leaves a phantom enqueue,
@@ -122,12 +122,12 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 		return false, err
 	}
 	for _, w := range toWake {
-		bh.advanceGC(ctx, w.GroupKind(), w.ID)
+		bh.gcAdvance(ctx, w.GroupKind(), w.ID)
 	}
 	return deleted, nil
 }
 
-// advanceGC moves (gk, id) forward toward collection after a deletion-related
+// gcAdvance moves (gk, id) forward toward collection after a deletion-related
 // change, once the caller's transaction (if any) has committed.
 //
 // The post-commit hook is what makes it safe to call from inside a transaction —
@@ -147,15 +147,15 @@ func (bh *Beehive) collect(ctx context.Context, id ObjectID) (deleted bool, err 
 // a spec write owes the object a reconcile, a deletion owes it a collect — and
 // advanceGCNow is where the second one's answer changes if it ever grows past a
 // requeue (a durable stamp, say, as pending_wake is for dependency wakes).
-func (bh *Beehive) advanceGC(ctx context.Context, gk GroupKind, id ObjectID) {
+func (bh *Beehive) gcAdvance(ctx context.Context, gk GroupKind, id ObjectID) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
-		bh.advanceGCNow(gk, id)
+		bh.gcAdvanceNow(gk, id)
 	})
 }
 
 // wakeAfterCommit schedules a reconciler wake for gk/id once the ambient
 // transaction commits and its watch events are out — the wake sibling of
-// advanceGC, kept non-generic here rather than on the typed client. Registering
+// gcAdvance, kept non-generic here rather than on the typed client. Registering
 // on the store rather than enqueuing after Within is what keeps the ordering
 // under nesting: a caller may have wrapped the write in ControllerClient.Within,
 // and the nested Within returns while that outer transaction is still open — so a
@@ -166,7 +166,7 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 	bh.store.AfterCommit(ctx, func(context.Context) { bh.enqueueIfRegistered(gk, id) })
 }
 
-// advanceGCNow is advanceGC's body, run with no transaction in flight. A
+// gcAdvanceNow is gcAdvance's body, run with no transaction in flight. A
 // registered kind is requeued so its own reconcile loop runs collect; a
 // client-only kind has no loop to requeue onto, and the global sweeper's next
 // tick is its backstop — which is exactly what enqueueIfRegistered's no-op arm
@@ -178,6 +178,6 @@ func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectI
 // recursive cascade of physical deletes on the caller's goroutine and ctx — so a
 // caller cancelling right after its commit could abandon the cascade mid-flight,
 // with nothing scheduled to resume it.
-func (bh *Beehive) advanceGCNow(gk GroupKind, id ObjectID) {
+func (bh *Beehive) gcAdvanceNow(gk GroupKind, id ObjectID) {
 	bh.enqueueIfRegistered(gk, id)
 }

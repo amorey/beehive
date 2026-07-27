@@ -26,7 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// sweepEventRetention trims the log to the configured bound and is a no-op until
+// eventRetentionSweep trims the log to the configured bound and is a no-op until
 // WithEventRetention sets one.
 func TestSweepEventRetention(t *testing.T) {
 	store, err := sqlite.OpenMemory()
@@ -45,7 +45,7 @@ func TestSweepEventRetention(t *testing.T) {
 	t.Run("unconfigured is a no-op", func(t *testing.T) {
 		bh, err := New(store)
 		require.NoError(t, err)
-		bh.sweepEventRetention(ctx)
+		bh.eventRetentionSweep(ctx)
 		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 4)
@@ -54,13 +54,13 @@ func TestSweepEventRetention(t *testing.T) {
 	t.Run("store error is logged, not fatal", func(t *testing.T) {
 		bad, err := New(eventErrStore{newClientTestStore(t)}, WithEventRetention(2, time.Hour))
 		require.NoError(t, err)
-		bad.sweepEventRetention(ctx) // EventsSweep errors → warn branch, must not panic
+		bad.eventRetentionSweep(ctx) // EventsSweep errors → warn branch, must not panic
 	})
 
 	t.Run("caps per object", func(t *testing.T) {
 		bh, err := New(store, WithEventRetention(2, 0))
 		require.NoError(t, err)
-		bh.sweepEventRetention(ctx)
+		bh.eventRetentionSweep(ctx)
 		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
@@ -252,7 +252,7 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// TestRunGCSweeperTicks covers runGCSweeper's periodic branch: after the startup
+// TestRunGCSweeperTicks covers gcSweeperRun's periodic branch: after the startup
 // pass it sweeps again on every resync tick. The store signals each sweep, so the
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
@@ -262,7 +262,7 @@ func TestRunGCSweeperTicks(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go bh.runGCSweeper(ctx)
+	go bh.gcSweeperRun(ctx)
 
 	recv(t, store.gcSwept) // startup pass
 	recv(t, store.gcSwept) // a periodic tick

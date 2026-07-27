@@ -293,7 +293,7 @@ func newFakeStream[V any]() fakeStream[V] {
 func (w *fakeStream[V]) endStream() { close(w.ch) }
 
 // fakeObjectStream is a controllable ObjectsSubscription, backing the client
-// adaptWatcher tests.
+// adaptObjectStream tests.
 type fakeObjectStream struct {
 	fakeStream[storeapi.RawObjectChange]
 }

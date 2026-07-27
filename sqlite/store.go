@@ -248,7 +248,7 @@ func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.ChangeType, 
 	if _, err := s.attachConditions(ctx, obj); err != nil {
 		return nil, err
 	}
-	s.emit(ctx, typ, obj)
+	s.changeEmit(ctx, typ, obj)
 	return obj, nil
 }
 
@@ -1076,7 +1076,7 @@ func (s *sqliteStore) EventsRecord(ctx context.Context, gk storeapi.GroupKind, i
 		}
 		// Publish the resulting run to event-log watchers — buffered in the tx
 		// collector and published after commit, like the object mutators' emit.
-		s.emitEvent(ctx, gk, result)
+		s.eventEmit(ctx, gk, result)
 		return nil
 	})
 	return result, err
@@ -1357,7 +1357,7 @@ func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	// drop events at or below their snapshot's version, and the row's last
 	// version may already sit in a snapshot, which would swallow the Deleted.
 	obj.ResourceVersion = rv
-	s.emit(ctx, storeapi.Deleted, obj)
+	s.changeEmit(ctx, storeapi.Deleted, obj)
 	return nil
 }
 

@@ -173,28 +173,28 @@ func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
 func TestCollectGetObjectMetaError(t *testing.T) {
 	bh, err := New(&collectFakeStore{getMetaErr: errBoom})
 	require.NoError(t, err)
-	_, err = bh.collect(context.Background(), 1)
+	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDeletionsMarkOwnedError(t *testing.T) {
 	bh, err := New(&collectFakeStore{markErr: errBoom})
 	require.NoError(t, err)
-	_, err = bh.collect(context.Background(), 1)
+	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDropDependsRefsError(t *testing.T) {
 	bh, err := New(&collectFakeStore{dropDependsErr: errBoom})
 	require.NoError(t, err)
-	_, err = bh.collect(context.Background(), 1)
+	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectHasIncomingRefsError(t *testing.T) {
 	bh, err := New(&collectFakeStore{hasRefsErr: errBoom})
 	require.NoError(t, err)
-	_, err = bh.collect(context.Background(), 1)
+	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -202,14 +202,14 @@ func TestCollectListOutgoingRefsError(t *testing.T) {
 	// hasRefs false so collect proceeds to the delete prep where RefsListOutgoing runs.
 	bh, err := New(&collectFakeStore{outgoingErr: errBoom})
 	require.NoError(t, err)
-	_, err = bh.collect(context.Background(), 1)
+	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDeleteObjectError(t *testing.T) {
 	bh, err := New(&collectFakeStore{deleteObjectErr: errBoom})
 	require.NoError(t, err)
-	_, err = bh.collect(context.Background(), 1)
+	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -233,7 +233,7 @@ func TestCollectIgnoresLiveObject(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "alive"})
 	require.NoError(t, err)
 
-	gone, err := bh.collect(ctx, obj.ID)
+	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.False(t, gone, "live object not collected")
 
@@ -249,7 +249,7 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
-	gone, err := bh.collect(ctx, obj.ID)
+	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, gone, "unfinalized object collected")
 
@@ -277,7 +277,7 @@ func TestCollectDeletesSelfDependentObject(t *testing.T) {
 	require.NoError(t, addRef(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
-	gone, err := bh.collect(ctx, obj.ID)
+	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, gone, "a self-dependency must not hold its own object open")
 
@@ -293,7 +293,7 @@ func TestCollectKeepsFinalizedObject(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
-	gone, err := bh.collect(ctx, obj.ID)
+	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.False(t, gone, "object with a finalizer is not collected")
 
@@ -312,7 +312,7 @@ func TestCollectCascadesAndBlocksOnChild(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	gone, err := bh.collect(ctx, owner.ID)
+	gone, err := bh.gcCollect(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.False(t, gone, "owner blocked by child ref")
 
@@ -340,14 +340,14 @@ func TestCollectDeletesOwnerAfterChildGone(t *testing.T) {
 
 	// Collect the child first: no finalizers, so it's removed and its owned_by
 	// edge cascades away, freeing the owner.
-	gone, err := bh.collect(ctx, child.ID)
+	gone, err := bh.gcCollect(ctx, child.ID)
 	require.NoError(t, err)
 	assert.True(t, gone)
 	_, err = client.Get(ctx, child.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 
 	// Now the owner has no referrers and is collectable.
-	gone, err = bh.collect(ctx, owner.ID)
+	gone, err = bh.gcCollect(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.True(t, gone)
 	_, err = client.Get(ctx, owner.ID)
@@ -364,7 +364,7 @@ func TestCollectBreaksSelfDependency(t *testing.T) {
 	require.NoError(t, addRef(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
-	gone, err := bh.collect(ctx, obj.ID)
+	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, gone, "a self-dependency must not block collection")
 
@@ -653,7 +653,7 @@ func TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete(t *testing.T) {
 	require.NoError(t, err, "the delete marks the row; collecting it is the sweeper's job")
 	require.NotNil(t, got.DeletionRequestedAt, "the row must be deletion-pending for the sweep to find it")
 
-	bh.sweepDeletionPending(ctx)
+	bh.deletionPendingSweep(ctx)
 
 	_, err = client.Get(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -687,7 +687,7 @@ func TestGCSweepLogsCollectFailure(t *testing.T) {
 		bh, err := New(store, WithLogger(logger))
 		require.NoError(t, err)
 
-		bh.sweepDeletionPending(ctx)
+		bh.deletionPendingSweep(ctx)
 
 		assert.Contains(t, buf.String(), "gc sweep: collecting object failed")
 		assert.Contains(t, buf.String(), errBoom.Error())
@@ -701,7 +701,7 @@ func TestGCSweepLogsCollectFailure(t *testing.T) {
 		bh, err := New(store, WithLogger(logger))
 		require.NoError(t, err)
 
-		bh.sweepDeletionPending(ctx)
+		bh.deletionPendingSweep(ctx)
 
 		assert.Empty(t, buf.String())
 	})
@@ -763,7 +763,7 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 //
 // The row is marked deletion-pending only after the sweeper's startup pass has
 // provably run, and through the store rather than the client, so neither that
-// pass nor advanceGC's post-Delete wake can be what collects it: a periodic sweep
+// pass nor gcAdvance's post-Delete wake can be what collects it: a periodic sweep
 // is the only path left. The kind has no registered controller, so nothing
 // dispatches a reconcile either.
 func TestGCSweepsOnItsOwnInterval(t *testing.T) {
@@ -854,7 +854,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 		}
 	}
 
-	// Mark it deletion-pending through the store, so the client's own advanceGC
+	// Mark it deletion-pending through the store, so the client's own gcAdvance
 	// wake isn't what drives this either.
 	_, _, err = real.DeletionsRequest(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)

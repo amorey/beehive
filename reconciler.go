@@ -90,7 +90,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	deleting := raw.DeletionRequestedAt != nil
 	obj, err := rawToTyped[Spec, Status](raw, t.bh.migratorFor(t.gk))
 	if err != nil {
-		// Quarantine, as List and adaptWatcher do (see rawToTyped's callers): a row
+		// Quarantine, as List and adaptObjectStream do (see rawToTyped's callers): a row
 		// whose bytes don't decode can't be reconciled, and the bytes won't change
 		// until someone rewrites the spec — which re-enqueues it. Returning the error
 		// would instead retry the identical row forever under backoff, and resync
@@ -116,7 +116,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// fixed build lets the pass run to the decrement below.
 		log.WarnContext(ctx, "skipping undecodable object; cannot reconcile", "err", err)
 		if deleting {
-			if _, gcErr := t.bh.collect(ctx, id); gcErr != nil {
+			if _, gcErr := t.bh.gcCollect(ctx, id); gcErr != nil {
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
 				return Result{}, gcErr
 			}
@@ -150,16 +150,16 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	}
 	// Advance any targets the controller freed via DependenciesDelete, so a
 	// now-unreferenced deletion-pending target is re-examined without waiting on the GC
-	// sweep. advanceGC (not enqueueIfRegistered) rather than a plain wake because the
+	// sweep. gcAdvance (not enqueueIfRegistered) rather than a plain wake because the
 	// follow-up a deletion owes is a collect, not a reconcile — it routes by the
 	// target's own kind, and a client-only target falls to the sweeper's next tick.
 	for _, tgt := range wakes.targets {
-		t.bh.advanceGC(ctx, tgt.GroupKind(), tgt.ID)
+		t.bh.gcAdvance(ctx, tgt.GroupKind(), tgt.ID)
 	}
 	// GC runs in its own transaction over the controller's committed writes, so a
 	// finalizer the controller just cleared is visible.
 	if deleting {
-		gone, gcErr := t.bh.collect(ctx, id)
+		gone, gcErr := t.bh.gcCollect(ctx, id)
 		if gcErr != nil {
 			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
 			// Either error makes the worker retry; prefer the reconcile error.
@@ -215,10 +215,10 @@ type reconciler struct {
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
 
-	// afterWatchSchedule, when set, runs after a watchSchedule goroutine exits.
+	// afterScheduleWatch, when set, runs after a scheduleWatch goroutine exits.
 	// Tests use it to await teardown without reading the channel — a read would
 	// let a parked send succeed and mask the ctx.Done/close arm under test.
-	afterWatchSchedule func()
+	afterScheduleWatch func()
 }
 
 // enqueue adds id to the work queue if one is configured.
@@ -351,9 +351,9 @@ func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(c
 	return true
 }
 
-// nextBackoff returns the next retry delay for id and doubles it for next time,
+// backoffNext returns the next retry delay for id and doubles it for next time,
 // capped at maxRetryInterval.
-func (r *reconciler) nextBackoff(id ObjectID) time.Duration {
+func (r *reconciler) backoffNext(id ObjectID) time.Duration {
 	r.backoffMu.Lock()
 	defer r.backoffMu.Unlock()
 	cur := r.backoffFor[id]
@@ -372,8 +372,8 @@ func (r *reconciler) nextBackoff(id ObjectID) time.Duration {
 	return cur
 }
 
-// clearBackoff resets the retry delay for id after a successful reconcile.
-func (r *reconciler) clearBackoff(id ObjectID) {
+// backoffClear resets the retry delay for id after a successful reconcile.
+func (r *reconciler) backoffClear(id ObjectID) {
 	r.backoffMu.Lock()
 	defer r.backoffMu.Unlock()
 	delete(r.backoffFor, id)
@@ -388,7 +388,7 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 // requeue.
 func (r *reconciler) requeue(id ObjectID, resetBackoff bool) {
 	if resetBackoff {
-		r.clearBackoff(id)
+		r.backoffClear(id)
 	}
 	r.requeueNow(id)
 }
@@ -415,37 +415,37 @@ func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
 	return r.work.nextRequeueAt(id)
 }
 
-// mergeSchedule is the schedule hub's coalescing policy: latest value wins and the
+// scheduleMerge is the schedule hub's coalescing policy: latest value wins and the
 // slot is never annihilated. Unlike the object watch, "unscheduled" (the zero
 // Schedule) is a real gauge value a subscriber must observe, so it is kept, not
 // dropped — a slow reader converges to the id's current schedule.
-func mergeSchedule(_, next Schedule) (Schedule, bool) { return next, true }
+func scheduleMerge(_, next Schedule) (Schedule, bool) { return next, true }
 
-// publishSchedule feeds one work-queue schedule change into the hub. It is the
+// schedulePublish feeds one work-queue schedule change into the hub. It is the
 // onSchedule callback, so it runs under the queue lock: it maps the queue's native
 // (time, scheduled) to the public Schedule (unscheduled folds to the zero time),
 // then Sends — which never blocks, and a closed hub drops it. The scheduled bool is
 // redundant with a zero time here, so it is ignored.
-func (r *reconciler) publishSchedule(id ObjectID, at time.Time, _ bool) {
+func (r *reconciler) schedulePublish(id ObjectID, at time.Time, _ bool) {
 	_ = r.scheduleHub.Sender().Send(id, Schedule{NextRequeueAt: at})
 }
 
-// watchSchedule returns a channel that delivers id's current schedule on subscribe
+// scheduleWatch returns a channel that delivers id's current schedule on subscribe
 // and every reschedule thereafter, until ctx is cancelled or the hub closes. The
-// receiver is registered atomically with the snapshot read (subscribeSchedule), so
+// receiver is registered atomically with the snapshot read (scheduleSubscribe), so
 // no change between the two is lost. The queue's native (time, scheduled) is mapped
 // to a Schedule here — the reconciler owns that domain type, not the queue.
-func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Schedule {
+func (r *reconciler) scheduleWatch(ctx context.Context, id ObjectID) <-chan Schedule {
 	var rx *conflate.Receiver[ObjectID, Schedule]
-	at := r.work.subscribeSchedule(id, func() {
+	at := r.work.scheduleSubscribe(id, func() {
 		rx = r.scheduleHub.Receiver(r.scheduleHub.WithKeyFilter(func(k ObjectID) bool { return k == id }))
 	})
 	snapshot := Schedule{NextRequeueAt: at}
 
 	out := make(chan Schedule)
 	go func() {
-		if r.afterWatchSchedule != nil {
-			defer r.afterWatchSchedule()
+		if r.afterScheduleWatch != nil {
+			defer r.afterScheduleWatch()
 		}
 		defer close(out)
 		defer rx.Close()
@@ -627,11 +627,11 @@ func (r *reconciler) runWorker(ctx context.Context) {
 					// The reconcile failure itself is already logged (with the
 					// error) in typedController.reconcile; here we only add the
 					// computed backoff delay at Debug.
-					delay := r.nextBackoff(id)
+					delay := r.backoffNext(id)
 					r.work.addAfter(id, delay)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
 				} else {
-					r.clearBackoff(id)
+					r.backoffClear(id)
 					if result.RequeueAfter > 0 {
 						r.work.addAfter(id, result.RequeueAfter)
 						r.logger.Debug("requeued", "id", id, "after", result.RequeueAfter)
