@@ -43,7 +43,7 @@ func (s *unsettledIDsStore) ObjectsListUnsettledIDs(_ context.Context, _ GroupKi
 	return s.ids, nil
 }
 
-// pendingWakeIDsStore is a fakeStore whose WakesListPendingIDs returns a fixed
+// pendingWakeIDsStore is a fakeStore whose ReconcileOwedListIDs returns a fixed
 // slice, used to exercise the durable-wake backstop enqueue without a real
 // database — the sibling of unsettledIDsStore and deletionPendingIDsStore.
 type pendingWakeIDsStore struct {
@@ -51,7 +51,7 @@ type pendingWakeIDsStore struct {
 	ids []ObjectID
 }
 
-func (s *pendingWakeIDsStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *pendingWakeIDsStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
@@ -68,7 +68,7 @@ type tickOnlyPendingWakeStore struct {
 	calls int
 }
 
-func (s *tickOnlyPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *tickOnlyPendingWakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -1112,7 +1112,7 @@ type errPendingWakeStore struct {
 	fakeStore
 }
 
-func (s *errPendingWakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *errPendingWakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, errBoom
 }
 
@@ -1135,7 +1135,7 @@ func TestEnqueueFromListErrorSkipsPass(t *testing.T) {
 }
 
 // TestEnqueuePendingWake verifies that enqueuePendingWake enqueues exactly the IDs
-// returned by WakesListPendingIDs, in order — the sibling of the test above.
+// returned by ReconcileOwedListIDs, in order — the sibling of the test above.
 // Only its failed-list branch was covered (TestEnqueueFromListErrorSkipsPass), so
 // the helper whose whole purpose is not losing an owed wake was the one of the
 // three that could have stopped enqueuing anything without a test noticing.
@@ -1559,10 +1559,10 @@ type owedBadSpecStore struct {
 }
 
 func (s *owedBadSpecStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
-	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), PendingWake: 2}, nil
+	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), ReconcileOwed: 2}, nil
 }
 
-func (s *owedBadSpecStore) WakesDecrement(context.Context, ObjectID, int64) error {
+func (s *owedBadSpecStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
 	s.decremented = true
 	return nil
 }
@@ -1870,7 +1870,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 // mutator); the returned count always reads the real store underneath it.
 // reconcilePendingWakeHarness returns the pieces the durable-wake tests need,
 // including owe: seeding an owed wake goes through the concrete store, since
-// WakesIncrement is deliberately absent from the Store interface (EdgesAdd is
+// ReconcileOwedIncrement is deliberately absent from the Store interface (EdgesAdd is
 // production's only producer). A closure rather than the store itself because the
 // concrete type is unexported in package sqlite and so cannot be named here.
 func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
@@ -1901,9 +1901,9 @@ func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedCo
 		t.Helper()
 		got, err := s.ObjectsGet(ctx, raw.ID)
 		require.NoError(t, err)
-		return got.PendingWake
+		return got.ReconcileOwed
 	}
-	owe := func() error { return s.WakesIncrement(ctx, raw.ID) }
+	owe := func() error { return s.ReconcileOwedIncrement(ctx, raw.ID) }
 	return tc, inner, raw.ID, count, owe
 }
 
@@ -1958,7 +1958,7 @@ func TestReconcileDrainsMultiplePendingWakes(t *testing.T) {
 }
 
 // TestReconcilePendingWakeSurvivesConcurrentWake pins the condition the reviewer
-// surfaced, and the reason pending_wake is a count rather than a single token: a
+// surfaced, and the reason reconcile_owed is a count rather than a single token: a
 // second wake owed *while a reconcile is already servicing an earlier one* must not
 // be lost. Under the reverted design (the token was the target's resource_version)
 // two wakes for the same unchanged target shared a value, so the reconcile's clear
@@ -1987,15 +1987,15 @@ type failDecrementPendingWakeStore struct {
 	Store
 }
 
-func (s *failDecrementPendingWakeStore) WakesDecrement(context.Context, ObjectID, int64) error {
+func (s *failDecrementPendingWakeStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
 	return errBoom
 }
 
-// TestReconcileWakesDecrementErrorIsNonFatal pins that a failed decrement does
+// TestReconcileReconcileOwedDecrementErrorIsNonFatal pins that a failed decrement does
 // not fail the reconcile: the count stays up and the backstop re-enqueues (a
 // harmless extra pass), so shadowing the successful reconcile with the decrement
 // error would be strictly worse.
-func TestReconcileWakesDecrementErrorIsNonFatal(t *testing.T) {
+func TestReconcileReconcileOwedDecrementErrorIsNonFatal(t *testing.T) {
 	ctx := context.Background()
 	tc, inner, id, count, owe := reconcilePendingWakeHarness(t, func(s Store) Store {
 		return &failDecrementPendingWakeStore{Store: s}
@@ -2550,12 +2550,12 @@ func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
 }
 
 // wakeStampingStore is the store surface a catchup test needs: the Store contract
-// plus WakesIncrement, which is deliberately not on Store (see the comment
+// plus ReconcileOwedIncrement, which is deliberately not on Store (see the comment
 // on reconcilePendingWakeHarness) but exists on the concrete sqlite store so a
 // test can seed an owed wake without staging the whole declare race.
 type wakeStampingStore interface {
 	Store
-	WakesIncrement(context.Context, ObjectID) error
+	ReconcileOwedIncrement(context.Context, ObjectID) error
 }
 
 // newCatchupHarness starts a control plane whose only periodic driver is the
@@ -2650,7 +2650,7 @@ func TestCatchupTickDispatchesOwedWake(t *testing.T) {
 
 	// Now owed a wake, the way a crash between a target's commit and the
 	// dependent's dispatch leaves it.
-	require.NoError(t, real.WakesIncrement(ctx, id))
+	require.NoError(t, real.ReconcileOwedIncrement(ctx, id))
 
 	select {
 	case got := <-reconciled:

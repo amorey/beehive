@@ -487,7 +487,7 @@ func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.Obje
 	return scanObjectRefs(rows)
 }
 
-func (s *sqliteStore) WakesListPendingIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
@@ -500,7 +500,7 @@ func (s *sqliteStore) WakesListPendingIDs(ctx context.Context, gk storeapi.Group
 	return scanIDs(rows)
 }
 
-// WakesIncrement and WakesDecrement are single no-emit UPDATEs on the
+// ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs on the
 // owed-wake count. The decrement's contract (cross-kind, no resource_version bump,
 // why it takes the observed count) is on storeapi.Store; the subtraction floors at
 // 0 with max() so it can never drive the count negative.
@@ -511,13 +511,13 @@ func (s *sqliteStore) WakesListPendingIDs(ctx context.Context, gk storeapi.Group
 // yet. It stays here as the standalone form — reachable on the concrete store, so
 // tests can seed a count without staging the whole declare race — and is where a
 // future non-edge producer (see the dependency-waker item in TODO.md) would hook in.
-func (s *sqliteStore) WakesIncrement(ctx context.Context, id storeapi.ObjectID) error {
+func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)
 	return err
 }
 
-func (s *sqliteStore) WakesDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
+func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0) WHERE id = ?`, observed, id)
 	return err
@@ -1444,8 +1444,8 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 			return err
 		}
 		out = storeapi.EdgesAddResult{
-			From:        storeapi.GroupKind{Group: group, Kind: kind},
-			WakeStamped: stamped,
+			From:                 storeapi.GroupKind{Group: group, Kind: kind},
+			ReconcileOwedStamped: stamped,
 		}
 		return nil
 	})
@@ -1652,7 +1652,7 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
 		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
-		&deletionAt, &obj.PendingWake, &finalizers, &createdAt, &updatedAt)
+		&deletionAt, &obj.ReconcileOwed, &finalizers, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storeapi.ErrNotFound
 	}

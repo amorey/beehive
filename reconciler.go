@@ -105,7 +105,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// ongoing operational fault, and a recurring warning at that coarse cadence keeps
 		// it visible rather than logging once and going silent.
 		//
-		// Returning here also leaves any owed pending_wake count standing, which is
+		// Returning here also leaves any owed reconcile_owed count standing, which is
 		// deliberate, not an oversight of the early return: the wake is owed because a
 		// dependency moved, and this pass did not service it — the controller never
 		// saw the object. Draining it would be exactly the silent discard the
@@ -143,8 +143,8 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// write when nothing was owed. A failed subtraction is not fatal: the count
 	// stays up and the backstop retries it, whereas requeueing on the error would
 	// spin against a store that keeps failing.
-	if reconcileErr == nil && raw.PendingWake != 0 {
-		if err := t.bh.store.WakesDecrement(ctx, id, raw.PendingWake); err != nil {
+	if reconcileErr == nil && raw.ReconcileOwed != 0 {
+		if err := t.bh.store.ReconcileOwedDecrement(ctx, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement pending-wake count; backstop will retry", "err", err)
 		}
 	}
@@ -239,7 +239,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 }
 
 // enqueuePendingWake enqueues objects owed a durable dependency wake (see
-// pending_wake). Like a pending deletion it is recorded, known-owed work: a
+// reconcile_owed). Like a pending deletion it is recorded, known-owed work: a
 // wake bumps no generation, so the unsettled listing never sees it, and its
 // in-memory requeue does not outlive the process — a crash between the token's
 // commit and the dispatch leaves a stranded dependent nothing else re-checks.
@@ -250,7 +250,7 @@ func (r *reconciler) enqueuePendingWake(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "pending-wake", r.store.WakesListPendingIDs)
+	r.enqueueFrom(ctx, "pending-wake", r.store.ReconcileOwedListIDs)
 }
 
 // hasPeriodicPass reports whether this reconciler has a periodic driver left for

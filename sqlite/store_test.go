@@ -2051,12 +2051,12 @@ func pendingWake(t *testing.T, store *sqliteStore, id beehive.ObjectID) int64 {
 	t.Helper()
 	obj, err := store.ObjectsGet(context.Background(), id)
 	require.NoError(t, err)
-	return obj.PendingWake
+	return obj.ReconcileOwed
 }
 
 // TestPendingWakeCount exercises the owed-wake counter: a fresh row owes nothing,
-// WakesIncrement raises the count (visible on the object and via
-// WakesListPendingIDs), and WakesDecrement subtracts the count a pass
+// ReconcileOwedIncrement raises the count (visible on the object and via
+// ReconcileOwedListIDs), and ReconcileOwedDecrement subtracts the count a pass
 // observed — draining the row fully rather than leaving a residual — while
 // increments beyond that observed count survive, and flooring at 0.
 func TestPendingWakeCount(t *testing.T) {
@@ -2066,36 +2066,36 @@ func TestPendingWakeCount(t *testing.T) {
 	newRefObject(t, store) // a second row that owes nothing, so the list stays scoped
 
 	// A fresh object owes no wake.
-	require.Zero(t, a.PendingWake)
-	ids, err := store.WakesListPendingIDs(ctx, testGK)
+	require.Zero(t, a.ReconcileOwed)
+	ids, err := store.ReconcileOwedListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Empty(t, ids)
 
 	// Two wakes owed (e.g. a second stamped while the first was still owed).
-	require.NoError(t, store.WakesIncrement(ctx, a.ID))
-	require.NoError(t, store.WakesIncrement(ctx, a.ID))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
 	assert.Equal(t, int64(2), pendingWake(t, store, a.ID), "the count is read back off the row")
 
-	ids, err = store.WakesListPendingIDs(ctx, testGK)
+	ids, err = store.ReconcileOwedListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{a.ID}, ids, "only the owed row is listed (b owes nothing)")
 
 	// A pass that observed both services both: subtracting the observed count
 	// drains the row in one go, leaving nothing for the backstop to re-enqueue.
-	require.NoError(t, store.WakesDecrement(ctx, a.ID, 2))
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, a.ID, 2))
 	assert.Zero(t, pendingWake(t, store, a.ID), "subtracting the observed count drains the row")
-	ids, err = store.WakesListPendingIDs(ctx, testGK)
+	ids, err = store.ReconcileOwedListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "drained row leaves the partial index")
 
 	// An increment beyond what a pass observed survives that pass's subtraction.
-	require.NoError(t, store.WakesIncrement(ctx, a.ID)) // observed by the pass
-	require.NoError(t, store.WakesIncrement(ctx, a.ID)) // lands during the pass
-	require.NoError(t, store.WakesDecrement(ctx, a.ID, 1))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID)) // observed by the pass
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID)) // lands during the pass
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, a.ID, 1))
 	assert.Equal(t, int64(1), pendingWake(t, store, a.ID), "the later increment stays owed")
 
 	// Subtracting more than is owed floors at 0 rather than going negative.
-	require.NoError(t, store.WakesDecrement(ctx, a.ID, 5))
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, a.ID, 5))
 	assert.Zero(t, pendingWake(t, store, a.ID), "subtraction floors at 0")
 }
 
@@ -2104,10 +2104,10 @@ func TestPendingWakeQueryErrors(t *testing.T) {
 	store.db.Close()
 	ctx := context.Background()
 
-	_, err := store.WakesListPendingIDs(ctx, testGK)
+	_, err := store.ReconcileOwedListIDs(ctx, testGK)
 	require.Error(t, err)
-	require.Error(t, store.WakesIncrement(ctx, 1))
-	require.Error(t, store.WakesDecrement(ctx, 1, 1))
+	require.Error(t, store.ReconcileOwedIncrement(ctx, 1))
+	require.Error(t, store.ReconcileOwedDecrement(ctx, 1, 1))
 }
 
 func TestObjectsUpdateSpecDBError(t *testing.T) {
@@ -2320,7 +2320,7 @@ func TestRefsAddStampsPendingWake(t *testing.T) {
 	// target passes — so there is nothing to have raced.
 	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
 	require.NoError(t, err)
-	assert.False(t, res.WakeStamped, "no version claim, nothing to have raced")
+	assert.False(t, res.ReconcileOwedStamped, "no version claim, nothing to have raced")
 	assert.Zero(t, pendingWake(t, store, a.ID))
 
 	// A claim the target has not moved past: the caller's read is still current.
@@ -2329,14 +2329,14 @@ func TestRefsAddStampsPendingWake(t *testing.T) {
 	require.NoError(t, err)
 	res, err = store.EdgesAdd(ctx, c.ID, b.ID, "depends_on", current.ResourceVersion)
 	require.NoError(t, err)
-	assert.False(t, res.WakeStamped, "the target has not moved past the claim")
+	assert.False(t, res.ReconcileOwedStamped, "the target has not moved past the claim")
 	assert.Zero(t, pendingWake(t, store, c.ID))
 
 	// Both halves hold: the stamp lands, on fromID.
 	e := newRefObject(t, store)
 	res, err = store.EdgesAdd(ctx, e.ID, b.ID, "depends_on", stale)
 	require.NoError(t, err)
-	assert.True(t, res.WakeStamped)
+	assert.True(t, res.ReconcileOwedStamped)
 	assert.Equal(t, int64(1), pendingWake(t, store, e.ID), "the stamp is on the dependent, not the target")
 	assert.Zero(t, pendingWake(t, store, b.ID))
 }
@@ -2355,13 +2355,13 @@ func TestRefsAddStampsOnlyNewEdge(t *testing.T) {
 	moveTarget(t, store, b.ID)
 	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale)
 	require.NoError(t, err)
-	require.True(t, res.WakeStamped)
+	require.True(t, res.ReconcileOwedStamped)
 
 	// Re-declare against an even staler claim, with the target moved again.
 	moveTarget(t, store, b.ID)
 	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale)
 	require.NoError(t, err)
-	assert.False(t, res.WakeStamped, "the edge was already there, so the stamp is suppressed")
+	assert.False(t, res.ReconcileOwedStamped, "the edge was already there, so the stamp is suppressed")
 	assert.Equal(t, int64(1), pendingWake(t, store, a.ID), "still the one wake owed")
 }
 

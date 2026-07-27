@@ -144,11 +144,11 @@ func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]Objec
 func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) WakesDecrement(context.Context, ObjectID, int64) error {
-	panic("not implemented: fakeStore.WakesDecrement")
+func (s *fakeStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.ReconcileOwedDecrement")
 }
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
@@ -497,7 +497,7 @@ func (s *wakeProbeStore) waitLooked(t *testing.T) {
 type listProbeStore struct {
 	Store
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
-	wakeListed      chan struct{} // WakesListPendingIDs (per-kind)
+	wakeListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
 }
 
@@ -519,8 +519,8 @@ func (s *listProbeStore) ObjectsListUnsettledIDs(ctx context.Context, gk GroupKi
 	return ids, err
 }
 
-func (s *listProbeStore) WakesListPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.WakesListPendingIDs(ctx, gk)
+func (s *listProbeStore) ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ReconcileOwedListIDs(ctx, gk)
 	probeSignal(s.wakeListed)
 	return ids, err
 }

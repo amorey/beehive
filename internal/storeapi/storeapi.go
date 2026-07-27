@@ -212,17 +212,17 @@ type RawObject struct {
 	ObservedAt          *time.Time
 	ResourceVersion     int64
 	DeletionRequestedAt *time.Time
-	// PendingWake is the count of owed durable dependency wakes (see the
-	// objects.pending_wake column). 0 means nothing owed. The reconciler reads it to
-	// decide whether to decrement on a successful pass. Store-owned and
+	// ReconcileOwed is how many passes beehive owes this object (see the
+	// objects.reconcile_owed column). 0 means nothing owed. The reconciler reads it
+	// to decide whether to decrement on a successful pass. Store-owned and
 	// store-assigned, like ResourceVersion: it is reported on reads and moved only by
-	// Increment/WakesDecrement, so a value set on a RawObject handed to
-	// ObjectsCreate is not persisted (a new object owes nothing).
-	PendingWake int64
-	Finalizers  []string
-	Conditions  []Condition // assembled on reads; nil when the object has none
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// ReconcileOwedIncrement/ReconcileOwedDecrement, so a value set on a RawObject
+	// handed to ObjectsCreate is not persisted (a new object owes nothing).
+	ReconcileOwed int64
+	Finalizers    []string
+	Conditions    []Condition // assembled on reads; nil when the object has none
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // Relation is the kind of edge in the edges table. The schema's CHECK constraint
@@ -244,13 +244,13 @@ type EdgesAddResult struct {
 	// Edges are cross-kind, so a caller routing a requeue to fromID cannot assume
 	// its own kind.
 	From GroupKind
-	// WakeStamped reports whether this call incremented fromID's pending_wake:
+	// ReconcileOwedStamped reports whether this call incremented fromID's reconcile_owed:
 	// the edge was new *and* the target had moved past the claimed version. A
 	// caller pairing the durable stamp with an in-memory requeue gates the requeue
 	// on this rather than recomputing the conjunction, so the two halves cannot
 	// drift — and there is deliberately no second, independently derived
 	// edge-new report to drift against.
-	WakeStamped bool
+	ReconcileOwedStamped bool
 }
 
 // ObjectRef names one object — its id plus the GroupKind needed to route a
@@ -505,19 +505,24 @@ type Store interface {
 	// sharing with writes it means to keep.
 	//
 	// A claim that toID has already moved past, on an edge this call creates,
-	// increments fromID's pending_wake — the durable record that a dependency
-	// wake is owed — and reports it as EdgesAddResult.WakeStamped. That write must
-	// land on the same side of the insert as the rejection, and for the same
-	// reason: were it a second call after EdgesAdd returned, a caller sharing an
-	// ambient transaction could handle the error and commit the edge with no
+	// increments fromID's reconcile_owed — the durable record that a dependency
+	// wake is owed — and reports it as EdgesAddResult.ReconcileOwedStamped. That
+	// write must land on the same side of the insert as the rejection, and for the
+	// same reason: were it a second call after EdgesAdd returned, a caller sharing
+	// an ambient transaction could handle the error and commit the edge with no
 	// wake, which is precisely the stranded-dependent race the claim exists to
 	// close. The endpoint check, the stamp and the insert are therefore one
 	// atomic unit, and an implementation must not leave them separable.
 	//
+	// What the count holds is durable, owed *work*; the in-memory dependency waker
+	// is a separate mechanism and leaves nothing here. A second durable marker
+	// (undecodable rows, say) gets its own column and its own cadence — it does not
+	// join this count.
+	//
 	// The stamp is unconditional on fromID's kind: the store cannot know which
 	// kinds have reconcile loops, and gating would cost the caller a pre-read of
 	// fromID's kind on every declare. A kind with no loop never drains its count,
-	// and nothing scans it either (WakesListPendingIDs is per-kind), so the count is
+	// and nothing scans it either (ReconcileOwedListIDs is per-kind), so the count is
 	// unread — but it is a lasting row and index entry, and re-declaring an edge
 	// bumps it again. Reclaiming it wants a cross-kind sweeper (see TODO.md), not a
 	// gate here: declining to stamp would lose the wake outright for a kind that
@@ -579,29 +584,29 @@ type Store interface {
 
 	// There is deliberately no standalone increment here. Wakes are produced by
 	// EdgesAdd — its stamp has to be indivisible from the edge insert, so it issues
-	// one itself and reports it as EdgesAddResult.WakeStamped — and consumed by
-	// WakesDecrement. An interface increment would be surface no caller could
+	// one itself and reports it as EdgesAddResult.ReconcileOwedStamped — and consumed by
+	// ReconcileOwedDecrement. An interface increment would be surface no caller could
 	// use correctly for the declare path (it cannot be made atomic with the edge)
 	// and none uses at all otherwise; leaving it off makes "the stamp rides EdgesAdd"
 	// a compile-time property rather than something a test has to police. Add it
 	// when a producer other than EdgesAdd exists — the durable-wake half of the
 	// dependency-waker item in TODO.md would be one.
 
-	// WakesDecrement subtracts observed from id's pending_wake (floored at 0),
+	// ReconcileOwedDecrement subtracts observed from id's reconcile_owed (floored at 0),
 	// recording that a reconcile serviced every wake it saw. Callers pass the count
 	// they loaded, not 1: a single pass reads the target's current state, which
 	// addresses all the wakes outstanding when it started, so subtracting 1 would
 	// strand the rest as a residual nothing re-enqueues. Increments landing *after*
 	// that load are above observed, so they survive the subtraction and stay owed.
 	// Bumps no resource_version and emits no event.
-	WakesDecrement(ctx context.Context, id ObjectID, observed int64) error
+	ReconcileOwedDecrement(ctx context.Context, id ObjectID, observed int64) error
 
-	// WakesListPendingIDs returns the IDs of objects of kind gk owed a durable
-	// dependency wake (pending_wake != 0). The reconcile backstop enqueues these so
+	// ReconcileOwedListIDs returns the IDs of objects of kind gk owed a durable
+	// dependency wake (reconcile_owed != 0). The reconcile backstop enqueues these so
 	// a wake that outlived the process (its in-memory requeue lost to a crash) is
 	// serviced on restart, without a spec change to wake it. Orthogonal to
 	// ObjectsListUnsettledIDs: an object can be spec-converged yet still owe a wake.
-	WakesListPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
 	// ObjectsWatch returns a subscription to the single object id of kind gk: its current
 	// state (if any) as an Added snapshot, then live changes filtered to that id.

@@ -146,7 +146,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 // does. The two are kept as separate names because they answer separate questions —
 // a spec write owes the object a reconcile, a deletion owes it a collect — and
 // advanceGCNow is where the second one's answer changes if it ever grows past a
-// requeue (a durable stamp, say, as pending_wake is for dependency wakes).
+// requeue (a durable stamp, say, as reconcile_owed is for dependency wakes).
 func (bh *Beehive) gcAdvance(ctx context.Context, gk GroupKind, id ObjectID) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		bh.gcAdvanceNow(gk, id)
