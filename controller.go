@@ -32,7 +32,7 @@ import (
 // reconcile failure. Aliased from storeapi like ErrNotFound.
 var ErrWrongKind = storeapi.ErrWrongKind
 
-// ErrTargetResourceVersionFuture is returned by AddDependency when
+// ErrTargetResourceVersionFuture is returned by DependenciesAdd when
 // targetResourceVersion exceeds the target's current ResourceVersion. An object's
 // version only moves forward, so a version above the target's own cannot have come
 // from reading it — the caller passed some other object's version, or some other
@@ -54,23 +54,9 @@ type Controller[Spec, Status any] interface {
 // ControllerClient is the write surface a controller uses to report observed
 // state. It only writes Status and metadata — never Spec, which the user owns.
 type ControllerClient[Status any] interface {
-	// UpdateStatus records status and the generation this reconcile observed.
-	// Status that marshals to the stored bytes writes nothing: no
-	// resource_version bump and no Modified event, so a controller can report
-	// unconditionally without waking watchers (or dependents) on an unchanged
-	// poll. The exception is the generation handshake — if this reconcile
-	// settled a generation the object hadn't settled at before, that advance is
-	// recorded and does emit, so watchers see the object converge.
-	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
-	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
-	DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
-	// RecordEvent appends an observation to id's event log, aggregating into
-	// contiguous runs (see EventSpec). Like the other writes it is kind-folded and
-	// composes in Within, so a controller can record an event and update a
-	// condition atomically.
-	RecordEvent(ctx context.Context, id ObjectID, event EventSpec) error
-	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
-	// AddDependency records that fromID depends on toID, so Beehive requeues
+	ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error
+	ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error
+	// DependenciesAdd records that fromID depends on toID, so Beehive requeues
 	// fromID when toID changes.
 	//
 	// targetResourceVersion is the version of toID that the decision to depend on
@@ -83,7 +69,7 @@ type ControllerClient[Status any] interface {
 	// read and the declaration reaches nobody — the dependency waker resolves
 	// dependents at the instant of the change, and the edge does not exist yet —
 	// and the dependent then settles at its own generation on the stale read,
-	// where ListUnsettledIDs structurally cannot see it. So if toID has moved past
+	// where ObjectsListUnsettledIDs structurally cannot see it. So if toID has moved past
 	// targetResourceVersion by the time the edge commits, fromID is requeued: it
 	// declared a dependency on a version that is already superseded.
 	//
@@ -117,25 +103,39 @@ type ControllerClient[Status any] interface {
 	// a worse failure than the miss, and not one the caller can see. Repairing lost
 	// wakes belongs to a backstop that derives staleness rather than to a guard that
 	// records an intent.
-	AddDependency(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
-	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
-	// HasIncomingRefs reports whether any object with a live claim still points at id:
+	DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
+	DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
+	// DependenciesList returns the objects id depends on (outgoing depends_on).
+	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// DependentsList returns the objects that depend on id (incoming depends_on).
+	DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// EdgesHasIncoming reports whether any object with a live claim still points at id:
 	// an owned child, or a dependent that is not itself being deleted. A dependent
 	// that is itself finalizing is excluded — it's going away and no longer has a
 	// claim. A finalizer can gate teardown on this: a controller holding a shared
 	// resource clears its finalizer only once nothing with a live claim references
 	// the object, so the resource outlives its last real user.
-	HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
-	// GetOwner returns id's owner, if any (its outgoing owned_by edge). ok reports
+	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
+	// EventsRecord appends an observation to id's event log, aggregating into
+	// contiguous runs (see EventSpec). Like the other writes it is kind-folded and
+	// composes in Within, so a controller can record an event and update a
+	// condition atomically.
+	EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error
+	FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
+	// OwnedList returns the objects id owns (its incoming owned_by edges).
+	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// OwnersGet returns id's owner, if any (its outgoing owned_by edge). ok reports
 	// presence: false with a nil error when the object has no owner. The lazy
 	// counterpart to a reconciler's LoadOwner default.
-	GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
-	// ListDependencies returns the objects id depends on (outgoing depends_on).
-	ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
-	// ListDependents returns the objects that depend on id (incoming depends_on).
-	ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
-	// ListOwned returns the objects id owns (its incoming owned_by edges).
-	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
+	OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
+	// UpdateStatus records status and the generation this reconcile observed.
+	// Status that marshals to the stored bytes writes nothing: no
+	// resource_version bump and no Modified event, so a controller can report
+	// unconditionally without waking watchers (or dependents) on an unchanged
+	// poll. The exception is the generation handshake — if this reconcile
+	// settled a generation the object hadn't settled at before, that advance is
+	// recorded and does emit, so watchers see the object converge.
+	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
 	// Within runs fn inside a single transaction: the ControllerClient writes fn
 	// makes (with the ctx passed to it) all commit together on a nil return, or all
 	// roll back on error. Reconcile itself is not transactional — each write
@@ -168,12 +168,12 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	}
 	// The store's UpdateStatus emits the Modified event into its transaction's
 	// collector, so it's published only after the write commits.
-	_, err = c.bh.store.UpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
+	_, err = c.bh.store.ObjectsUpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
 	return err
 }
 
-func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	_, err := c.bh.store.SetCondition(ctx, c.gk, id, storeapi.Condition{
+func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error {
+	_, err := c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
 		Reason:   condition.Reason,
@@ -183,17 +183,17 @@ func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id Obje
 	return err
 }
 
-func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	_, err := c.bh.store.DeleteCondition(ctx, c.gk, id, conditionType)
+func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error {
+	_, err := c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType)
 	return err
 }
 
-// RecordEvent marshals the event's optional Detail (typed-in, opaque-out, like
+// EventsRecord marshals the event's optional Detail (typed-in, opaque-out, like
 // Spec/Status) and appends the run through the store, which folds in the
 // controller's kind and emits the run into the transaction's collector so it
 // publishes to watchers only after the write commits. A nil Detail stays nil (no
 // payload); the store aggregates by (Category, Type, Reason).
-func (c *controllerClientImpl[Status]) RecordEvent(ctx context.Context, id ObjectID, event EventSpec) error {
+func (c *controllerClientImpl[Status]) EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error {
 	var detail []byte
 	if event.Detail != nil {
 		var err error
@@ -201,7 +201,7 @@ func (c *controllerClientImpl[Status]) RecordEvent(ctx context.Context, id Objec
 			return err
 		}
 	}
-	_, err := c.bh.store.RecordEvent(ctx, c.gk, id, storeapi.Event{
+	_, err := c.bh.store.EventsRecord(ctx, c.gk, id, storeapi.Event{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,
@@ -211,24 +211,24 @@ func (c *controllerClientImpl[Status]) RecordEvent(ctx context.Context, id Objec
 	return err
 }
 
-func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
-	_, err := c.bh.store.DeleteFinalizer(ctx, c.gk, id, finalizer)
+func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
+	_, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
 	return err
 }
 
-// AddDependency implements the contract documented on ControllerClient. The
+// DependenciesAdd implements the contract documented on ControllerClient. The
 // relation is always "depends_on" (owner edges come from WithOwner at create
-// time). Both writes — the edge and the durable wake stamp — live inside AddRef,
+// time). Both writes — the edge and the durable wake stamp — live inside EdgesAdd,
 // which is atomic on its own, so the Within here is not what makes either safe;
 // it is only the seam for this method's own composition, joining a controller's
 // Within when nested rather than opening a second transaction.
 //
 // They are in the store rather than sequenced here precisely because a nested
-// Within unwinds nothing: a stamp issued as a second call after AddRef returned
+// Within unwinds nothing: a stamp issued as a second call after EdgesAdd returned
 // would leave a caller who handles this method's error free to commit the edge
 // without it — a dependent stranded on a stale read, which is the race this
 // method exists to close. Ordering inside one store call is the guarantee (see
-// AddRef), and WakeStamped reports what it did rather than having the conjunction
+// EdgesAdd), and WakeStamped reports what it did rather than having the conjunction
 // recomputed here, where the two halves could drift apart.
 //
 // The wake is a conjunction — the edge is new *and* the target moved — and both
@@ -248,12 +248,12 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id O
 // expendable half: a process that dies before it runs still finds the stamp on
 // restart, and the backstop that drains pending_wake makes the reconcile happen
 // late rather than never.
-func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error {
+func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error {
 	return c.bh.store.Within(ctx, func(ctx context.Context) error {
 		// The store rejects a version above the target's own before it inserts (see
 		// ErrTargetResourceVersionFuture), so a bad claim leaves no edge regardless
 		// of whose transaction this is running in.
-		res, err := c.bh.store.AddRef(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
+		res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
 		if err != nil {
 			return err
 		}
@@ -271,12 +271,12 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 	})
 }
 
-func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fromID, toID ObjectID) error {
+func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
 	return c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if err := c.bh.store.DeleteRef(ctx, fromID, toID, RelationDependsOn); err != nil {
+		if err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn); err != nil {
 			return err
 		}
-		// Removing the edge can unblock toID's physical deletion (refs are RESTRICT).
+		// Removing the edge can unblock toID's physical deletion (edges are RESTRICT).
 		// If toID is finalizing, register it for a post-commit re-check so GC removes
 		// it without waiting on the resync backstop (which may be disabled). Outside a
 		// reconcile there's no collector — nothing to schedule.
@@ -284,7 +284,7 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fro
 		if wakes == nil {
 			return nil
 		}
-		target, err := c.bh.store.GetObjectMeta(ctx, toID)
+		target, err := c.bh.store.ObjectsGetMeta(ctx, toID)
 		if errors.Is(err, ErrNotFound) {
 			return nil // target already gone
 		}
@@ -292,37 +292,37 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fro
 			return err
 		}
 		if target.DeletionRequestedAt != nil {
-			wakes.targets = append(wakes.targets, Referrer{ID: toID, Group: target.Group, Kind: target.Kind})
+			wakes.targets = append(wakes.targets, ObjectRef{ID: toID, Group: target.Group, Kind: target.Kind})
 		}
 		return nil
 	})
 }
 
-// HasIncomingRefs reports whether anything still claims id. It is a plain read that
+// EdgesHasIncoming reports whether anything still claims id. It is a plain read that
 // commits on its own; to gate a write on it atomically — e.g. clearing a finalizer
 // only if nothing references the object — a controller runs both inside Within, so
 // the read and the write share one transaction snapshot.
-// GetOwner/ListDependencies/ListDependents/ListOwned read ref edges directly,
-// like HasIncomingRefs above — no kind-scoping, since a controller reasons about
+// OwnersGet/DependenciesList/DependentsList/OwnedList read ref edges directly,
+// like EdgesHasIncoming above — no kind-scoping, since a controller reasons about
 // its own object's relationships.
-func (c *controllerClientImpl[Status]) GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error) {
+func (c *controllerClientImpl[Status]) OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
-func (c *controllerClientImpl[Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListOutgoingRefsByRelation(ctx, id, RelationDependsOn)
+func (c *controllerClientImpl[Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
+func (c *controllerClientImpl[Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
+func (c *controllerClientImpl[Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
 }
 
-func (c *controllerClientImpl[Status]) HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error) {
-	return c.bh.store.HasIncomingRefs(ctx, id)
+func (c *controllerClientImpl[Status]) EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error) {
+	return c.bh.store.EdgesHasIncoming(ctx, id)
 }
 
 // Within opens a transaction and runs fn under it; the ControllerClient writes fn

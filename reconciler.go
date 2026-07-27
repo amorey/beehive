@@ -68,11 +68,11 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	log := t.log().With("id", id)
 	// Controller-client calls that free a ref target register it here; we requeue
-	// them after Reconcile returns (see DeleteDependency).
+	// them after Reconcile returns (see DependenciesDelete).
 	wakes := &pendingWakes{}
 	ctx = withPendingWakes(ctx, wakes)
 
-	raw, err := t.bh.store.GetObject(ctx, id)
+	raw, err := t.bh.store.ObjectsGet(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// The queued object is already gone (collected by a prior pass, a cascade,
 		// or the backstop between enqueue and now). Nothing to reconcile — a no-op
@@ -90,7 +90,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	deleting := raw.DeletionRequestedAt != nil
 	obj, err := rawToTyped[Spec, Status](raw, t.bh.migratorFor(t.gk))
 	if err != nil {
-		// Quarantine, as List and adaptWatcher do (see rawToTyped's callers): a row
+		// Quarantine, as List and adaptObjectStream do (see rawToTyped's callers): a row
 		// whose bytes don't decode can't be reconciled, and the bytes won't change
 		// until someone rewrites the spec — which re-enqueues it. Returning the error
 		// would instead retry the identical row forever under backoff, and resync
@@ -101,7 +101,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// never do, so it correctly waits for a fixed build.
 		//
 		// This re-WARNs each time the catchup tick re-enqueues the unsettled poison row
-		// (it never settles, so ListUnsettledIDs keeps returning it): a bad row is an
+		// (it never settles, so ObjectsListUnsettledIDs keeps returning it): a bad row is an
 		// ongoing operational fault, and a recurring warning at that coarse cadence keeps
 		// it visible rather than logging once and going silent.
 		//
@@ -116,7 +116,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// fixed build lets the pass run to the decrement below.
 		log.WarnContext(ctx, "skipping undecodable object; cannot reconcile", "err", err)
 		if deleting {
-			if _, gcErr := t.bh.collect(ctx, id); gcErr != nil {
+			if _, gcErr := t.bh.gcCollect(ctx, id); gcErr != nil {
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
 				return Result{}, gcErr
 			}
@@ -144,22 +144,22 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// stays up and the backstop retries it, whereas requeueing on the error would
 	// spin against a store that keeps failing.
 	if reconcileErr == nil && raw.PendingWake != 0 {
-		if err := t.bh.store.DecrementPendingWake(ctx, id, raw.PendingWake); err != nil {
+		if err := t.bh.store.WakesDecrement(ctx, id, raw.PendingWake); err != nil {
 			log.WarnContext(ctx, "failed to decrement pending-wake count; backstop will retry", "err", err)
 		}
 	}
-	// Advance any targets the controller freed via DeleteDependency, so a
+	// Advance any targets the controller freed via DependenciesDelete, so a
 	// now-unreferenced deletion-pending target is re-examined without waiting on the GC
-	// sweep. advanceGC (not enqueueIfRegistered) rather than a plain wake because the
+	// sweep. gcAdvance (not enqueueIfRegistered) rather than a plain wake because the
 	// follow-up a deletion owes is a collect, not a reconcile — it routes by the
 	// target's own kind, and a client-only target falls to the sweeper's next tick.
 	for _, tgt := range wakes.targets {
-		t.bh.advanceGC(ctx, tgt.GroupKind(), tgt.ID)
+		t.bh.gcAdvance(ctx, tgt.GroupKind(), tgt.ID)
 	}
 	// GC runs in its own transaction over the controller's committed writes, so a
 	// finalizer the controller just cleared is visible.
 	if deleting {
-		gone, gcErr := t.bh.collect(ctx, id)
+		gone, gcErr := t.bh.gcCollect(ctx, id)
 		if gcErr != nil {
 			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
 			// Either error makes the worker retry; prefer the reconcile error.
@@ -183,7 +183,7 @@ type reconciler struct {
 	adapter controllerAdapter
 	store   Store
 	work    *workQueue
-	// scheduleHub fans each object's next-requeue changes out to WatchSchedule
+	// scheduleHub fans each object's next-requeue changes out to SchedulesWatch
 	// subscribers, keyed by ObjectID with latest-value-per-id coalescing. The work
 	// queue feeds it through onSchedule; Close (on teardown) ends live streams.
 	scheduleHub       *conflate.Hub[ObjectID, Schedule]
@@ -215,10 +215,10 @@ type reconciler struct {
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
 
-	// afterWatchSchedule, when set, runs after a watchSchedule goroutine exits.
+	// afterScheduleWatch, when set, runs after a scheduleWatch goroutine exits.
 	// Tests use it to await teardown without reading the channel — a read would
 	// let a parked send succeed and mask the ctx.Done/close arm under test.
-	afterWatchSchedule func()
+	afterScheduleWatch func()
 }
 
 // enqueue adds id to the work queue if one is configured.
@@ -235,7 +235,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "unsettled", r.store.ListUnsettledIDs)
+	r.enqueueFrom(ctx, "unsettled", r.store.ObjectsListUnsettledIDs)
 }
 
 // enqueuePendingWake enqueues objects owed a durable dependency wake (see
@@ -250,7 +250,7 @@ func (r *reconciler) enqueuePendingWake(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "pending-wake", r.store.ListPendingWakeIDs)
+	r.enqueueFrom(ctx, "pending-wake", r.store.WakesListPendingIDs)
 }
 
 // hasPeriodicPass reports whether this reconciler has a periodic driver left for
@@ -308,7 +308,7 @@ func (r *reconciler) enqueueAll(ctx context.Context) bool {
 		// an escalation that can never run.
 		return true
 	}
-	return r.enqueueFrom(ctx, "all", r.store.ListIDs)
+	return r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
 }
 
 // log returns a non-nil logger, guarding reconcilers built outside Register (e.g.
@@ -351,9 +351,9 @@ func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(c
 	return true
 }
 
-// nextBackoff returns the next retry delay for id and doubles it for next time,
+// backoffNext returns the next retry delay for id and doubles it for next time,
 // capped at maxRetryInterval.
-func (r *reconciler) nextBackoff(id ObjectID) time.Duration {
+func (r *reconciler) backoffNext(id ObjectID) time.Duration {
 	r.backoffMu.Lock()
 	defer r.backoffMu.Unlock()
 	cur := r.backoffFor[id]
@@ -372,8 +372,8 @@ func (r *reconciler) nextBackoff(id ObjectID) time.Duration {
 	return cur
 }
 
-// clearBackoff resets the retry delay for id after a successful reconcile.
-func (r *reconciler) clearBackoff(id ObjectID) {
+// backoffClear resets the retry delay for id after a successful reconcile.
+func (r *reconciler) backoffClear(id ObjectID) {
 	r.backoffMu.Lock()
 	defer r.backoffMu.Unlock()
 	delete(r.backoffFor, id)
@@ -388,7 +388,7 @@ func (r *reconciler) clearBackoff(id ObjectID) {
 // requeue.
 func (r *reconciler) requeue(id ObjectID, resetBackoff bool) {
 	if resetBackoff {
-		r.clearBackoff(id)
+		r.backoffClear(id)
 	}
 	r.requeueNow(id)
 }
@@ -415,37 +415,37 @@ func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
 	return r.work.nextRequeueAt(id)
 }
 
-// mergeSchedule is the schedule hub's coalescing policy: latest value wins and the
+// scheduleMerge is the schedule hub's coalescing policy: latest value wins and the
 // slot is never annihilated. Unlike the object watch, "unscheduled" (the zero
 // Schedule) is a real gauge value a subscriber must observe, so it is kept, not
 // dropped — a slow reader converges to the id's current schedule.
-func mergeSchedule(_, next Schedule) (Schedule, bool) { return next, true }
+func scheduleMerge(_, next Schedule) (Schedule, bool) { return next, true }
 
-// publishSchedule feeds one work-queue schedule change into the hub. It is the
+// schedulePublish feeds one work-queue schedule change into the hub. It is the
 // onSchedule callback, so it runs under the queue lock: it maps the queue's native
 // (time, scheduled) to the public Schedule (unscheduled folds to the zero time),
 // then Sends — which never blocks, and a closed hub drops it. The scheduled bool is
 // redundant with a zero time here, so it is ignored.
-func (r *reconciler) publishSchedule(id ObjectID, at time.Time, _ bool) {
+func (r *reconciler) schedulePublish(id ObjectID, at time.Time, _ bool) {
 	_ = r.scheduleHub.Sender().Send(id, Schedule{NextRequeueAt: at})
 }
 
-// watchSchedule returns a channel that delivers id's current schedule on subscribe
+// scheduleWatch returns a channel that delivers id's current schedule on subscribe
 // and every reschedule thereafter, until ctx is cancelled or the hub closes. The
-// receiver is registered atomically with the snapshot read (subscribeSchedule), so
+// receiver is registered atomically with the snapshot read (scheduleSubscribe), so
 // no change between the two is lost. The queue's native (time, scheduled) is mapped
 // to a Schedule here — the reconciler owns that domain type, not the queue.
-func (r *reconciler) watchSchedule(ctx context.Context, id ObjectID) <-chan Schedule {
+func (r *reconciler) scheduleWatch(ctx context.Context, id ObjectID) <-chan Schedule {
 	var rx *conflate.Receiver[ObjectID, Schedule]
-	at := r.work.subscribeSchedule(id, func() {
+	at := r.work.scheduleSubscribe(id, func() {
 		rx = r.scheduleHub.Receiver(r.scheduleHub.WithKeyFilter(func(k ObjectID) bool { return k == id }))
 	})
 	snapshot := Schedule{NextRequeueAt: at}
 
 	out := make(chan Schedule)
 	go func() {
-		if r.afterWatchSchedule != nil {
-			defer r.afterWatchSchedule()
+		if r.afterScheduleWatch != nil {
+			defer r.afterScheduleWatch()
 		}
 		defer close(out)
 		defer rx.Close()
@@ -522,12 +522,12 @@ func (r *reconciler) run(ctx context.Context) {
 	// Resync-off is deliberately not logged: it is the default, so narrating it
 	// would put a line in every process's startup for the ordinary case.
 	if r.catchupInterval <= 0 {
-		r.logger.InfoContext(ctx, "catchup disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ListUnsettledIDs + Client.Requeue",
+		r.logger.InfoContext(ctx, "catchup disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ObjectsListUnsettledIDs + Client.Requeue",
 			"group", r.gk.Group, "kind", r.gk.Kind)
 	}
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
 	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue,
-	// and close the schedule hub so live WatchSchedule streams end instead of hanging
+	// and close the schedule hub so live SchedulesWatch streams end instead of hanging
 	// on a subscriber context that outlives the control plane.
 	defer func() {
 		wg.Wait()
@@ -627,11 +627,11 @@ func (r *reconciler) runWorker(ctx context.Context) {
 					// The reconcile failure itself is already logged (with the
 					// error) in typedController.reconcile; here we only add the
 					// computed backoff delay at Debug.
-					delay := r.nextBackoff(id)
+					delay := r.backoffNext(id)
 					r.work.addAfter(id, delay)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
 				} else {
-					r.clearBackoff(id)
+					r.backoffClear(id)
 					if result.RequeueAfter > 0 {
 						r.work.addAfter(id, result.RequeueAfter)
 						r.logger.Debug("requeued", "id", id, "after", result.RequeueAfter)

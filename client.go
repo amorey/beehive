@@ -28,8 +28,11 @@ import (
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// Change reports a change to a watched object.
-type Change[Spec, Status any] struct {
+// ObjectChange reports a change to a watched object: what happened (Type) and
+// the object it happened to. On a Deleted change Object carries the row's final
+// state. It is delivered by value — a type tag plus one pointer — so a consumer
+// never has to reason about a nil change.
+type ObjectChange[Spec, Status any] struct {
 	Type   ChangeType
 	Object *Object[Spec, Status]
 }
@@ -39,6 +42,43 @@ type Change[Spec, Status any] struct {
 type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
 	CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
+	// Delete soft-deletes the object (sets DeletionRequestedAt) and advances GC so
+	// the controller runs its finalizers; physical removal follows once they clear.
+	// An id naming no object of this kind is ErrNotFound — contrast DeleteBySlug,
+	// which folds absence to nil.
+	Delete(ctx context.Context, id ObjectID) error
+	// DeleteBySlug requests deletion of the object with the given slug. It is
+	// idempotent: a slug that matches no object returns nil (already gone), and a
+	// row already deletion-pending is a no-op returning nil (as Delete is on a
+	// repeated call). Kind-scoped like GetBySlug — a slug is per-kind, so this only
+	// ever targets this client's kind. Deletion itself is Delete's: a soft delete
+	// plus a GC advance.
+	//
+	// The delete-if-present partner to GetOrCreate's create-if-absent, so an
+	// ensure/remove pair is one call on each side.
+	DeleteBySlug(ctx context.Context, slug string) error
+	// DependenciesList returns the objects id depends on (its outgoing depends_on
+	// edges). The lazy counterpart to LoadDependencies().
+	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// DependentsList returns the objects that depend on id (incoming depends_on).
+	// The lazy counterpart to LoadDependents().
+	DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// EventsGetLatest returns the current (most-recent) run in id's category timeline.
+	// ok reports presence: false (with a nil error) when the timeline is empty.
+	EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error)
+
+	// EventsList returns id's event-log runs, newest-first, filtered by the given
+	// options (see EventOption). Like the ref lookups it reads by id and does not
+	// kind-scope: a foreign id reads that object's log. An empty log is an empty slice.
+	EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
+	// EventsWatch streams id's event log: the runs matching opts as a snapshot, then
+	// live runs, on the returned channel. The channel closes when ctx is cancelled or
+	// the stream ends. Like Watch it requires a registered controller and is scoped to
+	// this client's kind. Runs conflate per run, so a lagging reader converges to each
+	// run's latest state.
+	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
 	// GetOrCreate returns the object with the given slug, creating it from spec if
 	// absent. Unlike CreateOrUpdate it NEVER mutates an existing row: a slug held by
 	// a live OR deletion-pending row is returned as-is with created=false, so the
@@ -75,7 +115,7 @@ type Client[Spec, Status any] interface {
 	// lacks the owner or finalizers you passed keeps lacking them, and created=false
 	// is the only signal you get. Do not read created=false as "exists and matches
 	// opts": a caller depending on the owner edge (for cascade collection, say) must
-	// check it with LoadOwner()/GetOwner and reconcile the difference itself.
+	// check it with LoadOwner()/OwnersGet and reconcile the difference itself.
 	// Beehive can't adopt the row for you — owner is single, so adding the edge to a
 	// row that already has a different owner would produce a two-owner object, and
 	// picking a winner is caller policy.
@@ -89,56 +129,22 @@ type Client[Spec, Status any] interface {
 	// json.Marshal out of the transaction, which on a single-connection store would
 	// hold the write lock across arbitrary user MarshalJSON code.
 	GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
-	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
-	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
-	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
-	// Delete soft-deletes the object (sets DeletionRequestedAt) and advances GC so
-	// the controller runs its finalizers; physical removal follows once they clear.
-	// An id naming no object of this kind is ErrNotFound — contrast DeleteBySlug,
-	// which folds absence to nil.
-	Delete(ctx context.Context, id ObjectID) error
-	// DeleteBySlug requests deletion of the object with the given slug. It is
-	// idempotent: a slug that matches no object returns nil (already gone), and a
-	// row already deletion-pending is a no-op returning nil (as Delete is on a
-	// repeated call). Kind-scoped like GetBySlug — a slug is per-kind, so this only
-	// ever targets this client's kind. Deletion itself is Delete's: a soft delete
-	// plus a GC advance.
-	//
-	// The delete-if-present partner to GetOrCreate's create-if-absent, so an
-	// ensure/remove pair is one call on each side.
-	DeleteBySlug(ctx context.Context, slug string) error
-	Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error)
-	WatchList(ctx context.Context) (<-chan Change[Spec, Status], error)
-
-	// GetOwner returns id's owner, if any. ok reports presence: false (with a nil
-	// error) when the object simply has no owner. The lazy counterpart to
-	// LoadOwner() — fetch the owner only when it is actually needed.
-	//
-	// This and the three ListDependencies/ListDependents/ListOwned lookups read
-	// their edge query directly and do not kind-scope id: passing another kind's
-	// id reads that kind's edges, and a missing id reads empty — neither reports
-	// ErrNotFound. Reserve them for ids this client owns.
-	GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error)
-	// ListDependencies returns the objects id depends on (its outgoing depends_on
-	// edges). The lazy counterpart to LoadDependencies().
-	ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error)
-	// ListDependents returns the objects that depend on id (incoming depends_on).
-	// The lazy counterpart to LoadDependents().
-	ListDependents(ctx context.Context, id ObjectID) ([]Ref, error)
-	// ListOwned returns the objects id owns (its incoming owned_by edges). The
+	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
+	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
+	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
-	ListOwned(ctx context.Context, id ObjectID) ([]Ref, error)
+	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 
-	// ListOwnedObjects returns the objects owned by ownerID that belong to THIS
-	// client's kind, fully decoded — the typed, kind-scoped form of ListOwned
+	// OwnedObjectsList returns the objects owned by ownerID that belong to THIS
+	// client's kind, fully decoded — the typed, kind-scoped form of OwnedList
 	// (which returns untyped Refs across every owned kind, leaving the caller to
 	// filter by Kind and Get each child through that kind's client). Ownership is
 	// the owned_by edge (child -> owner), so these are ownerID's children of this
-	// kind, ordered by id as ListOwned is.
+	// kind, ordered by id as OwnedList is.
 	//
 	// ownerID need not be this client's kind — it is the owner, typically another
-	// kind — and like ListOwned it is not kind-scoped or existence-checked: an
+	// kind — and like OwnedList it is not kind-scoped or existence-checked: an
 	// owner with no children of this kind, and an ownerID that doesn't exist, both
 	// read empty rather than ErrNotFound. A deletion-pending child is included;
 	// whether to skip it is the caller's call (check DeletionRequestedAt).
@@ -148,21 +154,17 @@ type Client[Spec, Status any] interface {
 	// children come back with nothing loaded and their ref/event accessors return
 	// ErrNotLoaded. Pass e.g. LoadOwned() to walk a second level of the tree
 	// without a Get per child — the per-child Get this method exists to avoid.
-	ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
+	OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
 
-	// ListEvents returns id's event-log runs, newest-first, filtered by the given
-	// options (see EventOption). Like the ref lookups it reads by id and does not
-	// kind-scope: a foreign id reads that object's log. An empty log is an empty slice.
-	ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
-	// GetLatestEvent returns the current (most-recent) run in id's category timeline.
-	// ok reports presence: false (with a nil error) when the timeline is empty.
-	GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
-	// WatchEvents streams id's event log: the runs matching opts as a snapshot, then
-	// live runs, on the returned channel. The channel closes when ctx is cancelled or
-	// the stream ends. Like Watch it requires a registered controller and is scoped to
-	// this client's kind. Runs conflate per run, so a lagging reader converges to each
-	// run's latest state.
-	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+	// OwnersGet returns id's owner, if any. ok reports presence: false (with a nil
+	// error) when the object simply has no owner. The lazy counterpart to
+	// LoadOwner() — fetch the owner only when it is actually needed.
+	//
+	// This and the three DependenciesList/DependentsList/OwnedList lookups read
+	// their edge query directly and do not kind-scope id: passing another kind's
+	// id reads that kind's edges, and a missing id reads empty — neither reports
+	// ErrNotFound. Reserve them for ids this client owns.
+	OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
 
 	// Requeue requeues id for immediate reconcile. A latency hint, not a
 	// synchronous run: with the periodic resync enabled, correctness rests on that,
@@ -171,7 +173,7 @@ type Client[Spec, Status any] interface {
 	// It is also the supported way to drive reconciles yourself when no ticker is
 	// configured — WithCatchupInterval(0) with WithResyncInterval(0), where startup
 	// drains owed work once and nothing re-derives it afterward.
-	// Store.ListUnsettledIDs reports what is owed.
+	// Store.ObjectsListUnsettledIDs reports what is owed.
 	//
 	// By default it preserves id's retry backoff ladder: a requeue is the common
 	// event-driven nudge (config change, dependency update, manual poke) and
@@ -183,7 +185,7 @@ type Client[Spec, Status any] interface {
 	// Returns ErrNotFound if id does not exist and ErrNoController if the kind has
 	// no registered controller.
 	Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error
-	// GetSchedule reports id's Schedule: when the reconcile loop has, in advance,
+	// SchedulesGet reports id's Schedule: when the reconcile loop has, in advance,
 	// scheduled id to be requeued — a pending backoff retry or RequeueAfter delay,
 	// or now if it is already queued — in Schedule.NextRequeueAt, or the zero time
 	// there when nothing is scheduled. The Schedule wrapper leaves room for future
@@ -202,17 +204,18 @@ type Client[Spec, Status any] interface {
 	// wakes, store-write enqueues, or Requeue. So the actual next reconcile may be
 	// earlier than reported, and a zero NextRequeueAt means "nothing scheduled", not
 	// "will not reconcile". Treat it as observability, not a guarantee. Use
-	// WatchSchedule to observe changes live.
-	GetSchedule(ctx context.Context, id ObjectID) (Schedule, error)
-	// WatchSchedule streams id's schedule as a gauge: the current value on subscribe,
+	// SchedulesWatch to observe changes live.
+	SchedulesGet(ctx context.Context, id ObjectID) (Schedule, error)
+	// SchedulesWatch streams id's schedule as a gauge: the current value on subscribe,
 	// then a new Schedule on every (re)schedule — backoff step, RequeueAfter, resync
 	// or dependency wake, dispatch, or Requeue — none of which the object Watch sees.
 	// The channel closes when ctx is cancelled or the control plane stops. A lagging
 	// reader converges to the latest value (per-id coalescing), so it can miss
-	// intermediate values but never the current one. Unlike GetSchedule, a client-only
+	// intermediate values but never the current one. Unlike SchedulesGet, a client-only
 	// kind returns ErrNoController rather than hang on a stream that can never emit; id
 	// need not exist — an unscheduled id streams the zero Schedule until scheduled.
-	WatchSchedule(ctx context.Context, id ObjectID) (<-chan Schedule, error)
+	SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error)
+	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -280,7 +283,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 // each caller has already populated from its single source (WithSlug for Create,
 // the positional argument for CreateOrUpdate/GetOrCreate).
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
-	raw, err := c.bh.store.CreateObject(ctx, &RawObject{
+	raw, err := c.bh.store.ObjectsCreate(ctx, &RawObject{
 		Group:       c.gk.Group,
 		Kind:        c.gk.Kind,
 		Slug:        co.slug,
@@ -292,10 +295,10 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte
 		return nil, err
 	}
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it
-	// via ListIncomingRefs(owner, RelationOwnedBy). No version claim and no wake
+	// via EdgesListIncoming(owner, RelationOwnedBy). No version claim and no wake
 	// stamp: an owner edge carries no read this call could be racing.
 	if co.owner != nil {
-		if _, err := c.bh.store.AddRef(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
+		if _, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -321,7 +324,7 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, id ObjectI
 // doesn't round-trip rolls the write back rather than committing a row the process
 // can't read (see Create), and then registers the post-commit reconcile wake — but
 // only when changed is true. The wake is gated because a no-op write (an identical
-// spec, which UpdateSpec collapses) emits nothing; waking anyway would be the lone
+// spec, which ObjectsUpdateSpec collapses) emits nothing; waking anyway would be the lone
 // signal claiming something happened and, for a controller re-applying its own
 // kind's spec each pass, a self-sustaining reconcile loop. Keeping this contract in
 // one place is the update-path counterpart to signalCreated on the create paths.
@@ -340,7 +343,7 @@ func (c *clientImpl[Spec, Status]) decodeAndWake(ctx context.Context, raw *RawOb
 // updates the existing object carrying that slug, or creates one with that slug
 // if none exists. Wrapping the read-then-write in Within makes the upsert atomic,
 // so concurrent callers can't both insert the same slug — the second sees the
-// first's row and updates instead. Re-applying the same spec is a no-op (UpdateSpec
+// first's row and updates instead. Re-applying the same spec is a no-op (ObjectsUpdateSpec
 // suppresses the generation bump on equal bytes).
 //
 // It drives the store mutators directly rather than composing Create/Update so
@@ -354,12 +357,12 @@ func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug stri
 	}
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 		var raw *RawObject
 		changed := true // the create branch always changes something
 		switch {
 		case err == nil:
-			raw, changed, err = c.bh.store.UpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+			raw, changed, err = c.bh.store.ObjectsUpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		case errors.Is(err, ErrNotFound):
 			// No opts on this surface, so the row carries no finalizers and no owner.
 			raw, err = c.insertObject(ctx, b, &createOptions{slug: &slug})
@@ -406,7 +409,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	// TOCTOU: the loser of a concurrent create observes the winner's row instead
 	// of failing on the slug's UNIQUE constraint.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 		if err == nil {
 			// Found: return the existing row as-is (live or deletion-pending; never
 			// mutated). A pre-existing poison row is not ours to roll back, so its
@@ -458,17 +461,17 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	if err != nil {
 		return nil, err
 	}
-	// UpdateSpec self-wraps in Within; wrapping it here lets the decode join that
+	// ObjectsUpdateSpec self-wraps in Within; wrapping it here lets the decode join that
 	// same transaction, so a spec that doesn't round-trip rolls the write back (see
 	// Create), keeping the prior good spec instead of committing a row the process
 	// can't read. Outside a caller's Within this is a standalone tx; nested in one it
 	// joins, and the wake defers to that outer commit either way.
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		// UpdateSpec folds this client's kind into the write, so a foreign id is
+		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
 		// rejected at the store (no separate read-then-write to keep atomic);
 		// hideWrongKind keeps that foreign id invisible to this single-kind client.
-		raw, changed, err := c.bh.store.UpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		if err = c.hideWrongKind(err); err != nil {
 			return err
 		}
@@ -499,10 +502,10 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads .
 // scopedGet loads id and confirms it belongs to this client's kind. A Client is
 // the surface for a single resource kind, so an id naming an object of another
 // kind must be invisible here — reads, updates, and deletes through this client
-// must never touch another controller's rows. On the read path GetObject isn't
+// must never touch another controller's rows. On the read path ObjectsGet isn't
 // kind-scoped, so the client checks here, reporting ErrNotFound for a foreign id.
 func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
-	raw, err := c.bh.store.GetObject(ctx, id)
+	raw, err := c.bh.store.ObjectsGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +527,7 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 }
 
 func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
-	raw, err := c.bh.store.GetObjectBySlug(ctx, c.gk, slug)
+	raw, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +557,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnerBit
 	}
 	if set&LoadDependenciesBit != 0 {
-		deps, err := store.ListOutgoingRefsByRelation(ctx, obj.ID, RelationDependsOn)
+		deps, err := store.EdgesListOutgoingByRelation(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -562,7 +565,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependenciesBit
 	}
 	if set&LoadDependentsBit != 0 {
-		dependents, err := store.ListIncomingRefs(ctx, obj.ID, RelationDependsOn)
+		dependents, err := store.EdgesListIncoming(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -570,7 +573,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependentsBit
 	}
 	if set&LoadOwnedBit != 0 {
-		owned, err := store.ListIncomingRefs(ctx, obj.ID, RelationOwnedBy)
+		owned, err := store.EdgesListIncoming(ctx, obj.ID, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -578,7 +581,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnedBit
 	}
 	if set&LoadEventsBit != 0 {
-		raw, err := store.ListEvents(ctx, obj.ID, storeapi.EventQuery{})
+		raw, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
 		if err != nil {
 			return err
 		}
@@ -590,19 +593,19 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 
 // fetchOwnerRef resolves id's single owned_by edge. Owner is single (WithOwner
 // sets one), so the first row is the owner and ok is false when there is none.
-func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (Ref, bool, error) {
-	owners, err := store.ListOutgoingRefsByRelation(ctx, id, RelationOwnedBy)
+func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bool, error) {
+	owners, err := store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
 	if err != nil {
-		return Ref{}, false, err
+		return ObjectRef{}, false, err
 	}
 	if len(owners) == 0 {
-		return Ref{}, false, nil
+		return ObjectRef{}, false, nil
 	}
 	return owners[0], true, nil
 }
 
 func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ListObjects(ctx, c.gk)
+	raws, err := c.bh.store.ObjectsList(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}
@@ -646,7 +649,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		ids[i] = o.ID
 	}
 	if set&LoadOwnerBit != 0 {
-		byID, err := c.bh.store.GroupOutgoingRefsByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.EdgesGroupOutgoingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -659,7 +662,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependenciesBit != 0 {
-		byID, err := c.bh.store.GroupOutgoingRefsByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.EdgesGroupOutgoingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -669,7 +672,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependentsBit != 0 {
-		byID, err := c.bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -679,7 +682,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadOwnedBit != 0 {
-		byID, err := c.bh.store.GroupIncomingRefsByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -692,9 +695,9 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		// Events have no batched store primitive (unlike the ref relations), so this
 		// is one query per object — the deliberate exception to loadListRelated's
 		// batching. Each object's log is retention-bounded; for large lists or
-		// filtered reads, prefer the lazy Client.ListEvents.
+		// filtered reads, prefer the lazy Client.EventsList.
 		for _, o := range objs {
-			raw, err := c.bh.store.ListEvents(ctx, o.ID, storeapi.EventQuery{})
+			raw, err := c.bh.store.EventsList(ctx, o.ID, storeapi.EventQuery{})
 			if err != nil {
 				return err
 			}
@@ -713,30 +716,30 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 // kind's edges and a missing id reads empty — neither surfaces as ErrNotFound —
 // so passing another kind's id through this single-kind client is silent misuse
 // rather than a clean error.
-func (c *clientImpl[Spec, Status]) GetOwner(ctx context.Context, id ObjectID) (Ref, bool, error) {
+func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
-func (c *clientImpl[Spec, Status]) ListDependencies(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListOutgoingRefsByRelation(ctx, id, RelationDependsOn)
+func (c *clientImpl[Spec, Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
-func (c *clientImpl[Spec, Status]) ListDependents(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationDependsOn)
+func (c *clientImpl[Spec, Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
 }
 
-func (c *clientImpl[Spec, Status]) ListOwned(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.ListIncomingRefs(ctx, id, RelationOwnedBy)
+func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
 }
 
 // The kind filter lives in the store statement's WHERE, so foreign-kind children
 // never reach Go. See the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ListIncomingRefObjects(ctx, c.gk, ownerID, RelationOwnedBy)
+func (c *clientImpl[Spec, Status]) OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
+	raws, err := c.bh.store.ObjectsListByIncomingEdge(ctx, c.gk, ownerID, RelationOwnedBy)
 	if err != nil {
 		return nil, err
 	}
-	objs := c.decodeList(raws, "ListOwnedObjects")
+	objs := c.decodeList(raws, "OwnedObjectsList")
 	if err := c.loadListRelated(ctx, objs, resolveLoads(loads)); err != nil {
 		return nil, err
 	}
@@ -769,14 +772,14 @@ func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID, opt
 	return nil
 }
 
-// GetSchedule reports id's Schedule. It reads the in-memory work queue directly,
+// SchedulesGet reports id's Schedule. It reads the in-memory work queue directly,
 // with no store lookup and no kind guard: a foreign or missing id just isn't in
 // this kind's schedule, and a client-only kind has no reconciler — both fold into
 // the zero-value Schedule. The error is reserved for symmetry with the rest of the
 // surface and is never returned today; ctx is unused (no I/O). See the Client
 // interface for the full contract — notably that it does not account for resync or
 // event-driven wakes.
-func (c *clientImpl[Spec, Status]) GetSchedule(ctx context.Context, id ObjectID) (Schedule, error) {
+func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID) (Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
 	if !ok {
 		return Schedule{}, nil // client-only kind: nothing is ever scheduled
@@ -785,24 +788,24 @@ func (c *clientImpl[Spec, Status]) GetSchedule(ctx context.Context, id ObjectID)
 	return Schedule{NextRequeueAt: at}, nil
 }
 
-// WatchSchedule streams id's schedule live. It requires a registered controller
+// SchedulesWatch streams id's schedule live. It requires a registered controller
 // (the reconcile loop that owns the schedule hub); a client-only kind has none, so
 // it returns ErrNoController. See the Client interface for the full contract.
-func (c *clientImpl[Spec, Status]) WatchSchedule(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
+func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
 	if !ok {
 		return nil, ErrNoController
 	}
-	return r.watchSchedule(ctx, id), nil
+	return r.scheduleWatch(ctx, id), nil
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	// RequestDeletion emits the Modified event itself, and only on a real state
+	// DeletionRequestsCreate emits the Modified event itself, and only on a real state
 	// change — an idempotent retry carries the same resource_version, so emitting
 	// would show watchers a spurious diff. It folds this client's kind into the
 	// write, so a foreign id can't be deleted through this client; hideWrongKind
 	// keeps that foreign id invisible.
-	_, _, err := c.bh.store.RequestDeletion(ctx, c.gk, id)
+	_, _, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
@@ -810,7 +813,7 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// deletion-pending object to the controller to clear finalizers. A client-only
 	// kind has no controller to hand it to, so it falls to the global GC sweeper —
 	// whose cadence is guaranteed, since WithGCInterval refuses to be disabled.
-	c.bh.advanceGC(ctx, c.gk, id)
+	c.bh.gcAdvance(ctx, c.gk, id)
 	return nil
 }
 
@@ -820,46 +823,46 @@ func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string
 	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
 	// The one place a slug delete departs from Delete, which reports a missing id.
-	obj, _, err := c.bh.store.RequestDeletionBySlug(ctx, c.gk, slug)
+	obj, _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
 		return err
 	}
-	c.bh.advanceGC(ctx, c.gk, obj.ID) // unconditionally, as in Delete
+	c.bh.gcAdvance(ctx, c.gk, obj.ID) // unconditionally, as in Delete
 	return nil
 }
 
-func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context) (<-chan Change[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	w, err := c.bh.store.WatchList(ctx, c.gk)
+	w, err := c.bh.store.ObjectsWatchList(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}
-	return c.adaptWatcher(ctx, w), nil
+	return c.adaptObjectStream(ctx, w), nil
 }
 
-func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID) (<-chan Change[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	w, err := c.bh.store.Watch(ctx, c.gk, id)
+	w, err := c.bh.store.ObjectsWatch(ctx, c.gk, id)
 	if err != nil {
 		return nil, err
 	}
-	return c.adaptWatcher(ctx, w), nil
+	return c.adaptObjectStream(ctx, w), nil
 }
 
-// adaptWatcher decodes a store Watcher's raw events (the snapshot's Added events
+// adaptObjectStream decodes a store Watcher's raw events (the snapshot's Added events
 // followed by live changes — the store owns snapshotting, dedup, and id
 // filtering) into typed Changes. It forwards on the returned channel until
 // ctx is cancelled, the watcher's stream ends, or an event fails to decode; the
 // channel closes and the watcher is released on exit.
-func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) <-chan Change[Spec, Status] {
-	out := make(chan Change[Spec, Status])
+func (c *clientImpl[Spec, Status]) adaptObjectStream(ctx context.Context, w *ObjectsSubscription) <-chan ObjectChange[Spec, Status] {
+	out := make(chan ObjectChange[Spec, Status])
 	// The migrator is invariant for the watcher's lifetime; resolve it once rather
 	// than re-locking the registry on every event.
 	mig := c.bh.migratorFor(c.gk)
@@ -882,7 +885,7 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 					continue
 				}
 				select {
-				case out <- Change[Spec, Status]{Type: ev.Type, Object: obj}:
+				case out <- ObjectChange[Spec, Status]{Type: ev.Type, Object: obj}:
 				case <-ctx.Done():
 					return
 				}
@@ -894,18 +897,18 @@ func (c *clientImpl[Spec, Status]) adaptWatcher(ctx context.Context, w Watcher) 
 	return out
 }
 
-// ListEvents reads id's runs and maps them to public Events. It reads by id
+// EventsList reads id's runs and maps them to public Events. It reads by id
 // (not kind-scoped), like the ref lookups.
-func (c *clientImpl[Spec, Status]) ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.ListEvents(ctx, id, resolveEvents(opts))
+func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
+	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts))
 	if err != nil {
 		return nil, err
 	}
 	return eventsFromRaw(raw), nil
 }
 
-func (c *clientImpl[Spec, Status]) GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error) {
-	raw, err := c.bh.store.GetLatestEvent(ctx, id, category)
+func (c *clientImpl[Spec, Status]) EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error) {
+	raw, err := c.bh.store.EventsGetLatest(ctx, id, category)
 	if err != nil {
 		return Event{}, false, err
 	}
@@ -915,30 +918,30 @@ func (c *clientImpl[Spec, Status]) GetLatestEvent(ctx context.Context, id Object
 	return eventFromRaw(*raw), true, nil
 }
 
-func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error) {
+func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	w, err := c.bh.store.WatchEvents(ctx, c.gk, id, resolveEvents(opts))
+	w, err := c.bh.store.EventsWatch(ctx, c.gk, id, resolveEvents(opts))
 	if err != nil {
 		return nil, err
 	}
-	return adaptEventWatcher(ctx, w), nil
+	return adaptEventStream(ctx, w), nil
 }
 
-// adaptEventWatcher forwards a store EventWatcher's raw runs as public Events
+// adaptEventStream forwards a store EventsSubscription's raw runs as public Events
 // until ctx is cancelled or the stream ends, then closes the channel and releases
-// the watcher. Simpler than adaptWatcher: event runs carry no Spec/Status to
+// the watcher. Simpler than adaptObjectStream: event runs carry no Spec/Status to
 // decode, so there is no migrator and no per-event quarantine — it needs nothing
 // from the client, so it is a free function.
-func adaptEventWatcher(ctx context.Context, w EventWatcher) <-chan Event {
+func adaptEventStream(ctx context.Context, w *EventsSubscription) <-chan Event {
 	out := make(chan Event)
 	go func() {
 		defer close(out)
 		defer w.Close()
 		for {
 			select {
-			case ev, ok := <-w.Events():
+			case ev, ok := <-w.Changes():
 				if !ok {
 					return
 				}

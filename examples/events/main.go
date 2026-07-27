@@ -20,7 +20,7 @@
 // identical outcomes coalesce into runs, so a flapping cluster produces the
 // aggregated, newest-first timeline a panel renders:
 //
-//	Create(spec) -> prober RecordEvent×N -> Client.ListEvents -> render
+//	Create(spec) -> prober EventsRecord×N -> Client.EventsList -> render
 //
 // Run it with `go run ./examples/events/main.go`.
 package main
@@ -94,10 +94,10 @@ func main() {
 	exitOnErr(err)
 	fmt.Printf("created Cluster id=%d endpoint=%s\n\n", cluster.ID, cluster.Spec.Endpoint)
 
-	// Simulate a flapping connection: one RecordEvent per probe outcome.
+	// Simulate a flapping connection: one EventsRecord per probe outcome.
 	probe := func(typ beehive.EventType, reason, message string, detail any, n int) {
 		for range n {
-			exitOnErr(prober.RecordEvent(ctx, cluster.ID, beehive.EventSpec{
+			exitOnErr(prober.EventsRecord(ctx, cluster.ID, beehive.EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: message, Detail: detail,
 			}))
 		}
@@ -108,7 +108,7 @@ func main() {
 	probe(beehive.EventWarning, "ProbeFailed", "i/o timeout", ProbeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18)
 	probe(beehive.EventNormal, "Connected", "", nil, 4)
 
-	panel, err := client.ListEvents(ctx, cluster.ID, beehive.WithEventCategory("connection"))
+	panel, err := client.EventsList(ctx, cluster.ID, beehive.WithEventCategory("connection"))
 	exitOnErr(err)
 
 	fmt.Println("connection-health panel (newest first):")

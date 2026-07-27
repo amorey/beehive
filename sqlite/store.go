@@ -38,16 +38,16 @@ type sqliteStore struct {
 	processStart time.Time
 
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
-	// created lazily on first use. hubMu guards the maps, changeHub and the
+	// created lazily on first use. hubMu guards the maps, writeHub and the
 	// closed flag.
 	hubMu sync.RWMutex
-	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawChange]
-	// changeHub is the store-wide twin of hubs: every object change, of every kind,
+	hubs  map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawObjectChange]
+	// writeHub is the store-wide twin of hubs: every object change, of every kind,
 	// keyed by the same globally unique ObjectID, carrying the projection rather
-	// than the row (see pendingChange). Created eagerly in open — there is exactly one
+	// than the row (see writeSignal). Created eagerly in open — there is exactly one
 	// and no key to look it up by, so making it lazy would cost the publish path
 	// (which runs on every object write) a second lock and map lookup.
-	changeHub *conflate.Hub[storeapi.ObjectID, pendingChange]
+	writeHub *conflate.Hub[storeapi.ObjectID, writeSignal]
 	// eventHubs fan the event log out, one per GroupKind, keyed by run so a run's
 	// count-bumps conflate while distinct runs stay separate (see eventKey).
 	eventHubs map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]
@@ -91,7 +91,7 @@ func (s *sqliteStore) Close() error {
 		for _, h := range s.eventHubs {
 			h.Close()
 		}
-		s.changeHub.Close()
+		s.writeHub.Close()
 		s.hubs = nil
 		s.eventHubs = nil
 	}
@@ -143,8 +143,8 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // Read-modify-write atomicity rests on the DSN's _txlock=immediate: BeginTx
 // issues BEGIN IMMEDIATE, so a transaction holds the sole WAL write lock from
 // BEGIN through Commit, before its first read. No other writer can commit in
-// between, so a compare-then-write (UpdateSpec's no-op suppression, SetCondition,
-// DeleteFinalizer, …) can't act on a stale snapshot, independent of pool size.
+// between, so a compare-then-write (ObjectsUpdateSpec's no-op suppression, ConditionsSet,
+// FinalizersDelete, …) can't act on a stale snapshot, independent of pool size.
 // This only covers compound writes routed through Within; a read then a separate
 // write on the bare pool is not atomic, so keep multi-statement mutations here.
 //
@@ -248,11 +248,11 @@ func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.ChangeType, 
 	if _, err := s.attachConditions(ctx, obj); err != nil {
 		return nil, err
 	}
-	s.emit(ctx, typ, obj)
+	s.changeEmit(ctx, typ, obj)
 	return obj, nil
 }
 
-func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
 	finalizers := marshalFinalizers(obj.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
@@ -276,7 +276,7 @@ func (s *sqliteStore) CreateObject(ctx context.Context, obj *storeapi.RawObject)
 
 // getObjectRow reads the objects row without assembling conditions. Internal
 // callers that don't need the conditions (existence checks, pre-write reads) use
-// it to avoid the extra per-object conditions query GetObject would run.
+// it to avoid the extra per-object conditions query ObjectsGet would run.
 func (s *sqliteStore) getObjectRow(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE id = ?`, id)
@@ -285,7 +285,7 @@ func (s *sqliteStore) getObjectRow(ctx context.Context, id storeapi.ObjectID) (*
 
 // getObjectRowScoped loads id's bare row (no conditions) and confirms it belongs
 // to gk. Returns ErrNotFound if the row is gone, ErrWrongKind if it names another
-// kind. It replaces the full GetObject + Go-side compare the client/controller
+// kind. It replaces the full ObjectsGet + Go-side compare the client/controller
 // used to do purely to enforce the kind boundary, dropping the conditions marshal.
 func (s *sqliteStore) getObjectRowScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	obj, err := s.getObjectRow(ctx, id)
@@ -313,7 +313,7 @@ func (s *sqliteStore) objectInKind(ctx context.Context, gk storeapi.GroupKind, i
 	return true, nil
 }
 
-func (s *sqliteStore) GetObject(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsGet(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	obj, err := s.getObjectRow(ctx, id)
 	if err != nil {
 		return nil, err
@@ -321,9 +321,9 @@ func (s *sqliteStore) GetObject(ctx context.Context, id storeapi.ObjectID) (*sto
 	return s.attachConditions(ctx, obj)
 }
 
-// GetObjectMeta is getObjectRow exposed across the store boundary: id's row with
+// ObjectsGetMeta is getObjectRow exposed across the store boundary: id's row with
 // no conditions assembled, for metadata-only callers (GC collect, ref checks).
-func (s *sqliteStore) GetObjectMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsGetMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	return s.getObjectRow(ctx, id)
 }
 
@@ -337,7 +337,7 @@ func (s *sqliteStore) getObjectRowBySlug(ctx context.Context, gk storeapi.GroupK
 	return scanObject(row)
 }
 
-func (s *sqliteStore) GetObjectBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsGetBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
 	obj, err := s.getObjectRowBySlug(ctx, gk, slug)
 	if err != nil {
 		return nil, err
@@ -345,22 +345,22 @@ func (s *sqliteStore) GetObjectBySlug(ctx context.Context, gk storeapi.GroupKind
 	return s.attachConditions(ctx, obj)
 }
 
-func (s *sqliteStore) ListObjects(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsList(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
 	return s.listObjectsWhere(ctx, `WHERE o."group" = ? AND o.kind = ?`, gk.Group, gk.Kind)
 }
 
-// ListIncomingRefObjects returns the full rows of the objects pointing at toID
+// ObjectsListByIncomingEdge returns the full rows of the objects pointing at toID
 // through relation, restricted to kind gk — the blob-bearing form of
-// ListIncomingRefs (which returns bare id/GroupKind referrers). Resolving the
+// EdgesListIncoming (which returns bare id/GroupKind referrers). Resolving the
 // edges in the statement is what saves the caller a Get per child.
 //
 // The edge is a semi-join, not a join: written as a join the planner drives from
-// idx_objects_kind (which already delivers ORDER BY o.id) and probes refs once
-// per object *of the kind*. IN (SELECT …) lets idx_refs_to drive instead, so the
+// idx_objects_kind (which already delivers ORDER BY o.id) and probes edges once
+// per object *of the kind*. IN (SELECT …) lets idx_edges_to drive instead, so the
 // work scales with the owner's children rather than the whole table.
-func (s *sqliteStore) ListIncomingRefObjects(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsListByIncomingEdge(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
 	return s.listObjectsWhere(ctx, `
-		WHERE o.id IN (SELECT from_id FROM refs WHERE to_id = ? AND relation = ?)
+		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
 		  AND o."group" = ? AND o.kind = ?`,
 		toID, string(relation), gk.Group, gk.Kind)
 }
@@ -414,8 +414,8 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 // predicate. The two statements are not in one transaction, so a re-run could
 // match a different set — a concurrent ref or object write between them would
 // silently drop the conditions of a row we are about to return. Keying off the
-// ids also avoids paying the predicate (a refs semi-join, for
-// ListIncomingRefObjects) twice. The list is chunked under the bound-parameter
+// ids also avoids paying the predicate (an edges semi-join, for
+// ObjectsListByIncomingEdge) twice. The list is chunked under the bound-parameter
 // limit (see idChunkSize).
 func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.ObjectID) (map[storeapi.ObjectID][]storeapi.Condition, error) {
 	byID := make(map[storeapi.ObjectID][]storeapi.Condition, len(ids))
@@ -457,7 +457,7 @@ func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.O
 	return rows.Err()
 }
 
-func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s *sqliteStore) ObjectsListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
 		 WHERE "group" = ? AND kind = ?
@@ -470,7 +470,7 @@ func (s *sqliteStore) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKin
 	return scanIDs(rows)
 }
 
-func (s *sqliteStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
 	// Kind-agnostic: no group/kind filter, so the global GC sweeper sees every
 	// finalizing object. The kind rides along because the sweeper routes on it
 	// (see the Store doc), and idx_objects_deleting is keyed to match — partial on
@@ -484,10 +484,10 @@ func (s *sqliteStore) ListAllDeletionPending(ctx context.Context) ([]storeapi.Re
 	if err != nil {
 		return nil, err
 	}
-	return scanReferrers(rows)
+	return scanObjectRefs(rows)
 }
 
-func (s *sqliteStore) ListPendingWakeIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s *sqliteStore) WakesListPendingIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	// Matches the partial index idx_objects_pending_wake WHERE pending_wake != 0.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
@@ -500,30 +500,30 @@ func (s *sqliteStore) ListPendingWakeIDs(ctx context.Context, gk storeapi.GroupK
 	return scanIDs(rows)
 }
 
-// IncrementPendingWake and DecrementPendingWake are single no-emit UPDATEs on the
+// WakesIncrement and WakesDecrement are single no-emit UPDATEs on the
 // owed-wake count. The decrement's contract (cross-kind, no resource_version bump,
 // why it takes the observed count) is on storeapi.Store; the subtraction floors at
 // 0 with max() so it can never drive the count negative.
 //
 // The increment is deliberately *not* on that interface: production wakes are
-// produced by AddRef, whose stamp must be indivisible from the edge insert, so the
+// produced by EdgesAdd, whose stamp must be indivisible from the edge insert, so the
 // declare path cannot route through a separate call and no other producer exists
 // yet. It stays here as the standalone form — reachable on the concrete store, so
 // tests can seed a count without staging the whole declare race — and is where a
 // future non-edge producer (see the dependency-waker item in TODO.md) would hook in.
-func (s *sqliteStore) IncrementPendingWake(ctx context.Context, id storeapi.ObjectID) error {
+func (s *sqliteStore) WakesIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET pending_wake = pending_wake + 1 WHERE id = ?`, id)
 	return err
 }
 
-func (s *sqliteStore) DecrementPendingWake(ctx context.Context, id storeapi.ObjectID, observed int64) error {
+func (s *sqliteStore) WakesDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET pending_wake = max(pending_wake - ?, 0) WHERE id = ?`, observed, id)
 	return err
 }
 
-func (s *sqliteStore) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
 		gk.Group, gk.Kind)
@@ -547,7 +547,7 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 
 // stampVersion resolves the schema version a write should leave on the row, given
 // what's stored and what the caller reports. It is the write-side twin of
-// convertBlob and applies to *both* branches of UpdateSpec/UpdateStatus — the
+// convertBlob and applies to *both* branches of ObjectsUpdateSpec/UpdateStatus — the
 // content no-op and the real content write — because the tag records the shape the
 // bytes are in, and a wrong tag corrupts every later read the same way regardless
 // of whether the bytes moved.
@@ -573,7 +573,7 @@ func stampVersion(stored, incoming int) (int, error) {
 	}
 }
 
-func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
 	var result *storeapi.RawObject
@@ -595,7 +595,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		// Identical spec *at the same schema version*: nothing changed, so don't
 		// bump generation/resource_version or emit. A bump would falsely unsettle a
 		// converged object and trigger a needless reconcile, and the event would show
-		// watchers a spurious diff (mirrors RequestDeletion's idempotent no-op).
+		// watchers a spurious diff (mirrors DeletionRequestsCreate's idempotent no-op).
 		//
 		// The version gate is what makes the byte compare meaningful. Convert-on-read
 		// leaves old rows tagged at the version they were written in, so a caller at a
@@ -609,7 +609,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 		// included. That is the point, not a side effect: bumping resource_version
 		// while leaving generation would re-stamp a row that stays settled
 		// (ObservedGeneration == Generation), so neither the reconciler nor
-		// ListUnsettledIDs would ever re-derive status against the new shape. Worst
+		// ObjectsListUnsettledIDs would ever re-derive status against the new shape. Worst
 		// case a re-stamp costs one generation bump and one spurious reconcile per
 		// row per version bump — at most once per row, since the next write compares
 		// equal — which the level-triggered loop absorbs.
@@ -639,15 +639,15 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 	return result, changed, err
 }
 
-// UpdateStatus skips the status write when the incoming bytes equal the stored
-// ones, mirroring UpdateSpec/DeleteFinalizer/DeleteCondition: no resource_version
+// ObjectsUpdateStatus skips the status write when the incoming bytes equal the stored
+// ones, mirroring ObjectsUpdateSpec/FinalizersDelete/ConditionsDelete: no resource_version
 // bump, no updated_at touch, no Modified event — a watcher would otherwise see a
 // spurious diff, and downstream controllers that wake dependents off a status
 // Modified would reconcile for nothing on every unchanged health poll.
 //
 // The convergence handshake is the one thing a content no-op must still carry:
 // observed_generation/observed_at record *that the controller ran*, not what it
-// wrote, and ListUnsettledIDs (the resync backstop) keys off observed_generation
+// wrote, and ObjectsListUnsettledIDs (the resync backstop) keys off observed_generation
 // < generation. Leaving it behind on an identical-status reconcile would strand
 // the object unsettled forever, re-enqueued every resync. And that advance is a
 // real transition — the object just settled at a new generation — so it bumps
@@ -661,7 +661,7 @@ func (s *sqliteStore) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id 
 // written in a different shape aren't comparable, so a caller at a newer version
 // takes the content path even when the bytes look identical. Identical status at
 // the same version, with the generation already recorded, writes nothing at all.
-func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
 	var result *storeapi.RawObject
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
@@ -693,7 +693,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			// actually move.
 			//
 			// The version gate is what makes the byte compare meaningful — see
-			// UpdateSpec for the argument. A caller at a newer schema version holds
+			// ObjectsUpdateSpec for the argument. A caller at a newer schema version holds
 			// bytes in a different shape, so equal bytes aren't equal values; that
 			// case falls through to the content write below, which stamps, bumps
 			// resource_version and emits. It writes the reported generation verbatim
@@ -703,7 +703,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 			// >=, not ==: with no content to write, a report at or below the recorded
 			// generation is nothing new to record. Treating a stale one as an advance
 			// would roll observed_generation backwards, re-unsettling a converged
-			// object for ListUnsettledIDs and emitting a Modified that wakes every
+			// object for ObjectsListUnsettledIDs and emitting a Modified that wakes every
 			// dependent — all to relay strictly less than what's already stored. The
 			// changed-status path below deliberately does *not* clamp: there the
 			// stale reporter overwrote the status content, so unsettling the object
@@ -745,7 +745,7 @@ func (s *sqliteStore) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, i
 		// backstop re-derives that content. Clamping here would pin stale status as
 		// converged, and nothing would ever revisit it.
 		//
-		// Keyed on id alone, like UpdateSpec's: the kind boundary and the
+		// Keyed on id alone, like ObjectsUpdateSpec's: the kind boundary and the
 		// generation guard both came from the scoped read above, in this same
 		// transaction, and group/kind are write-once at insert. Keep the read if you
 		// move this statement.
@@ -893,7 +893,7 @@ func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want stor
 		existing.Liveness == want.Liveness
 }
 
-func (s *sqliteStore) SetCondition(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) (*storeapi.RawObject, error) {
 	// Within keeps the condition write and the object's version bump atomic: it
 	// opens a transaction when called standalone and joins the caller's when
 	// nested (the reconcile path), so a crash between the two statements can't
@@ -909,7 +909,7 @@ func (s *sqliteStore) SetCondition(ctx context.Context, gk storeapi.GroupKind, i
 			return err
 		}
 		// No-op suppression: an identical condition carries the same resource_version,
-		// so emitting would show watchers a spurious diff (mirrors RequestDeletion).
+		// so emitting would show watchers a spurious diff (mirrors DeletionRequestsCreate).
 		existing, err := s.getCondition(ctx, id, cond.Type)
 		if err != nil {
 			return err
@@ -943,13 +943,13 @@ func (s *sqliteStore) SetCondition(ctx context.Context, gk storeapi.GroupKind, i
 	return result, err
 }
 
-func (s *sqliteStore) DeleteCondition(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.RawObject, error) {
-	// Within keeps the delete and the version bump atomic (see SetCondition).
+func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.RawObject, error) {
+	// Within keeps the delete and the version bump atomic (see ConditionsSet).
 	var result *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary up front (symmetric with
-		// SetCondition); the conditions table carries no group/kind to fold into
+		// ConditionsSet); the conditions table carries no group/kind to fold into
 		// the DELETE, so the gate is the object read.
 		obj, err := s.getObjectRowScoped(ctx, gk, id)
 		if err != nil {
@@ -996,7 +996,7 @@ func scanEvent(sc scanner) (*storeapi.Event, error) {
 }
 
 // latestEventRun returns the full newest run for (id, category), or nil if that
-// timeline is empty. GetLatestEvent returns it as-is.
+// timeline is empty. EventsGetLatest returns it as-is.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
@@ -1012,11 +1012,11 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 }
 
 // latestEventKey returns just the run key (id, type, reason) of the newest run
-// for (id, category), or ok=false if that timeline is empty. RecordEvent needs
+// for (id, category), or ok=false if that timeline is empty. EventsRecord needs
 // only the key to decide extend-vs-append, so it deliberately does not decode the
-// full row (unlike GetLatestEvent): probing the columns it is about to discard
+// full row (unlike EventsGetLatest): probing the columns it is about to discard
 // would let a decode fault in an older run mask — rather than surface through —
-// the write RecordEvent is about to make.
+// the write EventsRecord is about to make.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
@@ -1031,14 +1031,14 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 	return evID, typ, reason, true, nil
 }
 
-func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
+func (s *sqliteStore) EventsRecord(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
 	// Within serializes the read-latest-then-write (via _txlock=immediate) so the
 	// run-boundary decision can't race, and joins the caller's tx when nested.
 	var result *storeapi.Event
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrNotFound/ErrWrongKind), like
-		// SetCondition — the events table carries no group/kind to fold in.
+		// ConditionsSet — the events table carries no group/kind to fold in.
 		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
 			return err
 		}
@@ -1076,7 +1076,7 @@ func (s *sqliteStore) RecordEvent(ctx context.Context, gk storeapi.GroupKind, id
 		}
 		// Publish the resulting run to event-log watchers — buffered in the tx
 		// collector and published after commit, like the object mutators' emit.
-		s.emitEvent(ctx, gk, result)
+		s.eventEmit(ctx, gk, result)
 		return nil
 	})
 	return result, err
@@ -1096,7 +1096,7 @@ func scanEvents(rows *sql.Rows) ([]storeapi.Event, error) {
 	return out, rows.Err()
 }
 
-func (s *sqliteStore) ListEvents(ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery) ([]storeapi.Event, error) {
+func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery) ([]storeapi.Event, error) {
 	where := []string{"object_id = ?"}
 	args := []any{id}
 	if q.Category != nil {
@@ -1129,11 +1129,11 @@ func (s *sqliteStore) ListEvents(ctx context.Context, id storeapi.ObjectID, q st
 	return scanEvents(rows)
 }
 
-func (s *sqliteStore) GetLatestEvent(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
+func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	return s.latestEventRun(ctx, id, category)
 }
 
-func (s *sqliteStore) SweepEvents(ctx context.Context, perObject int, maxAge time.Duration) (int, error) {
+func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error) {
 	var total int64
 	// One transaction so both bounds see the same snapshot and land together.
 	err := s.Within(ctx, func(ctx context.Context) error {
@@ -1170,7 +1170,7 @@ func (s *sqliteStore) SweepEvents(ctx context.Context, perObject int, maxAge tim
 	return int(total), err
 }
 
-func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (*storeapi.RawObject, error) {
 	// Within keeps the read-modify-write of the finalizer list atomic: it opens a
 	// transaction standalone and joins the caller's on the reconcile path, so a
 	// concurrent writer can't slip between the load and the rewrite.
@@ -1184,7 +1184,7 @@ func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind
 		}
 		remaining, removed := removeFinalizer(obj.Finalizers, finalizer)
 		// Absent finalizer: nothing changed, so don't bump resource_version or emit
-		// — a watcher would otherwise see a spurious diff (mirrors DeleteCondition).
+		// — a watcher would otherwise see a spurious diff (mirrors ConditionsDelete).
 		if !removed {
 			result, err = s.attachConditions(ctx, obj)
 			return err
@@ -1211,7 +1211,7 @@ func (s *sqliteStore) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind
 // group/kind/slug triple — so a new keying is a call-site change rather than a
 // second copy of this statement. It is parenthesized before the guard is appended,
 // so a disjunctive key can't bind loosely enough to escape the IS NULL and re-stamp
-// an already-deleting row. Like refsByIDs' column names it is a compile-time
+// an already-deleting row. Like edgesByIDs' column names it is a compile-time
 // fragment, never user input; only whereArgs carry values. The row persists
 // (deletion is async via finalizers), so the emitted object still carries its
 // conditions, matching Get/List. Runs on the ambient connection — callers wrap it
@@ -1269,41 +1269,41 @@ func (s *sqliteStore) requestDeletion(
 	return result, changed, err
 }
 
-// RequestDeletion marks id within gk. The kind is folded into the write, so a
+// DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
 // foreign id matches no row and the re-read reports ErrWrongKind.
-func (s *sqliteStore) RequestDeletion(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
-// RequestDeletionBySlug marks the gk row holding slug. The slug rides in the
-// UPDATE's own WHERE the way the kind does for RequestDeletion, so the resolve and
+// DeletionRequestsCreateBySlug marks the gk row holding slug. The slug rides in the
+// UPDATE's own WHERE the way the kind does for DeletionRequestsCreate, so the resolve and
 // the mark are one statement: atomic, and a round trip cheaper than the alternative
-// of wrapping a GetObjectBySlug + RequestDeletion pair in a Within — which matters
+// of wrapping a ObjectsGetBySlug + DeletionRequestsCreate pair in a Within — which matters
 // on a store that runs every caller through one connection.
-func (s *sqliteStore) RequestDeletionBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowBySlug(ctx, gk, slug) },
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
-// MarkOwnedForDeletion cascades deletion to ownerID's owned children. One indexed
-// pass over the owned_by edge (idx_refs_to) reads each child's deletion state;
+// DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children. One indexed
+// pass over the owned_by edge (idx_edges_to) reads each child's deletion state;
 // markForDeletion then stamps only those not already deleting. So a re-cascade over
 // an already-deleting subtree (the steady-state resync) is a lone SELECT — no
 // writes, no events. It returns every owned child for requeue, deleting or not.
-func (s *sqliteStore) MarkOwnedForDeletion(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
-		FROM refs r JOIN objects o ON o.id = r.from_id
+		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?
 		ORDER BY o.id`, ownerID, string(storeapi.RelationOwnedBy))
 	if err != nil {
 		return nil, err
 	}
 	type child struct {
-		ref      storeapi.Referrer
+		ref      storeapi.ObjectRef
 		deleting bool
 	}
 	var children []child
@@ -1321,7 +1321,7 @@ func (s *sqliteStore) MarkOwnedForDeletion(ctx context.Context, ownerID storeapi
 	_ = rows.Err()
 	rows.Close() // free the single-conn pool before the per-child writes below
 
-	out := make([]storeapi.Referrer, 0, len(children))
+	out := make([]storeapi.ObjectRef, 0, len(children))
 	for _, ch := range children {
 		out = append(out, ch.ref)
 		if ch.deleting {
@@ -1337,7 +1337,7 @@ func (s *sqliteStore) MarkOwnedForDeletion(ctx context.Context, ownerID storeapi
 	return out, nil
 }
 
-func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) error {
+func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) error {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -1357,13 +1357,13 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 	// drop events at or below their snapshot's version, and the row's last
 	// version may already sit in a snapshot, which would swallow the Deleted.
 	obj.ResourceVersion = rv
-	s.emit(ctx, storeapi.Deleted, obj)
+	s.changeEmit(ctx, storeapi.Deleted, obj)
 	return nil
 }
 
-// AddRef inserts a (from_id, to_id, relation) edge, stamping an owed dependency
+// EdgesAdd inserts a (from_id, to_id, relation) edge, stamping an owed dependency
 // wake when the caller's version claim says the target moved under it (see
-// storeapi.Store.AddRef for the contract, and ControllerClient.AddDependency for
+// storeapi.Store.EdgesAdd for the contract, and ControllerClient.DependenciesAdd for
 // what the claim means). It neither bumps resource_version nor emits — a ref is
 // not a field of the object, so watchers would see no diff.
 //
@@ -1372,7 +1372,7 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 // what makes the claim decidable at all: read as a separate statement, a write to
 // the target landing between the version read and the insert would be invisible
 // both here and to the dependency waker (the edge is not yet inserted) — which is the
-// very window AddDependency exists to close. Relying on the caller to supply the
+// very window DependenciesAdd exists to close. Relying on the caller to supply the
 // transaction, or on sqlite serializing writers on one connection, would leave
 // that as an unstated precondition of the guard.
 //
@@ -1384,9 +1384,9 @@ func (s *sqliteStore) DeleteObject(ctx context.Context, id storeapi.ObjectID) er
 // and it points the residual failure the harmless way: a stamp with no edge is
 // one spurious owed wake, which costs a no-op reconcile and drains back to zero,
 // where an edge with no stamp is a dependent stranded on a stale read that
-// ListUnsettledIDs structurally cannot see.
-func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation, targetResourceVersion int64) (storeapi.AddRefResult, error) {
-	var out storeapi.AddRefResult
+// ObjectsListUnsettledIDs structurally cannot see.
+func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation, targetResourceVersion int64) (storeapi.EdgesAddResult, error) {
+	var out storeapi.EdgesAddResult
 	err := s.Within(ctx, func(ctx context.Context) error {
 		// One round-trip, and without loading the row blobs. Joining the two rows
 		// rather than projecting each column as its own scalar subquery keeps this at
@@ -1415,7 +1415,7 @@ func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID
 		}
 		// The durable wake stamp, on the same side of the insert as the rejection
 		// above and for the same reason. Its NOT EXISTS is the edge-new test, a probe
-		// straight down the refs primary key — which, refs being WITHOUT ROWID, is
+		// straight down the edges primary key — which, edges being WITHOUT ROWID, is
 		// the table itself, so it is one statement with no extra round-trip. And it
 		// is the *only* place edge-newness is decided, so there is no second
 		// derivation of it to fall out of agreement with.
@@ -1424,7 +1424,7 @@ func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID
 			res, err := s.conn(ctx).ExecContext(ctx, `
 				UPDATE objects SET pending_wake = pending_wake + 1
 				WHERE id = ? AND NOT EXISTS (
-					SELECT 1 FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?)`,
+					SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?)`,
 				fromID, fromID, toID, string(relation))
 			if err != nil {
 				return err
@@ -1438,54 +1438,54 @@ func (s *sqliteStore) AddRef(ctx context.Context, fromID, toID storeapi.ObjectID
 			stamped = n > 0
 		}
 		if _, err := s.conn(ctx).ExecContext(ctx, `
-			INSERT INTO refs (from_id, to_id, relation) VALUES (?, ?, ?)
+			INSERT INTO edges (from_id, to_id, relation) VALUES (?, ?, ?)
 			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
 			fromID, toID, string(relation)); err != nil {
 			return err
 		}
-		out = storeapi.AddRefResult{
+		out = storeapi.EdgesAddResult{
 			From:        storeapi.GroupKind{Group: group, Kind: kind},
 			WakeStamped: stamped,
 		}
 		return nil
 	})
 	if err != nil {
-		return storeapi.AddRefResult{}, err
+		return storeapi.EdgesAddResult{}, err
 	}
 	return out, nil
 }
 
-// DeleteRef removes a (from_id, to_id, relation) edge; an absent edge is a
-// silent no-op. Like AddRef it bumps nothing and joins the ambient transaction.
-func (s *sqliteStore) DeleteRef(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
+// EdgesDelete removes a (from_id, to_id, relation) edge; an absent edge is a
+// silent no-op. Like EdgesAdd it bumps nothing and joins the ambient transaction.
+func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
-		`DELETE FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?`,
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		fromID, toID, string(relation))
 	return err
 }
 
-// ListIncomingRefs returns the objects pointing at toID through relation, joining refs
+// EdgesListIncoming returns the objects pointing at toID through relation, joining edges
 // to objects so each carries the GroupKind needed to route a requeue.
-func (s *sqliteStore) ListIncomingRefs(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) EdgesListIncoming(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.from_id
+		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?
 		ORDER BY o.id`, toID, string(relation))
 	if err != nil {
 		return nil, err
 	}
-	return scanReferrers(rows)
+	return scanObjectRefs(rows)
 }
 
-// GroupIncomingRefsByID resolves ListIncomingRefs for many targets at once,
-// bucketed by target id — the incoming twin of GroupOutgoingRefsByID. It routes
+// EdgesGroupIncomingByID resolves EdgesListIncoming for many targets at once,
+// bucketed by target id — the incoming twin of EdgesGroupOutgoingByID. It routes
 // by r.to_id and joins the source side (r.from_id).
-func (s *sqliteStore) GroupIncomingRefsByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
-	return s.refsByIDs(ctx, toIDs, relation, "to_id", "from_id")
+func (s *sqliteStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+	return s.edgesByIDs(ctx, toIDs, relation, "to_id", "from_id")
 }
 
-// idChunkSize bounds how many ids the batched by-id reads (refsByIDs,
+// idChunkSize bounds how many ids the batched by-id reads (edgesByIDs,
 // conditionsByIDs) bind in a single query, kept under SQLite's
 // SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc) with room for the extra
 // parameters — otherwise a large List would fail with "too many SQL variables".
@@ -1493,28 +1493,28 @@ func (s *sqliteStore) GroupIncomingRefsByID(ctx context.Context, toIDs []storeap
 // without seeding tens of thousands of rows.
 var idChunkSize = 30000
 
-// refsByIDs is the shared batched edge lookup behind GroupIncomingRefsByID and
-// GroupOutgoingRefsByID: it filters refs by routeCol IN (ids), joins objects on
+// edgesByIDs is the shared batched edge lookup behind EdgesGroupIncomingByID and
+// EdgesGroupOutgoingByID: it filters edges by routeCol IN (ids), joins objects on
 // the opposite endpoint joinCol, and buckets each referrer under its routeCol
 // value. routeCol/joinCol are fixed internal column names (never user input), so
 // concatenating them is injection-safe. The id list is chunked under the bound-
 // parameter limit (see idChunkSize); each chunk merges into the same map,
 // and a routeCol value with no matching edge never appears.
-func (s *sqliteStore) refsByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
-	out := make(map[storeapi.ObjectID][]storeapi.Referrer, len(ids))
+func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+	out := make(map[storeapi.ObjectID][]storeapi.ObjectRef, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
 		end := min(start+idChunkSize, len(ids))
-		if err := s.refsByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
+		if err := s.edgesByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-// refsByIDsChunk runs refsByIDs for one chunk of ids, merging rows into out. It
+// edgesByIDsChunk runs edgesByIDs for one chunk of ids, merging rows into out. It
 // closes its result set before returning so the next chunk's query can run on the
 // single-connection store (which permits one open result set at a time).
-func (s *sqliteStore) refsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.Referrer) error {
+func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
 	args := make([]any, 0, len(ids)+1)
 	placeholders := make([]string, len(ids))
 	for i, id := range ids {
@@ -1524,7 +1524,7 @@ func (s *sqliteStore) refsByIDsChunk(ctx context.Context, ids []storeapi.ObjectI
 	args = append(args, string(relation))
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT r.`+routeCol+`, o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.`+joinCol+`
+		FROM edges r JOIN objects o ON o.id = r.`+joinCol+`
 		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
 		ORDER BY r.`+routeCol+`, o.id`, args...)
 	if err != nil {
@@ -1533,62 +1533,62 @@ func (s *sqliteStore) refsByIDsChunk(ctx context.Context, ids []storeapi.ObjectI
 	defer rows.Close()
 	for rows.Next() {
 		var route storeapi.ObjectID
-		var d storeapi.Referrer
-		// All columns are INTEGER/TEXT NOT NULL; the scan never fails (see scanReferrers).
+		var d storeapi.ObjectRef
+		// All columns are INTEGER/TEXT NOT NULL; the scan never fails (see scanObjectRefs).
 		_ = rows.Scan(&route, &d.ID, &d.Group, &d.Kind)
 		out[route] = append(out[route], d)
 	}
 	return rows.Err()
 }
 
-// ListOutgoingRefs returns the distinct objects fromID points at (any relation),
-// the inverse of ListIncomingRefs. DISTINCT collapses an object reached through
+// EdgesListOutgoing returns the distinct objects fromID points at (any relation),
+// the inverse of EdgesListIncoming. DISTINCT collapses an object reached through
 // more than one relation (e.g. both owned_by and depends_on) to a single row.
-func (s *sqliteStore) ListOutgoingRefs(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.to_id
+		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ?
 		ORDER BY o.id`, fromID)
 	if err != nil {
 		return nil, err
 	}
-	return scanReferrers(rows)
+	return scanObjectRefs(rows)
 }
 
-// ListOutgoingRefsByRelation returns the objects fromID points at through the
+// EdgesListOutgoingByRelation returns the objects fromID points at through the
 // given relation, ordered by id — the relation-filtered form of
-// ListOutgoingRefs. No DISTINCT is needed: (from_id, to_id, relation) is unique,
+// EdgesListOutgoing. No DISTINCT is needed: (from_id, to_id, relation) is unique,
 // so a fixed relation can reach each target at most once.
-func (s *sqliteStore) ListOutgoingRefsByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.Referrer, error) {
+func (s *sqliteStore) EdgesListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.to_id
+		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ? AND r.relation = ?
 		ORDER BY o.id`, fromID, string(relation))
 	if err != nil {
 		return nil, err
 	}
-	return scanReferrers(rows)
+	return scanObjectRefs(rows)
 }
 
-// GroupOutgoingRefsByID resolves ListOutgoingRefsByRelation for many sources at
+// EdgesGroupOutgoingByID resolves EdgesListOutgoingByRelation for many sources at
 // once, bucketed by source id. It routes by r.from_id and joins the target side
 // (r.to_id).
-func (s *sqliteStore) GroupOutgoingRefsByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.Referrer, error) {
-	return s.refsByIDs(ctx, fromIDs, relation, "from_id", "to_id")
+func (s *sqliteStore) EdgesGroupOutgoingByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+	return s.edgesByIDs(ctx, fromIDs, relation, "from_id", "to_id")
 }
 
-// scanReferrers collects an (id, group, kind) SELECT into Referrers, closing rows
+// scanObjectRefs collects an (id, group, kind) SELECT into ObjectRefs, closing rows
 // on return. Like scanObjects it ends in `return out, rows.Err()`: the id/group/
 // kind columns are INTEGER/TEXT NOT NULL scanned into int64/string, which never
 // fails, and modernc's buffered result set leaves rows.Err clean after a good
 // query — so the tail error is reported in one statement, not a dead branch.
-func scanReferrers(rows *sql.Rows) ([]storeapi.Referrer, error) {
+func scanObjectRefs(rows *sql.Rows) ([]storeapi.ObjectRef, error) {
 	defer rows.Close()
-	var out []storeapi.Referrer
+	var out []storeapi.ObjectRef
 	for rows.Next() {
-		var d storeapi.Referrer
+		var d storeapi.ObjectRef
 		// id (INTEGER) -> int64 and group/kind (TEXT NOT NULL) -> string never fail.
 		_ = rows.Scan(&d.ID, &d.Group, &d.Kind)
 		out = append(out, d)
@@ -1596,31 +1596,31 @@ func scanReferrers(rows *sql.Rows) ([]storeapi.Referrer, error) {
 	return out, rows.Err()
 }
 
-// DeleteFinalizingDependsOnRefs removes depends_on edges into toID whose source
+// EdgesDeleteFinalizingDependsOn removes depends_on edges into toID whose source
 // is itself deletion-pending, breaking the deadlock where mutually dependent (or
 // self-dependent) finalizing objects each hold the other's RESTRICT. Like
-// DeleteRef it bumps no version and emits no event.
-func (s *sqliteStore) DeleteFinalizingDependsOnRefs(ctx context.Context, toID storeapi.ObjectID) error {
+// EdgesDelete it bumps no version and emits no event.
+func (s *sqliteStore) EdgesDeleteFinalizingDependsOn(ctx context.Context, toID storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
-		DELETE FROM refs
+		DELETE FROM edges
 		WHERE to_id = ? AND relation = ?
 		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
 		toID, string(storeapi.RelationDependsOn))
 	return err
 }
 
-// HasIncomingRefs reports whether any object with a live claim points at id: an
+// EdgesHasIncoming reports whether any object with a live claim points at id: an
 // owned_by edge, or a depends_on edge from a source that is not itself
 // finalizing. A depends_on edge from a deletion-pending source is ignored — that
 // dependent is going away and no longer has a claim, so it must not gate a
-// finalizer (HasIncomingRefs would otherwise never clear when two finalizing
+// finalizer (EdgesHasIncoming would otherwise never clear when two finalizing
 // objects depend on each other). owned_by always counts: the foreground cascade
 // must wait for the owned child to be physically removed.
-func (s *sqliteStore) HasIncomingRefs(ctx context.Context, id storeapi.ObjectID) (bool, error) {
+func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID) (bool, error) {
 	var exists int
 	err := s.conn(ctx).QueryRowContext(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM refs r
+			SELECT 1 FROM edges r
 			WHERE r.to_id = ?
 			  AND NOT (r.relation = ? AND r.from_id IN
 			           (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,

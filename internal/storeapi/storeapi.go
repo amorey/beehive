@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -54,7 +55,7 @@ var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 // settled once its spec later reached that generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
-// ErrSchemaVersionDowngrade is returned by UpdateSpec/UpdateStatus when the
+// ErrSchemaVersionDowngrade is returned by ObjectsUpdateSpec/UpdateStatus when the
 // caller's schema version is non-zero and lower than the one already stamped on
 // the row. Zero is the "no opinion" case (the kind is unversioned, or this build
 // has no migrator for it) and keeps the stored tag instead of erroring. It is the
@@ -63,7 +64,7 @@ var ErrObservedGenerationFuture = errors.New("beehive: observed generation excee
 // convert already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
-// ErrTargetResourceVersionFuture is returned by AddRef when the caller's
+// ErrTargetResourceVersionFuture is returned by EdgesAdd when the caller's
 // claimed version of the target exceeds the target's current one. An object's
 // version only moves forward, so a version above the target's own cannot have come
 // from reading it — the caller passed some other object's version, or some other
@@ -81,53 +82,64 @@ const (
 	Deleted  ChangeType = "Deleted"
 )
 
-// RawChange is the untyped change a Watcher delivers. The client decodes it
-// into the generic, user-facing Change[Spec, Status]; the name carries the
+// RawObjectChange is the untyped change an ObjectsSubscription delivers. The client decodes it
+// into the generic, user-facing ObjectChange[Spec, Status]; the name carries the
 // "Raw" prefix (like RawObject) to avoid colliding with that generic type.
-type RawChange struct {
+type RawObjectChange struct {
 	Type   ChangeType
 	Object *RawObject
 }
 
-// Watcher is a subscription to a kind's change stream. Changes yields the current
-// state as Added changes (the snapshot) followed by live changes, until the
-// watcher is closed or its store shuts down, at which point the channel closes.
-// Close releases the subscription and is safe to call more than once.
-type Watcher interface {
-	Changes() <-chan RawChange
-	Close()
+// Subscription is a closeable stream of V, the shape every store watch returns.
+// Changes yields items until the subscription is closed or its store shuts down,
+// at which point the channel closes; Close releases the subscription and is safe
+// to call more than once.
+//
+// It is concrete rather than one interface per stream: the three it replaced
+// differed only in the name of their single accessor, which forced the sqlite
+// implementation to hang three method names on one channel to satisfy them all.
+// A backend builds one with NewSubscription.
+type Subscription[V any] struct {
+	ch    <-chan V
+	close func()
+	once  sync.Once
 }
 
-// ObjectChange is a change stripped to what a consumer that only routes by
+// NewSubscription wraps a stream's channel and its release function. close is
+// called at most once however many times Close is.
+func NewSubscription[V any](ch <-chan V, close func()) *Subscription[V] {
+	return &Subscription[V]{ch: ch, close: close}
+}
+
+func (s *Subscription[V]) Changes() <-chan V { return s.ch }
+func (s *Subscription[V]) Close()            { s.once.Do(s.close) }
+
+// ObjectsSubscription is a subscription to a kind's change stream: the current
+// state as Added changes (the snapshot) followed by live changes.
+type ObjectsSubscription = Subscription[RawObjectChange]
+
+// EventsSubscription is a subscription to one object's event log: the current
+// runs (the snapshot) followed by live runs, each an aggregated Event. Unlike
+// ObjectsSubscription there are no tombstones — a run only appears or updates —
+// so a lagging subscriber converges to each run's latest count/window.
+type EventsSubscription = Subscription[Event]
+
+// ObjectWritesSubscription is a subscription to the store-wide write stream. It
+// yields the writes that were ready together, coalesced per object — a burst
+// arrives as one slice with one entry per distinct object, so a consumer that
+// resolves each entry against the store pays per burst rather than per write.
+type ObjectWritesSubscription = Subscription[[]ObjectWrite]
+
+// ObjectWrite is a change stripped to what a consumer that only routes by
 // identity needs: which object changed, and how. The id is the object's, not a
 // change's — changes are not addressable here — so this is an object reference
 // annotated with what happened to it, and a consumer reads current state itself.
 // It carries no *RawObject on purpose: the store-wide stream sees every write in
 // the process, and holding a row would pin its spec and status blobs for as long
 // as the value is undelivered.
-type ObjectChange struct {
+type ObjectWrite struct {
 	ID   ObjectID
 	Type ChangeType
-}
-
-// ObjectChangeWatcher is a subscription to the store-wide change stream. Batches
-// yields the changes that were ready together, coalesced per object — a burst
-// of writes arrives as one slice with one entry per distinct object, so a
-// consumer that resolves each entry against the store pays per burst rather
-// than per write. The channel closes when the watcher is closed or its store
-// shuts down; Close is idempotent.
-type ObjectChangeWatcher interface {
-	Batches() <-chan []ObjectChange
-	Close()
-}
-
-// EventWatcher is a subscription to one object's event log: the current runs
-// (the snapshot) followed by live runs, each an aggregated Event. Unlike Watcher
-// there are no tombstones — a run only appears or updates — so a lagging
-// subscriber converges to each run's latest count/window. Close is idempotent.
-type EventWatcher interface {
-	Events() <-chan Event
-	Close()
 }
 
 // Condition is the untyped form of a single condition row. Status is one of
@@ -165,7 +177,7 @@ type Event struct {
 	ResourceVersion int64
 }
 
-// EventQuery filters and bounds a ListEvents read. The zero value selects every
+// EventQuery filters and bounds a EventsList read. The zero value selects every
 // run for the object, newest first (by LastAt, then id). The client builds one
 // from its EventOptions; the store never sees the option type.
 type EventQuery struct {
@@ -204,8 +216,8 @@ type RawObject struct {
 	// objects.pending_wake column). 0 means nothing owed. The reconciler reads it to
 	// decide whether to decrement on a successful pass. Store-owned and
 	// store-assigned, like ResourceVersion: it is reported on reads and moved only by
-	// Increment/DecrementPendingWake, so a value set on a RawObject handed to
-	// CreateObject is not persisted (a new object owes nothing).
+	// Increment/WakesDecrement, so a value set on a RawObject handed to
+	// ObjectsCreate is not persisted (a new object owes nothing).
 	PendingWake int64
 	Finalizers  []string
 	Conditions  []Condition // assembled on reads; nil when the object has none
@@ -213,7 +225,7 @@ type RawObject struct {
 	UpdatedAt   time.Time
 }
 
-// Relation is the kind of edge in the refs table. The schema's CHECK constraint
+// Relation is the kind of edge in the edges table. The schema's CHECK constraint
 // permits exactly these two values.
 type Relation string
 
@@ -224,10 +236,10 @@ const (
 	RelationDependsOn Relation = "depends_on"
 )
 
-// AddRefResult is what a caller needs to follow up on an edge it declared, all
-// of it a by-product of work AddRef already does — no extra query pays for any
+// EdgesAddResult is what a caller needs to follow up on an edge it declared, all
+// of it a by-product of work EdgesAdd already does — no extra query pays for any
 // of it.
-type AddRefResult struct {
+type EdgesAddResult struct {
 	// From is the source object's GroupKind, projected from the endpoint check.
 	// Edges are cross-kind, so a caller routing a requeue to fromID cannot assume
 	// its own kind.
@@ -241,16 +253,19 @@ type AddRefResult struct {
 	WakeStamped bool
 }
 
-// Referrer is an object pointing at a target through a ref edge, with the
-// GroupKind needed to route a requeue. ListIncomingRefs returns these.
-type Referrer struct {
+// ObjectRef names one object — its id plus the GroupKind needed to route a
+// requeue or a GC step to it. It is a reference to an object, not an edge: it
+// carries no direction, so the same shape serves both ends of an edge query
+// (EdgesListIncoming's sources, EdgesListOutgoing's targets) and the edgeless
+// DeletionRequests lists, where it is simply "which object, and what kind".
+type ObjectRef struct {
 	ID    ObjectID
 	Group string
 	Kind  string
 }
 
 // GroupKind is the kind to route a requeue (or a GC step) to.
-func (r Referrer) GroupKind() GroupKind {
+func (r ObjectRef) GroupKind() GroupKind {
 	return GroupKind{Group: r.Group, Kind: r.Kind}
 }
 
@@ -262,7 +277,7 @@ func (r Referrer) GroupKind() GroupKind {
 // id, resource_version, and timestamps without a re-read. A nil error therefore
 // guarantees a non-nil object, and callers dereference it unguarded — including
 // on the idempotent no-op paths, where the row is unchanged but still returned
-// (RequestDeletion and RequestDeletionBySlug with changed=false). An
+// (DeletionRequestsCreate and DeletionRequestsCreateBySlug with changed=false). An
 // implementation that returns (nil, nil) is broken, not a case to handle.
 type Store interface {
 	io.Closer
@@ -297,72 +312,132 @@ type Store interface {
 	// and this library lets panics surface (Reconcile is not recovered either).
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
 
-	// CreateObject inserts a new object. The store assigns ID and
-	// ResourceVersion and sets Generation to 1; the caller supplies the rest
-	// (Group, Kind, Slug, Spec, Finalizers).
-	CreateObject(ctx context.Context, obj *RawObject) (*RawObject, error)
+	// ConditionsDelete removes the condition of type condType from id. Removing an
+	// existing condition bumps ResourceVersion and emits a Modified event; an
+	// absent condition is a no-op. Returns the object with its conditions assembled.
+	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
+	// id with ErrNotFound.
+	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) (*RawObject, error)
 
-	// GetObject loads an object by id, or returns ErrNotFound.
-	GetObject(ctx context.Context, id ObjectID) (*RawObject, error)
+	// ConditionsSet upserts the condition keyed by (id, cond.Type). A real change
+	// bumps the object's ResourceVersion and emits a Modified event; an identical
+	// write is a no-op. Returns the object with its conditions assembled. Scoped
+	// to gk: an id of another kind is rejected with ErrWrongKind, a missing id
+	// with ErrNotFound.
+	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) (*RawObject, error)
 
-	// GetObjectMeta is GetObject without the conditions query: the returned
-	// Conditions is always nil. Metadata-only callers (GC collect, ref bookkeeping)
-	// use it to avoid that extra read. Returns ErrNotFound if no object matches.
-	GetObjectMeta(ctx context.Context, id ObjectID) (*RawObject, error)
+	// DeletionRequestsCreate requests an object's deletion by setting
+	// DeletionRequestedAt; the row lingers until its finalizers clear, so this
+	// creates the request and never the deletion itself (ObjectsDelete does that).
+	// changed is true only when this call was the one that set the flag;
+	// repeat calls are idempotent and return changed=false. Scoped to gk: an id
+	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
+	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
 
-	// GetObjectBySlug loads the object with the given slug within gk, or returns
-	// ErrNotFound.
-	GetObjectBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error)
+	// DeletionRequestsCreateBySlug is DeletionRequestsCreate keyed by slug within
+	// gk: the slug is folded into the write itself, so the resolve and the stamp
+	// are one atomic statement rather than a lookup wrapped in a transaction with
+	// the write. Both are race-free; this one costs a round trip less, which a
+	// single-connection store feels. Semantics otherwise match
+	// DeletionRequestsCreate: changed is true only when this call set the flag, a
+	// repeat is idempotent with changed=false, and ErrNotFound means no object of
+	// gk holds the slug (there is no ErrWrongKind — a foreign kind's slug is
+	// simply not found, since slugs are unique per kind rather than globally).
+	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
 
-	// ListObjects returns every object of kind gk, ordered by id.
-	ListObjects(ctx context.Context, gk GroupKind) ([]*RawObject, error)
+	// DeletionRequestsCreateFromOwner is the GC cascade as one command: it requests
+	// deletion of every object that owned_by ownerID and returns them all to
+	// requeue. It stamps (and emits a Modified for) only children not already
+	// deletion-pending, so a re-cascade over an already-deleting subtree is a
+	// single read — no per-child write every sweep.
+	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]ObjectRef, error)
 
-	// ListUnsettledIDs returns the IDs of objects of kind gk whose
-	// observed_generation doesn't match generation (not yet converged).
-	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ListPendingWakeIDs returns the IDs of objects of kind gk owed a durable
-	// dependency wake (pending_wake != 0). The reconcile backstop enqueues these so
-	// a wake that outlived the process (its in-memory requeue lost to a crash) is
-	// serviced on restart, without a spec change to wake it. Orthogonal to
-	// ListUnsettledIDs: an object can be spec-converged yet still owe a wake.
-	ListPendingWakeIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// There is deliberately no standalone increment here. Wakes are produced by
-	// AddRef — its stamp has to be indivisible from the edge insert, so it issues
-	// one itself and reports it as AddRefResult.WakeStamped — and consumed by
-	// DecrementPendingWake. An interface increment would be surface no caller could
-	// use correctly for the declare path (it cannot be made atomic with the edge)
-	// and none uses at all otherwise; leaving it off makes "the stamp rides AddRef"
-	// a compile-time property rather than something a test has to police. Add it
-	// when a producer other than AddRef exists — the durable-wake half of the
-	// dependency-waker item in TODO.md would be one.
-
-	// DecrementPendingWake subtracts observed from id's pending_wake (floored at 0),
-	// recording that a reconcile serviced every wake it saw. Callers pass the count
-	// they loaded, not 1: a single pass reads the target's current state, which
-	// addresses all the wakes outstanding when it started, so subtracting 1 would
-	// strand the rest as a residual nothing re-enqueues. Increments landing *after*
-	// that load are above observed, so they survive the subtraction and stay owed.
-	// Bumps no resource_version and emits no event.
-	DecrementPendingWake(ctx context.Context, id ObjectID, observed int64) error
-
-	// ListAllDeletionPending returns every deletion-pending object, of every kind,
+	// DeletionRequestsList returns every deletion-pending object, of every kind,
 	// each row's GroupKind alongside its id. The global GC sweeper is the sole
 	// caller and needs the kind to route: an object of a registered kind is
 	// enqueued so its controller can clear finalizers (a step collect cannot take),
 	// while a client-only kind — which no reconcile loop reaches, and which could
 	// otherwise strand and RESTRICT-block an owner's delete forever — is collected
 	// directly.
-	ListAllDeletionPending(ctx context.Context) ([]Referrer, error)
+	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
 
-	// ListIDs returns the IDs of every object of kind gk, ordered by id. The
+	// EventsGetLatest returns the most recent run in id's category timeline, or nil
+	// if that timeline has no events. Reads by object id only (not kind-scoped).
+	EventsGetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
+
+	// EventsList returns id's event runs matching q, newest first (by LastAt, then
+	// id). The zero EventQuery returns every run for the object. Reads by object id
+	// only — not kind-scoped, like the ref-list reads.
+	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
+
+	// EventsRecord records an observation about id in the (id, ev.Category) timeline,
+	// aggregating into contiguous runs: if the latest run there shares ev's
+	// (Type, Reason) it is extended (Count++, LastAt bumped, Message/Detail
+	// re-sampled), else a new run is appended (Count 1). Only ev's
+	// Category/Type/Reason/Message/Detail are read; the store assigns the rest and
+	// returns the run. The compare is scoped to (id, Category), so an interleaved
+	// other-category emission never breaks this run. Scoped to gk: foreign id
+	// ErrWrongKind, missing id ErrNotFound.
+	EventsRecord(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
+
+	// EventsSweep trims the event log by retention, returning the number of runs
+	// deleted. perObject > 0 caps each (object, category) timeline to its newest
+	// perObject runs (a ring, so a flapping timeline can't evict a quiet one);
+	// maxAge > 0 drops any run whose LastAt is older than maxAge. A zero bound is
+	// skipped. It sweeps every object of every kind — retention is global, not
+	// per-kind — so the global GC sweeper calls it once per pass.
+	EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
+
+	// FinalizersDelete removes finalizer from id's finalizer list. Removing a
+	// present finalizer bumps ResourceVersion and emits a Modified event; a
+	// finalizer that isn't on the object is a no-op (no bump, no event). Returns
+	// the object with its conditions assembled, or ErrNotFound if id is gone.
+	// Scoped to gk: an id of another kind is rejected with ErrWrongKind.
+	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (*RawObject, error)
+
+	// ObjectsCreate inserts a new object. The store assigns ID and
+	// ResourceVersion and sets Generation to 1; the caller supplies the rest
+	// (Group, Kind, Slug, Spec, Finalizers).
+	ObjectsCreate(ctx context.Context, obj *RawObject) (*RawObject, error)
+
+	// ObjectsDelete removes the row outright. Callers must ensure finalizers are
+	// empty first; this is the physical delete the GC path performs.
+	ObjectsDelete(ctx context.Context, id ObjectID) error
+
+	// ObjectsGet loads an object by id, or returns ErrNotFound.
+	ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error)
+
+	// ObjectsGetBySlug loads the object with the given slug within gk, or returns
+	// ErrNotFound.
+	ObjectsGetBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error)
+
+	// ObjectsGetMeta is ObjectsGet without the conditions query: the returned
+	// Conditions is always nil. Metadata-only callers (GC collect, ref bookkeeping)
+	// use it to avoid that extra read. Returns ErrNotFound if no object matches.
+	ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawObject, error)
+
+	// ObjectsList returns every object of kind gk, ordered by id.
+	ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error)
+
+	// ObjectsListByIncomingEdge is the blob-bearing, kind-scoped form of
+	// EdgesListIncoming: the full rows of the objects of kind gk pointing at toID
+	// through relation, ordered by id, conditions attached. It resolves the edges
+	// and the rows in one query so a typed read of an owner's children of one kind
+	// (Client.OwnedObjectsList) costs no Get per child. Objects of other kinds are
+	// filtered out; a toID with no matching edge reads empty, never ErrNotFound.
+	ObjectsListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
+
+	// ObjectsListIDs returns the IDs of every object of kind gk, ordered by id. The
 	// reconciler uses it to enqueue a full reconcile pass at startup, so
 	// process-scoped state (e.g. liveness conditions) is re-confirmed even on
 	// objects whose spec is already settled.
-	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+	ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
-	// UpdateSpec replaces an object's spec, bumping Generation (a real spec
+	// ObjectsListUnsettledIDs returns the IDs of objects of kind gk whose
+	// observed_generation doesn't match generation (not yet converged).
+	ObjectsListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// ObjectsUpdateSpec replaces an object's spec, bumping Generation (a real spec
 	// change) and ResourceVersion, and stamps specVersion (the migrator schema
 	// version the bytes were written at). Writing spec bytes identical to the
 	// stored ones *at the row's own schema version* is an idempotent no-op: no
@@ -375,9 +450,9 @@ type Store interface {
 	// keep their own follow-up (a reconciler wake) in step with the store's
 	// silence. Scoped to gk: an id of another kind is rejected with ErrWrongKind,
 	// a missing id with ErrNotFound.
-	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
-	// UpdateStatus replaces an object's status, records the generation the
+	// ObjectsUpdateStatus replaces an object's status, records the generation the
 	// controller observed, and stamps statusVersion (the migrator schema version
 	// the status bytes were written at). When the bytes differ from the stored
 	// ones it bumps ObservedAt, ResourceVersion and UpdatedAt and emits Modified.
@@ -414,92 +489,9 @@ type Store interface {
 	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
 	// id with ErrNotFound. An observedGeneration greater than the row's current
 	// generation is rejected with ErrObservedGenerationFuture, no-op or not.
-	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
+	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
 
-	// SetCondition upserts the condition keyed by (id, cond.Type). A real change
-	// bumps the object's ResourceVersion and emits a Modified event; an identical
-	// write is a no-op. Returns the object with its conditions assembled. Scoped
-	// to gk: an id of another kind is rejected with ErrWrongKind, a missing id
-	// with ErrNotFound.
-	SetCondition(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) (*RawObject, error)
-
-	// DeleteCondition removes the condition of type condType from id. Removing an
-	// existing condition bumps ResourceVersion and emits a Modified event; an
-	// absent condition is a no-op. Returns the object with its conditions assembled.
-	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
-	// id with ErrNotFound.
-	DeleteCondition(ctx context.Context, gk GroupKind, id ObjectID, condType string) (*RawObject, error)
-
-	// DeleteFinalizer removes finalizer from id's finalizer list. Removing a
-	// present finalizer bumps ResourceVersion and emits a Modified event; a
-	// finalizer that isn't on the object is a no-op (no bump, no event). Returns
-	// the object with its conditions assembled, or ErrNotFound if id is gone.
-	// Scoped to gk: an id of another kind is rejected with ErrWrongKind.
-	DeleteFinalizer(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (*RawObject, error)
-
-	// RequestDeletion marks an object for deletion by setting
-	// DeletionRequestedAt; the row lingers until its finalizers clear.
-	// changed is true only when this call was the one that set the flag;
-	// repeat calls are idempotent and return changed=false. Scoped to gk: an id
-	// of another kind is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	RequestDeletion(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
-
-	// RequestDeletionBySlug is RequestDeletion keyed by slug within gk: the slug is
-	// folded into the write itself, so the resolve and the mark are one atomic
-	// statement rather than a lookup wrapped in a transaction with the write. Both
-	// are race-free; this one costs a round trip less, which a single-connection
-	// store feels. Semantics otherwise match RequestDeletion: changed is true only
-	// when this call set the flag, a repeat is idempotent with changed=false, and
-	// ErrNotFound means no object of gk holds the slug (there is no ErrWrongKind —
-	// a foreign kind's slug is simply not found, since slugs are unique per kind
-	// rather than globally).
-	RequestDeletionBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
-
-	// DeleteObject removes the row outright. Callers must ensure finalizers are
-	// empty first; this is the physical delete the GC path performs.
-	DeleteObject(ctx context.Context, id ObjectID) error
-
-	// MarkOwnedForDeletion is the GC cascade as one command: it marks every object
-	// that owned_by ownerID for deletion and returns them all to requeue. It stamps
-	// (and emits a Modified for) only children not already deletion-pending, so a
-	// re-cascade over an already-deleting subtree is a single read — no per-child
-	// write every sweep.
-	MarkOwnedForDeletion(ctx context.Context, ownerID ObjectID) ([]Referrer, error)
-
-	// RecordEvent records an observation about id in the (id, ev.Category) timeline,
-	// aggregating into contiguous runs: if the latest run there shares ev's
-	// (Type, Reason) it is extended (Count++, LastAt bumped, Message/Detail
-	// re-sampled), else a new run is appended (Count 1). Only ev's
-	// Category/Type/Reason/Message/Detail are read; the store assigns the rest and
-	// returns the run. The compare is scoped to (id, Category), so an interleaved
-	// other-category emission never breaks this run. Scoped to gk: foreign id
-	// ErrWrongKind, missing id ErrNotFound.
-	RecordEvent(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
-
-	// ListEvents returns id's event runs matching q, newest first (by LastAt, then
-	// id). The zero EventQuery returns every run for the object. Reads by object id
-	// only — not kind-scoped, like the ref-list reads.
-	ListEvents(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
-
-	// GetLatestEvent returns the most recent run in id's category timeline, or nil
-	// if that timeline has no events. Reads by object id only (not kind-scoped).
-	GetLatestEvent(ctx context.Context, id ObjectID, category string) (*Event, error)
-
-	// WatchEvents subscribes to id's event log within gk: the runs matching q as a
-	// snapshot (oldest-first), then live runs. q filters both the snapshot and the
-	// live stream (Limit bounds only the snapshot). Runs conflate per run id, so a
-	// lagging subscriber converges to each run's latest state.
-	WatchEvents(ctx context.Context, gk GroupKind, id ObjectID, q EventQuery) (EventWatcher, error)
-
-	// SweepEvents trims the event log by retention, returning the number of runs
-	// deleted. perObject > 0 caps each (object, category) timeline to its newest
-	// perObject runs (a ring, so a flapping timeline can't evict a quiet one);
-	// maxAge > 0 drops any run whose LastAt is older than maxAge. A zero bound is
-	// skipped. It sweeps every object of every kind — retention is global, not
-	// per-kind — so the global GC sweeper calls it once per pass.
-	SweepEvents(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
-
-	// AddRef inserts a directed (fromID -> toID) edge with the given relation.
+	// EdgesAdd inserts a directed (fromID -> toID) edge with the given relation.
 	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on
 	// the object, so it bumps no version and emits no event.
 	//
@@ -514,9 +506,9 @@ type Store interface {
 	//
 	// A claim that toID has already moved past, on an edge this call creates,
 	// increments fromID's pending_wake — the durable record that a dependency
-	// wake is owed — and reports it as AddRefResult.WakeStamped. That write must
+	// wake is owed — and reports it as EdgesAddResult.WakeStamped. That write must
 	// land on the same side of the insert as the rejection, and for the same
-	// reason: were it a second call after AddRef returned, a caller sharing an
+	// reason: were it a second call after EdgesAdd returned, a caller sharing an
 	// ambient transaction could handle the error and commit the edge with no
 	// wake, which is precisely the stranded-dependent race the claim exists to
 	// close. The endpoint check, the stamp and the insert are therefore one
@@ -525,84 +517,108 @@ type Store interface {
 	// The stamp is unconditional on fromID's kind: the store cannot know which
 	// kinds have reconcile loops, and gating would cost the caller a pre-read of
 	// fromID's kind on every declare. A kind with no loop never drains its count,
-	// and nothing scans it either (ListPendingWakeIDs is per-kind), so the count is
+	// and nothing scans it either (WakesListPendingIDs is per-kind), so the count is
 	// unread — but it is a lasting row and index entry, and re-declaring an edge
 	// bumps it again. Reclaiming it wants a cross-kind sweeper (see TODO.md), not a
 	// gate here: declining to stamp would lose the wake outright for a kind that
 	// gains a controller later.
-	AddRef(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (AddRefResult, error)
+	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (EdgesAddResult, error)
 
-	// DeleteRef removes the (fromID, toID, relation) edge; an absent edge is a
-	// no-op. Like AddRef it bumps no version and emits no event.
-	DeleteRef(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+	// EdgesDelete removes the (fromID, toID, relation) edge; an absent edge is a
+	// no-op. Like EdgesAdd it bumps no version and emits no event.
+	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) error
 
-	// ListIncomingRefs returns every object pointing at toID through relation, ordered by
-	// id (e.g. the dependents to requeue, or the owned children to GC).
-	ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
-
-	// ListIncomingRefObjects is the blob-bearing, kind-scoped form of
-	// ListIncomingRefs: the full rows of the objects of kind gk pointing at toID
-	// through relation, ordered by id, conditions attached. It resolves the edges
-	// and the rows in one query so a typed read of an owner's children of one kind
-	// (Client.ListOwnedObjects) costs no Get per child. Objects of other kinds are
-	// filtered out; a toID with no matching edge reads empty, never ErrNotFound.
-	ListIncomingRefObjects(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
-
-	// GroupIncomingRefsByID is the batched form of ListIncomingRefs: the inbound
-	// referrers for many targets through relation, bucketed by target id. The
-	// incoming-edge twin of GroupOutgoingRefsByID (e.g. eager-loading dependents
-	// over a List without an N+1). A target with no referrer is absent.
-	GroupIncomingRefsByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error)
-
-	// ListOutgoingRefs returns the distinct objects that fromID points at through any
-	// relation, ordered by id (the inverse of ListIncomingRefs). GC uses it to wake
-	// the targets a row was holding open before removing it: deleting fromID drops
-	// its outgoing edges (ON DELETE CASCADE), which can unblock a deletion-pending
-	// target that RESTRICT was keeping alive.
-	ListOutgoingRefs(ctx context.Context, fromID ObjectID) ([]Referrer, error)
-
-	// ListOutgoingRefsByRelation is the relation-filtered form of ListOutgoingRefs:
-	// the objects fromID points at through exactly relation, ordered by id (e.g. a
-	// child's owner via RelationOwnedBy, or its dependencies via RelationDependsOn).
-	ListOutgoingRefsByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]Referrer, error)
-
-	// GroupOutgoingRefsByID is the batched form of ListOutgoingRefsByRelation: it
-	// resolves the relation's outgoing targets for many sources, bucketed by source
-	// id. A source with no matching edge is absent from the map (never a nil/empty
-	// entry), so eager loading over a List avoids an N+1. The implementation may
-	// chunk a large id list across several queries; the bucketed result is the same.
-	GroupOutgoingRefsByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error)
-
-	// DeleteFinalizingDependsOnRefs removes the depends_on edges pointing at toID
+	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
 	// whose source object is itself marked for deletion. A finalizing dependent is
 	// going away, so its dependency must not keep the target alive: without this,
 	// two deletion-pending objects that depend on each other (or a self-dependency)
 	// would each hold the other's RESTRICT and never be collected. owned_by edges
 	// are left untouched — those clear only when the owned child is physically
 	// removed (the foreground cascade).
-	DeleteFinalizingDependsOnRefs(ctx context.Context, toID ObjectID) error
+	EdgesDeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
 
-	// HasIncomingRefs reports whether any object with a live claim points at id: an
+	// EdgesGroupIncomingByID is the batched form of EdgesListIncoming: the inbound
+	// referrers for many targets through relation, bucketed by target id. The
+	// incoming-edge twin of EdgesGroupOutgoingByID (e.g. eager-loading dependents
+	// over a List without an N+1). A target with no referrer is absent.
+	EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
+
+	// EdgesGroupOutgoingByID is the batched form of EdgesListOutgoingByRelation: it
+	// resolves the relation's outgoing targets for many sources, bucketed by source
+	// id. A source with no matching edge is absent from the map (never a nil/empty
+	// entry), so eager loading over a List avoids an N+1. The implementation may
+	// chunk a large id list across several queries; the bucketed result is the same.
+	EdgesGroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
+
+	// EdgesHasIncoming reports whether any object with a live claim points at id: an
 	// owned_by edge, or a depends_on edge from a source that is not itself
 	// finalizing. A depends_on edge from a deletion-pending source is ignored —
 	// that dependent is going away and no longer has a claim, so it must not gate a
 	// finalizer (two mutually dependent finalizing objects would otherwise never
-	// see HasIncomingRefs clear). owned_by always counts: the foreground cascade must
+	// see EdgesHasIncoming clear). owned_by always counts: the foreground cascade must
 	// wait for the owned child to be physically removed. GC pairs this with
-	// DeleteFinalizingDependsOnRefs, which physically removes the ignored edges
-	// before DeleteObject so the refs RESTRICT is satisfied.
-	HasIncomingRefs(ctx context.Context, id ObjectID) (bool, error)
+	// EdgesDeleteFinalizingDependsOn, which physically removes the ignored edges
+	// before ObjectsDelete so the edges RESTRICT is satisfied.
+	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
 
-	// Watch returns a Watcher for the single object id of kind gk: its current
+	// EdgesListIncoming returns every object pointing at toID through relation, ordered by
+	// id (e.g. the dependents to requeue, or the owned children to GC).
+	EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error)
+
+	// EdgesListOutgoing returns the distinct objects that fromID points at through any
+	// relation, ordered by id (the inverse of EdgesListIncoming). GC uses it to wake
+	// the targets a row was holding open before removing it: deleting fromID drops
+	// its outgoing edges (ON DELETE CASCADE), which can unblock a deletion-pending
+	// target that RESTRICT was keeping alive.
+	EdgesListOutgoing(ctx context.Context, fromID ObjectID) ([]ObjectRef, error)
+
+	// EdgesListOutgoingByRelation is the relation-filtered form of EdgesListOutgoing:
+	// the objects fromID points at through exactly relation, ordered by id (e.g. a
+	// child's owner via RelationOwnedBy, or its dependencies via RelationDependsOn).
+	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
+
+	// There is deliberately no standalone increment here. Wakes are produced by
+	// EdgesAdd — its stamp has to be indivisible from the edge insert, so it issues
+	// one itself and reports it as EdgesAddResult.WakeStamped — and consumed by
+	// WakesDecrement. An interface increment would be surface no caller could
+	// use correctly for the declare path (it cannot be made atomic with the edge)
+	// and none uses at all otherwise; leaving it off makes "the stamp rides EdgesAdd"
+	// a compile-time property rather than something a test has to police. Add it
+	// when a producer other than EdgesAdd exists — the durable-wake half of the
+	// dependency-waker item in TODO.md would be one.
+
+	// WakesDecrement subtracts observed from id's pending_wake (floored at 0),
+	// recording that a reconcile serviced every wake it saw. Callers pass the count
+	// they loaded, not 1: a single pass reads the target's current state, which
+	// addresses all the wakes outstanding when it started, so subtracting 1 would
+	// strand the rest as a residual nothing re-enqueues. Increments landing *after*
+	// that load are above observed, so they survive the subtraction and stay owed.
+	// Bumps no resource_version and emits no event.
+	WakesDecrement(ctx context.Context, id ObjectID, observed int64) error
+
+	// WakesListPendingIDs returns the IDs of objects of kind gk owed a durable
+	// dependency wake (pending_wake != 0). The reconcile backstop enqueues these so
+	// a wake that outlived the process (its in-memory requeue lost to a crash) is
+	// serviced on restart, without a spec change to wake it. Orthogonal to
+	// ObjectsListUnsettledIDs: an object can be spec-converged yet still owe a wake.
+	WakesListPendingIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// ObjectsWatch returns a subscription to the single object id of kind gk: its current
 	// state (if any) as an Added snapshot, then live changes filtered to that id.
-	Watch(ctx context.Context, gk GroupKind, id ObjectID) (Watcher, error)
+	ObjectsWatch(ctx context.Context, gk GroupKind, id ObjectID) (*ObjectsSubscription, error)
 
-	// WatchList returns a Watcher for every object of kind gk: the current set as
+	// EventsWatch subscribes to id's event log within gk: the runs matching q as a
+	// snapshot (oldest-first), then live runs. q filters both the snapshot and the
+	// live stream (Limit bounds only the snapshot). Runs conflate per run id, so a
+	// lagging subscriber converges to each run's latest state.
+	EventsWatch(ctx context.Context, gk GroupKind, id ObjectID, q EventQuery) (*EventsSubscription, error)
+
+	// ObjectsWatchList returns a subscription to every object of kind gk: the current set as
 	// an Added snapshot, then all live changes for the kind.
-	WatchList(ctx context.Context, gk GroupKind) (Watcher, error)
+	ObjectsWatchList(ctx context.Context, gk GroupKind) (*ObjectsSubscription, error)
 
-	// WatchObjectChanges returns an ObjectChangeWatcher for live changes to every kind in
+	// ObjectWritesSubscribe returns a subscription to live writes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.
-	WatchObjectChanges(ctx context.Context) (ObjectChangeWatcher, error)
+	ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, error)
 }

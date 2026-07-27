@@ -27,14 +27,14 @@ a bug regardless of whether the bytes changed.
 
 ## The content no-op splits the two halves of the write
 
-Every mutator skips a write whose bytes match what's stored (`UpdateSpec`,
-`DeleteFinalizer`, `DeleteCondition`, `UpdateStatus`) — no `resource_version` bump,
+Every mutator skips a write whose bytes match what's stored (`ObjectsUpdateSpec`,
+`FinalizersDelete`, `ConditionsDelete`, `UpdateStatus`) — no `resource_version` bump,
 no `updated_at`, no emit, since a watcher would otherwise see a spurious diff and
 any dependent free-riding on this kind's status `Modified` would reconcile for
 nothing on each unchanged poll.
 
 But `UpdateStatus` alone also carries `observed_generation` / `observed_at`, which
-record *that the controller ran*, not what it wrote, and `ListUnsettledIDs` keys
+record *that the controller ran*, not what it wrote, and `ObjectsListUnsettledIDs` keys
 off `observed_generation < generation`. So the no-op branch still advances those
 two columns when they'd move — skipping them would strand a legitimately converged
 object unsettled and re-enqueued forever — and that advance **does** bump
@@ -68,7 +68,7 @@ reconcile per row per version bump, which the level-triggered loop absorbs.
 ## The stamp is never downward, on either branch
 
 One rule, `stampVersion(stored, incoming)` — the write-side twin of `convertBlob`,
-applied by both `UpdateSpec` and `UpdateStatus` to the content no-op *and* the real
+applied by both `ObjectsUpdateSpec` and `UpdateStatus` to the content no-op *and* the real
 content write:
 
 - `incoming == 0` is "no opinion" (kind unversioned, or this build lost the

@@ -18,7 +18,7 @@ Split them into three drivers.
 
 ### `WithCatchupInterval` (default 30s, per-kind)
 
-`enqueueCatchup` = `ListUnsettledIDs` + `ListPendingWakeIDs`. Work the store
+`enqueueCatchup` = `ObjectsListUnsettledIDs` + `WakesListPendingIDs`. Work the store
 *records* as owed, so its cost is bounded by what is outstanding and it returns
 nothing in a converged system. The two listings stay separate rather than unioned
 in SQL so one failing still lets the other through, and `enqueueFrom`'s log names
@@ -36,13 +36,13 @@ still compiles and now buys a full pass.
 
 ### `WithGCInterval` (default 30s, global)
 
-`runGCSweeper`: `sweepDeletionPending` + `sweepEventRetention`. Global because it
+`gcSweeperRun`: `sweepDeletionPending` + `sweepEventRetention`. Global because it
 spans kinds with no controller.
 
 `sweepDeletionPending` **routes** rather than collecting: a registered kind is
 enqueued (only a reconcile can clear a finalizer — `collect` cascades then returns
 while any remain), a client-only kind is collected directly. That is why
-`ListAllDeletionPending` returns `[]Referrer`, not ids. The routing lives in one
+`DeletionRequestsList` returns `[]ObjectRef`, not ids. The routing lives in one
 place, `advanceDeletion`, and the sweeper is its only caller: the event-driven
 path (`advanceGCNow`) *only* requeues, so a client-only kind is always left for
 the sweeper's next tick (`enqueueIfRegistered`'s no-op arm) and every `collect`
@@ -61,12 +61,12 @@ owner's delete.
 That invariant is load-bearing *inside* the sweeper too: every failure there is
 logged and swallowed on the promise of a next tick, which is only true while a
 cadence is guaranteed. Under the old startup-only mode, a swallowed
-`ListAllDeletionPending` error was the process's single attempt, stranding rows
+`DeletionRequestsList` error was the process's single attempt, stranding rows
 for its lifetime. Requiring a cadence deleted that hole, `advanceGCNow`'s
 synchronous-collect arm, and that arm's caller-cancellation strand (a cascade
 abandoned mid-flight with nothing scheduled to resume it) in one move.
 
-`runGCSweeper` still returns early on a non-positive interval — unreachable
+`gcSweeperRun` still returns early on a non-positive interval — unreachable
 through `New`, kept so a `Beehive` assembled field-by-field (the
 `withoutGCSweeper()` test helper) has no sweeper instead of panicking in
 `NewTicker`.
