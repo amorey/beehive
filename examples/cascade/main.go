@@ -170,8 +170,8 @@ func stopBeehive(stop func(context.Context) error) {
 func watchCascade(
 	ctx context.Context,
 	clusterClient beehive.Client[ClusterSpec, ClusterStatus],
-	clusterCh <-chan beehive.ObjectChange[ClusterSpec, ClusterStatus],
-	cacheCh <-chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus],
+	clusterCh <-chan *beehive.ObjectChange[ClusterSpec, ClusterStatus],
+	cacheCh <-chan *beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus],
 	clusterID beehive.ObjectID,
 ) {
 	warmed := map[beehive.ObjectID]bool{}
