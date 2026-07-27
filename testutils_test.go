@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gochan/oneshot"
 )
 
 // errBoom is a sentinel error shared by tests that exercise error-propagation
@@ -327,6 +328,36 @@ type noopController[Spec, Status any] struct{}
 
 func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) (Result, error) {
 	return Result{}, nil
+}
+
+// signal is a one-shot notification from a test fake to the test: a callback
+// that may run many times calls fire, and the test awaits it with wait. Firing
+// is idempotent by contract — oneshot reports a second Send as ErrClosed, where
+// a second close of a channel would panic — so a fake needs no sync.Once beside
+// its signal.
+type signal struct {
+	tx *oneshot.Sender[struct{}]
+	rx *oneshot.Receiver[struct{}]
+}
+
+func newSignal() *signal {
+	tx, rx := oneshot.New[struct{}]()
+	return &signal{tx: tx, rx: rx}
+}
+
+// fire signals, whether or not the test is waiting yet: the value is held in the
+// slot until wait takes it. Repeat calls are no-ops, and the returned bool says
+// which call this was — true only for the one that signalled, so a callback that
+// also has first-time-only work to do can gate it on that instead of on a
+// sync.Once of its own.
+func (s *signal) fire() bool { return s.tx.Send(struct{}{}) == nil }
+
+// wait blocks until fire has run, failing the test after the failsafe timeout.
+// The receiver's channel yields the value and is then closed, so a second wait
+// on the same signal returns immediately rather than hanging.
+func (s *signal) wait(t *testing.T, what string) {
+	t.Helper()
+	waitClosed(t, s.rx.Chan(), what)
 }
 
 // waitClosed blocks until ch is closed, failing the test if that takes longer

@@ -18,13 +18,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gochan/oneshot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1191,9 +1191,10 @@ func TestObjectWritesSubscribeSkipsSnapshot(t *testing.T) {
 // one the caller must consume.
 func newParkedObjectChangeStream(t *testing.T, store *sqliteStore) *storeapi.ObjectWritesSubscription {
 	t.Helper()
-	parked := make(chan struct{})
-	var once sync.Once
-	store.beforeLiveSend = func() { once.Do(func() { close(parked) }) }
+	// oneshot rather than a channel closed under a sync.Once: the seam fires on
+	// every live send, and a repeat Send is a no-op where a repeat close panics.
+	parkedTx, parkedRx := oneshot.New[struct{}]()
+	store.beforeLiveSend = func() { _ = parkedTx.Send(struct{}{}) }
 
 	w, err := store.ObjectWritesSubscribe(context.Background())
 	require.NoError(t, err)
@@ -1202,7 +1203,7 @@ func newParkedObjectChangeStream(t *testing.T, store *sqliteStore) *storeapi.Obj
 	_, err = store.ObjectsCreate(context.Background(), newWatchObject())
 	require.NoError(t, err)
 	select {
-	case <-parked:
+	case <-parkedRx.Chan():
 	case <-time.After(2 * time.Second):
 		t.Fatal("object-change stream never parked on its send")
 	}
