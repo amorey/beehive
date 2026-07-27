@@ -1810,18 +1810,17 @@ func TestTypedControllerReconcile(t *testing.T) {
 }
 
 // funcController is a test Controller whose Reconcile delegates to fn (given the
-// ControllerClient passed into Reconcile). If signal is non-nil it is closed
-// once, after fn's first call, so a test can wait for the reconcile to have run.
+// ControllerClient passed into Reconcile). If signal is non-nil it fires after
+// fn's first call, so a test can wait for the reconcile to have run.
 type funcController struct {
-	once   sync.Once
-	signal chan struct{}
+	signal *signal
 	fn     func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error)
 }
 
 func (c *funcController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	res, err := c.fn(ctx, client, obj)
 	if c.signal != nil {
-		c.once.Do(func() { close(c.signal) })
+		c.signal.fire()
 	}
 	return res, err
 }
@@ -2052,41 +2051,38 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 }
 
 // statusSettingController writes a fixed status on the first Reconcile call and
-// closes reconciledCh.
+// fires reconciled.
 type statusSettingController struct {
-	once         sync.Once
-	reconciledCh chan struct{}
+	reconciled *signal
 }
 
 func (c *statusSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
 		return Result{}, err
 	}
-	c.once.Do(func() { close(c.reconciledCh) })
+	c.reconciled.fire()
 	return Result{}, nil
 }
 
 // specEchoController writes cStatus{Val: obj.Spec.Val} on every Reconcile.
-// firstDone closes after the first successful reconcile; secondCh closes once a
+// firstDone fires after the first successful reconcile; secondDone fires once a
 // reconcile observes generation 2, signalling that the spec update — not merely a
 // second reconcile — was seen.
 type specEchoController struct {
-	firstOnce sync.Once
-	once      sync.Once
-	firstDone chan struct{}
-	secondCh  chan struct{}
+	firstDone  *signal
+	secondDone *signal
 }
 
 func (c *specEchoController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: obj.Spec.Val}); err != nil {
 		return Result{}, err
 	}
-	c.firstOnce.Do(func() { close(c.firstDone) })
+	c.firstDone.fire()
 	// Gate on the observed generation, not a reconcile count: a duplicate startup
 	// reconcile of the original generation (the startup pass can race the Create's
 	// own enqueue) must not be mistaken for the update being reconciled.
 	if obj.Generation >= 2 {
-		c.once.Do(func() { close(c.secondCh) })
+		c.secondDone.fire()
 	}
 	return Result{}, nil
 }
@@ -2103,15 +2099,13 @@ const deletionTrackingFinalizer = "test.beehive/deletion-tracking"
 // reconcile and deleted when the object's DeletionRequestedAt is set, then
 // clears its finalizer so the row can finally be collected.
 type deletionTrackingController struct {
-	reconcileOne sync.Once
-	deleteOne    sync.Once
-	reconciled   chan struct{}
-	deleted      chan struct{}
+	reconciled *signal
+	deleted    *signal
 }
 
 func (c *deletionTrackingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt != nil {
-		c.deleteOne.Do(func() { close(c.deleted) })
+		c.deleted.fire()
 		// Clear the finalizer so GC can collect the row now that the deletion has
 		// been observed (idempotent: re-clearing a gone finalizer is a no-op).
 		if err := client.FinalizersDelete(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
@@ -2122,7 +2116,7 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
 		return Result{}, err
 	}
-	c.reconcileOne.Do(func() { close(c.reconciled) })
+	c.reconciled.fire()
 	return Result{}, nil
 }
 
@@ -2132,7 +2126,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
 
-	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
+	ctrl := &statusSettingController{reconciled: newSignal()}
 	_, err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
@@ -2143,7 +2137,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.reconciledCh, "first reconcile")
+	ctrl.reconciled.wait(t, "first reconcile")
 
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2160,8 +2154,8 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &specEchoController{
-		firstDone: make(chan struct{}),
-		secondCh:  make(chan struct{}),
+		firstDone:  newSignal(),
+		secondDone: newSignal(),
 	}
 	_, err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
@@ -2176,12 +2170,12 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	// Wait for the first reconcile before updating, so the update is genuinely a
 	// distinct reconcile of generation 2 rather than being coalesced with the
 	// create into a single pass.
-	waitClosed(t, ctrl.firstDone, "first reconcile")
+	ctrl.firstDone.wait(t, "first reconcile")
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.secondCh, "second reconcile after spec update")
+	ctrl.secondDone.wait(t, "second reconcile after spec update")
 
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2196,8 +2190,8 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &deletionTrackingController{
-		reconciled: make(chan struct{}),
-		deleted:    make(chan struct{}),
+		reconciled: newSignal(),
+		deleted:    newSignal(),
 	}
 	_, err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
@@ -2211,10 +2205,10 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.reconciled, "first reconcile")
+	ctrl.reconciled.wait(t, "first reconcile")
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	waitClosed(t, ctrl.deleted, "reconcile after deletion requested")
+	ctrl.deleted.wait(t, "reconcile after deletion requested")
 }
 
 // TestIntegrationWatchScheduleClosesOnStop verifies a live SchedulesWatch stream is
@@ -2366,7 +2360,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &funcController{
-		signal: make(chan struct{}),
+		signal: newSignal(),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 			_ = cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "persisted"})
 			return Result{}, errBoom
@@ -2382,7 +2376,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.signal, "reconcile wrote status before erroring")
+	ctrl.signal.wait(t, "reconcile wrote status before erroring")
 
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2391,10 +2385,9 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 }
 
 // conditionSettingController sets a Ready=True condition on the first Reconcile,
-// then closes reconciledCh.
+// then fires reconciled.
 type conditionSettingController struct {
-	once         sync.Once
-	reconciledCh chan struct{}
+	reconciled *signal
 }
 
 func (c *conditionSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
@@ -2403,7 +2396,7 @@ func (c *conditionSettingController) Reconcile(ctx context.Context, client Contr
 	}); err != nil {
 		return Result{}, err
 	}
-	c.once.Do(func() { close(c.reconciledCh) })
+	c.reconciled.fire()
 	return Result{}, nil
 }
 
@@ -2413,7 +2406,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
 	require.NoError(t, err)
 
-	ctrl := &conditionSettingController{reconciledCh: make(chan struct{})}
+	ctrl := &conditionSettingController{reconciled: newSignal()}
 	_, err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
@@ -2424,7 +2417,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.reconciledCh, "first reconcile")
+	ctrl.reconciled.wait(t, "first reconcile")
 
 	// Flows through Get.
 	got, err := client.Get(ctx, obj.ID)
@@ -2451,7 +2444,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	require.NoError(t, err)
 
 	ctrl := &funcController{
-		signal: make(chan struct{}),
+		signal: newSignal(),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 			_ = cc.ConditionsSet(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
 			return Result{}, errBoom
@@ -2467,7 +2460,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	waitClosed(t, ctrl.signal, "reconcile set condition before erroring")
+	ctrl.signal.wait(t, "reconcile set condition before erroring")
 
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2489,7 +2482,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
 
-	ctrl := &statusSettingController{reconciledCh: make(chan struct{})}
+	ctrl := &statusSettingController{reconciled: newSignal()}
 	_, err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
@@ -2497,7 +2490,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	defer stop(ctx)
 
 	// Without startup enqueue this would time out (resync is disabled).
-	waitClosed(t, ctrl.reconciledCh, "reconcile of pre-existing object at startup")
+	ctrl.reconciled.wait(t, "reconcile of pre-existing object at startup")
 }
 
 // TestReconcilerRequeueNow verifies requeueNow cancels any pending delayed retry
