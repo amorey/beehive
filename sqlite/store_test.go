@@ -161,7 +161,7 @@ func TestRecordEventScoped(t *testing.T) {
 	assert.ErrorIs(t, err, storeapi.ErrNotFound)
 }
 
-// ListEvents returns an object's runs newest-first (by last_at, then id as the
+// EventsList returns an object's runs newest-first (by last_at, then id as the
 // same-millisecond tiebreak).
 func TestListEventsOrdersNewestFirst(t *testing.T) {
 	store := newTestStore(t)
@@ -186,7 +186,7 @@ func TestListEventsOrdersNewestFirst(t *testing.T) {
 	assert.Equal(t, "Connected", got[3].Reason)    // A, oldest
 }
 
-// EventQuery narrows a ListEvents read by category/type/reason/since and caps it
+// EventQuery narrows a EventsList read by category/type/reason/since and caps it
 // by limit; the zero query returns every run for the object.
 func TestListEventsFilters(t *testing.T) {
 	store := newTestStore(t)
@@ -243,7 +243,7 @@ func TestListEventsFilters(t *testing.T) {
 	})
 }
 
-// GetLatestEvent returns the current run in a category timeline, or nil when that
+// EventsGetLatest returns the current run in a category timeline, or nil when that
 // timeline is empty.
 func TestGetLatestEvent(t *testing.T) {
 	store := newTestStore(t)
@@ -437,7 +437,7 @@ func TestRecordEventStoreErrors(t *testing.T) {
 	})
 }
 
-// ListEvents surfaces a query fault and a per-row scan fault.
+// EventsList surfaces a query fault and a per-row scan fault.
 func TestListEventsStoreErrors(t *testing.T) {
 	ctx := context.Background()
 
@@ -460,7 +460,7 @@ func TestListEventsStoreErrors(t *testing.T) {
 	})
 }
 
-// GetLatestEvent surfaces a scan fault on the current run.
+// EventsGetLatest surfaces a scan fault on the current run.
 func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)

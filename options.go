@@ -70,7 +70,7 @@ func LoadOwned() LoadOption {
 
 // LoadEvents selects the object's event-log runs, read via Object.Events().
 // It loads the object's current runs (bounded by retention); for filtered or
-// bounded reads use the lazy Client.ListEvents with EventOptions instead.
+// bounded reads use the lazy Client.EventsList with EventOptions instead.
 func LoadEvents() LoadOption {
 	return func(s *LoadSet) { *s |= LoadEventsBit }
 }
@@ -110,7 +110,7 @@ func resolveRequeue(opts []RequeueOption) requeueOptions {
 	return o
 }
 
-// EventOption filters a Client.ListEvents / WatchEvents read. Like LoadOption and
+// EventOption filters a Client.EventsList / EventsWatch read. Like LoadOption and
 // RequeueOption it is distinct from Option: it applies only to the event reads,
 // composing into the store's event query.
 type EventOption func(*storeapi.EventQuery)
@@ -132,7 +132,7 @@ func WithEventReason(reason string) EventOption {
 }
 
 // WithEventLimit caps a read to the newest n runs. It bounds only the snapshot of
-// a WatchEvents subscription, not its live stream.
+// a EventsWatch subscription, not its live stream.
 func WithEventLimit(n int) EventOption {
 	return func(q *storeapi.EventQuery) { q.Limit = n }
 }

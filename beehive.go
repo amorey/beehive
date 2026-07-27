@@ -594,8 +594,8 @@ func (bh *Beehive) migratorFor(gk GroupKind) Migrator {
 }
 
 // reconcilerFor returns the reconciler registered for gk, if one exists. The
-// client's Requeue reaches the per-kind work queue through it, and GetSchedule /
-// WatchSchedule read schedule state through it; a client-only kind (no Register)
+// client's Requeue reaches the per-kind work queue through it, and SchedulesGet /
+// SchedulesWatch read schedule state through it; a client-only kind (no Register)
 // has none.
 func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 	bh.mu.Lock()

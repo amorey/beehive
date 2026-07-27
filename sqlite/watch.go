@@ -612,7 +612,7 @@ func eventMatchesQuery(ev storeapi.Event, q storeapi.EventQuery) bool {
 	if q.Reason != "" && ev.Reason != q.Reason {
 		return false
 	}
-	// Compare at stored (millisecond) precision, matching ListEvents' toMillis(Since)
+	// Compare at stored (millisecond) precision, matching EventsList' toMillis(Since)
 	// bound: a sub-millisecond Since (e.g. time.Now()) must not drop a live run in
 	// that same millisecond that the snapshot query would keep.
 	if !q.Since.IsZero() && toMillis(ev.LastAt) < toMillis(q.Since) {
@@ -643,7 +643,7 @@ func (s *sqliteStore) EventsWatch(ctx context.Context, gk storeapi.GroupKind, id
 	var objectExists bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		// Scope the snapshot to gk: the live stream is already gk-scoped (its hub),
-		// so an unscoped ListEvents(id) would leak a foreign object's log and
+		// so an unscoped EventsList(id) would leak a foreign object's log and
 		// disagree with the live half. A missing or wrong-kind id yields an empty
 		// snapshot — the live stream delivers nothing for it either.
 		var err error
@@ -672,7 +672,7 @@ func (s *sqliteStore) EventsWatch(ctx context.Context, gk storeapi.GroupKind, id
 		defer close(w.out)
 		defer rx.Close()
 		send := func(ev storeapi.Event) bool { return w.send(wctx, s.done, ev) }
-		// ListEvents is newest-first; deliver the snapshot oldest-first so the
+		// EventsList is newest-first; deliver the snapshot oldest-first so the
 		// timeline builds in order. Record which runs it carried, to dedup their
 		// race-window republish below.
 		seen := make(map[storeapi.EventID]struct{}, len(snapshot))

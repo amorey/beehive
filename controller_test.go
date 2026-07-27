@@ -151,7 +151,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 	select { // snapshot
 	case ev := <-ch:

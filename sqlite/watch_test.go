@@ -91,7 +91,7 @@ func TestMergeEvent(t *testing.T) {
 }
 
 // eventMatchesQuery bounds Since at stored (millisecond) precision, matching
-// ListEvents' toMillis(Since) SQL bound, so a sub-millisecond Since doesn't drop a
+// EventsList' toMillis(Since) SQL bound, so a sub-millisecond Since doesn't drop a
 // live run in that same millisecond that the snapshot would keep.
 func TestEventMatchesQuerySincePrecision(t *testing.T) {
 	const ms = int64(1_700_000_000_123)
@@ -106,7 +106,7 @@ func TestEventMatchesQuerySincePrecision(t *testing.T) {
 	assert.False(t, eventMatchesQuery(earlier, q), "a run a full millisecond earlier is filtered")
 }
 
-// WatchEvents delivers the object's current runs as a snapshot (oldest-first),
+// EventsWatch delivers the object's current runs as a snapshot (oldest-first),
 // then streams live runs.
 func TestWatchEventsSnapshotThenLive(t *testing.T) {
 	store := newTestStore(t)
@@ -140,7 +140,7 @@ func TestWatchEventsDropsRaceWindowRunsForDeletedObject(t *testing.T) {
 
 	// Record a run then delete the object, both in the subscribe→snapshot window:
 	// the run is buffered in the receiver, but the FK cascade removes it before the
-	// snapshot reads, so ListEvents (and the object scope-check) see it gone.
+	// snapshot reads, so EventsList (and the object scope-check) see it gone.
 	store.beforeSnapshot = func() {
 		_, err := store.EventsRecord(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 		require.NoError(t, err)
@@ -154,7 +154,7 @@ func TestWatchEventsDropsRaceWindowRunsForDeletedObject(t *testing.T) {
 	assertNoLogEvent(t, w, 200*time.Millisecond)
 }
 
-// WatchEvents scopes its snapshot to gk: a foreign id's existing log must not
+// EventsWatch scopes its snapshot to gk: a foreign id's existing log must not
 // leak through the snapshot, keeping it consistent with the gk-scoped live stream.
 func TestWatchEventsScopesSnapshotToKind(t *testing.T) {
 	store := newTestStore(t)
@@ -920,7 +920,7 @@ func TestWatchLiveSendCtxDone(t *testing.T) {
 	assert.False(t, ok, "channel must be closed after the goroutine exits")
 }
 
-// WatchEvents on a closed store returns errStoreClosed (nil event hub).
+// EventsWatch on a closed store returns errStoreClosed (nil event hub).
 func TestWatchEventsAfterCloseErrors(t *testing.T) {
 	store := newRawStore(t)
 	require.NoError(t, store.Close())
@@ -943,7 +943,7 @@ func TestEventMatchesQueryTypeAndReason(t *testing.T) {
 	assert.True(t, eventMatchesQuery(run, storeapi.EventQuery{Type: "Warning", Reason: "ProbeFailed"}))
 }
 
-// WatchEvents surfaces snapshot faults: the object scope-check and the list query.
+// EventsWatch surfaces snapshot faults: the object scope-check and the list query.
 func TestWatchEventsSnapshotErrors(t *testing.T) {
 	t.Run("object scope check fails", func(t *testing.T) {
 		store := newRawStore(t)

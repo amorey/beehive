@@ -155,7 +155,7 @@ func main() {
 	client := beehive.NewClient[ServerSpec, ServerStatus](bh, ServerGroupKind)
 
 	// Subscribe before creating so we don't miss the controller's first writes.
-	watchCh, err := client.WatchList(ctx)
+	watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
 	obj, err := client.Create(ctx, ServerSpec{Replicas: 3})
@@ -176,7 +176,7 @@ func stopBeehive(stop func(context.Context) error) {
 
 // waitForReady prints each change to object id and returns once its Ready
 // condition reports True.
-func waitForReady(id int64, watchCh <-chan beehive.Change[ServerSpec, ServerStatus]) {
+func waitForReady(id int64, watchCh <-chan beehive.ObjectChange[ServerSpec, ServerStatus]) {
 	for evt := range watchCh {
 		if evt.Object.ID != id {
 			continue

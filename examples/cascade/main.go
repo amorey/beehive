@@ -134,9 +134,9 @@ func main() {
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
 	// Subscribe before creating so no lifecycle event is missed.
-	clusterCh, err := clusterClient.WatchList(ctx)
+	clusterCh, err := clusterClient.ObjectsWatchList(ctx)
 	exitOnErr(err)
-	cacheCh, err := cacheClient.WatchList(ctx)
+	cacheCh, err := cacheClient.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
 	// A Cluster guarded by a connection finalizer, owning two caches that each
@@ -170,8 +170,8 @@ func stopBeehive(stop func(context.Context) error) {
 func watchCascade(
 	ctx context.Context,
 	clusterClient beehive.Client[ClusterSpec, ClusterStatus],
-	clusterCh <-chan beehive.Change[ClusterSpec, ClusterStatus],
-	cacheCh <-chan beehive.Change[ClusterCacheSpec, ClusterCacheStatus],
+	clusterCh <-chan beehive.ObjectChange[ClusterSpec, ClusterStatus],
+	cacheCh <-chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus],
 	clusterID beehive.ObjectID,
 ) {
 	warmed := map[beehive.ObjectID]bool{}

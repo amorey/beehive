@@ -199,7 +199,7 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	select {
@@ -1092,7 +1092,7 @@ func TestClientWatchNonExistentID(t *testing.T) {
 
 	// Watch a non-existent ID: the snapshot loader returns (nil, nil) via the
 	// ErrNotFound path, yielding an empty snapshot and an open channel.
-	ch, err := client.Watch(ctx, 9999)
+	ch, err := client.ObjectsWatch(ctx, 9999)
 	require.NoError(t, err)
 
 	// Cancel ctx — channel must close cleanly (no events, just the cancel).
@@ -1460,9 +1460,9 @@ func TestClientWatchPropagatesStoreError(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
-	_, err = client.Watch(context.Background(), 1)
+	_, err = client.ObjectsWatch(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
-	_, err = client.WatchList(context.Background())
+	_, err = client.ObjectsWatchList(context.Background())
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -1496,7 +1496,7 @@ func TestClientAdaptWatcherConversionError(t *testing.T) {
 	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
-	ch, err := client.WatchList(context.Background())
+	ch, err := client.ObjectsWatchList(context.Background())
 	require.NoError(t, err)
 
 	w.push(Modified, &RawObject{ID: 1, Spec: []byte("not-json")})
@@ -1512,14 +1512,14 @@ func TestClientAdaptWatcherConversionError(t *testing.T) {
 }
 
 // TestClientAdaptWatcherForwardsThenClosesOnCancel verifies a decodable event is
-// forwarded as a typed Change, and cancelling the context closes the channel.
+// forwarded as a typed ObjectChange, and cancelling the context closes the channel.
 func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	w.push(Added, &RawObject{ID: 1, Spec: []byte(`{}`)})
@@ -1550,7 +1550,7 @@ func TestClientAdaptWatcherSendParkCtxDone(t *testing.T) {
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	// push returns once the adapter has taken the event; with no reader on ch it
@@ -1581,7 +1581,7 @@ func TestClientAdaptWatcherClosesWhenStreamEnds(t *testing.T) {
 	w := newFakeObjectStream()
 	client := newWatchClient(t, &watcherStore{w: w}, gk)
 
-	ch, err := client.WatchList(context.Background())
+	ch, err := client.ObjectsWatchList(context.Background())
 	require.NoError(t, err)
 
 	w.endStream()
@@ -1644,7 +1644,7 @@ func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
@@ -1664,7 +1664,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 
 	// Subscribe before creating so the snapshot is empty and the first event is
 	// the Modified from the Update, not an Added from the snapshot.
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj, err := client.Create(ctx, cSpec{Val: "v1"})
@@ -1688,7 +1688,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj, err := client.Create(ctx, cSpec{})
@@ -1710,7 +1710,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj, err := client.Create(ctx, cSpec{})
@@ -1743,7 +1743,7 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	obj2, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
 
-	ch, err := client.Watch(ctx, obj1.ID)
+	ch, err := client.ObjectsWatch(ctx, obj1.ID)
 	require.NoError(t, err)
 
 	// Drain the initial snapshot Added event for obj1.
@@ -1770,7 +1770,7 @@ func TestWatchListClosesOnCtxCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	_, client := watchTestBH(t)
 
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	cancel()
@@ -1785,7 +1785,7 @@ func TestWatchClosesOnCtxCancel(t *testing.T) {
 	obj, err := client.Create(context.Background(), cSpec{})
 	require.NoError(t, err)
 
-	ch, err := client.Watch(ctx, obj.ID)
+	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	cancel()
@@ -1817,7 +1817,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 
 	// Subscribe after create: the snapshot emits Added(obj) first, then we
 	// expect Modified from UpdateStatus.
-	ch, err := client2.WatchList(ctx)
+	ch, err := client2.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	// Drain the initial snapshot Added event.
@@ -1845,7 +1845,7 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
 
-	ch, err := client.WatchList(ctx)
+	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	// Two snapshot Added events must arrive, one per existing object.
@@ -1868,7 +1868,7 @@ func TestWatchInitialSnapshot(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "hello"})
 	require.NoError(t, err)
 
-	ch, err := client.Watch(ctx, obj.ID)
+	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	evt := recv(t, ch)
@@ -1906,10 +1906,10 @@ func TestWatchListErrForUnregisteredKind(t *testing.T) {
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
 
-	_, err = client.WatchList(ctx)
+	_, err = client.ObjectsWatchList(ctx)
 	require.Error(t, err)
 
-	_, err = client.Watch(ctx, 0)
+	_, err = client.ObjectsWatch(ctx, 0)
 	require.Error(t, err)
 }
 
@@ -2031,7 +2031,7 @@ func TestClientListOwned(t *testing.T) {
 
 // ownedObjectsFixture builds an owner of kind Owner plus children of two kinds:
 // two Widgets and one Gadget, all owned by that owner — the multi-kind shape
-// ListOwnedObjects has to filter down. It returns the two clients, the owner id,
+// OwnedObjectsList has to filter down. It returns the two clients, the owner id,
 // and the widget children in id order.
 func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus], Client[cSpec, cStatus], ObjectID, []*Object[cSpec, cStatus]) {
 	t.Helper()
@@ -2058,7 +2058,7 @@ func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus],
 func TestClientListOwnedObjectsReturnsTypedChildren(t *testing.T) {
 	ctx, _, widgets, ownerID, children := ownedObjectsFixture(t)
 
-	got, err := widgets.ListOwnedObjects(ctx, ownerID)
+	got, err := widgets.OwnedObjectsList(ctx, ownerID)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "the Gadget child belongs to another kind")
 	// Ordered by id, decoded, and kind-scoped: no Gadget in sight.
@@ -2073,13 +2073,13 @@ func TestClientListOwnedObjectsReturnsTypedChildren(t *testing.T) {
 func TestClientListOwnedObjectsLoads(t *testing.T) {
 	ctx, _, widgets, ownerID, _ := ownedObjectsFixture(t)
 
-	bare, err := widgets.ListOwnedObjects(ctx, ownerID)
+	bare, err := widgets.OwnedObjectsList(ctx, ownerID)
 	require.NoError(t, err)
 	require.Len(t, bare, 2)
 	_, _, err = bare[0].Owner()
 	assert.ErrorIs(t, err, ErrNotLoaded, "no load option -> nothing loaded")
 
-	got, err := widgets.ListOwnedObjects(ctx, ownerID, LoadOwner())
+	got, err := widgets.OwnedObjectsList(ctx, ownerID, LoadOwner())
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	for _, child := range got {
@@ -2094,7 +2094,7 @@ func TestClientListOwnedObjectsEmpty(t *testing.T) {
 	ctx, _, widgets, _, children := ownedObjectsFixture(t)
 
 	// A child owns nothing, so it has no children of this kind.
-	got, err := widgets.ListOwnedObjects(ctx, children[0].ID)
+	got, err := widgets.OwnedObjectsList(ctx, children[0].ID)
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
@@ -2111,7 +2111,7 @@ func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, widgets.Delete(ctx, child.ID))
 
-	got, err := widgets.ListOwnedObjects(ctx, owner.ID)
+	got, err := widgets.OwnedObjectsList(ctx, owner.ID)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "deletion-pending children are included, as in OwnedList")
 	assert.Equal(t, child.ID, got[0].ID)
@@ -2122,7 +2122,7 @@ func TestClientListOwnedObjectsUnknownOwner(t *testing.T) {
 	ctx, _, widgets, _, _ := ownedObjectsFixture(t)
 
 	// Like OwnedList, it reads edges: a missing owner is empty, not ErrNotFound.
-	got, err := widgets.ListOwnedObjects(ctx, 99999)
+	got, err := widgets.OwnedObjectsList(ctx, 99999)
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
@@ -2142,12 +2142,12 @@ func TestClientListOwnedObjectsStoreError(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.ListOwnedObjects(ctx, 1)
+	_, err = client.OwnedObjectsList(ctx, 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
 // ownedObjectsBadJSONStore returns one undecodable row alongside a good one,
-// driving ListOwnedObjects' quarantine branch.
+// driving OwnedObjectsList' quarantine branch.
 type ownedObjectsBadJSONStore struct {
 	fakeStore
 	gk GroupKind
@@ -2166,14 +2166,14 @@ func TestClientListOwnedObjectsQuarantinesUndecodable(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	got, err := client.ListOwnedObjects(ctx, 1)
+	got, err := client.OwnedObjectsList(ctx, 1)
 	require.NoError(t, err, "one bad row is skipped, not fatal")
 	require.Len(t, got, 1)
 	assert.Equal(t, ObjectID(2), got[0].ID)
 }
 
 // ownedObjectsLoadErrorStore returns a decodable child but fails the batched ref
-// read, driving ListOwnedObjects' eager-load error branch.
+// read, driving OwnedObjectsList' eager-load error branch.
 type ownedObjectsLoadErrorStore struct {
 	fakeStore
 	gk GroupKind
@@ -2193,7 +2193,7 @@ func TestClientListOwnedObjectsLoadError(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.ListOwnedObjects(ctx, 1, LoadOwner())
+	_, err = client.OwnedObjectsList(ctx, 1, LoadOwner())
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -2557,7 +2557,7 @@ func TestClientRequeue(t *testing.T) {
 	}
 }
 
-// TestClientGetScheduleUnknownID verifies GetSchedule reads in-memory schedule
+// TestClientGetScheduleUnknownID verifies SchedulesGet reads in-memory schedule
 // state without a store lookup: an id that does not exist (or belongs to another
 // kind) is simply unscheduled, so it reads as the zero Schedule with a nil error
 // rather than ErrNotFound.
@@ -2569,12 +2569,12 @@ func TestClientGetScheduleUnknownID(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	s, err := client.GetSchedule(ctx, 999)
+	s, err := client.SchedulesGet(ctx, 999)
 	require.NoError(t, err)
 	assert.True(t, s.NextRequeueAt.IsZero(), "unknown id must read as the zero Schedule, got %s", s.NextRequeueAt)
 }
 
-// TestClientGetScheduleScheduled verifies GetSchedule returns a Schedule carrying
+// TestClientGetScheduleScheduled verifies SchedulesGet returns a Schedule carrying
 // the pending delayed reconcile's fire time in NextRequeueAt.
 func TestClientGetScheduleScheduled(t *testing.T) {
 	ctx := context.Background()
@@ -2592,13 +2592,13 @@ func TestClientGetScheduleScheduled(t *testing.T) {
 	drainQueue(r.work)
 	r.work.addAfter(obj.ID, time.Hour)
 
-	s, err := client.GetSchedule(ctx, obj.ID)
+	s, err := client.SchedulesGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, s.NextRequeueAt.After(time.Now().Add(time.Minute)),
 		"fire time must be ~1h out, got %s", s.NextRequeueAt)
 }
 
-// TestClientGetScheduleUnscheduled verifies GetSchedule returns the zero-value
+// TestClientGetScheduleUnscheduled verifies SchedulesGet returns the zero-value
 // Schedule (and no error) when nothing is scheduled for the id.
 func TestClientGetScheduleUnscheduled(t *testing.T) {
 	ctx := context.Background()
@@ -2614,14 +2614,14 @@ func TestClientGetScheduleUnscheduled(t *testing.T) {
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
 
-	s, err := client.GetSchedule(ctx, obj.ID)
+	s, err := client.SchedulesGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, s.NextRequeueAt.IsZero(), "unscheduled id must carry the zero time, got %s", s.NextRequeueAt)
 }
 
-// TestClientGetScheduleNoController verifies GetSchedule folds a client-only kind
+// TestClientGetScheduleNoController verifies SchedulesGet folds a client-only kind
 // (no reconcile loop to schedule against) into the zero Schedule and a nil error,
-// degrading gracefully rather than erroring like the WatchSchedule live stream.
+// degrading gracefully rather than erroring like the SchedulesWatch live stream.
 func TestClientGetScheduleNoController(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -2631,12 +2631,12 @@ func TestClientGetScheduleNoController(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	s, err := client.GetSchedule(ctx, obj.ID)
+	s, err := client.SchedulesGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, s.NextRequeueAt.IsZero(), "client-only kind must carry the zero time, got %s", s.NextRequeueAt)
 }
 
-// TestClientWatchScheduleSnapshot verifies WatchSchedule delivers the current
+// TestClientWatchScheduleSnapshot verifies SchedulesWatch delivers the current
 // schedule on subscribe: an id with a pending future requeue emits that fire time
 // first, before any live change.
 func TestClientWatchScheduleSnapshot(t *testing.T) {
@@ -2656,7 +2656,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 	drainQueue(r.work)
 	r.work.addAfter(obj.ID, time.Hour)
 
-	ch, err := client.WatchSchedule(ctx, obj.ID)
+	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	s := recv(t, ch)
@@ -2664,7 +2664,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 		"snapshot must carry the pending ~1h fire time, got %s", s.NextRequeueAt)
 }
 
-// TestClientWatchScheduleLive verifies WatchSchedule streams reschedules live: the
+// TestClientWatchScheduleLive verifies SchedulesWatch streams reschedules live: the
 // snapshot, then a future fire time, then due-now, then the unscheduled zero as the
 // id moves through addAfter → requeueNow → dispatch.
 func TestClientWatchScheduleLive(t *testing.T) {
@@ -2682,7 +2682,7 @@ func TestClientWatchScheduleLive(t *testing.T) {
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
 
-	ch, err := client.WatchSchedule(ctx, obj.ID)
+	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	// Snapshot: nothing scheduled after the drain.
@@ -2708,9 +2708,9 @@ func TestClientWatchScheduleLive(t *testing.T) {
 	assert.True(t, cleared.NextRequeueAt.IsZero(), "dispatch must emit the unscheduled zero, got %s", cleared.NextRequeueAt)
 }
 
-// TestClientWatchScheduleNoController verifies WatchSchedule rejects a client-only
+// TestClientWatchScheduleNoController verifies SchedulesWatch rejects a client-only
 // kind with ErrNoController: a live stream that can never emit should say so, unlike
-// the point-read GetSchedule which degrades to the zero Schedule.
+// the point-read SchedulesGet which degrades to the zero Schedule.
 func TestClientWatchScheduleNoController(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2721,7 +2721,7 @@ func TestClientWatchScheduleNoController(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	_, err = client.WatchSchedule(ctx, obj.ID)
+	_, err = client.SchedulesWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
 }
 
@@ -2756,11 +2756,11 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	_, err = client.ListEvents(ctx, obj.ID)
+	_, err = client.EventsList(ctx, obj.ID)
 	assert.ErrorIs(t, err, errBoom)
-	_, _, err = client.GetLatestEvent(ctx, obj.ID, "c")
+	_, _, err = client.EventsGetLatest(ctx, obj.ID, "c")
 	assert.ErrorIs(t, err, errBoom)
-	_, err = client.WatchEvents(ctx, obj.ID)
+	_, err = client.EventsWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, errBoom)
 	_, err = client.Get(ctx, obj.ID, LoadEvents())
 	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on Get")
@@ -2768,7 +2768,7 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on List")
 }
 
-// A client ListEvents on an object with no runs returns an empty slice (the
+// A client EventsList on an object with no runs returns an empty slice (the
 // eventsFromRaw nil branch).
 func TestClientListEventsEmpty(t *testing.T) {
 	ctx := context.Background()
@@ -2779,7 +2779,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	got, err := client.ListEvents(ctx, obj.ID)
+	got, err := client.EventsList(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
@@ -2855,7 +2855,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	emit(EventWarning, "ProbeFailed", "i/o timeout", probeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18)
 	emit(EventNormal, "Connected", "", nil, 4)
 
-	panel, err := client.ListEvents(ctx, cluster.ID, WithEventCategory("connection"))
+	panel, err := client.EventsList(ctx, cluster.ID, WithEventCategory("connection"))
 	require.NoError(t, err)
 
 	type row struct {
@@ -2886,7 +2886,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	assert.Equal(t, "x509: certificate expired", panel[3].Message)
 
 	// The panel header — current state of the connection timeline.
-	latest, ok, err := client.GetLatestEvent(ctx, cluster.ID, "connection")
+	latest, ok, err := client.EventsGetLatest(ctx, cluster.ID, "connection")
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "Connected", latest.Reason)
@@ -2950,7 +2950,7 @@ func TestClientListLoadsEvents(t *testing.T) {
 	assert.Equal(t, "BBad", byReason[b.ID])
 }
 
-// ListEvents returns an object's runs as public Events, newest-first, with the
+// EventsList returns an object's runs as public Events, newest-first, with the
 // query options resolved into the store filter.
 func TestClientListEvents(t *testing.T) {
 	ctx := context.Background()
@@ -2969,12 +2969,12 @@ func TestClientListEvents(t *testing.T) {
 	rec("connection", "Normal", "Connected")
 	rec("sync", "Normal", "Synced")
 
-	all, err := client.ListEvents(ctx, obj.ID)
+	all, err := client.EventsList(ctx, obj.ID)
 	require.NoError(t, err)
 	require.Len(t, all, 3)
 	assert.Equal(t, "Synced", all[0].Reason, "newest-first across categories")
 
-	conn, err := client.ListEvents(ctx, obj.ID, WithEventCategory("connection"))
+	conn, err := client.EventsList(ctx, obj.ID, WithEventCategory("connection"))
 	require.NoError(t, err)
 	require.Len(t, conn, 2)
 	assert.Equal(t, EventNormal, conn[0].Type, "newest connection run mapped to EventType")
@@ -2982,7 +2982,7 @@ func TestClientListEvents(t *testing.T) {
 	assert.Equal(t, EventWarning, conn[1].Type)
 }
 
-// GetLatestEvent returns the current run in a category with ok=true, or the zero
+// EventsGetLatest returns the current run in a category with ok=true, or the zero
 // Event with ok=false when the timeline is empty.
 func TestClientGetLatestEvent(t *testing.T) {
 	ctx := context.Background()
@@ -2996,17 +2996,17 @@ func TestClientGetLatestEvent(t *testing.T) {
 	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
-	got, ok, err := client.GetLatestEvent(ctx, obj.ID, "connection")
+	got, ok, err := client.EventsGetLatest(ctx, obj.ID, "connection")
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "Connected", got.Reason)
 
-	_, ok, err = client.GetLatestEvent(ctx, obj.ID, "nope")
+	_, ok, err = client.EventsGetLatest(ctx, obj.ID, "nope")
 	require.NoError(t, err)
 	assert.False(t, ok, "empty timeline is ok=false")
 }
 
-// WatchEvents streams live runs as public Events and, like Watch, requires a
+// EventsWatch streams live runs as public Events and, like Watch, requires a
 // registered controller.
 func TestClientWatchEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3020,7 +3020,7 @@ func TestClientWatchEvents(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	ch, err := client.WatchEvents(ctx, obj.ID)
+	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
@@ -3035,8 +3035,8 @@ func TestClientWatchEvents(t *testing.T) {
 	}
 
 	unregistered := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Unregistered"})
-	_, err = unregistered.WatchEvents(ctx, obj.ID)
-	assert.Error(t, err, "WatchEvents requires a registered controller")
+	_, err = unregistered.EventsWatch(ctx, obj.ID)
+	assert.Error(t, err, "EventsWatch requires a registered controller")
 }
 
 // eventFromRaw maps the store's raw event row to the public Event, translating

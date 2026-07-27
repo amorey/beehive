@@ -183,7 +183,7 @@ type reconciler struct {
 	adapter controllerAdapter
 	store   Store
 	work    *workQueue
-	// scheduleHub fans each object's next-requeue changes out to WatchSchedule
+	// scheduleHub fans each object's next-requeue changes out to SchedulesWatch
 	// subscribers, keyed by ObjectID with latest-value-per-id coalescing. The work
 	// queue feeds it through onSchedule; Close (on teardown) ends live streams.
 	scheduleHub       *conflate.Hub[ObjectID, Schedule]
@@ -527,7 +527,7 @@ func (r *reconciler) run(ctx context.Context) {
 	}
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
 	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue,
-	// and close the schedule hub so live WatchSchedule streams end instead of hanging
+	// and close the schedule hub so live SchedulesWatch streams end instead of hanging
 	// on a subscriber context that outlives the control plane.
 	defer func() {
 		wg.Wait()

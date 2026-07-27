@@ -181,10 +181,10 @@ func (s *fakeStore) EventsRecord(context.Context, GroupKind, ObjectID, RawEvent)
 	panic("not implemented: fakeStore.EventsRecord")
 }
 func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
-	panic("not implemented: fakeStore.ListEvents")
+	panic("not implemented: fakeStore.EventsList")
 }
 func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
-	panic("not implemented: fakeStore.GetLatestEvent")
+	panic("not implemented: fakeStore.EventsGetLatest")
 }
 func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
 	panic("not implemented: fakeStore.EventsSweep")

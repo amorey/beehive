@@ -108,7 +108,7 @@ func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, cc Cont
 // waitForDeletions consumes w until it has seen a Deleted event for every id in
 // want, failing on timeout. The watcher must be subscribed before the deletions
 // are triggered so no event is missed.
-func waitForDeletions(t *testing.T, w <-chan Change[cSpec, cStatus], want ...ObjectID) {
+func waitForDeletions(t *testing.T, w <-chan *ObjectChange[cSpec, cStatus], want ...ObjectID) {
 	t.Helper()
 	pending := make(map[ObjectID]struct{}, len(want))
 	for _, id := range want {
@@ -393,7 +393,7 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -425,7 +425,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -472,7 +472,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// Subscribe before Start so the Deleted event can't be missed.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -506,7 +506,7 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	// Subscribe before deleting so the Deleted event can't be missed.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.Watch(wctx, obj.ID)
+	w, err := client.ObjectsWatch(wctx, obj.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -539,7 +539,7 @@ func TestIntegrationGCCascadeWithResyncDisabled(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, owner.ID))
@@ -568,7 +568,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	// Deleting only the owner must cascade to the child and remove both.
@@ -615,7 +615,7 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	// only the sweeper can collect that client-only child.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	wOwner, err := owners.WatchList(wctx)
+	wOwner, err := owners.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	require.NoError(t, owners.Delete(ctx, owner.ID))
@@ -737,7 +737,7 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -833,7 +833,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.WatchList(wctx)
+	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)

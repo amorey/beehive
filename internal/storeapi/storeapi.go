@@ -83,7 +83,7 @@ const (
 )
 
 // RawObjectChange is the untyped change an ObjectsSubscription delivers. The client decodes it
-// into the generic, user-facing Change[Spec, Status]; the name carries the
+// into the generic, user-facing ObjectChange[Spec, Status]; the name carries the
 // "Raw" prefix (like RawObject) to avoid colliding with that generic type.
 type RawObjectChange struct {
 	Type   ChangeType
@@ -177,7 +177,7 @@ type Event struct {
 	ResourceVersion int64
 }
 
-// EventQuery filters and bounds a ListEvents read. The zero value selects every
+// EventQuery filters and bounds a EventsList read. The zero value selects every
 // run for the object, newest first (by LastAt, then id). The client builds one
 // from its EventOptions; the store never sees the option type.
 type EventQuery struct {
@@ -419,7 +419,7 @@ type Store interface {
 	// RefsListIncoming: the full rows of the objects of kind gk pointing at toID
 	// through relation, ordered by id, conditions attached. It resolves the edges
 	// and the rows in one query so a typed read of an owner's children of one kind
-	// (Client.ListOwnedObjects) costs no Get per child. Objects of other kinds are
+	// (Client.OwnedObjectsList) costs no Get per child. Objects of other kinds are
 	// filtered out; a toID with no matching edge reads empty, never ErrNotFound.
 	ObjectsListByIncomingRef(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
 

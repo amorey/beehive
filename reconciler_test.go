@@ -2217,7 +2217,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	waitClosed(t, ctrl.deleted, "reconcile after deletion requested")
 }
 
-// TestIntegrationWatchScheduleClosesOnStop verifies a live WatchSchedule stream is
+// TestIntegrationWatchScheduleClosesOnStop verifies a live SchedulesWatch stream is
 // torn down when the control plane stops, even though the subscriber's own context
 // stays open: run's teardown closes the schedule hub, which ends the receiver and
 // closes the channel. Without that close the stream would hang forever on Background.
@@ -2237,7 +2237,7 @@ func TestIntegrationWatchScheduleClosesOnStop(t *testing.T) {
 
 	// Subscribe with a context that never cancels, so only the control plane's
 	// teardown can close the stream.
-	ch, err := client.WatchSchedule(ctx, obj.ID)
+	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
 	recv(t, ch) // drain the snapshot: the stream is live before we stop
 
@@ -2264,7 +2264,7 @@ func TestIntegrationWatchScheduleClosesOnCtxCancel(t *testing.T) {
 	require.NoError(t, err)
 
 	wctx, cancel := context.WithCancel(ctx)
-	ch, err := client.WatchSchedule(wctx, obj.ID)
+	ch, err := client.SchedulesWatch(wctx, obj.ID)
 	require.NoError(t, err)
 	recv(t, ch) // drain the snapshot: the stream is live before we cancel
 
@@ -2307,7 +2307,7 @@ func TestWatchScheduleSnapshotSendCtxDone(t *testing.T) {
 	exited := make(chan struct{})
 	r.afterWatchSchedule = func() { close(exited) }
 
-	ch, err := client.WatchSchedule(ctx, obj.ID)
+	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	cancel() // goroutine parks on the snapshot send (no reader) → ctx.Done
@@ -2338,7 +2338,7 @@ func TestWatchScheduleLiveSendCtxDone(t *testing.T) {
 	exited := make(chan struct{})
 	r.afterWatchSchedule = func() { close(exited) }
 
-	ch, err := client.WatchSchedule(ctx, obj.ID)
+	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	// Buffer a live reschedule before draining the snapshot: it is pending by the

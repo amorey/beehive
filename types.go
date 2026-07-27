@@ -154,12 +154,12 @@ type Result struct {
 
 // Schedule reports when an object is next due to reconcile. It is a struct rather
 // than a bare time.Time so fields can be added without a breaking change — a
-// reschedule watcher (Client.WatchSchedule) observes this value as a gauge.
+// reschedule watcher (Client.SchedulesWatch) observes this value as a gauge.
 type Schedule struct {
 	// NextRequeueAt is when the reconcile loop has scheduled the object to be
 	// requeued, or the zero time when nothing is scheduled. It reflects only per-id
 	// timers (backoff, RequeueAfter, an immediate enqueue), not the periodic resync
-	// or event-driven wakes. Reported by Client.GetSchedule and WatchSchedule.
+	// or event-driven wakes. Reported by Client.SchedulesGet and SchedulesWatch.
 	NextRequeueAt time.Time
 	// Reserved: a future Trigger/Reason enum (backoff vs success-cadence vs manual
 	// poke) may be added here. Not populated yet.

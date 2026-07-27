@@ -107,7 +107,7 @@ func TestObjectListOwned(t *testing.T) {
 	assert.Equal(t, owned, got)
 }
 
-// Object.ListEvents is gated by LoadEventsBit like the ref accessors: ErrNotLoaded
+// Object.EventsList is gated by LoadEventsBit like the ref accessors: ErrNotLoaded
 // until LoadEvents() was passed, then the loaded runs (empty slice when none).
 func TestObjectListEvents(t *testing.T) {
 	events := []Event{{ID: 1, Reason: "Connected"}}

@@ -84,7 +84,7 @@ func main() {
 	client := beehive.NewClient[GreetingSpec, GreetingStatus](bh, GreetingGroupKind)
 
 	// Subscribe before creating so we don't miss the controller's UpdateStatus event.
-	watchCh, err := client.WatchList(ctx)
+	watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
 	obj, err := client.Create(ctx, GreetingSpec{Name: "world"})
@@ -104,7 +104,7 @@ func stopBeehive(stop func(context.Context) error) {
 }
 
 // waitForConvergence drains watchCh until it sees a status-bearing event for id.
-func waitForConvergence(id int64, watchCh <-chan beehive.Change[GreetingSpec, GreetingStatus]) {
+func waitForConvergence(id int64, watchCh <-chan beehive.ObjectChange[GreetingSpec, GreetingStatus]) {
 	for evt := range watchCh {
 		if evt.Object.ID != id || evt.Object.Status == nil {
 			continue

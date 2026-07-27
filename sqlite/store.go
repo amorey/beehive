@@ -996,7 +996,7 @@ func scanEvent(sc scanner) (*storeapi.Event, error) {
 }
 
 // latestEventRun returns the full newest run for (id, category), or nil if that
-// timeline is empty. GetLatestEvent returns it as-is.
+// timeline is empty. EventsGetLatest returns it as-is.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
@@ -1014,7 +1014,7 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 // latestEventKey returns just the run key (id, type, reason) of the newest run
 // for (id, category), or ok=false if that timeline is empty. EventsRecord needs
 // only the key to decide extend-vs-append, so it deliberately does not decode the
-// full row (unlike GetLatestEvent): probing the columns it is about to discard
+// full row (unlike EventsGetLatest): probing the columns it is about to discard
 // would let a decode fault in an older run mask — rather than surface through —
 // the write EventsRecord is about to make.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
