@@ -59,10 +59,10 @@ type Client[Spec, Status any] interface {
 	DeleteBySlug(ctx context.Context, slug string) error
 	// DependenciesList returns the objects id depends on (its outgoing depends_on
 	// edges). The lazy counterpart to LoadDependencies().
-	DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error)
+	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// DependentsList returns the objects that depend on id (incoming depends_on).
 	// The lazy counterpart to LoadDependents().
-	DependentsList(ctx context.Context, id ObjectID) ([]Ref, error)
+	DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// EventsGetLatest returns the current (most-recent) run in id's category timeline.
 	// ok reports presence: false (with a nil error) when the timeline is empty.
 	EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error)
@@ -134,7 +134,7 @@ type Client[Spec, Status any] interface {
 	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
-	OwnedList(ctx context.Context, id ObjectID) ([]Ref, error)
+	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 
 	// OwnedObjectsList returns the objects owned by ownerID that belong to THIS
 	// client's kind, fully decoded — the typed, kind-scoped form of OwnedList
@@ -164,7 +164,7 @@ type Client[Spec, Status any] interface {
 	// their edge query directly and do not kind-scope id: passing another kind's
 	// id reads that kind's edges, and a missing id reads empty — neither reports
 	// ErrNotFound. Reserve them for ids this client owns.
-	OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
+	OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
 
 	// Requeue requeues id for immediate reconcile. A latency hint, not a
 	// synchronous run: with the periodic resync enabled, correctness rests on that,
@@ -593,13 +593,13 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 
 // fetchOwnerRef resolves id's single owned_by edge. Owner is single (WithOwner
 // sets one), so the first row is the owner and ok is false when there is none.
-func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (Ref, bool, error) {
+func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bool, error) {
 	owners, err := store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
 	if err != nil {
-		return Ref{}, false, err
+		return ObjectRef{}, false, err
 	}
 	if len(owners) == 0 {
-		return Ref{}, false, nil
+		return ObjectRef{}, false, nil
 	}
 	return owners[0], true, nil
 }
@@ -716,19 +716,19 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 // kind's edges and a missing id reads empty — neither surfaces as ErrNotFound —
 // so passing another kind's id through this single-kind client is silent misuse
 // rather than a clean error.
-func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error) {
+func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
-func (c *clientImpl[Spec, Status]) DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *clientImpl[Spec, Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
 	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
-func (c *clientImpl[Spec, Status]) DependentsList(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *clientImpl[Spec, Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
 	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
 }
 
-func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
 	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
 }
 

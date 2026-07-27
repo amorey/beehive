@@ -351,7 +351,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID, to.ResourceVersion))
 	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []Ref{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
+	assert.Equal(t, []ObjectRef{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
 	require.NoError(t, cc.DependenciesDelete(ctx, from.ID, to.ID))
 	deps, err = bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
@@ -589,7 +589,7 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 
 	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration leaves no edge")
+	assert.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "a rejected declaration leaves no edge")
 	f.requireNotRequeued(t)
 
 	// The target's own current version is the boundary, and is accepted.
@@ -631,7 +631,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 
 	refs, err := real.EdgesListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{dep.ID}, refObjectIDs(refs), "the edge landed")
+	assert.Equal(t, []ObjectID{dep.ID}, objectRefIDs(refs), "the edge landed")
 
 	owed, err := real.WakesListPendingIDs(ctx, gk)
 	require.NoError(t, err)
@@ -657,7 +657,7 @@ func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
 
 	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration must leave no edge, committed or not")
+	assert.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "a rejected declaration must leave no edge, committed or not")
 }
 
 // TestAddDependencyStaleResourceVersionWakesAtMostOnce pins the wake's
@@ -712,7 +712,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 
 	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	require.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "the rolled-back declaration left no edge")
+	require.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "the rolled-back declaration left no edge")
 	f.requireNotRequeued(t)
 }
 
@@ -930,7 +930,7 @@ func TestControllerClientDeleteDependencyWakesFinalizingTarget(t *testing.T) {
 	wakes := &pendingWakes{}
 	ctx := withPendingWakes(context.Background(), wakes)
 	require.NoError(t, cc.DependenciesDelete(ctx, 1, 2))
-	assert.Equal(t, []Ref{{ID: 2, Group: "g", Kind: "K"}}, wakes.targets,
+	assert.Equal(t, []ObjectRef{{ID: 2, Group: "g", Kind: "K"}}, wakes.targets,
 		"a finalizing freed target is scheduled for a GC re-check")
 }
 
@@ -984,13 +984,13 @@ func TestControllerClientReadEdges(t *testing.T) {
 
 	deps, err := cc.DependenciesList(ctx, child.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{owner.ID}, refObjectIDs(deps))
+	assert.Equal(t, []ObjectID{owner.ID}, objectRefIDs(deps))
 
 	dependents, err := cc.DependentsList(ctx, owner.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{child.ID}, refObjectIDs(dependents))
+	assert.Equal(t, []ObjectID{child.ID}, objectRefIDs(dependents))
 
 	owned, err := cc.OwnedList(ctx, owner.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{child.ID}, refObjectIDs(owned))
+	assert.Equal(t, []ObjectID{child.ID}, objectRefIDs(owned))
 }

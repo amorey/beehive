@@ -2189,7 +2189,7 @@ func newRefObject(t *testing.T, store beehive.Store) *beehive.RawObject {
 }
 
 // refIDs projects an ObjectRef slice to its ids for order-sensitive assertions.
-func refIDs(refs []beehive.Ref) []beehive.ObjectID {
+func refIDs(refs []beehive.ObjectRef) []beehive.ObjectID {
 	var ids []beehive.ObjectID
 	for _, r := range refs {
 		ids = append(ids, r.ID)
@@ -2532,7 +2532,7 @@ func TestRefsListIncoming(t *testing.T) {
 
 	deps, err := store.EdgesListIncoming(ctx, c.ID, "depends_on")
 	require.NoError(t, err)
-	require.Equal(t, []beehive.Ref{
+	require.Equal(t, []beehive.ObjectRef{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
 	}, deps)

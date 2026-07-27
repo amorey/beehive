@@ -25,7 +25,7 @@ import (
 // OwnersGet errors with ErrNotLoaded when unloaded; once loaded, ok reports
 // presence and folds away the loaded-but-ownerless case.
 func TestObjectGetOwner(t *testing.T) {
-	owner := Ref{ID: 7, Kind: "Cluster"}
+	owner := ObjectRef{ID: 7, Kind: "Cluster"}
 
 	t.Run("not loaded errors", func(t *testing.T) {
 		var o Object[struct{}, struct{}]
@@ -38,7 +38,7 @@ func TestObjectGetOwner(t *testing.T) {
 		got, ok, err := o.Owner()
 		require.NoError(t, err)
 		assert.False(t, ok, "loaded but ownerless is not present")
-		assert.Equal(t, Ref{}, got)
+		assert.Equal(t, ObjectRef{}, got)
 	})
 
 	t.Run("loaded with owner", func(t *testing.T) {
@@ -53,7 +53,7 @@ func TestObjectGetOwner(t *testing.T) {
 // DependenciesList errors with ErrNotLoaded when unloaded; a loaded-but-empty
 // result is an empty slice with a nil error.
 func TestObjectListDependencies(t *testing.T) {
-	deps := []Ref{{ID: 1}, {ID: 2}}
+	deps := []ObjectRef{{ID: 1}, {ID: 2}}
 
 	t.Run("not loaded errors", func(t *testing.T) {
 		var o Object[struct{}, struct{}]
@@ -62,7 +62,7 @@ func TestObjectListDependencies(t *testing.T) {
 	})
 
 	t.Run("loaded, empty", func(t *testing.T) {
-		o := Object[struct{}, struct{}]{loaded: LoadDependenciesBit, dependencies: []Ref{}}
+		o := Object[struct{}, struct{}]{loaded: LoadDependenciesBit, dependencies: []ObjectRef{}}
 		got, err := o.Dependencies()
 		require.NoError(t, err, "loaded-empty is not an error")
 		assert.Empty(t, got)
@@ -77,7 +77,7 @@ func TestObjectListDependencies(t *testing.T) {
 }
 
 func TestObjectListDependents(t *testing.T) {
-	dependents := []Ref{{ID: 3}}
+	dependents := []ObjectRef{{ID: 3}}
 
 	var unloaded Object[struct{}, struct{}]
 	_, err := unloaded.Dependents()
@@ -90,13 +90,13 @@ func TestObjectListDependents(t *testing.T) {
 }
 
 func TestObjectListOwned(t *testing.T) {
-	owned := []Ref{{ID: 4}, {ID: 5}}
+	owned := []ObjectRef{{ID: 4}, {ID: 5}}
 
 	var unloaded Object[struct{}, struct{}]
 	_, err := unloaded.Owned()
 	assert.ErrorIs(t, err, ErrNotLoaded)
 
-	empty := Object[struct{}, struct{}]{loaded: LoadOwnedBit, owned: []Ref{}}
+	empty := Object[struct{}, struct{}]{loaded: LoadOwnedBit, owned: []ObjectRef{}}
 	got, err := empty.Owned()
 	require.NoError(t, err, "loaded-empty is not an error")
 	assert.Empty(t, got)

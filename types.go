@@ -29,11 +29,11 @@ type GroupKind = storeapi.GroupKind
 // ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = storeapi.ObjectID
 
-// Ref identifies a related object reached through an edge — an owner, a
+// ObjectRef identifies a related object reached through an edge — an owner, a
 // dependency, or a dependent — carrying the GroupKind needed to address it. It
 // is a reference to the object, not the edge itself: the store's Edges* family
 // deals in edges, and every one of its queries returns this same shape.
-type Ref = storeapi.ObjectRef
+type ObjectRef = storeapi.ObjectRef
 
 // LoadSet is a bitset of secondary lookups (owner, dependencies, dependents,
 // owned) to fetch alongside an object. The zero value loads nothing; reads OR in the
@@ -79,11 +79,11 @@ type Object[Spec, Status any] struct {
 	// actually fetched, so the OwnersGet/DependenciesList/DependentsList/OwnedList
 	// accessors distinguish "loaded and empty" from "never asked". These fields are
 	// unexported; reach for the accessors, never the backing storage.
-	owner        *Ref    // the owning object, if any
-	dependencies []Ref   // objects this one depends on
-	dependents   []Ref   // objects that depend on this one
-	owned        []Ref   // objects this one owns
-	events       []Event // the object's event-log runs
+	owner        *ObjectRef  // the owning object, if any
+	dependencies []ObjectRef // objects this one depends on
+	dependents   []ObjectRef // objects that depend on this one
+	owned        []ObjectRef // objects this one owns
+	events       []Event     // the object's event-log runs
 	loaded       LoadSet
 }
 
@@ -96,12 +96,12 @@ var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
 // Owner returns the object's owner. It errors with ErrNotLoaded if LoadOwner()
 // was not passed to the read. Otherwise ok reports presence — false when the
 // object has no owner. (Use the lazy Client.Owner to fetch on demand instead.)
-func (o *Object[Spec, Status]) Owner() (Ref, bool, error) {
+func (o *Object[Spec, Status]) Owner() (ObjectRef, bool, error) {
 	if o.loaded&LoadOwnerBit == 0 {
-		return Ref{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
+		return ObjectRef{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
 	}
 	if o.owner == nil {
-		return Ref{}, false, nil
+		return ObjectRef{}, false, nil
 	}
 	return *o.owner, true, nil
 }
@@ -109,7 +109,7 @@ func (o *Object[Spec, Status]) Owner() (Ref, bool, error) {
 // Dependencies returns the objects this one depends on, or ErrNotLoaded if
 // LoadDependencies() was not passed to the read. A loaded-but-empty result is an
 // empty slice with a nil error.
-func (o *Object[Spec, Status]) Dependencies() ([]Ref, error) {
+func (o *Object[Spec, Status]) Dependencies() ([]ObjectRef, error) {
 	if o.loaded&LoadDependenciesBit == 0 {
 		return nil, fmt.Errorf("%w: dependencies (pass LoadDependencies())", ErrNotLoaded)
 	}
@@ -118,7 +118,7 @@ func (o *Object[Spec, Status]) Dependencies() ([]Ref, error) {
 
 // Dependents returns the objects that depend on this one, or ErrNotLoaded if
 // LoadDependents() was not passed to the read.
-func (o *Object[Spec, Status]) Dependents() ([]Ref, error) {
+func (o *Object[Spec, Status]) Dependents() ([]ObjectRef, error) {
 	if o.loaded&LoadDependentsBit == 0 {
 		return nil, fmt.Errorf("%w: dependents (pass LoadDependents())", ErrNotLoaded)
 	}
@@ -128,7 +128,7 @@ func (o *Object[Spec, Status]) Dependents() ([]Ref, error) {
 // Owned returns the objects this one owns (its incoming owned_by edges), or
 // ErrNotLoaded if LoadOwned() was not passed to the read. A loaded-but-empty
 // result is an empty slice with a nil error.
-func (o *Object[Spec, Status]) Owned() ([]Ref, error) {
+func (o *Object[Spec, Status]) Owned() ([]ObjectRef, error) {
 	if o.loaded&LoadOwnedBit == 0 {
 		return nil, fmt.Errorf("%w: owned (pass LoadOwned())", ErrNotLoaded)
 	}

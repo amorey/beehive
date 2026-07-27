@@ -629,14 +629,14 @@ type blockingDepsStore struct {
 	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
 }
 
-func (s *blockingDepsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Ref, error) {
+func (s *blockingDepsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
 	s.entered <- struct{}{}
 	<-s.release
 	// One referrer for an unregistered kind: enough to make the waker re-enter
 	// bh.mu via enqueueIfRegistered (the registration check happens after Lock).
-	out := map[ObjectID][]Ref{}
+	out := map[ObjectID][]ObjectRef{}
 	for _, id := range toIDs {
-		out[id] = []Ref{{ID: 1, Kind: "Widget"}}
+		out[id] = []ObjectRef{{ID: 1, Kind: "Widget"}}
 	}
 	return out, nil
 }
@@ -693,7 +693,7 @@ type recordingDepsStore struct {
 	calls chan ObjectID
 }
 
-func (s *recordingDepsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Ref, error) {
+func (s *recordingDepsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
 	for _, id := range toIDs {
 		s.calls <- id
 	}
@@ -752,15 +752,15 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 // one query rather than one per target.
 type depsStore struct {
 	fakeStore
-	deps  map[ObjectID][]Ref
+	deps  map[ObjectID][]ObjectRef
 	calls atomic.Int64
 	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Ref, error) {
+func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
 	s.calls.Add(1)
 	s.seen = append(s.seen, slices.Clone(toIDs))
-	out := make(map[ObjectID][]Ref, len(toIDs))
+	out := make(map[ObjectID][]ObjectRef, len(toIDs))
 	for _, id := range toIDs {
 		if deps, ok := s.deps[id]; ok {
 			out[id] = deps
@@ -774,7 +774,7 @@ func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, 
 // work queue, so a caller can assert which kind's queue a wake landed in.
 // newWorkQueue leaves onSchedule nil, so nothing reaches the reconcilers' unset
 // scheduleHub.
-func wakerFixture(deps map[ObjectID][]Ref, kinds ...GroupKind) (*Beehive, *depsStore, map[GroupKind]*reconciler) {
+func wakerFixture(deps map[ObjectID][]ObjectRef, kinds ...GroupKind) (*Beehive, *depsStore, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	for _, gk := range kinds {
 		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
@@ -801,7 +801,7 @@ func changed(ids ...ObjectID) []ObjectWrite {
 // TODO.md covers the shape this guard does not fix.
 func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, _, rs := wakerFixture(map[ObjectID][]Ref{1: {{ID: 1, Kind: "Widget"}}}, gk)
+	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
 	bh.dependentsWake(context.Background(), changed(1))
 
@@ -818,12 +818,12 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	widget := GroupKind{Kind: "Widget"}
 	gadget := GroupKind{Kind: "Gadget"}
 	// The self-edge is first: a return guard drops the two behind it.
-	deps := []Ref{
+	deps := []ObjectRef{
 		{ID: 1, Kind: "Widget"},
 		{ID: 2, Kind: "Widget"},
 		{ID: 3, Kind: "Gadget"},
 	}
-	bh, _, rs := wakerFixture(map[ObjectID][]Ref{1: deps}, widget, gadget)
+	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: deps}, widget, gadget)
 
 	bh.dependentsWake(context.Background(), changed(1))
 
@@ -845,11 +845,11 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
-	bhA, _, rsA := wakerFixture(map[ObjectID][]Ref{1: {{ID: 2, Kind: "Widget"}}}, gk)
+	bhA, _, rsA := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 2, Kind: "Widget"}}}, gk)
 	bhA.dependentsWake(context.Background(), changed(1))
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
-	bhB, _, rsB := wakerFixture(map[ObjectID][]Ref{2: {{ID: 1, Kind: "Widget"}}}, gk)
+	bhB, _, rsB := wakerFixture(map[ObjectID][]ObjectRef{2: {{ID: 1, Kind: "Widget"}}}, gk)
 	bhB.dependentsWake(context.Background(), changed(2))
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
@@ -906,7 +906,7 @@ func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], ob
 // errDepsStore returns an error from the edges lookup.
 type errDepsStore struct{ fakeStore }
 
-func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
+func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
 
@@ -3196,7 +3196,7 @@ func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
 // per-change is what keeps a hot kind from taxing them.
 func TestWakeDependentsBatchOneQuery(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, store, rs := wakerFixture(map[ObjectID][]Ref{
+	bh, store, rs := wakerFixture(map[ObjectID][]ObjectRef{
 		1: {{ID: 10, Kind: "Widget"}},
 		2: {{ID: 20, Kind: "Widget"}},
 		3: {{ID: 30, Kind: "Widget"}},
@@ -3214,7 +3214,7 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 // single connection, and a repeated dependent is a wasted reconcile.
 func TestWakeDependentsBatchDedups(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, store, rs := wakerFixture(map[ObjectID][]Ref{
+	bh, store, rs := wakerFixture(map[ObjectID][]ObjectRef{
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
@@ -3231,7 +3231,7 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 // by 1's change while being skipped for its own.
 func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, _, rs := wakerFixture(map[ObjectID][]Ref{
+	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{
 		1: {{ID: 2, Kind: "Widget"}},
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)

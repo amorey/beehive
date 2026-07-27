@@ -1928,7 +1928,7 @@ func TestClientGetOwner(t *testing.T) {
 	got, ok, err := client.OwnersGet(ctx, child.ID)
 	require.NoError(t, err)
 	assert.True(t, ok)
-	assert.Equal(t, Ref{ID: owner.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}, got)
+	assert.Equal(t, ObjectRef{ID: owner.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}, got)
 
 	// An ownerless object reports absence, not an error.
 	_, ok, err = client.OwnersGet(ctx, owner.ID)
@@ -1963,13 +1963,13 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 
 	dependents, err := client.DependentsList(ctx, a.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents), "a self-dependency is still a dependency")
+	assert.Equal(t, []ObjectID{a.ID}, objectRefIDs(dependents), "a self-dependency is still a dependency")
 
 	got, err := client.Get(ctx, a.ID, LoadDependents())
 	require.NoError(t, err)
 	loaded, err := got.Dependents()
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(loaded), "and the eager load sees it too")
+	assert.Equal(t, []ObjectID{a.ID}, objectRefIDs(loaded), "and the eager load sees it too")
 }
 
 func TestClientListDependenciesAndDependents(t *testing.T) {
@@ -1992,12 +1992,12 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 
 	deps, err := client.DependenciesList(ctx, a.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{b.ID, c.ID}, refObjectIDs(deps))
+	assert.Equal(t, []ObjectID{b.ID, c.ID}, objectRefIDs(deps))
 
 	// b's dependents include a.
 	dependents, err := client.DependentsList(ctx, b.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
+	assert.Equal(t, []ObjectID{a.ID}, objectRefIDs(dependents))
 
 	// No edges -> empty, no error.
 	none, err := client.DependenciesList(ctx, b.ID)
@@ -2021,7 +2021,7 @@ func TestClientListOwned(t *testing.T) {
 
 	owned, err := client.OwnedList(ctx, owner.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{c1.ID, c2.ID}, refObjectIDs(owned))
+	assert.Equal(t, []ObjectID{c1.ID, c2.ID}, objectRefIDs(owned))
 
 	// A child owns nothing -> empty, no error.
 	none, err := client.OwnedList(ctx, c1.ID)
@@ -2183,7 +2183,7 @@ func (s *ownedObjectsLoadErrorStore) ObjectsListByIncomingEdge(context.Context, 
 	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
 }
 
-func (*ownedObjectsLoadErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
+func (*ownedObjectsLoadErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
 
@@ -2242,12 +2242,12 @@ type countingStore struct {
 	incomingByIDs int
 }
 
-func (s *countingStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Ref, error) {
+func (s *countingStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	s.outgoingByIDs++
 	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
 }
 
-func (s *countingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Ref, error) {
+func (s *countingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	s.incomingByIDs++
 	return s.Store.EdgesGroupIncomingByID(ctx, ids, rel)
 }
@@ -2311,7 +2311,7 @@ func TestClientLoadsOwned(t *testing.T) {
 	require.NoError(t, err)
 	owned, err := got.Owned()
 	require.NoError(t, err)
-	assert.Equal(t, childIDs, refObjectIDs(owned))
+	assert.Equal(t, childIDs, objectRefIDs(owned))
 
 	// A child owns nothing: loaded but empty.
 	leaf, err := client.Get(ctx, childIDs[0], LoadOwned())
@@ -2330,7 +2330,7 @@ func TestClientLoadsOwned(t *testing.T) {
 	}
 	owned, err = byID[owner.ID].Owned()
 	require.NoError(t, err)
-	assert.Equal(t, childIDs, refObjectIDs(owned))
+	assert.Equal(t, childIDs, objectRefIDs(owned))
 	assert.Equal(t, 1, store.incomingByIDs, "owned load batched into one store call, not N")
 }
 
@@ -2351,7 +2351,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	deps, err := got.Dependencies()
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
+	assert.Equal(t, []ObjectID{b.ID}, objectRefIDs(deps))
 	dependents, err := got.Dependents()
 	require.NoError(t, err, "loaded even though empty")
 	assert.Empty(t, dependents)
@@ -2360,7 +2360,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	dependents, err = got.Dependents()
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
+	assert.Equal(t, []ObjectID{a.ID}, objectRefIDs(dependents))
 }
 
 func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
@@ -2385,10 +2385,10 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 
 	deps, err := byID[a.ID].Dependencies()
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
+	assert.Equal(t, []ObjectID{b.ID}, objectRefIDs(deps))
 	dependents, err := byID[b.ID].Dependents()
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
+	assert.Equal(t, []ObjectID{a.ID}, objectRefIDs(dependents))
 
 	assert.Equal(t, 1, store.outgoingByIDs, "dependencies batched into one call")
 	assert.Equal(t, 1, store.incomingByIDs, "dependents batched into one call")
@@ -2400,16 +2400,16 @@ type edgeErrorStore struct {
 	Store
 }
 
-func (edgeErrorStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]Ref, error) {
+func (edgeErrorStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]ObjectRef, error) {
 	return nil, errBoom
 }
-func (edgeErrorStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]Ref, error) {
+func (edgeErrorStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]ObjectRef, error) {
 	return nil, errBoom
 }
-func (edgeErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
+func (edgeErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
-func (edgeErrorStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
+func (edgeErrorStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
 

@@ -94,18 +94,19 @@ Four judgment calls worth recording, since each has a defensible other answer:
   is what is being deleted, not the actor. `From` keeps the sense of "derived from an
   owner id" and answers the question `CreateOwned` leaves open, whether the owner
   itself gets a request. It does not.
-- **`Edges*` for the family, `Ref` for the value.** These were both "ref": the store
-  family `Refs*` meant rows in the `refs` table, while the type it returned was
+- **`Edges*` for the family, `ObjectRef` for the value.** These were both "ref": the
+  store family `Refs*` meant rows in the `refs` table, while the type it returned was
   `Referrer`, aliased publicly as `Ref`. But that type is `{ID, Group, Kind}` — no
   from, no to, no relation — so it cannot express an edge, and `Referrer` was wrong
   about direction besides: `EdgesListOutgoing` returns the objects pointed *at*, and
   `DeletionRequestsList` returns objects with no edge in the picture at all. So the
-  value became `ObjectRef` (public `Ref`) — a reference to an object, the same shape
-  Kubernetes calls a reference — and the family became `Edges*`, which is what it
-  always operated on. `Ref` keeps the short public name because it is the one users
-  see, on `Owner()`/`Dependencies()`/`Dependents()`/`Owned()`. The table itself was
-  renamed `refs` → `edges` in `0001_init.sql` rather than migrated: nothing has
-  shipped, so there is no deployed database to carry the old name forward.
+  value became `ObjectRef` — a reference to an object, the same shape Kubernetes calls
+  a reference — and the family became `Edges*`, which is what it always operated on.
+  The short public alias `Ref` went with them rather than surviving as a synonym: one
+  type wants one name, and every other alias in the package (`GroupKind`, `ObjectID`,
+  `Relation`, the subscriptions) already re-exports the internal name unchanged. The
+  table itself was renamed `refs` → `edges` in `0001_init.sql` rather than migrated:
+  nothing has shipped, so there is no deployed database to carry the old name forward.
 
 Left undone: `EventsSubscription` still carries a bare `Event`, so a consumer cannot
 tell a new run from a count-bump on an existing one — the one place a log does face

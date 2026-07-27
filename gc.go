@@ -23,7 +23,7 @@ import "context"
 // ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
 // runs on one goroutine, so the slice needs no locking.
 type pendingWakes struct {
-	targets []Ref
+	targets []ObjectRef
 }
 
 type pendingWakesKey struct{}
@@ -63,7 +63,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 	// cascaded children, plus (when the row is removed) the targets it was holding
 	// open. Waking post-commit means a rollback never leaves a phantom enqueue,
 	// matching the dependency waker's post-commit pattern.
-	var toWake []Ref
+	var toWake []ObjectRef
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
 		obj, err := bh.store.ObjectsGetMeta(ctx, id)
 		if err != nil {

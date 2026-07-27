@@ -106,9 +106,9 @@ type ControllerClient[Status any] interface {
 	DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
 	DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
 	// DependenciesList returns the objects id depends on (outgoing depends_on).
-	DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error)
+	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// DependentsList returns the objects that depend on id (incoming depends_on).
-	DependentsList(ctx context.Context, id ObjectID) ([]Ref, error)
+	DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// EventsRecord appends an observation to id's event log, aggregating into
 	// contiguous runs (see EventSpec). Like the other writes it is kind-folded and
 	// composes in Within, so a controller can record an event and update a
@@ -116,11 +116,11 @@ type ControllerClient[Status any] interface {
 	EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error
 	FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
 	// OwnedList returns the objects id owns (its incoming owned_by edges).
-	OwnedList(ctx context.Context, id ObjectID) ([]Ref, error)
+	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// OwnersGet returns id's owner, if any (its outgoing owned_by edge). ok reports
 	// presence: false with a nil error when the object has no owner. The lazy
 	// counterpart to a reconciler's LoadOwner default.
-	OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
+	OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
 	// EdgesHasIncoming reports whether any object with a live claim still points at id:
 	// an owned child, or a dependent that is not itself being deleted. A dependent
 	// that is itself finalizing is excluded — it's going away and no longer has a
@@ -292,7 +292,7 @@ func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, f
 			return err
 		}
 		if target.DeletionRequestedAt != nil {
-			wakes.targets = append(wakes.targets, Ref{ID: toID, Group: target.Group, Kind: target.Kind})
+			wakes.targets = append(wakes.targets, ObjectRef{ID: toID, Group: target.Group, Kind: target.Kind})
 		}
 		return nil
 	})
@@ -305,19 +305,19 @@ func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, f
 // OwnersGet/DependenciesList/DependentsList/OwnedList read ref edges directly,
 // like EdgesHasIncoming above — no kind-scoping, since a controller reasons about
 // its own object's relationships.
-func (c *controllerClientImpl[Status]) OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error) {
+func (c *controllerClientImpl[Status]) OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
-func (c *controllerClientImpl[Status]) DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *controllerClientImpl[Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
 	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) DependentsList(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *controllerClientImpl[Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
 	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) OwnedList(ctx context.Context, id ObjectID) ([]Ref, error) {
+func (c *controllerClientImpl[Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
 	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
 }
 

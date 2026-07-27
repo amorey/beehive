@@ -664,10 +664,10 @@ func TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete(t *testing.T) {
 // embedded collectFakeStore decide how that collect fails.
 type sweepFailStore struct {
 	collectFakeStore
-	rows []Ref
+	rows []ObjectRef
 }
 
-func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]Ref, error) {
+func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]ObjectRef, error) {
 	return s.rows, nil
 }
 
@@ -678,7 +678,7 @@ func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]Ref, error) {
 // benign race and not worth a warning on every sweep.
 func TestGCSweepLogsCollectFailure(t *testing.T) {
 	ctx := context.Background()
-	rows := []Ref{{ID: 7, Kind: "ClientOnly"}}
+	rows := []ObjectRef{{ID: 7, Kind: "ClientOnly"}}
 
 	t.Run("real error", func(t *testing.T) {
 		logger, buf := captureLogger(slog.LevelWarn)

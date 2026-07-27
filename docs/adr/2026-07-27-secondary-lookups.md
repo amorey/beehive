@@ -5,7 +5,7 @@
 
 ## Context
 
-Ref edges are read on request, never folded into the object's blob-bearing
+ObjectRef edges are read on request, never folded into the object's blob-bearing
 `SELECT` — a one-to-many join would re-send the spec/status JSON per edge.
 
 ## Decision: two paths, one set of loaders
@@ -54,9 +54,9 @@ all (they are bare nouns — `Owner()`, `Dependencies()`) while the `Client` /
 `ControllerClient` lazy lookups spell the same relations with one (`OwnersGet`,
 `DependenciesList`):
 
-- `Owner() (Ref, bool, error)` — bool = owner present, folding away ownerless;
+- `Owner() (ObjectRef, bool, error)` — bool = owner present, folding away ownerless;
   err = not loaded.
-- `Dependencies()` / `Dependents()` / `Owned() ([]Ref, error)` — loaded-empty is an
+- `Dependencies()` / `Dependents()` / `Owned() ([]ObjectRef, error)` — loaded-empty is an
   empty slice plus nil err; no bool, since not-loaded is an error now, not an empty.
 
 ## `Client.OwnedObjectsList` is the typed counterpart of `OwnedList`

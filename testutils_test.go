@@ -397,11 +397,11 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 	return err
 }
 
-// refObjectIDs projects a Ref/Ref slice to its ids, for assertions that care
+// objectRefIDs projects an ObjectRef slice to its ids, for assertions that care
 // which objects are on the far end of an edge rather than how they were reached.
-// Ref and Ref are both aliases of storeapi.ObjectRef, so one projection serves
-// the owner/dependency lookups and the incoming-ref lookups alike.
-func refObjectIDs(refs []Ref) []ObjectID {
+// One projection serves the owner/dependency lookups and the incoming-edge
+// lookups alike, since every Edges* query returns this same shape.
+func objectRefIDs(refs []ObjectRef) []ObjectID {
 	var ids []ObjectID
 	for _, r := range refs {
 		ids = append(ids, r.ID)
@@ -427,7 +427,7 @@ type wakeProbeStore struct {
 	looked   chan struct{} // one send per targetID depends_on lookup
 }
 
-func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]Ref, error) {
+func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error) {
 	refs, err := s.Store.EdgesListIncoming(ctx, toID, relation)
 	if toID == s.targetID {
 		s.note(relation)
@@ -438,7 +438,7 @@ func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, r
 // EdgesGroupIncomingByID is the waker's own lookup (it resolves a whole batch of
 // changed targets in one query), so the probe has to cover it too — otherwise a
 // test waiting on "the waker looked" would wait forever.
-func (s *wakeProbeStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Ref, error) {
+func (s *wakeProbeStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error) {
 	refs, err := s.Store.EdgesGroupIncomingByID(ctx, toIDs, relation)
 	if slices.Contains(toIDs, s.targetID) {
 		s.note(relation)

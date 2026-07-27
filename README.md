@@ -239,16 +239,16 @@ type Object[Spec, Status any] struct {
     // Load options) and reached through the accessors below — never as fields.
 }
 
-type Ref = storeapi.ObjectRef // { ID ObjectID; Group, Kind string }
+type ObjectRef = storeapi.ObjectRef // { ID ObjectID; Group, Kind string }
 ```
 
-The secondary-lookup data is filled only when the read asked for it. Read it through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty. These are bare accessors, with no verb to add: cardinality is in the return type, `(Ref, bool, error)` for the at-most-one owner against `([]Ref, error)` for the rest.
+The secondary-lookup data is filled only when the read asked for it. Read it through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty. These are bare accessors, with no verb to add: cardinality is in the return type, `(ObjectRef, bool, error)` for the at-most-one owner against `([]ObjectRef, error)` for the rest.
 
 ```go
-func (o *Object[Spec, Status]) Owner() (Ref, bool, error) // bool: an owner exists; err: not loaded
-func (o *Object[Spec, Status]) Dependencies() ([]Ref, error)
-func (o *Object[Spec, Status]) Dependents() ([]Ref, error)
-func (o *Object[Spec, Status]) Owned() ([]Ref, error)
+func (o *Object[Spec, Status]) Owner() (ObjectRef, bool, error) // bool: an owner exists; err: not loaded
+func (o *Object[Spec, Status]) Dependencies() ([]ObjectRef, error)
+func (o *Object[Spec, Status]) Dependents() ([]ObjectRef, error)
+func (o *Object[Spec, Status]) Owned() ([]ObjectRef, error)
 func (o *Object[Spec, Status]) Events() ([]Event, error)
 ```
 
@@ -303,10 +303,10 @@ type Client[Spec, Status any] interface {
     ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
-    OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
-    DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error)
-    DependentsList(ctx context.Context, id ObjectID) ([]Ref, error)
-    OwnedList(ctx context.Context, id ObjectID) ([]Ref, error)
+    OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
+    DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
     // The typed, kind-scoped form of OwnedList: this kind's decoded children.
     OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
 
@@ -427,7 +427,7 @@ An object's ref edges are fetched on request, two ways:
 
 `OwnedList` (and the eager `LoadOwned()` / `Object.Owned()`) is the inverse of `OwnersGet` over `owned_by`: it returns the objects a given owner owns, the same way `DependentsList` inverts `DependenciesList` over `depends_on`.
 
-`OwnedObjectsList(ownerID)` is its typed counterpart: where `OwnedList` returns untyped `Ref`s across *every* owned kind — leaving the caller to filter by `Kind` and `Get` each child through that kind's client — `OwnedObjectsList` returns the fully decoded `*Object[Spec, Status]` children of **this client's kind**, in one store query (the kind filter and the row read are folded into the edge semi-join, so there is no `Get` per child). Same ordering (by id) and same missing-owner behavior as `OwnedList`; deletion-pending children are included, so a caller that wants to skip them checks `DeletionRequestedAt` itself. It takes the same `LoadOption`s as `List`, batched the same way — without them the children carry nothing loaded and their accessors return `ErrNotLoaded`.
+`OwnedObjectsList(ownerID)` is its typed counterpart: where `OwnedList` returns untyped `ObjectRef`s across *every* owned kind — leaving the caller to filter by `Kind` and `Get` each child through that kind's client — `OwnedObjectsList` returns the fully decoded `*Object[Spec, Status]` children of **this client's kind**, in one store query (the kind filter and the row read are folded into the edge semi-join, so there is no `Get` per child). Same ordering (by id) and same missing-owner behavior as `OwnedList`; deletion-pending children are included, so a caller that wants to skip them checks `DeletionRequestedAt` itself. It takes the same `LoadOption`s as `List`, batched the same way — without them the children carry nothing loaded and their accessors return `ErrNotLoaded`.
 
 Both issue the same secondary query (edges are a separate indexed lookup, never joined into the object's blob-bearing `SELECT`); eager just attaches the result to the object and batches across a `List`.
 
@@ -474,10 +474,10 @@ type ControllerClient[Status any] interface {
     DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
     EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
     // Lazy secondary lookups, for reading an object's edges during reconcile.
-    OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
-    DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error)
-    DependentsList(ctx context.Context, id ObjectID) ([]Ref, error)
-    OwnedList(ctx context.Context, id ObjectID) ([]Ref, error)
+    OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
+    DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
