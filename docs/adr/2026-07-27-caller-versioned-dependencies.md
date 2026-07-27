@@ -93,10 +93,10 @@ and it points the residual failure the harmless way: a stamp with no edge is one
 spurious owed wake that drains back to 0, where an edge with no stamp is invisible
 forever.
 
-The stamp's own `WHERE … NOT EXISTS (SELECT 1 FROM refs …)` is the **sole**
-edge-new test — a probe straight down the refs primary key, which is the table
-itself since `refs` is `WITHOUT ROWID` (see
-[refs WITHOUT ROWID](2026-07-26-refs-without-rowid.md)) — no pre-read, and no
+The stamp's own `WHERE … NOT EXISTS (SELECT 1 FROM edges …)` is the **sole**
+edge-new test — a probe straight down the edges primary key, which is the table
+itself since `edges` is `WITHOUT ROWID` (see
+[edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)) — no pre-read, and no
 second derivation (the old `EdgesAddResult.Inserted`) left to fall out of agreement
 with it.
 

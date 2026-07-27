@@ -1947,7 +1947,7 @@ func TestClientGetOwner(t *testing.T) {
 // not the store's: filtering from_id = to_id out of EdgesListIncoming would also
 // suppress the wake, and would look like a tidier fix, but that call backs the
 // read API — so a self-dependency would silently vanish from DependentsList and
-// from the LoadDependents eager load. GC would not notice (it reads refs through
+// from the LoadDependents eager load. GC would not notice (it reads edges through
 // EdgesHasIncoming and EdgesDeleteFinalizingDependsOn, not this call), which is
 // what makes the mis-implementation quiet: only the read surface changes.
 func TestClientListDependentsIncludesSelfEdge(t *testing.T) {

@@ -225,7 +225,7 @@ type RawObject struct {
 	UpdatedAt   time.Time
 }
 
-// Relation is the kind of edge in the refs table. The schema's CHECK constraint
+// Relation is the kind of edge in the edges table. The schema's CHECK constraint
 // permits exactly these two values.
 type Relation string
 
@@ -558,7 +558,7 @@ type Store interface {
 	// see EdgesHasIncoming clear). owned_by always counts: the foreground cascade must
 	// wait for the owned child to be physically removed. GC pairs this with
 	// EdgesDeleteFinalizingDependsOn, which physically removes the ignored edges
-	// before ObjectsDelete so the refs RESTRICT is satisfied.
+	// before ObjectsDelete so the edges RESTRICT is satisfied.
 	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
 
 	// EdgesListIncoming returns every object pointing at toID through relation, ordered by

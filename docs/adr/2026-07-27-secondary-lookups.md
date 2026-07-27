@@ -85,12 +85,12 @@ fragment **once**, and the batched conditions read (`conditionsByIDs`, chunked u
 Re-running the predicate for the conditions half would be a skew bug, not a shared
 seam — the two statements aren't in one transaction, so a concurrent ref/object
 write between them could drop the conditions of a row already scanned. Keying off
-the ids also avoids paying the refs semi-join twice. An empty result skips the
+the ids also avoids paying the edges semi-join twice. An empty result skips the
 conditions round-trip.
 
 `ObjectsList` supplies the kind tail; `ObjectsListByIncomingEdge` a kind tail plus
-`o.id IN (SELECT from_id FROM refs …)` — a **semi-join, not a join**. Written as a
+`o.id IN (SELECT from_id FROM edges …)` — a **semi-join, not a join**. Written as a
 join, the planner drives from `idx_objects_kind` (which already satisfies
-`ORDER BY o.id`) and probes `refs` once per object *of the kind*; `IN (SELECT …)`
-lets `idx_refs_to` drive, so the work scales with the owner's children instead of
+`ORDER BY o.id`) and probes `edges` once per object *of the kind*; `IN (SELECT …)`
+lets `idx_edges_to` drive, so the work scales with the owner's children instead of
 the table.

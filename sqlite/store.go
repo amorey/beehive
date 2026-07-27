@@ -355,12 +355,12 @@ func (s *sqliteStore) ObjectsList(ctx context.Context, gk storeapi.GroupKind) ([
 // edges in the statement is what saves the caller a Get per child.
 //
 // The edge is a semi-join, not a join: written as a join the planner drives from
-// idx_objects_kind (which already delivers ORDER BY o.id) and probes refs once
-// per object *of the kind*. IN (SELECT …) lets idx_refs_to drive instead, so the
+// idx_objects_kind (which already delivers ORDER BY o.id) and probes edges once
+// per object *of the kind*. IN (SELECT …) lets idx_edges_to drive instead, so the
 // work scales with the owner's children rather than the whole table.
 func (s *sqliteStore) ObjectsListByIncomingEdge(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
 	return s.listObjectsWhere(ctx, `
-		WHERE o.id IN (SELECT from_id FROM refs WHERE to_id = ? AND relation = ?)
+		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
 		  AND o."group" = ? AND o.kind = ?`,
 		toID, string(relation), gk.Group, gk.Kind)
 }
@@ -414,7 +414,7 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 // predicate. The two statements are not in one transaction, so a re-run could
 // match a different set — a concurrent ref or object write between them would
 // silently drop the conditions of a row we are about to return. Keying off the
-// ids also avoids paying the predicate (a refs semi-join, for
+// ids also avoids paying the predicate (an edges semi-join, for
 // ObjectsListByIncomingEdge) twice. The list is chunked under the bound-parameter
 // limit (see idChunkSize).
 func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.ObjectID) (map[storeapi.ObjectID][]storeapi.Condition, error) {
@@ -1289,14 +1289,14 @@ func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk store
 }
 
 // DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children. One indexed
-// pass over the owned_by edge (idx_refs_to) reads each child's deletion state;
+// pass over the owned_by edge (idx_edges_to) reads each child's deletion state;
 // markForDeletion then stamps only those not already deleting. So a re-cascade over
 // an already-deleting subtree (the steady-state resync) is a lone SELECT — no
 // writes, no events. It returns every owned child for requeue, deleting or not.
 func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
-		FROM refs r JOIN objects o ON o.id = r.from_id
+		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?
 		ORDER BY o.id`, ownerID, string(storeapi.RelationOwnedBy))
 	if err != nil {
@@ -1415,7 +1415,7 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		}
 		// The durable wake stamp, on the same side of the insert as the rejection
 		// above and for the same reason. Its NOT EXISTS is the edge-new test, a probe
-		// straight down the refs primary key — which, refs being WITHOUT ROWID, is
+		// straight down the edges primary key — which, edges being WITHOUT ROWID, is
 		// the table itself, so it is one statement with no extra round-trip. And it
 		// is the *only* place edge-newness is decided, so there is no second
 		// derivation of it to fall out of agreement with.
@@ -1424,7 +1424,7 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 			res, err := s.conn(ctx).ExecContext(ctx, `
 				UPDATE objects SET pending_wake = pending_wake + 1
 				WHERE id = ? AND NOT EXISTS (
-					SELECT 1 FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?)`,
+					SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?)`,
 				fromID, fromID, toID, string(relation))
 			if err != nil {
 				return err
@@ -1438,7 +1438,7 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 			stamped = n > 0
 		}
 		if _, err := s.conn(ctx).ExecContext(ctx, `
-			INSERT INTO refs (from_id, to_id, relation) VALUES (?, ?, ?)
+			INSERT INTO edges (from_id, to_id, relation) VALUES (?, ?, ?)
 			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
 			fromID, toID, string(relation)); err != nil {
 			return err
@@ -1459,17 +1459,17 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 // silent no-op. Like EdgesAdd it bumps nothing and joins the ambient transaction.
 func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
-		`DELETE FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?`,
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		fromID, toID, string(relation))
 	return err
 }
 
-// EdgesListIncoming returns the objects pointing at toID through relation, joining refs
+// EdgesListIncoming returns the objects pointing at toID through relation, joining edges
 // to objects so each carries the GroupKind needed to route a requeue.
 func (s *sqliteStore) EdgesListIncoming(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.from_id
+		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?
 		ORDER BY o.id`, toID, string(relation))
 	if err != nil {
@@ -1494,7 +1494,7 @@ func (s *sqliteStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []storea
 var idChunkSize = 30000
 
 // edgesByIDs is the shared batched edge lookup behind EdgesGroupIncomingByID and
-// EdgesGroupOutgoingByID: it filters refs by routeCol IN (ids), joins objects on
+// EdgesGroupOutgoingByID: it filters edges by routeCol IN (ids), joins objects on
 // the opposite endpoint joinCol, and buckets each referrer under its routeCol
 // value. routeCol/joinCol are fixed internal column names (never user input), so
 // concatenating them is injection-safe. The id list is chunked under the bound-
@@ -1524,7 +1524,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 	args = append(args, string(relation))
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT r.`+routeCol+`, o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.`+joinCol+`
+		FROM edges r JOIN objects o ON o.id = r.`+joinCol+`
 		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
 		ORDER BY r.`+routeCol+`, o.id`, args...)
 	if err != nil {
@@ -1547,7 +1547,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.to_id
+		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ?
 		ORDER BY o.id`, fromID)
 	if err != nil {
@@ -1563,7 +1563,7 @@ func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.Obj
 func (s *sqliteStore) EdgesListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
-		FROM refs r JOIN objects o ON o.id = r.to_id
+		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ? AND r.relation = ?
 		ORDER BY o.id`, fromID, string(relation))
 	if err != nil {
@@ -1602,7 +1602,7 @@ func scanObjectRefs(rows *sql.Rows) ([]storeapi.ObjectRef, error) {
 // EdgesDelete it bumps no version and emits no event.
 func (s *sqliteStore) EdgesDeleteFinalizingDependsOn(ctx context.Context, toID storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
-		DELETE FROM refs
+		DELETE FROM edges
 		WHERE to_id = ? AND relation = ?
 		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
 		toID, string(storeapi.RelationDependsOn))
@@ -1620,7 +1620,7 @@ func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID
 	var exists int
 	err := s.conn(ctx).QueryRowContext(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM refs r
+			SELECT 1 FROM edges r
 			WHERE r.to_id = ?
 			  AND NOT (r.relation = ? AND r.from_id IN
 			           (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,

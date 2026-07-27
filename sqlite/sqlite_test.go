@@ -32,7 +32,7 @@ func TestOpen(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
-	for _, table := range []string{"objects", "conditions", "refs", "resource_version_seq", "schema_migrations"} {
+	for _, table := range []string{"objects", "conditions", "edges", "resource_version_seq", "schema_migrations"} {
 		assert.True(t, tableExists(t, store.db, table), "table %q should exist after migration", table)
 	}
 }
@@ -44,7 +44,7 @@ func TestOpenMemoryAppliesMigrations(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
-	for _, table := range []string{"objects", "conditions", "refs", "resource_version_seq", "schema_migrations"} {
+	for _, table := range []string{"objects", "conditions", "edges", "resource_version_seq", "schema_migrations"} {
 		assert.True(t, tableExists(t, store.db, table), "table %q should exist after migration", table)
 	}
 }

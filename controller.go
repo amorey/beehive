@@ -276,7 +276,7 @@ func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, f
 		if err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn); err != nil {
 			return err
 		}
-		// Removing the edge can unblock toID's physical deletion (refs are RESTRICT).
+		// Removing the edge can unblock toID's physical deletion (edges are RESTRICT).
 		// If toID is finalizing, register it for a post-commit re-check so GC removes
 		// it without waiting on the resync backstop (which may be disabled). Outside a
 		// reconcile there's no collector — nothing to schedule.

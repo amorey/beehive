@@ -253,18 +253,18 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, gone, "unfinalized object collected")
 
-	_, err = client.Get(ctx, obj.ID) // no finalizers, no refs: physically gone
+	_, err = client.Get(ctx, obj.ID) // no finalizers, no edges: physically gone
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
 // TestCollectDeletesSelfDependentObject pins the deadlock collect names the self
-// case for: a self-dependency is its own referrer, so refs' ON DELETE RESTRICT
+// case for: a self-dependency is its own referrer, so edges' ON DELETE RESTRICT
 // would pin the row forever if EdgesDeleteFinalizingDependsOn did not drop the
 // edge first. Verified by mutation — excluding from_id = to_id there leaves the
 // object undeletable.
 //
 // It is deliberately *not* the twin of TestClientListDependentsIncludesSelfEdge:
-// collect reads refs through EdgesHasIncoming and EdgesDeleteFinalizingDependsOn,
+// collect reads edges through EdgesHasIncoming and EdgesDeleteFinalizingDependsOn,
 // never EdgesListIncoming, so a self-edge filtered out of that call would leave
 // this path untouched. The two tests cover different consumers, not two halves of
 // one mistake.

@@ -50,7 +50,7 @@ func pendingWakesFrom(ctx context.Context) *pendingWakes {
 //   - Cascade: every object that owns_by this one is itself marked for deletion
 //     and requeued, so deleting an owner tears its children down with it.
 //   - Physical delete: once the object has no finalizers left AND nothing still
-//     references it, its row is removed. The refs table's ON DELETE RESTRICT
+//     references it, its row is removed. The edges table's ON DELETE RESTRICT
 //     makes that ordering mandatory — an owner cannot be removed while a child
 //     still points at it — and ON DELETE CASCADE on the child side means
 //     removing the last child drops the edge that was blocking the owner. The

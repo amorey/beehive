@@ -547,7 +547,7 @@ func WithMigrator(m Migrator) Option               // attach a schema-version Mi
 func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring + optional age bound (0 = no age bound)
 ```
 
-`WithOwner` sets an `owned_by` edge in `refs` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
+`WithOwner` sets an `owned_by` edge in `edges` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
 
 `WithOnCreate` is the commit-safe channel for a create-conditional side effect (an external call, an in-memory counter). It is registered on the same post-commit path as the reconciler wake, so it runs once after the *outermost* commit and never on a rollback. `Create` always fires it; `GetOrCreate` fires it only on the create branch, not when it returns an existing row. Prefer it over branching on `GetOrCreate`'s returned `created` bool: that bool is synchronous, so inside a caller's `ControllerClient.Within` it is set before the enclosing transaction commits, and acting on it there fires the side effect for a row a later rollback would discard.
 

@@ -1385,9 +1385,9 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	assert.Equal(t, b1.ResourceVersion, b2.ResourceVersion)
 }
 
-// DeletionRequestsCreateFromOwner's child lookup must ride the idx_refs_to index, not scan
-// the refs table — that index alignment is the point of the single-query cascade.
-// COVERING is asserted too: refs is WITHOUT ROWID, so idx_refs_to implicitly
+// DeletionRequestsCreateFromOwner's child lookup must ride the idx_edges_to index, not scan
+// the edges table — that index alignment is the point of the single-query cascade.
+// COVERING is asserted too: edges is WITHOUT ROWID, so idx_edges_to implicitly
 // carries from_id and the probe never touches the table. That property lives in
 // the table's storage class, not the index definition, so dropping WITHOUT ROWID
 // would give it back with nothing in the schema looking different — this is the
@@ -1399,7 +1399,7 @@ func TestDeletionRequestsCreateFromOwnerUsesRefsIndex(t *testing.T) {
 	rows, err := store.db.QueryContext(ctx, `
 		EXPLAIN QUERY PLAN
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
-		FROM refs r JOIN objects o ON o.id = r.from_id
+		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?
 		ORDER BY o.id`, int64(1), string(storeapi.RelationOwnedBy))
 	require.NoError(t, err)
@@ -1413,8 +1413,8 @@ func TestDeletionRequestsCreateFromOwnerUsesRefsIndex(t *testing.T) {
 		plan += detail + "\n"
 	}
 	require.NoError(t, rows.Err())
-	assert.Contains(t, plan, "COVERING INDEX idx_refs_to",
-		"child lookup must use idx_refs_to as a covering index:\n"+plan)
+	assert.Contains(t, plan, "COVERING INDEX idx_edges_to",
+		"child lookup must use idx_edges_to as a covering index:\n"+plan)
 }
 
 func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
@@ -2197,12 +2197,12 @@ func refIDs(refs []beehive.Ref) []beehive.ObjectID {
 	return ids
 }
 
-// countEdges reads the refs table directly to assert edge presence.
+// countEdges reads the edges table directly to assert edge presence.
 func countEdges(t *testing.T, store *sqliteStore, from, to beehive.ObjectID, relation string) int {
 	t.Helper()
 	var n int
 	require.NoError(t, store.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM refs WHERE from_id = ? AND to_id = ? AND relation = ?`,
+		`SELECT COUNT(*) FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		from, to, relation).Scan(&n))
 	return n
 }
@@ -2381,7 +2381,7 @@ func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	stale := b.ResourceVersion
 	moveTarget(t, store, b.ID)
 	// The stamp is the only UPDATE on objects EdgesAdd issues, so blocking those
-	// fails it while leaving the endpoint read and the refs insert alone. RAISE(ABORT)
+	// fails it while leaving the endpoint read and the edges insert alone. RAISE(ABORT)
 	// undoes the statement, not the transaction, so the outer transaction below is
 	// still committable — exactly the failure band where ordering, rather than
 	// rollback, is what protects the caller.
@@ -2419,7 +2419,7 @@ func TestRefsAddEdgeFailureLeavesStamp(t *testing.T) {
 	b := newRefObject(t, store)
 	stale := b.ResourceVersion
 	moveTarget(t, store, b.ID)
-	blockRefInserts(t, store)
+	blockEdgeInserts(t, store)
 
 	err := store.Within(ctx, func(ctx context.Context) error {
 		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
@@ -2609,14 +2609,14 @@ func TestRefsAddEndpointReadDBError(t *testing.T) {
 }
 
 // TestRefsAddInsertDBError covers the insert failing after the endpoint
-// read succeeded: the refs table is gone, so both endpoints resolve and only the
+// read succeeded: the edges table is gone, so both endpoints resolve and only the
 // write fails.
 func TestRefsAddInsertDBError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
-	_, err := store.db.ExecContext(ctx, `DROP TABLE refs`)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE edges`)
 	require.NoError(t, err)
 
 	_, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
@@ -3168,12 +3168,12 @@ func blockObjectUpdates(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
-// blockRefInserts makes every INSERT into refs abort while leaving the endpoint
+// blockEdgeInserts makes every INSERT into edges abort while leaving the endpoint
 // read and the stamp UPDATE alone, isolating EdgesAdd's final statement.
-func blockRefInserts(t *testing.T, store *sqliteStore) {
+func blockEdgeInserts(t *testing.T, store *sqliteStore) {
 	t.Helper()
 	_, err := store.db.ExecContext(context.Background(), `
-		CREATE TRIGGER block_ref_inserts BEFORE INSERT ON refs
+		CREATE TRIGGER block_edge_inserts BEFORE INSERT ON edges
 		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
 	require.NoError(t, err)
 }

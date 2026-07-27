@@ -620,12 +620,12 @@ func TestStartToleratesWatchError(t *testing.T) {
 	_ = stop(context.Background())
 }
 
-// blockingDepsStore parks the dependency waker inside its refs lookup — after it
+// blockingDepsStore parks the dependency waker inside its edges lookup — after it
 // has read a Modified event but before it re-enters Beehive's mutex via
 // enqueueIfRegistered — so a test can drive a precise interleaving with Stop.
 type blockingDepsStore struct {
 	watcherStore
-	entered chan struct{} // closed-by-send when the waker reaches the refs lookup
+	entered chan struct{} // closed-by-send when the waker reaches the edges lookup
 	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
 }
 
@@ -685,7 +685,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 	}
 }
 
-// recordingDepsStore reports the targets each refs lookup asks about on a channel and serves a preset
+// recordingDepsStore reports the targets each edges lookup asks about on a channel and serves a preset
 // watcher (via the embedded watcherStore), so a test can observe exactly which
 // events drive a wake.
 type recordingDepsStore struct {
@@ -860,7 +860,7 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 // requeues the object through wakeAfterCommit, independently of any edge.
 //
 // It cannot detect a guard mis-implemented as a self-edge filter in
-// EdgesListIncoming — that path never consults refs, so this test stays green
+// EdgesListIncoming — that path never consults edges, so this test stays green
 // while the read API silently loses the edge. TestClientListDependentsIncludesSelfEdge
 // is what catches that; this one only pins the wake.
 func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
@@ -903,7 +903,7 @@ func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], ob
 	return Result{}, nil
 }
 
-// errDepsStore returns an error from the refs lookup.
+// errDepsStore returns an error from the edges lookup.
 type errDepsStore struct{ fakeStore }
 
 func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
@@ -3191,7 +3191,7 @@ func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
 }
 
 // TestWakeDependentsBatchOneQuery verifies a batch of changed targets resolves
-// in a single refs query. The store runs on one connection, so the waker's reads
+// in a single edges query. The store runs on one connection, so the waker's reads
 // serialize against every writer in the process — per-burst instead of
 // per-change is what keeps a hot kind from taxing them.
 func TestWakeDependentsBatchOneQuery(t *testing.T) {
@@ -3340,7 +3340,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 }
 
 // TestClientOnlyTargetDeletionUnwedges is the unrecoverable half of the defect.
-// refs.to_id is ON DELETE RESTRICT, so a target with dependents cannot be
+// edges.to_id is ON DELETE RESTRICT, so a target with dependents cannot be
 // physically removed: Delete sets the tombstone and emits Modified, and only the
 // dependents' own reconciles can drop the edge that blocks collection. With no
 // waker for the target's kind that Modified reaches nobody, so the row stays

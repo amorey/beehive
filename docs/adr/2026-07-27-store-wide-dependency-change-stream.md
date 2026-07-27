@@ -50,7 +50,7 @@ client-only target never learned its target moved, for the life of the store.
 
 ### The case no configuration recovered
 
-`refs.to_id` is `REFERENCES objects(id) ON DELETE RESTRICT`
+`edges.to_id` is `REFERENCES objects(id) ON DELETE RESTRICT`
 (`sqlite/migrations/0001_init.sql:152`), so a target with dependents cannot be
 physically removed. `Client.Delete` sets the tombstone and emits `Modified`; the
 row stays deletion-pending until every incoming edge is gone, and only a
@@ -117,7 +117,7 @@ client-side map cannot cheaply re-read, and a reconciler can and must.)
 
 ### The batch is drained at the receiver
 
-Wake resolution costs one refs lookup per changed target. Per-kind, that was one
+Wake resolution costs one edges lookup per changed target. Per-kind, that was one
 lookup per change on registered kinds; store-wide it would be one per change in
 the *store* — and the new load is precisely the high-write client-only kinds that
 motivate the change. The store is `SetMaxOpenConns(1)`, so those reads serialize
@@ -144,7 +144,7 @@ deletes for.
 
 `Start` skips the subscription entirely when `len(bh.order) == 0`. Every dependent
 would land on `enqueueIfRegistered`'s no-op arm, and the stream is not free — it
-would pay a refs query per change in the whole store to reach it.
+would pay a edges query per change in the whole store to reach it.
 
 ### Alternatives considered
 
@@ -182,7 +182,7 @@ target id so a kind's wakes stay ordered. Recorded in `TODO.md`; unbuilt.
 ### Two `Beehive`s on one store observe each other's kinds
 
 The restart tests use that shape. `enqueueIfRegistered` filters correctly, so it
-is sound — but it is paid for in refs queries.
+is sound — but it is paid for in edges queries.
 
 ### Delete-time state is unrecoverable
 

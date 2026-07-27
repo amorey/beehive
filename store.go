@@ -47,7 +47,7 @@ var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
 // write-side twin of the read path's refusal to decode data a newer build wrote.
 var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade
 
-// Relation is the kind of edge in the refs table.
+// Relation is the kind of edge in the edges table.
 type Relation = storeapi.Relation
 
 const (

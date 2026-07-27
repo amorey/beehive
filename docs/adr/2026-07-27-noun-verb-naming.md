@@ -103,9 +103,9 @@ Four judgment calls worth recording, since each has a defensible other answer:
   value became `ObjectRef` (public `Ref`) — a reference to an object, the same shape
   Kubernetes calls a reference — and the family became `Edges*`, which is what it
   always operated on. `Ref` keeps the short public name because it is the one users
-  see, on `Owner()`/`Dependencies()`/`Dependents()`/`Owned()`. The `refs` table keeps
-  its name; renaming it is a migration, not a rename, and the doc comments say which
-  table `Edges*` writes.
+  see, on `Owner()`/`Dependencies()`/`Dependents()`/`Owned()`. The table itself was
+  renamed `refs` → `edges` in `0001_init.sql` rather than migrated: nothing has
+  shipped, so there is no deployed database to carry the old name forward.
 
 Left undone: `EventsSubscription` still carries a bare `Event`, so a consumer cannot
 tell a new run from a count-bump on an existing one — the one place a log does face

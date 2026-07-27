@@ -315,7 +315,7 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 // dependent's own kind.
 //
 // With no registered controllers there is nothing to wake, and the stream is not
-// free: it would pay a refs query per change in the whole store only to reach
+// free: it would pay a edges query per change in the whole store only to reach
 // enqueueIfRegistered's no-op arm.
 func (bh *Beehive) dependencyWakerStart(runCtx context.Context) {
 	if len(bh.order) == 0 {
@@ -344,7 +344,7 @@ func (bh *Beehive) dependencyWakerStart(runCtx context.Context) {
 // cancelled or the stream ends. The stream is store-wide and established by
 // Start (events-only, no snapshot: the reconciler's own startup pass already
 // covers existing objects), and it arrives in batches — a burst of changes costs
-// one refs query rather than one per change. The ctx.Done() arm is needed
+// one edges query rather than one per change. The ctx.Done() arm is needed
 // because a watcher's channel may never close on its own.
 func (bh *Beehive) dependencyWakerRun(ctx context.Context, w *ObjectWritesSubscription) {
 	defer w.Close()
@@ -379,7 +379,7 @@ func (bh *Beehive) dependencyWakerRun(ctx context.Context, w *ObjectWritesSubscr
 // each in its own kind's reconciler. Over-eager wakes are harmless: unregistered
 // kinds are ignored and the work queue coalesces duplicates.
 //
-// It resolves the whole batch in one refs query, which is not merely an
+// It resolves the whole batch in one edges query, which is not merely an
 // optimization: the store runs on a single connection, so every lookup the waker
 // makes serializes against every writer in the process — and the waker sees every
 // change in the store, not just the registered kinds'. One query per burst rather

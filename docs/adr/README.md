@@ -21,7 +21,7 @@ a new record and mark the old one `Superseded by <file>`.
 
 ## Index
 
-- [refs WITHOUT ROWID](2026-07-26-refs-without-rowid.md)
+- [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [One store-wide change stream for the dependency waker](2026-07-27-store-wide-dependency-change-stream.md)
 - [Three independent periodic drivers](2026-07-27-periodic-reconcile-drivers.md)
 - [Dependency-wake failures escalate the catchup tick](2026-07-27-dependency-wake-escalation.md)

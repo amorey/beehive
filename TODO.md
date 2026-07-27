@@ -112,7 +112,7 @@ tell "we decided against this for now" from "nobody thought of it."
   **Two real fixes, in increasing order of scope.** The narrow one: the escalation
   exists solely to reach stale *dependents*, and an object with no outgoing
   `depends_on` edge cannot be one — so the escalated pass never needed to be a full
-  pass. `SELECT DISTINCT from_id FROM refs WHERE relation='depends_on'` (joined to
+  pass. `SELECT DISTINCT from_id FROM edges WHERE relation='depends_on'` (joined to
   the kind) scales with declared edges instead of table size, and wants the same
   `idx_refs_dependents` partial index `observed_cursor` does. That is a contained
   change that would close this item on its own. The broad one is
@@ -449,7 +449,7 @@ tell "we decided against this for now" from "nobody thought of it."
   `Register`. Changes to such a target reached no waker: not a dropped wake, none
   attempted, so nothing in healthy operation repaired it, and only
   `WithStartupResync` covered it — at the *next process start*. The sharper case
-  had no cover at all: `refs.to_id` is `ON DELETE RESTRICT`, so deleting such a
+  had no cover at all: `edges.to_id` is `ON DELETE RESTRICT`, so deleting such a
   target only sets a tombstone, and with no dependent woken to drop the edge the
   row stays deletion-pending while the GC sweeper retries it every tick, forever.
 
@@ -473,7 +473,7 @@ tell "we decided against this for now" from "nobody thought of it."
   What it does *not* fix, and what it costs. Both waker failure branches are now
   process-wide: one lost subscription or one ended stream kills dependency wakes
   for every kind. Two `Beehive`s on one store each observe the other's kinds —
-  filtered correctly, but paid for in refs queries. And **the single waker
+  filtered correctly, but paid for in edges queries. And **the single waker
   goroutine is a process-wide head-of-line block**: K independent wakers became
   one, so a slow `EdgesGroupIncomingByID` — which queues behind writers on the
   single connection — now delays wakes for *every* kind, where before it delayed
@@ -604,7 +604,7 @@ tell "we decided against this for now" from "nobody thought of it."
   covering, and already in id order, so the sort disappears too. Re-probed with
   5000 rows / 50 deletion-pending after `ANALYZE`. The only other consumer of the
   index — the `from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS
-  NOT NULL)` semi-join in the finalizing-refs cleanup — still plans identically,
+  NOT NULL)` semi-join in the finalizing-edges cleanup — still plans identically,
   since `id` leads the new key.
 
   The partial `WHERE` is what keeps the wider key cheap: only finalizing rows are
@@ -757,7 +757,7 @@ tell "we decided against this for now" from "nobody thought of it."
 
   Two things it deliberately does *not* do. It is a durable *wake*, not a derived
   backstop: it recovers only signals something explicitly raised, so a wake lost
-  because `dependentsWake` swallowed its refs-lookup error (see "Three silent
+  because `dependentsWake` swallowed its edges-lookup error (see "Three silent
   loss points" above) still heals never, and "resync is the correctness backstop"
   stays false in general. And it shares spec-convergence's coverage everywhere *but*
   the unconditional startup/tick enqueue — which is why it works under
@@ -777,7 +777,7 @@ tell "we decided against this for now" from "nobody thought of it."
   `pending_wake`. It costs a write on every successful pass (vs only when something is
   owed) and over-flags (a target change during a pass costs an extra tick even when
   the read was late enough), so it was not taken now; revisit it if the waker's silent
-  loss points are addressed. Storing the cursor **per-edge on `refs`** was rejected
+  loss points are addressed. Storing the cursor **per-edge on `edges`** was rejected
   outright: advanced only on re-assert, a controller that declares an edge once and
   never re-asserts freezes its cursor and the backstop re-enqueues it every tick
   forever.
