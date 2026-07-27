@@ -68,7 +68,7 @@ func LoadOwned() LoadOption {
 	return func(s *LoadSet) { *s |= LoadOwnedBit }
 }
 
-// LoadEvents selects the object's event-log runs, read via Object.ListEvents().
+// LoadEvents selects the object's event-log runs, read via Object.Events().
 // It loads the object's current runs (bounded by retention); for filtered or
 // bounded reads use the lazy Client.ListEvents with EventOptions instead.
 func LoadEvents() LoadOption {

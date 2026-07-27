@@ -92,10 +92,10 @@ type Object[Spec, Status any] struct {
 // missing object, so it is kept distinct from a present-but-empty result.
 var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
 
-// GetOwner returns the object's owner. It errors with ErrNotLoaded if LoadOwner()
+// Owner returns the object's owner. It errors with ErrNotLoaded if LoadOwner()
 // was not passed to the read. Otherwise ok reports presence — false when the
-// object has no owner. (Use the lazy Client.GetOwner to fetch on demand instead.)
-func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) {
+// object has no owner. (Use the lazy Client.Owner to fetch on demand instead.)
+func (o *Object[Spec, Status]) Owner() (Ref, bool, error) {
 	if o.loaded&LoadOwnerBit == 0 {
 		return Ref{}, false, fmt.Errorf("%w: owner (pass LoadOwner())", ErrNotLoaded)
 	}
@@ -105,40 +105,40 @@ func (o *Object[Spec, Status]) GetOwner() (Ref, bool, error) {
 	return *o.owner, true, nil
 }
 
-// ListDependencies returns the objects this one depends on, or ErrNotLoaded if
+// Dependencies returns the objects this one depends on, or ErrNotLoaded if
 // LoadDependencies() was not passed to the read. A loaded-but-empty result is an
 // empty slice with a nil error.
-func (o *Object[Spec, Status]) ListDependencies() ([]Ref, error) {
+func (o *Object[Spec, Status]) Dependencies() ([]Ref, error) {
 	if o.loaded&LoadDependenciesBit == 0 {
 		return nil, fmt.Errorf("%w: dependencies (pass LoadDependencies())", ErrNotLoaded)
 	}
 	return o.dependencies, nil
 }
 
-// ListDependents returns the objects that depend on this one, or ErrNotLoaded if
+// Dependents returns the objects that depend on this one, or ErrNotLoaded if
 // LoadDependents() was not passed to the read.
-func (o *Object[Spec, Status]) ListDependents() ([]Ref, error) {
+func (o *Object[Spec, Status]) Dependents() ([]Ref, error) {
 	if o.loaded&LoadDependentsBit == 0 {
 		return nil, fmt.Errorf("%w: dependents (pass LoadDependents())", ErrNotLoaded)
 	}
 	return o.dependents, nil
 }
 
-// ListOwned returns the objects this one owns (its incoming owned_by edges), or
+// Owned returns the objects this one owns (its incoming owned_by edges), or
 // ErrNotLoaded if LoadOwned() was not passed to the read. A loaded-but-empty
 // result is an empty slice with a nil error.
-func (o *Object[Spec, Status]) ListOwned() ([]Ref, error) {
+func (o *Object[Spec, Status]) Owned() ([]Ref, error) {
 	if o.loaded&LoadOwnedBit == 0 {
 		return nil, fmt.Errorf("%w: owned (pass LoadOwned())", ErrNotLoaded)
 	}
 	return o.owned, nil
 }
 
-// ListEvents returns the object's event-log runs, newest-first, or ErrNotLoaded
+// Events returns the object's event-log runs, newest-first, or ErrNotLoaded
 // if LoadEvents() was not passed to the read. A loaded-but-empty log is an empty
-// slice with a nil error. (Use the lazy Client.ListEvents to fetch on demand, or
+// slice with a nil error. (Use the lazy Client.Events to fetch on demand, or
 // to filter/limit.)
-func (o *Object[Spec, Status]) ListEvents() ([]Event, error) {
+func (o *Object[Spec, Status]) Events() ([]Event, error) {
 	if o.loaded&LoadEventsBit == 0 {
 		return nil, fmt.Errorf("%w: events (pass LoadEvents())", ErrNotLoaded)
 	}

@@ -1967,7 +1967,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 
 	got, err := client.Get(ctx, a.ID, LoadDependents())
 	require.NoError(t, err)
-	loaded, err := got.ListDependents()
+	loaded, err := got.Dependents()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(loaded), "and the eager load sees it too")
 }
@@ -2076,14 +2076,14 @@ func TestClientListOwnedObjectsLoads(t *testing.T) {
 	bare, err := widgets.ListOwnedObjects(ctx, ownerID)
 	require.NoError(t, err)
 	require.Len(t, bare, 2)
-	_, _, err = bare[0].GetOwner()
+	_, _, err = bare[0].Owner()
 	assert.ErrorIs(t, err, ErrNotLoaded, "no load option -> nothing loaded")
 
 	got, err := widgets.ListOwnedObjects(ctx, ownerID, LoadOwner())
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	for _, child := range got {
-		owner, ok, err := child.GetOwner()
+		owner, ok, err := child.Owner()
 		require.NoError(t, err)
 		require.True(t, ok)
 		assert.Equal(t, ownerID, owner.ID)
@@ -2212,13 +2212,13 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	// Without the selector the owner is not loaded — accessing it errors.
 	plain, err := client.Get(ctx, child.ID)
 	require.NoError(t, err)
-	_, _, err = plain.GetOwner()
+	_, _, err = plain.Owner()
 	assert.ErrorIs(t, err, ErrNotLoaded, "owner not loaded without LoadOwner()")
 
 	// With it, the owner is populated in the same read.
 	got, err := client.Get(ctx, child.ID, LoadOwner())
 	require.NoError(t, err)
-	ref, ok, err := got.GetOwner()
+	ref, ok, err := got.Owner()
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, owner.ID, ref.ID)
@@ -2228,7 +2228,7 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	require.NoError(t, err)
 	bySlug, err := client.GetBySlug(ctx, "s1", LoadOwner())
 	require.NoError(t, err)
-	ref, ok, err = bySlug.GetOwner()
+	ref, ok, err = bySlug.Owner()
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, owner.ID, ref.ID)
@@ -2272,7 +2272,7 @@ func TestClientListWithLoadOwnerBatches(t *testing.T) {
 
 	var withOwner int
 	for _, o := range objs {
-		ref, ok, err := o.GetOwner()
+		ref, ok, err := o.Owner()
 		require.NoError(t, err)
 		if ok {
 			assert.Equal(t, owner.ID, ref.ID)
@@ -2303,20 +2303,20 @@ func TestClientLoadsOwned(t *testing.T) {
 	// Without the selector the owned set is not loaded — accessing it errors.
 	plain, err := client.Get(ctx, owner.ID)
 	require.NoError(t, err)
-	_, err = plain.ListOwned()
+	_, err = plain.Owned()
 	assert.ErrorIs(t, err, ErrNotLoaded, "owned not loaded without LoadOwned()")
 
 	// Single-object path populates the owner's children.
 	got, err := client.Get(ctx, owner.ID, LoadOwned())
 	require.NoError(t, err)
-	owned, err := got.ListOwned()
+	owned, err := got.Owned()
 	require.NoError(t, err)
 	assert.Equal(t, childIDs, refObjectIDs(owned))
 
 	// A child owns nothing: loaded but empty.
 	leaf, err := client.Get(ctx, childIDs[0], LoadOwned())
 	require.NoError(t, err)
-	owned, err = leaf.ListOwned()
+	owned, err = leaf.Owned()
 	require.NoError(t, err, "loaded even though empty")
 	assert.Empty(t, owned)
 
@@ -2328,7 +2328,7 @@ func TestClientLoadsOwned(t *testing.T) {
 	for _, o := range objs {
 		byID[o.ID] = o
 	}
-	owned, err = byID[owner.ID].ListOwned()
+	owned, err = byID[owner.ID].Owned()
 	require.NoError(t, err)
 	assert.Equal(t, childIDs, refObjectIDs(owned))
 	assert.Equal(t, 1, store.incomingByIDs, "owned load batched into one store call, not N")
@@ -2349,16 +2349,16 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 
 	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)
-	deps, err := got.ListDependencies()
+	deps, err := got.Dependencies()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
-	dependents, err := got.ListDependents()
+	dependents, err := got.Dependents()
 	require.NoError(t, err, "loaded even though empty")
 	assert.Empty(t, dependents)
 
 	got, err = client.Get(ctx, b.ID, LoadDependents())
 	require.NoError(t, err)
-	dependents, err = got.ListDependents()
+	dependents, err = got.Dependents()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
 }
@@ -2383,10 +2383,10 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 		byID[o.ID] = o
 	}
 
-	deps, err := byID[a.ID].ListDependencies()
+	deps, err := byID[a.ID].Dependencies()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{b.ID}, refObjectIDs(deps))
-	dependents, err := byID[b.ID].ListDependents()
+	dependents, err := byID[b.ID].Dependents()
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, refObjectIDs(dependents))
 
@@ -2893,7 +2893,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	assert.Equal(t, 4, latest.Count)
 }
 
-// Get(LoadEvents()) eager-loads the object's runs onto Object.ListEvents(); without
+// Get(LoadEvents()) eager-loads the object's runs onto Object.Events(); without
 // it the accessor reports ErrNotLoaded.
 func TestClientGetLoadsEvents(t *testing.T) {
 	ctx := context.Background()
@@ -2908,12 +2908,12 @@ func TestClientGetLoadsEvents(t *testing.T) {
 
 	plain, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
-	_, err = plain.ListEvents()
+	_, err = plain.Events()
 	assert.ErrorIs(t, err, ErrNotLoaded, "not loaded without LoadEvents()")
 
 	loaded, err := client.Get(ctx, obj.ID, LoadEvents())
 	require.NoError(t, err)
-	evs, err := loaded.ListEvents()
+	evs, err := loaded.Events()
 	require.NoError(t, err)
 	require.Len(t, evs, 1)
 	assert.Equal(t, "ProbeFailed", evs[0].Reason)
@@ -2941,7 +2941,7 @@ func TestClientListLoadsEvents(t *testing.T) {
 	require.NoError(t, err)
 	byReason := map[ObjectID]string{}
 	for _, o := range objs {
-		evs, err := o.ListEvents()
+		evs, err := o.Events()
 		require.NoError(t, err)
 		require.Len(t, evs, 1, "each object gets its own log")
 		byReason[o.ID] = evs[0].Reason

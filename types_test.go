@@ -29,13 +29,13 @@ func TestObjectGetOwner(t *testing.T) {
 
 	t.Run("not loaded errors", func(t *testing.T) {
 		var o Object[struct{}, struct{}]
-		_, _, err := o.GetOwner()
+		_, _, err := o.Owner()
 		assert.ErrorIs(t, err, ErrNotLoaded)
 	})
 
 	t.Run("loaded, no owner", func(t *testing.T) {
 		o := Object[struct{}, struct{}]{loaded: LoadOwnerBit}
-		got, ok, err := o.GetOwner()
+		got, ok, err := o.Owner()
 		require.NoError(t, err)
 		assert.False(t, ok, "loaded but ownerless is not present")
 		assert.Equal(t, Ref{}, got)
@@ -43,7 +43,7 @@ func TestObjectGetOwner(t *testing.T) {
 
 	t.Run("loaded with owner", func(t *testing.T) {
 		o := Object[struct{}, struct{}]{loaded: LoadOwnerBit, owner: &owner}
-		got, ok, err := o.GetOwner()
+		got, ok, err := o.Owner()
 		require.NoError(t, err)
 		assert.True(t, ok)
 		assert.Equal(t, owner, got)
@@ -57,20 +57,20 @@ func TestObjectListDependencies(t *testing.T) {
 
 	t.Run("not loaded errors", func(t *testing.T) {
 		var o Object[struct{}, struct{}]
-		_, err := o.ListDependencies()
+		_, err := o.Dependencies()
 		assert.ErrorIs(t, err, ErrNotLoaded)
 	})
 
 	t.Run("loaded, empty", func(t *testing.T) {
 		o := Object[struct{}, struct{}]{loaded: LoadDependenciesBit, dependencies: []Ref{}}
-		got, err := o.ListDependencies()
+		got, err := o.Dependencies()
 		require.NoError(t, err, "loaded-empty is not an error")
 		assert.Empty(t, got)
 	})
 
 	t.Run("loaded, non-empty", func(t *testing.T) {
 		o := Object[struct{}, struct{}]{loaded: LoadDependenciesBit, dependencies: deps}
-		got, err := o.ListDependencies()
+		got, err := o.Dependencies()
 		require.NoError(t, err)
 		assert.Equal(t, deps, got)
 	})
@@ -80,11 +80,11 @@ func TestObjectListDependents(t *testing.T) {
 	dependents := []Ref{{ID: 3}}
 
 	var unloaded Object[struct{}, struct{}]
-	_, err := unloaded.ListDependents()
+	_, err := unloaded.Dependents()
 	assert.ErrorIs(t, err, ErrNotLoaded)
 
 	o := Object[struct{}, struct{}]{loaded: LoadDependentsBit, dependents: dependents}
-	got, err := o.ListDependents()
+	got, err := o.Dependents()
 	require.NoError(t, err)
 	assert.Equal(t, dependents, got)
 }
@@ -93,16 +93,16 @@ func TestObjectListOwned(t *testing.T) {
 	owned := []Ref{{ID: 4}, {ID: 5}}
 
 	var unloaded Object[struct{}, struct{}]
-	_, err := unloaded.ListOwned()
+	_, err := unloaded.Owned()
 	assert.ErrorIs(t, err, ErrNotLoaded)
 
 	empty := Object[struct{}, struct{}]{loaded: LoadOwnedBit, owned: []Ref{}}
-	got, err := empty.ListOwned()
+	got, err := empty.Owned()
 	require.NoError(t, err, "loaded-empty is not an error")
 	assert.Empty(t, got)
 
 	o := Object[struct{}, struct{}]{loaded: LoadOwnedBit, owned: owned}
-	got, err = o.ListOwned()
+	got, err = o.Owned()
 	require.NoError(t, err)
 	assert.Equal(t, owned, got)
 }
@@ -114,20 +114,20 @@ func TestObjectListEvents(t *testing.T) {
 
 	t.Run("not loaded errors", func(t *testing.T) {
 		var o Object[struct{}, struct{}]
-		_, err := o.ListEvents()
+		_, err := o.Events()
 		assert.ErrorIs(t, err, ErrNotLoaded)
 	})
 
 	t.Run("loaded returns events", func(t *testing.T) {
 		o := Object[struct{}, struct{}]{loaded: LoadEventsBit, events: events}
-		got, err := o.ListEvents()
+		got, err := o.Events()
 		require.NoError(t, err)
 		assert.Equal(t, events, got)
 	})
 
 	t.Run("loaded but empty", func(t *testing.T) {
 		o := Object[struct{}, struct{}]{loaded: LoadEventsBit}
-		got, err := o.ListEvents()
+		got, err := o.Events()
 		require.NoError(t, err)
 		assert.Empty(t, got)
 	})
