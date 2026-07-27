@@ -346,8 +346,11 @@ func newSignal() *signal {
 }
 
 // fire signals, whether or not the test is waiting yet: the value is held in the
-// slot until wait takes it. Repeat calls are no-ops.
-func (s *signal) fire() { _ = s.tx.Send(struct{}{}) }
+// slot until wait takes it. Repeat calls are no-ops, and the returned bool says
+// which call this was — true only for the one that signalled, so a callback that
+// also has first-time-only work to do can gate it on that instead of on a
+// sync.Once of its own.
+func (s *signal) fire() bool { return s.tx.Send(struct{}{}) == nil }
 
 // wait blocks until fire has run, failing the test after the failsafe timeout.
 // The receiver's channel yields the value and is then closed, so a second wait

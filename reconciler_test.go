@@ -357,17 +357,15 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &dependentController{observed: make(chan bool, 8)}
-	var once sync.Once
-	readDone := make(chan struct{}) // closed once the first pass has read the target
-	proceed := make(chan struct{})  // closed by the test after it changes the target
+	readDone := newSignal()        // fires once the first pass has read the target
+	proceed := make(chan struct{}) // closed by the test after it changes the target
 	ctrl.afterRead = func(ctx context.Context, cc ControllerClient[tStatus], target *Object[tSpec, tStatus]) error {
 		// First pass only: park between the read and the declaration so the test can
 		// land its change to the target inside the window. Later passes declare
 		// straight through, as a level-triggered controller re-asserting its edges.
-		once.Do(func() {
-			close(readDone)
+		if readDone.fire() {
 			<-proceed
-		})
+		}
 		// The version the read above reflects — not a fresh one, which would claim
 		// to have seen changes this pass did not.
 		return cc.DependenciesAdd(ctx, ctrl.depID, ctrl.targetID, target.ResourceVersion)
@@ -394,11 +392,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	defer stop(ctx)
 
 	// The dependent has read the target and not yet declared the edge.
-	select {
-	case <-readDone:
-	case <-time.After(testTimeout):
-		t.Fatal("dependent's first reconcile did not read the target")
-	}
+	readDone.wait(t, "the dependent's first reconcile to read the target")
 
 	// Change the target inside the window and wait for the waker to resolve its
 	// dependents — with no edge yet, that lookup comes back empty and the change
@@ -1207,12 +1201,11 @@ func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
 	const objID = ObjectID(42)
 
 	block := make(chan struct{})
-	started := make(chan struct{})
-	var startOnce sync.Once
+	started := newSignal()
 
 	adapter := &fakeAdapter{
 		reconcileFn: func(_ context.Context, _ ObjectID) (Result, error) {
-			startOnce.Do(func() { close(started) })
+			started.fire()
 			<-block
 			return Result{}, nil
 		},
@@ -1232,7 +1225,7 @@ func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
 	done := runInBackground(r, ctx)
 
 	r.enqueue(objID)
-	waitClosed(t, started, "reconcile to start")
+	started.wait(t, "reconcile to start")
 
 	// Simulate a resync tick while the reconcile is still in-flight.
 	r.enqueueUnsettled(ctx)
@@ -1252,8 +1245,7 @@ func TestReconcilerConcurrency(t *testing.T) {
 	const workers = 3
 
 	gate := make(chan struct{})
-	allStarted := make(chan struct{})
-	var closeOnce sync.Once
+	allStarted := newSignal()
 
 	var (
 		mu          sync.Mutex
@@ -1272,7 +1264,7 @@ func TestReconcilerConcurrency(t *testing.T) {
 			mu.Unlock()
 
 			if cur == workers {
-				closeOnce.Do(func() { close(allStarted) })
+				allStarted.fire()
 			}
 
 			<-gate // block until test releases all workers
@@ -1300,7 +1292,7 @@ func TestReconcilerConcurrency(t *testing.T) {
 		r.enqueue(i)
 	}
 
-	waitClosed(t, allStarted, "3 concurrent reconciles to start")
+	allStarted.wait(t, "3 concurrent reconciles to start")
 	close(gate) // release all in-flight reconciles
 
 	cancel()
@@ -1317,9 +1309,8 @@ func TestReconcilerNoConcurrentReconcileOfSameID(t *testing.T) {
 	const workers = 4
 	const objID = ObjectID(1)
 
-	inReconcile := make(chan struct{}) // closed when the first reconcile starts
-	release := make(chan struct{})     // unblocks the first reconcile
-	var startOnce sync.Once
+	inReconcile := newSignal()     // fires when the first reconcile starts
+	release := make(chan struct{}) // unblocks the first reconcile
 
 	var (
 		mu        sync.Mutex
@@ -1341,7 +1332,7 @@ func TestReconcilerNoConcurrentReconcileOfSameID(t *testing.T) {
 				// Hold the object while the test piles on re-adds; without the
 				// processing-hold this is exactly when a second worker would
 				// dispatch the same id.
-				startOnce.Do(func() { close(inReconcile) })
+				inReconcile.fire()
 				<-release
 			}
 
@@ -1365,7 +1356,7 @@ func TestReconcilerNoConcurrentReconcileOfSameID(t *testing.T) {
 	done := runInBackground(r, ctx)
 
 	r.enqueue(objID)
-	waitClosed(t, inReconcile, "first reconcile to start")
+	inReconcile.wait(t, "first reconcile to start")
 
 	for range 50 {
 		r.enqueue(objID)
