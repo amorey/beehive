@@ -534,6 +534,8 @@ func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log
 
 `AddDependency` and `DeleteDependency` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.
 
+The target may be of **any** kind, including one you only ever use through `Client` and never `Register` — configuration, secrets, any reference data your application writes and your controllers read. Beehive observes changes to every object in the store, not only to kinds that have controllers, so such a target wakes its dependents like any other.
+
 `AddDependency` takes `targetResourceVersion`: the `ResourceVersion` of the target *as the decision to depend on it was read*, not a freshly fetched one. A change to the target that lands between that read and the edge's commit would otherwise reach nobody — the waker resolves dependents at the instant of the change, and the edge does not exist yet — so if the target has moved past the version you pass, the dependent is requeued. Pass `0` to skip the check; that is the right value when you declare the edge *before* reading the target, which needs no check.
 
 A version *above* the target's current one is rejected with `ErrTargetResourceVersionFuture` — versions only move forward, so it cannot have come from reading the target. The rejection happens before anything is written, so no edge is declared even if you call it inside your own `Within` and ignore the error.

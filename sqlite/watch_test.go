@@ -17,6 +17,8 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,32 +31,46 @@ import (
 
 var errWatchBoom = errors.New("boom")
 
+// recvOrFail waits for the next value on ch, failing the test if the channel
+// closes or nothing arrives within the failsafe timeout. what names the stream
+// in the failure message.
+func recvOrFail[V any](t *testing.T, ch <-chan V, what string) V {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			t.Fatalf("%s channel closed unexpectedly", what)
+		}
+		return v
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
+	}
+}
+
+// assertNoRecv fails if any value arrives on ch within d (or if it closes).
+func assertNoRecv[V any](t *testing.T, ch <-chan V, d time.Duration, what string) {
+	t.Helper()
+	select {
+	case v, ok := <-ch:
+		if ok {
+			t.Fatalf("unexpected %s: %+v", what, v)
+		}
+		t.Fatalf("%s channel closed unexpectedly", what)
+	case <-time.After(d):
+	}
+}
+
 // recvLogEvent waits for the next event-log run on w, failing on timeout/close.
 func recvLogEvent(t *testing.T, w storeapi.EventWatcher) storeapi.Event {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Events():
-		if !ok {
-			t.Fatal("event watcher channel closed unexpectedly")
-		}
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for log event")
-		panic("unreachable")
-	}
+	return recvOrFail(t, w.Events(), "log event")
 }
 
 // assertNoLogEvent fails if any event-log run arrives on w within d.
 func assertNoLogEvent(t *testing.T, w storeapi.EventWatcher, d time.Duration) {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Events():
-		if ok {
-			t.Fatalf("unexpected log event: %+v", ev)
-		}
-		t.Fatal("event watcher channel closed unexpectedly")
-	case <-time.After(d):
-	}
+	assertNoRecv(t, w.Events(), d, "log event")
 }
 
 // mergeEvent keeps the higher-resource-version run, so a slow subscriber
@@ -210,33 +226,16 @@ func TestWatchEventsFiltersLiveByCategory(t *testing.T) {
 	assert.Equal(t, "ProbeFailed", got.Reason)
 }
 
-// recvEvent waits for the next event on w, failing the test if none arrives or
-// the channel closes within the failsafe timeout.
+// recvEvent waits for the next object change on w, failing on timeout/close.
 func recvEvent(t *testing.T, w beehive.Watcher) storeapi.RawChange {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Changes():
-		if !ok {
-			t.Fatal("watcher channel closed unexpectedly")
-		}
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for event")
-		panic("unreachable")
-	}
+	return recvOrFail(t, w.Changes(), "change event")
 }
 
-// assertNoEvent fails if any event arrives on w within d.
+// assertNoEvent fails if any object change arrives on w within d.
 func assertNoEvent(t *testing.T, w beehive.Watcher, d time.Duration) {
 	t.Helper()
-	select {
-	case ev, ok := <-w.Changes():
-		if ok {
-			t.Fatalf("unexpected event: %+v", ev)
-		}
-		t.Fatal("watcher channel closed unexpectedly")
-	case <-time.After(d):
-	}
+	assertNoRecv(t, w.Changes(), d, "change event")
 }
 
 // assertWatcherClosed fails if w's channel does not close within the timeout.
@@ -432,48 +431,6 @@ func TestWatchAfterCloseErrors(t *testing.T) {
 	require.ErrorIs(t, err, errStoreClosed)
 	_, err = store.Watch(context.Background(), testGK, 1)
 	require.ErrorIs(t, err, errStoreClosed)
-	_, err = store.WatchChanges(context.Background(), testGK)
-	require.ErrorIs(t, err, errStoreClosed)
-}
-
-// TestWatchChangesSkipsSnapshot verifies WatchChanges delivers no initial snapshot
-// for pre-existing objects, but does stream subsequent live changes.
-func TestWatchChangesSkipsSnapshot(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	// A pre-existing object: WatchList would replay it as Added; WatchChanges must not.
-	pre, err := store.CreateObject(ctx, newWatchObject())
-	require.NoError(t, err)
-
-	w, err := store.WatchChanges(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	assertNoEvent(t, w, 200*time.Millisecond)
-
-	// A live change to that object streams through.
-	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Modified, ev.Type)
-	assert.Equal(t, pre.ID, ev.Object.ID)
-}
-
-// TestWatchChangesStreamsLiveAdded verifies a newly created object reaches a
-// WatchChanges subscriber as an Added event (only the initial snapshot is skipped).
-func TestWatchChangesStreamsLiveAdded(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	w, err := store.WatchChanges(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-
-	created, err := store.CreateObject(ctx, newWatchObject())
-	require.NoError(t, err)
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Added, ev.Type)
-	assert.Equal(t, created.ID, ev.Object.ID)
 }
 
 // TestWatchSnapshotLoadError verifies a snapshot-load failure surfaces as an
@@ -737,28 +694,35 @@ func TestAnnihilatingMergeForList(t *testing.T) {
 	assert.Equal(t, beehive.Deleted, got.Type)
 }
 
-// TestAnnihilatingMergeForEvents verifies the WatchChanges memory bound: with no
-// snapshot to preserve (preserve == nil), every unobserved Added→Deleted pair is
-// annihilated, while a non-delete coalescence still survives.
-func TestAnnihilatingMergeForEvents(t *testing.T) {
-	merge := annihilatingMerge(nil)
-	const id storeapi.ObjectID = 7
-	added := storeapi.RawChange{Type: beehive.Added,
-		Object: &storeapi.RawObject{ID: id, ResourceVersion: 1}}
-	deleted := storeapi.RawChange{Type: beehive.Deleted,
-		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
-	modified := storeapi.RawChange{Type: beehive.Modified,
-		Object: &storeapi.RawObject{ID: id, ResourceVersion: 2}}
+// TestMergePendingChangeAnnihilates verifies the store-wide stream's memory bound:
+// it has no snapshot, so nothing is pre-known and every unobserved Added→Deleted
+// pair is annihilated, while a non-delete coalescence still survives as Added at
+// the latest version. This is the snapshot-less half of the policy
+// annihilatingMerge covers for WatchList.
+func TestMergePendingChangeAnnihilates(t *testing.T) {
+	added := pendingChange{typ: beehive.Added, rv: 1}
+	deleted := pendingChange{typ: beehive.Deleted, rv: 2}
+	modified := pendingChange{typ: beehive.Modified, rv: 2}
 
 	// Unobserved create→delete: dropped entirely.
-	_, keep := merge(added, deleted)
+	_, keep := mergePendingChange(added, deleted)
 	assert.False(t, keep)
 
-	// Create→modify still coalesces and survives (kept as Added, latest body).
-	got, keep := merge(added, modified)
+	// Create→modify still coalesces and survives (kept as Added, latest version).
+	got, keep := mergePendingChange(added, modified)
 	require.True(t, keep)
-	assert.Equal(t, beehive.Added, got.Type)
-	assert.EqualValues(t, 2, got.Object.ResourceVersion)
+	assert.Equal(t, beehive.Added, got.typ)
+	assert.EqualValues(t, 2, got.rv)
+
+	// An observed object's delete is a real tombstone, not noise.
+	got, keep = mergePendingChange(modified, deleted)
+	require.True(t, keep)
+	assert.Equal(t, beehive.Deleted, got.typ)
+
+	// Conflation is version-ordered, not arrival-ordered.
+	got, keep = mergePendingChange(pendingChange{typ: beehive.Modified, rv: 5}, modified)
+	require.True(t, keep)
+	assert.EqualValues(t, 5, got.rv)
 }
 
 // TestWatchSnapshotRaceModifiedNotAdded verifies that when a race-window Added
@@ -1099,17 +1063,310 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	w, err := store.WatchChanges(ctx, testGK)
+	w, err := store.WatchObjectChanges(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
-	var seen storeapi.RawChange
+	var seen []storeapi.ObjectChange
 	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
 		if _, err := store.CreateObject(txCtx, newWatchObject()); err != nil {
 			return err
 		}
-		store.AfterCommit(txCtx, func(context.Context) { seen = recvEvent(t, w) })
+		store.AfterCommit(txCtx, func(context.Context) { seen = recvBatch(t, w) })
 		return nil
 	}))
-	assert.Equal(t, beehive.Added, seen.Type, "the hook must observe the already-published event")
+	require.Len(t, seen, 1)
+	assert.Equal(t, beehive.Added, seen[0].Type, "the hook must observe the already-published event")
+}
+
+// TestPublishReachesGlobalHub verifies every object write also lands on the
+// store-wide change hub, whatever its kind: it is the single stream the
+// dependency waker subscribes to, so a kind missing from it is a kind whose
+// dependents never wake. The hub carries the projection (see pendingChange), not the
+// row — a pending RawChange would pin that object's blobs.
+func TestPublishReachesGlobalHub(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	rx := store.changeHub.Receiver()
+	defer rx.Close()
+
+	first, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	otherGK := beehive.GroupKind{Kind: "Other"}
+	second, err := store.CreateObject(ctx, &beehive.RawObject{
+		Group: otherGK.Group, Kind: otherGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	got := map[storeapi.ObjectID]storeapi.ChangeType{}
+	for range 2 {
+		ev, err := rx.Recv()
+		require.NoError(t, err)
+		got[ev.Key] = ev.Value.typ
+	}
+	assert.Equal(t, map[storeapi.ObjectID]storeapi.ChangeType{
+		first.ID:  beehive.Added,
+		second.ID: beehive.Added,
+	}, got, "both kinds reach the one global hub")
+}
+
+// recvBatch waits for the next object-change batch on w, failing on timeout/close.
+func recvBatch(t *testing.T, w storeapi.ObjectChangeWatcher) []storeapi.ObjectChange {
+	t.Helper()
+	return recvOrFail(t, w.Batches(), "object-change batch")
+}
+
+// assertNoBatch fails if any object-change batch arrives on w within d.
+func assertNoBatch(t *testing.T, w storeapi.ObjectChangeWatcher, d time.Duration) {
+	t.Helper()
+	assertNoRecv(t, w.Batches(), d, "object-change batch")
+}
+
+// TestWatchObjectChangesStreamsLiveChanges verifies a live write reaches the
+// store-wide stream as an id-and-type reference.
+func TestWatchObjectChangesStreamsLiveChanges(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchObjectChanges(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	created, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ObjectChange{{ID: created.ID, Type: beehive.Added}}, recvBatch(t, w))
+}
+
+// TestWatchObjectChangesSpansKinds verifies the stream is store-wide: one
+// subscription observes changes to a kind it was never told about, which is the
+// whole point — a dependency target may be of a kind with no controller.
+func TestWatchObjectChangesSpansKinds(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, err := store.WatchObjectChanges(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	first, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	second, err := store.CreateObject(ctx, &beehive.RawObject{Kind: "Other", Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	got := map[storeapi.ObjectID]bool{}
+	for len(got) < 2 {
+		for _, ref := range recvBatch(t, w) {
+			got[ref.ID] = true
+		}
+	}
+	assert.Equal(t, map[storeapi.ObjectID]bool{first.ID: true, second.ID: true}, got)
+}
+
+// TestWatchObjectChangesSkipsSnapshot verifies the stream has no initial snapshot:
+// existing objects are already accounted for by the reconciler's startup pass,
+// and replaying them would make every restart a full wake storm.
+func TestWatchObjectChangesSkipsSnapshot(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pre, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, err := store.WatchObjectChanges(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+	assertNoBatch(t, w, 200*time.Millisecond)
+
+	_, _, err = store.UpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ObjectChange{{ID: pre.ID, Type: beehive.Modified}}, recvBatch(t, w))
+}
+
+// newParkedObjectChangeStream returns a object-change watcher whose goroutine is
+// provably parked on its send: out is unbuffered by design, so one write is
+// enough to park it, and the beforeLiveSend seam reports the instant it is about
+// to block. Writes made after that pile up in the receiver — where they still
+// conflate — until the caller reads. The parking write's own batch is the first
+// one the caller must consume.
+func newParkedObjectChangeStream(t *testing.T, store *sqliteStore) storeapi.ObjectChangeWatcher {
+	t.Helper()
+	parked := make(chan struct{})
+	var once sync.Once
+	store.beforeLiveSend = func() { once.Do(func() { close(parked) }) }
+
+	w, err := store.WatchObjectChanges(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+
+	_, err = store.CreateObject(context.Background(), newWatchObject())
+	require.NoError(t, err)
+	select {
+	case <-parked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("object-change stream never parked on its send")
+	}
+	return w
+}
+
+// TestWatchObjectChangesBatchesBurst verifies a burst of writes drains as one
+// batch: the waker resolves each entry against the store, so per-burst instead
+// of per-write is what keeps a hot kind from taxing every writer.
+func TestWatchObjectChangesBatchesBurst(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	var want []storeapi.ObjectID
+	for range 3 {
+		obj, err := store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+		want = append(want, obj.ID)
+	}
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	var got []storeapi.ObjectID
+	for _, ref := range recvBatch(t, w) {
+		got = append(got, ref.ID)
+	}
+	assert.Equal(t, want, got, "the whole burst arrives as one batch, in first-touch order")
+}
+
+// TestWatchObjectChangesCapsBatch verifies a batch is bounded: with more ready than
+// the cap, the first batch is exactly the cap and the rest follow in the next.
+func TestWatchObjectChangesCapsBatch(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	const extra = 2
+	for range objectChangeBatchCap + extra {
+		_, err := store.CreateObject(ctx, newWatchObject())
+		require.NoError(t, err)
+	}
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	assert.Len(t, recvBatch(t, w), objectChangeBatchCap)
+	assert.Len(t, recvBatch(t, w), extra)
+}
+
+// TestWatchObjectChangesCoalescesRepeatWrites verifies the batch is drained from
+// the receiver, not from a buffer in front of it: repeated writes to one object
+// merge into its pending slot, so a hot object costs one entry per batch rather
+// than one per write. This is the property a buffered out channel would lose —
+// once a value has left the receiver it can no longer coalesce.
+func TestWatchObjectChangesCoalescesRepeatWrites(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	obj, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	for i := range 5 {
+		_, _, err := store.UpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		require.NoError(t, err)
+	}
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	assert.Equal(t, []storeapi.ObjectChange{{ID: obj.ID, Type: beehive.Added}}, recvBatch(t, w),
+		"one create plus five updates conflate to one entry, still Added to a consumer that never saw it")
+	assertNoBatch(t, w, 200*time.Millisecond) // and nothing trails behind it
+}
+
+// TestWatchObjectChangesAnnihilatesTransient verifies an object born and deleted
+// while the consumer was behind produces nothing at all: it has no dependents
+// left to wake, and a lone tombstone would be pure noise. This is what bounds a
+// slow consumer's memory by the live key set rather than by churn.
+func TestWatchObjectChangesAnnihilatesTransient(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	transient, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+	require.NoError(t, store.DeleteObject(ctx, transient.ID))
+	survivor, err := store.CreateObject(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
+	assert.Equal(t, []storeapi.ObjectChange{{ID: survivor.ID, Type: beehive.Added}}, recvBatch(t, w),
+		"the transient object is dropped entirely")
+	assertNoBatch(t, w, 200*time.Millisecond)
+}
+
+// TestWatchObjectChangesOnClosedStore verifies subscribing after Close fails
+// loudly rather than handing back a stream that can never fire.
+func TestWatchObjectChangesOnClosedStore(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	_, err = store.WatchObjectChanges(context.Background())
+	assert.ErrorIs(t, err, errStoreClosed)
+}
+
+// TestWatchObjectChangesClosesOnStoreClose verifies an open stream ends when the
+// store does, whether its goroutine is parked on a receive or on a send —
+// closing the hub wakes only the former, which is what s.done covers.
+func TestWatchObjectChangesClosesOnStoreClose(t *testing.T) {
+	t.Run("parked on receive", func(t *testing.T) {
+		store, err := OpenMemory()
+		require.NoError(t, err)
+
+		w, err := store.WatchObjectChanges(context.Background())
+		require.NoError(t, err)
+
+		require.NoError(t, store.Close())
+		select {
+		case _, ok := <-w.Batches():
+			assert.False(t, ok, "channel must close when the store closes")
+		case <-time.After(2 * time.Second):
+			t.Fatal("object-change stream outlived its store")
+		}
+	})
+
+	t.Run("parked on send", func(t *testing.T) {
+		store := newRawStore(t)
+		exited := make(chan struct{})
+		store.afterStream = func() { close(exited) }
+		w := newParkedObjectChangeStream(t, store)
+
+		require.NoError(t, store.Close())
+		<-exited
+		_, ok := <-w.Batches()
+		assert.False(t, ok, "channel must close when the store closes mid-send")
+	})
+}
+
+// TestWatchObjectChangesClosesOnCancel verifies the caller's context ends the
+// stream: a Beehive that stops must not leave a waker's goroutine behind.
+func TestWatchObjectChangesClosesOnCancel(t *testing.T) {
+	store := newRawStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w, err := store.WatchObjectChanges(ctx)
+	require.NoError(t, err)
+
+	cancel()
+	select {
+	case _, ok := <-w.Batches():
+		assert.False(t, ok, "channel must close when the caller's context is cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("object-change stream outlived its context")
+	}
+}
+
+// assertObjectChanges collects want references off w — a burst may arrive as one
+// batch or several, which is the stream's business, not the caller's — and
+// asserts every one carries typ.
+func assertObjectChanges(t *testing.T, w storeapi.ObjectChangeWatcher, want int, typ storeapi.ChangeType) {
+	t.Helper()
+	var got []storeapi.ObjectChange
+	for len(got) < want {
+		got = append(got, recvBatch(t, w)...)
+	}
+	assert.Len(t, got, want)
+	for _, ref := range got {
+		assert.Equal(t, typ, ref.Type)
+	}
 }

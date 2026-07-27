@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -104,7 +105,7 @@ type Beehive struct {
 // Both reach every reconciler rather than the failing kind's, and that is forced
 // by the failures themselves: dependency edges are deliberately cross-kind, so a
 // lost wake strands dependents of any kind, and the lookup that fails in
-// wakeDependents is the very thing that would have named them. Escalating one kind
+// wakeDependentsBatch is the very thing that would have named them. Escalating one kind
 // would repair one arbitrary kind and silently spend the repair for the rest.
 // order is frozen once Start runs, so it reads without bh.mu — the same reasoning
 // stop relies on.
@@ -180,38 +181,13 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		return nil, fmt.Errorf("beehive: start aborted: %w", err)
 	}
 
-	// A per-kind dependency waker requeues dependents on each change. Driving it
-	// off change-events (which the store suppresses for no-ops) rather than every
-	// reconcile means a steady state stops waking and cycles settle.
-	//
-	// Subscribe and start consuming every waker BEFORE launching any reconcile
-	// loop: a controller's startup reconcile can modify a target the instant it
-	// runs, and that Modified event must not be published before the relevant
-	// waker is listening — otherwise dependents go unwoken under configurations
-	// that rely on dependency events (e.g. a settled dependent, which no owed-work
-	// listing can see, with every ticker disabled). A subscribe failure is
-	// non-fatal: it escalates every periodic pass to a full resync, which is the
-	// only thing that reaches a settled dependent (see the branch below).
-	for _, r := range bh.order {
-		w, err := bh.store.WatchChanges(runCtx, r.gk)
-		if err != nil {
-			// A waker that never starts is a dead waker: no change on this kind will
-			// wake a dependent for the life of the process. This used to claim the
-			// resync covered it, which was never true — a settled dependent is exactly
-			// what an owed-work tick cannot see — so escalate to make it true, and
-			// report which situation the operator is actually in.
-			bh.resyncKindsEveryTick()
-			msg := "dependency waker subscription failed; escalating every periodic pass to a full resync so dependents still converge"
-			if !bh.hasPeriodicPass() {
-				msg = "dependency waker subscription failed and there is no periodic pass to fall back on; dependents will not be woken — drive them with Client.Requeue"
-			}
-			bh.logger.Warn(msg, "group", r.gk.Group, "kind", r.gk.Kind, "err", err)
-			continue
-		}
-		bh.wg.Go(func() {
-			bh.runDependencyWaker(runCtx, r.gk, w)
-		})
-	}
+	// Subscribe and start consuming the dependency waker BEFORE launching any
+	// reconcile loop: a controller's startup reconcile can modify a target the
+	// instant it runs, and that change must not be published before the waker is
+	// listening — otherwise dependents go unwoken under configurations that rely
+	// on dependency events (e.g. a settled dependent, which no owed-work listing
+	// can see, with every ticker disabled).
+	bh.startDependencyWaker(runCtx)
 
 	// Now launch the reconcile loops.
 	for _, r := range bh.order {
@@ -325,19 +301,58 @@ func (bh *Beehive) advanceDeletion(ctx context.Context, gk GroupKind, id ObjectI
 	return err
 }
 
+// startDependencyWaker launches the single waker over one store-wide change
+// stream. Driving requeues off change-events (which the store suppresses for
+// no-ops) rather than off every reconcile means a steady state stops waking and
+// cycles settle.
+//
+// Store-wide rather than per registered kind: a depends_on edge may point at an
+// object of any kind, including one used through Client with no Register. Such a
+// target has no reconciler, so a per-kind subscription list — however it is
+// computed — cannot name it, and changes to it would reach no waker at all.
+// Routing stays correct because it was never keyed on the subscription:
+// wakeDependentsBatch enqueues each dependent through enqueueIfRegistered, by the
+// dependent's own kind.
+//
+// With no registered controllers there is nothing to wake, and the stream is not
+// free: it would pay a refs query per change in the whole store only to reach
+// enqueueIfRegistered's no-op arm.
+func (bh *Beehive) startDependencyWaker(runCtx context.Context) {
+	if len(bh.order) == 0 {
+		return
+	}
+	w, err := bh.store.WatchObjectChanges(runCtx)
+	if err != nil {
+		// A waker that never starts is a dead waker: no change anywhere in the store
+		// will wake a dependent for the life of the process — every kind's, not one
+		// kind's, since this is the process's only stream. This used to claim the
+		// resync covered it, which was never true — a settled dependent is exactly
+		// what an owed-work tick cannot see — so escalate to make it true, and report
+		// which situation the operator is actually in.
+		bh.resyncKindsEveryTick()
+		msg := "dependency waker subscription failed; no dependency wakes will be delivered for any kind, so escalating every periodic pass to a full resync to converge dependents"
+		if !bh.hasPeriodicPass() {
+			msg = "dependency waker subscription failed and there is no periodic pass to fall back on; no dependency wakes will be delivered for any kind — drive them with Client.Requeue"
+		}
+		bh.logger.Warn(msg, "err", err)
+		return
+	}
+	bh.wg.Go(func() { bh.runDependencyWaker(runCtx, w) })
+}
+
 // runDependencyWaker requeues dependents when a target changes, until ctx is
-// cancelled or the stream ends. gk is the kind being watched, carried for the log
-// on the stream-ended path — the Watcher does not report it. The watcher is established by Start (events-only,
-// no snapshot: the reconciler's own startup pass already covers existing objects).
-// The ctx.Done() arm is needed because a watcher's channel may never close on its
-// own.
-func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watcher) {
+// cancelled or the stream ends. The stream is store-wide and established by
+// Start (events-only, no snapshot: the reconciler's own startup pass already
+// covers existing objects), and it arrives in batches — a burst of changes costs
+// one refs query rather than one per change. The ctx.Done() arm is needed
+// because a watcher's channel may never close on its own.
+func (bh *Beehive) runDependencyWaker(ctx context.Context, w ObjectChangeWatcher) {
 	defer w.Close()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, ok := <-w.Changes():
+		case batch, ok := <-w.Batches():
 			if !ok {
 				// Stop closes the stream by cancelling this same ctx, so on shutdown
 				// both select arms are ready at once and Go may pick this one. Re-check
@@ -348,37 +363,56 @@ func (bh *Beehive) runDependencyWaker(ctx context.Context, gk GroupKind, w Watch
 					return
 				}
 				// The stream ended without the control plane stopping (that arrives on
-				// ctx.Done above, and is not a loss). Nothing re-subscribes, so every
-				// future change on this kind now reaches no dependent at all.
-				bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for this kind for the life of the process; escalating every catchup tick to a full resync pass",
-					"group", gk.Group, "kind", gk.Kind)
+				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
+				// the process's only change stream, so every future change to every kind
+				// now reaches no dependent at all.
+				bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for every kind for the life of the process; escalating every catchup tick to a full resync pass")
 				bh.resyncKindsEveryTick()
 				return
 			}
-			// Wake on any present-state change. We must handle Added, not just
-			// Modified: the conflating store hub coalesces a create-then-modify into
-			// a single Added, so skipping it would drop the modify's wake. A
-			// brand-new object usually has no dependents, so the extra lookup is a
-			// cheap no-op — the over-wake is harmless. Deleted carries nothing to
-			// requeue (a gone object has no dependents).
-			if ev.Type == Added || ev.Type == Modified {
-				bh.wakeDependents(ctx, ev.Object.ID)
-			}
+			bh.wakeDependentsBatch(ctx, batch)
 		}
 	}
 }
 
-// wakeDependents requeues every object that depends_on targetID, each in its own
-// kind's reconciler. Over-eager wakes are harmless: unregistered kinds are
-// ignored and the work queue coalesces duplicates.
+// wakeDependentsBatch requeues every object that depends_on one of targetIDs,
+// each in its own kind's reconciler. Over-eager wakes are harmless: unregistered
+// kinds are ignored and the work queue coalesces duplicates.
+//
+// It resolves the whole batch in one refs query, which is not merely an
+// optimization: the store runs on a single connection, so every lookup the waker
+// makes serializes against every writer in the process — and the waker sees every
+// change in the store, not just the registered kinds'. One query per burst rather
+// than one per change is what keeps a write-heavy kind from taxing them all.
+//
+// It wakes on any present-state change. Added matters as much as Modified: the
+// conflating store hub coalesces a create-then-modify into a single Added, so
+// skipping it would drop the modify's wake. A brand-new object usually has no
+// dependents, so the extra lookup is a cheap no-op — the over-wake is harmless.
+// Deleted carries nothing to requeue (a gone object has no dependents).
+// Duplicates are collapsed by scan rather than by a map: the hub already
+// coalesces per object so a repeat is rare, and the batch is bounded, but the
+// wake policy must not depend on how its input was produced.
 //
 // It addresses dependents by bare id, both to skip the self-edge and to route
 // through d.GroupKind(), because an ObjectID is unique across every kind
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
-	deps, err := bh.store.ListIncomingRefs(ctx, targetID, RelationDependsOn)
+func (bh *Beehive) wakeDependentsBatch(ctx context.Context, batch []ObjectChange) {
+	ids := make([]ObjectID, 0, len(batch))
+	for _, ref := range batch {
+		if ref.Type != Added && ref.Type != Modified {
+			continue
+		}
+		if !slices.Contains(ids, ref.ID) {
+			ids = append(ids, ref.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	byTarget, err := bh.store.GroupIncomingRefsByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		// Shutdown cancels this same ctx, so a change already dequeued when Stop
 		// lands fails here for no reason of its own. Escalating would arm a full
@@ -387,26 +421,28 @@ func (bh *Beehive) wakeDependents(ctx context.Context, targetID ObjectID) {
 		if ctx.Err() != nil {
 			return
 		}
-		// Every dependent of this target just missed this change. A dependent that
-		// has settled is invisible to every owed-work listing — its own generation
-		// never moved — so with no full pass configured the miss is permanent, not
-		// slow. Nothing here can name who was missed: the lookup that failed is
-		// exactly the one that would have said.
-		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for this change were dropped, forcing a full resync pass",
-			"targetID", targetID, "err", err)
+		// Every dependent of these targets just missed their changes. A dependent
+		// that has settled is invisible to every owed-work listing — its own
+		// generation never moved — so with no full pass configured the miss is
+		// permanent, not slow. Nothing here can name who was missed: the lookup
+		// that failed is exactly the one that would have said.
+		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for these changes were dropped, forcing a full resync pass",
+			"targetIDs", ids, "err", err)
 		bh.resyncKindsNextTick()
 		return
 	}
-	for _, d := range deps {
-		if d.ID == targetID {
-			// Self-edge: nothing here is owed a wake. A spec write requeues through
-			// wakeAfterCommit; a status or condition write is this object's own pass,
-			// which just ran. Waking it re-enqueues at full speed with nothing to
-			// converge it. Cycles of two or more still do; see the cycle entry in
-			// TODO.md.
-			continue
+	for _, targetID := range ids {
+		for _, d := range byTarget[targetID] {
+			if d.ID == targetID {
+				// Self-edge: nothing here is owed a wake. A spec write requeues through
+				// wakeAfterCommit; a status or condition write is this object's own pass,
+				// which just ran. Waking it re-enqueues at full speed with nothing to
+				// converge it. Cycles of two or more still do; see the cycle entry in
+				// TODO.md.
+				continue
+			}
+			bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 		}
-		bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 	}
 }
 

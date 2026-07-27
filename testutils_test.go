@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -228,8 +229,8 @@ func (s *fakeStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error)
 func (s *fakeStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return noopWatcher{}, nil
 }
-func (s *fakeStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
-	return noopWatcher{}, nil
+func (s *fakeStore) WatchObjectChanges(context.Context) (storeapi.ObjectChangeWatcher, error) {
+	return noopObjectChangeWatcher{}, nil
 }
 func (s *fakeStore) WatchEvents(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (EventWatcher, error) {
 	panic("not implemented: fakeStore.WatchEvents")
@@ -241,12 +242,19 @@ type noopWatcher struct{}
 func (noopWatcher) Changes() <-chan storeapi.RawChange { return nil }
 func (noopWatcher) Close()                             {}
 
+// noopObjectChangeWatcher is noopWatcher's store-wide-stream twin.
+type noopObjectChangeWatcher struct{}
+
+func (noopObjectChangeWatcher) Batches() <-chan []storeapi.ObjectChange { return nil }
+func (noopObjectChangeWatcher) Close()                                  {}
+
 // watcherStore is a fakeStore whose Watch/WatchList return a preset Watcher and
 // error, so client-layer tests can drive the typed-adapter goroutine directly.
 type watcherStore struct {
 	fakeStore
-	w   Watcher
-	err error
+	w       Watcher
+	changes ObjectChangeWatcher // served by WatchObjectChanges, for the dependency waker
+	err     error
 }
 
 func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, error) {
@@ -255,37 +263,61 @@ func (s *watcherStore) Watch(context.Context, GroupKind, ObjectID) (Watcher, err
 func (s *watcherStore) WatchList(context.Context, GroupKind) (Watcher, error) {
 	return s.w, s.err
 }
-func (s *watcherStore) WatchChanges(context.Context, GroupKind) (Watcher, error) {
-	return s.w, s.err
+func (s *watcherStore) WatchObjectChanges(context.Context) (ObjectChangeWatcher, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.changes, nil
 }
 
-// fakeWatcher is a controllable Watcher: push feeds a raw event, endStream ends
-// the stream, and Close signals the adapter goroutine's exit. It backs the
-// client adaptWatcher tests.
-type fakeWatcher struct {
-	ch        chan storeapi.RawChange
+// fakeStream is the shared body of the controllable watcher doubles: an
+// unbuffered channel of whatever the stream carries, plus a closed signal so a
+// test can synchronize on the consumer goroutine's exit instead of reading the
+// channel — which could itself satisfy a pending send and race the outcome.
+type fakeStream[V any] struct {
+	ch        chan V
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
+func newFakeStream[V any]() fakeStream[V] {
+	return fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
+}
+
+// Close is called by the consumer's defer on exit.
+func (w *fakeStream[V]) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
+
+// endStream closes the channel, signalling the stream has ended.
+func (w *fakeStream[V]) endStream() { close(w.ch) }
+
+// fakeWatcher is a controllable Watcher, backing the client adaptWatcher tests.
+type fakeWatcher struct{ fakeStream[storeapi.RawChange] }
+
 func newFakeWatcher() *fakeWatcher {
-	return &fakeWatcher{ch: make(chan storeapi.RawChange), closed: make(chan struct{})}
+	return &fakeWatcher{newFakeStream[storeapi.RawChange]()}
 }
 
 func (w *fakeWatcher) Changes() <-chan storeapi.RawChange { return w.ch }
-
-// Close (called by adaptWatcher's defer on exit) closes closed, letting tests
-// synchronize on goroutine exit instead of reading Changes — which could itself
-// satisfy a pending send and race the outcome.
-func (w *fakeWatcher) Close() { w.closeOnce.Do(func() { close(w.closed) }) }
 
 // push delivers a raw event to the adapter goroutine.
 func (w *fakeWatcher) push(typ ChangeType, obj *RawObject) {
 	w.ch <- storeapi.RawChange{Type: typ, Object: obj}
 }
 
-// endStream closes the event channel, signalling the stream has ended.
-func (w *fakeWatcher) endStream() { close(w.ch) }
+// fakeObjectChangeWatcher is fakeWatcher's store-wide-stream twin, backing the
+// dependency-waker tests. A batch is the push unit deliberately — the waker
+// resolves a whole batch in one query, so a double that could only deliver one
+// reference at a time would hide that.
+type fakeObjectChangeWatcher struct{ fakeStream[[]ObjectChange] }
+
+func newFakeObjectChangeWatcher() *fakeObjectChangeWatcher {
+	return &fakeObjectChangeWatcher{newFakeStream[[]ObjectChange]()}
+}
+
+func (w *fakeObjectChangeWatcher) Batches() <-chan []ObjectChange { return w.ch }
+
+// push delivers one batch to the waker.
+func (w *fakeObjectChangeWatcher) push(refs ...ObjectChange) { w.ch <- refs }
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.
@@ -381,7 +413,7 @@ func refObjectIDs(refs []Ref) []ObjectID {
 // change and the commit, so a test that wants the window deterministically has to
 // wait for this rather than assume the waker is done.
 //
-// It is keyed on (toID, relation), not on the caller — ListIncomingRefs is also
+// It is keyed on (toID, relation), not on the caller — the same lookups are also
 // reached from ListDependents and the LoadDependents eager path, and nothing here
 // can tell those from the waker. So a token means "somebody looked", and a test
 // that wants "the waker looked" must resetLooked immediately before the write it
@@ -396,17 +428,35 @@ type wakeProbeStore struct {
 
 func (s *wakeProbeStore) ListIncomingRefs(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error) {
 	refs, err := s.Store.ListIncomingRefs(ctx, toID, relation)
-	if toID == s.targetID && relation == RelationDependsOn {
-		// Non-blocking: this runs on the waker's goroutine, and a full buffer means
-		// no test is waiting. Blocking there would park the waker inside the store
-		// and hang the reconciler — a timeout in some unrelated test rather than a
-		// failure here.
-		select {
-		case s.looked <- struct{}{}:
-		default:
-		}
+	if toID == s.targetID {
+		s.note(relation)
 	}
 	return refs, err
+}
+
+// GroupIncomingRefsByID is the waker's own lookup (it resolves a whole batch of
+// changed targets in one query), so the probe has to cover it too — otherwise a
+// test waiting on "the waker looked" would wait forever.
+func (s *wakeProbeStore) GroupIncomingRefsByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error) {
+	refs, err := s.Store.GroupIncomingRefsByID(ctx, toIDs, relation)
+	if slices.Contains(toIDs, s.targetID) {
+		s.note(relation)
+	}
+	return refs, err
+}
+
+// note records one depends_on lookup for the target. Non-blocking: it runs on
+// the waker's goroutine, and a full buffer means no test is waiting. Blocking
+// there would park the waker inside the store and hang the reconciler — a
+// timeout in some unrelated test rather than a failure here.
+func (s *wakeProbeStore) note(relation Relation) {
+	if relation != RelationDependsOn {
+		return
+	}
+	select {
+	case s.looked <- struct{}{}:
+	default:
+	}
 }
 
 // resetLooked discards lookups recorded so far, so the next waitLooked can only
