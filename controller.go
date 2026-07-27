@@ -109,6 +109,13 @@ type ControllerClient[Status any] interface {
 	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// DependentsList returns the objects that depend on id (incoming depends_on).
 	DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// EdgesHasIncoming reports whether any object with a live claim still points at id:
+	// an owned child, or a dependent that is not itself being deleted. A dependent
+	// that is itself finalizing is excluded — it's going away and no longer has a
+	// claim. A finalizer can gate teardown on this: a controller holding a shared
+	// resource clears its finalizer only once nothing with a live claim references
+	// the object, so the resource outlives its last real user.
+	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
 	// EventsRecord appends an observation to id's event log, aggregating into
 	// contiguous runs (see EventSpec). Like the other writes it is kind-folded and
 	// composes in Within, so a controller can record an event and update a
@@ -121,13 +128,6 @@ type ControllerClient[Status any] interface {
 	// presence: false with a nil error when the object has no owner. The lazy
 	// counterpart to a reconciler's LoadOwner default.
 	OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
-	// EdgesHasIncoming reports whether any object with a live claim still points at id:
-	// an owned child, or a dependent that is not itself being deleted. A dependent
-	// that is itself finalizing is excluded — it's going away and no longer has a
-	// claim. A finalizer can gate teardown on this: a controller holding a shared
-	// resource clears its finalizer only once nothing with a live claim references
-	// the object, so the resource outlives its last real user.
-	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
 	// UpdateStatus records status and the generation this reconcile observed.
 	// Status that marshals to the stored bytes writes nothing: no
 	// resource_version bump and no Modified event, so a controller can report
