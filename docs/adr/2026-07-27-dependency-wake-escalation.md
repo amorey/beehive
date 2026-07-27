@@ -1,7 +1,11 @@
 # Dependency-wake failures escalate the catchup tick
 
-- **Status:** Accepted — implemented in `beehive.go` (policy) and `reconciler.go`
-  (primitives).
+- **Status:** Superseded by
+  [2026-07-27-waker-watermark-replay.md](2026-07-27-waker-watermark-replay.md). The
+  escalation could not run at the default configuration — its flags were read only
+  inside the catchup ticker's case, and `resyncInterval` already defaults to 0 — so
+  the waker now replays missed changes from a `resource_version` watermark and the
+  machinery below is deleted. Kept as the record of what was tried.
 - **Date:** 2026-07-27 (recorded retroactively)
 
 ## Context

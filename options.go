@@ -366,6 +366,12 @@ func WithMigrator(m Migrator) Option {
 // or where the embedder drives its own reconciles. Passed to New it sets the
 // default for all controllers; passed to Register it overrides that default for
 // one.
+//
+// Setting it false also opts out of crash recovery for *settled dependents*. The
+// dependency waker's resume cursor is per-process, so a crash during a waker outage
+// leaves a dependent whose target changed in that window stale: its own generation
+// never moved, so no owed-work listing can see it, and this pass is what would
+// otherwise have caught it. See the observed_cursor entry in TODO.md.
 func WithStartupResync(enabled bool) Option {
 	return func(target any) error {
 		switch t := target.(type) {
