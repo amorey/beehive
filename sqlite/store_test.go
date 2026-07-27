@@ -1351,8 +1351,8 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 		return o.ID
 	}
 	owner, childA, childB := mk(), mk(), mk()
-	require.NoError(t, addRef(ctx, store, childA, owner, beehive.RelationOwnedBy))
-	require.NoError(t, addRef(ctx, store, childB, owner, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, childA, owner, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, childB, owner, beehive.RelationOwnedBy))
 
 	// Watch live changes only (no snapshot) so each cascade's events are isolated.
 	w, err := store.ObjectWritesSubscribe(ctx)
@@ -1487,12 +1487,12 @@ func TestListOutgoingRefs(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, from.ID, a.ID, beehive.RelationOwnedBy))
-	require.NoError(t, addRef(ctx, store, from.ID, b.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, from.ID, a.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, from.ID, b.ID, beehive.RelationDependsOn))
 	// A second edge to the same target via another relation must not duplicate it.
-	require.NoError(t, addRef(ctx, store, from.ID, a.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, from.ID, a.ID, beehive.RelationDependsOn))
 
-	refs, err := store.RefsListOutgoing(ctx, from.ID)
+	refs, err := store.EdgesListOutgoing(ctx, from.ID)
 	require.NoError(t, err)
 	var ids []beehive.ObjectID
 	for _, r := range refs {
@@ -1501,7 +1501,7 @@ func TestListOutgoingRefs(t *testing.T) {
 	assert.Equal(t, []beehive.ObjectID{a.ID, b.ID}, ids, "distinct targets, ordered by id")
 
 	// An object that points at nothing has no referents.
-	refs, err = store.RefsListOutgoing(ctx, a.ID)
+	refs, err = store.EdgesListOutgoing(ctx, a.ID)
 	require.NoError(t, err)
 	assert.Empty(t, refs)
 }
@@ -1513,18 +1513,18 @@ func TestListOutgoingRefsByRelation(t *testing.T) {
 	owner := newRefObject(t, store)
 	dep := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, from.ID, owner.ID, beehive.RelationOwnedBy))
-	require.NoError(t, addRef(ctx, store, from.ID, dep.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, from.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, from.ID, dep.ID, beehive.RelationDependsOn))
 
-	owned, err := store.RefsListOutgoingByRelation(ctx, from.ID, beehive.RelationOwnedBy)
+	owned, err := store.EdgesListOutgoingByRelation(ctx, from.ID, beehive.RelationOwnedBy)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{owner.ID}, refIDs(owned), "only the owned_by target")
 
-	deps, err := store.RefsListOutgoingByRelation(ctx, from.ID, beehive.RelationDependsOn)
+	deps, err := store.EdgesListOutgoingByRelation(ctx, from.ID, beehive.RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(deps), "only the depends_on target")
 
-	none, err := store.RefsListOutgoingByRelation(ctx, owner.ID, beehive.RelationOwnedBy)
+	none, err := store.EdgesListOutgoingByRelation(ctx, owner.ID, beehive.RelationOwnedBy)
 	require.NoError(t, err)
 	assert.Empty(t, none, "no matching edges")
 }
@@ -1537,12 +1537,12 @@ func TestGroupOutgoingRefsByID(t *testing.T) {
 	childB := newRefObject(t, store)
 	loner := newRefObject(t, store) // owns nothing through owned_by
 
-	require.NoError(t, addRef(ctx, store, childA.ID, owner.ID, beehive.RelationOwnedBy))
-	require.NoError(t, addRef(ctx, store, childB.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, childA.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, childB.ID, owner.ID, beehive.RelationOwnedBy))
 	// A depends_on edge the relation filter must exclude.
-	require.NoError(t, addRef(ctx, store, childA.ID, loner.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, childA.ID, loner.ID, beehive.RelationDependsOn))
 
-	got, err := store.RefsGroupOutgoingByID(ctx,
+	got, err := store.EdgesGroupOutgoingByID(ctx,
 		[]beehive.ObjectID{childA.ID, childB.ID, loner.ID}, beehive.RelationOwnedBy)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{owner.ID}, refIDs(got[childA.ID]))
@@ -1550,13 +1550,13 @@ func TestGroupOutgoingRefsByID(t *testing.T) {
 	_, ok := got[loner.ID]
 	assert.False(t, ok, "a source with no matching edge is absent from the map")
 
-	empty, err := store.RefsGroupOutgoingByID(ctx, nil, beehive.RelationOwnedBy)
+	empty, err := store.EdgesGroupOutgoingByID(ctx, nil, beehive.RelationOwnedBy)
 	require.NoError(t, err)
 	assert.Empty(t, empty, "empty input short-circuits to an empty map")
 }
 
 // TestGroupOutgoingRefsByIDChunks shrinks the chunk size so a modest id list
-// spans several queries, proving refsByIDs stays under SQLite's bound-parameter
+// spans several queries, proving edgesByIDs stays under SQLite's bound-parameter
 // limit and merges every chunk's rows into one map.
 func TestGroupOutgoingRefsByIDChunks(t *testing.T) {
 	defer func(n int) { idChunkSize = n }(idChunkSize)
@@ -1568,11 +1568,11 @@ func TestGroupOutgoingRefsByIDChunks(t *testing.T) {
 	var children []beehive.ObjectID
 	for i := 0; i < 5; i++ {
 		c := newRefObject(t, store)
-		require.NoError(t, addRef(ctx, store, c.ID, owner.ID, beehive.RelationOwnedBy))
+		require.NoError(t, addEdge(ctx, store, c.ID, owner.ID, beehive.RelationOwnedBy))
 		children = append(children, c.ID)
 	}
 
-	got, err := store.RefsGroupOutgoingByID(ctx, children, beehive.RelationOwnedBy)
+	got, err := store.EdgesGroupOutgoingByID(ctx, children, beehive.RelationOwnedBy)
 	require.NoError(t, err)
 	require.Len(t, got, len(children), "every id resolved across all chunks")
 	for _, id := range children {
@@ -1588,11 +1588,11 @@ func TestDeleteFinalizingDependsOnRefs(t *testing.T) {
 	liveDep := newRefObject(t, store)
 	owned := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, deletingDep.ID, target.ID, beehive.RelationDependsOn))
-	require.NoError(t, addRef(ctx, store, liveDep.ID, target.ID, beehive.RelationDependsOn))
-	require.NoError(t, addRef(ctx, store, owned.ID, target.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, deletingDep.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, liveDep.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, owned.ID, target.ID, beehive.RelationOwnedBy))
 	// A self-dependency the GC must also be able to clear.
-	require.NoError(t, addRef(ctx, store, target.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, target.ID, target.ID, beehive.RelationDependsOn))
 
 	// The target and the finalizing dependent and the owned child are deleting;
 	// the live dependent is not.
@@ -1601,15 +1601,15 @@ func TestDeleteFinalizingDependsOnRefs(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.NoError(t, store.RefsDeleteFinalizingDependsOn(ctx, target.ID))
+	require.NoError(t, store.EdgesDeleteFinalizingDependsOn(ctx, target.ID))
 
 	// depends_on edges from finalizing sources (including the self-edge) are gone.
-	assert.Equal(t, 0, countRefs(t, store, deletingDep.ID, target.ID, "depends_on"))
-	assert.Equal(t, 0, countRefs(t, store, target.ID, target.ID, "depends_on"))
+	assert.Equal(t, 0, countEdges(t, store, deletingDep.ID, target.ID, "depends_on"))
+	assert.Equal(t, 0, countEdges(t, store, target.ID, target.ID, "depends_on"))
 	// A live dependent's edge is preserved — it still legitimately blocks deletion.
-	assert.Equal(t, 1, countRefs(t, store, liveDep.ID, target.ID, "depends_on"))
+	assert.Equal(t, 1, countEdges(t, store, liveDep.ID, target.ID, "depends_on"))
 	// owned_by is never touched here; it clears only when the child is removed.
-	assert.Equal(t, 1, countRefs(t, store, owned.ID, target.ID, "owned_by"))
+	assert.Equal(t, 1, countEdges(t, store, owned.ID, target.ID, "owned_by"))
 }
 
 func TestHasIncomingRefs(t *testing.T) {
@@ -1618,17 +1618,17 @@ func TestHasIncomingRefs(t *testing.T) {
 	owner := newRefObject(t, store)
 	child := newRefObject(t, store)
 
-	has, err := store.RefsHasIncoming(ctx, owner.ID)
+	has, err := store.EdgesHasIncoming(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "no edges yet")
 
-	require.NoError(t, addRef(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
 
-	has, err = store.RefsHasIncoming(ctx, owner.ID)
+	has, err = store.EdgesHasIncoming(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.True(t, has, "owner is referenced by the child")
 
-	has, err = store.RefsHasIncoming(ctx, child.ID)
+	has, err = store.EdgesHasIncoming(ctx, child.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "child is the source, not a target")
 }
@@ -1638,27 +1638,27 @@ func TestHasIncomingRefsIgnoresFinalizingDependent(t *testing.T) {
 	ctx := context.Background()
 	target := newRefObject(t, store)
 	dep := newRefObject(t, store)
-	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
 
 	// A live dependent has a claim: it counts.
-	has, err := store.RefsHasIncoming(ctx, target.ID)
+	has, err := store.EdgesHasIncoming(ctx, target.ID)
 	require.NoError(t, err)
 	assert.True(t, has)
 
 	// Once the dependent is itself finalizing, its claim is void — it's going away.
 	_, _, err = store.DeletionRequestsCreate(ctx, testGK, dep.ID)
 	require.NoError(t, err)
-	has, err = store.RefsHasIncoming(ctx, target.ID)
+	has, err = store.EdgesHasIncoming(ctx, target.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "a finalizing dependent does not count as a referrer")
 
 	// But a finalizing owned child still counts: the foreground cascade must wait
 	// for it to be physically removed.
 	child := newRefObject(t, store)
-	require.NoError(t, addRef(ctx, store, child.ID, target.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, child.ID, target.ID, beehive.RelationOwnedBy))
 	_, _, err = store.DeletionRequestsCreate(ctx, testGK, child.ID)
 	require.NoError(t, err)
-	has, err = store.RefsHasIncoming(ctx, target.ID)
+	has, err = store.EdgesHasIncoming(ctx, target.ID)
 	require.NoError(t, err)
 	assert.True(t, has, "a finalizing owned child still blocks deletion")
 }
@@ -2188,8 +2188,8 @@ func newRefObject(t *testing.T, store beehive.Store) *beehive.RawObject {
 	return obj
 }
 
-// refIDs projects a Referrer slice to its ids for order-sensitive assertions.
-func refIDs(refs []beehive.Referrer) []beehive.ObjectID {
+// refIDs projects an ObjectRef slice to its ids for order-sensitive assertions.
+func refIDs(refs []beehive.Ref) []beehive.ObjectID {
 	var ids []beehive.ObjectID
 	for _, r := range refs {
 		ids = append(ids, r.ID)
@@ -2197,8 +2197,8 @@ func refIDs(refs []beehive.Referrer) []beehive.ObjectID {
 	return ids
 }
 
-// countRefs reads the refs table directly to assert edge presence.
-func countRefs(t *testing.T, store *sqliteStore, from, to beehive.ObjectID, relation string) int {
+// countEdges reads the refs table directly to assert edge presence.
+func countEdges(t *testing.T, store *sqliteStore, from, to beehive.ObjectID, relation string) int {
 	t.Helper()
 	var n int
 	require.NoError(t, store.db.QueryRowContext(context.Background(),
@@ -2207,12 +2207,12 @@ func countRefs(t *testing.T, store *sqliteStore, from, to beehive.ObjectID, rela
 	return n
 }
 
-// addRef declares an edge for test scaffolding: it discards the RefsAddResult and
-// passes no version claim (0), keeping the common require.NoError(t, addRef(...))
+// addEdge declares an edge for test scaffolding: it discards the EdgesAddResult and
+// passes no version claim (0), keeping the common require.NoError(t, addEdge(...))
 // shape a one-liner. Tests that assert on the result or the version guard call
-// store.RefsAdd directly.
-func addRef(ctx context.Context, store beehive.Store, from, to beehive.ObjectID, relation beehive.Relation) error {
-	_, err := store.RefsAdd(ctx, from, to, relation, 0)
+// store.EdgesAdd directly.
+func addEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID, relation beehive.Relation) error {
+	_, err := store.EdgesAdd(ctx, from, to, relation, 0)
 	return err
 }
 
@@ -2222,8 +2222,8 @@ func TestRefsAddInsertsRow(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, "depends_on"))
-	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"))
 }
 
 func TestRefsAddIdempotent(t *testing.T) {
@@ -2232,9 +2232,9 @@ func TestRefsAddIdempotent(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, "depends_on"))
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, "depends_on"))
-	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"), "re-adding an identical edge is a no-op")
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "re-adding an identical edge is a no-op")
 }
 
 func TestRefsAddNonexistentEndpoint(t *testing.T) {
@@ -2242,20 +2242,20 @@ func TestRefsAddNonexistentEndpoint(t *testing.T) {
 	ctx := context.Background()
 	a := newRefObject(t, store)
 
-	err := addRef(ctx, store, a.ID, 9999, "depends_on")
+	err := addEdge(ctx, store, a.ID, 9999, "depends_on")
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "missing to_id yields ErrNotFound")
-	assert.Equal(t, 0, countRefs(t, store, a.ID, 9999, "depends_on"))
+	assert.Equal(t, 0, countEdges(t, store, a.ID, 9999, "depends_on"))
 
-	err = addRef(ctx, store, 9999, a.ID, "depends_on")
+	err = addEdge(ctx, store, 9999, a.ID, "depends_on")
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "missing from_id yields ErrNotFound")
-	assert.Equal(t, 0, countRefs(t, store, 9999, a.ID, "depends_on"))
+	assert.Equal(t, 0, countEdges(t, store, 9999, a.ID, "depends_on"))
 }
 
 // TestRefsAddReportsEndpoints pins the one thing the endpoint check reports back:
 // the source's GroupKind. The edge is cross-kind, so a caller routing a wake to
 // fromID cannot assume its own kind, and it must come from the same round-trip as
 // the insert. The target's resource_version is read on this path too, but is
-// consumed inside RefsAdd rather than reported — TestRefsAddStampsPendingWake
+// consumed inside EdgesAdd rather than reported — TestRefsAddStampsPendingWake
 // covers it, by observing the stamp it decides.
 func TestRefsAddReportsEndpoints(t *testing.T) {
 	store := newRawStore(t)
@@ -2263,15 +2263,15 @@ func TestRefsAddReportsEndpoints(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	res, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
 	require.NoError(t, err)
 	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "fromID's kind")
-	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"), "this call created the edge")
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "this call created the edge")
 
-	res, err = store.RefsAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
 	require.NoError(t, err)
 	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "re-declare reports it too")
-	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"), "the edge already existed; the insert was a no-op")
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge already existed; the insert was a no-op")
 }
 
 // TestRefsAddRejectsFutureTargetVersion pins that the version claim is
@@ -2283,14 +2283,14 @@ func TestRefsAddRejectsFutureTargetVersion(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	_, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion+1)
+	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion+1)
 	assert.ErrorIs(t, err, beehive.ErrTargetResourceVersionFuture)
-	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"), "a rejected claim writes nothing")
+	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"), "a rejected claim writes nothing")
 
 	// The target's own current version is the boundary, and is accepted.
-	_, err = store.RefsAdd(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion)
+	_, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion)
 	require.NoError(t, err)
-	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"))
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"))
 }
 
 // moveTarget writes to b so its resource_version advances past what a caller read,
@@ -2302,11 +2302,11 @@ func moveTarget(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
 	require.NoError(t, err)
 }
 
-// TestRefsAddStampsPendingWake covers the conjunction RefsAdd evaluates on the
+// TestRefsAddStampsPendingWake covers the conjunction EdgesAdd evaluates on the
 // caller's behalf: the stamp lands only when the edge is new *and* the target has
 // moved past the claimed version. Each half is withdrawn in turn, and each one
 // alone suppresses the stamp. It doubles as the coverage for the target's
-// resource_version, which RefsAdd reads but no longer reports — the stamp is how
+// resource_version, which EdgesAdd reads but no longer reports — the stamp is how
 // that read is observable.
 func TestRefsAddStampsPendingWake(t *testing.T) {
 	store := newRawStore(t)
@@ -2318,7 +2318,7 @@ func TestRefsAddStampsPendingWake(t *testing.T) {
 
 	// A zero claim is "no opinion" — what an edge declared before reading the
 	// target passes — so there is nothing to have raced.
-	res, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
 	require.NoError(t, err)
 	assert.False(t, res.WakeStamped, "no version claim, nothing to have raced")
 	assert.Zero(t, pendingWake(t, store, a.ID))
@@ -2327,14 +2327,14 @@ func TestRefsAddStampsPendingWake(t *testing.T) {
 	c := newRefObject(t, store)
 	current, err := store.ObjectsGet(ctx, b.ID)
 	require.NoError(t, err)
-	res, err = store.RefsAdd(ctx, c.ID, b.ID, "depends_on", current.ResourceVersion)
+	res, err = store.EdgesAdd(ctx, c.ID, b.ID, "depends_on", current.ResourceVersion)
 	require.NoError(t, err)
 	assert.False(t, res.WakeStamped, "the target has not moved past the claim")
 	assert.Zero(t, pendingWake(t, store, c.ID))
 
 	// Both halves hold: the stamp lands, on fromID.
 	e := newRefObject(t, store)
-	res, err = store.RefsAdd(ctx, e.ID, b.ID, "depends_on", stale)
+	res, err = store.EdgesAdd(ctx, e.ID, b.ID, "depends_on", stale)
 	require.NoError(t, err)
 	assert.True(t, res.WakeStamped)
 	assert.Equal(t, int64(1), pendingWake(t, store, e.ID), "the stamp is on the dependent, not the target")
@@ -2353,13 +2353,13 @@ func TestRefsAddStampsOnlyNewEdge(t *testing.T) {
 
 	stale := b.ResourceVersion
 	moveTarget(t, store, b.ID)
-	res, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", stale)
+	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale)
 	require.NoError(t, err)
 	require.True(t, res.WakeStamped)
 
 	// Re-declare against an even staler claim, with the target moved again.
 	moveTarget(t, store, b.ID)
-	res, err = store.RefsAdd(ctx, a.ID, b.ID, "depends_on", stale)
+	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale)
 	require.NoError(t, err)
 	assert.False(t, res.WakeStamped, "the edge was already there, so the stamp is suppressed")
 	assert.Equal(t, int64(1), pendingWake(t, store, a.ID), "still the one wake owed")
@@ -2368,7 +2368,7 @@ func TestRefsAddStampsOnlyNewEdge(t *testing.T) {
 // TestRefsAddStampFailureLeavesNoEdge is the ordering guarantee itself. The stamp
 // is a write, so it must land on the same side of the insert as the version
 // rejection: a nested Within is a bare fn(ctx) with no transaction of its own, so
-// a caller that handles RefsAdd's error — here by swallowing it and committing the
+// a caller that handles EdgesAdd's error — here by swallowing it and committing the
 // ambient transaction anyway — unwinds nothing. Were the stamp sequenced after the
 // insert, that caller would commit an edge with no wake, stranding the dependent
 // on a stale read where ObjectsListUnsettledIDs cannot see it. Running last, the insert
@@ -2380,7 +2380,7 @@ func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	b := newRefObject(t, store)
 	stale := b.ResourceVersion
 	moveTarget(t, store, b.ID)
-	// The stamp is the only UPDATE on objects RefsAdd issues, so blocking those
+	// The stamp is the only UPDATE on objects EdgesAdd issues, so blocking those
 	// fails it while leaving the endpoint read and the refs insert alone. RAISE(ABORT)
 	// undoes the statement, not the transaction, so the outer transaction below is
 	// still committable — exactly the failure band where ordering, rather than
@@ -2388,14 +2388,14 @@ func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	blockObjectUpdates(t, store)
 
 	err := store.Within(ctx, func(ctx context.Context) error {
-		if _, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
+		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
 			return nil // the caller logs and carries on; the outer tx still commits
 		}
-		return assert.AnError // RefsAdd must not have succeeded
+		return assert.AnError // EdgesAdd must not have succeeded
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"),
+	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"),
 		"a failed stamp must leave no edge, committed or not")
 	assert.Zero(t, pendingWake(t, store, a.ID))
 }
@@ -2403,7 +2403,7 @@ func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 // TestRefsAddEdgeFailureLeavesStamp is the other side of the ordering tradeoff, and
 // pins that it fails the way the design claims rather than merely asserting it in a
 // comment. Stamp first, insert second means the reverse residual is possible: the
-// insert aborts, the caller swallows RefsAdd's error and commits the ambient
+// insert aborts, the caller swallows EdgesAdd's error and commits the ambient
 // transaction, and a wake is owed for an edge that does not exist.
 //
 // That is the deliberately chosen direction. This residual is self-correcting — the
@@ -2422,14 +2422,14 @@ func TestRefsAddEdgeFailureLeavesStamp(t *testing.T) {
 	blockRefInserts(t, store)
 
 	err := store.Within(ctx, func(ctx context.Context) error {
-		if _, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
+		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
 			return nil // the caller logs and carries on; the outer tx still commits
 		}
-		return assert.AnError // RefsAdd must not have succeeded
+		return assert.AnError // EdgesAdd must not have succeeded
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"), "the edge did not land")
+	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge did not land")
 	assert.Equal(t, int64(1), pendingWake(t, store, a.ID),
 		"the stamp did, and stands as a self-draining spurious wake rather than a lost one")
 }
@@ -2447,7 +2447,7 @@ func TestRefsAddNoVersionBumpNoEvent(t *testing.T) {
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
 	assertNoEvent(t, w, 200*time.Millisecond)
 
 	gotA, err := store.ObjectsGet(ctx, a.ID)
@@ -2464,9 +2464,9 @@ func TestDeleteRefRemovesRow(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, "depends_on"))
-	require.NoError(t, store.RefsDelete(ctx, a.ID, b.ID, "depends_on"))
-	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
+	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
+	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"))
 }
 
 func TestDeleteRefAbsentNoop(t *testing.T) {
@@ -2476,8 +2476,8 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	b := newRefObject(t, store)
 
 	// No edge exists, and a nonexistent endpoint, are both silent no-ops.
-	require.NoError(t, store.RefsDelete(ctx, a.ID, b.ID, "depends_on"))
-	require.NoError(t, store.RefsDelete(ctx, a.ID, 9999, "depends_on"))
+	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
+	require.NoError(t, store.EdgesDelete(ctx, a.ID, 9999, "depends_on"))
 
 	w, err := store.ObjectsWatchList(ctx, testGK)
 	require.NoError(t, err)
@@ -2485,7 +2485,7 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
 
-	require.NoError(t, store.RefsDelete(ctx, a.ID, b.ID, "depends_on"))
+	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
 	assertNoEvent(t, w, 200*time.Millisecond)
 }
 
@@ -2496,9 +2496,9 @@ func TestRefsAddJoinsTransaction(t *testing.T) {
 	b := newRefObject(t, store)
 
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
-		return addRef(ctx, store, a.ID, b.ID, "depends_on")
+		return addEdge(ctx, store, a.ID, b.ID, "depends_on")
 	}))
-	assert.Equal(t, 1, countRefs(t, store, a.ID, b.ID, "depends_on"), "edge is committed with the transaction")
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "edge is committed with the transaction")
 }
 
 func TestRefsAddRollback(t *testing.T) {
@@ -2509,13 +2509,13 @@ func TestRefsAddRollback(t *testing.T) {
 
 	sentinel := errors.New("rollback")
 	err := store.Within(ctx, func(ctx context.Context) error {
-		if err := addRef(ctx, store, a.ID, b.ID, "depends_on"); err != nil {
+		if err := addEdge(ctx, store, a.ID, b.ID, "depends_on"); err != nil {
 			return err
 		}
 		return sentinel
 	})
 	require.ErrorIs(t, err, sentinel)
-	assert.Equal(t, 0, countRefs(t, store, a.ID, b.ID, "depends_on"), "the edge rolled back with the transaction")
+	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge rolled back with the transaction")
 }
 
 func TestRefsListIncoming(t *testing.T) {
@@ -2525,19 +2525,19 @@ func TestRefsListIncoming(t *testing.T) {
 	b := newRefObject(t, store)
 	c := newRefObject(t, store)
 
-	require.NoError(t, addRef(ctx, store, a.ID, c.ID, "depends_on"))
-	require.NoError(t, addRef(ctx, store, b.ID, c.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, a.ID, c.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, b.ID, c.ID, "depends_on"))
 	// An owned_by edge to c must not show up under a depends_on query.
-	require.NoError(t, addRef(ctx, store, a.ID, c.ID, "owned_by"))
+	require.NoError(t, addEdge(ctx, store, a.ID, c.ID, "owned_by"))
 
-	deps, err := store.RefsListIncoming(ctx, c.ID, "depends_on")
+	deps, err := store.EdgesListIncoming(ctx, c.ID, "depends_on")
 	require.NoError(t, err)
-	require.Equal(t, []beehive.Referrer{
+	require.Equal(t, []beehive.Ref{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
 	}, deps)
 
-	none, err := store.RefsListIncoming(ctx, a.ID, "depends_on")
+	none, err := store.EdgesListIncoming(ctx, a.ID, "depends_on")
 	require.NoError(t, err)
 	assert.Empty(t, none, "a target with no dependents returns an empty slice, not an error")
 }
@@ -2556,17 +2556,17 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 	})
 	require.NoError(t, err)
 	for _, child := range []*beehive.RawObject{c1, c2, foreign} {
-		require.NoError(t, addRef(ctx, store, child.ID, owner.ID, "owned_by"))
+		require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, "owned_by"))
 	}
 	// A depends_on edge into owner must not surface under an owned_by query.
 	dep := newRefObject(t, store)
-	require.NoError(t, addRef(ctx, store, dep.ID, owner.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, dep.ID, owner.ID, "depends_on"))
 
 	_, err = store.ConditionsSet(ctx, testGK, c1.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	got, err := store.ObjectsListByIncomingRef(ctx, testGK, owner.ID, "owned_by")
+	got, err := store.ObjectsListByIncomingEdge(ctx, testGK, owner.ID, "owned_by")
 	require.NoError(t, err)
 	require.Len(t, got, 2, "the foreign-kind child and the depends_on referrer are excluded")
 	// Ordered by id (c2 was created first), with full rows and conditions attached.
@@ -2576,11 +2576,11 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 	require.Len(t, got[1].Conditions, 1)
 	assert.Equal(t, "Ready", got[1].Conditions[0].Type)
 
-	none, err := store.ObjectsListByIncomingRef(ctx, testGK, c1.ID, "owned_by")
+	none, err := store.ObjectsListByIncomingEdge(ctx, testGK, c1.ID, "owned_by")
 	require.NoError(t, err)
 	assert.Empty(t, none, "an owner with no children of this kind reads empty")
 
-	missing, err := store.ObjectsListByIncomingRef(ctx, testGK, 99999, "owned_by")
+	missing, err := store.ObjectsListByIncomingEdge(ctx, testGK, 99999, "owned_by")
 	require.NoError(t, err)
 	assert.Empty(t, missing, "a nonexistent owner reads empty, not ErrNotFound")
 }
@@ -2588,7 +2588,7 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 func TestObjectsListByIncomingRefDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.ObjectsListByIncomingRef(context.Background(), testGK, 1, "owned_by")
+	_, err := store.ObjectsListByIncomingEdge(context.Background(), testGK, 1, "owned_by")
 	require.Error(t, err)
 }
 
@@ -2603,7 +2603,7 @@ func TestRefsAddEndpointReadDBError(t *testing.T) {
 	b := newRefObject(t, store)
 	dropObjects(t, store)
 
-	_, err := store.RefsAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, beehive.ErrNotFound, "a dropped table is not a missing endpoint")
 }
@@ -2619,26 +2619,26 @@ func TestRefsAddInsertDBError(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE refs`)
 	require.NoError(t, err)
 
-	_, err = store.RefsAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	_, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
 	require.Error(t, err)
 }
 
 func TestRefsAddDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	require.Error(t, addRef(context.Background(), store, 1, 2, "depends_on"))
+	require.Error(t, addEdge(context.Background(), store, 1, 2, "depends_on"))
 }
 
 func TestDeleteRefDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	require.Error(t, store.RefsDelete(context.Background(), 1, 2, "depends_on"))
+	require.Error(t, store.EdgesDelete(context.Background(), 1, 2, "depends_on"))
 }
 
 func TestRefsListIncomingDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.RefsListIncoming(context.Background(), 1, "depends_on")
+	_, err := store.EdgesListIncoming(context.Background(), 1, "depends_on")
 	require.Error(t, err)
 }
 
@@ -3169,7 +3169,7 @@ func blockObjectUpdates(t *testing.T, store *sqliteStore) {
 }
 
 // blockRefInserts makes every INSERT into refs abort while leaving the endpoint
-// read and the stamp UPDATE alone, isolating RefsAdd's final statement.
+// read and the stamp UPDATE alone, isolating EdgesAdd's final statement.
 func blockRefInserts(t *testing.T, store *sqliteStore) {
 	t.Helper()
 	_, err := store.db.ExecContext(context.Background(), `
@@ -3295,7 +3295,7 @@ func TestDeletionRequestsCreateFromOwnerChildMarkError(t *testing.T) {
 	ctx := context.Background()
 	owner := newRefObject(t, store)
 	child := newRefObject(t, store)
-	require.NoError(t, addRef(ctx, store, child.ID, owner.ID, storeapi.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, storeapi.RelationOwnedBy))
 	dropSeq(t, store)
 
 	_, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
@@ -3305,14 +3305,14 @@ func TestDeletionRequestsCreateFromOwnerChildMarkError(t *testing.T) {
 func TestListOutgoingRefsDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.RefsListOutgoing(context.Background(), 1)
+	_, err := store.EdgesListOutgoing(context.Background(), 1)
 	require.Error(t, err)
 }
 
 func TestHasIncomingRefsDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.RefsHasIncoming(context.Background(), 1)
+	_, err := store.EdgesHasIncoming(context.Background(), 1)
 	require.Error(t, err)
 }
 
@@ -3324,18 +3324,18 @@ func TestRefsGroupIncomingByID(t *testing.T) {
 	depB := newRefObject(t, store)
 	loner := newRefObject(t, store) // points at target via owned_by, not depends_on
 
-	require.NoError(t, addRef(ctx, store, depA.ID, target.ID, beehive.RelationDependsOn))
-	require.NoError(t, addRef(ctx, store, depB.ID, target.ID, beehive.RelationDependsOn))
-	require.NoError(t, addRef(ctx, store, loner.ID, target.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, depA.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, depB.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, loner.ID, target.ID, beehive.RelationOwnedBy))
 
-	got, err := store.RefsGroupIncomingByID(ctx,
+	got, err := store.EdgesGroupIncomingByID(ctx,
 		[]beehive.ObjectID{target.ID, depA.ID}, beehive.RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{depA.ID, depB.ID}, refIDs(got[target.ID]))
 	_, ok := got[depA.ID]
 	assert.False(t, ok, "a target with no inbound depends_on is absent from the map")
 
-	empty, err := store.RefsGroupIncomingByID(ctx, nil, beehive.RelationDependsOn)
+	empty, err := store.EdgesGroupIncomingByID(ctx, nil, beehive.RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 }
@@ -3344,16 +3344,16 @@ func TestRefsByIDsDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 	ctx := context.Background()
-	_, err := store.RefsGroupOutgoingByID(ctx, []beehive.ObjectID{1}, beehive.RelationOwnedBy)
+	_, err := store.EdgesGroupOutgoingByID(ctx, []beehive.ObjectID{1}, beehive.RelationOwnedBy)
 	require.Error(t, err)
-	_, err = store.RefsGroupIncomingByID(ctx, []beehive.ObjectID{1}, beehive.RelationDependsOn)
+	_, err = store.EdgesGroupIncomingByID(ctx, []beehive.ObjectID{1}, beehive.RelationDependsOn)
 	require.Error(t, err)
 }
 
 func TestListOutgoingRefsByRelationDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.RefsListOutgoingByRelation(context.Background(), 1, beehive.RelationOwnedBy)
+	_, err := store.EdgesListOutgoingByRelation(context.Background(), 1, beehive.RelationOwnedBy)
 	require.Error(t, err)
 }
 
@@ -3384,7 +3384,7 @@ func TestDeletionRequestsList(t *testing.T) {
 	require.NoError(t, err)
 	// The kind rides along so the sweeper can route on it: a registered kind is
 	// enqueued for its controller, a client-only kind collected directly.
-	assert.Equal(t, []storeapi.Referrer{
+	assert.Equal(t, []storeapi.ObjectRef{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: other.ID, Group: otherGK.Group, Kind: otherGK.Kind},

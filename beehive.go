@@ -412,7 +412,7 @@ func (bh *Beehive) dependentsWake(ctx context.Context, batch []ObjectWrite) {
 	if len(ids) == 0 {
 		return
 	}
-	byTarget, err := bh.store.RefsGroupIncomingByID(ctx, ids, RelationDependsOn)
+	byTarget, err := bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		// Shutdown cancels this same ctx, so a change already dequeued when Stop
 		// lands fails here for no reason of its own. Escalating would arm a full

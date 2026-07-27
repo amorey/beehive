@@ -121,13 +121,13 @@ type ControllerClient[Status any] interface {
 	// presence: false with a nil error when the object has no owner. The lazy
 	// counterpart to a reconciler's LoadOwner default.
 	OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
-	// RefsHasIncoming reports whether any object with a live claim still points at id:
+	// EdgesHasIncoming reports whether any object with a live claim still points at id:
 	// an owned child, or a dependent that is not itself being deleted. A dependent
 	// that is itself finalizing is excluded — it's going away and no longer has a
 	// claim. A finalizer can gate teardown on this: a controller holding a shared
 	// resource clears its finalizer only once nothing with a live claim references
 	// the object, so the resource outlives its last real user.
-	RefsHasIncoming(ctx context.Context, id ObjectID) (bool, error)
+	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
 	// UpdateStatus records status and the generation this reconcile observed.
 	// Status that marshals to the stored bytes writes nothing: no
 	// resource_version bump and no Modified event, so a controller can report
@@ -218,17 +218,17 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 
 // DependenciesAdd implements the contract documented on ControllerClient. The
 // relation is always "depends_on" (owner edges come from WithOwner at create
-// time). Both writes — the edge and the durable wake stamp — live inside RefsAdd,
+// time). Both writes — the edge and the durable wake stamp — live inside EdgesAdd,
 // which is atomic on its own, so the Within here is not what makes either safe;
 // it is only the seam for this method's own composition, joining a controller's
 // Within when nested rather than opening a second transaction.
 //
 // They are in the store rather than sequenced here precisely because a nested
-// Within unwinds nothing: a stamp issued as a second call after RefsAdd returned
+// Within unwinds nothing: a stamp issued as a second call after EdgesAdd returned
 // would leave a caller who handles this method's error free to commit the edge
 // without it — a dependent stranded on a stale read, which is the race this
 // method exists to close. Ordering inside one store call is the guarantee (see
-// RefsAdd), and WakeStamped reports what it did rather than having the conjunction
+// EdgesAdd), and WakeStamped reports what it did rather than having the conjunction
 // recomputed here, where the two halves could drift apart.
 //
 // The wake is a conjunction — the edge is new *and* the target moved — and both
@@ -253,7 +253,7 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 		// The store rejects a version above the target's own before it inserts (see
 		// ErrTargetResourceVersionFuture), so a bad claim leaves no edge regardless
 		// of whose transaction this is running in.
-		res, err := c.bh.store.RefsAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
+		res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
 		if err != nil {
 			return err
 		}
@@ -273,7 +273,7 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 
 func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
 	return c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if err := c.bh.store.RefsDelete(ctx, fromID, toID, RelationDependsOn); err != nil {
+		if err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn); err != nil {
 			return err
 		}
 		// Removing the edge can unblock toID's physical deletion (refs are RESTRICT).
@@ -292,37 +292,37 @@ func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, f
 			return err
 		}
 		if target.DeletionRequestedAt != nil {
-			wakes.targets = append(wakes.targets, Referrer{ID: toID, Group: target.Group, Kind: target.Kind})
+			wakes.targets = append(wakes.targets, Ref{ID: toID, Group: target.Group, Kind: target.Kind})
 		}
 		return nil
 	})
 }
 
-// RefsHasIncoming reports whether anything still claims id. It is a plain read that
+// EdgesHasIncoming reports whether anything still claims id. It is a plain read that
 // commits on its own; to gate a write on it atomically — e.g. clearing a finalizer
 // only if nothing references the object — a controller runs both inside Within, so
 // the read and the write share one transaction snapshot.
 // OwnersGet/DependenciesList/DependentsList/OwnedList read ref edges directly,
-// like RefsHasIncoming above — no kind-scoping, since a controller reasons about
+// like EdgesHasIncoming above — no kind-scoping, since a controller reasons about
 // its own object's relationships.
 func (c *controllerClientImpl[Status]) OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
 
 func (c *controllerClientImpl[Status]) DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.RefsListOutgoingByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) DependentsList(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.RefsListIncoming(ctx, id, RelationDependsOn)
+	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) OwnedList(ctx context.Context, id ObjectID) ([]Ref, error) {
-	return c.bh.store.RefsListIncoming(ctx, id, RelationOwnedBy)
+	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
 }
 
-func (c *controllerClientImpl[Status]) RefsHasIncoming(ctx context.Context, id ObjectID) (bool, error) {
-	return c.bh.store.RefsHasIncoming(ctx, id)
+func (c *controllerClientImpl[Status]) EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error) {
+	return c.bh.store.EdgesHasIncoming(ctx, id)
 }
 
 // Within opens a transaction and runs fn under it; the ControllerClient writes fn

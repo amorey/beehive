@@ -278,7 +278,7 @@ func TestDependencyRequeue(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, "depends_on"))
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
 	_, err = store.ConditionsSet(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
@@ -629,14 +629,14 @@ type blockingDepsStore struct {
 	release chan struct{} // close to let the waker proceed to enqueueIfRegistered
 }
 
-func (s *blockingDepsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+func (s *blockingDepsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Ref, error) {
 	s.entered <- struct{}{}
 	<-s.release
 	// One referrer for an unregistered kind: enough to make the waker re-enter
 	// bh.mu via enqueueIfRegistered (the registration check happens after Lock).
-	out := map[ObjectID][]Referrer{}
+	out := map[ObjectID][]Ref{}
 	for _, id := range toIDs {
-		out[id] = []Referrer{{ID: 1, Kind: "Widget"}}
+		out[id] = []Ref{{ID: 1, Kind: "Widget"}}
 	}
 	return out, nil
 }
@@ -693,7 +693,7 @@ type recordingDepsStore struct {
 	calls chan ObjectID
 }
 
-func (s *recordingDepsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+func (s *recordingDepsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Ref, error) {
 	for _, id := range toIDs {
 		s.calls <- id
 	}
@@ -752,15 +752,15 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 // one query rather than one per target.
 type depsStore struct {
 	fakeStore
-	deps  map[ObjectID][]Referrer
+	deps  map[ObjectID][]Ref
 	calls atomic.Int64
 	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *depsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Referrer, error) {
+func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]Ref, error) {
 	s.calls.Add(1)
 	s.seen = append(s.seen, slices.Clone(toIDs))
-	out := make(map[ObjectID][]Referrer, len(toIDs))
+	out := make(map[ObjectID][]Ref, len(toIDs))
 	for _, id := range toIDs {
 		if deps, ok := s.deps[id]; ok {
 			out[id] = deps
@@ -774,7 +774,7 @@ func (s *depsStore) RefsGroupIncomingByID(_ context.Context, toIDs []ObjectID, _
 // work queue, so a caller can assert which kind's queue a wake landed in.
 // newWorkQueue leaves onSchedule nil, so nothing reaches the reconcilers' unset
 // scheduleHub.
-func wakerFixture(deps map[ObjectID][]Referrer, kinds ...GroupKind) (*Beehive, *depsStore, map[GroupKind]*reconciler) {
+func wakerFixture(deps map[ObjectID][]Ref, kinds ...GroupKind) (*Beehive, *depsStore, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	for _, gk := range kinds {
 		rs[gk] = &reconciler{gk: gk, work: newWorkQueue()}
@@ -801,7 +801,7 @@ func changed(ids ...ObjectID) []ObjectWrite {
 // TODO.md covers the shape this guard does not fix.
 func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 1, Kind: "Widget"}}}, gk)
+	bh, _, rs := wakerFixture(map[ObjectID][]Ref{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
 	bh.dependentsWake(context.Background(), changed(1))
 
@@ -818,12 +818,12 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	widget := GroupKind{Kind: "Widget"}
 	gadget := GroupKind{Kind: "Gadget"}
 	// The self-edge is first: a return guard drops the two behind it.
-	deps := []Referrer{
+	deps := []Ref{
 		{ID: 1, Kind: "Widget"},
 		{ID: 2, Kind: "Widget"},
 		{ID: 3, Kind: "Gadget"},
 	}
-	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{1: deps}, widget, gadget)
+	bh, _, rs := wakerFixture(map[ObjectID][]Ref{1: deps}, widget, gadget)
 
 	bh.dependentsWake(context.Background(), changed(1))
 
@@ -845,11 +845,11 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
-	bhA, _, rsA := wakerFixture(map[ObjectID][]Referrer{1: {{ID: 2, Kind: "Widget"}}}, gk)
+	bhA, _, rsA := wakerFixture(map[ObjectID][]Ref{1: {{ID: 2, Kind: "Widget"}}}, gk)
 	bhA.dependentsWake(context.Background(), changed(1))
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
-	bhB, _, rsB := wakerFixture(map[ObjectID][]Referrer{2: {{ID: 1, Kind: "Widget"}}}, gk)
+	bhB, _, rsB := wakerFixture(map[ObjectID][]Ref{2: {{ID: 1, Kind: "Widget"}}}, gk)
 	bhB.dependentsWake(context.Background(), changed(2))
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
@@ -860,7 +860,7 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 // requeues the object through wakeAfterCommit, independently of any edge.
 //
 // It cannot detect a guard mis-implemented as a self-edge filter in
-// RefsListIncoming — that path never consults refs, so this test stays green
+// EdgesListIncoming — that path never consults refs, so this test stays green
 // while the read API silently loses the edge. TestClientListDependentsIncludesSelfEdge
 // is what catches that; this one only pins the wake.
 func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
@@ -879,7 +879,7 @@ func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, gk)
 	obj, err := client.Create(ctx, cSpec{Val: "a"})
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, store, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -906,7 +906,7 @@ func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], ob
 // errDepsStore returns an error from the refs lookup.
 type errDepsStore struct{ fakeStore }
 
-func (*errDepsStore) RefsGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
 	return nil, errBoom
 }
 
@@ -1870,7 +1870,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 // mutator); the returned count always reads the real store underneath it.
 // reconcilePendingWakeHarness returns the pieces the durable-wake tests need,
 // including owe: seeding an owed wake goes through the concrete store, since
-// WakesIncrement is deliberately absent from the Store interface (RefsAdd is
+// WakesIncrement is deliberately absent from the Store interface (EdgesAdd is
 // production's only producer). A closure rather than the store itself because the
 // concrete type is unexported in package sqlite and so cannot be named here.
 func reconcilePendingWakeHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
@@ -3196,7 +3196,7 @@ func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
 // per-change is what keeps a hot kind from taxing them.
 func TestWakeDependentsBatchOneQuery(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, store, rs := wakerFixture(map[ObjectID][]Referrer{
+	bh, store, rs := wakerFixture(map[ObjectID][]Ref{
 		1: {{ID: 10, Kind: "Widget"}},
 		2: {{ID: 20, Kind: "Widget"}},
 		3: {{ID: 30, Kind: "Widget"}},
@@ -3214,7 +3214,7 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 // single connection, and a repeated dependent is a wasted reconcile.
 func TestWakeDependentsBatchDedups(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, store, rs := wakerFixture(map[ObjectID][]Referrer{
+	bh, store, rs := wakerFixture(map[ObjectID][]Ref{
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
@@ -3231,7 +3231,7 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 // by 1's change while being skipped for its own.
 func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, _, rs := wakerFixture(map[ObjectID][]Referrer{
+	bh, _, rs := wakerFixture(map[ObjectID][]Ref{
 		1: {{ID: 2, Kind: "Widget"}},
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)
@@ -3303,7 +3303,7 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	target, err := NewClient[tSpec, tStatus](bh, clientOnlyGK).Create(ctx, tSpec{})
 	require.NoError(t, err)
 	awaitReconcile(t, reconciled, dep.ID, "the dependent's creation reconcile did not run")
-	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	_, err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
@@ -3330,7 +3330,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	// subscribe time could have named it.
 	target, err := NewClient[tSpec, tStatus](bh, clientOnlyGK).Create(ctx, tSpec{})
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	_, err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
@@ -3359,7 +3359,7 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	target, err := targetClient.Create(ctx, tSpec{})
 	require.NoError(t, err)
 	awaitReconcile(t, reconciled, dep.ID, "the dependent's creation reconcile did not run")
-	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	require.NoError(t, targetClient.Delete(ctx, target.ID))
 	awaitReconcile(t, reconciled, dep.ID,
@@ -3367,7 +3367,7 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
-	require.NoError(t, store.RefsDelete(ctx, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn))
 	_, err = bh.gcCollect(ctx, target.ID)
 	require.NoError(t, err)
 	_, err = store.ObjectsGet(ctx, target.ID)

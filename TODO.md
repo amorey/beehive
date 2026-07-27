@@ -45,7 +45,7 @@ tell "we decided against this for now" from "nobody thought of it."
   way and this entry should not pretend otherwise — a self-edge requires naming
   your own id, whereas a mutual dependency is what two independently-written
   controllers fall into with neither author seeing both halves, which is why
-  `RefsDeleteFinalizingDependsOn` exists at all. Whether beehive should support
+  `EdgesDeleteFinalizingDependsOn` exists at all. Whether beehive should support
   cycles is also unsettled, which is a reason not to guard hastily.
 
   **Each candidate has its own tripwire, because no one test constrains both.**
@@ -146,7 +146,7 @@ tell "we decided against this for now" from "nobody thought of it."
   simply a level-triggered no-op re-pass on a value D already saw.
 
   **What is missing is durability.** This wake is in-memory only. `pending_wake`
-  covers the *declare* window (`RefsAdd` stamps when a new edge's caller-supplied
+  covers the *declare* window (`EdgesAdd` stamps when a new edge's caller-supplied
   target version is already stale) and nothing else, so an ordinary target-change
   wake has no persisted "reconcile owed". A crash between T's commit and D's
   re-dispatch loses it: D settled at its own generation, so no owed-work listing
@@ -175,7 +175,7 @@ tell "we decided against this for now" from "nobody thought of it."
   Deferred as a *durable* fix because it is not local to this timing. Stamping
   `pending_wake` in `dependentsWake` would make every target change a write per
   dependent on the wake path — the cost `pending_wake` avoids today by riding a
-  write `RefsAdd` was already doing — and the decrement is per-pass, so a
+  write `EdgesAdd` was already doing — and the decrement is per-pass, so a
   stamp-per-change would need the same count-not-flag reasoning re-derived against
   a much higher write volume. The `observed_cursor` watermark stays the recorded
   alternative that would make it durable under *any* configuration: it re-derives
@@ -187,14 +187,14 @@ tell "we decided against this for now" from "nobody thought of it."
   rows when resync is off** — known, not fixed. The ownership mirror of the
   `DependenciesAdd` race above: there the edge is declared after the *change*, here
   after the *cascade*. `insertObject` checks nothing about the owner's lifecycle, and
-  `RefsAdd` only verifies both endpoints exist — never that the target is live — so a
+  `EdgesAdd` only verifies both endpoints exist — never that the target is live — so a
   child created against an owner that is already deletion-pending, and whose
   `DeletionRequestsCreateFromOwner` pass has already run, is born live and unmarked under a
   finalizing owner. Its `owned_by` edge is an unconditional live claim in
-  `RefsHasIncoming` (only deletion-pending `depends_on` sources are excluded), so the
+  `EdgesHasIncoming` (only deletion-pending `depends_on` sources are excluded), so the
   owner can never be physically collected.
 
-  Nothing event-driven recovers it. `RefsAdd` bumps no `resource_version` and emits
+  Nothing event-driven recovers it. `EdgesAdd` bumps no `resource_version` and emits
   nothing, so no watcher fires; `dependentsWake` reads only `depends_on` and would
   ignore the edge regardless; the child's own `collect` returns at the
   `DeletionRequestedAt == nil` early-out because *it* is not finalizing; and the owner
@@ -232,8 +232,8 @@ tell "we decided against this for now" from "nobody thought of it."
   above wearing a different hat.
 
   Whichever is chosen, the owner's `DeletionRequestedAt` is already on the row
-  `RefsAdd` reads for its endpoint check — the same check that reports
-  `TargetResourceVersion` for the dependency guard. Adding it to `RefsAddResult`
+  `EdgesAdd` reads for its endpoint check — the same check that reports
+  `TargetResourceVersion` for the dependency guard. Adding it to `EdgesAddResult`
   would let `insertObject` see the owner's lifecycle from the write it already
   makes, rather than a second read, exactly as `DependenciesAdd` reads the target's
   version from that one call.
@@ -264,7 +264,7 @@ tell "we decided against this for now" from "nobody thought of it."
   entry nobody harvests.
 
   **Gating the stamp on registration is the wrong fix**, and is why it wasn't taken.
-  The stamp is SQL inside `RefsAdd` (it has to be, for the ordering guarantee the
+  The stamp is SQL inside `EdgesAdd` (it has to be, for the ordering guarantee the
   nested-`Within` contract forces), and the store cannot know which kinds are
   registered — so the caller would have to resolve `fromID`'s kind before every
   declare, which is exactly the per-call pre-read that sank the original wake guard,
@@ -390,16 +390,16 @@ tell "we decided against this for now" from "nobody thought of it."
   caller propagating it to the real `Within` rolls anything back, and a caller that
   logs and carries on commits every write that already landed. Any method
   performing two writes is therefore atomic only by the grace of its callers:
-  `ControllerClient.DependenciesDelete` (the `RefsDelete` plus its GC re-check), any
+  `ControllerClient.DependenciesDelete` (the `EdgesDelete` plus its GC re-check), any
   controller's own two-write `Within` block, and — until it was restructured —
   `DependenciesAdd`.
 
   That last one is the worked example. Its durable wake stamp used to be a second
-  store call sequenced after `RefsAdd`; a reviewer pointed out that a caller
+  store call sequenced after `EdgesAdd`; a reviewer pointed out that a caller
   swallowing the stamp's error would commit the edge with neither the stamp nor the
   requeue, which is exactly the stranded-dependent race the edge's version claim
   exists to close. The fix was local and ordering-based: fold the stamp into
-  `RefsAdd` ahead of the insert, so the only write that can fail after the edge
+  `EdgesAdd` ahead of the insert, so the only write that can fail after the edge
   exists is none. That is the same trick `ErrTargetResourceVersionFuture` already
   used, and it works precisely because there were two writes and one could be moved.
   It does not generalize — reorder anything whose second write depends on the first
@@ -465,7 +465,7 @@ tell "we decided against this for now" from "nobody thought of it."
   `ObjectWrite{ID, Type}` rather than `RawObjectChange`, because it sees every write in
   the process and an undelivered `*RawObject` pins that row's blobs; and its
   feeder drains the receiver with `TryRecv`, so a burst costs one
-  `RefsGroupIncomingByID` rather than one `RefsListIncoming` per change — the
+  `EdgesGroupIncomingByID` rather than one `EdgesListIncoming` per change — the
   store is single-connection, so the waker's reads serialize against every
   writer. Draining at the receiver rather than through a buffered channel is what
   keeps conflation alive to the handoff.
@@ -475,7 +475,7 @@ tell "we decided against this for now" from "nobody thought of it."
   for every kind. Two `Beehive`s on one store each observe the other's kinds —
   filtered correctly, but paid for in refs queries. And **the single waker
   goroutine is a process-wide head-of-line block**: K independent wakers became
-  one, so a slow `RefsGroupIncomingByID` — which queues behind writers on the
+  one, so a slow `EdgesGroupIncomingByID` — which queues behind writers on the
   single connection — now delays wakes for *every* kind, where before it delayed
   only its own. Batching was the agreed mitigation and it bounds throughput
   (O(bursts) queries, not O(changes)), but it does not bound *latency*: a batch
@@ -550,7 +550,7 @@ tell "we decided against this for now" from "nobody thought of it."
   than warning about it, and reverses the decision recorded below (see that entry).
 
   **GC routes rather than collects.** `ListAllDeletionPendingIDs` became
-  `DeletionRequestsList`, returning `[]Referrer`, because the sweeper needs each
+  `DeletionRequestsList`, returning `[]ObjectRef`, because the sweeper needs each
   row's kind: `collect` cannot clear a finalizer (it cascades, then returns while
   any remain), so a registered kind must be *enqueued* for its controller and only
   a client-only kind collected directly. That let `enqueueDeletionPending` and
@@ -561,7 +561,7 @@ tell "we decided against this for now" from "nobody thought of it."
   **The waker's three loss points**, all now logged at Warn and all repaired by
   escalating the *catchup* ticker (not resync, which is off by default — a repair
   hung off an opt-in knob would be dead where it is needed most): a failed
-  `RefsGroupIncomingByID` arms one full pass (it cannot be narrower — the lookup that
+  `EdgesGroupIncomingByID` arms one full pass (it cannot be narrower — the lookup that
   failed is what would have named the dependents); a closed change stream and a
   failed subscription each force every later pass, since they keep dropping changes
   rather than having dropped one. `Beehive.resyncKindsNextTick`/`EveryTick` fan out
@@ -719,8 +719,8 @@ tell "we decided against this for now" from "nobody thought of it."
 
   The fix increments `objects.pending_wake` under the same edge-new ∧ target-moved
   conjunction that fires the wake — so the durable record and the edge commit
-  together. It lives *inside* `RefsAdd` and *before* the insert, reporting through
-  `RefsAddResult.WakeStamped`; as a second store call after `RefsAdd` returned it was
+  together. It lives *inside* `EdgesAdd` and *before* the insert, reporting through
+  `EdgesAddResult.WakeStamped`; as a second store call after `EdgesAdd` returned it was
   not actually indivisible from the edge, since a nested `Within` unwinds nothing
   (see "A nested `Within` is not a rollback boundary" above, which records both the
   reviewer's finding and why the general fix was not taken). The stamp is

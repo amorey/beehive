@@ -239,7 +239,7 @@ type Object[Spec, Status any] struct {
     // Load options) and reached through the accessors below — never as fields.
 }
 
-type Ref = storeapi.Referrer // { ID ObjectID; Group, Kind string }
+type Ref = storeapi.ObjectRef // { ID ObjectID; Group, Kind string }
 ```
 
 The secondary-lookup data is filled only when the read asked for it. Read it through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty. These are bare accessors, with no verb to add: cardinality is in the return type, `(Ref, bool, error)` for the at-most-one owner against `([]Ref, error)` for the rest.
@@ -472,7 +472,7 @@ type ControllerClient[Status any] interface {
     FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
     DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
     DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
-    RefsHasIncoming(ctx context.Context, id ObjectID) (bool, error)
+    EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
     // Lazy secondary lookups, for reading an object's edges during reconcile.
     OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
     DependenciesList(ctx context.Context, id ObjectID) ([]Ref, error)
@@ -490,9 +490,9 @@ So `ObservedAt` records **when the object settled at `ObservedGeneration`**, not
 
 → [ADR: the generation handshake and content no-ops](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md), for how the no-op splits the two halves of the write and why it is gated on the schema version.
 
-`OwnersGet`/`DependenciesList`/`DependentsList`/`OwnedList` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `OwnersGet` returns the owner via `owned_by`, `OwnedList` the inverse (the owner's children); `DependentsList` is the inverse of `DependenciesList` over `depends_on`. Distinct from `RefsHasIncoming`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `DependentsList`.
+`OwnersGet`/`DependenciesList`/`DependentsList`/`OwnedList` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `OwnersGet` returns the owner via `owned_by`, `OwnedList` the inverse (the owner's children); `DependentsList` is the inverse of `DependenciesList` over `depends_on`. Distinct from `EdgesHasIncoming`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `DependentsList`.
 
-`RefsHasIncoming` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
+`EdgesHasIncoming` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
 `EventsRecord` appends an observation to the object's event log — see [Event](#event). Like `ConditionsSet` it is a scoped, transactional write (kind-folded; `ErrWrongKind` for a foreign id) and composes inside `Within`, so a controller can record an observation and flip a condition in one atomic step.
 

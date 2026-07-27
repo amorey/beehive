@@ -141,7 +141,7 @@ func (s *fakeStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, erro
 func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.Referrer, error) {
+func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
 func (s *fakeStore) WakesListPendingIDs(context.Context, GroupKind) ([]ObjectID, error) {
@@ -174,7 +174,7 @@ func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, strin
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")
 }
-func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
 func (s *fakeStore) EventsRecord(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
@@ -189,34 +189,34 @@ func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEven
 func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
 	panic("not implemented: fakeStore.EventsSweep")
 }
-func (s *fakeStore) RefsAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.RefsAddResult, error) {
-	panic("not implemented: fakeStore.RefsAdd")
+func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.EdgesAddResult, error) {
+	panic("not implemented: fakeStore.EdgesAdd")
 }
-func (s *fakeStore) RefsDelete(context.Context, ObjectID, ObjectID, Relation) error {
-	panic("not implemented: fakeStore.RefsDelete")
+func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
+	panic("not implemented: fakeStore.EdgesDelete")
 }
-func (s *fakeStore) RefsListIncoming(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *fakeStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return nil, nil
 }
-func (s *fakeStore) RefsGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) RefsListOutgoing(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) RefsListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) RefsGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.Referrer, error) {
+func (s *fakeStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
 	return nil, nil
 }
-func (s *fakeStore) RefsDeleteFinalizingDependsOn(context.Context, ObjectID) error {
+func (s *fakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
 	return nil
 }
-func (s *fakeStore) RefsHasIncoming(context.Context, ObjectID) (bool, error) {
+func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 
@@ -388,18 +388,18 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 	return Result{}, nil
 }
 
-// addRef declares an edge for test scaffolding: it discards the endpoint metadata
-// RefsAdd reports and passes no version claim (0), so the common
-// require.NoError(t, addRef(...)) shape stays a one-liner. Tests that assert on
-// the RefsAddResult, or on the version guard, call the method directly.
-func addRef(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
-	_, err := store.RefsAdd(ctx, from, to, relation, 0)
+// addEdge declares an edge for test scaffolding: it discards the endpoint metadata
+// EdgesAdd reports and passes no version claim (0), so the common
+// require.NoError(t, addEdge(...)) shape stays a one-liner. Tests that assert on
+// the EdgesAddResult, or on the version guard, call the method directly.
+func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
+	_, err := store.EdgesAdd(ctx, from, to, relation, 0)
 	return err
 }
 
-// refObjectIDs projects a Ref/Referrer slice to its ids, for assertions that care
+// refObjectIDs projects a Ref/Ref slice to its ids, for assertions that care
 // which objects are on the far end of an edge rather than how they were reached.
-// Ref and Referrer are both aliases of storeapi.Referrer, so one projection serves
+// Ref and Ref are both aliases of storeapi.ObjectRef, so one projection serves
 // the owner/dependency lookups and the incoming-ref lookups alike.
 func refObjectIDs(refs []Ref) []ObjectID {
 	var ids []ObjectID
@@ -427,19 +427,19 @@ type wakeProbeStore struct {
 	looked   chan struct{} // one send per targetID depends_on lookup
 }
 
-func (s *wakeProbeStore) RefsListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error) {
-	refs, err := s.Store.RefsListIncoming(ctx, toID, relation)
+func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]Ref, error) {
+	refs, err := s.Store.EdgesListIncoming(ctx, toID, relation)
 	if toID == s.targetID {
 		s.note(relation)
 	}
 	return refs, err
 }
 
-// RefsGroupIncomingByID is the waker's own lookup (it resolves a whole batch of
+// EdgesGroupIncomingByID is the waker's own lookup (it resolves a whole batch of
 // changed targets in one query), so the probe has to cover it too — otherwise a
 // test waiting on "the waker looked" would wait forever.
-func (s *wakeProbeStore) RefsGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error) {
-	refs, err := s.Store.RefsGroupIncomingByID(ctx, toIDs, relation)
+func (s *wakeProbeStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Ref, error) {
+	refs, err := s.Store.EdgesGroupIncomingByID(ctx, toIDs, relation)
 	if slices.Contains(toIDs, s.targetID) {
 		s.note(relation)
 	}
@@ -525,7 +525,7 @@ func (s *listProbeStore) WakesListPendingIDs(ctx context.Context, gk GroupKind) 
 	return ids, err
 }
 
-func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.Referrer, error) {
+func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
 	rows, err := s.Store.DeletionRequestsList(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err

@@ -23,7 +23,7 @@ import "context"
 // ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
 // runs on one goroutine, so the slice needs no locking.
 type pendingWakes struct {
-	targets []Referrer
+	targets []Ref
 }
 
 type pendingWakesKey struct{}
@@ -63,7 +63,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 	// cascaded children, plus (when the row is removed) the targets it was holding
 	// open. Waking post-commit means a rollback never leaves a phantom enqueue,
 	// matching the dependency waker's post-commit pattern.
-	var toWake []Referrer
+	var toWake []Ref
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
 		obj, err := bh.store.ObjectsGetMeta(ctx, id)
 		if err != nil {
@@ -90,12 +90,12 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// depends_on edges before the referrer gate, or two deletion-pending objects
 		// that depend on each other (or a self-dependency) would each hold the
 		// other's RESTRICT forever. owned_by edges are left for the cascade.
-		if err := bh.store.RefsDeleteFinalizingDependsOn(ctx, id); err != nil {
+		if err := bh.store.EdgesDeleteFinalizingDependsOn(ctx, id); err != nil {
 			return err
 		}
 		// Still referenced (owned children or live dependents): RESTRICT forbids the
 		// delete. Leave the row; a referrer's own removal will wake us (below).
-		referenced, err := bh.store.RefsHasIncoming(ctx, id)
+		referenced, err := bh.store.EdgesHasIncoming(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -107,7 +107,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// unblock a deletion-pending target RESTRICT was holding. Capture those
 		// targets before the delete so we can wake them — the event-driven path that
 		// lets a cascade finish without waiting on the next GC sweep.
-		referents, err := bh.store.RefsListOutgoing(ctx, id)
+		referents, err := bh.store.EdgesListOutgoing(ctx, id)
 		if err != nil {
 			return err
 		}

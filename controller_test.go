@@ -349,44 +349,44 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID, to.ResourceVersion))
-	deps, err := bh.store.RefsListIncoming(ctx, to.ID, RelationDependsOn)
+	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
-	assert.Equal(t, []Referrer{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
+	assert.Equal(t, []Ref{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
 	require.NoError(t, cc.DependenciesDelete(ctx, from.ID, to.ID))
-	deps, err = bh.store.RefsListIncoming(ctx, to.ID, RelationDependsOn)
+	deps, err = bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
 
-// addRefTxTrackingStore records whether the ref insert ran inside a Within call,
+// edgesAddTxTrackingStore records whether the ref insert ran inside a Within call,
 // so a test can assert DependenciesAdd wraps its endpoint check + insert in one
 // transaction. Accessed only from the test goroutine, so it needs no locking.
-type addRefTxTrackingStore struct {
+type edgesAddTxTrackingStore struct {
 	Store
 	depth      int
 	addRefInTx bool
 }
 
-func (s *addRefTxTrackingStore) Within(ctx context.Context, fn func(context.Context) error) error {
+func (s *edgesAddTxTrackingStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	s.depth++
 	defer func() { s.depth-- }()
 	return s.Store.Within(ctx, fn)
 }
 
-func (s *addRefTxTrackingStore) RefsAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.RefsAddResult, error) {
+func (s *edgesAddTxTrackingStore) EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.EdgesAddResult, error) {
 	s.addRefInTx = s.depth > 0
-	return s.Store.RefsAdd(ctx, fromID, toID, relation, targetRV)
+	return s.Store.EdgesAdd(ctx, fromID, toID, relation, targetRV)
 }
 
 // TestControllerClientAddDependencyIsTransactional pins that DependenciesAdd runs its
 // endpoint existence check and the ref insert in one transaction (like
-// DependenciesDelete). RefsAdd checks then inserts as separate statements, so without
+// DependenciesDelete). EdgesAdd checks then inserts as separate statements, so without
 // the transaction a delete interleaving between them would leak a raw FK error
 // instead of the store's ErrNotFound contract.
 func TestControllerClientAddDependencyIsTransactional(t *testing.T) {
 	ctx := context.Background()
-	tracking := &addRefTxTrackingStore{Store: newClientTestStore(t)}
+	tracking := &edgesAddTxTrackingStore{Store: newClientTestStore(t)}
 	bh, err := New(tracking)
 	require.NoError(t, err)
 
@@ -454,7 +454,7 @@ type declareFixture struct {
 	// change: the waker requeues from its own lookup's results, so the witness
 	// reconciling is an effect that cannot precede that lookup — and it proves dep
 	// was absent from it. Watching the lookup itself cannot show that; a probe on
-	// RefsListIncoming sees a call, not which change it is for, so one already in
+	// EdgesListIncoming sees a call, not which change it is for, so one already in
 	// flight is indistinguishable from the one under test.
 	witness    *Object[tSpec, tStatus]
 	reconciled chan *Object[tSpec, tStatus] // dep's kind only
@@ -492,7 +492,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 	require.NoError(t, err)
 	// Declared straight through the store: the witness's edge is scaffolding, not a
 	// use of the guard under test.
-	require.NoError(t, addRef(ctx, store, f.witness.ID, f.target.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, f.witness.ID, f.target.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -587,7 +587,7 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 	err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1)
 	require.ErrorIs(t, err, ErrTargetResourceVersionFuture)
 
-	refs, err := f.store.RefsListIncoming(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration leaves no edge")
 	f.requireNotRequeued(t)
@@ -604,7 +604,7 @@ func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
 //
 // That the stamp *cannot* be a second call is now structural: the Store interface
 // carries no standalone increment, so nothing on this path could issue one. What
-// remains to check is the other half — that folding it into RefsAdd actually stamps —
+// remains to check is the other half — that folding it into EdgesAdd actually stamps —
 // which is what the two assertions below do: edge and wake land together.
 func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	ctx := context.Background()
@@ -629,13 +629,13 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	// Conjunction fires: new edge, target moved past stale.
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID, stale))
 
-	refs, err := real.RefsListIncoming(ctx, target.ID, RelationDependsOn)
+	refs, err := real.EdgesListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, refObjectIDs(refs), "the edge landed")
 
 	owed, err := real.WakesListPendingIDs(ctx, gk)
 	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside RefsAdd")
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
 }
 
 // TestAddDependencyRejectsFutureResourceVersionNested is the rejection's harder
@@ -655,7 +655,7 @@ func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	refs, err := f.store.RefsListIncoming(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "a rejected declaration must leave no edge, committed or not")
 }
@@ -710,13 +710,13 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errBoom)
 
-	refs, err := f.store.RefsListIncoming(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectID{f.witness.ID}, refObjectIDs(refs), "the rolled-back declaration left no edge")
 	f.requireNotRequeued(t)
 }
 
-func TestControllerClientHasIncomingRefs(t *testing.T) {
+func TestControllerClientHasIncomingEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
@@ -734,11 +734,11 @@ func TestControllerClientHasIncomingRefs(t *testing.T) {
 	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
 
-	has, err := cc.RefsHasIncoming(ctx, owner.ID)
+	has, err := cc.EdgesHasIncoming(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.True(t, has, "owner is referenced by the child")
 
-	has, err = cc.RefsHasIncoming(ctx, child.ID)
+	has, err = cc.EdgesHasIncoming(ctx, child.ID)
 	require.NoError(t, err)
 	assert.False(t, has, "nothing references the child")
 }
@@ -747,7 +747,7 @@ func TestControllerClientHasIncomingRefs(t *testing.T) {
 // status/condition/finalizer writes refuse an id belonging to another kind: a
 // controller for "Widget" must not be able to persist its Status (or mutate
 // conditions/finalizers) on a "Gadget" row, which would corrupt that kind's
-// rows. DependenciesAdd/RefsHasIncoming are intentionally cross-kind and not guarded.
+// rows. DependenciesAdd/EdgesHasIncoming are intentionally cross-kind and not guarded.
 func TestControllerClientWritesScopedToKind(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -778,34 +778,34 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	assert.Equal(t, []string{"f"}, got.Finalizers, "foreign finalizer write rejected")
 }
 
-// failHasIncomingRefsStore returns an error from RefsHasIncoming.
-type failHasIncomingRefsStore struct {
+// failEdgesHasIncomingStore returns an error from EdgesHasIncoming.
+type failEdgesHasIncomingStore struct {
 	fakeStore
 }
 
-func (s *failHasIncomingRefsStore) RefsHasIncoming(context.Context, ObjectID) (bool, error) {
+func (s *failEdgesHasIncomingStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, errBoom
 }
 
 func TestControllerClientHasIncomingRefsStoreError(t *testing.T) {
-	bh, err := New(&failHasIncomingRefsStore{})
+	bh, err := New(&failEdgesHasIncomingStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	_, err = cc.RefsHasIncoming(context.Background(), 1)
+	_, err = cc.EdgesHasIncoming(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
-// failAddRefStore returns an error from the ref insert.
-type failAddRefStore struct {
+// failEdgesAddStore returns an error from the ref insert.
+type failEdgesAddStore struct {
 	fakeStore
 }
 
-func (s *failAddRefStore) RefsAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.RefsAddResult, error) {
-	return storeapi.RefsAddResult{}, errBoom
+func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.EdgesAddResult, error) {
+	return storeapi.EdgesAddResult{}, errBoom
 }
 
 func TestControllerClientAddDependencyStoreError(t *testing.T) {
-	bh, err := New(&failAddRefStore{})
+	bh, err := New(&failEdgesAddStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
 	err = cc.DependenciesAdd(context.Background(), 1, 2, 0)
@@ -856,19 +856,19 @@ func TestControllerClientUpdateStatusStoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// failDeleteRefStore returns an error from RefsDelete (Within runs fn inline).
-type failDeleteRefStore struct {
+// failEdgesDeleteStore returns an error from EdgesDelete (Within runs fn inline).
+type failEdgesDeleteStore struct {
 	fakeStore
 }
 
-func (s *failDeleteRefStore) RefsDelete(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
 	return errBoom
 }
 
-// TestControllerClientDeleteDependencyDeleteRefError covers the RefsDelete failure
+// TestControllerClientDeleteDependencyDeleteRefError covers the EdgesDelete failure
 // branch: the edge removal itself fails, so the whole DependenciesDelete errors.
 func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
-	bh, err := New(&failDeleteRefStore{})
+	bh, err := New(&failEdgesDeleteStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
 	err = cc.DependenciesDelete(context.Background(), 1, 2)
@@ -876,7 +876,7 @@ func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 }
 
 // metaDeleteDepStore lets a DependenciesDelete test control what ObjectsGetMeta
-// returns after the edge is dropped. RefsDelete succeeds; the rest defaults to the
+// returns after the edge is dropped. EdgesDelete succeeds; the rest defaults to the
 // fakeStore (Within inline, no-ops).
 type metaDeleteDepStore struct {
 	fakeStore
@@ -884,7 +884,7 @@ type metaDeleteDepStore struct {
 	metaErr error
 }
 
-func (s *metaDeleteDepStore) RefsDelete(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *metaDeleteDepStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
 	return nil
 }
 func (s *metaDeleteDepStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
@@ -930,7 +930,7 @@ func TestControllerClientDeleteDependencyWakesFinalizingTarget(t *testing.T) {
 	wakes := &pendingWakes{}
 	ctx := withPendingWakes(context.Background(), wakes)
 	require.NoError(t, cc.DependenciesDelete(ctx, 1, 2))
-	assert.Equal(t, []Referrer{{ID: 2, Group: "g", Kind: "K"}}, wakes.targets,
+	assert.Equal(t, []Ref{{ID: 2, Group: "g", Kind: "K"}}, wakes.targets,
 		"a finalizing freed target is scheduled for a GC re-check")
 }
 
@@ -962,7 +962,7 @@ func TestControllerClientDeleteDependencyNoWakesOutsideReconcile(t *testing.T) {
 	require.NoError(t, cc.DependenciesDelete(context.Background(), 1, 2))
 }
 
-func TestControllerClientReadRefs(t *testing.T) {
+func TestControllerClientReadEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
@@ -975,7 +975,7 @@ func TestControllerClientReadRefs(t *testing.T) {
 	require.NoError(t, err)
 	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, store, child.ID, owner.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, RelationDependsOn))
 
 	ref, ok, err := cc.OwnersGet(ctx, child.ID)
 	require.NoError(t, err)

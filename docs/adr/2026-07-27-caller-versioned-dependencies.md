@@ -1,7 +1,7 @@
 # Declaring a dependency is caller-versioned, and the wake has a durable twin
 
 - **Status:** Accepted — implemented in `controller.go` (policy), `sqlite/store.go`
-  (`RefsAdd`, `pending_wake`), `reconciler.go` (drain).
+  (`EdgesAdd`, `pending_wake`), `reconciler.go` (drain).
 - **Date:** 2026-07-27 (recorded retroactively)
 
 ## Context
@@ -56,16 +56,16 @@ from an old read, a freshly re-read one from a decision made this instant).
 
 ### Neither half costs a query
 
-`RefsAdd` returns an `RefsAddResult` projecting `fromID`'s `GroupKind` and `toID`'s
+`EdgesAdd` returns an `EdgesAddResult` projecting `fromID`'s `GroupKind` and `toID`'s
 `resource_version` from the endpoint check it already runs. A *pre-read* for
 edge-newness is exactly what sank the earlier guard.
 
-`RefsAdd` **self-wraps in `Within`** like the other mutators: reporting a
+`EdgesAdd` **self-wraps in `Within`** like the other mutators: reporting a
 `resource_version` from a statement that a write could land behind before the edge
 is inserted would recreate this very window — invisible to the result *and* to
 `dependentsWake` — so the atomicity is the store's to guarantee, not an
 unstated precondition on the caller or on sqlite's single-writer serialization.
-(`RefsAdd` returns the endpoint metadata to every caller; the owner-edge path in
+(`EdgesAdd` returns the endpoint metadata to every caller; the owner-edge path in
 `insertObject` discards it and passes a `0` version claim.)
 
 The store still interprets nothing — the wake policy lives in `controller.go`. The
@@ -80,10 +80,10 @@ out-of-band call where `Register` hands the application a `ControllerClient`.
 The conjunction increments `objects.pending_wake`, so a process that dies between
 the commit and the in-memory requeue leaves a persisted "reconcile owed".
 
-### The stamp is inside `RefsAdd`, and *before* the insert
+### The stamp is inside `EdgesAdd`, and *before* the insert
 
-Reported back as `RefsAddResult.WakeStamped`, which the requeue gates on instead of
-recomputing the conjunction. Sequencing it as a second store call after `RefsAdd`
+Reported back as `EdgesAddResult.WakeStamped`, which the requeue gates on instead of
+recomputing the conjunction. Sequencing it as a second store call after `EdgesAdd`
 returned is the shape a reviewer caught: a nested `Within` unwinds nothing, so a
 caller who handled `DependenciesAdd`'s error would commit the edge with no wake — the
 stranded dependent this whole guard exists to prevent.
@@ -97,7 +97,7 @@ The stamp's own `WHERE … NOT EXISTS (SELECT 1 FROM refs …)` is the **sole**
 edge-new test — a probe straight down the refs primary key, which is the table
 itself since `refs` is `WITHOUT ROWID` (see
 [refs WITHOUT ROWID](2026-07-26-refs-without-rowid.md)) — no pre-read, and no
-second derivation (the old `RefsAddResult.Inserted`) left to fall out of agreement
+second derivation (the old `EdgesAddResult.Inserted`) left to fall out of agreement
 with it.
 
 ### The stamp is not gated on `fromID`'s kind being registered
@@ -109,7 +109,7 @@ re-declaring an edge (delete + re-add) with a stale claim increments it again, s
 can grow. What it costs when that kind later gains a controller is bounded to **one**
 spurious pass, since the reconcile subtracts the whole observed count.
 
-Gating is not the cheap alternative it looks: the stamp is SQL inside `RefsAdd`, and
+Gating is not the cheap alternative it looks: the stamp is SQL inside `EdgesAdd`, and
 the store cannot know registration, so the caller would have to resolve `fromID`'s
 kind *before* the call — the per-declare pre-read that sank the earlier guard — and
 it would bake in a fact that changes between runs, losing the wake outright for a
@@ -127,11 +127,11 @@ with `blockObjectUpdates`' `BEFORE UPDATE ON objects` trigger — `RAISE(ABORT)`
 undoes the statement, not the transaction, so the outer caller *can* swallow and
 commit, which is the whole point.
 
-`WakesIncrement` is deliberately **not on the `Store` interface** — `RefsAdd`
+`WakesIncrement` is deliberately **not on the `Store` interface** — `EdgesAdd`
 is production's only wake producer and `WakesDecrement` its only consumer, so
 a standalone increment would be surface the declare path *cannot* use correctly (it
 can't be made atomic with the edge) and nothing else uses at all. Leaving it off
-makes "the stamp rides `RefsAdd`" a compile-time property instead of something a test
+makes "the stamp rides `EdgesAdd`" a compile-time property instead of something a test
 polices; it survives on the concrete sqlite store so tests can seed a count without
 staging the whole declare race, and is where a future non-edge producer would hook
 in. `TestAddDependencyStampRidesAddRef` now pins only the half that isn't

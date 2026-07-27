@@ -18,7 +18,7 @@ All three loss points log at Warn and arm an escalation:
 
 | loss point | escalation |
 |---|---|
-| `dependentsWake`' failed `RefsGroupIncomingByID` | `resyncNextTick` — one full pass |
+| `dependentsWake`' failed `EdgesGroupIncomingByID` | `resyncNextTick` — one full pass |
 | a closed change stream | `resyncEveryTick` |
 | a failed subscription | `resyncEveryTick` |
 

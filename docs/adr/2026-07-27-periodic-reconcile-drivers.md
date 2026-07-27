@@ -42,7 +42,7 @@ spans kinds with no controller.
 `sweepDeletionPending` **routes** rather than collecting: a registered kind is
 enqueued (only a reconcile can clear a finalizer — `collect` cascades then returns
 while any remain), a client-only kind is collected directly. That is why
-`DeletionRequestsList` returns `[]Referrer`, not ids. The routing lives in one
+`DeletionRequestsList` returns `[]ObjectRef`, not ids. The routing lives in one
 place, `advanceDeletion`, and the sweeper is its only caller: the event-driven
 path (`advanceGCNow`) *only* requeues, so a client-only kind is always left for
 the sweeper's next tick (`enqueueIfRegistered`'s no-op arm) and every `collect`

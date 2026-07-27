@@ -312,7 +312,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
 
 	// The owner ref is recorded child -> owner, so the owner sees the child.
-	refs, err := store.RefsListIncoming(ctx, owner.ID, RelationOwnedBy)
+	refs, err := store.EdgesListIncoming(ctx, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	assert.Equal(t, child.ID, refs[0].ID)
@@ -1944,11 +1944,11 @@ func TestClientGetOwner(t *testing.T) {
 
 // TestClientListDependentsIncludesSelfEdge guards the wake guard against being
 // re-implemented one layer down. Skipping the self-edge is the waker's policy,
-// not the store's: filtering from_id = to_id out of RefsListIncoming would also
+// not the store's: filtering from_id = to_id out of EdgesListIncoming would also
 // suppress the wake, and would look like a tidier fix, but that call backs the
 // read API — so a self-dependency would silently vanish from DependentsList and
 // from the LoadDependents eager load. GC would not notice (it reads refs through
-// RefsHasIncoming and RefsDeleteFinalizingDependsOn, not this call), which is
+// EdgesHasIncoming and EdgesDeleteFinalizingDependsOn, not this call), which is
 // what makes the mis-implementation quiet: only the read surface changes.
 func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	ctx := context.Background()
@@ -1959,7 +1959,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 
 	a, err := client.Create(ctx, cSpec{Val: "a"})
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, store, a.ID, a.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, a.ID, a.ID, RelationDependsOn))
 
 	dependents, err := client.DependentsList(ctx, a.ID)
 	require.NoError(t, err)
@@ -1987,8 +1987,8 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 
 	// a depends on b and c.
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
-	require.NoError(t, addRef(ctx, store, a.ID, c.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, a.ID, c.ID, RelationDependsOn))
 
 	deps, err := client.DependenciesList(ctx, a.ID)
 	require.NoError(t, err)
@@ -2132,7 +2132,7 @@ type ownedObjectsErrorStore struct {
 	fakeStore
 }
 
-func (*ownedObjectsErrorStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (*ownedObjectsErrorStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -2153,7 +2153,7 @@ type ownedObjectsBadJSONStore struct {
 	gk GroupKind
 }
 
-func (s *ownedObjectsBadJSONStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsBadJSONStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return []*RawObject{
 		{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")},
 		{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)},
@@ -2179,11 +2179,11 @@ type ownedObjectsLoadErrorStore struct {
 	gk GroupKind
 }
 
-func (s *ownedObjectsLoadErrorStore) ObjectsListByIncomingRef(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsLoadErrorStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
 }
 
-func (*ownedObjectsLoadErrorStore) RefsGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (*ownedObjectsLoadErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
 	return nil, errBoom
 }
 
@@ -2242,14 +2242,14 @@ type countingStore struct {
 	incomingByIDs int
 }
 
-func (s *countingStore) RefsGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
+func (s *countingStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Ref, error) {
 	s.outgoingByIDs++
-	return s.Store.RefsGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
 }
 
-func (s *countingStore) RefsGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Referrer, error) {
+func (s *countingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]Ref, error) {
 	s.incomingByIDs++
-	return s.Store.RefsGroupIncomingByID(ctx, ids, rel)
+	return s.Store.EdgesGroupIncomingByID(ctx, ids, rel)
 }
 
 func TestClientListWithLoadOwnerBatches(t *testing.T) {
@@ -2345,7 +2345,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn)) // a depends on b
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn)) // a depends on b
 
 	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)
@@ -2374,7 +2374,7 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
 
 	objs, err := client.List(ctx, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)
@@ -2394,28 +2394,28 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	assert.Equal(t, 1, store.incomingByIDs, "dependents batched into one call")
 }
 
-// refErrorStore wraps a real store but errors on every ref-edge lookup, driving
+// edgeErrorStore wraps a real store but errors on every ref-edge lookup, driving
 // the error branches of the eager loaders (single + batched) and fetchOwnerRef.
-type refErrorStore struct {
+type edgeErrorStore struct {
 	Store
 }
 
-func (refErrorStore) RefsListOutgoingByRelation(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (edgeErrorStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]Ref, error) {
 	return nil, errBoom
 }
-func (refErrorStore) RefsListIncoming(context.Context, ObjectID, Relation) ([]Referrer, error) {
+func (edgeErrorStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]Ref, error) {
 	return nil, errBoom
 }
-func (refErrorStore) RefsGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (edgeErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
 	return nil, errBoom
 }
-func (refErrorStore) RefsGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Referrer, error) {
+func (edgeErrorStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]Ref, error) {
 	return nil, errBoom
 }
 
 func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	ctx := context.Background()
-	store := &refErrorStore{Store: newClientTestStore(t)}
+	store := &edgeErrorStore{Store: newClientTestStore(t)}
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)

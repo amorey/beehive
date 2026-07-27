@@ -21,10 +21,10 @@ Ref edges are read on request, never folded into the object's blob-bearing
 Both issue the same secondary query; eager just attaches the result and batches
 across a list.
 
-Store primitives: the relation-filtered `RefsListOutgoingByRelation` (single) and
-the batched `RefsGroupOutgoingByID` / `RefsGroupIncomingByID` (returning a
-`map[id][]Referrer`, not a slice — hence `Group…ByID`, not `List…`; one shared
-`refsByIDs` helper, routeCol/joinCol swapped). The unfiltered `RefsListOutgoing`
+Store primitives: the relation-filtered `EdgesListOutgoingByRelation` (single) and
+the batched `EdgesGroupOutgoingByID` / `EdgesGroupIncomingByID` (returning a
+`map[id][]ObjectRef`, not a slice — hence `Group…ByID`, not `List…`; one shared
+`edgesByIDs` helper, routeCol/joinCol swapped). The unfiltered `EdgesListOutgoing`
 stays for GC.
 
 There is no standing default-loads option: per-call plus lazy cover every case
@@ -33,9 +33,9 @@ without a "queries you didn't use" footgun.
 ## `owned` is the inverse of `owner`
 
 `OwnersGet` / `LoadOwner` read the *outgoing* `owned_by` edge
-(`RefsListOutgoingByRelation` / `RefsGroupOutgoingByID`).
+(`EdgesListOutgoingByRelation` / `EdgesGroupOutgoingByID`).
 `OwnedList` / `LoadOwned` / `Object.Owned` read the *incoming* `owned_by` edges
-(`RefsListIncoming` / `RefsGroupIncomingByID`) — the owner's children — exactly as
+(`EdgesListIncoming` / `EdgesGroupIncomingByID`) — the owner's children — exactly as
 `dependents` inverts `dependencies` over `depends_on`.
 
 `owner` is single (`WithOwner` sets one), so `fetchOwnerRef` takes the first
@@ -65,7 +65,7 @@ It returns the decoded `[]*Object[Spec, Status]` children of *this client's kind
 where `OwnedList` returns untyped refs across every owned kind.
 
 It is deliberately not a fifth lazy ref lookup: the kind filter and the row read
-fold into one store primitive, `ObjectsListByIncomingRef(gk, toID, relation)`, so the
+fold into one store primitive, `ObjectsListByIncomingEdge(gk, toID, relation)`, so the
 Go-side `ref.Kind` filter and the `Get`-per-child the untyped shape forces on
 callers never happen. Its contract otherwise tracks `OwnedList`'s (see the godoc),
 and it takes `List`'s `LoadOption`s through the same `loadListRelated` — a list read
@@ -80,7 +80,7 @@ which is exactly why that surface's quartet is untyped refs.
 
 `listObjectsWhere(tail, args…)`: the blob-bearing `SELECT` runs the internal WHERE
 fragment **once**, and the batched conditions read (`conditionsByIDs`, chunked under
-`idChunkSize` like `refsByIDs`) keys off the ids it returned.
+`idChunkSize` like `edgesByIDs`) keys off the ids it returned.
 
 Re-running the predicate for the conditions half would be a skew bug, not a shared
 seam — the two statements aren't in one transaction, so a concurrent ref/object
@@ -88,7 +88,7 @@ write between them could drop the conditions of a row already scanned. Keying of
 the ids also avoids paying the refs semi-join twice. An empty result skips the
 conditions round-trip.
 
-`ObjectsList` supplies the kind tail; `ObjectsListByIncomingRef` a kind tail plus
+`ObjectsList` supplies the kind tail; `ObjectsListByIncomingEdge` a kind tail plus
 `o.id IN (SELECT from_id FROM refs …)` — a **semi-join, not a join**. Written as a
 join, the planner drives from `idx_objects_kind` (which already satisfies
 `ORDER BY o.id`) and probes `refs` once per object *of the kind*; `IN (SELECT …)`

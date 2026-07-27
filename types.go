@@ -29,10 +29,11 @@ type GroupKind = storeapi.GroupKind
 // ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = storeapi.ObjectID
 
-// Ref identifies a related object reached through a ref edge — an owner, a
+// Ref identifies a related object reached through an edge — an owner, a
 // dependency, or a dependent — carrying the GroupKind needed to address it. It
-// is the same shape the store returns for every edge query.
-type Ref = storeapi.Referrer
+// is a reference to the object, not the edge itself: the store's Edges* family
+// deals in edges, and every one of its queries returns this same shape.
+type Ref = storeapi.ObjectRef
 
 // LoadSet is a bitset of secondary lookups (owner, dependencies, dependents,
 // owned) to fetch alongside an object. The zero value loads nothing; reads OR in the

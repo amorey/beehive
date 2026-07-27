@@ -64,7 +64,7 @@ var ErrObservedGenerationFuture = errors.New("beehive: observed generation excee
 // convert already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
-// ErrTargetResourceVersionFuture is returned by RefsAdd when the caller's
+// ErrTargetResourceVersionFuture is returned by EdgesAdd when the caller's
 // claimed version of the target exceeds the target's current one. An object's
 // version only moves forward, so a version above the target's own cannot have come
 // from reading it — the caller passed some other object's version, or some other
@@ -236,10 +236,10 @@ const (
 	RelationDependsOn Relation = "depends_on"
 )
 
-// RefsAddResult is what a caller needs to follow up on an edge it declared, all
-// of it a by-product of work RefsAdd already does — no extra query pays for any
+// EdgesAddResult is what a caller needs to follow up on an edge it declared, all
+// of it a by-product of work EdgesAdd already does — no extra query pays for any
 // of it.
-type RefsAddResult struct {
+type EdgesAddResult struct {
 	// From is the source object's GroupKind, projected from the endpoint check.
 	// Edges are cross-kind, so a caller routing a requeue to fromID cannot assume
 	// its own kind.
@@ -253,16 +253,19 @@ type RefsAddResult struct {
 	WakeStamped bool
 }
 
-// Referrer is an object pointing at a target through a ref edge, with the
-// GroupKind needed to route a requeue. RefsListIncoming returns these.
-type Referrer struct {
+// ObjectRef names one object — its id plus the GroupKind needed to route a
+// requeue or a GC step to it. It is a reference to an object, not an edge: it
+// carries no direction, so the same shape serves both ends of an edge query
+// (EdgesListIncoming's sources, EdgesListOutgoing's targets) and the edgeless
+// DeletionRequests lists, where it is simply "which object, and what kind".
+type ObjectRef struct {
 	ID    ObjectID
 	Group string
 	Kind  string
 }
 
 // GroupKind is the kind to route a requeue (or a GC step) to.
-func (r Referrer) GroupKind() GroupKind {
+func (r ObjectRef) GroupKind() GroupKind {
 	return GroupKind{Group: r.Group, Kind: r.Kind}
 }
 
@@ -347,7 +350,7 @@ type Store interface {
 	// requeue. It stamps (and emits a Modified for) only children not already
 	// deletion-pending, so a re-cascade over an already-deleting subtree is a
 	// single read — no per-child write every sweep.
-	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]Referrer, error)
+	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]ObjectRef, error)
 
 	// DeletionRequestsList returns every deletion-pending object, of every kind,
 	// each row's GroupKind alongside its id. The global GC sweeper is the sole
@@ -356,7 +359,7 @@ type Store interface {
 	// while a client-only kind — which no reconcile loop reaches, and which could
 	// otherwise strand and RESTRICT-block an owner's delete forever — is collected
 	// directly.
-	DeletionRequestsList(ctx context.Context) ([]Referrer, error)
+	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
 
 	// EventsGetLatest returns the most recent run in id's category timeline, or nil
 	// if that timeline has no events. Reads by object id only (not kind-scoped).
@@ -416,13 +419,13 @@ type Store interface {
 	// ObjectsList returns every object of kind gk, ordered by id.
 	ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error)
 
-	// ObjectsListByIncomingRef is the blob-bearing, kind-scoped form of
-	// RefsListIncoming: the full rows of the objects of kind gk pointing at toID
+	// ObjectsListByIncomingEdge is the blob-bearing, kind-scoped form of
+	// EdgesListIncoming: the full rows of the objects of kind gk pointing at toID
 	// through relation, ordered by id, conditions attached. It resolves the edges
 	// and the rows in one query so a typed read of an owner's children of one kind
 	// (Client.OwnedObjectsList) costs no Get per child. Objects of other kinds are
 	// filtered out; a toID with no matching edge reads empty, never ErrNotFound.
-	ObjectsListByIncomingRef(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
+	ObjectsListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
 
 	// ObjectsListIDs returns the IDs of every object of kind gk, ordered by id. The
 	// reconciler uses it to enqueue a full reconcile pass at startup, so
@@ -488,7 +491,7 @@ type Store interface {
 	// generation is rejected with ErrObservedGenerationFuture, no-op or not.
 	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
 
-	// RefsAdd inserts a directed (fromID -> toID) edge with the given relation.
+	// EdgesAdd inserts a directed (fromID -> toID) edge with the given relation.
 	// Idempotent; both endpoints must exist, else ErrNotFound. The edge isn't on
 	// the object, so it bumps no version and emits no event.
 	//
@@ -503,9 +506,9 @@ type Store interface {
 	//
 	// A claim that toID has already moved past, on an edge this call creates,
 	// increments fromID's pending_wake — the durable record that a dependency
-	// wake is owed — and reports it as RefsAddResult.WakeStamped. That write must
+	// wake is owed — and reports it as EdgesAddResult.WakeStamped. That write must
 	// land on the same side of the insert as the rejection, and for the same
-	// reason: were it a second call after RefsAdd returned, a caller sharing an
+	// reason: were it a second call after EdgesAdd returned, a caller sharing an
 	// ambient transaction could handle the error and commit the edge with no
 	// wake, which is precisely the stranded-dependent race the claim exists to
 	// close. The endpoint check, the stamp and the insert are therefore one
@@ -519,69 +522,69 @@ type Store interface {
 	// bumps it again. Reclaiming it wants a cross-kind sweeper (see TODO.md), not a
 	// gate here: declining to stamp would lose the wake outright for a kind that
 	// gains a controller later.
-	RefsAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (RefsAddResult, error)
+	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (EdgesAddResult, error)
 
-	// RefsDelete removes the (fromID, toID, relation) edge; an absent edge is a
-	// no-op. Like RefsAdd it bumps no version and emits no event.
-	RefsDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+	// EdgesDelete removes the (fromID, toID, relation) edge; an absent edge is a
+	// no-op. Like EdgesAdd it bumps no version and emits no event.
+	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) error
 
-	// RefsDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
+	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
 	// whose source object is itself marked for deletion. A finalizing dependent is
 	// going away, so its dependency must not keep the target alive: without this,
 	// two deletion-pending objects that depend on each other (or a self-dependency)
 	// would each hold the other's RESTRICT and never be collected. owned_by edges
 	// are left untouched — those clear only when the owned child is physically
 	// removed (the foreground cascade).
-	RefsDeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
+	EdgesDeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
 
-	// RefsGroupIncomingByID is the batched form of RefsListIncoming: the inbound
+	// EdgesGroupIncomingByID is the batched form of EdgesListIncoming: the inbound
 	// referrers for many targets through relation, bucketed by target id. The
-	// incoming-edge twin of RefsGroupOutgoingByID (e.g. eager-loading dependents
+	// incoming-edge twin of EdgesGroupOutgoingByID (e.g. eager-loading dependents
 	// over a List without an N+1). A target with no referrer is absent.
-	RefsGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error)
+	EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
 
-	// RefsGroupOutgoingByID is the batched form of RefsListOutgoingByRelation: it
+	// EdgesGroupOutgoingByID is the batched form of EdgesListOutgoingByRelation: it
 	// resolves the relation's outgoing targets for many sources, bucketed by source
 	// id. A source with no matching edge is absent from the map (never a nil/empty
 	// entry), so eager loading over a List avoids an N+1. The implementation may
 	// chunk a large id list across several queries; the bucketed result is the same.
-	RefsGroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]Referrer, error)
+	EdgesGroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
 
-	// RefsHasIncoming reports whether any object with a live claim points at id: an
+	// EdgesHasIncoming reports whether any object with a live claim points at id: an
 	// owned_by edge, or a depends_on edge from a source that is not itself
 	// finalizing. A depends_on edge from a deletion-pending source is ignored —
 	// that dependent is going away and no longer has a claim, so it must not gate a
 	// finalizer (two mutually dependent finalizing objects would otherwise never
-	// see RefsHasIncoming clear). owned_by always counts: the foreground cascade must
+	// see EdgesHasIncoming clear). owned_by always counts: the foreground cascade must
 	// wait for the owned child to be physically removed. GC pairs this with
-	// RefsDeleteFinalizingDependsOn, which physically removes the ignored edges
+	// EdgesDeleteFinalizingDependsOn, which physically removes the ignored edges
 	// before ObjectsDelete so the refs RESTRICT is satisfied.
-	RefsHasIncoming(ctx context.Context, id ObjectID) (bool, error)
+	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
 
-	// RefsListIncoming returns every object pointing at toID through relation, ordered by
+	// EdgesListIncoming returns every object pointing at toID through relation, ordered by
 	// id (e.g. the dependents to requeue, or the owned children to GC).
-	RefsListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]Referrer, error)
+	EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error)
 
-	// RefsListOutgoing returns the distinct objects that fromID points at through any
-	// relation, ordered by id (the inverse of RefsListIncoming). GC uses it to wake
+	// EdgesListOutgoing returns the distinct objects that fromID points at through any
+	// relation, ordered by id (the inverse of EdgesListIncoming). GC uses it to wake
 	// the targets a row was holding open before removing it: deleting fromID drops
 	// its outgoing edges (ON DELETE CASCADE), which can unblock a deletion-pending
 	// target that RESTRICT was keeping alive.
-	RefsListOutgoing(ctx context.Context, fromID ObjectID) ([]Referrer, error)
+	EdgesListOutgoing(ctx context.Context, fromID ObjectID) ([]ObjectRef, error)
 
-	// RefsListOutgoingByRelation is the relation-filtered form of RefsListOutgoing:
+	// EdgesListOutgoingByRelation is the relation-filtered form of EdgesListOutgoing:
 	// the objects fromID points at through exactly relation, ordered by id (e.g. a
 	// child's owner via RelationOwnedBy, or its dependencies via RelationDependsOn).
-	RefsListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]Referrer, error)
+	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
 	// There is deliberately no standalone increment here. Wakes are produced by
-	// RefsAdd — its stamp has to be indivisible from the edge insert, so it issues
-	// one itself and reports it as RefsAddResult.WakeStamped — and consumed by
+	// EdgesAdd — its stamp has to be indivisible from the edge insert, so it issues
+	// one itself and reports it as EdgesAddResult.WakeStamped — and consumed by
 	// WakesDecrement. An interface increment would be surface no caller could
 	// use correctly for the declare path (it cannot be made atomic with the edge)
-	// and none uses at all otherwise; leaving it off makes "the stamp rides RefsAdd"
+	// and none uses at all otherwise; leaving it off makes "the stamp rides EdgesAdd"
 	// a compile-time property rather than something a test has to police. Add it
-	// when a producer other than RefsAdd exists — the durable-wake half of the
+	// when a producer other than EdgesAdd exists — the durable-wake half of the
 	// dependency-waker item in TODO.md would be one.
 
 	// WakesDecrement subtracts observed from id's pending_wake (floored at 0),

@@ -126,7 +126,7 @@ write in the process.
 
 So the feeder blocks on `RecvContext` for the first value, then drains with
 `conflate.Receiver.TryRecv` until empty or `objectChangeBatchCap` (64), and
-`dependentsWake` resolves the whole batch in one `RefsGroupIncomingByID`.
+`dependentsWake` resolves the whole batch in one `EdgesGroupIncomingByID`.
 O(bursts) instead of O(changes), with no timer and no accumulation window — in
 steady state a batch is one element, and a batch only grows when values were
 already waiting.
@@ -171,7 +171,7 @@ exists (`TestSubscribeFailureReportsWholeProcess`).
 
 ### One waker goroutine is a head-of-line block
 
-K independent wakers became one. A slow `RefsGroupIncomingByID` — itself queued
+K independent wakers became one. A slow `EdgesGroupIncomingByID` — itself queued
 behind writers on the single connection — now delays wakes for every kind, where
 before it delayed only its own. Batching bounds throughput, not latency: a batch
 still waits for the query ahead of it. Accepted deliberately, since the

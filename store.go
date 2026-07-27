@@ -47,10 +47,6 @@ var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
 // write-side twin of the read path's refusal to decode data a newer build wrote.
 var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade
 
-// Referrer is an object pointing at a target through a ref edge, with the
-// GroupKind needed to route a requeue.
-type Referrer = storeapi.Referrer
-
 // Relation is the kind of edge in the refs table.
 type Relation = storeapi.Relation
 

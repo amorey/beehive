@@ -10,7 +10,7 @@ The `Store` interface had grown to forty methods named verb-first — `CreateObj
 methods alphabetically, so verb-first scatters one concern across the page: deletion
 was `RequestDeletion` under R, `MarkOwnedForDeletion` under M and
 `ListAllDeletionPending` under L, and the two halves of the `pending_wake` protocol
-sat thirty methods apart. Reading "what can I do to a ref?" meant a full scan.
+sat thirty methods apart. Reading "what can I do to an edge?" meant a full scan.
 
 The stream surface had a second problem. `Watcher`, `EventWatcher` and
 `ObjectChangeWatcher` were three interfaces differing only in the name of their single
@@ -23,13 +23,13 @@ instantiation being used through only its own interface.
 **1. `NounsVerbQualifier`.** The noun prefix is plural and names the family the method
 belongs to; cardinality lives in the verb (`Get`/`Watch` for one, `List`/`WatchList`
 for many). Plural rather than singular so a family has exactly one prefix —
-`RefsAdd`/`RefsDelete`/`RefsListIncoming`, not `RefAdd` beside `RefsListIncoming`.
+`EdgesAdd`/`EdgesDelete`/`EdgesListIncoming`, not `EdgeAdd` beside `EdgesListIncoming`.
 
 **Omit the prefix when the family is already the receiver's own.** `Client` is its
 kind, so `Create`/`Get`/`Update`/`Delete`/`List` stay bare; only its secondary nouns
 (events, schedule, relations, the object watches) take one. On `ControllerClient` the
 line falls between a **column on the object's row** and a **table of its own**:
-`UpdateStatus` stays bare, while conditions, finalizers, events and refs — each its
+`UpdateStatus` stays bare, while conditions, finalizers, events and edges — each its
 own table — are prefixed.
 
 `Object`'s relation accessors are the degenerate case: noun-first with no verb left is
@@ -67,19 +67,19 @@ Each surface's members are now sorted alphabetically in source, matching how god
 renders them, so the file and the doc page agree.
 
 The tax is a verb in the middle on qualified lists (`ObjectsListUnsettledIDs`,
-`RefsListOutgoingByRelation`). The alternative, qualifier-before-verb, reads worse;
+`EdgesListOutgoingByRelation`). The alternative, qualifier-before-verb, reads worse;
 it is paid on about six methods.
 
-Three judgment calls worth recording, since each has a defensible other answer:
+Four judgment calls worth recording, since each has a defensible other answer:
 
 - **`OwnersGet` for an at-most-one relation.** The prefix names the family (the store
   holds many owners), the verb carries cardinality. Folding all four relations under
-  `Refs*` on the client surfaces — `RefsGetOwner`, `RefsListDependencies` — would be
+  `Edges*` on the client surfaces — `EdgesGetOwner`, `EdgesListDependencies` — would be
   more internally consistent with `Store`, at the cost of the user's vocabulary. The
   relation nouns won on the client; `Store`, which genuinely deals in edges, keeps
-  `Refs*`.
-- **`ObjectsListByIncomingRef`** files under `Objects`, away from the `Refs*` family it
-  is conceptually adjacent to. It returns objects, not refs, and forcing that question
+  `Edges*`.
+- **`ObjectsListByIncomingEdge`** files under `Objects`, away from the `Edges*` family it
+  is conceptually adjacent to. It returns objects, not edges, and forcing that question
   is the point — but it is the one method that loses a neighbour.
 - **`DeletionRequests*`, and `From` instead of `By` on its cascade.** The family sets
   `deletion_requested_at` and never removes a row — the hard delete is `ObjectsDelete`
@@ -88,12 +88,24 @@ Three judgment calls worth recording, since each has a defensible other answer:
   objection here; `Wakes*` (`objects.pending_wake`) is the same shape. `Pending` then
   drops out of the list method, since a request is only ever cleared by the delete
   itself. The cascade breaks the `By…` qualifier pattern (`BySlug`, `ByRelation`,
-  `ByIncomingRef`, all naming the key you pass) and reads
+  `ByIncomingEdge`, all naming the key you pass) and reads
   `DeletionRequestsCreateFromOwner`: `By` also means *agency* in English, and unlike a
   slug an owner is animate, so `CreateByOwner` invites the wrong reading — the owner
   is what is being deleted, not the actor. `From` keeps the sense of "derived from an
   owner id" and answers the question `CreateOwned` leaves open, whether the owner
   itself gets a request. It does not.
+- **`Edges*` for the family, `Ref` for the value.** These were both "ref": the store
+  family `Refs*` meant rows in the `refs` table, while the type it returned was
+  `Referrer`, aliased publicly as `Ref`. But that type is `{ID, Group, Kind}` — no
+  from, no to, no relation — so it cannot express an edge, and `Referrer` was wrong
+  about direction besides: `EdgesListOutgoing` returns the objects pointed *at*, and
+  `DeletionRequestsList` returns objects with no edge in the picture at all. So the
+  value became `ObjectRef` (public `Ref`) — a reference to an object, the same shape
+  Kubernetes calls a reference — and the family became `Edges*`, which is what it
+  always operated on. `Ref` keeps the short public name because it is the one users
+  see, on `Owner()`/`Dependencies()`/`Dependents()`/`Owned()`. The `refs` table keeps
+  its name; renaming it is a migration, not a rename, and the doc comments say which
+  table `Edges*` writes.
 
 Left undone: `EventsSubscription` still carries a bare `Event`, so a consumer cannot
 tell a new run from a count-bump on an existing one — the one place a log does face

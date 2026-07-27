@@ -77,15 +77,15 @@ func (c *finalizerClearingController) Reconcile(ctx context.Context, client Cont
 	return Result{}, nil
 }
 
-// hasIncomingRefsGatingController models the documented finalizer workflow: an
-// object holding `finalizer` clears it only once RefsHasIncoming reports no live
+// hasIncomingEdgesGatingController models the documented finalizer workflow: an
+// object holding `finalizer` clears it only once EdgesHasIncoming reports no live
 // claim, so a shared resource outlives its last real user. Objects that don't
 // hold the finalizer are left for GC directly.
-type hasIncomingRefsGatingController struct {
+type hasIncomingEdgesGatingController struct {
 	finalizer string
 }
 
-func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	if obj.DeletionRequestedAt == nil {
 		return Result{}, nil
 	}
@@ -98,7 +98,7 @@ func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, cc Cont
 	if !held {
 		return Result{}, nil
 	}
-	referenced, err := cc.RefsHasIncoming(ctx, obj.ID)
+	referenced, err := cc.EdgesHasIncoming(ctx, obj.ID)
 	if err != nil || referenced {
 		return Result{}, err // a live user remains; keep the finalizer
 	}
@@ -140,10 +140,10 @@ type collectFakeStore struct {
 	finalizers      []string // on the collected object
 	getMetaErr      error    // ObjectsGetMeta
 	markErr         error    // DeletionRequestsCreateFromOwner
-	dropDependsErr  error    // RefsDeleteFinalizingDependsOn
-	hasRefs         bool     // RefsHasIncoming result
-	hasRefsErr      error    // RefsHasIncoming error
-	outgoingErr     error    // RefsListOutgoing error
+	dropDependsErr  error    // EdgesDeleteFinalizingDependsOn
+	hasEdges        bool     // EdgesHasIncoming result
+	hasEdgesErr     error    // EdgesHasIncoming error
+	outgoingErr     error    // EdgesListOutgoing error
 	deleteObjectErr error    // ObjectsDelete error
 }
 
@@ -154,16 +154,16 @@ func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawO
 	now := time.Now()
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
 	return nil, s.markErr
 }
-func (s *collectFakeStore) RefsDeleteFinalizingDependsOn(context.Context, ObjectID) error {
+func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
 	return s.dropDependsErr
 }
-func (s *collectFakeStore) RefsHasIncoming(context.Context, ObjectID) (bool, error) {
-	return s.hasRefs, s.hasRefsErr
+func (s *collectFakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
+	return s.hasEdges, s.hasEdgesErr
 }
-func (s *collectFakeStore) RefsListOutgoing(context.Context, ObjectID) ([]storeapi.Referrer, error) {
+func (s *collectFakeStore) EdgesListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
 	return nil, s.outgoingErr
 }
 func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
@@ -192,14 +192,14 @@ func TestCollectDropDependsRefsError(t *testing.T) {
 }
 
 func TestCollectHasIncomingRefsError(t *testing.T) {
-	bh, err := New(&collectFakeStore{hasRefsErr: errBoom})
+	bh, err := New(&collectFakeStore{hasEdgesErr: errBoom})
 	require.NoError(t, err)
 	_, err = bh.gcCollect(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectListOutgoingRefsError(t *testing.T) {
-	// hasRefs false so collect proceeds to the delete prep where RefsListOutgoing runs.
+	// hasEdges false so collect proceeds to the delete prep where EdgesListOutgoing runs.
 	bh, err := New(&collectFakeStore{outgoingErr: errBoom})
 	require.NoError(t, err)
 	_, err = bh.gcCollect(context.Background(), 1)
@@ -259,13 +259,13 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 
 // TestCollectDeletesSelfDependentObject pins the deadlock collect names the self
 // case for: a self-dependency is its own referrer, so refs' ON DELETE RESTRICT
-// would pin the row forever if RefsDeleteFinalizingDependsOn did not drop the
+// would pin the row forever if EdgesDeleteFinalizingDependsOn did not drop the
 // edge first. Verified by mutation — excluding from_id = to_id there leaves the
 // object undeletable.
 //
 // It is deliberately *not* the twin of TestClientListDependentsIncludesSelfEdge:
-// collect reads refs through RefsHasIncoming and RefsDeleteFinalizingDependsOn,
-// never RefsListIncoming, so a self-edge filtered out of that call would leave
+// collect reads refs through EdgesHasIncoming and EdgesDeleteFinalizingDependsOn,
+// never EdgesListIncoming, so a self-edge filtered out of that call would leave
 // this path untouched. The two tests cover different consumers, not two halves of
 // one mistake.
 func TestCollectDeletesSelfDependentObject(t *testing.T) {
@@ -274,7 +274,7 @@ func TestCollectDeletesSelfDependentObject(t *testing.T) {
 
 	obj, err := client.Create(ctx, cSpec{Val: "self"})
 	require.NoError(t, err)
-	require.NoError(t, addRef(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
@@ -361,7 +361,7 @@ func TestCollectBreaksSelfDependency(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "self"})
 	require.NoError(t, err)
 	// A controller accidentally recorded a self-dependency.
-	require.NoError(t, addRef(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
@@ -388,8 +388,8 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
 	// A and B depend on each other: neither can be collected until the cycle breaks.
-	require.NoError(t, addRef(ctx, store, a.ID, b.ID, RelationDependsOn))
-	require.NoError(t, addRef(ctx, store, b.ID, a.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, b.ID, a.ID, RelationDependsOn))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -412,7 +412,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	// Resync disabled: the finalizer gate must clear purely event-driven.
 	bh, err := New(store, WithResyncInterval(0))
 	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &hasIncomingRefsGatingController{finalizer: "gate"})
+	_, err = Register(bh, clientTestGK, &hasIncomingEdgesGatingController{finalizer: "gate"})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -421,7 +421,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	// A finalizing dependent that points at obj — modeled as a self-dependency, so
 	// the referrer is itself deletion-pending the instant obj is deleted. Without
 	// the fix, the gate sees this edge, never clears the finalizer, and GC stalls.
-	require.NoError(t, addRef(ctx, store, obj.ID, obj.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, RelationDependsOn))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -664,10 +664,10 @@ func TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete(t *testing.T) {
 // embedded collectFakeStore decide how that collect fails.
 type sweepFailStore struct {
 	collectFakeStore
-	rows []Referrer
+	rows []Ref
 }
 
-func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]Referrer, error) {
+func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]Ref, error) {
 	return s.rows, nil
 }
 
@@ -678,7 +678,7 @@ func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]Referrer, erro
 // benign race and not worth a warning on every sweep.
 func TestGCSweepLogsCollectFailure(t *testing.T) {
 	ctx := context.Background()
-	rows := []Referrer{{ID: 7, Kind: "ClientOnly"}}
+	rows := []Ref{{ID: 7, Kind: "ClientOnly"}}
 
 	t.Run("real error", func(t *testing.T) {
 		logger, buf := captureLogger(slog.LevelWarn)
@@ -727,7 +727,7 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 
 	// dep depends_on target (not owned: the dependent survives the target).
-	require.NoError(t, addRef(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	ctrl.mu.Lock()
 	ctrl.reader = client
