@@ -497,7 +497,7 @@ func (s *wakeProbeStore) waitLooked(t *testing.T) {
 type listProbeStore struct {
 	Store
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
-	wakeListed      chan struct{} // ReconcileOwedListIDs (per-kind)
+	owedListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
 }
 
@@ -521,7 +521,7 @@ func (s *listProbeStore) ObjectsListUnsettledIDs(ctx context.Context, gk GroupKi
 
 func (s *listProbeStore) ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
 	ids, err := s.Store.ReconcileOwedListIDs(ctx, gk)
-	probeSignal(s.wakeListed)
+	probeSignal(s.owedListed)
 	return ids, err
 }
 

@@ -815,7 +815,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	real := newClientTestStore(t)
 	store := &listProbeStore{
 		Store:      real,
-		wakeListed: make(chan struct{}, 8),
+		owedListed: make(chan struct{}, 8),
 		gcSwept:    make(chan struct{}, 8),
 	}
 
@@ -844,7 +844,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 		name string
 		ch   chan struct{}
 	}{
-		{"reconciler startup enqueue", store.wakeListed},
+		{"reconciler startup enqueue", store.owedListed},
 		{"gc sweeper startup pass", store.gcSwept},
 	} {
 		select {
