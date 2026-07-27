@@ -108,7 +108,7 @@ func (c *hasIncomingRefsGatingController) Reconcile(ctx context.Context, cc Cont
 // waitForDeletions consumes w until it has seen a Deleted event for every id in
 // want, failing on timeout. The watcher must be subscribed before the deletions
 // are triggered so no event is missed.
-func waitForDeletions(t *testing.T, w <-chan *ObjectChange[cSpec, cStatus], want ...ObjectID) {
+func waitForDeletions(t *testing.T, w <-chan ObjectChange[cSpec, cStatus], want ...ObjectID) {
 	t.Helper()
 	pending := make(map[ObjectID]struct{}, len(want))
 	for _, id := range want {

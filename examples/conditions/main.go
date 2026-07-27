@@ -176,7 +176,7 @@ func stopBeehive(stop func(context.Context) error) {
 
 // waitForReady prints each change to object id and returns once its Ready
 // condition reports True.
-func waitForReady(id int64, watchCh <-chan *beehive.ObjectChange[ServerSpec, ServerStatus]) {
+func waitForReady(id int64, watchCh <-chan beehive.ObjectChange[ServerSpec, ServerStatus]) {
 	for evt := range watchCh {
 		if evt.Object.ID != id {
 			continue

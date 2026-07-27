@@ -299,8 +299,8 @@ type Client[Spec, Status any] interface {
     List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
     Delete(ctx context.Context, id ObjectID) error
     DeleteBySlug(ctx context.Context, slug string) error // idempotent: absent or already-deleting is a nil no-op
-    ObjectsWatch(ctx context.Context, id ObjectID) (<-chan *ObjectChange[Spec, Status], error)
-    ObjectsWatchList(ctx context.Context) (<-chan *ObjectChange[Spec, Status], error)
+    ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
+    ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
     OwnersGet(ctx context.Context, id ObjectID) (Ref, bool, error)
@@ -414,7 +414,7 @@ The resolve is **atomic with the delete**, in the same sense the table above hol
 
 #### Watching
 
-`ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `*ObjectChange` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `EventsList`/`EventsWatch` below — is a separate concept: `ObjectChange` is an object-change notification, `Event` is a recorded log entry.)
+`ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `EventsList`/`EventsWatch` below — is a separate concept: `ObjectChange` is an object-change notification, `Event` is a recorded log entry.)
 
 → [ADR: watch fan-out conflates per object](docs/adr/2026-07-27-conflating-watch-fanout.md), for why there is no ring, no lag error, and no relist.
 

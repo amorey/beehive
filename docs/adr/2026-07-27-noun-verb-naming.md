@@ -38,12 +38,23 @@ The `Get`/`List` cardinality signal moves to the return type, which already carr
 
 Exempt: `Err*` values, `With*` options, and anything satisfying an external interface.
 
-**2. Every watch returns `<-chan *NounChange` or a `*NounsSubscription`** — never a
-bare `…Watcher` interface, never a bare channel of a domain value. The three
+**2. A watch over a change stream returns `<-chan NounChange` or a
+`*NounsSubscription`** — never a bare `…Watcher` interface. The change
+travels by value: `ObjectChange[Spec, Status]` is a type tag plus one pointer, so
+copying it costs nothing worth avoiding, and a pointer would add a per-change
+allocation and a `nil` case with no meaning on a delivery channel. The
+subscription is a pointer because it is a handle with identity and a `Close`. The three
 interfaces collapsed into one concrete `storeapi.Subscription[V]` with a single
 `Changes()` accessor, aliased per stream (`ObjectsSubscription`, `EventsSubscription`,
 `ObjectWritesSubscription`); a backend builds one with `NewSubscription`, and `Close`
 is idempotent through a `sync.Once`, so the test doubles no longer carry their own.
+
+Not every watch is over changes, and the rule does not reach the ones that aren't. A
+**gauge** (`SchedulesWatch`) and a **log** (`EventsWatch`) stream the value itself:
+there is one current `Schedule`, and "what happened to it" is not a question a
+consumer can act on — a `ScheduleChange` would carry a `Type` that never varies. The
+wrapper earns its place only where the consumer must tell *what happened* from *what
+it now is*, which is the test the next section applies to `Event`.
 
 `Subscribe` survives as a distinct verb for exactly one method,
 `ObjectWritesSubscribe`. It carries no row — the consumer re-reads current state — and
@@ -72,8 +83,9 @@ Two judgment calls worth recording, since both have a defensible other answer:
   is the point — but it is the one method that loses a neighbour.
 
 Left undone: `EventsSubscription` still carries a bare `Event`, so a consumer cannot
-tell a new run from a count-bump on an existing one. Rule 2 wants an `*EventChange`
-there and the information would be a genuine improvement, but that is a behavioural
+tell a new run from a count-bump on an existing one — the one place a log does face
+rule 2's test and fail it. It wants an `EventChange` there (by value, like
+`ObjectChange`) and the information would be a genuine improvement, but that is a behavioural
 change to a public surface rather than a rename, so it is not part of this work.
 
 This is a breaking change to every public surface; it ships as one release. Downstream
