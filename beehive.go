@@ -361,6 +361,44 @@ func (dw *waker) start(runCtx context.Context) {
 	dw.bh.wg.Go(func() { dw.run(runCtx, w) })
 }
 
+// replayPageCap bounds one replay page. Sized like the live stream's batch cap so
+// a replay costs what ordinary traffic costs: the store runs on a single
+// connection, so an unbounded read would block every writer in the process for its
+// whole duration and, after a long outage, materialise the whole table.
+const replayPageCap = 64
+
+// replay feeds everything above the watermark back through the wake path, a page
+// at a time, and reports whether it got through. This is the repair: rather than
+// re-deriving every object of every kind to find the dependents a lost change
+// stranded, it re-reads the changes themselves, so the cost is what was missed
+// rather than what exists.
+//
+// The cursor advances per page, which is sound here and nowhere else: pages come
+// back in resource_version order, so a page that succeeded really does mean
+// everything below it is done. A page that fails leaves the cursor where it was —
+// the changes are still owed, and the caller retries from there.
+func (dw *waker) replay(ctx context.Context) bool {
+	for {
+		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, replayPageCap)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false // shutdown cancelled this read; not a loss of its own
+			}
+			dw.bh.log().WarnContext(ctx, "replaying missed changes failed; dependency wakes for them are still owed",
+				"watermark", dw.watermark, "err", err)
+			return false
+		}
+		if len(page) == 0 {
+			return true // caught up
+		}
+		// wakeDependents advances the watermark itself, which is what makes the next
+		// page start where this one ended.
+		if !dw.wakeDependents(ctx, page) {
+			return false
+		}
+	}
+}
+
 // run requeues dependents when a target changes, until ctx is
 // cancelled or the stream ends. The stream is store-wide and established by
 // Start (events-only, no snapshot: the reconciler's own startup pass already
@@ -391,7 +429,16 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 				dw.bh.resyncKindsEveryTick()
 				return
 			}
-			dw.wakeDependents(ctx, batch)
+			if !dw.wakeDependents(ctx, batch) {
+				// The batch was dropped and the watermark still points below it, so the
+				// changes are recoverable by re-reading them. Retry before consuming
+				// anything further: taking the next batch first would interleave a
+				// success past a failure, and the cursor may only move once everything
+				// below it is done. Stalling here is safe because the hub conflates per
+				// object — what a paused consumer holds is bounded by the store's live
+				// key set, not by how much churn it missed.
+				dw.replay(ctx)
+			}
 		}
 	}
 }

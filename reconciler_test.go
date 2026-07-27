@@ -863,6 +863,99 @@ func TestWakeDependentsHoldsWatermarkOnLookupFailure(t *testing.T) {
 	assert.EqualValues(t, 5, dw.watermark, "an unprocessed batch does not move the cursor")
 }
 
+// replayStore serves ObjectWritesListSince from a fixed set of rows, recording the
+// cursor and limit of every page it was asked for.
+type replayStore struct {
+	depsStore
+	rows  []ObjectWrite // every live row, in version order
+	pages [][2]int64    // (afterRV, limit) per call
+	err   error
+}
+
+func (s *replayStore) ObjectWritesListSince(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
+	if s.err != nil {
+		return nil, s.err
+	}
+	var out []ObjectWrite
+	for _, r := range s.rows {
+		if r.ResourceVersion > afterRV && len(out) < limit {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// replayRows builds count live rows at versions 1..count.
+func replayRows(count int) []ObjectWrite {
+	rows := make([]ObjectWrite, 0, count)
+	for i := 1; i <= count; i++ {
+		rows = append(rows, ObjectWrite{ID: ObjectID(i), Type: Modified, ResourceVersion: int64(i)})
+	}
+	return rows
+}
+
+// Replay is bounded by what was missed, not by the size of the store. That is the
+// whole point of holding a cursor: after a long outage a full pass would be the
+// table, on a store whose single connection every writer shares.
+func TestWakerReplayReadsOnlyWhatWasMissed(t *testing.T) {
+	const total, missed = 50, 5
+	store := &replayStore{rows: replayRows(total)}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+	dw.watermark = total - missed // caught up to all but the last few
+
+	require.True(t, dw.replay(context.Background()))
+
+	assert.EqualValues(t, total, dw.watermark, "the cursor ends at the newest row")
+	var read int
+	for _, p := range store.pages {
+		read += len(store.rowsAbove(p[0], int(p[1])))
+	}
+	assert.Equal(t, missed, read, "only the missed changes are read, not the whole table")
+}
+
+// Paging keeps a replay the same cost shape as live traffic, and the cursor moves
+// per page — safe here precisely because pages come back in version order, which
+// is the one place ordering is guaranteed.
+func TestWakerReplayPages(t *testing.T) {
+	store := &replayStore{rows: replayRows(replayPageCap * 2)}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+
+	require.True(t, dw.replay(context.Background()))
+
+	assert.Greater(t, len(store.pages), 2, "more rows than a page holds must take several")
+	assert.EqualValues(t, replayPageCap, store.pages[0][1], "each page is bounded")
+	assert.EqualValues(t, 0, store.pages[0][0], "the first page starts at the watermark")
+	assert.EqualValues(t, replayPageCap, store.pages[1][0], "the next resumes where it ended")
+	assert.EqualValues(t, replayPageCap*2, dw.watermark)
+}
+
+// A target deleted during the outage is absent from the replay rather than
+// erroring it — and per edges.to_id's RESTRICT it can have had no dependents left
+// to strand.
+func TestWakerReplaySkipsDeletedRows(t *testing.T) {
+	store := &replayStore{rows: []ObjectWrite{{ID: 7, Type: Modified, ResourceVersion: 9}}}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+
+	assert.True(t, dw.replay(context.Background()), "the gap left by a deleted row is not an error")
+	assert.EqualValues(t, 9, dw.watermark)
+}
+
+// A replay that could not read holds the cursor, for the same reason a failed
+// wake does: the changes are still owed.
+func TestWakerReplayHoldsWatermarkOnListFailure(t *testing.T) {
+	store := &replayStore{err: errBoom}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+	dw.watermark = 3
+
+	assert.False(t, dw.replay(context.Background()))
+	assert.EqualValues(t, 3, dw.watermark, "an unread page leaves the cursor owed")
+}
+
 // TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
 // itself is woken by its own Modified, and the wake is what caused the write, so
 // nothing converges it. There is no tick, no backoff and no already-settled skip
@@ -3482,4 +3575,16 @@ func TestDeadWakerReportsWholeProcess(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "for every kind")
 	assert.NotContains(t, out, "group=", "there is no per-kind scope left to name")
+}
+
+// rowsAbove is the page replayStore would return for (afterRV, limit), for tests
+// that count how much a replay actually read.
+func (s *replayStore) rowsAbove(afterRV int64, limit int) []ObjectWrite {
+	var out []ObjectWrite
+	for _, r := range s.rows {
+		if r.ResourceVersion > afterRV && len(out) < limit {
+			out = append(out, r)
+		}
+	}
+	return out
 }
