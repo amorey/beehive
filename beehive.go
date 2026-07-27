@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/amorey/gobus/conflate"
+	"github.com/amorey/gochan/oneshot"
 )
 
 const (
@@ -470,18 +471,20 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Unlock()
 
 	// Wait for reconcile loops to exit, but don't block past ctx. A drain that
-	// loses the race to ctx is reported to the caller.
-	done := make(chan struct{})
+	// loses the race to ctx is reported to the caller. Send never blocks, so the
+	// waiting goroutine outlives a timed-out stop only until the loops drain.
+	//
+	// oneshot resolves a cancelled ctx ahead of an already-delivered value, so a
+	// stop whose ctx is cancelled at the moment the drain lands reports the
+	// deadline rather than success — the truthful answer for a caller that asked
+	// to stop waiting, and one the plain select could already give by picking
+	// that arm at random.
+	tx, rx := oneshot.New[struct{}]()
 	go func() {
 		bh.wg.Wait()
-		close(done)
+		_ = tx.Send(struct{}{})
 	}()
-	var drainErr error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		drainErr = ctx.Err()
-	}
+	_, drainErr := rx.RecvContext(ctx)
 
 	// Watch subscriptions are owned by the store, not the control plane, so stop
 	// does not terminate them: an active watcher ends when its context is
