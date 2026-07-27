@@ -420,15 +420,16 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) {
+func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) bool {
+	var high int64
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
-		// Every reference advances the cursor, including the ones with nothing to
+		// Every reference counts toward the cursor, including the ones with nothing to
 		// wake. Deletes carry no dependents and the hub annihilates transients, so on
 		// a delete-heavy store those are most of the traffic — a watermark that only
 		// moved on wakeable changes would trail arbitrarily far behind and turn a
 		// bounded replay into a whole-table scan.
-		dw.watermark = max(dw.watermark, ref.ResourceVersion)
+		high = max(high, ref.ResourceVersion)
 		if ref.Type != Added && ref.Type != Modified {
 			continue
 		}
@@ -437,7 +438,8 @@ func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) {
 		}
 	}
 	if len(ids) == 0 {
-		return
+		dw.watermark = max(dw.watermark, high) // consumed, with nothing owed
+		return true
 	}
 	byTarget, err := dw.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
 	if err != nil {
@@ -446,7 +448,7 @@ func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) {
 		// pass on every reconciler of a control plane that is going away — the same
 		// re-check the stream-ended path above makes, for the same reason.
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		// Every dependent of these targets just missed their changes. A dependent
 		// that has settled is invisible to every owed-work listing — its own
@@ -456,7 +458,12 @@ func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) {
 		dw.bh.log().WarnContext(ctx, "dependents lookup failed; wakes for these changes were dropped, forcing a full resync pass",
 			"targetIDs", ids, "err", err)
 		dw.bh.resyncKindsNextTick()
-		return
+		// The watermark stays put: this batch was not processed, so it is still part
+		// of what a recovery has to replay. Advancing here would let a later batch
+		// that succeeded carry the cursor past this one — batches do not arrive in
+		// version order across a failure — and the recovery would skip exactly the
+		// changes it exists for.
+		return false
 	}
 	for _, targetID := range ids {
 		for _, d := range byTarget[targetID] {
@@ -471,6 +478,8 @@ func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) {
 			dw.bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 		}
 	}
+	dw.watermark = max(dw.watermark, high)
+	return true
 }
 
 // stop tears the control plane down: it cancels the reconcile loops and waits

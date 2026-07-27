@@ -846,6 +846,23 @@ func TestWakerStartSeedsWatermarkFromSubscribeCursor(t *testing.T) {
 	assert.EqualValues(t, 42, dw.watermark, "the cursor the subscription started from")
 }
 
+// A batch whose dependents lookup failed must leave the watermark where it was.
+// This is the ordering mistake that makes recovery silently useless: batches do
+// not arrive in version order across a failure, so advancing on receipt lets a
+// later batch that succeeded carry the cursor past an earlier one that did not —
+// and the changes the recovery exists to replay are exactly the ones it then
+// skips. Every "it recovers" test still passes.
+func TestWakeDependentsHoldsWatermarkOnLookupFailure(t *testing.T) {
+	bh := &Beehive{store: &errDepsStore{}}
+	dw := wakerOf(bh)
+	dw.watermark = 5
+
+	ok := dw.wakeDependents(context.Background(), changedAt(100))
+
+	assert.False(t, ok, "the batch was not processed")
+	assert.EqualValues(t, 5, dw.watermark, "an unprocessed batch does not move the cursor")
+}
+
 // TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
 // itself is woken by its own Modified, and the wake is what caused the write, so
 // nothing converges it. There is no tick, no backoff and no already-settled skip
