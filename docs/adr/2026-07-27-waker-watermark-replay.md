@@ -51,13 +51,13 @@ than on `WriteBatchCap`. That second condition is not optional: the hub delivers
 *first-touch* order, since a re-written object coalesces into the queue position it
 already held. So the highest version in a batch says nothing about what is still
 queued below it, and taking it as a resume point would step over changes that were
-never processed. A full batch stages its high-water mark instead; a short one commits
-it. On a failed lookup the
-waker stops consuming and retries from the watermark, which keeps the cursor a scalar and
-removes the hazard by construction: batches do not arrive rv-ordered across a failure, so
-advancing on receipt would let a later batch that succeeded carry the cursor past an
-earlier one that did not — skipping exactly the changes the recovery exists to replay,
-while passing every "it recovers" test.
+never processed. A full batch stages its high-water mark instead; a short one commits it.
+
+On a failed lookup the waker stops consuming and retries from the watermark. That keeps
+the cursor a scalar and removes the second hazard by construction: batches do not arrive
+version-ordered across a failure either, so advancing on receipt would let a later batch
+that succeeded carry the cursor past an earlier one that did not — skipping exactly the
+changes the recovery exists to replay, while passing every "it recovers" test.
 
 Stalling the live consumer is safe *because the hub conflates per object*: a paused
 consumer's pending set is bounded by the store's live key set, not by churn.
