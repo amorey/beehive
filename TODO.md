@@ -145,7 +145,7 @@ tell "we decided against this for now" from "nobody thought of it."
   row. The benign variant — T changing after `get` but *before* D reads T — is
   simply a level-triggered no-op re-pass on a value D already saw.
 
-  **What is missing is durability.** This wake is in-memory only. `pending_wake`
+  **What is missing is durability.** This wake is in-memory only. `reconcile_owed`
   covers the *declare* window (`EdgesAdd` stamps when a new edge's caller-supplied
   target version is already stale) and nothing else, so an ordinary target-change
   wake has no persisted "reconcile owed". A crash between T's commit and D's
@@ -173,8 +173,8 @@ tell "we decided against this for now" from "nobody thought of it."
   the restart path already handles.
 
   Deferred as a *durable* fix because it is not local to this timing. Stamping
-  `pending_wake` in `dependentsWake` would make every target change a write per
-  dependent on the wake path — the cost `pending_wake` avoids today by riding a
+  `reconcile_owed` in `dependentsWake` would make every target change a write per
+  dependent on the wake path — the cost `reconcile_owed` avoids today by riding a
   write `EdgesAdd` was already doing — and the decrement is per-pass, so a
   stamp-per-change would need the same count-not-flag reasoning re-derived against
   a much higher write volume. The `observed_cursor` watermark stays the recorded
@@ -246,12 +246,12 @@ tell "we decided against this for now" from "nobody thought of it."
   for it yet: the repro exists only as a throwaway, and `TestMarkOwnedForDeletionCascadesThenIsNoOp`
   re-cascades over a fixed child set, so it never adds a child between passes.
 
-- **A client-only dependent's `pending_wake` count is never reclaimed** — known, not
+- **A client-only dependent's `reconcile_owed` count is never reclaimed** — known, not
   fixed. Edges are deliberately cross-kind, so `DependenciesAdd(clientOnlyID, target,
   staleRV)` is legal and its stamp lands on a row whose kind has no reconcile loop.
-  Nothing drains it (`WakesDecrement` is called only by a reconcile) and
-  nothing scans it (`WakesListPendingIDs` is per-kind, called only by that kind's
-  reconciler), so the count and its `idx_objects_pending_wake` entry persist for the
+  Nothing drains it (`ReconcileOwedDecrement` is called only by a reconcile) and
+  nothing scans it (`ReconcileOwedListIDs` is per-kind, called only by that kind's
+  reconciler), so the count and its `idx_objects_reconcile_owed` entry persist for the
   life of the row. Re-declaring an edge — `DependenciesDelete` then `DependenciesAdd`
   with a claim the target has already moved past — satisfies the edge-new half again
   and increments it again, so it is not even bounded by the distinct-target count.
@@ -272,7 +272,7 @@ tell "we decided against this for now" from "nobody thought of it."
   that changes between runs: a kind registered later would have lost its wake
   outright.
 
-  The fix that fits is a **cross-kind sweeper**, the `pending_wake` analogue of the
+  The fix that fits is a **cross-kind sweeper**, the `reconcile_owed` analogue of the
   global GC sweeper's `DeletionRequestsList`: list rows with a nonzero count
   across all kinds, zero the ones whose kind has no registered reconciler, on the
   sweeper's existing cadence. Off the hot path, symmetric with machinery that already
@@ -283,7 +283,7 @@ tell "we decided against this for now" from "nobody thought of it."
   that declares many edges from client-only kinds, where the index entries would
   actually be measurable.
 
-- **`WakesDecrement` is not kind-scoped** — known, not fixed. Its UPDATE is keyed
+- **`ReconcileOwedDecrement` is not kind-scoped** — known, not fixed. Its UPDATE is keyed
   `WHERE id = ?` with no group/kind in the predicate, so it will decrement any row in
   `objects` whose id it is handed, of any kind. Every other id-keyed mutator in the
   store is scoped to a `GroupKind` and rejects a foreign id with `ErrWrongKind` —
@@ -314,7 +314,7 @@ tell "we decided against this for now" from "nobody thought of it."
   kind, slug, spec, schema_version_spec, finalizers — and ignores the other twelve:
   `ID`, `ResourceVersion`, `CreatedAt`, `UpdatedAt` (store-assigned), `Status` and
   `Generation` (hardcoded `NULL` and `1`), `StatusVersion`, `ObservedGeneration`,
-  `ObservedAt`, `DeletionRequestedAt`, `Conditions`, and `PendingWake`. A caller
+  `ObservedAt`, `DeletionRequestedAt`, `Conditions`, and `ReconcileOwed`. A caller
   passing any of them gets a row without it and no error.
 
   `Status` is the sharp one: seeding a status on create is a plausible thing to
@@ -328,7 +328,7 @@ tell "we decided against this for now" from "nobody thought of it."
   `RawObject` is an exported alias, so narrowing the parameter is a breaking change
   to an externally-implementable `Store`, and it wants doing alongside the return-shape
   item below rather than as a second separate break. Surfaced in review of the
-  `pending_wake` work, where the new field simply joined the existing eleven; noted
+  `reconcile_owed` work, where the new field simply joined the existing eleven; noted
   here so the next reader sees it is a pre-existing shape problem and not something
   that arrived with the durable wake.
 
@@ -560,7 +560,7 @@ tell "we decided against this for now" from "nobody thought of it."
   dependency wake, of which the waker dropped three kinds silently.
 
   **The knobs.** `WithCatchupInterval` (30s, per-kind) drains what the store
-  records as owed — `ObjectsListUnsettledIDs` + `WakesListPendingIDs`, bounded by what is
+  records as owed — `ObjectsListUnsettledIDs` + `ReconcileOwedListIDs`, bounded by what is
   outstanding. `WithResyncInterval` (**0, off**, per-kind) re-dispatches every
   object; opt-in because it scales with object count and the startup pass covers
   the same ground once per process. Its *meaning changed* while keeping its name,
@@ -684,7 +684,7 @@ tell "we decided against this for now" from "nobody thought of it."
 
   **The alternative was built, then reverted** — recorded so it is not rebuilt.
   Hoisting `enqueueUnsettled` out of the strategy switch (next to
-  `enqueueDeletionPending`/`enqueuePendingWake`) makes recovery unconditional and
+  `enqueueDeletionPending`/`enqueueReconcileOwed`) makes recovery unconditional and
   reduces the strategy to "do you *also* sweep settled objects". It passes the whole
   suite. Two things sank it. It deletes the only way to express "drive nothing
   automatically" — `StartupReconcileNone` and `StartupReconcileUnsettled` become
@@ -720,18 +720,18 @@ tell "we decided against this for now" from "nobody thought of it."
 
 - **`reconciler.enqueueFrom` logs its list error** — done. It was silent, on the
   reasoning that a failed resync list skips one tick and the next retries, so it
-  self-heals on cadence. `enqueuePendingWake` broke that premise: at
+  self-heals on cadence. `enqueueReconcileOwed` broke that premise: at
   `resyncInterval = 0` its startup call is the *only* invocation, so a failed
-  `WakesListPendingIDs` defers every recorded owed wake to the next process start —
+  `ReconcileOwedListIDs` defers every recorded owed wake to the next process start —
   the one backstop whose entire purpose is not losing them, failing indistinguishably
   from "nothing was owed". It now warns, and takes a `source` naming which backstop
   lost its pass, since the cost differs sharply between them. Surfaced in review of
-  the `pending_wake` work, which is exactly the "when one of the items above is
+  the `reconcile_owed` work, which is exactly the "when one of the items above is
   touched" trigger the deferred entry named. `reconciler.log()` was added alongside
   it (the nil-safe accessor `typedController` already had), because the enqueue
   helpers are reachable on reconcilers built outside `Register`.
 
-- **Durable twin for the in-memory dependency wake (`pending_wake`)** — done.
+- **Durable twin for the in-memory dependency wake (`reconcile_owed`)** — done.
   `DependenciesAdd`'s guard (see CLAUDE.md) produced an ordinary `wakeAfterCommit`
   requeue, and the work queue does not outlive the process: a crash between the
   edge's commit and the dispatch left the edge in place, the dependent settled on a
@@ -741,10 +741,10 @@ tell "we decided against this for now" from "nobody thought of it."
   spec-write wake still leaves `generation > observed_generation` for the resync tick
   to re-derive).
 
-  The fix increments `objects.pending_wake` under the same edge-new ∧ target-moved
+  The fix increments `objects.reconcile_owed` under the same edge-new ∧ target-moved
   conjunction that fires the wake — so the durable record and the edge commit
   together. It lives *inside* `EdgesAdd` and *before* the insert, reporting through
-  `EdgesAddResult.WakeStamped`; as a second store call after `EdgesAdd` returned it was
+  `EdgesAddResult.ReconcileOwedStamped`; as a second store call after `EdgesAdd` returned it was
   not actually indivisible from the edge, since a nested `Within` unwinds nothing
   (see "A nested `Within` is not a rollback boundary" above, which records both the
   reviewer's finding and why the general fix was not taken). The stamp is
@@ -754,25 +754,25 @@ tell "we decided against this for now" from "nobody thought of it."
   running a beehive predicate inside the write transaction and deciding
   registration in two places, when `enqueueIfRegistered` already decides it once.
   `typedController.reconcile` subtracts, on a successful pass, **the count it
-  loaded** (`WakesDecrement(id, observed)`, floored at 0), skipping the write
-  when that count is 0. `pending_wake` is a **count of outstanding wakes, not a
+  loaded** (`ReconcileOwedDecrement(id, observed)`, floored at 0), skipping the write
+  when that count is 0. `reconcile_owed` is a **count of outstanding wakes, not a
   single token** — that is what survives a wake owed *while an earlier one is being
   reconciled*: it lands above `observed` and so survives the subtraction, where a
   token compared to the loaded value (an earlier design used the target's rv) would
   have been dropped when two wakes for the same unchanged target shared a value, then
   lost to a crash (surfaced in review, pinned by
-  `TestReconcilePendingWakeSurvivesConcurrentWake`). Subtracting `observed` rather
+  `TestReconcileOwedSurvivesConcurrentIncrement`). Subtracting `observed` rather
   than 1 is the second half, also from review: one pass reads the target's *current*
   state, addressing every wake outstanding when it began, and the backstop enqueues a
   row only once (the work queue coalesces), so a `-1` would strand the remainder with
   nothing to re-enqueue it — indefinitely at `resyncInterval=0`, one per tick
-  otherwise (`TestReconcileDrainsMultiplePendingWakes`). No follow-up requeue is
+  otherwise (`TestReconcileDrainsMultipleOwedPasses`). No follow-up requeue is
   scheduled: a residual exists only when an increment landed mid-pass, and that
   increment carried its own in-memory requeue. A failed subtraction is logged and
   left for the backstop rather than requeued, which would spin against a store that
   keeps failing. The
-  backstop `WakesListPendingIDs` rides the partial index
-  `idx_objects_pending_wake WHERE pending_wake != 0` — a sibling of
+  backstop `ReconcileOwedListIDs` rides the partial index
+  `idx_objects_reconcile_owed WHERE reconcile_owed != 0` — a sibling of
   `ListDeletionPendingIDs`, not folded into `ObjectsListUnsettledIDs` (an owed wake is
   orthogonal to spec convergence), enqueued unconditionally at startup and each
   resync tick so `StartupReconcileNone` + `resyncInterval=0` still recovers.
@@ -798,7 +798,7 @@ tell "we decided against this for now" from "nobody thought of it."
   advance it on every successful pass, and enqueue any dependent whose target's
   version exceeds it. Because it *derives* staleness rather than recording an intent,
   it heals any lost wake — including the three silent loss points — and subsumes
-  `pending_wake`. It costs a write on every successful pass (vs only when something is
+  `reconcile_owed`. It costs a write on every successful pass (vs only when something is
   owed) and over-flags (a target change during a pass costs an extra tick even when
   the read was late enough), so it was not taken now; revisit it if the waker's silent
   loss points are addressed. Storing the cursor **per-edge on `edges`** was rejected

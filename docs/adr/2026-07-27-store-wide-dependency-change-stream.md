@@ -38,12 +38,12 @@ controllers have asked to hear about.
 |---|---|
 | the dependency waker | no — no waker existed for that kind |
 | `ObjectsListUnsettledIDs` (catchup tick) | no — the dependent is settled; its own generation never moved |
-| `WakesListPendingIDs` (catchup tick) | only if the edge was declared against an already-moved target, a different case |
+| `ReconcileOwedListIDs` (catchup tick) | only if the edge was declared against an already-moved target, a different case |
 | `WithStartupResync` | **yes**, and only at the next process start |
 
 The last row held for a narrow reason: `enqueueAll` (the startup full pass)
 deliberately includes already-settled objects, while `enqueueCatchup` —
-`ObjectsListUnsettledIDs` + `WakesListPendingIDs` — structurally cannot see a settled
+`ObjectsListUnsettledIDs` + `ReconcileOwedListIDs` — structurally cannot see a settled
 dependent. So the sole cover was a default, not a mechanism, and two supported
 configurations remove it: under `WithStartupResync(false)` a dependent of a
 client-only target never learned its target moved, for the life of the store.
@@ -246,5 +246,5 @@ scan cadence rather than within milliseconds, and the RESTRICT stall is merely
 bounded by that cadence instead of by the process lifetime. Waker first, for that
 reason.
 
-The unreclaimed `pending_wake` count for client-only *dependents* is the mirror
+The unreclaimed `reconcile_owed` count for client-only *dependents* is the mirror
 gap on the other side of the edge, and is still open in `TODO.md`.

@@ -38,6 +38,14 @@ The `Get`/`List` cardinality signal moves to the return type, which already carr
 
 Exempt: `Err*` values, `With*` options, and anything satisfying an external interface.
 
+One family takes a **singular** prefix: `ReconcileOwed*`, over the
+`objects.reconcile_owed` column. The rule's purpose is one prefix per family, which a
+singular serves here as well as a plural would, and the family fronts a scalar count
+whose name it should match — `ReconcilesOwed*` buys the letter of the rule at every
+call site, and `OwedReconciles*` reads as a noun only by inverting the column name.
+Recorded rather than left to the reader, because an undocumented exception is how a
+convention erodes.
+
 **2. A watch over a change stream returns `<-chan NounChange` or a
 `*NounsSubscription`** — never a bare `…Watcher` interface. The change
 travels by value: `ObjectChange[Spec, Status]` is a type tag plus one pointer, so
@@ -85,9 +93,10 @@ Four judgment calls worth recording, since each has a defensible other answer:
   `deletion_requested_at` and never removes a row — the hard delete is `ObjectsDelete`
   — so naming it `Deletions*` gave one word two families, and the one that deletes
   nothing had the better claim on it. Being a column rather than a table is no
-  objection here; `Wakes*` (`objects.pending_wake`) is the same shape. `Pending` then
-  drops out of the list method, since a request is only ever cleared by the delete
-  itself. The cascade breaks the `By…` qualifier pattern (`BySlug`, `ByRelation`,
+  objection here; `ReconcileOwed*` (`objects.reconcile_owed`) is the same shape.
+  `Pending` then drops out of the list method, since a request is only ever cleared by
+  the delete itself — and out of `ReconcileOwedListIDs` for the same reason, the family
+  name already saying the row owes something. The cascade breaks the `By…` qualifier pattern (`BySlug`, `ByRelation`,
   `ByIncomingEdge`, all naming the key you pass) and reads
   `DeletionRequestsCreateFromOwner`: `By` also means *agency* in English, and unlike a
   slug an owner is animate, so `CreateByOwner` invites the wrong reading — the owner

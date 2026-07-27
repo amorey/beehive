@@ -582,7 +582,7 @@ type Store interface {
 	// child's owner via RelationOwnedBy, or its dependencies via RelationDependsOn).
 	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
-	// There is deliberately no standalone increment here. Wakes are produced by
+	// There is deliberately no standalone increment here. Increments are produced by
 	// EdgesAdd — its stamp has to be indivisible from the edge insert, so it issues
 	// one itself and reports it as EdgesAddResult.ReconcileOwedStamped — and consumed by
 	// ReconcileOwedDecrement. An interface increment would be surface no caller could

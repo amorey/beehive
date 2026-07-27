@@ -18,7 +18,7 @@ Split them into three drivers.
 
 ### `WithCatchupInterval` (default 30s, per-kind)
 
-`enqueueCatchup` = `ObjectsListUnsettledIDs` + `WakesListPendingIDs`. Work the store
+`enqueueCatchup` = `ObjectsListUnsettledIDs` + `ReconcileOwedListIDs`. Work the store
 *records* as owed, so its cost is bounded by what is outstanding and it returns
 nothing in a converged system. The two listings stay separate rather than unioned
 in SQL so one failing still lets the other through, and `enqueueFrom`'s log names
