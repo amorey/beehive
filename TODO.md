@@ -283,6 +283,30 @@ tell "we decided against this for now" from "nobody thought of it."
   that declares many edges from client-only kinds, where the index entries would
   actually be measurable.
 
+- **`WakesDecrement` is not kind-scoped** — known, not fixed. Its UPDATE is keyed
+  `WHERE id = ?` with no group/kind in the predicate, so it will decrement any row in
+  `objects` whose id it is handed, of any kind. Every other id-keyed mutator in the
+  store is scoped to a `GroupKind` and rejects a foreign id with `ErrWrongKind` —
+  either in the `WHERE` or via the scoped re-read — and this is the sole exception.
+
+  It is safe today for a narrow reason: the only caller is the reconciler
+  (`reconciler.go`), which passes the id of a row it loaded one line earlier for its
+  own kind, along with the count it read off that same row. No path reaches it with a
+  foreign id, and the `max(… , 0)` floor means even a mistaken call cannot corrupt the
+  count into an invalid state — it would only clear a wake another kind was owed.
+
+  So the guard is caller discipline where the rest of the store has a structural one.
+  The fix is small — add `AND "group" = ? AND kind = ?` and thread a `GroupKind`
+  through — but it changes a `storeapi.Store` signature and wants a test pinning the
+  foreign-id rejection, which is more than the two-line diff it looks like. Deferred
+  because there is no reachable defect to fix, only an invariant to move from
+  convention into the schema. Revisit when a second caller appears — a cross-kind
+  sweeper (the item above) would be exactly that, and would be reaching for rows of
+  kinds it does not own, which is the case the scoping exists to catch.
+
+  Note the pending `reconcile_owed` rename (`specs/1-reconcile-owed-rename.md`)
+  renames this method to `ReconcileOwedDecrement` without touching the predicate.
+
 - **`ObjectsCreate` takes a `RawObject` and silently drops most of it** — known, not
   fixed, and the input-side twin of the item below. `RawObject` is a *read*-shaped
   DTO (it mirrors the full row, and is publicly aliased as `beehive.RawObject`), but
