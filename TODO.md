@@ -127,6 +127,45 @@ tell "we decided against this for now" from "nobody thought of it."
   permanent full-table pass reachable from a single dropped subscription is worse
   than the index it costs.
 
+- **A crash during a waker outage strands a settled dependent, and no in-memory
+  recovery can fix it** — analyzed, not fixed, and deliberately left out of the
+  watermark recovery design (`specs/6-waker-escalation-without-tick.md`). The gap
+  exists today and is *not* introduced by that spec: the escalation flags
+  (`resyncOnce`/`resyncAlways`) are in-memory too, so a restart loses the armed
+  repair exactly as a restart would lose a watermark. The spec closes the in-process
+  half; this is the half it leaves.
+
+  The scenario: D depends on T, the waker loses T's change (any of the three loss
+  points), and the process dies before the repair runs. On restart nothing replays
+  it. `enqueueCatchup` runs unconditionally at startup, but it lists unsettled
+  objects plus `reconcile_owed` stamps, and a settled dependent has neither — its own
+  generation never moved and nothing stamped it. `enqueueAll` is what would catch it,
+  and that is gated on `startupResync`, which defaults to `true`. **So the exposure
+  is `WithStartupResync(false)` plus a crash mid-outage** — narrow, but it is the same
+  configuration in which the in-process gap is most acute, so a reader who sees that
+  gap fixed will reasonably assume this one is too.
+
+  **Persisting the watermark is not the fix**, which is the analysis worth keeping. A
+  watermark records *delivery* ("the waker reached rv N"); what has to survive a
+  restart is *convergence* ("D actually reconciled against T's new state"). Those
+  come apart in the ordinary case: if the waker requeues D, advances past T, and the
+  process dies before D's reconcile runs, a persisted cursor is already past T and D
+  is stranded anyway. Persisting buys half the hole, leaves the twin half open, and
+  charges a write per consumed batch on a single connection.
+
+  Nor is the cheap durable trick available: you cannot stamp `reconcile_owed` on the
+  dependent at failure time, because the lookup that failed is the one that would
+  have named the dependents. Recorded intent needs to know who to record against, and
+  that is exactly the information the failure destroyed.
+
+  **The fix is `observed_cursor`** (recorded under the pending-wake backstop item
+  below) — per-object, so durability attaches to the thing that must converge, and
+  derived rather than recorded, so it needs no knowledge of who was missed. Not fixed
+  now because it is a schema-and-write-path change well past the scope of the
+  in-process repair, and because the exposure needs an opt-out knob *and* a crash.
+  Revisit with `observed_cursor`; until then, `WithStartupResync(false)` should
+  document that it opts out of crash recovery for settled dependents.
+
 - **A target change landing *mid-reconcile* is safe in memory, but has no durable
   twin** — analyzed, in-memory half verified sound, durable half not fixed. The
   scenario: D depends on T, T changes and wakes D, and T changes *again* while D's
