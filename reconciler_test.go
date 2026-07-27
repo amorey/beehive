@@ -1014,7 +1014,6 @@ func TestWakerRecoversFromSubscribeFailureWithNoPeriodicPass(t *testing.T) {
 
 	r := &reconciler{gk: gk, work: newWorkQueue()}
 	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{gk: r}, order: []*reconciler{r}}
-	require.False(t, bh.hasPeriodicPass(), "the configuration this gap needs: nothing periodic to fall back on")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	dw := wakerOf(bh)
@@ -1028,6 +1027,39 @@ func TestWakerRecoversFromSubscribeFailureWithNoPeriodicPass(t *testing.T) {
 	bh.wg.Wait()
 
 	assert.Equal(t, []ObjectID{8}, r.work.items, "the dependent of the target whose change was lost")
+}
+
+// The other loss point, on the same recovery path: a closed stream used to end the
+// waker for the life of the process, repaired only by escalating every later
+// catchup tick. Now it resubscribes and replays from its watermark, so a settled
+// dependent of a target that changed during the gap still converges with nothing
+// periodic configured. Written when the escalation was deleted, to keep the
+// coverage its own test had — it passes on the recovery loop as built.
+func TestWakerRecoversFromClosedStreamWithNoPeriodicPass(t *testing.T) {
+	gk := GroupKind{Kind: "Widget"}
+	store := &recoveringStore{
+		replayStore: replayStore{
+			depsStore: depsStore{deps: map[ObjectID][]ObjectRef{7: {{ID: 8, Kind: "Widget"}}}},
+			rows:      []ObjectWrite{{ID: 7, Type: Modified, ResourceVersion: 5}},
+		},
+		writes: newFakeWriteStream(),
+		woke:   newSignal(),
+	}
+	r := &reconciler{gk: gk, work: newWorkQueue()}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{gk: r}, order: []*reconciler{r}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dw := wakerOf(bh)
+	dw.wait = func(context.Context, time.Duration) bool { return true }
+	dw.start(ctx)
+
+	// End the first stream: the waker must come back on a new one and replay the gap.
+	store.writes.endStream()
+	store.woke.wait(t, "the dependents lookup a resubscribed waker makes")
+	cancel()
+	bh.wg.Wait()
+
+	assert.Equal(t, []ObjectID{8}, r.work.items, "the dependent stranded by the closed stream")
 }
 
 // The retry interval grows but is capped, and the loop never stops trying. An
@@ -3149,15 +3181,13 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 	wakerOf(bh).wakeDependents(ctx, changed(1))
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
-	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
 }
 
-// TestDependencyWakerStreamEndLogs pins the second. A closed change stream ends
-// the waker for the life of the process — nothing re-subscribes, and it is the
-// process's only stream — so every future change to every kind reaches no
-// dependent at all. No reachable path closes the
-// channel short of store Close today, which makes this latent rather than live;
-// unlogged either way.
+// TestDependencyWakerStreamEndLogs pins the second loss point. A closed change
+// stream costs every kind's wakes, not one kind's — it is the process's only
+// stream — so it is worth a warning even though the waker now resubscribes and
+// replays rather than dying on it. No reachable path closes the channel short of
+// store Close today, which makes this latent rather than live; logged either way.
 func TestDependencyWakerStreamEndLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	fw := newFakeWriteStream()
@@ -3172,8 +3202,8 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 	fw.endStream()
 	waitClosed(t, done, "waker to exit on stream end")
 
-	assert.Contains(t, buf.String(), "dependency waker stopped",
-		"a dead waker must not be silent")
+	assert.Contains(t, buf.String(), "change stream ended",
+		"a lost stream must not be silent")
 }
 
 // TestDependencyWakerCancelDoesNotLog is the negative: an ordinary shutdown ends
@@ -3197,43 +3227,6 @@ func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 }
 
-// TestCatchupTickEscalationPredicate covers the tick's full-pass decision
-// directly, because the two escalation reasons differ in a way an integration
-// test cannot show cheaply: a dead waker is a standing condition, while a dropped
-// wake is a one-shot that must be *consumed* by the tick it drives.
-//
-// It also pins the consumption order. When a standing reason already applies, the
-// one-shot must survive rather than be burned — that tick sweeps anyway, and
-// spending it there would discard the repair still owed if the standing reason
-// later goes away.
-func TestCatchupTickEscalationPredicate(t *testing.T) {
-	t.Run("no escalation by default", func(t *testing.T) {
-		assert.False(t, (&reconciler{}).tickResyncs())
-	})
-
-	t.Run("resyncNextTick fires once", func(t *testing.T) {
-		r := &reconciler{}
-		r.resyncNextTick()
-		assert.True(t, r.tickResyncs())
-		assert.False(t, r.tickResyncs(), "one-shot: a transient drop must not degrade the process")
-	})
-
-	t.Run("resyncEveryTick fires forever", func(t *testing.T) {
-		r := &reconciler{}
-		r.resyncEveryTick()
-		assert.True(t, r.tickResyncs())
-		assert.True(t, r.tickResyncs(), "sticky: the waker is gone for the process lifetime")
-	})
-
-	t.Run("a standing reason leaves the one-shot armed", func(t *testing.T) {
-		r := &reconciler{}
-		r.resyncEveryTick()
-		r.resyncNextTick()
-		assert.True(t, r.tickResyncs())
-		assert.True(t, r.resyncOnce.Load(), "not consumed by a tick it did not decide")
-	})
-}
-
 // errListIDsStore fails the full-pass listing and reports each attempt, so a test
 // can await the tick that consumed an escalation.
 type errListIDsStore struct {
@@ -3249,78 +3242,6 @@ func (s *errListIDsStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID
 	default:
 	}
 	return nil, errBoom
-}
-
-// TestFailedEscalatedPassRearmsOneShot pins the other half of the one-shot's
-// contract: it is spent on a full pass that *ran*, not merely on one that was
-// attempted. tickResyncs consumes the flag before the listing, so a transient
-// ObjectsListIDs failure used to swallow the repair permanently — and with resync off by
-// default nothing else reaches the settled dependents a dropped wake stranded.
-func TestFailedEscalatedPassRearmsOneShot(t *testing.T) {
-	store := &errListIDsStore{calls: make(chan struct{}, 1)}
-	r := &reconciler{store: store, catchupInterval: time.Millisecond, logger: discardLogger}
-	r.resyncNextTick()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := runInBackground(r, ctx)
-
-	// Two escalated passes: the second can only happen because the first re-armed
-	// the flag it consumed.
-	for range 2 {
-		select {
-		case <-store.calls:
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for the escalated full pass")
-		}
-	}
-
-	cancel()
-	<-done
-	assert.True(t, r.resyncOnce.Load(), "a pass that never listed leaves the repair owed")
-}
-
-// TestDroppedWakeEscalatesEveryKind pins the property the first attempt at this
-// got wrong. The flags were process-wide but consumed per-reconciler, so a dropped
-// wake repaired whichever kind ticked first and silently spent the repair for the
-// rest — a guarantee stated in a comment and contradicted by the code.
-//
-// Cross-kind is forced by the mechanism, not chosen: dependency edges are
-// deliberately cross-kind, so a lost wake on one kind strands dependents of any
-// kind, and the lookup that failed is what would have named them.
-func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
-	logger, buf := captureLogger(slog.LevelWarn)
-	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
-
-	wakerOf(bh).wakeDependents(context.Background(), changed(1))
-
-	assert.Contains(t, buf.String(), "forcing a full resync pass")
-	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
-	assert.True(t, r2.resyncOnce.Load())
-	assert.False(t, r1.resyncAlways.Load(), "a transient lookup error is not a permanent escalation")
-}
-
-// TestDeadWakerEscalatesEveryKind is the sticky counterpart: a waker whose stream
-// ended keeps dropping every future change, so one pass would repair the instant
-// of death and strand everything after it.
-func TestDeadWakerEscalatesEveryKind(t *testing.T) {
-	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWriteStream()
-	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger, order: []*reconciler{r1, r2}}
-
-	done := make(chan struct{})
-	go func() {
-		wakerOf(bh).run(context.Background(), fw.sub)
-		close(done)
-	}()
-	fw.endStream()
-	waitClosed(t, done, "waker to exit on stream end")
-
-	assert.Contains(t, buf.String(), "escalating")
-	assert.True(t, r1.resyncAlways.Load(), "a dead waker escalates every kind's later ticks")
-	assert.True(t, r2.resyncAlways.Load())
 }
 
 // shutdownCtx reports itself cancelled but never fires Done. Real shutdown
@@ -3339,77 +3260,6 @@ type shutdownCtx struct{ context.Context }
 
 func (shutdownCtx) Done() <-chan struct{} { return nil }
 func (shutdownCtx) Err() error            { return context.Canceled }
-
-// TestDeadWakerOnShutdownDoesNotEscalate is TestDeadWakerEscalatesEveryKind's
-// negative twin. Stop ends the stream by cancelling the same ctx the waker
-// selects on, so a stream that ends during shutdown is a normal exit, not a
-// dropped wake. Escalating there would arm every later tick of a control plane
-// that is going away, and it would do so on every clean Stop — which is how the
-// one message that matters gets trained out of an operator.
-func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
-	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWriteStream()
-	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger, order: []*reconciler{r1, r2}}
-
-	done := make(chan struct{})
-	go func() {
-		wakerOf(bh).run(shutdownCtx{context.Background()}, fw.sub)
-		close(done)
-	}()
-	fw.endStream()
-	waitClosed(t, done, "waker to exit on a stream ended by shutdown")
-
-	assert.Empty(t, buf.String(), "a stream ended by shutdown is not a dropped wake")
-	assert.False(t, r1.resyncAlways.Load(), "a control plane going away must not arm its later ticks")
-	assert.False(t, r2.resyncAlways.Load())
-}
-
-// TestEscalatedCatchupTickReconcilesSettled closes the loop end to end: an armed
-// escalation must actually reach a settled object, which is the only kind of
-// object the repair exists for — one that is owed nothing and therefore invisible
-// to the catchup listings the tick would otherwise run.
-func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
-	ctx := context.Background()
-	gk := GroupKind{Kind: "Widget"}
-
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
-	raw, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
-	require.NoError(t, err)
-	_, err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
-
-	reconciled := make(chan ObjectID, 4)
-	// Catchup on (it carries the escalation), resync off, no startup pass: only an
-	// escalated catchup tick can reach a settled object.
-	bh, err := New(store, WithCatchupInterval(10*time.Millisecond),
-		WithResyncInterval(0), withoutGCSweeper())
-	require.NoError(t, err)
-	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
-		WithStartupResync(false))
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	defer stop(ctx)
-
-	select {
-	case got := <-reconciled:
-		t.Fatalf("settled object %d dispatched before any escalation", got)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	bh.resyncKindsNextTick()
-
-	select {
-	case got := <-reconciled:
-		assert.Equal(t, raw.ID, got)
-	case <-time.After(testTimeout):
-		t.Fatal("escalation never reached the settled object")
-	}
-}
 
 // TestWakeDependentsBatchOneQuery verifies a batch of changed targets resolves
 // in a single edges query. The store runs on one connection, so the waker's reads

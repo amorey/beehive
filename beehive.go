@@ -96,47 +96,6 @@ type Beehive struct {
 	wg     sync.WaitGroup
 }
 
-// resyncKindsNextTick repairs a dependency-wake failure that dropped a single
-// change: every registered reconciler runs one full pass on its next catchup
-// tick, then returns to draining owed work.
-//
-// resyncKindsEveryTick is the sticky counterpart, for a failure that will keep
-// dropping changes for the life of the process.
-//
-// Both reach every reconciler rather than the failing kind's, and that is forced
-// by the failures themselves: dependency edges are deliberately cross-kind, so a
-// lost wake strands dependents of any kind, and the lookup that fails in
-// wakeDependentsBatch is the very thing that would have named them. Escalating one kind
-// would repair one arbitrary kind and silently spend the repair for the rest.
-// order is frozen once Start runs, so it reads without bh.mu — the same reasoning
-// stop relies on.
-func (bh *Beehive) resyncKindsNextTick() {
-	for _, r := range bh.order {
-		r.resyncNextTick()
-	}
-}
-
-// resyncKindsEveryTick is the sticky counterpart of resyncKindsNextTick; see that
-// method's doc for why both are cross-kind.
-func (bh *Beehive) resyncKindsEveryTick() {
-	for _, r := range bh.order {
-		r.resyncEveryTick()
-	}
-}
-
-// hasPeriodicPass reports whether any registered reconciler still has a tick for
-// an escalation to ride. Asked across every kind rather than the failing one,
-// because the escalation is cross-kind too (see resyncKindsNextTick): a tick on
-// any kind repairs dependents of that kind, whatever kind's waker was lost.
-func (bh *Beehive) hasPeriodicPass() bool {
-	for _, r := range bh.order {
-		if r.hasPeriodicPass() {
-			return true
-		}
-	}
-	return false
-}
-
 // log returns a non-nil logger. Start resolves bh.logger, but Stop (and tests
 // that drive state directly) may run before that, so guard against nil.
 func (bh *Beehive) log() *slog.Logger {
@@ -503,8 +462,7 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
 				// the process's only change stream, so every future change to every kind
 				// now reaches no dependent at all.
-				dw.bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for every kind for the life of the process; escalating every catchup tick to a full resync pass")
-				dw.bh.resyncKindsEveryTick()
+				dw.bh.log().Warn("dependency waker change stream ended for every kind; resubscribing and replaying the changes it missed")
 				return delivered
 			}
 			delivered = true
@@ -581,9 +539,8 @@ func (dw *waker) wakeDependents(ctx context.Context, batch []ObjectWrite) bool {
 		// generation never moved — so with no full pass configured the miss is
 		// permanent, not slow. Nothing here can name who was missed: the lookup
 		// that failed is exactly the one that would have said.
-		dw.bh.log().WarnContext(ctx, "dependents lookup failed; wakes for these changes were dropped, forcing a full resync pass",
+		dw.bh.log().WarnContext(ctx, "dependents lookup failed; replaying these changes from the watermark",
 			"targetIDs", ids, "err", err)
-		dw.bh.resyncKindsNextTick()
 		// The watermark stays put: this batch was not processed, so it is still part
 		// of what a recovery has to replay. Advancing here would let a later batch
 		// that succeeded carry the cursor past this one — batches do not arrive in
