@@ -395,7 +395,7 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 			if err != nil {
 				return // ctx cancelled, watcher closed, or hub closed
 			}
-			batch := []storeapi.ObjectWrite{{ID: wev.Key, Type: wev.Value.typ}}
+			batch := []storeapi.ObjectWrite{{ID: wev.Key, Type: wev.Value.typ, ResourceVersion: wev.Value.rv}}
 			// Drain whatever else is already pending. Taking it from the receiver
 			// rather than from a buffered out channel is what keeps conflation
 			// intact up to this point: until a value is popped, another write to the
@@ -406,7 +406,7 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 				if err != nil {
 					break // drained, or the hub closed (the next Recv reports it)
 				}
-				batch = append(batch, storeapi.ObjectWrite{ID: next.Key, Type: next.Value.typ})
+				batch = append(batch, storeapi.ObjectWrite{ID: next.Key, Type: next.Value.typ, ResourceVersion: next.Value.rv})
 			}
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park

@@ -140,6 +140,13 @@ type ObjectWritesSubscription = Subscription[[]ObjectWrite]
 type ObjectWrite struct {
 	ID   ObjectID
 	Type ChangeType
+
+	// ResourceVersion is the version of the write this reference reports — the
+	// newest one, where conflation merged several. It is the store-wide cursor (see
+	// resource_version_seq), so a consumer that records the highest version it has
+	// finished processing can resume from there instead of re-deriving the world.
+	// Eight bytes and no row: the blob-pinning above stays avoided.
+	ResourceVersion int64
 }
 
 // Condition is the untyped form of a single condition row. Status is one of

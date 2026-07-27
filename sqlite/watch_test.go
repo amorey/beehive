@@ -1135,7 +1135,28 @@ func TestObjectWritesSubscribeStreamsLiveChanges(t *testing.T) {
 
 	created, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: created.ID, Type: beehive.Added}}, recvBatch(t, w))
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: created.ID, Type: beehive.Added, ResourceVersion: created.ResourceVersion},
+	}, recvBatch(t, w))
+}
+
+// TestObjectWritesSubscribeCarriesResourceVersion verifies a reference reports the
+// version of the write that produced it. That scalar is what lets a consumer resume
+// from where it stopped instead of re-deriving the world, so it has to be the
+// write's own version and not merely nonzero.
+func TestObjectWritesSubscribeCarriesResourceVersion(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	created, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: created.ID, Type: beehive.Added, ResourceVersion: created.ResourceVersion},
+	}, recvBatch(t, w))
 }
 
 // TestObjectWritesSubscribeSpansKinds verifies the stream is store-wide: one
@@ -1178,9 +1199,11 @@ func TestObjectWritesSubscribeSkipsSnapshot(t *testing.T) {
 	defer w.Close()
 	assertNoBatch(t, w, 200*time.Millisecond)
 
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
+	updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: pre.ID, Type: beehive.Modified}}, recvBatch(t, w))
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: pre.ID, Type: beehive.Modified, ResourceVersion: updated.ResourceVersion},
+	}, recvBatch(t, w))
 }
 
 // newParkedObjectChangeStream returns a object-change watcher whose goroutine is
@@ -1263,14 +1286,19 @@ func TestObjectWritesSubscribeCoalescesRepeatWrites(t *testing.T) {
 
 	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
+	var last int64
 	for i := range 5 {
-		_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
 		require.NoError(t, err)
+		last = updated.ResourceVersion
 	}
 
 	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: obj.ID, Type: beehive.Added}}, recvBatch(t, w),
-		"one create plus five updates conflate to one entry, still Added to a consumer that never saw it")
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: obj.ID, Type: beehive.Added, ResourceVersion: last},
+	}, recvBatch(t, w),
+		"one create plus five updates conflate to one entry, still Added to a consumer that never saw it, "+
+			"carrying the newest write's version so a resume cursor is never behind the row")
 	assertNoBatch(t, w, 200*time.Millisecond) // and nothing trails behind it
 }
 
@@ -1290,8 +1318,9 @@ func TestObjectWritesSubscribeAnnihilatesTransient(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: survivor.ID, Type: beehive.Added}}, recvBatch(t, w),
-		"the transient object is dropped entirely")
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: survivor.ID, Type: beehive.Added, ResourceVersion: survivor.ResourceVersion},
+	}, recvBatch(t, w), "the transient object is dropped entirely")
 	assertNoBatch(t, w, 200*time.Millisecond)
 }
 
