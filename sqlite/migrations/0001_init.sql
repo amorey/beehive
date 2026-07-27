@@ -55,7 +55,7 @@ CREATE TABLE objects (
     deletion_requested_at INTEGER,
     finalizers            TEXT NOT NULL DEFAULT '[]', -- JSON array of finalizer names
 
-    -- Count of owed durable dependency wakes. AddDependency increments it when it
+    -- How many passes beehive owes this object. DependenciesAdd adds one when it
     -- detects its target moved between the caller's read and the declare (the
     -- read-then-declare race), so the wake survives a crash that loses the in-memory
     -- requeue; a successful reconcile subtracts the count it observed. 0 = nothing
@@ -63,7 +63,11 @@ CREATE TABLE objects (
     -- reconciled is not lost: it lands above the observed count and survives the
     -- subtraction. Subtracting the whole observed count (not 1) is what drains a
     -- multi-wake row in the single pass the backstop schedules for it.
-    pending_wake INTEGER NOT NULL DEFAULT 0,
+    --
+    -- This is durable, owed *work*; the in-memory dependency waker is a separate
+    -- mechanism and leaves nothing here. A second durable marker (undecodable rows,
+    -- say) gets its own column and its own cadence — it does not join this count.
+    reconcile_owed INTEGER NOT NULL DEFAULT 0,
 
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -96,12 +100,12 @@ CREATE INDEX idx_objects_unsettled
     ON objects("group", kind)
     WHERE observed_generation IS NULL OR observed_generation < generation;
 
--- Objects owed a durable dependency wake (see pending_wake). Separate from the
+-- Objects owed a durable dependency wake (see reconcile_owed). Separate from the
 -- unsettled index because the two are orthogonal: an object can be spec-converged
--- yet still owe a wake. The backstop query (ListPendingWakeIDs) rides this.
-CREATE INDEX idx_objects_pending_wake
+-- yet still owe a wake. The backstop query (ReconcileOwedListIDs) rides this.
+CREATE INDEX idx_objects_reconcile_owed
     ON objects("group", kind)
-    WHERE pending_wake != 0;
+    WHERE reconcile_owed != 0;
 
 -- ============================================================
 -- conditions

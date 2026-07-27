@@ -212,7 +212,7 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 const objectColumns = `id, "group", kind, slug, spec, status,
 	schema_version_spec, schema_version_status,
 	generation, observed_generation, observed_at, resource_version,
-	deletion_requested_at, pending_wake, finalizers, created_at, updated_at`
+	deletion_requested_at, reconcile_owed, finalizers, created_at, updated_at`
 
 // nextResourceVersion advances and returns the global write cursor. It draws
 // from a standalone counter (not MAX(objects.resource_version)) so that
@@ -488,10 +488,10 @@ func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.Obje
 }
 
 func (s *sqliteStore) WakesListPendingIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
-	// Matches the partial index idx_objects_pending_wake WHERE pending_wake != 0.
+	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
-		 WHERE "group" = ? AND kind = ? AND pending_wake != 0
+		 WHERE "group" = ? AND kind = ? AND reconcile_owed != 0
 		 ORDER BY id`,
 		gk.Group, gk.Kind)
 	if err != nil {
@@ -513,13 +513,13 @@ func (s *sqliteStore) WakesListPendingIDs(ctx context.Context, gk storeapi.Group
 // future non-edge producer (see the dependency-waker item in TODO.md) would hook in.
 func (s *sqliteStore) WakesIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
-		`UPDATE objects SET pending_wake = pending_wake + 1 WHERE id = ?`, id)
+		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)
 	return err
 }
 
 func (s *sqliteStore) WakesDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
-		`UPDATE objects SET pending_wake = max(pending_wake - ?, 0) WHERE id = ?`, observed, id)
+		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0) WHERE id = ?`, observed, id)
 	return err
 }
 
@@ -1422,7 +1422,7 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		var stamped bool
 		if targetResourceVersion > 0 && targetRV > targetResourceVersion {
 			res, err := s.conn(ctx).ExecContext(ctx, `
-				UPDATE objects SET pending_wake = pending_wake + 1
+				UPDATE objects SET reconcile_owed = reconcile_owed + 1
 				WHERE id = ? AND NOT EXISTS (
 					SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?)`,
 				fromID, fromID, toID, string(relation))
