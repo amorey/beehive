@@ -170,7 +170,11 @@ below.
    the waker keeps the watermark it already has, which is the whole point of holding one.
 
 2. **Advance from `max(rv)` of every batch actually consumed — including the no-op
-   ones.** `dependentsWake` early-returns when a batch holds no `Added`/`Modified`
+   ones — but only commit it on a batch shorter than `WriteBatchCap`.** A short batch
+   is how the backend reports that its drain ended on an empty receiver. Delivery is
+   in first-touch order, not version order, so a full batch may have left lower
+   versions queued behind it; its high-water mark stages until a short batch confirms
+   there is nothing left to step over. `dependentsWake` early-returns when a batch holds no `Added`/`Modified`
    (`beehive.go:410-412`), and `writeSignalMerge` annihilates unobserved transients
    outright (`sqlite/watch.go:135-137`). If those paths don't advance the cursor, a
    delete-heavy store leaves the watermark arbitrarily far behind and "replay is bounded"

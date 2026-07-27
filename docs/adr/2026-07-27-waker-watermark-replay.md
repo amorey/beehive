@@ -45,7 +45,14 @@ operator knob whose default disables a correctness repair.
 
 ### The watermark is a low-water mark
 
-It advances only on batches actually processed, never on receipt. On a failed lookup the
+It advances only on batches actually processed, never on receipt — and only when the
+batch was **short**, meaning the backend's drain ended on an empty receiver rather
+than on `WriteBatchCap`. That second condition is not optional: the hub delivers in
+*first-touch* order, since a re-written object coalesces into the queue position it
+already held. So the highest version in a batch says nothing about what is still
+queued below it, and taking it as a resume point would step over changes that were
+never processed. A full batch stages its high-water mark instead; a short one commits
+it. On a failed lookup the
 waker stops consuming and retries from the watermark, which keeps the cursor a scalar and
 removes the hazard by construction: batches do not arrive rv-ordered across a failure, so
 advancing on receipt would let a later batch that succeeded carry the cursor past an
@@ -79,11 +86,15 @@ tests must drive it — and must do so without waiting on a real interval.
 
 Three properties this rests on, each asserted rather than assumed:
 
-- **`resource_version` is monotonic in commit order.** It holds only because the store is
-  single-connection — the version is drawn inside the write transaction, so with a pool of
-  two a transaction could draw 5 and commit after one that drew 6, and a resuming consumer
-  would skip a real change. `TestResourceVersionMonotonicInCommitOrder` fails if
-  `SetMaxOpenConns` is raised.
+- **`resource_version` is monotonic in commit order, and publication follows commit
+  order.** The first half holds because the store is single-connection — the version is
+  drawn inside the write transaction, so with a pool of two a transaction could draw 5
+  and commit after one that drew 6. The second half does not come for free: `Commit`
+  releases the connection before the post-commit flush runs, so a writer at version 100
+  could be preempted and publish after one at 101, handing a cursor-keeping consumer a
+  version whose predecessor it has not seen. `Within` therefore holds `publishMu` across
+  commit-and-publish. Post-commit *hooks* run outside that lock, because a hook may write
+  to the store and would otherwise deadlock; only publication had to be ordered.
 - **A missing row means no dependent remains.** `edges.to_id` is `ON DELETE RESTRICT`, so
   a target cannot be removed while anything depends on it. It does not guarantee the
   replayed row still exists — a dependent deleted first cascades its own edge away and

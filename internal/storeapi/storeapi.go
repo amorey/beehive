@@ -130,6 +130,18 @@ type EventsSubscription = Subscription[Event]
 // resolves each entry against the store pays per burst rather than per write.
 type ObjectWritesSubscription = Subscription[[]ObjectWrite]
 
+// WriteBatchCap bounds how many references one ObjectWritesSubscribe batch
+// carries. A backend drains its receiver into a batch until the receiver is empty
+// or the batch reaches this size, so **a batch shorter than WriteBatchCap means
+// the receiver was drained** — everything published so far has been delivered.
+//
+// That is the signal a consumer needs to treat ResourceVersion as a resume
+// cursor. Delivery is in first-touch order, not version order (a re-written object
+// coalesces into its existing queue position), so the highest version in one batch
+// says nothing about what is still queued below it. Only on a short batch is the
+// highest version seen so far a safe low-water mark.
+const WriteBatchCap = 64
+
 // ObjectWrite is a change stripped to what a consumer that only routes by
 // identity needs: which object changed, and how. The id is the object's, not a
 // change's — changes are not addressable here — so this is an object reference

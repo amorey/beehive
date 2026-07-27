@@ -74,6 +74,11 @@ type ObjectWritesSubscription = storeapi.ObjectWritesSubscription
 // The id is the object's — a write has no identity of its own.
 type ObjectWrite = storeapi.ObjectWrite
 
+// writeBatchCap re-exports the store contract's batch bound. A batch shorter than
+// it means the backend drained its receiver, which is what lets the waker treat a
+// version as a resume point — see storeapi.WriteBatchCap.
+const writeBatchCap = storeapi.WriteBatchCap
+
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType
 

@@ -37,6 +37,11 @@ type sqliteStore struct {
 	// until a controller re-confirms them in this process.
 	processStart time.Time
 
+	// publishMu orders publication by commit order. Held across Commit+flush in
+	// Within, because Commit releases the connection before flush runs and the
+	// store-wide stream's versions are read as a cursor. See Within.
+	publishMu sync.Mutex
+
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
 	// created lazily on first use. hubMu guards the maps, writeHub and the
 	// closed flag.
@@ -172,9 +177,26 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	// Flush only on a clean commit, and as the very last step: a failed commit
 	// discards the buffer, and there is no later step that could fail after a
 	// successful one — so watchers never see writes that didn't land.
+	//
+	// Commit and flush are held together under publishMu so that **publication
+	// order is commit order**. Commit releases the connection before flush runs, so
+	// without this a writer that committed at resource_version 100 can be preempted
+	// and publish after one that committed at 101. A consumer treating the stream's
+	// versions as a cursor — the dependency waker does — would then advance past a
+	// change it has not seen. The lock is uncontended in the steady state: the store
+	// runs on one connection, so writers already serialize, and flush is a
+	// non-blocking send to a conflating hub.
+	var hooks []func()
+	s.publishMu.Lock()
 	err = tx.Commit()
 	if err == nil {
-		s.flush(coll)
+		hooks = s.flush(coll)
+	}
+	s.publishMu.Unlock()
+	// Outside the lock: a hook is user code (a wake, typically) and may write to the
+	// store, which would re-enter Within. Only publication had to be ordered.
+	for _, fn := range hooks {
+		fn()
 	}
 	return err
 }
@@ -550,6 +572,12 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 // deleted during the outage is simply absent (see the type's own note on why that
 // cannot strand a dependent).
 func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
+	if limit <= 0 {
+		// An exported entry point: a non-positive limit would reach SQLite as
+		// "LIMIT -1" (unbounded, the opposite of what was asked) and a negative one
+		// would panic in make below.
+		return nil, nil
+	}
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id, resource_version FROM objects
 		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,

@@ -1038,8 +1038,12 @@ func TestFlushedCollectorRefusesLateAdds(t *testing.T) {
 	ran := false
 	require.True(t, coll.addHook(func() { ran = true }), "an open collector buffers")
 
-	store.flush(coll)
-	assert.True(t, ran, "flush runs the buffered hook")
+	// flush hands the hooks back rather than running them — Within runs them once it
+	// has released publishMu, since a hook may write to the store.
+	hooks := store.flush(coll)
+	require.Len(t, hooks, 1, "flush drains the buffered hook")
+	hooks[0]()
+	assert.True(t, ran)
 
 	assert.False(t, coll.addHook(func() {}), "hook after flush must not be buffered")
 	assert.False(t, coll.add(pendingEvent{gk: testGK}), "event after flush must not be buffered")

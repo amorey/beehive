@@ -301,7 +301,7 @@ func (s *sqliteStore) publishEvent(gk storeapi.GroupKind, ev storeapi.Event) {
 // the collector closed, so a re-entrant emit or AfterCommit reaching it through a
 // captured tx ctx acts immediately rather than appending to a slice this flush
 // has already passed.
-func (s *sqliteStore) flush(coll *eventCollector) {
+func (s *sqliteStore) flush(coll *eventCollector) []func() {
 	coll.mu.Lock()
 	events, logRows, hooks := coll.events, coll.logRows, coll.hooks
 	coll.events, coll.logRows, coll.hooks = nil, nil, nil
@@ -314,9 +314,11 @@ func (s *sqliteStore) flush(coll *eventCollector) {
 	for _, p := range logRows {
 		s.publishEvent(p.gk, p.ev)
 	}
-	for _, fn := range hooks {
-		fn()
-	}
+	// The hooks are handed back rather than run: Within holds publishMu across this
+	// call to keep publication in commit order, and a hook is user code that may
+	// write to the store — running it here would re-enter Within and deadlock on a
+	// lock this goroutine already holds. Ordering only ever constrained the stream.
+	return hooks
 }
 
 // stream is the store side of a subscription: the channel a merge goroutine owns
@@ -367,7 +369,11 @@ func (s *sqliteStore) ObjectsWatchList(ctx context.Context, gk storeapi.GroupKin
 // slice, not retained memory: what a lagging consumer holds is its receiver's
 // pending set, which conflates per object and so is bounded by the store's live
 // key set either way.
-const writeBatchCap = 64
+//
+// Shared with consumers through storeapi, because a batch shorter than the cap is
+// how they learn the drain ended on an empty receiver rather than on this bound —
+// see storeapi.WriteBatchCap.
+const writeBatchCap = storeapi.WriteBatchCap
 
 // ObjectWritesSubscribe streams every kind's live changes as blob-free references. It
 // takes no snapshot, so the dedup floor is 0 — a fresh receiver starts at the

@@ -278,6 +278,15 @@ type waker struct {
 	// needs no synchronisation.
 	watermark int64
 
+	// seen is the highest version processed since the last safe point, which is not
+	// the same thing as the watermark. The stream delivers in first-touch order, not
+	// version order — a re-written object coalesces into its existing queue position
+	// — so the newest version in a batch can sit far above changes still queued
+	// behind it. Taking it as the resume point would step over them. seen only
+	// becomes the watermark on a drained batch, where there is nothing left queued
+	// for it to step over.
+	seen int64
+
 	// waitRetry replaces the retry delay when set. The recovery loop is the only thing
 	// standing between a dropped subscription and a control plane that has silently
 	// stopped honouring depends_on, so tests have to drive it — and they must do that
@@ -354,12 +363,25 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 				"attempt", attempt+1, "err", err)
 		default:
 			if round == 0 {
-				dw.watermark = cursor
+				dw.watermark, dw.seen = cursor, cursor
 			} else {
-				dw.replay(ctx)
+				// Keep replaying until one gets through, exactly as the in-run path does.
+				// Dropping a failed replay would leave the watermark below the gap while
+				// the live stream carried it past — and those changes would never wake
+				// their dependents, which is the loss this branch exists to prevent.
+				for !dw.replay(ctx) {
+					if !dw.backoff(ctx, attempt) {
+						return
+					}
+					attempt++
+				}
 			}
 			if dw.run(ctx, w) {
-				attempt = 0 // the stream did deliver: a fresh outage, not a run of them
+				// Reset only when the stream actually got work through. A stream that
+				// delivers one batch and closes, over and over, is a run of outages, not
+				// a fresh one each time — resetting on mere delivery would pin it at the
+				// backoff floor.
+				attempt = 0
 			}
 			if ctx.Err() != nil {
 				return
@@ -431,7 +453,7 @@ func (dw *waker) replay(ctx context.Context) bool {
 		}
 		// dependentsWake advances the watermark itself, which is what makes the next
 		// page start where this one ended.
-		if !dw.dependentsWake(ctx, page) {
+		if !dw.dependentsWake(ctx, page, true) {
 			return false
 		}
 		if len(page) < replayPageCap {
@@ -444,7 +466,11 @@ func (dw *waker) replay(ctx context.Context) bool {
 	}
 }
 
-// run requeues dependents when a target changes, until ctx is
+// run consumes one subscription until ctx is cancelled or the stream ends,
+// reporting whether it got any work through — which is what tells serve a fresh
+// outage from a run of them.
+//
+// It requeues dependents when a target changes, until ctx is
 // cancelled or the stream ends. The stream is store-wide and established by
 // Start (events-only, no snapshot: the reconciler's own startup pass already
 // covers existing objects), and it arrives in batches — a burst of changes costs
@@ -452,11 +478,11 @@ func (dw *waker) replay(ctx context.Context) bool {
 // because a watcher's channel may never close on its own.
 func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 	defer w.Close()
-	delivered := false
+	progressed := false
 	for {
 		select {
 		case <-ctx.Done():
-			return delivered
+			return progressed
 		case batch, ok := <-w.Changes():
 			if !ok {
 				// Stop closes the stream by cancelling this same ctx, so on shutdown
@@ -465,17 +491,22 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 				// of a control plane that is going away, on a stream that ended
 				// normally.
 				if ctx.Err() != nil {
-					return delivered
+					return progressed
 				}
 				// The stream ended without the control plane stopping (that arrives on
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
-				// the process's only change stream, so every future change to every kind
-				// now reaches no dependent at all.
+				// the process's only change stream, so until it is back no change of any
+				// kind reaches a dependent.
 				dw.bh.log().Warn("dependency waker change stream ended for every kind; resubscribing and replaying the changes it missed")
-				return delivered
+				return progressed
 			}
-			delivered = true
-			if !dw.dependentsWake(ctx, batch) {
+			// A batch shorter than the cap means the drain ended on an empty receiver,
+			// so everything published so far has reached us and the highest version
+			// seen is a safe resume point. A full batch may have left changes queued
+			// below it (first-touch order), so it stages instead.
+			if dw.dependentsWake(ctx, batch, len(batch) < writeBatchCap) {
+				progressed = true
+			} else {
 				// The batch was dropped and the watermark still points below it, so the
 				// changes are recoverable by re-reading them. Keep replaying until one
 				// gets through, before consuming anything further: taking the next batch
@@ -490,9 +521,10 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 				// connection that is already struggling.
 				for attempt := 0; !dw.replay(ctx); attempt++ {
 					if !dw.backoff(ctx, attempt) {
-						return delivered
+						return progressed
 					}
 				}
+				progressed = true
 			}
 		}
 	}
@@ -522,7 +554,7 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) bool {
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite) bool {
+func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, safe bool) bool {
 	var high int64
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
@@ -539,12 +571,15 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite) bool {
 			ids = append(ids, ref.ID)
 		}
 	}
-	// A batch with nothing to wake is still consumed, so the one assignment below
-	// covers both: the cursor moves exactly when this reports success.
+	// A batch with nothing to wake is still consumed, so the assignments below cover
+	// both: the cursor moves exactly when this reports success.
 	if len(ids) > 0 && !dw.dependentsEnqueue(ctx, ids) {
 		return false
 	}
-	dw.watermark = max(dw.watermark, high)
+	dw.seen = max(dw.seen, high)
+	if safe {
+		dw.watermark = dw.seen
+	}
 	return true
 }
 
