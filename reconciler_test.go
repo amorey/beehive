@@ -858,6 +858,20 @@ func TestWakeDependentsBoundedByBacklog(t *testing.T) {
 	assert.EqualValues(t, 5001, dw.watermark, "an empty backlog releases what was staged")
 }
 
+// A backend that could not read its backlog must not be taken for an empty one. A
+// closed handle abandons whatever it was holding, so there may be writes below
+// anything seen that will never arrive; holding the cursor keeps them replayable.
+func TestWakeDependentsHoldsCursorOnUnknownBacklog(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen, dw.graceFloor = 100, 100, 100
+
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(900), commitBounded, -1))
+
+	assert.EqualValues(t, 100, dw.watermark, "an unreadable backlog claims nothing")
+	assert.EqualValues(t, 900, dw.seen, "though what arrived is still recorded")
+}
+
 // The cursor keeps advancing as the backlog head moves, which is the whole point:
 // under sustained churn every batch has a backlog behind it, and the old
 // length-based rule committed on none of them.
@@ -881,13 +895,40 @@ func TestWakeDependentsReportsOverCommittedWatermark(t *testing.T) {
 	bh, _, _ := wakerFixture(nil)
 	bh.logger = logger
 	dw := wakerOf(bh)
-	dw.watermark, dw.seen = 500, 500
+	dw.watermark, dw.seen, dw.graceFloor = 500, 500, 100
 
-	// A late write from below the cursor: only possible out of version order.
+	// A late write from above the floor but below the cursor: only possible out of
+	// version order.
 	require.True(t, dw.dependentsWake(context.Background(), changedAt(120), commitBounded, 0))
 
 	assert.Contains(t, buf.String(), "out of version order")
 	assert.EqualValues(t, 119, dw.watermark, "the cursor gives back the ground it should not have claimed")
+	assert.EqualValues(t, 119, dw.seen,
+		"and seen comes with it, or the next empty-backlog batch jumps straight back over the range")
+
+	// The very next batch must not undo the repair.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(600), commitBounded, 0))
+	assert.EqualValues(t, 600, dw.watermark, "advancing again is fine; jumping back to the old seen was not")
+}
+
+// The seed and replay paths both hand the cursor versions the stream is still about
+// to deliver, and neither is a violation. Subscribing registers the receiver before
+// reading the cursor, so a write caught in that window arrives at or below it; a
+// replay reads rows the receiver may already hold. Reporting those would put an Error
+// per overlapping write into the log of a perfectly healthy control plane, and clamp
+// the cursor into a redundant replay each time.
+func TestWakeDependentsAcceptsSeedAndReplayOverlap(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelError)
+	bh, _, _ := wakerFixture(nil)
+	bh.logger = logger
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen, dw.graceFloor = 500, 500, 500
+
+	// A write from the overlap: at or below the cursor, but not above the floor.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(300), commitBounded, 0))
+
+	assert.Empty(t, buf.String(), "expected over-delivery is not evidence of misordering")
+	assert.EqualValues(t, 500, dw.watermark, "and the cursor keeps its ground")
 }
 
 // The detector must not fire on a batch that legitimately advances the cursor, or

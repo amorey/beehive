@@ -3559,3 +3559,51 @@ func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
 		require.Error(t, store.ObjectsDelete(ctx, obj.ID))
 	})
 }
+
+// DeletionRequestsCreateFromOwner stamps several children, each drawing a version and
+// publishing, so it has to hold one transaction across the lot. Outside one, two of
+// its own writes can reach the store-wide stream in the wrong order — which corrupts
+// the backlog bound a consumer reads as a cursor. The in-tree caller already wraps it;
+// this pins the public entry point for the callers Store's surface admits.
+func TestDeletionRequestsCreateFromOwnerPublishesInVersionOrder(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	mk := func() storeapi.ObjectID {
+		o, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		return o.ID
+	}
+	owner := mk()
+	for range 3 {
+		require.NoError(t, addEdge(ctx, store, mk(), owner, beehive.RelationOwnedBy))
+	}
+
+	w, _, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	// Every version the cascade published, in the order it arrived.
+	var versions []int64
+	for len(versions) < 3 {
+		for _, ref := range recvBatch(t, w) {
+			versions = append(versions, ref.ResourceVersion)
+		}
+	}
+	assert.IsIncreasing(t, versions, "the cascade's own writes must not overtake each other")
+}
+
+// The cascade's own listing failure. Reached directly because the exported wrapper
+// opens a transaction first, so a closed database now fails at BeginTx instead.
+func TestDeletionRequestsCreateFromOwnerListError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.deletionRequestsCreateFromOwner(context.Background(), 1)
+	require.Error(t, err)
+}

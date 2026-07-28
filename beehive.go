@@ -278,6 +278,16 @@ type waker struct {
 	// needs no synchronisation.
 	watermark int64
 
+	// graceFloor is the version below which a delivery cannot be evidence of anything.
+	// Two paths legitimately hand the cursor versions the stream is still about to
+	// deliver: subscribing registers the receiver *before* reading the cursor, so a
+	// write caught in that window is both buffered and at or below it; and a replay
+	// reads rows the receiver may already be holding. Both over-deliver on purpose —
+	// coalescing is not loss — but a detector that did not know it would report every
+	// one of them as a broken invariant. Raised to the watermark whenever one of those
+	// paths moves it; see overCommitted.
+	graceFloor int64
+
 	// seen is the highest version processed since the last safe point, which is not
 	// the same thing as the watermark. The stream delivers in first-touch order, not
 	// version order — a re-written object coalesces into its existing queue position
@@ -382,7 +392,7 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 		default:
 			switch {
 			case !seeded && round == 0:
-				dw.watermark, dw.seen = cursor, cursor
+				dw.watermark, dw.seen, dw.graceFloor = cursor, cursor, cursor
 			case !seeded:
 				// The first subscribe failed, so no cursor was ever known and a replay
 				// would start at zero — every live object, paged, with an edges lookup
@@ -393,7 +403,7 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 				// unless it was turned off (see WithStartupResync).
 				dw.bh.log().WarnContext(ctx, "dependency waker subscribed after an initial failure; changes made before it are not replayed, and the startup pass is what covers them",
 					"cursor", cursor)
-				dw.watermark, dw.seen = cursor, cursor
+				dw.watermark, dw.seen, dw.graceFloor = cursor, cursor, cursor
 			default:
 				// A new stream: nothing staged against the old one can be trusted against
 				// this one, so the staging area restarts from the cursor itself.
@@ -402,15 +412,17 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 				// Dropping a failed replay would leave the watermark below the gap while
 				// the live stream carried it past — and those changes would never wake
 				// their dependents, which is the loss this branch exists to prevent.
-				for !dw.replay(ctx) {
-					if !dw.backoff(ctx, attempt) {
+				// Its own counter: attempt paces resubscribes and doubles as the
+				// threshold a stream must outlive to reset it, so folding replay retries
+				// into it would make a healthy stream look like a flap.
+				for retry := 0; !dw.replay(ctx); retry++ {
+					if !dw.backoff(ctx, retry) {
 						// Giving up on this subscription without handing it to run, which
 						// is what would otherwise have closed it. Whoever abandons the
 						// stream releases it.
 						w.Close()
 						return
 					}
-					attempt++
 				}
 			}
 			seeded = true
@@ -442,9 +454,6 @@ func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor 
 	}
 }
 
-// backoff waits before the next resubscribe attempt, reporting false if the
-// control plane went away first. The delay doubles to wakerRetryCap and stays
-// there; the caller keeps trying regardless of how many attempts that takes.
 // clock reads the waker's notion of now, which tests replace.
 func (dw *waker) clock() time.Time {
 	if dw.now != nil {
@@ -462,6 +471,9 @@ func retryDelay(attempt int) time.Duration {
 	return min(wakerRetryBase<<min(attempt, 16), wakerRetryCap)
 }
 
+// backoff waits before the next retry, reporting false if the control plane went
+// away first. The delay doubles to wakerRetryCap and stays there; the caller keeps
+// trying regardless of how many attempts that takes.
 func (dw *waker) backoff(ctx context.Context, attempt int) bool {
 	d := retryDelay(attempt)
 	if dw.waitRetry != nil {
@@ -507,7 +519,11 @@ func (dw *waker) replay(ctx context.Context) bool {
 			return false
 		}
 		if len(page) == 0 {
-			return true // caught up
+			// Caught up. The rows just replayed may also be sitting in the receiver,
+			// buffered before the cursor overtook them, so the floor moves with the
+			// cursor: those deliveries are expected, not evidence of misordering.
+			dw.graceFloor = max(dw.graceFloor, dw.watermark)
+			return true
 		}
 		// dependentsWake advances the watermark itself, which is what makes the next
 		// page start where this one ended.
@@ -519,6 +535,7 @@ func (dw *waker) replay(ctx context.Context) bool {
 			// Anything committed since is already on the live stream — the subscription
 			// is established before a replay runs — so stopping here saves the empty
 			// query that would otherwise end every replay.
+			dw.graceFloor = max(dw.graceFloor, dw.watermark)
 			return true
 		}
 	}
@@ -623,8 +640,9 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit
 		// Versions start at 1, so a zero carries no cursor information at all: a
 		// backend that does not populate it has opted out of the cursor rather than
 		// misordered anything, and contributes nothing to high either, so the watermark
-		// simply never advances from it.
-		if ref.ResourceVersion > 0 && ref.ResourceVersion <= dw.watermark {
+		// simply never advances from it. Below the grace floor is the seed/replay
+		// overlap, which is expected over-delivery rather than evidence.
+		if ref.ResourceVersion > dw.graceFloor && ref.ResourceVersion <= dw.watermark {
 			dw.overCommitted(ctx, ref)
 			if f := ref.ResourceVersion - 1; floor < 0 || f < floor {
 				floor = f
@@ -651,13 +669,18 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit
 		// oldestPending is the version of the oldest write still queued behind this
 		// batch, so everything below it is delivered — or superseded by something
 		// pending, whose own version is at or above the bound and therefore above the
-		// cursor, where a replay will find it. Zero means the store reported no bound
-		// (an empty backlog, or a closed handle that abandoned one), and then the
-		// highest version actually delivered is the most that can be claimed.
-		if oldestPending > 0 {
+		// cursor, where a replay will find it.
+		switch {
+		case oldestPending > 0:
 			dw.watermark = max(dw.watermark, oldestPending-1)
-		} else {
+		case oldestPending == 0:
+			// The backlog was empty, so everything published has reached us and the
+			// highest version delivered is the most that can be claimed.
 			dw.watermark = max(dw.watermark, dw.seen)
+		default:
+			// The backend could not tell — a closed handle abandons whatever it was
+			// holding, so there may be writes below anything seen that will never
+			// arrive. Hold the cursor; a replay from here is always sound.
 		}
 	case commitOrdered:
 		// A replay page: version-ordered and complete, so everything up to this page's
@@ -672,11 +695,17 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit
 	return true
 }
 
-// clampTo lowers the watermark to floor when this batch proved the cursor had claimed
-// more than it should. A negative floor means it proved nothing.
+// clampTo lowers the cursor to floor when this batch proved it had claimed more than
+// it should. A negative floor means it proved nothing.
+//
+// seen comes down with it, and that is the whole repair rather than a detail: seen is
+// what the empty-backlog branch commits, so leaving it high would let the very next
+// batch jump straight back over the reserved range with no replay in between — the
+// clamp would lower the watermark and change nothing.
 func (dw *waker) clampTo(floor int64) {
 	if floor >= 0 {
 		dw.watermark = min(dw.watermark, floor)
+		dw.seen = min(dw.seen, floor)
 	}
 }
 

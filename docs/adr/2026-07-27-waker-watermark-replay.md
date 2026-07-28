@@ -131,8 +131,12 @@ Three properties this rests on, each asserted rather than assumed:
   records a slot's creating version and `writeSignalMerge` never advances it, so
   coalescing cannot move the bound. Where publication order fails, the waker notices —
   a delivered write at or below the cursor is proof the cursor over-committed, reported
-  at Error with the cursor clamped back. That is a detector, not a repair: it cannot help
-  if the stream drops before the late write arrives.
+  at Error with the cursor *and* `seen` clamped back (leaving `seen` high would let the
+  next empty-backlog batch jump straight back over the reserved range). Two paths
+  over-deliver on purpose and are exempt via a per-stream grace floor: subscribing
+  registers the receiver before reading the cursor, and a replay reads rows the receiver
+  may already hold. That is a detector, not a repair: it cannot help if the stream drops
+  before the late write arrives.
 
 **Not covered: changes made before the first successful subscribe.** If the initial
 subscribe fails, no cursor was ever taken, so the only honest resume point is zero —

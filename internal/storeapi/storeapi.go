@@ -134,7 +134,12 @@ type ObjectWritesSubscription = Subscription[ObjectWriteBatch]
 // were ready together, plus how far behind them the backlog reaches.
 //
 // OldestPending is the version of the *oldest write still queued* after this batch
-// was taken, or 0 when nothing is queued (versions start at 1, so 0 is unambiguous).
+// was taken. Zero means nothing was queued (versions start at 1, so 0 is
+// unambiguous); negative means the backend could not tell, which a closed handle
+// cannot distinguish from an empty backlog — and since closing abandons whatever was
+// queued, a consumer must hold its cursor there rather than claim everything it has
+// seen.
+//
 // It is the bound a consumer reading versions as a resume cursor needs: delivery
 // conflates per object and is in first-touch order, so the newest version in a batch
 // says nothing about what is still queued below it, and only this says where it is

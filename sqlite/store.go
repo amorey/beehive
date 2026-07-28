@@ -1378,6 +1378,25 @@ func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk store
 // an already-deleting subtree (the steady-state resync) is a lone SELECT — no
 // writes, no events. It returns every owned child for requeue, deleting or not.
 func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+	// Self-wrapped for the same reason as ObjectsCreate and ObjectsDelete: it stamps
+	// several children, each drawing a version and publishing, and publication is in
+	// commit order only inside Within. Outside one, two of this loop's own writes can
+	// reach the store-wide stream in the wrong order — which corrupts the backlog
+	// bound a consumer reads as a cursor. The in-tree caller already wraps it, so this
+	// is for the external ones Store's public surface admits.
+	var out []storeapi.ObjectRef
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		out, err = s.deletionRequestsCreateFromOwner(ctx, ownerID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id

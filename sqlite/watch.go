@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/conflate"
 )
 
@@ -384,6 +385,29 @@ func (s *sqliteStore) ObjectsWatchList(ctx context.Context, gk storeapi.GroupKin
 	})
 }
 
+// backlogUnknown is ObjectWriteBatch.OldestPending when the backlog could not be
+// read at all, which a closed handle cannot distinguish from an empty one.
+const backlogUnknown = -1
+
+// backlogBound turns a Peek at the receiver's head into the bound a batch carries.
+// Three answers, not two: ErrClosed is deliberately not folded into "nothing
+// pending", because Hub.Close and Receiver.Close abandon whatever is still queued —
+// so a closed handle says nothing about the backlog, and a consumer must hold its
+// cursor rather than claim everything it has seen.
+//
+// Written to take Peek's own results so it can be exercised directly; the closed arm
+// is otherwise reachable only in the window between a drain and the read after it.
+func backlogBound(head gobus.Event[storeapi.ObjectID, writeSignal], err error) int64 {
+	switch {
+	case err == nil:
+		return head.Value.firstRV
+	case errors.Is(err, gobus.ErrEmpty):
+		return 0 // nothing queued behind this batch
+	default:
+		return backlogUnknown // a closed handle abandoned whatever it held
+	}
+}
+
 // writeBatchCap bounds how many references one batch carries. It bounds the
 // slice, not retained memory: what a lagging consumer holds is its receiver's
 // pending set, which conflates per object and so is bounded by the store's live
@@ -454,14 +478,7 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 			// a head further along and hand the consumer a bound above what it was
 			// actually given.
 			//
-			// ErrClosed is deliberately not folded into "nothing pending": Hub.Close and
-			// Receiver.Close abandon whatever is still queued, so a closed handle says
-			// nothing about the backlog. 0 means "no bound known" and a consumer holding
-			// its cursor there is always sound.
-			var oldestPending int64
-			if head, err := rx.Peek(); err == nil {
-				oldestPending = head.Value.firstRV
-			}
+			oldestPending := backlogBound(rx.Peek())
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park
 			}

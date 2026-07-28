@@ -24,6 +24,7 @@ import (
 
 	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gobus"
 	"github.com/amorey/gochan/oneshot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1537,4 +1538,41 @@ func TestWriteSignalMergeKeepsNewestAndEarliest(t *testing.T) {
 	require.True(t, keep)
 	assert.EqualValues(t, 40, got.rv)
 	assert.EqualValues(t, 10, got.firstRV, "the earliest wins whichever order it arrives in")
+}
+
+// A closed handle abandons whatever it was still holding, so it cannot report an
+// empty backlog — it reports that it could not tell, and a consumer holds its cursor
+// there rather than claiming everything it has seen. The live paths are covered by the
+// OldestPending tests above; this pins the arm that only exists in the window between
+// a drain and the read after it.
+func TestBacklogBound(t *testing.T) {
+	head := gobus.Event[storeapi.ObjectID, writeSignal]{Key: 7, Value: writeSignal{rv: 40, firstRV: 12}}
+
+	assert.EqualValues(t, 12, backlogBound(head, nil), "the head's first-touch version, not its newest")
+	assert.Zero(t, backlogBound(gobus.Event[storeapi.ObjectID, writeSignal]{}, gobus.ErrEmpty),
+		"an empty backlog is a real answer: nothing is queued")
+	assert.EqualValues(t, backlogUnknown, backlogBound(gobus.Event[storeapi.ObjectID, writeSignal]{}, gobus.ErrClosed),
+		"a closed handle abandoned what it held, so it cannot claim the backlog was empty")
+}
+
+// changeEmit publishes directly when there is no ambient transaction. No mutator
+// reaches it that way any more — they all self-wrap, because publication is in commit
+// order only inside Within — so this exercises the arm directly rather than through
+// one. It stays as the fallback for an emit outside a transaction; a future mutator
+// that lands here is publishing unordered, which is what the waker's over-commit
+// detector reports.
+func TestChangeEmitPublishesOutsideTransaction(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	w, _, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	raw := &beehive.RawObject{ID: 7, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 3}
+	store.changeEmit(ctx, beehive.Modified, raw)
+
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: 7, Type: beehive.Modified, ResourceVersion: 3},
+	}, recvBatch(t, w))
 }
