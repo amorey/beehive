@@ -319,9 +319,6 @@ tell "we decided against this for now" from "nobody thought of it."
   sweeper (the item above) would be exactly that, and would be reaching for rows of
   kinds it does not own, which is the case the scoping exists to catch.
 
-  Note the pending `reconcile_owed` rename (`specs/1-reconcile-owed-rename.md`)
-  renames this method to `ReconcileOwedDecrement` without touching the predicate.
-
 - **`ObjectsCreate` takes a `RawObject` and silently drops most of it** — known, not
   fixed, and the input-side twin of the item below. `RawObject` is a *read*-shaped
   DTO (it mirrors the full row, and is publicly aliased as `beehive.RawObject`), but

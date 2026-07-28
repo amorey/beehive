@@ -47,27 +47,16 @@ operator knob whose default disables a correctness repair.
 
 It advances only on batches actually processed, never on receipt — and never past the
 oldest write still queued behind the batch. That second condition is not optional: the
-hub delivers in *first-touch* order, since a re-written object coalesces into the
-queue position it already held. So the highest version in a batch says nothing about
-what is still queued below it, and taking it as a resume point would step over changes
-that were never processed.
+hub delivers in *first-touch* order, so the highest version in a batch says nothing
+about what is still queued below it. Each batch therefore carries the bound, read from
+the receiver's own backlog head. **How that bound is obtained, the obligation it rests
+on, and the tripwire that guards it are their own decision** —
+see [the watermark's bound comes from the receiver's backlog head](2026-07-28-watermark-bound-from-backlog-head.md).
 
-Each batch therefore carries the bound (`ObjectWriteBatch.OldestPending`), read from
-the receiver's own backlog head via `conflate.Receiver.Peek` at the moment the batch
-is assembled. The cursor commits to one below it, or — when the backlog is empty — to
-the highest version actually delivered.
-
-An earlier form inferred the bound from the batch coming back *shorter* than the
-backend's cap. That starved: a workload touching more than a batch's worth of distinct
-objects with no lull made every batch full, so the cursor never moved at all and the
-first dropped subscription replayed essentially the whole table. The bound is now
-asked for rather than guessed.
-
-A **replay page** commits differently again: it is version-ordered and complete up to
-its own last row, so it advances the cursor by *that* row — never by the staged value,
-which may sit far above it. Committing the staged value on a replay page would step
-over the whole range between, which is exactly the range staging exists to keep out of
-the cursor.
+A **replay page** commits differently: it is version-ordered and complete up to its own
+last row, so it advances the cursor by *that* row — never by the staged value, which may
+sit far above it. Committing the staged value on a replay page would step over the whole
+range between, which is exactly the range staging exists to keep out of the cursor.
 
 On a failed lookup the waker stops consuming and retries from the watermark. That keeps
 the cursor a scalar and removes the second hazard by construction: batches do not arrive
@@ -125,18 +114,10 @@ Three properties this rests on, each asserted rather than assumed:
   frees the target — but a row that vanished had no dependents left to strand.
 - **Coalescing is not loss.** The hub delivers the latest state per object and the waker is
   level-triggered, so replaying "object X changed" once equals replaying it five times.
-- **The backlog head holds the lowest pending version.** What makes `Peek` sufficient:
-  the queue is in first-touch order, so its head is the earliest-touched key, and under
-  version-ordered publication that is also the lowest-versioned one. `writeSignal.firstRV`
-  records a slot's creating version and `writeSignalMerge` never advances it, so
-  coalescing cannot move the bound. Where publication order fails, the waker notices —
-  a delivered write at or below the cursor is proof the cursor over-committed, reported
-  at Error with the cursor *and* `seen` clamped back (leaving `seen` high would let the
-  next empty-backlog batch jump straight back over the reserved range). Two paths
-  over-deliver on purpose and are exempt via a per-stream grace floor: subscribing
-  registers the receiver before reading the cursor, and a replay reads rows the receiver
-  may already hold. That is a detector, not a repair: it cannot help if the stream drops
-  before the late write arrives.
+- **The backlog head holds the lowest pending version.** What makes the bound readable at
+  all, and it rests on publication being in version order — which beehive guarantees
+  structurally and the waker checks at runtime. Both are recorded in
+  [the bound's own ADR](2026-07-28-watermark-bound-from-backlog-head.md).
 
 **Not covered: changes made before the first successful subscribe.** If the initial
 subscribe fails, no cursor was ever taken, so the only honest resume point is zero —
