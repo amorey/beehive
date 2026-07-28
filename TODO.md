@@ -87,45 +87,60 @@ tell "we decided against this for now" from "nobody thought of it."
   if `DeletionRequestsCreate` ever gets the same treatment (its absent path has always
   had this shape, so the probe would belong in `requestDeletion` for both).
 
-- **A standing waker escalation runs a full pass at the *catchup* cadence,
-  permanently** — known, not fixed, and deliberately left alone rather than
-  throttled. `resyncEveryTick` sets `resyncAlways`, which nothing ever clears
-  (correctly — neither signal that sets it has a recovery path), and `tickResyncs`
-  makes *every* catchup tick a full pass from then on. The catchup tick is the
-  frequent one by design, and `WithCatchupInterval`'s own doc tells operators to
-  set it well below the resync cadence because it is cheap. So one closed change
-  stream or one failed subscription converts a bounded, index-driven listing into
-  a whole-table `ObjectsListIDs` pass at the fastest cadence the deployment configured,
-  for the life of the process, on a large object set.
+- **`ObjectWritesListSince` synthesizes `ObjectWrite.Type`** — known, deliberate, and
+  a trap for the second consumer. The replay query returns live rows, and the store no
+  longer knows what happened to a row that changed while nobody was listening, so every
+  row comes back `Modified`. That is a value the waker's own filter
+  (`ref.Type != Added && ref.Type != Modified`) needs in order to let the row through,
+  not a fact the store observed.
 
-  **A stride throttle was built and reverted**, and the reasoning is why this stays
-  open rather than getting a quick fix. Spacing the standing pass (one tick in
-  `ceil(window / catchupInterval)`, prompt on the tick the escalation lands on)
-  works and is about thirty lines. But it makes the *emergency repair* slower to
-  make it cheaper, on the one path where latency matters most; the window is a new
-  unanchored constant with no natural source (`resyncInterval` defaults to 0, so
-  there is nothing to inherit) and no option to tune it; and it is thirty lines of
-  new surface — a field, a counter, a stride helper, tests, a CLAUDE.md paragraph —
-  hung on a subsystem `observed_cursor` deletes outright. Mitigating the cost of a
-  mechanism whose replacement removes the mechanism is churn twice over.
+  Reusing `ObjectWrite` rather than minting a near-duplicate two-field type was the
+  right trade at one consumer, and the lie is documented at the interface, the
+  implementation and the field. But it is documented rather than unrepresentable, which
+  is the opposite of the argument the same change makes for the subscribe cursor. The
+  fix, if a second consumer appears: return `{ID, ResourceVersion}` only and make the
+  waker's "replayed rows are live by construction" assumption explicit at its own call
+  site. Not worth a new type for two fields today.
 
-  **Two real fixes, in increasing order of scope.** The narrow one: the escalation
-  exists solely to reach stale *dependents*, and an object with no outgoing
-  `depends_on` edge cannot be one — so the escalated pass never needed to be a full
-  pass. `SELECT DISTINCT from_id FROM edges WHERE relation='depends_on'` (joined to
-  the kind) scales with declared edges instead of table size, and wants the same
-  `idx_refs_dependents` partial index `observed_cursor` does. That is a contained
-  change that would close this item on its own. The broad one is
-  `observed_cursor` (recorded under the pending-wake backstop item below), which
-  deletes the escalation entirely — all three waker loss points get re-derived by
-  the tick query, so nothing needs to *observe* a loss to repair it.
+- **A crash during a waker outage strands a settled dependent, and no in-memory
+  recovery can fix it** — analyzed, not fixed, and deliberately scoped out of the
+  watermark recovery that shipped (see
+  [the ADR](docs/adr/2026-07-27-waker-watermark-replay.md)). The gap predates that
+  work rather than being introduced by it: the escalation flags it replaced
+  (`resyncOnce`/`resyncAlways`) were in-memory too, so a restart lost the armed repair
+  exactly as it now loses a watermark. The in-process half is closed; this is the half
+  left.
 
-  Not fixed now because the escalation only fires on a store-level watch failure
-  (rare), while both fixes cost index and query work that wants measuring, and the
-  narrow one is subsumed by the broad one. Revisit if `observed_cursor` is declined
-  or deferred past a release — at that point take the narrow fix, since leaving a
-  permanent full-table pass reachable from a single dropped subscription is worse
-  than the index it costs.
+  The scenario: D depends on T, the waker loses T's change (any of the three loss
+  points), and the process dies before the repair runs. On restart nothing replays
+  it. `enqueueCatchup` runs unconditionally at startup, but it lists unsettled
+  objects plus `reconcile_owed` stamps, and a settled dependent has neither — its own
+  generation never moved and nothing stamped it. `enqueueAll` is what would catch it,
+  and that is gated on `startupResync`, which defaults to `true`. **So the exposure
+  is `WithStartupResync(false)` plus a crash mid-outage** — narrow, but it is the same
+  configuration in which the in-process gap is most acute, so a reader who sees that
+  gap fixed will reasonably assume this one is too.
+
+  **Persisting the watermark is not the fix**, which is the analysis worth keeping. A
+  watermark records *delivery* ("the waker reached rv N"); what has to survive a
+  restart is *convergence* ("D actually reconciled against T's new state"). Those
+  come apart in the ordinary case: if the waker requeues D, advances past T, and the
+  process dies before D's reconcile runs, a persisted cursor is already past T and D
+  is stranded anyway. Persisting buys half the hole, leaves the twin half open, and
+  charges a write per consumed batch on a single connection.
+
+  Nor is the cheap durable trick available: you cannot stamp `reconcile_owed` on the
+  dependent at failure time, because the lookup that failed is the one that would
+  have named the dependents. Recorded intent needs to know who to record against, and
+  that is exactly the information the failure destroyed.
+
+  **The fix is `observed_cursor`** (recorded under the pending-wake backstop item
+  below) — per-object, so durability attaches to the thing that must converge, and
+  derived rather than recorded, so it needs no knowledge of who was missed. Not fixed
+  now because it is a schema-and-write-path change well past the scope of the
+  in-process repair, and because the exposure needs an opt-out knob *and* a crash.
+  Revisit with `observed_cursor`; until then, `WithStartupResync(false)` should
+  document that it opts out of crash recovery for settled dependents.
 
 - **A target change landing *mid-reconcile* is safe in memory, but has no durable
   twin** — analyzed, in-memory half verified sound, durable half not fixed. The
@@ -156,18 +171,18 @@ tell "we decided against this for now" from "nobody thought of it."
 
   **Under stock defaults it heals at the next process start, and that is the point
   most likely to be misread.** The loss is permanent for the *current* process: the
-  catchup tick sees only what the store records as owed, and the wake-failure
-  escalations cannot reach it either, since nothing *observed* the loss — neither
-  `resyncNextTick` nor `resyncEveryTick` fires. But the crash that loses the wake
+  catchup tick sees only what the store records as owed, and the waker's own replay
+  cannot reach it either, since nothing *observed* the loss — the wake was delivered,
+  so the watermark legitimately advanced past T. But the crash that loses the wake
   also ends the process, and the next one starts with `WithStartupResync` true (the
   default), re-dispatching every object: D reconciles, reads T's current state,
   converges. So the durable gap is not "a stranded dependent forever" but "a
   stranded dependent until restart".
 
-  Two configurations remove that backstop, and they are the ones that actually want
-  `WithResyncInterval` set: `WithStartupResync(false)` (the restart no longer
-  sweeps), and every ticker disabled (nothing to escalate, and by that
-  configuration's contract the embedder owns recovery). This is also why it is not
+  One configuration removes that backstop, and it is the one that actually wants
+  `WithResyncInterval` set: `WithStartupResync(false)`, where the restart no longer
+  sweeps. (Disabling every ticker no longer matters here — the waker recovers its own
+  losses now — but this loss is not one the waker can see.) This is also why it is not
   an argument for making the full resync a default — the startup pass already
   covers the crash case, so a periodic full pass would pay forever for a residual
   the restart path already handles.
@@ -303,9 +318,6 @@ tell "we decided against this for now" from "nobody thought of it."
   convention into the schema. Revisit when a second caller appears — a cross-kind
   sweeper (the item above) would be exactly that, and would be reaching for rows of
   kinds it does not own, which is the case the scoping exists to catch.
-
-  Note the pending `reconcile_owed` rename (`specs/1-reconcile-owed-rename.md`)
-  renames this method to `ReconcileOwedDecrement` without touching the predicate.
 
 - **`ObjectsCreate` takes a `RawObject` and silently drops most of it** — known, not
   fixed, and the input-side twin of the item below. `RawObject` is a *read*-shaped
@@ -549,6 +561,29 @@ tell "we decided against this for now" from "nobody thought of it."
   callers affected, since the default is 30s. A long interval expresses "collect
   rarely"; there is deliberately no way to express "never".
 
+- **The waker recovers its own losses from a `resource_version` watermark** — done,
+  replacing the tick escalation outright. The escalation could not run at the
+  configuration that needed it most: it set `resyncOnce`/`resyncAlways` on every
+  reconciler, those flags were read only inside the catchup ticker's case, and with
+  `catchupInterval <= 0` and `resyncInterval <= 0` — the latter already the default —
+  they were set and never read. `hasPeriodicPass` detected exactly that and reported it
+  to the operator without fixing it, while a settled dependent stayed stale forever
+  because its own generation never moved.
+
+  The waker now holds the highest `resource_version` it has processed and, on a failed
+  lookup or a re-established subscription, replays everything above it through the same
+  wake path — O(changes missed) rather than O(table). Three store changes carried it:
+  `ObjectWrite.ResourceVersion`, `ObjectWritesListSince` (blob-free, kind-agnostic,
+  paged), and `ObjectWritesSubscribe` returning its starting cursor so the
+  subscribe-then-read ordering is unrepresentable rather than documented.
+
+  **The part worth remembering is that a cursor is not a trigger.** Nothing survived the
+  loss points — a failed subscribe returned, a closed stream ended the loop — so the
+  watermark needed a driver, and the waker got its own resubscribe loop with a backoff
+  seam. That does not remove the tick dependency so much as move the timer from the
+  reconciler into the waker, which is the trade: one goroutine, bounded work, and no
+  knob whose default disables a correctness repair. → [ADR](docs/adr/2026-07-27-waker-watermark-replay.md)
+
 - **Three periodic drivers instead of one, and all three dependency-waker loss
   points repaired** — done, as one series. `resyncInterval` had been governing four
   unrelated jobs: the per-kind reconcile tick, the global GC sweeper, event-log
@@ -582,8 +617,10 @@ tell "we decided against this for now" from "nobody thought of it."
   duplicated the cross-kind sweep — which in turn made the index rekey possible
   (see the entry above).
 
-  **The waker's three loss points**, all now logged at Warn and all repaired by
-  escalating the *catchup* ticker (not resync, which is off by default — a repair
+  **The waker's three loss points** — the escalation described here was later
+  replaced by watermark replay (see the entry below); kept as written, because the
+  reasoning is what that replacement had to answer. All three logged at Warn and
+  repaired by escalating the *catchup* ticker (not resync, which is off by default — a repair
   hung off an opt-in knob would be dead where it is needed most): a failed
   `EdgesGroupIncomingByID` arms one full pass (it cannot be narrower — the lookup that
   failed is what would have named the dependents); a closed change stream and a

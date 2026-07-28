@@ -24,6 +24,7 @@ import (
 
 	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gobus"
 	"github.com/amorey/gochan/oneshot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1038,8 +1039,12 @@ func TestFlushedCollectorRefusesLateAdds(t *testing.T) {
 	ran := false
 	require.True(t, coll.addHook(func() { ran = true }), "an open collector buffers")
 
-	store.flush(coll)
-	assert.True(t, ran, "flush runs the buffered hook")
+	// flush hands the hooks back rather than running them — Within runs them once it
+	// has released publishMu, since a hook may write to the store.
+	hooks := store.flush(coll)
+	require.Len(t, hooks, 1, "flush drains the buffered hook")
+	hooks[0]()
+	assert.True(t, ran)
 
 	assert.False(t, coll.addHook(func() {}), "hook after flush must not be buffered")
 	assert.False(t, coll.add(pendingEvent{gk: testGK}), "event after flush must not be buffered")
@@ -1063,7 +1068,7 @@ func TestFlushPublishesEventsBeforeHooks(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1114,6 +1119,12 @@ func TestPublishReachesGlobalHub(t *testing.T) {
 // recvBatch waits for the next object-change batch on w, failing on timeout/close.
 func recvBatch(t *testing.T, w *storeapi.ObjectWritesSubscription) []storeapi.ObjectWrite {
 	t.Helper()
+	return recvOrFail(t, w.Changes(), "object-change batch").Writes
+}
+
+// recvWriteBatch is recvBatch with the backlog bound, for tests that assert on it.
+func recvWriteBatch(t *testing.T, w *storeapi.ObjectWritesSubscription) storeapi.ObjectWriteBatch {
+	t.Helper()
 	return recvOrFail(t, w.Changes(), "object-change batch")
 }
 
@@ -1129,13 +1140,61 @@ func TestObjectWritesSubscribeStreamsLiveChanges(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
 	created, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: created.ID, Type: beehive.Added}}, recvBatch(t, w))
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: created.ID, Type: beehive.Added, ResourceVersion: created.ResourceVersion},
+	}, recvBatch(t, w))
+}
+
+// TestObjectWritesSubscribeReturnsStartingCursor verifies subscribing hands back the
+// cursor the stream starts from, so a consumer never has to read it separately. The
+// two bounds together are the contract: the cursor covers every write committed
+// before the call, and every write after it arrives strictly above the cursor. A
+// separate read could span a write belonging to neither, which is why this is a
+// return value and not a rule.
+func TestObjectWritesSubscribeReturnsStartingCursor(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	before, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+
+	w, cursor, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+	assert.GreaterOrEqual(t, cursor, before.ResourceVersion,
+		"the cursor covers writes the stream will not replay")
+
+	after, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+	assert.Greater(t, after.ResourceVersion, cursor, "a later write is strictly above the cursor")
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: after.ID, Type: beehive.Added, ResourceVersion: after.ResourceVersion},
+	}, recvBatch(t, w))
+}
+
+// TestObjectWritesSubscribeCarriesResourceVersion verifies a reference reports the
+// version of the write that produced it. That scalar is what lets a consumer resume
+// from where it stopped instead of re-deriving the world, so it has to be the
+// write's own version and not merely nonzero.
+func TestObjectWritesSubscribeCarriesResourceVersion(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	w, _, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	created, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: created.ID, Type: beehive.Added, ResourceVersion: created.ResourceVersion},
+	}, recvBatch(t, w))
 }
 
 // TestObjectWritesSubscribeSpansKinds verifies the stream is store-wide: one
@@ -1145,7 +1204,7 @@ func TestObjectWritesSubscribeSpansKinds(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -1173,14 +1232,16 @@ func TestObjectWritesSubscribeSkipsSnapshot(t *testing.T) {
 	pre, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 	assertNoBatch(t, w, 200*time.Millisecond)
 
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
+	updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, pre.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: pre.ID, Type: beehive.Modified}}, recvBatch(t, w))
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: pre.ID, Type: beehive.Modified, ResourceVersion: updated.ResourceVersion},
+	}, recvBatch(t, w))
 }
 
 // newParkedObjectChangeStream returns a object-change watcher whose goroutine is
@@ -1196,7 +1257,7 @@ func newParkedObjectChangeStream(t *testing.T, store *sqliteStore) *storeapi.Obj
 	parkedTx, parkedRx := oneshot.New[struct{}]()
 	store.beforeLiveSend = func() { _ = parkedTx.Send(struct{}{}) }
 
-	w, err := store.ObjectWritesSubscribe(context.Background())
+	w, _, err := store.ObjectWritesSubscribe(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
@@ -1263,14 +1324,19 @@ func TestObjectWritesSubscribeCoalescesRepeatWrites(t *testing.T) {
 
 	obj, err := store.ObjectsCreate(ctx, newWatchObject())
 	require.NoError(t, err)
+	var last int64
 	for i := range 5 {
-		_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
 		require.NoError(t, err)
+		last = updated.ResourceVersion
 	}
 
 	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: obj.ID, Type: beehive.Added}}, recvBatch(t, w),
-		"one create plus five updates conflate to one entry, still Added to a consumer that never saw it")
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: obj.ID, Type: beehive.Added, ResourceVersion: last},
+	}, recvBatch(t, w),
+		"one create plus five updates conflate to one entry, still Added to a consumer that never saw it, "+
+			"carrying the newest write's version so a resume cursor is never behind the row")
 	assertNoBatch(t, w, 200*time.Millisecond) // and nothing trails behind it
 }
 
@@ -1290,8 +1356,9 @@ func TestObjectWritesSubscribeAnnihilatesTransient(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Len(t, recvBatch(t, w), 1, "the parking write's own batch")
-	assert.Equal(t, []storeapi.ObjectWrite{{ID: survivor.ID, Type: beehive.Added}}, recvBatch(t, w),
-		"the transient object is dropped entirely")
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: survivor.ID, Type: beehive.Added, ResourceVersion: survivor.ResourceVersion},
+	}, recvBatch(t, w), "the transient object is dropped entirely")
 	assertNoBatch(t, w, 200*time.Millisecond)
 }
 
@@ -1302,7 +1369,7 @@ func TestObjectWritesSubscribeOnClosedStore(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.Close())
 
-	_, err = store.ObjectWritesSubscribe(context.Background())
+	_, _, err = store.ObjectWritesSubscribe(context.Background())
 	assert.ErrorIs(t, err, errStoreClosed)
 }
 
@@ -1314,7 +1381,7 @@ func TestObjectWritesSubscribeClosesOnStoreClose(t *testing.T) {
 		store, err := OpenMemory()
 		require.NoError(t, err)
 
-		w, err := store.ObjectWritesSubscribe(context.Background())
+		w, _, err := store.ObjectWritesSubscribe(context.Background())
 		require.NoError(t, err)
 
 		require.NoError(t, store.Close())
@@ -1345,7 +1412,7 @@ func TestObjectWritesSubscribeClosesOnCancel(t *testing.T) {
 	store := newRawStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 
 	cancel()
@@ -1370,4 +1437,142 @@ func assertObjectChanges(t *testing.T, w *storeapi.ObjectWritesSubscription, wan
 	for _, ref := range got {
 		assert.Equal(t, typ, ref.Type)
 	}
+}
+
+// The cursor is read after the receiver is registered, so a store that cannot
+// answer for it must release the receiver rather than hand back a subscription
+// with no resume point.
+func TestObjectWritesSubscribeCursorReadFailure(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close() // the store itself is still open, so the read is what fails
+
+	w, cursor, err := store.ObjectWritesSubscribe(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, w)
+	assert.Zero(t, cursor)
+}
+
+// A batch reports how far the backlog behind it reaches, which is what lets a
+// consumer read these versions as a resume cursor. Delivery conflates per object and
+// is in first-touch order, so the newest version in a batch says nothing about what
+// is still queued below it — only this does.
+//
+// The backlog has to exceed the batch cap for one to exist at all, which is exactly
+// the case that starved a consumer inferring it from batch length instead.
+func TestObjectWritesSubscribeReportsOldestPending(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	const extra = 2
+	var made []*beehive.RawObject
+	for range writeBatchCap + extra {
+		obj, err := store.ObjectsCreate(ctx, newWatchObject())
+		require.NoError(t, err)
+		made = append(made, obj)
+	}
+
+	// The parking write's own batch was taken before the burst existed, so it reports
+	// no backlog: the bound describes what was queued when the batch was assembled,
+	// which is the only reading that is exact.
+	first := recvWriteBatch(t, w)
+	require.Len(t, first.Writes, 1)
+	assert.Zero(t, first.OldestPending)
+
+	// A full batch still reports a bound — the rest of the burst is behind it. This is
+	// the delivery the length-based rule could never commit on.
+	full := recvWriteBatch(t, w)
+	require.Len(t, full.Writes, writeBatchCap)
+	assert.Equal(t, made[writeBatchCap].ResourceVersion, full.OldestPending,
+		"a full batch reports the head of what it left behind")
+
+	// And the tail empties the backlog, reported as no bound at all.
+	tail := recvWriteBatch(t, w)
+	require.Len(t, tail.Writes, extra)
+	assert.Zero(t, tail.OldestPending, "nothing left queued")
+}
+
+// A queued slot reports the version it was *created* at, not the newest merged into
+// it. That is the whole point: the newest version is what a consumer should go read,
+// while the first is how far back the slot reaches, and a cursor may not pass it.
+func TestObjectWritesSubscribeOldestPendingSurvivesCoalescing(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	// Fill the first batch, so the object created next stays queued behind it.
+	for range writeBatchCap {
+		_, err := store.ObjectsCreate(ctx, newWatchObject())
+		require.NoError(t, err)
+	}
+	queued, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+	// Re-write it repeatedly while it waits: the slot's version climbs, its queue
+	// position and its first-touch version do not.
+	for i := range 5 {
+		_, _, err := store.ObjectsUpdateSpec(ctx, testGK, queued.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		require.NoError(t, err)
+	}
+
+	require.Len(t, recvWriteBatch(t, w).Writes, 1, "the parking write's own batch")
+	full := recvWriteBatch(t, w)
+	require.Len(t, full.Writes, writeBatchCap)
+	assert.Equal(t, queued.ResourceVersion, full.OldestPending,
+		"the queued slot's first-touch version, unmoved by five merges into it")
+}
+
+// writeSignalMerge keeps the newest rv and the earliest firstRV. Asserted directly,
+// because those pull in opposite directions and a later simplification that made them
+// agree would leave every end-to-end test passing.
+func TestWriteSignalMergeKeepsNewestAndEarliest(t *testing.T) {
+	prev := writeSignal{typ: storeapi.Modified, rv: 10, firstRV: 10}
+	next := writeSignal{typ: storeapi.Modified, rv: 40, firstRV: 40}
+
+	got, keep := writeSignalMerge(prev, next)
+	require.True(t, keep)
+	assert.EqualValues(t, 40, got.rv, "the state to go read is the newest")
+	assert.EqualValues(t, 10, got.firstRV, "how far back the slot reaches is the earliest")
+
+	// Out-of-version-order arrival must not advance firstRV either.
+	got, keep = writeSignalMerge(next, prev)
+	require.True(t, keep)
+	assert.EqualValues(t, 40, got.rv)
+	assert.EqualValues(t, 10, got.firstRV, "the earliest wins whichever order it arrives in")
+}
+
+// A closed handle abandons whatever it was still holding, so it cannot report an
+// empty backlog — it reports that it could not tell, and a consumer holds its cursor
+// there rather than claiming everything it has seen. The live paths are covered by the
+// OldestPending tests above; this pins the arm that only exists in the window between
+// a drain and the read after it.
+func TestBacklogBound(t *testing.T) {
+	head := gobus.Event[storeapi.ObjectID, writeSignal]{Key: 7, Value: writeSignal{rv: 40, firstRV: 12}}
+
+	assert.EqualValues(t, 12, backlogBound(head, nil), "the head's first-touch version, not its newest")
+	assert.Zero(t, backlogBound(gobus.Event[storeapi.ObjectID, writeSignal]{}, gobus.ErrEmpty),
+		"an empty backlog is a real answer: nothing is queued")
+	assert.EqualValues(t, backlogUnknown, backlogBound(gobus.Event[storeapi.ObjectID, writeSignal]{}, gobus.ErrClosed),
+		"a closed handle abandoned what it held, so it cannot claim the backlog was empty")
+}
+
+// changeEmit publishes directly when there is no ambient transaction. No mutator
+// reaches it that way any more — they all self-wrap, because publication is in commit
+// order only inside Within — so this exercises the arm directly rather than through
+// one. It stays as the fallback for an emit outside a transaction; a future mutator
+// that lands here is publishing unordered, which is what the waker's over-commit
+// detector reports.
+func TestChangeEmitPublishesOutsideTransaction(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	w, _, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	raw := &beehive.RawObject{ID: 7, Group: testGK.Group, Kind: testGK.Kind, ResourceVersion: 3}
+	store.changeEmit(ctx, beehive.Modified, raw)
+
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: 7, Type: beehive.Modified, ResourceVersion: 3},
+	}, recvBatch(t, w))
 }

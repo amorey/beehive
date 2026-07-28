@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/conflate"
 )
 
@@ -124,6 +125,14 @@ func changeMerge(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange,
 type writeSignal struct {
 	typ storeapi.ChangeType
 	rv  int64
+
+	// firstRV is the version of the write that *created* this slot, where rv is the
+	// newest one merged into it. A consumer reading the stream as a cursor needs a
+	// version below which nothing is still queued, and delivery is in first-touch
+	// order — so the head of the backlog holds the earliest-touched key, and its
+	// firstRV is the lowest version still pending. Merge must never advance it; see
+	// writeSignalMerge.
+	firstRV int64
 }
 
 // writeSignalMerge is changeMerge plus annihilation, over the projected value. The
@@ -139,6 +148,12 @@ func writeSignalMerge(prev, next writeSignal) (writeSignal, bool) {
 	if prev.rv > next.rv {
 		hi = prev
 	}
+	// The slot keeps the newest rv but the *earliest* firstRV: rv is what a consumer
+	// reads as "the state to go look at", while firstRV is how far back the slot
+	// reaches. prev is already in the slot, so prev.firstRV is the first touch; the
+	// min is belt-and-braces for a publisher that sends out of version order, where
+	// this would otherwise advance.
+	hi.firstRV = min(prev.firstRV, next.firstRV)
 	if hi.typ == storeapi.Deleted {
 		return hi, true
 	}
@@ -270,7 +285,10 @@ func (s *sqliteStore) changePublish(gk storeapi.GroupKind, ev storeapi.RawObject
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
 	// The store-wide hub carries the projection, not the row: see writeSignal.
-	_ = s.writeHub.Sender().Send(ev.Object.ID, writeSignal{typ: ev.Type, rv: ev.Object.ResourceVersion})
+	// firstRV starts equal to rv: Merge is never called on a first touch, so the
+	// value stored verbatim here is what establishes the field for the slot's life.
+	rv := ev.Object.ResourceVersion
+	_ = s.writeHub.Sender().Send(ev.Object.ID, writeSignal{typ: ev.Type, rv: rv, firstRV: rv})
 }
 
 // eventEmit delivers a written run to event-log watchers: queued on the tx
@@ -292,8 +310,10 @@ func (s *sqliteStore) publishEvent(gk storeapi.GroupKind, ev storeapi.Event) {
 }
 
 // flush publishes a committed transaction's buffered events (object changes then
-// event-log runs), then runs its post-commit hooks — a hook that wakes a
-// reconciler must not run before the events it should follow.
+// event-log runs) and returns its post-commit hooks for the caller to run after
+// them — a hook that wakes a reconciler must not run before the events it should
+// follow. Within runs them once it has released publishMu; see the note at the
+// return below for why they cannot run here.
 //
 // The buffers are taken under the lock and the callbacks run without it: a hook
 // runs code from the layer above this store and may re-enter it, so holding the
@@ -301,7 +321,7 @@ func (s *sqliteStore) publishEvent(gk storeapi.GroupKind, ev storeapi.Event) {
 // the collector closed, so a re-entrant emit or AfterCommit reaching it through a
 // captured tx ctx acts immediately rather than appending to a slice this flush
 // has already passed.
-func (s *sqliteStore) flush(coll *eventCollector) {
+func (s *sqliteStore) flush(coll *eventCollector) []func() {
 	coll.mu.Lock()
 	events, logRows, hooks := coll.events, coll.logRows, coll.hooks
 	coll.events, coll.logRows, coll.hooks = nil, nil, nil
@@ -314,9 +334,11 @@ func (s *sqliteStore) flush(coll *eventCollector) {
 	for _, p := range logRows {
 		s.publishEvent(p.gk, p.ev)
 	}
-	for _, fn := range hooks {
-		fn()
-	}
+	// The hooks are handed back rather than run: Within holds publishMu across this
+	// call to keep publication in commit order, and a hook is user code that may
+	// write to the store — running it here would re-enter Within and deadlock on a
+	// lock this goroutine already holds. Ordering only ever constrained the stream.
+	return hooks
 }
 
 // stream is the store side of a subscription: the channel a merge goroutine owns
@@ -363,10 +385,37 @@ func (s *sqliteStore) ObjectsWatchList(ctx context.Context, gk storeapi.GroupKin
 	})
 }
 
+// backlogUnknown is ObjectWriteBatch.OldestPending when the backlog could not be
+// read at all, which a closed handle cannot distinguish from an empty one.
+const backlogUnknown = -1
+
+// backlogBound turns a Peek at the receiver's head into the bound a batch carries.
+// Three answers, not two: ErrClosed is deliberately not folded into "nothing
+// pending", because Hub.Close and Receiver.Close abandon whatever is still queued —
+// so a closed handle says nothing about the backlog, and a consumer must hold its
+// cursor rather than claim everything it has seen.
+//
+// Written to take Peek's own results so it can be exercised directly; the closed arm
+// is otherwise reachable only in the window between a drain and the read after it.
+func backlogBound(head gobus.Event[storeapi.ObjectID, writeSignal], err error) int64 {
+	switch {
+	case err == nil:
+		return head.Value.firstRV
+	case errors.Is(err, gobus.ErrEmpty):
+		return 0 // nothing queued behind this batch
+	default:
+		return backlogUnknown // a closed handle abandoned whatever it held
+	}
+}
+
 // writeBatchCap bounds how many references one batch carries. It bounds the
 // slice, not retained memory: what a lagging consumer holds is its receiver's
 // pending set, which conflates per object and so is bounded by the store's live
 // key set either way.
+//
+// A backend detail, not part of the contract: a consumer learns how far the backlog
+// reaches from ObjectWriteBatch.OldestPending, not by comparing a batch's length
+// against this.
 const writeBatchCap = 64
 
 // ObjectWritesSubscribe streams every kind's live changes as blob-free references. It
@@ -374,14 +423,28 @@ const writeBatchCap = 64
 // current write position and everything it sees is genuinely post-subscribe —
 // and the hub's own writeSignalMerge both conflates and annihilates, so no
 // per-receiver merge is needed.
-func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.ObjectWritesSubscription, error) {
+//
+// It also returns the cursor the stream starts from, for a consumer that resumes
+// from a watermark rather than re-deriving state. Returning it here rather than
+// exposing a separate cursor read is what makes the ordering unrepresentable: the
+// receiver is registered first, so a write landing between the two is either already
+// in the receiver or above the returned value. The reverse order would leave a
+// window whose writes reach neither, which is the same hazard snapshotAt's
+// same-transaction read exists to close for the per-kind streams.
+func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.ObjectWritesSubscription, int64, error) {
 	if s.isClosed() {
-		return nil, errStoreClosed
+		return nil, 0, errStoreClosed
 	}
 	rx := s.writeHub.Receiver()
 
+	cursor, err := currentResourceVersion(ctx, s.conn(ctx))
+	if err != nil {
+		rx.Close()
+		return nil, 0, err
+	}
+
 	wctx, cancel := context.WithCancel(ctx)
-	w := newStream[[]storeapi.ObjectWrite](cancel)
+	w := newStream[storeapi.ObjectWriteBatch](cancel)
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -395,7 +458,7 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 			if err != nil {
 				return // ctx cancelled, watcher closed, or hub closed
 			}
-			batch := []storeapi.ObjectWrite{{ID: wev.Key, Type: wev.Value.typ}}
+			batch := []storeapi.ObjectWrite{{ID: wev.Key, Type: wev.Value.typ, ResourceVersion: wev.Value.rv}}
 			// Drain whatever else is already pending. Taking it from the receiver
 			// rather than from a buffered out channel is what keeps conflation
 			// intact up to this point: until a value is popped, another write to the
@@ -406,17 +469,25 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 				if err != nil {
 					break // drained, or the hub closed (the next Recv reports it)
 				}
-				batch = append(batch, storeapi.ObjectWrite{ID: next.Key, Type: next.Value.typ})
+				batch = append(batch, storeapi.ObjectWrite{ID: next.Key, Type: next.Value.typ, ResourceVersion: next.Value.rv})
 			}
+			// Ask what is left behind this batch, here and on this goroutine. The
+			// receiver has a single consumer, and a concurrent Send either coalesces in
+			// place or appends at the back — neither can move the head — so this answer
+			// is exact for this batch. Reading it later, or from elsewhere, could report
+			// a head further along and hand the consumer a bound above what it was
+			// actually given.
+			//
+			oldestPending := backlogBound(rx.Peek())
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park
 			}
-			if !w.send(wctx, s.done, batch) {
+			if !w.send(wctx, s.done, storeapi.ObjectWriteBatch{Writes: batch, OldestPending: oldestPending}) {
 				return
 			}
 		}
 	}()
-	return w.subscription(), nil
+	return w.subscription(), cursor, nil
 }
 
 func (s *sqliteStore) ObjectsWatch(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.ObjectsSubscription, error) {

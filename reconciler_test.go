@@ -653,7 +653,7 @@ func TestStopDoesNotDeadlockWithActiveWaker(t *testing.T) {
 		state:       beehiveRunning,
 		cancel:      cancel,
 	}
-	bh.wg.Go(func() { bh.dependencyWakerRun(ctx, fw.sub) })
+	bh.wg.Go(func() { wakerOf(bh).run(ctx, fw.sub) })
 
 	// Drive the waker to the point where it has consumed a Modified event and is
 	// parked just before re-entering bh.mu.
@@ -709,7 +709,7 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(ctx, fw.sub)
+		wakerOf(bh).run(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -747,12 +747,16 @@ func TestDependencyWakerWakesOnChange(t *testing.T) {
 type depsStore struct {
 	fakeStore
 	deps  map[ObjectID][]ObjectRef
+	err   error
 	calls atomic.Int64
 	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
 func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
 	s.calls.Add(1)
+	if s.err != nil {
+		return nil, s.err
+	}
 	s.seen = append(s.seen, slices.Clone(toIDs))
 	out := make(map[ObjectID][]ObjectRef, len(toIDs))
 	for _, id := range toIDs {
@@ -787,6 +791,650 @@ func changed(ids ...ObjectID) []ObjectWrite {
 	return refs
 }
 
+// changedAt is changed with explicit resource versions, for the watermark: the
+// live stream annotates every reference with the version of the write behind it.
+func changedAt(versions ...int64) []ObjectWrite {
+	refs := make([]ObjectWrite, 0, len(versions))
+	for i, rv := range versions {
+		refs = append(refs, ObjectWrite{ID: ObjectID(i + 1), Type: Modified, ResourceVersion: rv})
+	}
+	return refs
+}
+
+// The waker records how far it has got, so a later recovery can resume from there
+// instead of re-deriving the world. Highest version in the batch, because
+// conflation means one reference already stands for several writes.
+func TestWakeDependentsAdvancesWatermark(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+
+	dw.dependentsWake(context.Background(), changedAt(7, 4), commitBounded, 0)
+	assert.EqualValues(t, 7, dw.watermark, "the highest version in the batch, not the last")
+
+	dw.dependentsWake(context.Background(), changedAt(11), commitBounded, 0)
+	assert.EqualValues(t, 11, dw.watermark)
+}
+
+// A batch the waker has nothing to do with still moves the cursor. Deletes carry
+// no dependents to wake, and the hub annihilates transients outright, so on a
+// delete-heavy store these are most of the traffic — leaving the watermark parked
+// behind them would turn a bounded replay into a whole-table scan.
+func TestWakeDependentsAdvancesWatermarkOnNoOpBatch(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+
+	dw.dependentsWake(context.Background(), []ObjectWrite{{ID: 1, Type: Deleted, ResourceVersion: 9}}, commitBounded, 0)
+
+	assert.EqualValues(t, 9, dw.watermark, "a batch with nothing to wake is still consumed")
+}
+
+// A batch that reports a backlog behind it must not move the cursor past it, and
+// the batch's *length* has nothing to do with it. Delivery is in first-touch order —
+// a re-written object coalesces into the queue position it already held — so an
+// object bumped to a high version can ride in an early batch while lower-versioned
+// objects are still queued. Taking that high version as a resume point steps over
+// them, and if the stream then ends they never wake.
+//
+// The rule this replaced inferred the backlog from batch length, which starved: a
+// workload keeping more than one batch's worth of objects pending made every batch
+// full, so the cursor never moved at all and the first stream drop replayed
+// essentially the whole table. Length is deliberately not consulted here — the batch
+// below is far larger than any backend's cap and still advances the cursor.
+func TestWakeDependentsBoundedByBacklog(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+
+	// A big batch, delivered up to version 5000, with version 101 still queued.
+	big := make([]ObjectWrite, 100)
+	for i := range big {
+		big[i] = ObjectWrite{ID: ObjectID(i + 1), Type: Modified, ResourceVersion: int64(4901 + i)}
+	}
+	require.True(t, dw.dependentsWake(context.Background(), big, commitBounded, 101))
+	assert.EqualValues(t, 100, dw.watermark, "the cursor stops one below the oldest queued write")
+	assert.EqualValues(t, 5000, dw.seen, "what was delivered is still recorded")
+
+	// The backlog drains: now the highest version delivered is a safe resume point.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(5001), commitBounded, 0))
+	assert.EqualValues(t, 5001, dw.watermark, "an empty backlog releases what was staged")
+}
+
+// A backend that could not read its backlog must not be taken for an empty one. A
+// closed handle abandons whatever it was holding, so there may be writes below
+// anything seen that will never arrive; holding the cursor keeps them replayable.
+func TestWakeDependentsHoldsCursorOnUnknownBacklog(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen, dw.graceFloor = 100, 100, 100
+
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(900), commitBounded, -1))
+
+	assert.EqualValues(t, 100, dw.watermark, "an unreadable backlog claims nothing")
+	assert.EqualValues(t, 900, dw.seen, "though what arrived is still recorded")
+}
+
+// The cursor keeps advancing as the backlog head moves, which is the whole point:
+// under sustained churn every batch has a backlog behind it, and the old
+// length-based rule committed on none of them.
+func TestWakeDependentsAdvancesAsBacklogHeadMoves(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
+	dw := wakerOf(bh)
+
+	for _, bound := range []int64{101, 356, 900} {
+		require.True(t, dw.dependentsWake(context.Background(), changedAt(bound+50), commitBounded, bound))
+		assert.EqualValues(t, bound-1, dw.watermark)
+	}
+}
+
+// A write delivered at or below the cursor is proof the cursor was advanced past
+// something undelivered, which can only happen if the store published out of version
+// order. Report it and give the ground back: it is the only guard against a future
+// emitting store method that publishes outside Within, which no test over today's
+// mutators can cover.
+func TestWakeDependentsReportsOverCommittedWatermark(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelError)
+	bh, _, _ := wakerFixture(nil)
+	bh.logger = logger
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen, dw.graceFloor = 500, 500, 100
+
+	// A late write from above the floor but below the cursor: only possible out of
+	// version order.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(120), commitBounded, 0))
+
+	assert.Contains(t, buf.String(), "out of version order")
+	assert.EqualValues(t, 119, dw.watermark, "the cursor gives back the ground it should not have claimed")
+	assert.EqualValues(t, 119, dw.seen,
+		"and seen comes with it, or the next empty-backlog batch jumps straight back over the range")
+
+	// The very next batch must not undo the repair.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(600), commitBounded, 0))
+	assert.EqualValues(t, 600, dw.watermark, "advancing again is fine; jumping back to the old seen was not")
+}
+
+// The seed and replay paths both hand the cursor versions the stream is still about
+// to deliver, and neither is a violation. Subscribing registers the receiver before
+// reading the cursor, so a write caught in that window arrives at or below it; a
+// replay reads rows the receiver may already hold. Reporting those would put an Error
+// per overlapping write into the log of a perfectly healthy control plane, and clamp
+// the cursor into a redundant replay each time.
+func TestWakeDependentsAcceptsSeedAndReplayOverlap(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelError)
+	bh, _, _ := wakerFixture(nil)
+	bh.logger = logger
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen, dw.graceFloor = 500, 500, 500
+
+	// A write from the overlap: at or below the cursor, but not above the floor.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(300), commitBounded, 0))
+
+	assert.Empty(t, buf.String(), "expected over-delivery is not evidence of misordering")
+	assert.EqualValues(t, 500, dw.watermark, "and the cursor keeps its ground")
+}
+
+// The detector must not fire on a batch that legitimately advances the cursor, or
+// every batch reports itself.
+func TestWakeDependentsDoesNotReportOrdinaryAdvance(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelError)
+	bh, _, _ := wakerFixture(nil)
+	bh.logger = logger
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen = 100, 100
+
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(101, 102), commitBounded, 0))
+
+	assert.Empty(t, buf.String())
+	assert.EqualValues(t, 102, dw.watermark)
+}
+
+// The watermark starts where the stream does. Subscribing reports that cursor, so
+// a recovery before the first batch replays from the subscribe point rather than
+// from zero — which would be the whole table.
+func TestWakerStartSeedsWatermarkFromSubscribeCursor(t *testing.T) {
+	fw := newFakeWriteStream()
+	gk := GroupKind{Kind: "Widget"}
+	r := &reconciler{gk: gk, work: newWorkQueue()}
+	bh := &Beehive{
+		store:       &watcherStore{writes: fw, writesCursor: 42},
+		reconcilers: map[GroupKind]*reconciler{gk: r},
+		order:       []*reconciler{r},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dw := wakerOf(bh)
+	// The retry pause is reached only after the waker has seeded and consumed its
+	// first stream, which makes it the barrier: park there, then drain.
+	parked := newSignal()
+	dw.waitRetry = func(ctx context.Context, _ time.Duration) bool {
+		parked.fire()
+		<-ctx.Done()
+		return false
+	}
+	dw.start(ctx)
+
+	fw.endStream()
+	parked.wait(t, "the waker to finish its first stream")
+	cancel()
+	bh.wg.Wait()
+
+	assert.EqualValues(t, 42, dw.watermark, "the cursor the subscription started from")
+}
+
+// A batch whose dependents lookup failed must leave the watermark where it was.
+// This is the ordering mistake that makes recovery silently useless: batches do
+// not arrive in version order across a failure, so advancing on receipt lets a
+// later batch that succeeded carry the cursor past an earlier one that did not —
+// and the changes the recovery exists to replay are exactly the ones it then
+// skips. Every "it recovers" test still passes.
+func TestWakeDependentsHoldsWatermarkOnLookupFailure(t *testing.T) {
+	bh := &Beehive{store: &errDepsStore{}}
+	dw := wakerOf(bh)
+	dw.watermark = 5
+
+	ok := dw.dependentsWake(context.Background(), changedAt(100), commitBounded, 0)
+
+	assert.False(t, ok, "the batch was not processed")
+	assert.EqualValues(t, 5, dw.watermark, "an unprocessed batch does not move the cursor")
+}
+
+// replayStore serves ObjectWritesListSince from a fixed set of rows, recording the
+// cursor and limit of every page it was asked for.
+type replayStore struct {
+	depsStore
+	rows   []ObjectWrite // every live row, in version order
+	pages  [][2]int64    // (afterRV, limit) per call
+	read   int           // rows actually served, across every page
+	listed *signal       // fires on the first page request, when set
+	err    error
+}
+
+func (s *replayStore) ObjectWritesListSince(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
+	if s.listed != nil {
+		s.listed.fire()
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	var out []ObjectWrite
+	for _, r := range s.rows {
+		if r.ResourceVersion > afterRV && len(out) < limit {
+			out = append(out, r)
+		}
+	}
+	s.read += len(out)
+	return out, nil
+}
+
+// replayRows builds count live rows at versions 1..count.
+func replayRows(count int) []ObjectWrite {
+	rows := make([]ObjectWrite, 0, count)
+	for i := 1; i <= count; i++ {
+		rows = append(rows, ObjectWrite{ID: ObjectID(i), Type: Modified, ResourceVersion: int64(i)})
+	}
+	return rows
+}
+
+// Replay is bounded by what was missed, not by the size of the store. That is the
+// whole point of holding a cursor: after a long outage a full pass would be the
+// table, on a store whose single connection every writer shares.
+func TestWakerReplayReadsOnlyWhatWasMissed(t *testing.T) {
+	const total, missed = 50, 5
+	store := &replayStore{rows: replayRows(total)}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+	dw.watermark = total - missed // caught up to all but the last few
+
+	require.True(t, dw.replay(context.Background()))
+
+	assert.EqualValues(t, total, dw.watermark, "the cursor ends at the newest row")
+	assert.Equal(t, missed, store.read, "only the missed changes are read, not the whole table")
+}
+
+// Paging keeps a replay the same cost shape as live traffic, and the cursor moves
+// per page — safe here precisely because pages come back in version order, which
+// is the one place ordering is guaranteed.
+func TestWakerReplayPages(t *testing.T) {
+	store := &replayStore{rows: replayRows(replayPageCap * 2)}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+
+	require.True(t, dw.replay(context.Background()))
+
+	assert.Greater(t, len(store.pages), 2, "more rows than a page holds must take several")
+	assert.EqualValues(t, replayPageCap, store.pages[0][1], "each page is bounded")
+	assert.EqualValues(t, 0, store.pages[0][0], "the first page starts at the watermark")
+	assert.EqualValues(t, replayPageCap, store.pages[1][0], "the next resumes where it ended")
+	assert.EqualValues(t, replayPageCap*2, dw.watermark)
+}
+
+// A target deleted during the outage is absent from the replay rather than
+// erroring it — and per edges.to_id's RESTRICT it can have had no dependents left
+// to strand.
+func TestWakerReplaySkipsDeletedRows(t *testing.T) {
+	store := &replayStore{rows: []ObjectWrite{{ID: 7, Type: Modified, ResourceVersion: 9}}}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+
+	assert.True(t, dw.replay(context.Background()), "the gap left by a deleted row is not an error")
+	assert.EqualValues(t, 9, dw.watermark)
+}
+
+// A replay that could not read holds the cursor, for the same reason a failed
+// wake does: the changes are still owed.
+func TestWakerReplayHoldsWatermarkOnListFailure(t *testing.T) {
+	store := &replayStore{err: errBoom}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+	dw.watermark = 3
+
+	assert.False(t, dw.replay(context.Background()))
+	assert.EqualValues(t, 3, dw.watermark, "an unread page leaves the cursor owed")
+}
+
+// recoveringStore fails the first n subscribe attempts, then serves a live stream.
+// Its rows are what a replay finds above the cursor, and its deps are the edges the
+// wake path resolves — together, everything the waker needs to repair itself
+// without help from any periodic pass.
+type recoveringStore struct {
+	replayStore
+	failures atomic.Int64
+	mu       sync.Mutex
+	streams  []*fakeWriteStream
+
+	woke         *signal // fires on each dependents lookup
+	ready        chan *fakeWriteStream
+	bh           *Beehive
+	failListings atomic.Bool
+	wakeFailures atomic.Int64
+}
+
+// ObjectWritesListSince fails while failListings is set, so a test can break and
+// then repair a replay without racing the waker on replayStore.err.
+func (s *recoveringStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+	if s.failListings.Load() {
+		if s.listed != nil {
+			s.listed.fire()
+		}
+		return nil, errBoom
+	}
+	return s.replayStore.ObjectWritesListSince(ctx, afterRV, limit)
+}
+
+func (s *recoveringStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
+	if s.failures.Add(-1) >= 0 {
+		return nil, 0, errBoom
+	}
+	// A fresh stream per subscribe, so a test can end one round's stream and still
+	// push live traffic into the next.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := newFakeWriteStream()
+	s.streams = append(s.streams, st)
+	if s.ready != nil {
+		s.ready <- st
+	}
+	return st.sub, 0, nil
+}
+
+// nextStream waits for the waker's next successful subscribe and returns the
+// stream it took, so a test can push live traffic into that exact round.
+func (s *recoveringStore) nextStream(t *testing.T) *fakeWriteStream {
+	t.Helper()
+	select {
+	case st := <-s.ready:
+		return st
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the waker to subscribe")
+		panic("unreachable")
+	}
+}
+
+func (s *recoveringStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
+	if s.wakeFailures.Add(-1) >= 0 {
+		return nil, errBoom
+	}
+	out, err := s.depsStore.EdgesGroupIncomingByID(ctx, toIDs, r)
+	s.woke.fire()
+	return out, err
+}
+
+// recoveringFixtureLogged is recoveringFixture with the control plane's logger set,
+// for tests that assert on what the waker reports.
+func recoveringFixtureLogged(t *testing.T, failures int64, logger *slog.Logger) (*recoveringStore, *reconciler, func()) {
+	t.Helper()
+	return recoveringFixtureWith(t, failures, logger, nil)
+}
+
+// recoveringFixtureTuned is recoveringFixture with the waker's seams set *before* it
+// starts. They cannot be assigned afterwards: the waker reads them on its own
+// goroutine from the moment start returns.
+func recoveringFixtureTuned(t *testing.T, failures int64, configure func(*waker)) (*recoveringStore, *reconciler, func()) {
+	t.Helper()
+	return recoveringFixtureWith(t, failures, nil, configure)
+}
+
+// recoveringFixture wires a started waker over a store that can fail subscriptions
+// and serve a replay, with the retry pause stubbed so no test waits on a real
+// interval. The dependency is fixed: object 7 is the target, 8 its dependent.
+func recoveringFixture(t *testing.T, failures int64) (*recoveringStore, *reconciler, func()) {
+	t.Helper()
+	return recoveringFixtureWith(t, failures, nil, nil)
+}
+
+func recoveringFixtureWith(t *testing.T, failures int64, logger *slog.Logger, configure func(*waker)) (*recoveringStore, *reconciler, func()) {
+	t.Helper()
+	gk := GroupKind{Kind: "Widget"}
+	store := &recoveringStore{
+		replayStore: replayStore{
+			depsStore: depsStore{deps: map[ObjectID][]ObjectRef{7: {{ID: 8, Kind: "Widget"}}}},
+			rows:      []ObjectWrite{{ID: 7, Type: Modified, ResourceVersion: 5}},
+		},
+		woke:  newSignal(),
+		ready: make(chan *fakeWriteStream, 8),
+	}
+	store.listed = newSignal()
+	r := &reconciler{gk: gk, work: newWorkQueue()}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{gk: r}, order: []*reconciler{r}, logger: logger}
+	store.bh = bh
+
+	store.failures.Store(failures)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dw := wakerOf(bh)
+	dw.waitRetry = func(context.Context, time.Duration) bool { return true }
+	if configure != nil {
+		configure(dw)
+	}
+	dw.start(ctx)
+	// Draining the waker is every caller's barrier: once it has exited, the requeues
+	// it made have landed.
+	return store, r, func() { cancel(); bh.wg.Wait() }
+}
+
+// This is the whole gap. A failed subscription used to take down every dependency
+// wake for the life of the process, repaired only by escalating a periodic pass —
+// so with every tick disabled the repair was armed and never spent, and a settled
+// dependent, invisible to any owed-work listing because its own generation never
+// moved, stayed stale forever. The only signal was a log line.
+//
+// No catchup, no resync, no startup pass: the waker has to recover on its own.
+func TestWakerRecoversFromSubscribeFailureWithNoPeriodicPass(t *testing.T) {
+	store, r, drain := recoveringFixture(t, 1) // the first subscribe fails
+
+	// The waker retries and comes back, so changes from here on wake their
+	// dependents again — which is the gap: this used to be dead for the life of the
+	// process, with a log line as the only signal.
+	live := store.nextStream(t)
+	go live.push(ObjectWrite{ID: 7, Type: Modified, ResourceVersion: 10})
+
+	store.woke.wait(t, "the dependents lookup a recovered waker makes")
+	drain()
+
+	assert.Equal(t, []ObjectID{8}, r.work.items, "the dependent of a target that changed after recovery")
+}
+
+// Changes made *during* the initial outage are deliberately not replayed: no cursor
+// was ever taken, so the only honest resume point is zero, and replaying from there
+// is the whole-world pass this design exists to replace. The waker takes the first
+// cursor it can get and says what that skips, rather than paying O(table) for one
+// transient error or skipping it silently.
+func TestWakerSeedsAfterInitialSubscribeFailureAndSaysSo(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store, _, drain := recoveringFixtureLogged(t, 1, logger)
+
+	store.nextStream(t)
+	drain()
+
+	assert.Empty(t, store.pages, "no replay: there was never a cursor to replay from")
+	assert.Contains(t, buf.String(), "not replayed", "the skip is reported, not silent")
+}
+
+// End to end on the live path: a stream delivering nothing but batches with a
+// backlog behind them still advances the cursor, so a later replay is bounded by what
+// was missed rather than by the size of the store.
+//
+// This is the starvation case. The rule this replaced only committed on a batch
+// shorter than the backend's cap, so a workload keeping more than a batch's worth of
+// objects pending pinned the cursor at the subscribe cursor for the life of the
+// stream — and the first stream drop replayed essentially the whole table.
+func TestWakerAdvancesCursorOnBackloggedStream(t *testing.T) {
+	store, _, drain := recoveringFixture(t, 0)
+	defer drain()
+	dw := wakerOf(store.bh)
+
+	live := store.nextStream(t)
+	// Each batch reports a backlog behind it — never an empty one, which is what the
+	// old rule needed to commit at all.
+	for _, bound := range []int64{101, 356, 900} {
+		live.pushBounded(bound, ObjectWrite{ID: 7, Type: Modified, ResourceVersion: bound + 50})
+		store.woke.wait(t, "the dependents lookup for a backlogged batch")
+		store.woke = newSignal() // rearm for the next round
+	}
+	drain()
+
+	assert.EqualValues(t, 899, dw.watermark, "the cursor tracked the backlog head, not the batch length")
+}
+
+// The other loss point, on the same recovery path: a closed stream used to end the
+// waker for the life of the process, repaired only by escalating every later
+// catchup tick. Now it resubscribes and replays from its watermark, so a settled
+// dependent of a target that changed during the gap still converges with nothing
+// periodic configured. Written when the escalation was deleted, to keep the
+// coverage its own test had — it passes on the recovery loop as built.
+func TestWakerRecoversFromClosedStreamWithNoPeriodicPass(t *testing.T) {
+	store, r, drain := recoveringFixture(t, 0)
+
+	// End the first stream: the waker must come back on a new one and replay the gap.
+	store.nextStream(t).endStream()
+	store.woke.wait(t, "the dependents lookup a resubscribed waker makes")
+	drain()
+
+	assert.Equal(t, []ObjectID{8}, r.work.items, "the dependent stranded by the closed stream")
+}
+
+// A replay that fails on resubscribe must not be shrugged off. The watermark is
+// still below the gap, so going on to consume the live stream lets an ordinary
+// batch carry the cursor *past* changes that were never replayed — and their
+// dependents never wake, which is the loss this path exists to prevent.
+//
+// The live batch is what makes this bite: without one, the next resubscribe would
+// replay again and paper over the dropped attempt.
+func TestWakerRetriesFailedReplayOnResubscribe(t *testing.T) {
+	store, r, drain := recoveringFixture(t, 0)
+
+	// Fail the replay that the second subscription will run.
+	store.failListings.Store(true)
+	store.nextStream(t).endStream()
+	second := store.nextStream(t) // the waker is back on a new stream
+	store.listed.wait(t, "the failed replay attempt")
+
+	// Live traffic on the new stream, far above the un-replayed gap. Sent from its
+	// own goroutine because a waker that is repairing correctly will not take it
+	// until the replay succeeds — while one that dropped the failure takes it at
+	// once and moves the cursor past object 7 forever.
+	go second.push(ObjectWrite{ID: 99, Type: Modified, ResourceVersion: 500})
+	store.failListings.Store(false)
+
+	store.woke.wait(t, "the retried replay's dependents lookup")
+	drain()
+
+	assert.Contains(t, r.work.items, ObjectID(8), "the dependent the failed replay owed")
+}
+
+// A stream that flaps — handed over, one batch, closed, repeatedly — must keep
+// backing off. Its predecessor reset the counter on "the stream delivered
+// something", which such a store satisfies every round, so the delay stayed at the
+// floor and the waker resubscribed ten times a second, each round costing a
+// subscribe, a replay and an edges query on the connection every writer shares.
+func TestWakerFlappingStreamKeepsBackingOff(t *testing.T) {
+	var mu sync.Mutex
+	var delays []time.Duration
+	enough := newSignal()
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		// A frozen clock: every stream lasts no time at all, so no round can have
+		// outlived the pause it cost.
+		dw.now = func() time.Time { return time.Unix(0, 0) }
+		dw.waitRetry = func(_ context.Context, d time.Duration) bool {
+			mu.Lock()
+			delays = append(delays, d)
+			n := len(delays)
+			mu.Unlock()
+			if n >= 6 {
+				enough.fire()
+			}
+			return true
+		}
+	})
+	defer drain()
+
+	go func() {
+		for st := range store.ready {
+			st.endStream() // handed over, then dead: the flap
+		}
+	}()
+
+	enough.wait(t, "six rounds of a flapping stream")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Greater(t, delays[5], delays[0], "a flapping stream must not hold the delay at the floor")
+}
+
+// A stream that ran longer than the pause it would have cost was a working stream,
+// however quiet it was, so the next outage starts fresh rather than inheriting a
+// history that is no longer true.
+func TestWakerHealthyStreamResetsBackoff(t *testing.T) {
+	var mu sync.Mutex
+	var delays []time.Duration
+	enough := newSignal()
+	var reads atomic.Int64
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		// The clock jumps an hour on every read, so the gap serve measures across run
+		// — two reads — always dwarfs the retry that round would have cost.
+		dw.now = func() time.Time { return time.Unix(0, 0).Add(time.Duration(reads.Add(1)) * time.Hour) }
+		dw.waitRetry = func(_ context.Context, d time.Duration) bool {
+			mu.Lock()
+			delays = append(delays, d)
+			n := len(delays)
+			mu.Unlock()
+			if n >= 4 {
+				enough.fire()
+			}
+			return true
+		}
+	})
+	defer drain()
+
+	go func() {
+		for st := range store.ready {
+			st.endStream()
+		}
+	}()
+
+	enough.wait(t, "four long-lived streams")
+	mu.Lock()
+	defer mu.Unlock()
+	for i, d := range delays {
+		assert.Equal(t, wakerRetryBase, d, "round %d inherited a history that is no longer true", i)
+	}
+}
+
+// The retry interval grows but is capped, and the loop never stops trying. An
+// attempt cap would resurrect the dead waker this recovery exists to kill, just by
+// a slower route — so the ceiling is on the delay, not on the number of tries.
+func TestWakerBackoffCapsIntervalAndKeepsRetrying(t *testing.T) {
+	store := &recoveringStore{woke: newSignal(), ready: make(chan *fakeWriteStream, 8)}
+	store.failures.Store(40) // more failures than the backoff has doublings
+
+	r := &reconciler{gk: GroupKind{Kind: "Widget"}, work: newWorkQueue()}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{r.gk: r}, order: []*reconciler{r}}
+
+	var mu sync.Mutex
+	var delays []time.Duration
+	enough := newSignal()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); bh.wg.Wait() }()
+
+	dw := wakerOf(bh)
+	dw.waitRetry = func(_ context.Context, d time.Duration) bool {
+		mu.Lock()
+		delays = append(delays, d)
+		n := len(delays)
+		mu.Unlock()
+		if n >= 20 {
+			enough.fire()
+		}
+		return true
+	}
+	dw.start(ctx)
+
+	enough.wait(t, "twenty retries")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, wakerRetryCap, delays[len(delays)-1], "the interval stops growing at the ceiling")
+	assert.Greater(t, delays[1], delays[0], "and grows before it gets there")
+	assert.GreaterOrEqual(t, len(delays), 20, "still retrying long past any plausible attempt cap")
+}
+
 // TestWakeDependentsSkipsSelfEdge covers the spin: an object that depends on
 // itself is woken by its own Modified, and the wake is what caused the write, so
 // nothing converges it. There is no tick, no backoff and no already-settled skip
@@ -797,7 +1445,7 @@ func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 
 	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
 }
@@ -819,7 +1467,7 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	}
 	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: deps}, widget, gadget)
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 
 	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
@@ -840,11 +1488,11 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
 	bhA, _, rsA := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 2, Kind: "Widget"}}}, gk)
-	bhA.dependentsWake(context.Background(), changed(1))
+	wakerOf(bhA).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
 	bhB, _, rsB := wakerFixture(map[ObjectID][]ObjectRef{2: {{ID: 1, Kind: "Widget"}}}, gk)
-	bhB.dependentsWake(context.Background(), changed(2))
+	wakerOf(bhB).dependentsWake(context.Background(), changed(2), commitBounded, 0)
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
@@ -904,11 +1552,12 @@ func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relatio
 	return nil, errBoom
 }
 
-// TestWakeDependentsListError verifies a failed dependents lookup is swallowed:
-// the target still reconciled, and the resync backstop will retry the waking.
+// TestWakeDependentsListError verifies a failed dependents lookup does not take the
+// waker down with it: the target still reconciled, and the changes are replayed
+// from the watermark, which the caller holds.
 func TestWakeDependentsListError(t *testing.T) {
 	bh := &Beehive{store: &errDepsStore{}}
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 }
 
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
@@ -919,7 +1568,7 @@ func TestDependencyWakerStreamEnd(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 
@@ -2844,7 +3493,7 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &errDepsStore{}, logger: logger}
 
-	bh.dependentsWake(context.Background(), changed(1))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 
 	assert.Contains(t, buf.String(), "dependents lookup failed",
 		"a dropped wake must not be silent")
@@ -2866,18 +3515,16 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bh.dependentsWake(ctx, changed(1))
+	wakerOf(bh).dependentsWake(ctx, changed(1), commitBounded, 0)
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
-	assert.False(t, r.tickResyncs(), "shutdown must not arm a full pass")
 }
 
-// TestDependencyWakerStreamEndLogs pins the second. A closed change stream ends
-// the waker for the life of the process — nothing re-subscribes, and it is the
-// process's only stream — so every future change to every kind reaches no
-// dependent at all. No reachable path closes the
-// channel short of store Close today, which makes this latent rather than live;
-// unlogged either way.
+// TestDependencyWakerStreamEndLogs pins the second loss point. A closed change
+// stream costs every kind's wakes, not one kind's — it is the process's only
+// stream — so it is worth a warning even though the waker now resubscribes and
+// replays rather than dying on it. No reachable path closes the channel short of
+// store Close today, which makes this latent rather than live; logged either way.
 func TestDependencyWakerStreamEndLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	fw := newFakeWriteStream()
@@ -2885,15 +3532,15 @@ func TestDependencyWakerStreamEndLogs(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 
 	fw.endStream()
 	waitClosed(t, done, "waker to exit on stream end")
 
-	assert.Contains(t, buf.String(), "dependency waker stopped",
-		"a dead waker must not be silent")
+	assert.Contains(t, buf.String(), "change stream ended",
+		"a lost stream must not be silent")
 }
 
 // TestDependencyWakerCancelDoesNotLog is the negative: an ordinary shutdown ends
@@ -2907,7 +3554,7 @@ func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(ctx, fw.sub)
+		wakerOf(bh).run(ctx, fw.sub)
 		close(done)
 	}()
 
@@ -2915,132 +3562,6 @@ func TestDependencyWakerCancelDoesNotLog(t *testing.T) {
 	waitClosed(t, done, "waker to exit on cancel")
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
-}
-
-// TestCatchupTickEscalationPredicate covers the tick's full-pass decision
-// directly, because the two escalation reasons differ in a way an integration
-// test cannot show cheaply: a dead waker is a standing condition, while a dropped
-// wake is a one-shot that must be *consumed* by the tick it drives.
-//
-// It also pins the consumption order. When a standing reason already applies, the
-// one-shot must survive rather than be burned — that tick sweeps anyway, and
-// spending it there would discard the repair still owed if the standing reason
-// later goes away.
-func TestCatchupTickEscalationPredicate(t *testing.T) {
-	t.Run("no escalation by default", func(t *testing.T) {
-		assert.False(t, (&reconciler{}).tickResyncs())
-	})
-
-	t.Run("resyncNextTick fires once", func(t *testing.T) {
-		r := &reconciler{}
-		r.resyncNextTick()
-		assert.True(t, r.tickResyncs())
-		assert.False(t, r.tickResyncs(), "one-shot: a transient drop must not degrade the process")
-	})
-
-	t.Run("resyncEveryTick fires forever", func(t *testing.T) {
-		r := &reconciler{}
-		r.resyncEveryTick()
-		assert.True(t, r.tickResyncs())
-		assert.True(t, r.tickResyncs(), "sticky: the waker is gone for the process lifetime")
-	})
-
-	t.Run("a standing reason leaves the one-shot armed", func(t *testing.T) {
-		r := &reconciler{}
-		r.resyncEveryTick()
-		r.resyncNextTick()
-		assert.True(t, r.tickResyncs())
-		assert.True(t, r.resyncOnce.Load(), "not consumed by a tick it did not decide")
-	})
-}
-
-// errListIDsStore fails the full-pass listing and reports each attempt, so a test
-// can await the tick that consumed an escalation.
-type errListIDsStore struct {
-	fakeStore
-	calls chan struct{}
-}
-
-func (s *errListIDsStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	// Non-blocking: the ticker keeps firing, so a report the test isn't waiting
-	// for is dropped rather than parking run's loop past cancellation.
-	select {
-	case s.calls <- struct{}{}:
-	default:
-	}
-	return nil, errBoom
-}
-
-// TestFailedEscalatedPassRearmsOneShot pins the other half of the one-shot's
-// contract: it is spent on a full pass that *ran*, not merely on one that was
-// attempted. tickResyncs consumes the flag before the listing, so a transient
-// ObjectsListIDs failure used to swallow the repair permanently — and with resync off by
-// default nothing else reaches the settled dependents a dropped wake stranded.
-func TestFailedEscalatedPassRearmsOneShot(t *testing.T) {
-	store := &errListIDsStore{calls: make(chan struct{}, 1)}
-	r := &reconciler{store: store, catchupInterval: time.Millisecond, logger: discardLogger}
-	r.resyncNextTick()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := runInBackground(r, ctx)
-
-	// Two escalated passes: the second can only happen because the first re-armed
-	// the flag it consumed.
-	for range 2 {
-		select {
-		case <-store.calls:
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for the escalated full pass")
-		}
-	}
-
-	cancel()
-	<-done
-	assert.True(t, r.resyncOnce.Load(), "a pass that never listed leaves the repair owed")
-}
-
-// TestDroppedWakeEscalatesEveryKind pins the property the first attempt at this
-// got wrong. The flags were process-wide but consumed per-reconciler, so a dropped
-// wake repaired whichever kind ticked first and silently spent the repair for the
-// rest — a guarantee stated in a comment and contradicted by the code.
-//
-// Cross-kind is forced by the mechanism, not chosen: dependency edges are
-// deliberately cross-kind, so a lost wake on one kind strands dependents of any
-// kind, and the lookup that failed is what would have named them.
-func TestDroppedWakeEscalatesEveryKind(t *testing.T) {
-	logger, buf := captureLogger(slog.LevelWarn)
-	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &errDepsStore{}, logger: logger, order: []*reconciler{r1, r2}}
-
-	bh.dependentsWake(context.Background(), changed(1))
-
-	assert.Contains(t, buf.String(), "forcing a full resync pass")
-	assert.True(t, r1.resyncOnce.Load(), "every kind is armed, not just whichever ticks first")
-	assert.True(t, r2.resyncOnce.Load())
-	assert.False(t, r1.resyncAlways.Load(), "a transient lookup error is not a permanent escalation")
-}
-
-// TestDeadWakerEscalatesEveryKind is the sticky counterpart: a waker whose stream
-// ended keeps dropping every future change, so one pass would repair the instant
-// of death and strand everything after it.
-func TestDeadWakerEscalatesEveryKind(t *testing.T) {
-	logger, buf := captureLogger(slog.LevelWarn)
-	fw := newFakeWriteStream()
-	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger, order: []*reconciler{r1, r2}}
-
-	done := make(chan struct{})
-	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
-		close(done)
-	}()
-	fw.endStream()
-	waitClosed(t, done, "waker to exit on stream end")
-
-	assert.Contains(t, buf.String(), "escalating")
-	assert.True(t, r1.resyncAlways.Load(), "a dead waker escalates every kind's later ticks")
-	assert.True(t, r2.resyncAlways.Load())
 }
 
 // shutdownCtx reports itself cancelled but never fires Done. Real shutdown
@@ -3060,118 +3581,24 @@ type shutdownCtx struct{ context.Context }
 func (shutdownCtx) Done() <-chan struct{} { return nil }
 func (shutdownCtx) Err() error            { return context.Canceled }
 
-// TestDeadWakerOnShutdownDoesNotEscalate is TestDeadWakerEscalatesEveryKind's
-// negative twin. Stop ends the stream by cancelling the same ctx the waker
-// selects on, so a stream that ends during shutdown is a normal exit, not a
-// dropped wake. Escalating there would arm every later tick of a control plane
-// that is going away, and it would do so on every clean Stop — which is how the
-// one message that matters gets trained out of an operator.
-func TestDeadWakerOnShutdownDoesNotEscalate(t *testing.T) {
+// A stream that ends because the control plane is going away is not a loss, and
+// must not be reported as one. Shutdown cancels the ctx and closes the stream
+// together, so both arms of the waker's select are ready at once and the
+// stream-ended arm's re-check is what tells the two apart.
+func TestDependencyWakerStreamEndOnShutdownIsSilent(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	fw := newFakeWriteStream()
-	r1, r2 := &reconciler{}, &reconciler{}
-	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger, order: []*reconciler{r1, r2}}
+	bh := &Beehive{store: &watcherStore{writes: fw}, logger: logger}
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(shutdownCtx{context.Background()}, fw.sub)
+		wakerOf(bh).run(shutdownCtx{context.Background()}, fw.sub)
 		close(done)
 	}()
 	fw.endStream()
-	waitClosed(t, done, "waker to exit on a stream ended by shutdown")
+	waitClosed(t, done, "waker to exit on stream end")
 
-	assert.Empty(t, buf.String(), "a stream ended by shutdown is not a dropped wake")
-	assert.False(t, r1.resyncAlways.Load(), "a control plane going away must not arm its later ticks")
-	assert.False(t, r2.resyncAlways.Load())
-}
-
-// TestEscalatedCatchupTickReconcilesSettled closes the loop end to end: an armed
-// escalation must actually reach a settled object, which is the only kind of
-// object the repair exists for — one that is owed nothing and therefore invisible
-// to the catchup listings the tick would otherwise run.
-func TestEscalatedCatchupTickReconcilesSettled(t *testing.T) {
-	ctx := context.Background()
-	gk := GroupKind{Kind: "Widget"}
-
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
-	raw, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
-	require.NoError(t, err)
-	_, err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
-
-	reconciled := make(chan ObjectID, 4)
-	// Catchup on (it carries the escalation), resync off, no startup pass: only an
-	// escalated catchup tick can reach a settled object.
-	bh, err := New(store, WithCatchupInterval(10*time.Millisecond),
-		WithResyncInterval(0), withoutGCSweeper())
-	require.NoError(t, err)
-	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
-		WithStartupResync(false))
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	defer stop(ctx)
-
-	select {
-	case got := <-reconciled:
-		t.Fatalf("settled object %d dispatched before any escalation", got)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	bh.resyncKindsNextTick()
-
-	select {
-	case got := <-reconciled:
-		assert.Equal(t, raw.ID, got)
-	case <-time.After(testTimeout):
-		t.Fatal("escalation never reached the settled object")
-	}
-}
-
-// TestSubscribeFailureMessageMatchesCoverage covers the third of the waker's loss
-// points. The code there was always fine; the *message* was the defect — it said
-// "relying on resync", which was false even before resync became opt-in, because
-// the tick was owed-work-only and a settled dependent is exactly what that cannot
-// see. Rather than delete the promise, the failure now makes it true by escalating
-// the tick — and says which of the two situations the operator is in.
-//
-// The predicate is deliberately whether *any* kind has a catchup tick, not the
-// failing kind's: the escalation is cross-kind, so a tick on any kind repairs
-// dependents of that kind whatever kind's waker was lost. A per-kind test would
-// tell an operator to hand-drive recovery beehive is already providing, or promise
-// one it is not.
-func TestSubscribeFailureMessageMatchesCoverage(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-
-	start := func(t *testing.T, opts ...Option) (string, *Beehive) {
-		t.Helper()
-		logger, buf := captureLogger(slog.LevelWarn)
-		bh, err := New(&watcherStore{err: errBoom}, append(opts, WithLogger(logger))...)
-		require.NoError(t, err)
-		_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
-		require.NoError(t, err)
-		stop, err := bh.Start(context.Background())
-		require.NoError(t, err)
-		require.NoError(t, stop(context.Background()))
-		return buf.String(), bh
-	}
-
-	t.Run("with a tick, the promise is made true", func(t *testing.T) {
-		out, bh := start(t) // catchup on by default
-		assert.Contains(t, out, "escalating")
-		assert.True(t, bh.reconcilers[gk].resyncAlways.Load(),
-			"a waker that never started is a dead waker")
-	})
-
-	t.Run("with no tick, it says coverage is gone", func(t *testing.T) {
-		out, _ := start(t, WithCatchupInterval(0), WithResyncInterval(0))
-		assert.Contains(t, out, "no periodic pass to fall back on")
-		assert.Contains(t, out, "Requeue", "the caller owns recovery here, so name the primitive")
-		assert.NotContains(t, out, "escalating", "do not promise a repair that cannot run")
-	})
+	assert.Empty(t, buf.String(), "a control plane going away is not a lost stream")
 }
 
 // TestWakeDependentsBatchOneQuery verifies a batch of changed targets resolves
@@ -3186,7 +3613,7 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 		3: {{ID: 30, Kind: "Widget"}},
 	}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1, 2, 3))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1, 2, 3), commitBounded, 0)
 
 	assert.Equal(t, int64(1), store.calls.Load(), "one query for the whole batch")
 	assert.Equal(t, []ObjectID{10, 20, 30}, rs[gk].work.items)
@@ -3202,7 +3629,7 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1, 1, 1))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1, 1, 1), commitBounded, 0)
 
 	require.Len(t, store.seen, 1)
 	assert.Equal(t, []ObjectID{1}, store.seen[0], "the repeated target is asked about once")
@@ -3220,7 +3647,7 @@ func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)
 
-	bh.dependentsWake(context.Background(), changed(1, 2))
+	wakerOf(bh).dependentsWake(context.Background(), changed(1, 2), commitBounded, 0)
 
 	assert.Equal(t, []ObjectID{2}, rs[gk].work.items, "woken for 1's change, skipped for its own")
 }
@@ -3372,9 +3799,18 @@ func TestSubscribeFailureReportsWholeProcess(t *testing.T) {
 		_, err := Register(bh, GroupKind{Kind: kind}, &noopController[tSpec, tStatus]{})
 		require.NoError(t, err)
 	}
+	// One attempt, then park until shutdown: the retry loop would otherwise log once
+	// per attempt and the count below would race the backoff.
+	attempted := newSignal()
+	bh.waker.waitRetry = func(ctx context.Context, _ time.Duration) bool {
+		attempted.fire()
+		<-ctx.Done()
+		return false
+	}
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
+	attempted.wait(t, "the waker's first subscribe attempt")
 	require.NoError(t, stop(context.Background()))
 
 	out := buf.String()
@@ -3382,9 +3818,6 @@ func TestSubscribeFailureReportsWholeProcess(t *testing.T) {
 		"one stream, one warning — not one per registered kind")
 	assert.Contains(t, out, "for any kind", "the consequence is process-wide, so say so")
 	assert.NotContains(t, out, "kind=Widget", "there is no per-kind scope left to name")
-	for gk, r := range bh.reconcilers {
-		assert.True(t, r.resyncAlways.Load(), "every kind's later ticks are escalated: %v", gk)
-	}
 }
 
 // TestDeadWakerReportsWholeProcess is the same blast radius on the other loss
@@ -3397,7 +3830,7 @@ func TestDeadWakerReportsWholeProcess(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bh.dependencyWakerRun(context.Background(), fw.sub)
+		wakerOf(bh).run(context.Background(), fw.sub)
 		close(done)
 	}()
 	fw.endStream()
@@ -3406,4 +3839,163 @@ func TestDeadWakerReportsWholeProcess(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "for every kind")
 	assert.NotContains(t, out, "group=", "there is no per-kind scope left to name")
+}
+
+// cancellingSubscribeStore cancels the control plane as its subscribe fails, which
+// is what shutdown looks like from inside serve's error arm.
+type cancellingSubscribeStore struct {
+	fakeStore
+	cancel func()
+}
+
+func (s *cancellingSubscribeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
+	s.cancel()
+	return nil, 0, errBoom
+}
+
+// A subscribe that fails because the control plane is going away is not a loss and
+// must not be retried or reported — Stop cancels the same ctx the subscribe rides.
+func TestWakerSubscribeFailureOnShutdownIsSilent(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &cancellingSubscribeStore{cancel: cancel}
+	r := &reconciler{gk: GroupKind{Kind: "Widget"}, work: newWorkQueue()}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{r.gk: r}, order: []*reconciler{r}, logger: logger}
+
+	wakerOf(bh).start(ctx)
+	bh.wg.Wait()
+
+	assert.Empty(t, buf.String(), "a control plane going away is not a failed subscription")
+}
+
+// Shutdown during a replay retry ends the waker rather than looping: the backoff
+// reports the cancellation, and there is nothing left to repair for a control plane
+// that is going away.
+func TestWakerReplayRetryStopsOnShutdown(t *testing.T) {
+	stopping := newSignal()
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		dw.waitRetry = func(context.Context, time.Duration) bool {
+			stopping.fire()
+			return false // "the control plane went away"
+		}
+	})
+	defer drain()
+
+	store.failListings.Store(true) // every replay fails, so it can only end by shutting down
+	store.nextStream(t).endStream()
+
+	stopping.wait(t, "the waker to reach its retry pause")
+	store.bh.wg.Wait() // it exits rather than retrying forever
+}
+
+// backoff's own timer, exercised without the seam: the delay elapses and reports
+// true, and a cancelled control plane reports false instead of waiting it out.
+func TestWakerBackoffTimer(t *testing.T) {
+	dw := &waker{}
+	assert.True(t, dw.backoff(context.Background(), 0), "the delay elapses")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.False(t, dw.backoff(ctx, 8), "a cancelled control plane does not wait out the ceiling")
+}
+
+// A replay page whose dependents lookup fails leaves the cursor where it was and
+// reports failure, so the caller retries rather than treating the gap as closed.
+func TestWakerReplayPageLookupFailure(t *testing.T) {
+	store := &replayStore{
+		depsStore: depsStore{deps: map[ObjectID][]ObjectRef{7: {{ID: 8, Kind: "Widget"}}}, err: errBoom},
+		rows:      []ObjectWrite{{ID: 7, Type: Modified, ResourceVersion: 9}},
+	}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+	dw := wakerOf(bh)
+	dw.watermark = 3
+
+	assert.False(t, dw.replay(context.Background()))
+	assert.EqualValues(t, 3, dw.watermark, "a page that could not be woken leaves the cursor owed")
+}
+
+// A live batch whose dependents lookup fails is repaired in place: the waker holds
+// the cursor, replays until one gets through, and then counts the round as having
+// made progress — so a stream that recovered is not treated as another outage.
+func TestWakerRepairsFailedLiveBatchInPlace(t *testing.T) {
+	store, r, drain := recoveringFixture(t, 0)
+	store.wakeFailures.Store(1) // the live batch's lookup fails; the replay's succeeds
+
+	live := store.nextStream(t)
+	go live.push(ObjectWrite{ID: 7, Type: Modified, ResourceVersion: 10})
+
+	store.woke.wait(t, "the replay that repairs the dropped batch")
+	drain()
+
+	assert.Contains(t, r.work.items, ObjectID(8), "the dependent the dropped batch owed")
+}
+
+// Shutdown while retrying a replay on a fresh subscription ends the waker. The
+// stream-ended pause has to let it through first, so the two backoffs are told
+// apart by which one is being asked.
+func TestWakerReplayRetryOnResubscribeStopsOnShutdown(t *testing.T) {
+	stopping := newSignal()
+	var pauses atomic.Int64
+	store, _, drain := recoveringFixtureTuned(t, 0, func(dw *waker) {
+		dw.waitRetry = func(context.Context, time.Duration) bool {
+			if pauses.Add(1) == 1 {
+				return true // the stream-ended pause: let it resubscribe
+			}
+			stopping.fire()
+			return false // the replay retry: the control plane is going away
+		}
+	})
+	defer drain()
+
+	store.failListings.Store(true) // every replay fails, so only shutdown ends it
+	first := store.nextStream(t)
+	first.endStream()
+	second := store.nextStream(t) // the subscription it gives up on
+
+	stopping.wait(t, "the waker to reach its replay retry")
+	store.bh.wg.Wait()
+
+	// Abandoning a subscription still releases it: this exit does not go through
+	// run, which is what closes the stream on every other path.
+	waitClosed(t, second.closed, "the abandoned subscription to be released")
+}
+
+// resubscribeShutdownStore fails the second subscribe *and* cancels, which is what
+// Stop looks like to a waker that was already mid-resubscribe.
+type resubscribeShutdownStore struct {
+	recoveringStore
+	cancel func()
+}
+
+func (s *resubscribeShutdownStore) ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, int64, error) {
+	if len(s.streams) > 0 {
+		s.cancel()
+		return nil, 0, errBoom
+	}
+	return s.recoveringStore.ObjectWritesSubscribe(ctx)
+}
+
+// A resubscribe that fails because the control plane is going away is not reported:
+// the waker is already inside its loop, so unlike the first subscribe this reaches
+// serve's own shutdown re-check.
+func TestWakerResubscribeFailureOnShutdownIsSilent(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &resubscribeShutdownStore{
+		recoveringStore: recoveringStore{woke: newSignal(), ready: make(chan *fakeWriteStream, 8)},
+		cancel:          cancel,
+	}
+	r := &reconciler{gk: GroupKind{Kind: "Widget"}, work: newWorkQueue()}
+	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{r.gk: r}, order: []*reconciler{r}, logger: logger}
+
+	dw := wakerOf(bh)
+	dw.waitRetry = func(context.Context, time.Duration) bool { return true }
+	dw.start(ctx)
+
+	first := <-store.ready
+	first.endStream() // sends it round again, where the subscribe cancels and fails
+	bh.wg.Wait()
+
+	assert.NotContains(t, buf.String(), "subscription failed",
+		"a control plane going away is not a failed subscription")
 }

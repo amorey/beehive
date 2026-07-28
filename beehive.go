@@ -90,50 +90,10 @@ type Beehive struct {
 	// and launches reconcile loops deterministically, rather than in random map
 	// order.
 	order  []*reconciler
+	waker  *waker
 	state  beehiveState
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-}
-
-// resyncKindsNextTick repairs a dependency-wake failure that dropped a single
-// change: every registered reconciler runs one full pass on its next catchup
-// tick, then returns to draining owed work.
-//
-// resyncKindsEveryTick is the sticky counterpart, for a failure that will keep
-// dropping changes for the life of the process.
-//
-// Both reach every reconciler rather than the failing kind's, and that is forced
-// by the failures themselves: dependency edges are deliberately cross-kind, so a
-// lost wake strands dependents of any kind, and the lookup that fails in
-// wakeDependentsBatch is the very thing that would have named them. Escalating one kind
-// would repair one arbitrary kind and silently spend the repair for the rest.
-// order is frozen once Start runs, so it reads without bh.mu — the same reasoning
-// stop relies on.
-func (bh *Beehive) resyncKindsNextTick() {
-	for _, r := range bh.order {
-		r.resyncNextTick()
-	}
-}
-
-// resyncKindsEveryTick is the sticky counterpart of resyncKindsNextTick; see that
-// method's doc for why both are cross-kind.
-func (bh *Beehive) resyncKindsEveryTick() {
-	for _, r := range bh.order {
-		r.resyncEveryTick()
-	}
-}
-
-// hasPeriodicPass reports whether any registered reconciler still has a tick for
-// an escalation to ride. Asked across every kind rather than the failing one,
-// because the escalation is cross-kind too (see resyncKindsNextTick): a tick on
-// any kind repairs dependents of that kind, whatever kind's waker was lost.
-func (bh *Beehive) hasPeriodicPass() bool {
-	for _, r := range bh.order {
-		if r.hasPeriodicPass() {
-			return true
-		}
-	}
-	return false
 }
 
 // log returns a non-nil logger. Start resolves bh.logger, but Stop (and tests
@@ -181,13 +141,14 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		return nil, fmt.Errorf("beehive: start aborted: %w", err)
 	}
 
-	// Subscribe and start consuming the dependency waker BEFORE launching any
-	// reconcile loop: a controller's startup reconcile can modify a target the
-	// instant it runs, and that change must not be published before the waker is
-	// listening — otherwise dependents go unwoken under configurations that rely
-	// on dependency events (e.g. a settled dependent, which no owed-work listing
-	// can see, with every ticker disabled).
-	bh.dependencyWakerStart(runCtx)
+	// Subscribe the dependency waker BEFORE launching any reconcile loop: a
+	// controller's startup reconcile can modify a target the instant it runs, and
+	// that change must not be published before the waker's receiver is registered —
+	// otherwise dependents go unwoken under configurations that rely on dependency
+	// events (e.g. a settled dependent, which no owed-work listing can see, with
+	// every ticker disabled). start subscribes synchronously for that reason; only
+	// consuming and retrying are asynchronous.
+	bh.waker.start(runCtx)
 
 	// Now launch the reconcile loops.
 	for _, r := range bh.order {
@@ -301,7 +262,76 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 	return err
 }
 
-// dependencyWakerStart launches the single waker over one store-wide change
+// waker is the dependency waker: it rides the store-wide write stream and requeues
+// the dependents of every object that changes. One per control plane, and its own
+// type so the state it accumulates while running — a resume cursor, and the test
+// seams that pace its retries — has an owner. Every field is touched by the waker
+// goroutine alone; nothing outside it has any business reading them, which is why
+// they need no synchronisation.
+type waker struct {
+	bh *Beehive
+
+	// watermark is the highest resource_version this waker has consumed. It is the
+	// resume point for a recovery: the store-wide cursor is globally monotonic and
+	// never reused, so "everything above this" names exactly what was missed. Owned
+	// by the waker goroutine — seeded by serve, advanced by dependentsWake — so it
+	// needs no synchronisation.
+	watermark int64
+
+	// graceFloor is the version below which a delivery cannot be evidence of anything.
+	// Two paths legitimately hand the cursor versions the stream is still about to
+	// deliver: subscribing registers the receiver *before* reading the cursor, so a
+	// write caught in that window is both buffered and at or below it; and a replay
+	// reads rows the receiver may already be holding. Both over-deliver on purpose —
+	// coalescing is not loss — but a detector that did not know it would report every
+	// one of them as a broken invariant. Raised to the watermark whenever one of those
+	// paths moves it; see overCommitted.
+	graceFloor int64
+
+	// seen is the highest version processed since the last safe point, which is not
+	// the same thing as the watermark. The stream delivers in first-touch order, not
+	// version order — a re-written object coalesces into its existing queue position
+	// — so the newest version in a batch can sit far above changes still queued
+	// behind it. Taking it as the resume point would step over them. seen only
+	// becomes the watermark on a drained batch, where there is nothing left queued
+	// for it to step over.
+	seen int64
+
+	// now replaces the clock when set, so a test can decide how long a stream
+	// appeared to last without one actually lasting that long.
+	now func() time.Time
+
+	// waitRetry replaces the retry delay when set. The recovery loop is the only thing
+	// standing between a dropped subscription and a control plane that has silently
+	// stopped honouring depends_on, so tests have to drive it — and they must do that
+	// without waiting on a real interval, which would be the sleep-paced test the
+	// conventions rule out.
+	waitRetry func(ctx context.Context, d time.Duration) bool
+}
+
+// commitRule says which quantity a processed batch lets the watermark move to. The
+// two delivery paths make different promises: a live batch is in first-touch order
+// and carries its own bound for what is still queued behind it, while a replay page
+// is version-ordered and complete up to its own last row.
+type commitRule int
+
+const (
+	commitBounded commitRule = iota // a live batch: bounded by what is still queued
+	commitOrdered                   // a replay page: complete up to its own high
+)
+
+const (
+	// wakerRetryBase is the first resubscribe delay; wakerRetryCap bounds every
+	// later one. The ceiling is on the interval and never on the number of attempts:
+	// a waker that gave up is the dead waker this recovery exists to kill, reached by
+	// a slower route. A store unhappy enough to fail a subscription will fail the
+	// next one too, and a tight loop against its single connection makes the outage
+	// worse.
+	wakerRetryBase = 100 * time.Millisecond
+	wakerRetryCap  = 30 * time.Second
+)
+
+// start launches the single waker over one store-wide change
 // stream. Driving requeues off change-events (which the store suppresses for
 // no-ops) rather than off every reconcile means a steady state stops waking and
 // cycles settle.
@@ -311,42 +341,214 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 // target has no reconciler, so a per-kind subscription list — however it is
 // computed — cannot name it, and changes to it would reach no waker at all.
 // Routing stays correct because it was never keyed on the subscription:
-// wakeDependentsBatch enqueues each dependent through enqueueIfRegistered, by the
+// dependentsWake enqueues each dependent through enqueueIfRegistered, by the
 // dependent's own kind.
 //
 // With no registered controllers there is nothing to wake, and the stream is not
 // free: it would pay a edges query per change in the whole store only to reach
 // enqueueIfRegistered's no-op arm.
-func (bh *Beehive) dependencyWakerStart(runCtx context.Context) {
-	if len(bh.order) == 0 {
+func (dw *waker) start(runCtx context.Context) {
+	if len(dw.bh.order) == 0 {
 		return
 	}
-	w, err := bh.store.ObjectWritesSubscribe(runCtx)
-	if err != nil {
-		// A waker that never starts is a dead waker: no change anywhere in the store
-		// will wake a dependent for the life of the process — every kind's, not one
-		// kind's, since this is the process's only stream. This used to claim the
-		// resync covered it, which was never true — a settled dependent is exactly
-		// what an owed-work tick cannot see — so escalate to make it true, and report
-		// which situation the operator is actually in.
-		bh.resyncKindsEveryTick()
-		msg := "dependency waker subscription failed; no dependency wakes will be delivered for any kind, so escalating every periodic pass to a full resync to converge dependents"
-		if !bh.hasPeriodicPass() {
-			msg = "dependency waker subscription failed and there is no periodic pass to fall back on; no dependency wakes will be delivered for any kind — drive them with Client.Requeue"
-		}
-		bh.logger.Warn(msg, "err", err)
-		return
-	}
-	bh.wg.Go(func() { bh.dependencyWakerRun(runCtx, w) })
+	// Subscribe here rather than on the goroutine, so the ordering promise Start
+	// makes actually holds: registering the receiver is what starts buffering, and
+	// it has to happen before any reconcile loop can publish. Draining it can wait —
+	// the hub holds what arrives in the meantime, conflated per object.
+	w, cursor, err := dw.bh.store.ObjectWritesSubscribe(runCtx)
+	dw.bh.wg.Go(func() { dw.serve(runCtx, w, cursor, err) })
 }
 
-// dependencyWakerRun requeues dependents when a target changes, until ctx is
+// serve keeps a subscription alive for the life of the control plane, replaying
+// whatever each gap swallowed. It is the driver the watermark needs: a cursor says
+// where to resume, but something has to still be running to decide to. Nothing was
+// before — a failed subscribe returned, and a closed stream ended the loop — so
+// both losses were permanent, repaired only by escalating a periodic pass that at
+// the default configuration may not exist.
+//
+// It takes the first subscription from start rather than opening its own, so the
+// stream is established before Start returns. Round 0 has missed nothing and simply
+// takes its cursor; every later round has a gap below it and replays instead —
+// including the one after a failed first attempt, since writes really could have
+// been missed before any cursor was known.
+func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor int64, err error) {
+	var attempt int
+	// seeded says a cursor has been taken. Distinct from "watermark != 0", which a
+	// legitimately-zero cursor cannot express.
+	var seeded bool
+	for round := 0; ctx.Err() == nil; round++ {
+		if round > 0 {
+			w, cursor, err = dw.bh.store.ObjectWritesSubscribe(ctx)
+		}
+		switch {
+		case err != nil:
+			if ctx.Err() != nil {
+				return // shutdown, not a loss
+			}
+			// Every change in the store is reaching no dependent while this holds, for
+			// every kind — this is the process's only stream.
+			dw.bh.log().WarnContext(ctx, "dependency waker subscription failed; retrying, and dependency wakes are not being delivered for any kind until it succeeds",
+				"attempt", attempt+1, "err", err)
+		default:
+			switch {
+			case !seeded && round == 0:
+				dw.watermark, dw.seen, dw.graceFloor = cursor, cursor, cursor
+			case !seeded:
+				// The first subscribe failed, so no cursor was ever known and a replay
+				// would start at zero — every live object, paged, with an edges lookup
+				// each, on the connection every writer shares. That is the whole-world
+				// pass this design replaced, bought with one transient error, so take
+				// this cursor instead and say plainly what it skips: changes made during
+				// the outage are not replayed. The reconciler's startup pass covers them
+				// unless it was turned off (see WithStartupResync).
+				dw.bh.log().WarnContext(ctx, "dependency waker subscribed after an initial failure; changes made before it are not replayed, and the startup pass is what covers them",
+					"cursor", cursor)
+				dw.watermark, dw.seen, dw.graceFloor = cursor, cursor, cursor
+			default:
+				// A new stream: nothing staged against the old one can be trusted against
+				// this one, so the staging area restarts from the cursor itself.
+				dw.seen = dw.watermark
+				// Keep replaying until one gets through, exactly as the in-run path does.
+				// Dropping a failed replay would leave the watermark below the gap while
+				// the live stream carried it past — and those changes would never wake
+				// their dependents, which is the loss this branch exists to prevent.
+				// Its own counter: attempt paces resubscribes and doubles as the
+				// threshold a stream must outlive to reset it, so folding replay retries
+				// into it would make a healthy stream look like a flap.
+				for retry := 0; !dw.replay(ctx); retry++ {
+					if !dw.backoff(ctx, retry) {
+						// Giving up on this subscription without handing it to run, which
+						// is what would otherwise have closed it. Whoever abandons the
+						// stream releases it.
+						w.Close()
+						return
+					}
+				}
+			}
+			seeded = true
+			started := dw.clock()
+			dw.run(ctx, w)
+			// Reset only when the stream outlived the pause we would have taken for it.
+			// "It delivered something" is not that test: a store handing out a
+			// subscription, sending one batch and closing it again would satisfy it every
+			// round, hold attempt at zero, and loop at the 100ms floor — a subscribe, a
+			// replay and an edges query ten times a second on the connection every writer
+			// shares, which is the hammering the backoff exists to stop. Duration says
+			// what progress cannot: a stream that ran longer than the retry it would have
+			// cost was a working stream, however quiet, and one that did not was a flap,
+			// however busy.
+			if dw.clock().Sub(started) > retryDelay(attempt) {
+				attempt = 0
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+		// Whichever way this round ended, pause before the next subscribe: a store
+		// that fails them, or closes streams as fast as it hands them out, would
+		// otherwise spin against the single connection every writer shares.
+		if !dw.backoff(ctx, attempt) {
+			return
+		}
+		attempt++
+	}
+}
+
+// clock reads the waker's notion of now, which tests replace.
+func (dw *waker) clock() time.Time {
+	if dw.now != nil {
+		return dw.now()
+	}
+	return time.Now()
+}
+
+// retryDelay is the pause before retry number attempt, doubling to wakerRetryCap.
+//
+// The inner min is an overflow guard, not a second cap: attempt is unbounded (the
+// loop never gives up), and shifting past 63 wraps to a negative duration, which a
+// timer fires immediately — turning the backoff into the spin it exists to prevent.
+func retryDelay(attempt int) time.Duration {
+	return min(wakerRetryBase<<min(attempt, 16), wakerRetryCap)
+}
+
+// backoff waits before the next retry, reporting false if the control plane went
+// away first. The delay doubles to wakerRetryCap and stays there; the caller keeps
+// trying regardless of how many attempts that takes.
+func (dw *waker) backoff(ctx context.Context, attempt int) bool {
+	d := retryDelay(attempt)
+	if dw.waitRetry != nil {
+		return dw.waitRetry(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// replayPageCap bounds one replay page. The query is a covering-index range scan,
+// so a page is cheap to *run*; what costs is the number of round trips, since each
+// page also drives an edges lookup and every one of those serializes against every
+// writer on the store's single connection. Sized well above the live stream's batch
+// cap for that reason — the point of the bound is to keep an unbounded read from
+// materialising the whole table after a long outage, not to keep any one read short.
+const replayPageCap = 256
+
+// replay feeds everything above the watermark back through the wake path, a page
+// at a time, and reports whether it got through. This is the repair: rather than
+// re-deriving every object of every kind to find the dependents a lost change
+// stranded, it re-reads the changes themselves, so the cost is what was missed
+// rather than what exists.
+//
+// The cursor advances per page, which is sound here and nowhere else: pages come
+// back in resource_version order, so a page that succeeded really does mean
+// everything below it is done. A page that fails leaves the cursor where it was —
+// the changes are still owed, and the caller retries from there.
+func (dw *waker) replay(ctx context.Context) bool {
+	for {
+		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, replayPageCap)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false // shutdown cancelled this read; not a loss of its own
+			}
+			dw.bh.log().WarnContext(ctx, "replaying missed changes failed; dependency wakes for them are still owed",
+				"watermark", dw.watermark, "err", err)
+			return false
+		}
+		if len(page) == 0 {
+			// Caught up. The rows just replayed may also be sitting in the receiver,
+			// buffered before the cursor overtook them, so the floor moves with the
+			// cursor: those deliveries are expected, not evidence of misordering.
+			dw.graceFloor = max(dw.graceFloor, dw.watermark)
+			return true
+		}
+		// dependentsWake advances the watermark itself, which is what makes the next
+		// page start where this one ended.
+		if !dw.dependentsWake(ctx, page, commitOrdered, 0) {
+			return false
+		}
+		if len(page) < replayPageCap {
+			// A short page means nothing was live above it when the store answered.
+			// Anything committed since is already on the live stream — the subscription
+			// is established before a replay runs — so stopping here saves the empty
+			// query that would otherwise end every replay.
+			dw.graceFloor = max(dw.graceFloor, dw.watermark)
+			return true
+		}
+	}
+}
+
+// run consumes one subscription until ctx is cancelled or the stream ends. It
+// requeues dependents when a target changes, until ctx is
 // cancelled or the stream ends. The stream is store-wide and established by
 // Start (events-only, no snapshot: the reconciler's own startup pass already
 // covers existing objects), and it arrives in batches — a burst of changes costs
 // one edges query rather than one per change. The ctx.Done() arm is needed
 // because a watcher's channel may never close on its own.
-func (bh *Beehive) dependencyWakerRun(ctx context.Context, w *ObjectWritesSubscription) {
+func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 	defer w.Close()
 	for {
 		select {
@@ -364,13 +566,30 @@ func (bh *Beehive) dependencyWakerRun(ctx context.Context, w *ObjectWritesSubscr
 				}
 				// The stream ended without the control plane stopping (that arrives on
 				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
-				// the process's only change stream, so every future change to every kind
-				// now reaches no dependent at all.
-				bh.log().Warn("dependency waker stopped: its change stream ended, so dependency wakes are dead for every kind for the life of the process; escalating every catchup tick to a full resync pass")
-				bh.resyncKindsEveryTick()
+				// the process's only change stream, so until it is back no change of any
+				// kind reaches a dependent.
+				dw.bh.log().Warn("dependency waker change stream ended for every kind; resubscribing and replaying the changes it missed")
 				return
 			}
-			bh.dependentsWake(ctx, batch)
+			if !dw.dependentsWake(ctx, batch.Writes, commitBounded, batch.OldestPending) {
+				// The batch was dropped and the watermark still points below it, so the
+				// changes are recoverable by re-reading them. Keep replaying until one
+				// gets through, before consuming anything further: taking the next batch
+				// first would interleave a success past a failure, and the cursor may only
+				// move once everything below it is done. Stalling here is safe because the
+				// hub conflates per object — what a paused consumer holds is bounded by
+				// the store's live key set, not by how much churn it missed.
+				//
+				// Paced, because the lookup that failed is the one a replay makes again:
+				// a store unhappy enough to fail it will fail the retry too, and retrying
+				// at stream speed would add two queries per incoming batch to the single
+				// connection that is already struggling.
+				for attempt := 0; !dw.replay(ctx); attempt++ {
+					if !dw.backoff(ctx, attempt) {
+						return
+					}
+				}
+			}
 		}
 	}
 }
@@ -399,9 +618,36 @@ func (bh *Beehive) dependencyWakerRun(ctx context.Context, w *ObjectWritesSubscr
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (bh *Beehive) dependentsWake(ctx context.Context, batch []ObjectWrite) {
+func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit commitRule, oldestPending int64) bool {
+	var high int64
+	// floor is the ceiling this batch's own contents prove the cursor must respect,
+	// or -1 if it proved nothing. Versions start at 1, so a real floor is never
+	// negative.
+	floor := int64(-1)
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
+		// Every reference that *arrives* counts toward the cursor, including the ones
+		// with nothing to wake: a delete carries no dependents, but its version is
+		// still a version this consumer has accounted for, and on a delete-heavy store
+		// those are most of what arrives. (A transient the consumer never observed does
+		// not arrive at all — writeSignalMerge annihilates the slot — so its version is
+		// simply never accounted for, and the next arrival's higher version covers it.)
+		high = max(high, ref.ResourceVersion)
+		// A write at or below the cursor is proof the cursor was committed over
+		// something undelivered, which can only happen if publication went out of
+		// version order. Report it and give the ground back; see overCommitted.
+		//
+		// Versions start at 1, so a zero carries no cursor information at all: a
+		// backend that does not populate it has opted out of the cursor rather than
+		// misordered anything, and contributes nothing to high either, so the watermark
+		// simply never advances from it. Below the grace floor is the seed/replay
+		// overlap, which is expected over-delivery rather than evidence.
+		if ref.ResourceVersion > dw.graceFloor && ref.ResourceVersion <= dw.watermark {
+			dw.overCommitted(ctx, ref)
+			if f := ref.ResourceVersion - 1; floor < 0 || f < floor {
+				floor = f
+			}
+		}
 		if ref.Type != Added && ref.Type != Modified {
 			continue
 		}
@@ -409,29 +655,102 @@ func (bh *Beehive) dependentsWake(ctx context.Context, batch []ObjectWrite) {
 			ids = append(ids, ref.ID)
 		}
 	}
-	if len(ids) == 0 {
-		return
+	// Give the ground back before anything else, so a batch that then fails its
+	// lookup still leaves the cursor where a replay can reach the missed changes.
+	dw.clampTo(floor)
+	// A batch with nothing to wake is still consumed, so the assignments below cover
+	// both: the cursor moves exactly when this reports success.
+	if len(ids) > 0 && !dw.dependentsEnqueue(ctx, ids) {
+		return false
 	}
-	byTarget, err := bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
+	dw.seen = max(dw.seen, high)
+	switch commit {
+	case commitBounded:
+		// oldestPending is the version of the oldest write still queued behind this
+		// batch, so everything below it is delivered — or superseded by something
+		// pending, whose own version is at or above the bound and therefore above the
+		// cursor, where a replay will find it.
+		switch {
+		case oldestPending > 0:
+			dw.watermark = max(dw.watermark, oldestPending-1)
+		case oldestPending == 0:
+			// The backlog was empty, so everything published has reached us and the
+			// highest version delivered is the most that can be claimed.
+			dw.watermark = max(dw.watermark, dw.seen)
+		default:
+			// The backend could not tell — a closed handle abandons whatever it was
+			// holding, so there may be writes below anything seen that will never
+			// arrive. Hold the cursor; a replay from here is always sound.
+		}
+	case commitOrdered:
+		// A replay page: version-ordered and complete, so everything up to this page's
+		// own high is done — but nothing above it is, whatever seen may hold from an
+		// earlier live batch. Jumping to seen here would step over the range between.
+		dw.watermark = max(dw.watermark, high)
+	}
+	// And again after the commit: seen is precisely what a version-ordering violation
+	// makes untrustworthy, so the empty-backlog branch above would otherwise hand back
+	// the ground this batch just proved the cursor cannot have.
+	dw.clampTo(floor)
+	return true
+}
+
+// clampTo lowers the cursor to floor when this batch proved it had claimed more than
+// it should. A negative floor means it proved nothing.
+//
+// seen comes down with it, and that is the whole repair rather than a detail: seen is
+// what the empty-backlog branch commits, so leaving it high would let the very next
+// batch jump straight back over the reserved range with no replay in between — the
+// clamp would lower the watermark and change nothing.
+func (dw *waker) clampTo(floor int64) {
+	if floor >= 0 {
+		dw.watermark = min(dw.watermark, floor)
+		dw.seen = min(dw.seen, floor)
+	}
+}
+
+// overCommitted reports a delivered write at or below the watermark and gives back
+// the ground the cursor should not have claimed.
+//
+// The invariant: after committing watermark W, every later delivery has a version
+// above W — anything still queued has a first-touch version above W, so the version
+// it is delivered with is at least that, and a replay reads only rows above W. So a
+// delivery at or below W cannot happen while publication is in version order, and
+// this is the one place that notices when it is not. Error rather than Warn: unlike
+// a dropped stream this is a broken invariant, not an operating condition.
+//
+// Pulling the cursor back to just below the offender (see clampTo) repairs the
+// common case, where the late write arrives before anything drops the stream. It
+// cannot repair the case where the stream drops first — that needs the bound to be
+// right rather than checked, which is what the store's publication ordering is for.
+func (dw *waker) overCommitted(ctx context.Context, ref ObjectWrite) {
+	dw.bh.log().ErrorContext(ctx, "dependency waker received a write at or below its cursor, so the cursor was advanced past an undelivered change; object writes are being published out of version order",
+		"objectID", ref.ID, "resourceVersion", ref.ResourceVersion, "watermark", dw.watermark)
+}
+
+// dependentsEnqueue resolves the dependents of targetIDs in one edges query and
+// requeues each on its own kind's reconciler, reporting whether the lookup got
+// through. A false answer means these changes are still owed: the caller holds the
+// watermark so a replay can re-read them.
+func (dw *waker) dependentsEnqueue(ctx context.Context, targetIDs []ObjectID) bool {
+	byTarget, err := dw.bh.store.EdgesGroupIncomingByID(ctx, targetIDs, RelationDependsOn)
 	if err != nil {
 		// Shutdown cancels this same ctx, so a change already dequeued when Stop
-		// lands fails here for no reason of its own. Escalating would arm a full
-		// pass on every reconciler of a control plane that is going away — the same
-		// re-check the stream-ended path above makes, for the same reason.
+		// lands fails here for no reason of its own — the same re-check the
+		// stream-ended path makes, for the same reason.
 		if ctx.Err() != nil {
-			return
+			return false
 		}
-		// Every dependent of these targets just missed their changes. A dependent
+		// Every dependent of these targets just missed their changes, and a dependent
 		// that has settled is invisible to every owed-work listing — its own
-		// generation never moved — so with no full pass configured the miss is
-		// permanent, not slow. Nothing here can name who was missed: the lookup
-		// that failed is exactly the one that would have said.
-		bh.log().WarnContext(ctx, "dependents lookup failed; wakes for these changes were dropped, forcing a full resync pass",
-			"targetIDs", ids, "err", err)
-		bh.resyncKindsNextTick()
-		return
+		// generation never moved. Nothing here can name who was missed: the lookup
+		// that failed is exactly the one that would have said. Replaying the changes
+		// themselves is what repairs it.
+		dw.bh.log().WarnContext(ctx, "dependents lookup failed; replaying these changes from the watermark",
+			"targetIDs", targetIDs, "err", err)
+		return false
 	}
-	for _, targetID := range ids {
+	for _, targetID := range targetIDs {
 		for _, d := range byTarget[targetID] {
 			if d.ID == targetID {
 				// Self-edge: nothing here is owed a wake. A spec write requeues through
@@ -441,9 +760,10 @@ func (bh *Beehive) dependentsWake(ctx context.Context, batch []ObjectWrite) {
 				// TODO.md.
 				continue
 			}
-			bh.enqueueIfRegistered(d.GroupKind(), d.ID)
+			dw.bh.enqueueIfRegistered(d.GroupKind(), d.ID)
 		}
 	}
+	return true
 }
 
 // stop tears the control plane down: it cancels the reconcile loops and waits
@@ -502,6 +822,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		reconcilers:     make(map[GroupKind]*reconciler),
 		migrators:       make(map[GroupKind]Migrator),
 	}
+	bh.waker = &waker{bh: bh}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
 			return nil, err

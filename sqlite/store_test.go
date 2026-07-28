@@ -1355,7 +1355,7 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, childB, owner, beehive.RelationOwnedBy))
 
 	// Watch live changes only (no snapshot) so each cascade's events are isolated.
-	w, err := store.ObjectWritesSubscribe(ctx)
+	w, _, err := store.ObjectWritesSubscribe(ctx)
 	require.NoError(t, err)
 	defer w.Close()
 
@@ -3406,4 +3406,204 @@ func TestScopedMutatorWrongKind(t *testing.T) {
 	other := beehive.GroupKind{Kind: "Other"}
 	_, err := store.ObjectsUpdateStatus(ctx, other, obj.ID, 0, []byte(`{}`), 0)
 	require.ErrorIs(t, err, beehive.ErrWrongKind)
+}
+
+// ObjectWritesListSince replays what a stalled consumer missed: live rows above a
+// cursor, in cursor order, bounded by limit. Kind-agnostic on purpose — a
+// depends_on edge may point at a kind with no controller, so a per-kind query
+// could not name every target whose change was dropped.
+func TestObjectWritesListSince(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Kind: "Other"}
+
+	mk := func(gk beehive.GroupKind) *beehive.RawObject {
+		o, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		return o
+	}
+	first := mk(testGK)
+	second := mk(otherGK) // a different kind: it must still come back
+	third := mk(testGK)
+
+	// Everything above the first object's version, so `first` is excluded: the
+	// cursor is what the consumer already processed, not where it wants to start.
+	got, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 10)
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ObjectWrite{
+		{ID: second.ID, Type: beehive.Modified, ResourceVersion: second.ResourceVersion},
+		{ID: third.ID, Type: beehive.Modified, ResourceVersion: third.ResourceVersion},
+	}, got, "cursor-ordered, exclusive of afterRV, spanning kinds")
+
+	// A limit truncates from the low end, so the caller can page forward by taking
+	// the last row's version as its next cursor.
+	page, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 1)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, second.ID, page[0].ID, "the oldest missed change comes first")
+
+	next, err := store.ObjectWritesListSince(ctx, page[0].ResourceVersion, 1)
+	require.NoError(t, err)
+	require.Len(t, next, 1)
+	assert.Equal(t, third.ID, next[0].ID, "paging forward from the last row's version")
+
+	// Caught up: nothing above the newest version.
+	none, err := store.ObjectWritesListSince(ctx, third.ResourceVersion, 10)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
+
+// A row deleted during the outage is simply absent from the replay rather than
+// erroring it. Per edges.to_id's ON DELETE RESTRICT a target cannot be removed
+// while anything depends on it, and from_id's CASCADE means a dependent deleted
+// first took its own edge with it — so a row that vanished has no dependents left
+// to strand.
+func TestObjectWritesListSinceSkipsDeletedRows(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	base, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	gone, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
+
+	got, err := store.ObjectWritesListSince(ctx, base.ResourceVersion, 10)
+	require.NoError(t, err)
+	assert.Empty(t, got, "the deleted row is absent, not an error")
+}
+
+func TestObjectWritesListSinceDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.ObjectWritesListSince(context.Background(), 0, 10)
+	require.Error(t, err)
+}
+
+// resource_version is monotonic in commit order, which is what makes it usable as
+// a resume cursor at all. It holds because the store runs on a single connection:
+// the version is drawn inside the write transaction, so with a pool of two a
+// transaction could draw 5 and commit after one that drew 6, and a consumer
+// resuming from 6 would skip a real change. This test is a guard on that
+// assumption, not on new behavior — raising SetMaxOpenConns should fail here
+// rather than silently dropping wakes in production.
+func TestResourceVersionMonotonicInCommitOrder(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	var prev int64
+	for range 20 {
+		obj, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.Greater(t, obj.ResourceVersion, prev,
+			"each committed write draws a strictly higher version than the one before it")
+		prev = obj.ResourceVersion
+	}
+
+	// And the sequence never hands back a version already used, even after the
+	// highest-versioned row is physically deleted — the counter is standalone, not
+	// MAX(objects.resource_version).
+	require.NoError(t, store.ObjectsDelete(ctx, 20))
+	after, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	assert.Greater(t, after.ResourceVersion, prev, "a delete cannot make the cursor regress")
+}
+
+// A non-positive limit is rejected rather than passed through: SQLite reads a
+// negative LIMIT as unbounded, which is the opposite of what such a caller asked
+// for, and the preallocation below it would panic on a negative capacity.
+func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	_, err := store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	for _, limit := range []int{0, -1} {
+		got, err := store.ObjectWritesListSince(ctx, 0, limit)
+		require.NoError(t, err)
+		assert.Empty(t, got, "limit %d asks for nothing, not for everything", limit)
+	}
+}
+
+// ObjectsCreate and ObjectsDelete draw the resource version inside their own
+// transaction, so a failure there aborts the write with nothing published. Dropping
+// the sequence is the only way in: a closed database fails at BeginTx instead,
+// before the version is ever drawn.
+func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("create", func(t *testing.T) {
+		store := newRawStore(t)
+		_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+		require.NoError(t, err)
+		_, err = store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+		require.Error(t, err)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		store := newRawStore(t)
+		obj, err := store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+		require.NoError(t, err)
+		_, err = store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+		require.NoError(t, err)
+		require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+	})
+}
+
+// DeletionRequestsCreateFromOwner stamps several children, each drawing a version and
+// publishing, so it has to hold one transaction across the lot. Outside one, two of
+// its own writes can reach the store-wide stream in the wrong order — which corrupts
+// the backlog bound a consumer reads as a cursor. The in-tree caller already wraps it;
+// this pins the public entry point for the callers Store's surface admits.
+func TestDeletionRequestsCreateFromOwnerPublishesInVersionOrder(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	mk := func() storeapi.ObjectID {
+		o, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		return o.ID
+	}
+	owner := mk()
+	for range 3 {
+		require.NoError(t, addEdge(ctx, store, mk(), owner, beehive.RelationOwnedBy))
+	}
+
+	w, _, err := store.ObjectWritesSubscribe(ctx)
+	require.NoError(t, err)
+	defer w.Close()
+
+	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	// Every version the cascade published, in the order it arrived.
+	var versions []int64
+	for len(versions) < 3 {
+		for _, ref := range recvBatch(t, w) {
+			versions = append(versions, ref.ResourceVersion)
+		}
+	}
+	assert.IsIncreasing(t, versions, "the cascade's own writes must not overtake each other")
+}
+
+// The cascade's own listing failure. Reached directly because the exported wrapper
+// opens a transaction first, so a closed database now fails at BeginTx instead.
+func TestDeletionRequestsCreateFromOwnerListError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.deletionRequestsCreateFromOwner(context.Background(), 1)
+	require.Error(t, err)
 }

@@ -275,9 +275,9 @@ type countingChangeStreamStore struct {
 	subscriptions atomic.Int64
 }
 
-func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	s.subscriptions.Add(1)
-	return deadSubscription[[]storeapi.ObjectWrite](), nil
+	return deadSubscription[storeapi.ObjectWriteBatch](), 0, nil
 }
 
 // TestStartSubscribesOneChangeStream verifies the waker rides a single
@@ -295,7 +295,7 @@ func TestStartSubscribesOneChangeStream(t *testing.T) {
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
-	defer stop(context.Background())
+	require.NoError(t, stop(context.Background()))
 
 	assert.Equal(t, int64(1), store.subscriptions.Load(), "one stream for the whole store, not one per kind")
 }

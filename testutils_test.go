@@ -230,8 +230,11 @@ func (s *fakeStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*Objects
 func (s *fakeStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
 	return deadSubscription[storeapi.RawObjectChange](), nil
 }
-func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
-	return deadSubscription[[]storeapi.ObjectWrite](), nil
+func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
+	panic("not implemented: fakeStore.ObjectWritesListSince")
+}
+func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
+	return deadSubscription[storeapi.ObjectWriteBatch](), 0, nil
 }
 func (s *fakeStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
 	panic("not implemented: fakeStore.EventsWatch")
@@ -250,7 +253,10 @@ type watcherStore struct {
 	fakeStore
 	w      *fakeObjectStream
 	writes *fakeWriteStream // served by ObjectWritesSubscribe, for the dependency waker
-	err    error
+	// writesCursor is the starting cursor ObjectWritesSubscribe reports, for tests
+	// that drive the waker's resume position.
+	writesCursor int64
+	err          error
 }
 
 func (s *watcherStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
@@ -265,11 +271,11 @@ func (s *watcherStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSub
 	}
 	return s.w.sub, nil
 }
-func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, error) {
+func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	if s.err != nil {
-		return nil, s.err
+		return nil, 0, s.err
 	}
-	return s.writes.sub, nil
+	return s.writes.sub, s.writesCursor, nil
 }
 
 // fakeStream is the shared body of the controllable subscription doubles: an
@@ -312,14 +318,22 @@ func (w *fakeObjectStream) push(typ ChangeType, obj *RawObject) {
 // dependency-waker tests. A batch is the push unit deliberately — the waker
 // resolves a whole batch in one query, so a double that could only deliver one
 // write at a time would hide that.
-type fakeWriteStream struct{ fakeStream[[]ObjectWrite] }
+type fakeWriteStream struct{ fakeStream[ObjectWriteBatch] }
 
 func newFakeWriteStream() *fakeWriteStream {
-	return &fakeWriteStream{newFakeStream[[]ObjectWrite]()}
+	return &fakeWriteStream{newFakeStream[ObjectWriteBatch]()}
 }
 
-// push delivers one batch to the waker.
-func (w *fakeWriteStream) push(writes ...ObjectWrite) { w.ch <- writes }
+// push delivers one batch to the waker, reporting no backlog behind it.
+func (w *fakeWriteStream) push(writes ...ObjectWrite) {
+	w.ch <- ObjectWriteBatch{Writes: writes}
+}
+
+// pushBounded delivers one batch that reports oldestPending still queued behind it,
+// which is what bounds how far the waker may advance its cursor.
+func (w *fakeWriteStream) pushBounded(oldestPending int64, writes ...ObjectWrite) {
+	w.ch <- ObjectWriteBatch{Writes: writes, OldestPending: oldestPending}
+}
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.
@@ -560,4 +574,14 @@ func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.O
 	rows, err := s.Store.DeletionRequestsList(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
+}
+
+// wakerOf returns bh's dependency waker, wiring one on demand. New does this, but
+// most waker tests build a Beehive literal to control exactly which collaborators
+// exist, so they have no waker until they ask for one.
+func wakerOf(bh *Beehive) *waker {
+	if bh.waker == nil {
+		bh.waker = &waker{bh: bh}
+	}
+	return bh.waker
 }

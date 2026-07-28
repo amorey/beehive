@@ -3,7 +3,7 @@ module github.com/amorey/beehive
 go 1.26.4
 
 require (
-	github.com/amorey/gobus v0.1.0
+	github.com/amorey/gobus v0.2.0
 	github.com/amorey/gochan v0.2.0
 	github.com/stretchr/testify v1.11.1
 	modernc.org/sqlite v1.52.0

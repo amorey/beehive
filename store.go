@@ -74,6 +74,10 @@ type ObjectWritesSubscription = storeapi.ObjectWritesSubscription
 // The id is the object's — a write has no identity of its own.
 type ObjectWrite = storeapi.ObjectWrite
 
+// ObjectWriteBatch is one delivery from the store-wide write stream: the writes
+// that were ready together, plus how far behind them the backlog reaches.
+type ObjectWriteBatch = storeapi.ObjectWriteBatch
+
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType
 

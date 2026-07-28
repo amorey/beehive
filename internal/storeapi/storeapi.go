@@ -128,7 +128,26 @@ type EventsSubscription = Subscription[Event]
 // yields the writes that were ready together, coalesced per object — a burst
 // arrives as one slice with one entry per distinct object, so a consumer that
 // resolves each entry against the store pays per burst rather than per write.
-type ObjectWritesSubscription = Subscription[[]ObjectWrite]
+type ObjectWritesSubscription = Subscription[ObjectWriteBatch]
+
+// ObjectWriteBatch is what the store-wide write stream delivers: the writes that
+// were ready together, plus how far behind them the backlog reaches.
+//
+// OldestPending is the version of the *oldest write still queued* after this batch
+// was taken. Zero means nothing was queued (versions start at 1, so 0 is
+// unambiguous); negative means the backend could not tell, which a closed handle
+// cannot distinguish from an empty backlog — and since closing abandons whatever was
+// queued, a consumer must hold its cursor there rather than claim everything it has
+// seen.
+//
+// It is the bound a consumer reading versions as a resume cursor needs: delivery
+// conflates per object and is in first-touch order, so the newest version in a batch
+// says nothing about what is still queued below it, and only this says where it is
+// safe to resume from.
+type ObjectWriteBatch struct {
+	Writes        []ObjectWrite
+	OldestPending int64
+}
 
 // ObjectWrite is a change stripped to what a consumer that only routes by
 // identity needs: which object changed, and how. The id is the object's, not a
@@ -140,6 +159,13 @@ type ObjectWritesSubscription = Subscription[[]ObjectWrite]
 type ObjectWrite struct {
 	ID   ObjectID
 	Type ChangeType
+
+	// ResourceVersion is the version of the write this reference reports — the
+	// newest one, where conflation merged several. It is the store-wide cursor (see
+	// resource_version_seq), so a consumer that records the highest version it has
+	// finished processing can resume from there instead of re-deriving the world.
+	// Eight bytes and no row: the blob-pinning above stays avoided.
+	ResourceVersion int64
 }
 
 // Condition is the untyped form of a single condition row. Status is one of
@@ -622,8 +648,24 @@ type Store interface {
 	// an Added snapshot, then all live changes for the kind.
 	ObjectsWatchList(ctx context.Context, gk GroupKind) (*ObjectsSubscription, error)
 
+	// ObjectWritesListSince returns the live writes above afterRV in cursor order,
+	// at most limit of them — the blob-free, kind-agnostic replay twin of
+	// ObjectWritesSubscribe, for a consumer resuming from a watermark. Rows are
+	// reported Modified: what happened to a row that changed unobserved is no longer
+	// known, and a replaying consumer re-reads current state anyway. A row deleted
+	// during the outage is absent rather than an error.
+	ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+
 	// ObjectWritesSubscribe returns a subscription to live writes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.
-	ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, error)
+	//
+	// Each batch carries the backlog bound behind it (see ObjectWriteBatch).
+	//
+	// The int64 is the cursor the stream starts from: every write committed before
+	// the call is at or below it, and every write the stream delivers is above it.
+	// Returned here rather than as a separate read so the two cannot be ordered
+	// wrongly — a cursor read before the subscription exists would leave a window
+	// whose writes reach neither.
+	ObjectWritesSubscribe(ctx context.Context) (*ObjectWritesSubscription, int64, error)
 }

@@ -37,6 +37,11 @@ type sqliteStore struct {
 	// until a controller re-confirms them in this process.
 	processStart time.Time
 
+	// publishMu orders publication by commit order. Held across Commit+flush in
+	// Within, because Commit releases the connection before flush runs and the
+	// store-wide stream's versions are read as a cursor. See Within.
+	publishMu sync.Mutex
+
 	// hubs fan watch events out to subscribers, one conflating hub per GroupKind,
 	// created lazily on first use. hubMu guards the maps, writeHub and the
 	// closed flag.
@@ -172,9 +177,26 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	// Flush only on a clean commit, and as the very last step: a failed commit
 	// discards the buffer, and there is no later step that could fail after a
 	// successful one — so watchers never see writes that didn't land.
+	//
+	// Commit and flush are held together under publishMu so that **publication
+	// order is commit order**. Commit releases the connection before flush runs, so
+	// without this a writer that committed at resource_version 100 can be preempted
+	// and publish after one that committed at 101. A consumer treating the stream's
+	// versions as a cursor — the dependency waker does — would then advance past a
+	// change it has not seen. The lock is uncontended in the steady state: the store
+	// runs on one connection, so writers already serialize, and flush is a
+	// non-blocking send to a conflating hub.
+	var hooks []func()
+	s.publishMu.Lock()
 	err = tx.Commit()
 	if err == nil {
-		s.flush(coll)
+		hooks = s.flush(coll)
+	}
+	s.publishMu.Unlock()
+	// Outside the lock: a hook is user code (a wake, typically) and may write to the
+	// store, which would re-enter Within. Only publication had to be ordered.
+	for _, fn := range hooks {
+		fn()
 	}
 	return err
 }
@@ -253,6 +275,26 @@ func (s *sqliteStore) scanAndEmit(ctx context.Context, typ storeapi.ChangeType, 
 }
 
 func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
+	// Self-wrapping is what keeps publication in commit order: Within holds
+	// publishMu across commit-and-publish, and outside it changeEmit publishes
+	// inline, so two concurrent direct calls could draw versions 100 and 101 and
+	// publish them the other way round. A consumer reading those versions as a
+	// cursor — the dependency waker does — would then step over 100 and never
+	// replay it. Store is public, so the guarantee cannot rest on every caller
+	// happening to be inside a transaction already; a nested Within is free.
+	var created *storeapi.RawObject
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		created, err = s.objectsCreate(ctx, obj)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+func (s *sqliteStore) objectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
 	finalizers := marshalFinalizers(obj.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
@@ -531,6 +573,48 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 		return nil, err
 	}
 	return scanIDs(rows)
+}
+
+// ObjectWritesListSince replays the writes a stalled consumer missed: live rows
+// above afterRV, in cursor order, at most limit of them. The blob-free twin of the
+// store-wide write stream, for a consumer resuming from a watermark rather than
+// re-deriving state — so it selects no spec or status, and is covered by
+// idx_objects_rv.
+//
+// Kind-agnostic, like the stream: a depends_on edge may point at a kind with no
+// controller, so a per-kind query could not name every target whose change was
+// dropped. Ordered by resource_version so the caller can page by taking the last
+// row's version as its next cursor and advance a watermark per page.
+//
+// Rows are reported Modified rather than carrying a real lifecycle type: the store
+// no longer knows what happened to a row that changed while nobody was listening,
+// and a replaying consumer is level-triggered — it re-reads current state. A row
+// deleted during the outage is simply absent (see the type's own note on why that
+// cannot strand a dependent).
+func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
+	if limit <= 0 {
+		// An exported entry point: a non-positive limit would reach SQLite as
+		// "LIMIT -1" (unbounded, the opposite of what was asked) and a negative one
+		// would panic in make below.
+		return nil, nil
+	}
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT id, resource_version FROM objects
+		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
+		afterRV, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	// Capped: limit is the caller's, and a large one must not preallocate for rows
+	// the store may not have.
+	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
+	for rows.Next() {
+		w := storeapi.ObjectWrite{Type: storeapi.Modified}
+		_ = rows.Scan(&w.ID, &w.ResourceVersion) // two INTEGER columns into int64 never error
+		writes = append(writes, w)
+	}
+	return writes, rows.Err()
 }
 
 // scanIDs collects the single id column of a SELECT id query, closing rows.
@@ -1294,6 +1378,25 @@ func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk store
 // an already-deleting subtree (the steady-state resync) is a lone SELECT — no
 // writes, no events. It returns every owned child for requeue, deleting or not.
 func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+	// Self-wrapped for the same reason as ObjectsCreate and ObjectsDelete: it stamps
+	// several children, each drawing a version and publishing, and publication is in
+	// commit order only inside Within. Outside one, two of this loop's own writes can
+	// reach the store-wide stream in the wrong order — which corrupts the backlog
+	// bound a consumer reads as a cursor. The in-tree caller already wraps it, so this
+	// is for the external ones Store's public surface admits.
+	var out []storeapi.ObjectRef
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		out, err = s.deletionRequestsCreateFromOwner(ctx, ownerID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id
@@ -1338,6 +1441,12 @@ func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, owner
 }
 
 func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) error {
+	// Self-wrapped for the same reason as ObjectsCreate: publication order is
+	// commit order only inside Within.
+	return s.Within(ctx, func(ctx context.Context) error { return s.objectsDelete(ctx, id) })
+}
+
+func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
