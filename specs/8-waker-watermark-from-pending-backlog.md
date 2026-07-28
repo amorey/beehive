@@ -57,54 +57,86 @@ rejected:
 - *"Commit the high when a full batch is followed by a short one"* is already the behaviour
   — the short batch commits `seen`, which includes the earlier full batch's high. The
   problem is a short batch never arriving.
-- *A time or count bound* cannot be made sound. `writeSignalMerge` keeps the **max**
-  version, so an entry's first-touch version is unrecoverable from the delivered value,
-  and a key queued behind it can carry an arbitrarily lower version. There is no safe
-  fallback derivable from what the waker currently sees.
+- *A time or count bound* cannot be made sound **as things stand**. `writeSignalMerge`
+  keeps only the max version, so an entry's first-touch version is unrecoverable from the
+  delivered value, and a key queued behind it can carry an arbitrarily lower version. No
+  safe fallback is derivable from what the waker sees today — which is why the fix below
+  starts by making that version available rather than by picking a bound.
 
 ## What changes
 
-Take the bound from the backlog itself. Spec 7 adds a receiver accessor reporting the
-sequence of the **oldest undelivered value**; the correct watermark is one below it:
+Take the bound from the backlog itself. Spec 7 adds `Receiver.Peek`, which reports the
+oldest **undelivered** value without consuming it. Track that value's *first-touch*
+version in the signal, and the correct watermark is one below it:
 
 ```
-watermark = min(seen, oldestPending - 1)      // when something is pending
-watermark = seen                              // when the receiver is empty
+watermark = min(seen, oldestPendingFirstVersion - 1)   // something is pending
+watermark = seen                                       // the receiver is empty
 ```
 
-Every version below `oldestPending` has either been delivered, or been superseded by a
-later write to the same key — and if that later write is still pending, its version is at
-or above `oldestPending`, so it sits *above* the watermark and a replay picks it up. Both
-cases are covered.
+Every version below `oldestPendingFirstVersion` has either been delivered, or been
+superseded by a later write to the same key — and if that later write is still pending, its
+first-touch version is at or above the bound, so it sits *above* the watermark and a replay
+picks it up. Both cases are covered.
 
-Note this **generalizes** the existing rule rather than adding a second one beside it: the
+This **generalizes** the existing rule rather than adding a second one beside it: the
 empty-receiver case is exactly today's `commitDrained`. Expect the three-way `commitRule`
 (`beehive.go:306-311`) to collapse — the live path stops needing a staged-versus-drained
-distinction, and `commitOrdered` (replay pages, which are version-ordered and complete)
-stays because it commits by a different quantity. Land whatever shape falls out; do not
-preserve the enum for its own sake.
+distinction. `commitOrdered` (replay pages, which are version-ordered and complete) stays,
+because it commits by a different quantity. Land whatever shape falls out; do not preserve
+the enum for its own sake.
 
-### The store has to carry it
+### `writeSignal` carries a first-touch version
 
-The accessor lives on the receiver, which only the `sqlite` backend holds. So the value
-has to reach the waker alongside each batch — the batch type is `[]ObjectWrite`, so this
-is a signature or wrapper change on `ObjectWritesSubscribe`'s stream. Pick the shape that
-keeps the stream blob-free; that constraint is why `ObjectWrite` exists in its present
-form (see its doc comment in `internal/storeapi/storeapi.go`).
+`writeSignal` (`sqlite/watch.go`) is `{typ, rv}` and `writeSignalMerge` keeps `max(rv)`.
+Add a `firstRV`, set equal to `rv` at publish, which the merge **preserves from `prev`**
+while continuing to keep the max in `rv`.
 
-Read the accessor **when the batch is assembled**, not when it is consumed: by the time
-the waker processes a batch, the receiver has moved on, and a later read would report a
-higher oldest-pending than was true for that batch — committing a watermark above what was
-actually delivered.
+Both are needed, and for opposite reasons:
+
+- `rv` must stay the **latest**, because the delivered `ObjectWrite.ResourceVersion` is
+  what advances `seen`. A merged reference whose version trailed the row would hand a
+  resuming consumer a cursor behind the state it is about to read. Pinned by
+  `TestObjectWritesSubscribeCoalescesRepeatWrites`.
+- `firstRV` must stay the **earliest**, because it is the pending bound. Updating it on
+  coalesce turns it into a latest-touch version and destroys the ordering the whole design
+  rests on.
+
+**Two invariants move into this repo with it**, and both need tests of their own rather
+than being implied by an end-to-end assertion:
+
+1. **`writeSignalMerge` never advances `firstRV`.** Previously the bus would have enforced
+   this; now a later simplification of the merge could quietly break it, and every
+   "the cursor advances" test would still pass.
+2. **The queue front holds the *minimum* `firstRV`.** This is what makes `Peek` sufficient,
+   and it holds only because publication is commit-ordered and `resource_version` is
+   monotonic in commit order — so first-touch order *is* increasing-version order. Beehive
+   guarantees both (`publishMu` in `Within`, and
+   `TestResourceVersionMonotonicInCommitOrder`), which is why the argument belongs here
+   rather than in the bus. Assert the composition, not just the two halves.
+
+### The store carries it through
+
+`Peek` lives on the receiver, which only the `sqlite` backend holds, so the value has to
+reach the waker alongside each batch. The batch type is `[]ObjectWrite`, so this is a
+signature or wrapper change on `ObjectWritesSubscribe`'s stream. Pick the shape that keeps
+the stream blob-free; that constraint is why `ObjectWrite` exists in its present form (see
+its doc comment in `internal/storeapi/storeapi.go`).
+
+**Peek immediately after the drain, in the same goroutine.** That ordering is what makes
+the answer exact rather than a stale observation: the receiver has a single consumer, and
+the only concurrent mutation is a `Send`, which cannot change the front. Peeking later —
+or from another goroutine — can report a higher bound than was true for the batch, which
+commits a watermark above what was actually delivered.
 
 ### `WriteBatchCap` stops being contract
 
 `storeapi.WriteBatchCap` (`internal/storeapi/storeapi.go:133-143`) was exported *only* so
 consumers could infer drained-ness from batch length, and `store.go:77-80` re-exports it
 into the beehive package for that one comparison. Both go back to being an implementation
-detail of the backend's drain loop. Its doc comment currently states the inference as part
-of the contract; that paragraph is now wrong and must go, along with the ADR's
-"short batch" wording.
+detail of the backend's drain loop. Its doc comment states the inference as part of the
+contract; that paragraph is now wrong and must go, along with the ADR's "short batch"
+wording.
 
 ## Acceptance criteria
 
@@ -119,10 +151,13 @@ The starvation case is the point, so test it first and directly:
   drop those objects' dependents are still woken.
 - **A full batch that empties the receiver commits.** The off-by-one: it must behave as a
   short batch does.
-- **The oldest-pending value is read as of batch assembly.** Advance the receiver between
-  assembly and consumption and assert the committed watermark reflects the earlier state.
-  This is the ordering mistake that makes the fix silently unsound while every "it
-  advances" test passes.
+- **`writeSignalMerge` preserves the earliest `firstRV` and the latest `rv`.** A direct
+  unit test on the merge, not an end-to-end one. Both halves: coalescing must not advance
+  `firstRV`, and must not hold `rv` back.
+- **The peek happens after the drain, in the drain's own goroutine.** Advance the receiver
+  between assembly and consumption and assert the committed watermark reflects the state at
+  assembly. This is the ordering mistake that makes the fix silently unsound while every
+  "it advances" test passes.
 - **Replay pages still commit by their own high**, not by `seen` and not by
   oldest-pending. Keep the existing coverage
   (`TestWakerReplayAdvancesByPageNotStagedHigh`) green; the bug it pins is easy to
