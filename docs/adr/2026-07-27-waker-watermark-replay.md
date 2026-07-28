@@ -45,13 +45,23 @@ operator knob whose default disables a correctness repair.
 
 ### The watermark is a low-water mark
 
-It advances only on batches actually processed, never on receipt — and only when the
-batch was **short**, meaning the backend's drain ended on an empty receiver rather
-than on `WriteBatchCap`. That second condition is not optional: the hub delivers in
-*first-touch* order, since a re-written object coalesces into the queue position it
-already held. So the highest version in a batch says nothing about what is still
-queued below it, and taking it as a resume point would step over changes that were
-never processed. A full batch stages its high-water mark instead; a short one commits it.
+It advances only on batches actually processed, never on receipt — and never past the
+oldest write still queued behind the batch. That second condition is not optional: the
+hub delivers in *first-touch* order, since a re-written object coalesces into the
+queue position it already held. So the highest version in a batch says nothing about
+what is still queued below it, and taking it as a resume point would step over changes
+that were never processed.
+
+Each batch therefore carries the bound (`ObjectWriteBatch.OldestPending`), read from
+the receiver's own backlog head via `conflate.Receiver.Peek` at the moment the batch
+is assembled. The cursor commits to one below it, or — when the backlog is empty — to
+the highest version actually delivered.
+
+An earlier form inferred the bound from the batch coming back *shorter* than the
+backend's cap. That starved: a workload touching more than a batch's worth of distinct
+objects with no lull made every batch full, so the cursor never moved at all and the
+first dropped subscription replayed essentially the whole table. The bound is now
+asked for rather than guessed.
 
 A **replay page** commits differently again: it is version-ordered and complete up to
 its own last row, so it advances the cursor by *that* row — never by the staged value,
@@ -115,6 +125,14 @@ Three properties this rests on, each asserted rather than assumed:
   frees the target — but a row that vanished had no dependents left to strand.
 - **Coalescing is not loss.** The hub delivers the latest state per object and the waker is
   level-triggered, so replaying "object X changed" once equals replaying it five times.
+- **The backlog head holds the lowest pending version.** What makes `Peek` sufficient:
+  the queue is in first-touch order, so its head is the earliest-touched key, and under
+  version-ordered publication that is also the lowest-versioned one. `writeSignal.firstRV`
+  records a slot's creating version and `writeSignalMerge` never advances it, so
+  coalescing cannot move the bound. Where publication order fails, the waker notices —
+  a delivered write at or below the cursor is proof the cursor over-committed, reported
+  at Error with the cursor clamped back. That is a detector, not a repair: it cannot help
+  if the stream drops before the late write arrives.
 
 **Not covered: changes made before the first successful subscribe.** If the initial
 subscribe fails, no cursor was ever taken, so the only honest resume point is zero —

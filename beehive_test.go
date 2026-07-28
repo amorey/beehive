@@ -277,7 +277,7 @@ type countingChangeStreamStore struct {
 
 func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
 	s.subscriptions.Add(1)
-	return deadSubscription[[]storeapi.ObjectWrite](), 0, nil
+	return deadSubscription[storeapi.ObjectWriteBatch](), 0, nil
 }
 
 // TestStartSubscribesOneChangeStream verifies the waker rides a single

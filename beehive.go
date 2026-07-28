@@ -299,15 +299,14 @@ type waker struct {
 	waitRetry func(ctx context.Context, d time.Duration) bool
 }
 
-// commitRule says how far a processed batch lets the watermark move. The three
-// cases differ because the two delivery paths make different promises: the live
-// stream is in first-touch order and may leave changes queued below a batch, while
-// a replay page is version-ordered and complete up to its own last row.
+// commitRule says which quantity a processed batch lets the watermark move to. The
+// two delivery paths make different promises: a live batch is in first-touch order
+// and carries its own bound for what is still queued behind it, while a replay page
+// is version-ordered and complete up to its own last row.
 type commitRule int
 
 const (
-	commitStaged  commitRule = iota // a full live batch: record the high, move nothing
-	commitDrained                   // a short live batch: the receiver was empty
+	commitBounded commitRule = iota // a live batch: bounded by what is still queued
 	commitOrdered                   // a replay page: complete up to its own high
 )
 
@@ -512,7 +511,7 @@ func (dw *waker) replay(ctx context.Context) bool {
 		}
 		// dependentsWake advances the watermark itself, which is what makes the next
 		// page start where this one ended.
-		if !dw.dependentsWake(ctx, page, commitOrdered) {
+		if !dw.dependentsWake(ctx, page, commitOrdered, 0) {
 			return false
 		}
 		if len(page) < replayPageCap {
@@ -555,15 +554,7 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 				dw.bh.log().Warn("dependency waker change stream ended for every kind; resubscribing and replaying the changes it missed")
 				return
 			}
-			// A batch shorter than the cap means the drain ended on an empty receiver,
-			// so everything published so far has reached us and the highest version
-			// seen is a safe resume point. A full batch may have left changes queued
-			// below it (first-touch order), so it stages instead.
-			commit := commitStaged
-			if len(batch) < writeBatchCap {
-				commit = commitDrained
-			}
-			if !dw.dependentsWake(ctx, batch, commit) {
+			if !dw.dependentsWake(ctx, batch.Writes, commitBounded, batch.OldestPending) {
 				// The batch was dropped and the watermark still points below it, so the
 				// changes are recoverable by re-reading them. Keep replaying until one
 				// gets through, before consuming anything further: taking the next batch
@@ -610,19 +601,35 @@ func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
 // (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
 // per-kind id scheme the self-edge compare would also need the GroupKind, or it
 // would silently drop a foreign object's wake.
-func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit commitRule) bool {
+func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit commitRule, oldestPending int64) bool {
 	var high int64
+	// floor is the ceiling this batch's own contents prove the cursor must respect,
+	// or -1 if it proved nothing. Versions start at 1, so a real floor is never
+	// negative.
+	floor := int64(-1)
 	ids := make([]ObjectID, 0, len(batch))
 	for _, ref := range batch {
 		// Every reference that *arrives* counts toward the cursor, including the ones
 		// with nothing to wake: a delete carries no dependents, but its version is
 		// still a version this consumer has accounted for, and on a delete-heavy store
-		// those are most of what arrives. A cursor that moved only on wakeable changes
-		// would trail arbitrarily far behind and turn a bounded replay into a
-		// whole-table scan. (A transient the consumer never observed does not arrive at
-		// all — writeSignalMerge annihilates the slot — so its version is simply never
-		// accounted for, and the next arrival's higher version covers it.)
+		// those are most of what arrives. (A transient the consumer never observed does
+		// not arrive at all — writeSignalMerge annihilates the slot — so its version is
+		// simply never accounted for, and the next arrival's higher version covers it.)
 		high = max(high, ref.ResourceVersion)
+		// A write at or below the cursor is proof the cursor was committed over
+		// something undelivered, which can only happen if publication went out of
+		// version order. Report it and give the ground back; see overCommitted.
+		//
+		// Versions start at 1, so a zero carries no cursor information at all: a
+		// backend that does not populate it has opted out of the cursor rather than
+		// misordered anything, and contributes nothing to high either, so the watermark
+		// simply never advances from it.
+		if ref.ResourceVersion > 0 && ref.ResourceVersion <= dw.watermark {
+			dw.overCommitted(ctx, ref)
+			if f := ref.ResourceVersion - 1; floor < 0 || f < floor {
+				floor = f
+			}
+		}
 		if ref.Type != Added && ref.Type != Modified {
 			continue
 		}
@@ -630,6 +637,9 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit
 			ids = append(ids, ref.ID)
 		}
 	}
+	// Give the ground back before anything else, so a batch that then fails its
+	// lookup still leaves the cursor where a replay can reach the missed changes.
+	dw.clampTo(floor)
 	// A batch with nothing to wake is still consumed, so the assignments below cover
 	// both: the cursor moves exactly when this reports success.
 	if len(ids) > 0 && !dw.dependentsEnqueue(ctx, ids) {
@@ -637,18 +647,56 @@ func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit
 	}
 	dw.seen = max(dw.seen, high)
 	switch commit {
-	case commitDrained:
-		// The receiver was empty, so everything published so far has reached us and
-		// been processed — including whatever earlier full batches staged in seen.
-		dw.watermark = dw.seen
+	case commitBounded:
+		// oldestPending is the version of the oldest write still queued behind this
+		// batch, so everything below it is delivered — or superseded by something
+		// pending, whose own version is at or above the bound and therefore above the
+		// cursor, where a replay will find it. Zero means the store reported no bound
+		// (an empty backlog, or a closed handle that abandoned one), and then the
+		// highest version actually delivered is the most that can be claimed.
+		if oldestPending > 0 {
+			dw.watermark = max(dw.watermark, oldestPending-1)
+		} else {
+			dw.watermark = max(dw.watermark, dw.seen)
+		}
 	case commitOrdered:
 		// A replay page: version-ordered and complete, so everything up to this page's
 		// own high is done — but nothing above it is, whatever seen may hold from an
-		// earlier live batch. Jumping to seen here would step over the range between,
-		// which is precisely the range seen exists to keep out of the cursor.
+		// earlier live batch. Jumping to seen here would step over the range between.
 		dw.watermark = max(dw.watermark, high)
 	}
+	// And again after the commit: seen is precisely what a version-ordering violation
+	// makes untrustworthy, so the empty-backlog branch above would otherwise hand back
+	// the ground this batch just proved the cursor cannot have.
+	dw.clampTo(floor)
 	return true
+}
+
+// clampTo lowers the watermark to floor when this batch proved the cursor had claimed
+// more than it should. A negative floor means it proved nothing.
+func (dw *waker) clampTo(floor int64) {
+	if floor >= 0 {
+		dw.watermark = min(dw.watermark, floor)
+	}
+}
+
+// overCommitted reports a delivered write at or below the watermark and gives back
+// the ground the cursor should not have claimed.
+//
+// The invariant: after committing watermark W, every later delivery has a version
+// above W — anything still queued has a first-touch version above W, so the version
+// it is delivered with is at least that, and a replay reads only rows above W. So a
+// delivery at or below W cannot happen while publication is in version order, and
+// this is the one place that notices when it is not. Error rather than Warn: unlike
+// a dropped stream this is a broken invariant, not an operating condition.
+//
+// Pulling the cursor back to just below the offender (see clampTo) repairs the
+// common case, where the late write arrives before anything drops the stream. It
+// cannot repair the case where the stream drops first — that needs the bound to be
+// right rather than checked, which is what the store's publication ordering is for.
+func (dw *waker) overCommitted(ctx context.Context, ref ObjectWrite) {
+	dw.bh.log().ErrorContext(ctx, "dependency waker received a write at or below its cursor, so the cursor was advanced past an undelivered change; object writes are being published out of version order",
+		"objectID", ref.ID, "resourceVersion", ref.ResourceVersion, "watermark", dw.watermark)
 }
 
 // dependentsEnqueue resolves the dependents of targetIDs in one edges query and

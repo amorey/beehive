@@ -128,19 +128,21 @@ type EventsSubscription = Subscription[Event]
 // yields the writes that were ready together, coalesced per object — a burst
 // arrives as one slice with one entry per distinct object, so a consumer that
 // resolves each entry against the store pays per burst rather than per write.
-type ObjectWritesSubscription = Subscription[[]ObjectWrite]
+type ObjectWritesSubscription = Subscription[ObjectWriteBatch]
 
-// WriteBatchCap bounds how many references one ObjectWritesSubscribe batch
-// carries. A backend drains its receiver into a batch until the receiver is empty
-// or the batch reaches this size, so **a batch shorter than WriteBatchCap means
-// the receiver was drained** — everything published so far has been delivered.
+// ObjectWriteBatch is what the store-wide write stream delivers: the writes that
+// were ready together, plus how far behind them the backlog reaches.
 //
-// That is the signal a consumer needs to treat ResourceVersion as a resume
-// cursor. Delivery is in first-touch order, not version order (a re-written object
-// coalesces into its existing queue position), so the highest version in one batch
-// says nothing about what is still queued below it. Only on a short batch is the
-// highest version seen so far a safe low-water mark.
-const WriteBatchCap = 64
+// OldestPending is the version of the *oldest write still queued* after this batch
+// was taken, or 0 when nothing is queued (versions start at 1, so 0 is unambiguous).
+// It is the bound a consumer reading versions as a resume cursor needs: delivery
+// conflates per object and is in first-touch order, so the newest version in a batch
+// says nothing about what is still queued below it, and only this says where it is
+// safe to resume from.
+type ObjectWriteBatch struct {
+	Writes        []ObjectWrite
+	OldestPending int64
+}
 
 // ObjectWrite is a change stripped to what a consumer that only routes by
 // identity needs: which object changed, and how. The id is the object's, not a
@@ -652,6 +654,8 @@ type Store interface {
 	// ObjectWritesSubscribe returns a subscription to live writes to every kind in
 	// the store — no initial snapshot, no rows, no kind filter. Batches of
 	// identity, for a consumer that routes by id and reads current state itself.
+	//
+	// Each batch carries the backlog bound behind it (see ObjectWriteBatch).
 	//
 	// The int64 is the cursor the stream starts from: every write committed before
 	// the call is at or below it, and every write the stream delivers is above it.

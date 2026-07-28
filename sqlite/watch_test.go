@@ -1118,6 +1118,12 @@ func TestPublishReachesGlobalHub(t *testing.T) {
 // recvBatch waits for the next object-change batch on w, failing on timeout/close.
 func recvBatch(t *testing.T, w *storeapi.ObjectWritesSubscription) []storeapi.ObjectWrite {
 	t.Helper()
+	return recvOrFail(t, w.Changes(), "object-change batch").Writes
+}
+
+// recvWriteBatch is recvBatch with the backlog bound, for tests that assert on it.
+func recvWriteBatch(t *testing.T, w *storeapi.ObjectWritesSubscription) storeapi.ObjectWriteBatch {
+	t.Helper()
 	return recvOrFail(t, w.Changes(), "object-change batch")
 }
 
@@ -1443,4 +1449,92 @@ func TestObjectWritesSubscribeCursorReadFailure(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, w)
 	assert.Zero(t, cursor)
+}
+
+// A batch reports how far the backlog behind it reaches, which is what lets a
+// consumer read these versions as a resume cursor. Delivery conflates per object and
+// is in first-touch order, so the newest version in a batch says nothing about what
+// is still queued below it — only this does.
+//
+// The backlog has to exceed the batch cap for one to exist at all, which is exactly
+// the case that starved a consumer inferring it from batch length instead.
+func TestObjectWritesSubscribeReportsOldestPending(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	const extra = 2
+	var made []*beehive.RawObject
+	for range writeBatchCap + extra {
+		obj, err := store.ObjectsCreate(ctx, newWatchObject())
+		require.NoError(t, err)
+		made = append(made, obj)
+	}
+
+	// The parking write's own batch was taken before the burst existed, so it reports
+	// no backlog: the bound describes what was queued when the batch was assembled,
+	// which is the only reading that is exact.
+	first := recvWriteBatch(t, w)
+	require.Len(t, first.Writes, 1)
+	assert.Zero(t, first.OldestPending)
+
+	// A full batch still reports a bound — the rest of the burst is behind it. This is
+	// the delivery the length-based rule could never commit on.
+	full := recvWriteBatch(t, w)
+	require.Len(t, full.Writes, writeBatchCap)
+	assert.Equal(t, made[writeBatchCap].ResourceVersion, full.OldestPending,
+		"a full batch reports the head of what it left behind")
+
+	// And the tail empties the backlog, reported as no bound at all.
+	tail := recvWriteBatch(t, w)
+	require.Len(t, tail.Writes, extra)
+	assert.Zero(t, tail.OldestPending, "nothing left queued")
+}
+
+// A queued slot reports the version it was *created* at, not the newest merged into
+// it. That is the whole point: the newest version is what a consumer should go read,
+// while the first is how far back the slot reaches, and a cursor may not pass it.
+func TestObjectWritesSubscribeOldestPendingSurvivesCoalescing(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	w := newParkedObjectChangeStream(t, store)
+
+	// Fill the first batch, so the object created next stays queued behind it.
+	for range writeBatchCap {
+		_, err := store.ObjectsCreate(ctx, newWatchObject())
+		require.NoError(t, err)
+	}
+	queued, err := store.ObjectsCreate(ctx, newWatchObject())
+	require.NoError(t, err)
+	// Re-write it repeatedly while it waits: the slot's version climbs, its queue
+	// position and its first-touch version do not.
+	for i := range 5 {
+		_, _, err := store.ObjectsUpdateSpec(ctx, testGK, queued.ID, fmt.Appendf(nil, `{"x":%d}`, i), 0)
+		require.NoError(t, err)
+	}
+
+	require.Len(t, recvWriteBatch(t, w).Writes, 1, "the parking write's own batch")
+	full := recvWriteBatch(t, w)
+	require.Len(t, full.Writes, writeBatchCap)
+	assert.Equal(t, queued.ResourceVersion, full.OldestPending,
+		"the queued slot's first-touch version, unmoved by five merges into it")
+}
+
+// writeSignalMerge keeps the newest rv and the earliest firstRV. Asserted directly,
+// because those pull in opposite directions and a later simplification that made them
+// agree would leave every end-to-end test passing.
+func TestWriteSignalMergeKeepsNewestAndEarliest(t *testing.T) {
+	prev := writeSignal{typ: storeapi.Modified, rv: 10, firstRV: 10}
+	next := writeSignal{typ: storeapi.Modified, rv: 40, firstRV: 40}
+
+	got, keep := writeSignalMerge(prev, next)
+	require.True(t, keep)
+	assert.EqualValues(t, 40, got.rv, "the state to go read is the newest")
+	assert.EqualValues(t, 10, got.firstRV, "how far back the slot reaches is the earliest")
+
+	// Out-of-version-order arrival must not advance firstRV either.
+	got, keep = writeSignalMerge(next, prev)
+	require.True(t, keep)
+	assert.EqualValues(t, 40, got.rv)
+	assert.EqualValues(t, 10, got.firstRV, "the earliest wins whichever order it arrives in")
 }

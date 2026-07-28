@@ -1,10 +1,10 @@
 # Take the waker's watermark from the pending backlog, not from batch length
 
-**Repo: beehive.** Depends on
-[7-conflate-pending-backlog-visibility.md](7-conflate-pending-backlog-visibility.md)
-landing in `github.com/amorey/gobus` first (or on a local fork to prototype against).
+**Repo: beehive.** Depended on `conflate.Receiver.Peek`, which shipped in
+`gobus v0.2.0` (see [9-conflate-peek.md](9-conflate-peek.md); spec 7 was withdrawn).
 
-**Status: proposed.** Closes the one known correctness-adjacent gap left in the watermark
+**Status: IMPLEMENTED.** Kept as the record of the design and the reasoning behind it;
+the ADR carries the shipped version. Closes the one known correctness-adjacent gap left in the watermark
 recovery design recorded in
 [docs/adr/2026-07-27-waker-watermark-replay.md](../docs/adr/2026-07-27-waker-watermark-replay.md).
 Read that ADR before starting; this spec assumes it.
@@ -57,165 +57,63 @@ rejected:
 - *"Commit the high when a full batch is followed by a short one"* is already the behaviour
   — the short batch commits `seen`, which includes the earlier full batch's high. The
   problem is a short batch never arriving.
-- *A time or count bound* cannot be made sound **as things stand**. `writeSignalMerge`
-  keeps only the max version, so an entry's first-touch version is unrecoverable from the
-  delivered value, and a key queued behind it can carry an arbitrarily lower version. No
-  safe fallback is derivable from what the waker sees today — which is why the fix below
-  starts by making that version available rather than by picking a bound.
+- *A time or count bound* cannot be made sound. `writeSignalMerge` keeps the **max**
+  version, so an entry's first-touch version is unrecoverable from the delivered value,
+  and a key queued behind it can carry an arbitrarily lower version. There is no safe
+  fallback derivable from what the waker currently sees.
 
 ## What changes
 
-Take the bound from the backlog itself. Spec 7 adds `Receiver.Peek`, which reports the
-oldest **undelivered** value without consuming it. Track that value's *first-touch*
-version in the signal, and the correct watermark is one below it:
+Take the bound from the backlog itself. Spec 7 adds a receiver accessor,
+`OldestSequence() (int64, bool)`, reporting the sequence stamp of the **oldest undelivered
+value**; the correct watermark is one below it (`oldestPending` below is that stamp):
 
 ```
-watermark = max(watermark, oldestPendingFirstVersion - 1)   // something is pending
-watermark = max(watermark, seen)                            // the receiver is empty
+watermark = min(seen, oldestPending - 1)      // when something is pending (ok == true)
+watermark = seen                              // when the receiver is empty (ok == false)
 ```
 
-Every version below `oldestPendingFirstVersion` belongs to a key that is either not pending
-at all — so every write to it was delivered and processed — or pending in a slot created
-*later* than that write, which means the write went out in an earlier slot that has already
-been popped. The only remaining case is annihilation, a create/delete pair the consumer
-never saw, and a deleted object has no dependents to wake (`edges.to_id` is
-`ON DELETE RESTRICT`, so a depended-upon target cannot be removed). All three are covered.
+**Beehive must configure the receiver with `hub.WithSequence(func(w) int64 { return
+w.resource_version })`.** Spec 7's *default* arrival counter is a per-receiver ordinal, not a
+domain version — it resets when the receiver is recreated, so it is useless as a durable
+watermark across a dropped-and-resubscribed stream. Only the `WithSequence` override makes
+`OldestSequence` return a `resource_version`. The store already publishes under a mutex held
+across commit, which is exactly the *serialized publication* the override requires (spec 7),
+so the monotonicity enforcement never trips.
 
-Note the bound needs **no `min` against `seen`**: holding the cursor back to the highest
-version actually delivered would only lose ground for the annihilation case, which needs no
-wake. `seen` is still required, but only for the empty-receiver case — which is precisely
-today's `commitDrained`.
+Every version below `oldestPending` has either been delivered, or been superseded by a
+later write to the same key — and if that later write is still pending, its version is at
+or above `oldestPending`, so it sits *above* the watermark and a replay picks it up. Both
+cases are covered.
 
-This **generalizes** the existing rule rather than adding a second one beside it: the
+Note this **generalizes** the existing rule rather than adding a second one beside it: the
 empty-receiver case is exactly today's `commitDrained`. Expect the three-way `commitRule`
 (`beehive.go:306-311`) to collapse — the live path stops needing a staged-versus-drained
-distinction. `commitOrdered` (replay pages, which are version-ordered and complete) stays,
-because it commits by a different quantity. Land whatever shape falls out; do not preserve
-the enum for its own sake.
+distinction, and `commitOrdered` (replay pages, which are version-ordered and complete)
+stays because it commits by a different quantity. Land whatever shape falls out; do not
+preserve the enum for its own sake.
 
-### `writeSignal` carries a first-touch version
+### The store has to carry it
 
-`writeSignal` (`sqlite/watch.go`) is `{typ, rv}` and `writeSignalMerge` keeps `max(rv)`.
-Add a `firstRV`, set equal to `rv` at publish, which the merge **preserves from `prev`**
-while continuing to keep the max in `rv`.
+The accessor lives on the receiver, which only the `sqlite` backend holds. So the value
+has to reach the waker alongside each batch — the batch type is `[]ObjectWrite`, so this
+is a signature or wrapper change on `ObjectWritesSubscribe`'s stream. Pick the shape that
+keeps the stream blob-free; that constraint is why `ObjectWrite` exists in its present
+form (see its doc comment in `internal/storeapi/storeapi.go`).
 
-Both are needed, and for opposite reasons:
-
-- `rv` must stay the **latest**, because the delivered `ObjectWrite.ResourceVersion` is
-  what advances `seen`. A merged reference whose version trailed the row would hand a
-  resuming consumer a cursor behind the state it is about to read. Pinned by
-  `TestObjectWritesSubscribeCoalescesRepeatWrites`.
-- `firstRV` must stay the **earliest**, because it is the pending bound. Updating it on
-  coalesce turns it into a latest-touch version and destroys the ordering the whole design
-  rests on.
-
-**Two invariants move into this repo with it**, and both need tests of their own rather
-than being implied by an end-to-end assertion:
-
-1. **`writeSignalMerge` never advances `firstRV`.** Previously the bus would have enforced
-   this; now a later simplification of the merge could quietly break it, and every
-   "the cursor advances" test would still pass.
-2. **The queue front holds the *minimum* `firstRV`.** This is what makes `Peek` sufficient,
-   and it holds only because publication is commit-ordered and `resource_version` is
-   monotonic in commit order — so first-touch order *is* increasing-version order. Beehive
-   guarantees both (`publishMu` in `Within`, and
-   `TestResourceVersionMonotonicInCommitOrder`), which is why the argument belongs here
-   rather than in the bus. Assert the composition, not just the two halves.
-
-### The publish path must stay sequence-ordered
-
-`Peek` reports the *oldest-touched* pending key. That is only the *lowest-versioned* one if
-first touches are published in non-decreasing version order — and conflate is thread-safe
-and accepts out-of-order sends by design, so nothing upstream enforces this.
-
-Out of order it fails silently and permanently. Two writers at versions 100 and 101: if
-101 publishes first, the queue is `[K(first=101), K(first=100)]`, `Peek` reports 101, the
-waker commits 100, and `K`'s change *at* 100 is still queued and unprocessed. A later
-replay from 100 excludes it, and its dependents never wake.
-
-Beehive satisfies this today: `Within` holds `publishMu` across commit-and-publish so
-publication order is commit order, versions are drawn inside the write transaction on a
-single connection so version order is commit order, and within one transaction mutators
-draw then append to the collector in that same order.
-
-**What this makes load-bearing** is that *every* store method emitting an object change
-self-wraps in `Within`. `ObjectsCreate` and `ObjectsDelete` had to be fixed for exactly
-this reason; a new emitting method that publishes inline breaks the watermark with no
-failing test anywhere near it.
-
-So the invariant needs two guards, not one. A test that concurrent direct calls to each
-public emitting mutator produce stream versions in increasing order pins the mutators that
-exist now. The runtime detector below covers the ones that do not yet — which is the half
-that actually protects the next author.
-
-### The waker detects an over-committed watermark
-
-The ordering invariant above has an exact, free detector, and this spec requires it — the
-failure mode is otherwise silent permanent loss, which is the worst possible shape for a
-correctness bug.
-
-> After committing watermark `W`, every subsequently delivered write must have
-> `rv > W`.
-
-That holds by construction when publication is ordered: anything still queued has a
-first-touch version above `W`, so its delivered version is at least that, and a replay
-reads only rows above `W`. So **a delivered write with `rv <= W` is proof the watermark was
-committed above something undelivered.** One comparison per batch entry.
-
-On violation: log at **Error** — this is a broken invariant, not an operational condition
-like a dropped stream — naming the object id, its version and the watermark, then pull the
-watermark back to `rv - 1`. That self-heals the common case, where the late write arrives
-before the stream drops.
-
-Compare each entry against `W` **as it stood when the batch arrived**, not against the value
-the same batch is about to commit; otherwise every batch reports itself.
-
-Three things worth knowing about it:
-
-- **It guards both commit branches.** The empty-receiver rule (`watermark = seen`) is *also*
-  order-dependent: with unordered publication a write committed at 100 could publish after
-  the receiver looked empty at `seen = 101`, and `seen` would skip it. The detector catches
-  that case the same way.
-- **It catches more than a publish-order unit test would.** A test over today's mutators
-  says nothing about a mutator added next year that publishes outside `Within`. This does.
-- **It is a detector, not a guarantee.** In the window where the watermark is over-committed
-  *and* the stream drops before the late write is delivered, the change is still lost. If
-  that residual ever becomes unacceptable, take the first alternative below — it makes the
-  bound correct rather than merely checked.
-
-### The store carries it through
-
-`Peek` lives on the receiver, which only the `sqlite` backend holds, so the bound has to
-reach the waker alongside the batch it describes — beside it in a second channel would
-race. The stream item becomes a struct rather than a bare slice, roughly:
-
-```go
-type ObjectWriteBatch struct {
-	Writes []ObjectWrite
-	// OldestPending is the first-touch version of the oldest write still queued behind
-	// this batch, or 0 when nothing is. resource_version_seq starts at 0 and is
-	// pre-incremented, so no real version is ever 0 and the sentinel is unambiguous.
-	OldestPending int64
-}
-```
-
-Keep it blob-free; that constraint is why `ObjectWrite` exists in its present form (see its
-doc comment in `internal/storeapi/storeapi.go`).
-
-**Peek immediately after the drain, in the same goroutine.** That ordering is what makes
-the answer exact rather than a stale observation: the receiver has a single consumer, and
-the only concurrent mutation is a `Send`, which cannot change the front. Peeking later —
-or from another goroutine — can report a higher bound than was true for the batch, which
-commits a watermark above what was actually delivered.
+Read the accessor **when the batch is assembled**, not when it is consumed: by the time
+the waker processes a batch, the receiver has moved on, and a later read would report a
+higher oldest-pending than was true for that batch — committing a watermark above what was
+actually delivered.
 
 ### `WriteBatchCap` stops being contract
 
 `storeapi.WriteBatchCap` (`internal/storeapi/storeapi.go:133-143`) was exported *only* so
 consumers could infer drained-ness from batch length, and `store.go:77-80` re-exports it
 into the beehive package for that one comparison. Both go back to being an implementation
-detail of the backend's drain loop. Its doc comment states the inference as part of the
-contract; that paragraph is now wrong and must go, along with the ADR's "short batch"
-wording.
+detail of the backend's drain loop. Its doc comment currently states the inference as part
+of the contract; that paragraph is now wrong and must go, along with the ADR's
+"short batch" wording.
 
 ## Acceptance criteria
 
@@ -230,32 +128,17 @@ The starvation case is the point, so test it first and directly:
   drop those objects' dependents are still woken.
 - **A full batch that empties the receiver commits.** The off-by-one: it must behave as a
   short batch does.
-- **`writeSignalMerge` preserves the earliest `firstRV` and the latest `rv`.** A direct
-  unit test on the merge, not an end-to-end one. Both halves: coalescing must not advance
-  `firstRV`, and must not hold `rv` back.
-- **The peek happens after the drain, in the drain's own goroutine.** Advance the receiver
-  between assembly and consumption and assert the committed watermark reflects the state at
-  assembly. This is the ordering mistake that makes the fix silently unsound while every
-  "it advances" test passes.
+- **The oldest-pending value is read as of batch assembly.** Advance the receiver between
+  assembly and consumption and assert the committed watermark reflects the earlier state.
+  This is the ordering mistake that makes the fix silently unsound while every "it
+  advances" test passes.
 - **Replay pages still commit by their own high**, not by `seen` and not by
   oldest-pending. Keep the existing coverage
   (`TestWakerReplayAdvancesByPageNotStagedHigh`) green; the bug it pins is easy to
   reintroduce while reshaping `commitRule`.
-- **Out-of-order publication is caught.** Concurrent direct calls to each public emitting
-  mutator must produce stream versions in increasing order. This is the invariant `Peek`
-  rests on and the one nothing upstream can enforce; without a guard, a future mutator that
-  publishes outside `Within` breaks the watermark silently.
 - **Replay stays bounded after a long busy stream.** With N changes missed and M objects
   in the store, N ≪ M, assert the replay reads ~N rows. This is the property the gap
   broke, so assert it end-to-end rather than trusting the cursor arithmetic.
-
-- **A write delivered at or below the watermark is reported and repairs the cursor.** Drive
-  a delivery below a committed watermark (a fake store can publish out of order directly),
-  and assert an Error is logged and the watermark is pulled back below that write. This is
-  the guard against every future way the ordering invariant could break, so it needs a test
-  of its own rather than being implied by the ordered-publication one.
-- **The detector compares against the pre-batch watermark.** A batch that legitimately
-  advances the cursor must not report itself.
 
 Existing waker tests must stay green — in particular the recovery, low-water-mark and
 backoff tests in `reconciler_test.go`. Any that assert on batch-length semantics are
@@ -267,34 +150,6 @@ The repo requires **100% coverage on library packages** (CI enforces it, measure
 signal, never `time.Sleep`. The waker has seams for its retry pause and its clock
 (`waitRetry`, `now`); set them through the fixture's configure hook **before** `start`,
 since the waker reads them on its own goroutine.
-
-## Alternatives considered: order-independent bounds
-
-Both of these make the bound correct under arbitrary send order, rather than correct-by-
-assumption plus checked. Both were rejected for this change; record them here so the choice
-is visible if the residual above ever matters.
-
-The reason neither is needed today: beehive's send order is not incidentally ordered, it is
-*structurally* ordered. One connection serializes commits, `publishMu` serializes
-publication with them, and versions are drawn inside the transaction. Skew requires someone
-to remove `publishMu` or add an emitting store method that publishes outside `Within` —
-conspicuous edits to the store's core, and the detector above catches both.
-
-**Conflate maintains the minimum by rank.** The receiver takes a rank extractor
-(`Hub.WithSequence(seq func(V) int64)`) and keeps a min-heap keyed by it, so
-`OldestPending` is an O(1) query with O(log n) maintenance on enqueue, pop and annihilate.
-Order-independent by construction, because it computes a real minimum instead of using
-queue position as a proxy for version order. Costs a substantially bigger upstream ask, and
-teaches a deliberately domain-agnostic bus what a rank is. **This is the one to take** if
-the detector's residual becomes unacceptable.
-
-**Beehive shadows the outstanding set.** Needs no conflate change at all: beehive is both
-sender and consumer, so on publish it records `outstanding[id] = rv` and pushes to a
-min-heap, and on delivery drops the entry when the delivered version matches. The heap
-minimum is a true minimum whatever order sends arrive in, and the set is bounded by the
-live key set — the same bound the receiver's own pending map has. Rejected because it
-duplicates conflate's bookkeeping, puts a heap push on the publish path of every write, and
-has to be per-subscription since `writeHub` can serve several receivers.
 
 ## Out of scope
 

@@ -234,7 +234,7 @@ func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storea
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
 func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
-	return deadSubscription[[]storeapi.ObjectWrite](), 0, nil
+	return deadSubscription[storeapi.ObjectWriteBatch](), 0, nil
 }
 func (s *fakeStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
 	panic("not implemented: fakeStore.EventsWatch")
@@ -318,14 +318,22 @@ func (w *fakeObjectStream) push(typ ChangeType, obj *RawObject) {
 // dependency-waker tests. A batch is the push unit deliberately — the waker
 // resolves a whole batch in one query, so a double that could only deliver one
 // write at a time would hide that.
-type fakeWriteStream struct{ fakeStream[[]ObjectWrite] }
+type fakeWriteStream struct{ fakeStream[ObjectWriteBatch] }
 
 func newFakeWriteStream() *fakeWriteStream {
-	return &fakeWriteStream{newFakeStream[[]ObjectWrite]()}
+	return &fakeWriteStream{newFakeStream[ObjectWriteBatch]()}
 }
 
-// push delivers one batch to the waker.
-func (w *fakeWriteStream) push(writes ...ObjectWrite) { w.ch <- writes }
+// push delivers one batch to the waker, reporting no backlog behind it.
+func (w *fakeWriteStream) push(writes ...ObjectWrite) {
+	w.ch <- ObjectWriteBatch{Writes: writes}
+}
+
+// pushBounded delivers one batch that reports oldestPending still queued behind it,
+// which is what bounds how far the waker may advance its cursor.
+func (w *fakeWriteStream) pushBounded(oldestPending int64, writes ...ObjectWrite) {
+	w.ch <- ObjectWriteBatch{Writes: writes, OldestPending: oldestPending}
+}
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.

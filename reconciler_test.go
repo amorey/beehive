@@ -808,10 +808,10 @@ func TestWakeDependentsAdvancesWatermark(t *testing.T) {
 	bh, _, _ := wakerFixture(nil)
 	dw := wakerOf(bh)
 
-	dw.dependentsWake(context.Background(), changedAt(7, 4), commitDrained)
+	dw.dependentsWake(context.Background(), changedAt(7, 4), commitBounded, 0)
 	assert.EqualValues(t, 7, dw.watermark, "the highest version in the batch, not the last")
 
-	dw.dependentsWake(context.Background(), changedAt(11), commitDrained)
+	dw.dependentsWake(context.Background(), changedAt(11), commitBounded, 0)
 	assert.EqualValues(t, 11, dw.watermark)
 }
 
@@ -823,59 +823,86 @@ func TestWakeDependentsAdvancesWatermarkOnNoOpBatch(t *testing.T) {
 	bh, _, _ := wakerFixture(nil)
 	dw := wakerOf(bh)
 
-	dw.dependentsWake(context.Background(), []ObjectWrite{{ID: 1, Type: Deleted, ResourceVersion: 9}}, commitDrained)
+	dw.dependentsWake(context.Background(), []ObjectWrite{{ID: 1, Type: Deleted, ResourceVersion: 9}}, commitBounded, 0)
 
 	assert.EqualValues(t, 9, dw.watermark, "a batch with nothing to wake is still consumed")
 }
 
-// A full batch must not move the cursor. Delivery is in first-touch order, not
-// version order — a re-written object coalesces into the queue position it already
-// held — so an object bumped to a high version can ride in an early batch while
-// lower-versioned objects are still queued behind it. Taking that high version as a
-// resume point steps over them, and if the stream then ends they never wake. Only a
-// short batch, which means the receiver drained, is safe.
-func TestWakeDependentsHoldsWatermarkUntilDrained(t *testing.T) {
+// A batch that reports a backlog behind it must not move the cursor past it, and
+// the batch's *length* has nothing to do with it. Delivery is in first-touch order —
+// a re-written object coalesces into the queue position it already held — so an
+// object bumped to a high version can ride in an early batch while lower-versioned
+// objects are still queued. Taking that high version as a resume point steps over
+// them, and if the stream then ends they never wake.
+//
+// The rule this replaced inferred the backlog from batch length, which starved: a
+// workload keeping more than one batch's worth of objects pending made every batch
+// full, so the cursor never moved at all and the first stream drop replayed
+// essentially the whole table. Length is deliberately not consulted here — the batch
+// below is far larger than any backend's cap and still advances the cursor.
+func TestWakeDependentsBoundedByBacklog(t *testing.T) {
 	bh, _, _ := wakerFixture(nil)
 	dw := wakerOf(bh)
 
-	// A full batch carrying a high version: more may be queued below it.
-	full := make([]ObjectWrite, writeBatchCap)
-	for i := range full {
-		full[i] = ObjectWrite{ID: ObjectID(i + 1), Type: Modified, ResourceVersion: 200}
+	// A big batch, delivered up to version 5000, with version 101 still queued.
+	big := make([]ObjectWrite, 100)
+	for i := range big {
+		big[i] = ObjectWrite{ID: ObjectID(i + 1), Type: Modified, ResourceVersion: int64(4901 + i)}
 	}
-	require.True(t, dw.dependentsWake(context.Background(), full, commitStaged))
-	assert.Zero(t, dw.watermark, "a full batch may have left lower versions queued behind it")
+	require.True(t, dw.dependentsWake(context.Background(), big, commitBounded, 101))
+	assert.EqualValues(t, 100, dw.watermark, "the cursor stops one below the oldest queued write")
+	assert.EqualValues(t, 5000, dw.seen, "what was delivered is still recorded")
 
-	// The drain catches up: now the highest version seen is a safe resume point.
-	require.True(t, dw.dependentsWake(context.Background(), changedAt(65), commitDrained))
-	assert.EqualValues(t, 200, dw.watermark, "a short batch means nothing is left queued")
+	// The backlog drains: now the highest version delivered is a safe resume point.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(5001), commitBounded, 0))
+	assert.EqualValues(t, 5001, dw.watermark, "an empty backlog releases what was staged")
 }
 
-// A replay page must move the cursor by its own high, not by the high-water mark a
-// full live batch staged earlier. Those are different numbers whenever the live
-// stream ran ahead: staging exists precisely because a full batch may carry a
-// version far above changes still queued below it, so committing that staged value
-// on a replay page steps over the range between — the range the staging exists to
-// keep out of the cursor. Every one of those changes is then never replayed, and a
-// settled dependent is invisible to every owed-work listing.
-func TestWakerReplayAdvancesByPageNotStagedHigh(t *testing.T) {
-	store := &replayStore{rows: []ObjectWrite{
-		{ID: 1, Type: Modified, ResourceVersion: 101},
-		{ID: 2, Type: Modified, ResourceVersion: 356},
-	}}
-	bh := &Beehive{store: store, reconcilers: map[GroupKind]*reconciler{}}
+// The cursor keeps advancing as the backlog head moves, which is the whole point:
+// under sustained churn every batch has a backlog behind it, and the old
+// length-based rule committed on none of them.
+func TestWakeDependentsAdvancesAsBacklogHeadMoves(t *testing.T) {
+	bh, _, _ := wakerFixture(nil)
 	dw := wakerOf(bh)
-	dw.watermark = 100
-	dw.seen = 5000 // a full live batch ran ahead and staged this
 
-	require.True(t, dw.replay(context.Background()))
-
-	assert.EqualValues(t, 356, dw.watermark,
-		"the cursor follows the replayed rows, not the staged high")
-	for _, p := range store.pages {
-		assert.LessOrEqual(t, p[0], int64(356),
-			"no page may start above what has actually been replayed")
+	for _, bound := range []int64{101, 356, 900} {
+		require.True(t, dw.dependentsWake(context.Background(), changedAt(bound+50), commitBounded, bound))
+		assert.EqualValues(t, bound-1, dw.watermark)
 	}
+}
+
+// A write delivered at or below the cursor is proof the cursor was advanced past
+// something undelivered, which can only happen if the store published out of version
+// order. Report it and give the ground back: it is the only guard against a future
+// emitting store method that publishes outside Within, which no test over today's
+// mutators can cover.
+func TestWakeDependentsReportsOverCommittedWatermark(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelError)
+	bh, _, _ := wakerFixture(nil)
+	bh.logger = logger
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen = 500, 500
+
+	// A late write from below the cursor: only possible out of version order.
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(120), commitBounded, 0))
+
+	assert.Contains(t, buf.String(), "out of version order")
+	assert.EqualValues(t, 119, dw.watermark, "the cursor gives back the ground it should not have claimed")
+}
+
+// The detector must not fire on a batch that legitimately advances the cursor, or
+// every batch reports itself.
+func TestWakeDependentsDoesNotReportOrdinaryAdvance(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelError)
+	bh, _, _ := wakerFixture(nil)
+	bh.logger = logger
+	dw := wakerOf(bh)
+	dw.watermark, dw.seen = 100, 100
+
+	require.True(t, dw.dependentsWake(context.Background(), changedAt(101, 102), commitBounded, 0))
+
+	assert.Empty(t, buf.String())
+	assert.EqualValues(t, 102, dw.watermark)
 }
 
 // The watermark starts where the stream does. Subscribing reports that cursor, so
@@ -922,7 +949,7 @@ func TestWakeDependentsHoldsWatermarkOnLookupFailure(t *testing.T) {
 	dw := wakerOf(bh)
 	dw.watermark = 5
 
-	ok := dw.dependentsWake(context.Background(), changedAt(100), commitDrained)
+	ok := dw.dependentsWake(context.Background(), changedAt(100), commitBounded, 0)
 
 	assert.False(t, ok, "the batch was not processed")
 	assert.EqualValues(t, 5, dw.watermark, "an unprocessed batch does not move the cursor")
@@ -1181,6 +1208,32 @@ func TestWakerSeedsAfterInitialSubscribeFailureAndSaysSo(t *testing.T) {
 	assert.Contains(t, buf.String(), "not replayed", "the skip is reported, not silent")
 }
 
+// End to end on the live path: a stream delivering nothing but batches with a
+// backlog behind them still advances the cursor, so a later replay is bounded by what
+// was missed rather than by the size of the store.
+//
+// This is the starvation case. The rule this replaced only committed on a batch
+// shorter than the backend's cap, so a workload keeping more than a batch's worth of
+// objects pending pinned the cursor at the subscribe cursor for the life of the
+// stream — and the first stream drop replayed essentially the whole table.
+func TestWakerAdvancesCursorOnBackloggedStream(t *testing.T) {
+	store, _, drain := recoveringFixture(t, 0)
+	defer drain()
+	dw := wakerOf(store.bh)
+
+	live := store.nextStream(t)
+	// Each batch reports a backlog behind it — never an empty one, which is what the
+	// old rule needed to commit at all.
+	for _, bound := range []int64{101, 356, 900} {
+		live.pushBounded(bound, ObjectWrite{ID: 7, Type: Modified, ResourceVersion: bound + 50})
+		store.woke.wait(t, "the dependents lookup for a backlogged batch")
+		store.woke = newSignal() // rearm for the next round
+	}
+	drain()
+
+	assert.EqualValues(t, 899, dw.watermark, "the cursor tracked the backlog head, not the batch length")
+}
+
 // The other loss point, on the same recovery path: a closed stream used to end the
 // waker for the life of the process, repaired only by escalating every later
 // catchup tick. Now it resubscribes and replays from its watermark, so a settled
@@ -1351,7 +1404,7 @@ func TestWakeDependentsSkipsSelfEdge(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 1, Kind: "Widget"}}}, gk)
 
-	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 
 	assert.Empty(t, rs[gk].work.items, "a self-edge must not re-enqueue its own object")
 }
@@ -1373,7 +1426,7 @@ func TestWakeDependentsSkipsSelfEdgeOnly(t *testing.T) {
 	}
 	bh, _, rs := wakerFixture(map[ObjectID][]ObjectRef{1: deps}, widget, gadget)
 
-	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 
 	assert.Equal(t, []ObjectID{2}, rs[widget].work.items, "a dependent behind the self-edge must still wake")
 	assert.Equal(t, []ObjectID{3}, rs[gadget].work.items, "a dependent on another kind wakes on its own reconciler")
@@ -1394,11 +1447,11 @@ func TestWakeDependentsTwoCycle(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
 	bhA, _, rsA := wakerFixture(map[ObjectID][]ObjectRef{1: {{ID: 2, Kind: "Widget"}}}, gk)
-	wakerOf(bhA).dependentsWake(context.Background(), changed(1), commitDrained)
+	wakerOf(bhA).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 	assert.Equal(t, []ObjectID{2}, rsA[gk].work.items, "a change to A wakes its dependent B")
 
 	bhB, _, rsB := wakerFixture(map[ObjectID][]ObjectRef{2: {{ID: 1, Kind: "Widget"}}}, gk)
-	wakerOf(bhB).dependentsWake(context.Background(), changed(2), commitDrained)
+	wakerOf(bhB).dependentsWake(context.Background(), changed(2), commitBounded, 0)
 	assert.Equal(t, []ObjectID{1}, rsB[gk].work.items, "and B's own write wakes A straight back")
 }
 
@@ -1463,7 +1516,7 @@ func (*errDepsStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relatio
 // from the watermark, which the caller holds.
 func TestWakeDependentsListError(t *testing.T) {
 	bh := &Beehive{store: &errDepsStore{}}
-	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 }
 
 // TestDependencyWakerStreamEnd verifies the waker exits when its watch stream
@@ -3399,7 +3452,7 @@ func TestWakeDependentsListErrorLogs(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &errDepsStore{}, logger: logger}
 
-	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1), commitBounded, 0)
 
 	assert.Contains(t, buf.String(), "dependents lookup failed",
 		"a dropped wake must not be silent")
@@ -3421,7 +3474,7 @@ func TestWakeDependentsCancelledDoesNotLog(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	wakerOf(bh).dependentsWake(ctx, changed(1), commitDrained)
+	wakerOf(bh).dependentsWake(ctx, changed(1), commitBounded, 0)
 
 	assert.Empty(t, buf.String(), "a clean shutdown is not a dropped wake")
 }
@@ -3519,7 +3572,7 @@ func TestWakeDependentsBatchOneQuery(t *testing.T) {
 		3: {{ID: 30, Kind: "Widget"}},
 	}, gk)
 
-	wakerOf(bh).dependentsWake(context.Background(), changed(1, 2, 3), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1, 2, 3), commitBounded, 0)
 
 	assert.Equal(t, int64(1), store.calls.Load(), "one query for the whole batch")
 	assert.Equal(t, []ObjectID{10, 20, 30}, rs[gk].work.items)
@@ -3535,7 +3588,7 @@ func TestWakeDependentsBatchDedups(t *testing.T) {
 		1: {{ID: 10, Kind: "Widget"}},
 	}, gk)
 
-	wakerOf(bh).dependentsWake(context.Background(), changed(1, 1, 1), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1, 1, 1), commitBounded, 0)
 
 	require.Len(t, store.seen, 1)
 	assert.Equal(t, []ObjectID{1}, store.seen[0], "the repeated target is asked about once")
@@ -3553,7 +3606,7 @@ func TestWakeDependentsBatchSkipsSelfEdgePerTarget(t *testing.T) {
 		2: {{ID: 2, Kind: "Widget"}},
 	}, gk)
 
-	wakerOf(bh).dependentsWake(context.Background(), changed(1, 2), commitDrained)
+	wakerOf(bh).dependentsWake(context.Background(), changed(1, 2), commitBounded, 0)
 
 	assert.Equal(t, []ObjectID{2}, rs[gk].work.items, "woken for 1's change, skipped for its own")
 }

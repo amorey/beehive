@@ -124,6 +124,14 @@ func changeMerge(prev, next storeapi.RawObjectChange) (storeapi.RawObjectChange,
 type writeSignal struct {
 	typ storeapi.ChangeType
 	rv  int64
+
+	// firstRV is the version of the write that *created* this slot, where rv is the
+	// newest one merged into it. A consumer reading the stream as a cursor needs a
+	// version below which nothing is still queued, and delivery is in first-touch
+	// order — so the head of the backlog holds the earliest-touched key, and its
+	// firstRV is the lowest version still pending. Merge must never advance it; see
+	// writeSignalMerge.
+	firstRV int64
 }
 
 // writeSignalMerge is changeMerge plus annihilation, over the projected value. The
@@ -139,6 +147,12 @@ func writeSignalMerge(prev, next writeSignal) (writeSignal, bool) {
 	if prev.rv > next.rv {
 		hi = prev
 	}
+	// The slot keeps the newest rv but the *earliest* firstRV: rv is what a consumer
+	// reads as "the state to go look at", while firstRV is how far back the slot
+	// reaches. prev is already in the slot, so prev.firstRV is the first touch; the
+	// min is belt-and-braces for a publisher that sends out of version order, where
+	// this would otherwise advance.
+	hi.firstRV = min(prev.firstRV, next.firstRV)
 	if hi.typ == storeapi.Deleted {
 		return hi, true
 	}
@@ -270,7 +284,10 @@ func (s *sqliteStore) changePublish(gk storeapi.GroupKind, ev storeapi.RawObject
 		_ = h.Sender().Send(ev.Object.ID, ev)
 	}
 	// The store-wide hub carries the projection, not the row: see writeSignal.
-	_ = s.writeHub.Sender().Send(ev.Object.ID, writeSignal{typ: ev.Type, rv: ev.Object.ResourceVersion})
+	// firstRV starts equal to rv: Merge is never called on a first touch, so the
+	// value stored verbatim here is what establishes the field for the slot's life.
+	rv := ev.Object.ResourceVersion
+	_ = s.writeHub.Sender().Send(ev.Object.ID, writeSignal{typ: ev.Type, rv: rv, firstRV: rv})
 }
 
 // eventEmit delivers a written run to event-log watchers: queued on the tx
@@ -372,10 +389,10 @@ func (s *sqliteStore) ObjectsWatchList(ctx context.Context, gk storeapi.GroupKin
 // pending set, which conflates per object and so is bounded by the store's live
 // key set either way.
 //
-// Shared with consumers through storeapi, because a batch shorter than the cap is
-// how they learn the drain ended on an empty receiver rather than on this bound —
-// see storeapi.WriteBatchCap.
-const writeBatchCap = storeapi.WriteBatchCap
+// A backend detail, not part of the contract: a consumer learns how far the backlog
+// reaches from ObjectWriteBatch.OldestPending, not by comparing a batch's length
+// against this.
+const writeBatchCap = 64
 
 // ObjectWritesSubscribe streams every kind's live changes as blob-free references. It
 // takes no snapshot, so the dedup floor is 0 — a fresh receiver starts at the
@@ -403,7 +420,7 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
-	w := newStream[[]storeapi.ObjectWrite](cancel)
+	w := newStream[storeapi.ObjectWriteBatch](cancel)
 	go func() {
 		// Registered first so it runs last (after out is closed), letting tests
 		// await exit without reading out.
@@ -430,10 +447,25 @@ func (s *sqliteStore) ObjectWritesSubscribe(ctx context.Context) (*storeapi.Obje
 				}
 				batch = append(batch, storeapi.ObjectWrite{ID: next.Key, Type: next.Value.typ, ResourceVersion: next.Value.rv})
 			}
+			// Ask what is left behind this batch, here and on this goroutine. The
+			// receiver has a single consumer, and a concurrent Send either coalesces in
+			// place or appends at the back — neither can move the head — so this answer
+			// is exact for this batch. Reading it later, or from elsewhere, could report
+			// a head further along and hand the consumer a bound above what it was
+			// actually given.
+			//
+			// ErrClosed is deliberately not folded into "nothing pending": Hub.Close and
+			// Receiver.Close abandon whatever is still queued, so a closed handle says
+			// nothing about the backlog. 0 means "no bound known" and a consumer holding
+			// its cursor there is always sound.
+			var oldestPending int64
+			if head, err := rx.Peek(); err == nil {
+				oldestPending = head.Value.firstRV
+			}
 			if s.beforeLiveSend != nil {
 				s.beforeLiveSend() // test seam: act while the goroutine is provably about to park
 			}
-			if !w.send(wctx, s.done, batch) {
+			if !w.send(wctx, s.done, storeapi.ObjectWriteBatch{Writes: batch, OldestPending: oldestPending}) {
 				return
 			}
 		}
