@@ -70,14 +70,21 @@ oldest **undelivered** value without consuming it. Track that value's *first-tou
 version in the signal, and the correct watermark is one below it:
 
 ```
-watermark = min(seen, oldestPendingFirstVersion - 1)   // something is pending
-watermark = seen                                       // the receiver is empty
+watermark = max(watermark, oldestPendingFirstVersion - 1)   // something is pending
+watermark = max(watermark, seen)                            // the receiver is empty
 ```
 
-Every version below `oldestPendingFirstVersion` has either been delivered, or been
-superseded by a later write to the same key — and if that later write is still pending, its
-first-touch version is at or above the bound, so it sits *above* the watermark and a replay
-picks it up. Both cases are covered.
+Every version below `oldestPendingFirstVersion` belongs to a key that is either not pending
+at all — so every write to it was delivered and processed — or pending in a slot created
+*later* than that write, which means the write went out in an earlier slot that has already
+been popped. The only remaining case is annihilation, a create/delete pair the consumer
+never saw, and a deleted object has no dependents to wake (`edges.to_id` is
+`ON DELETE RESTRICT`, so a depended-upon target cannot be removed). All three are covered.
+
+Note the bound needs **no `min` against `seen`**: holding the cursor back to the highest
+version actually delivered would only lose ground for the annihilation case, which needs no
+wake. `seen` is still required, but only for the empty-receiver case — which is precisely
+today's `commitDrained`.
 
 This **generalizes** the existing rule rather than adding a second one beside it: the
 empty-receiver case is exactly today's `commitDrained`. Expect the three-way `commitRule`
@@ -115,13 +122,47 @@ than being implied by an end-to-end assertion:
    `TestResourceVersionMonotonicInCommitOrder`), which is why the argument belongs here
    rather than in the bus. Assert the composition, not just the two halves.
 
+### The publish path must stay sequence-ordered
+
+`Peek` reports the *oldest-touched* pending key. That is only the *lowest-versioned* one if
+first touches are published in non-decreasing version order — and conflate is thread-safe
+and accepts out-of-order sends by design, so nothing upstream enforces this.
+
+Out of order it fails silently and permanently. Two writers at versions 100 and 101: if
+101 publishes first, the queue is `[K(first=101), K(first=100)]`, `Peek` reports 101, the
+waker commits 100, and `K`'s change *at* 100 is still queued and unprocessed. A later
+replay from 100 excludes it, and its dependents never wake.
+
+Beehive satisfies this today: `Within` holds `publishMu` across commit-and-publish so
+publication order is commit order, versions are drawn inside the write transaction on a
+single connection so version order is commit order, and within one transaction mutators
+draw then append to the collector in that same order.
+
+**What this makes load-bearing** is that *every* store method emitting an object change
+self-wraps in `Within`. `ObjectsCreate` and `ObjectsDelete` had to be fixed for exactly
+this reason; a new emitting method that publishes inline breaks the watermark with no
+failing test anywhere near it. Add a guard the next author will trip over — the cheapest is
+a test asserting that concurrent direct calls to each public emitting mutator produce
+stream versions in increasing order.
+
 ### The store carries it through
 
-`Peek` lives on the receiver, which only the `sqlite` backend holds, so the value has to
-reach the waker alongside each batch. The batch type is `[]ObjectWrite`, so this is a
-signature or wrapper change on `ObjectWritesSubscribe`'s stream. Pick the shape that keeps
-the stream blob-free; that constraint is why `ObjectWrite` exists in its present form (see
-its doc comment in `internal/storeapi/storeapi.go`).
+`Peek` lives on the receiver, which only the `sqlite` backend holds, so the bound has to
+reach the waker alongside the batch it describes — beside it in a second channel would
+race. The stream item becomes a struct rather than a bare slice, roughly:
+
+```go
+type ObjectWriteBatch struct {
+	Writes []ObjectWrite
+	// OldestPending is the first-touch version of the oldest write still queued behind
+	// this batch, or 0 when nothing is. resource_version_seq starts at 0 and is
+	// pre-incremented, so no real version is ever 0 and the sentinel is unambiguous.
+	OldestPending int64
+}
+```
+
+Keep it blob-free; that constraint is why `ObjectWrite` exists in its present form (see its
+doc comment in `internal/storeapi/storeapi.go`).
 
 **Peek immediately after the drain, in the same goroutine.** That ordering is what makes
 the answer exact rather than a stale observation: the receiver has a single consumer, and
@@ -162,6 +203,10 @@ The starvation case is the point, so test it first and directly:
   oldest-pending. Keep the existing coverage
   (`TestWakerReplayAdvancesByPageNotStagedHigh`) green; the bug it pins is easy to
   reintroduce while reshaping `commitRule`.
+- **Out-of-order publication is caught.** Concurrent direct calls to each public emitting
+  mutator must produce stream versions in increasing order. This is the invariant `Peek`
+  rests on and the one nothing upstream can enforce; without a guard, a future mutator that
+  publishes outside `Within` breaks the watermark silently.
 - **Replay stays bounded after a long busy stream.** With N changes missed and M objects
   in the store, N ≪ M, assert the replay reads ~N rows. This is the property the gap
   broke, so assert it end-to-end rather than trusting the cursor arithmetic.

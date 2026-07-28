@@ -51,13 +51,31 @@ One method:
 func (rx *Receiver[K, V]) Peek() (gobus.Event[K, V], bool)
 ```
 
-Read `order.Front()`, look up `pending[k]`, return, under `s.mu`. No new state, no new
-option, no new obligation on the caller.
+Read `order.Front()`, look up `pending[k]`, return, under `s.mu`. No new state and no new
+option.
 
 **It replaces an `Empty()` accessor rather than needing one beside it:** `ok == false` is
 exactly "nothing pending right now". Note this is *not* the same question as the existing
 unexported `drainedLocked`, which folds in `txClosed` — that means "this stream is over",
 not "the queue is empty".
+
+### What a caller reading it as a cursor must guarantee
+
+Conflate itself needs no new invariant — `Peek` is just a read. But a caller using it as a
+**low-water mark** does, and it is worth a paragraph in the doc comment because nothing in
+the package can enforce it and a violation is silent.
+
+The queue is in first-touch order, so the front holds the *oldest-touched* key. For that to
+also be the key with the **lowest** sequence, first-touch `Send`s must arrive in
+non-decreasing sequence order. Coalescing `Send`s are unconstrained — they leave queue
+position alone.
+
+Out-of-order first touches break it outright. With two senders at sequences 100 and 101,
+if 101's `Send` lands first the queue is `[K(first=101), K(first=100)]`, the front reports
+101, and a caller concluding "everything below 101 is delivered" is wrong about a value
+still sitting in the queue. Conflate is thread-safe and accepts out-of-order `Send`s by
+design, so this is a constraint on the *caller's publish path*, not a bug in the bus:
+either publish under a lock that orders sends by sequence, or do not use `Peek` this way.
 
 ### The property worth documenting
 
@@ -84,6 +102,12 @@ and a documented ordering obligation on the sender.
 its own `Merge`** — preserving the earlier value's first-touch field while coalescing
 whatever else it likes — and reads it off the peeked value. All the domain knowledge stays
 with the domain.
+
+Note what this does *not* do: the ordering obligation above does not disappear with the
+rank API, it moves to the caller, where it is unenforceable but also where the guarantee
+actually lives. That is the right trade — beehive publishes under a mutex held across
+commit precisely so its sends are sequence-ordered — but it should not be sold as
+obligation-free.
 
 ## Acceptance criteria
 
