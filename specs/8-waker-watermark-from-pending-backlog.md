@@ -141,9 +141,47 @@ draw then append to the collector in that same order.
 **What this makes load-bearing** is that *every* store method emitting an object change
 self-wraps in `Within`. `ObjectsCreate` and `ObjectsDelete` had to be fixed for exactly
 this reason; a new emitting method that publishes inline breaks the watermark with no
-failing test anywhere near it. Add a guard the next author will trip over — the cheapest is
-a test asserting that concurrent direct calls to each public emitting mutator produce
-stream versions in increasing order.
+failing test anywhere near it.
+
+So the invariant needs two guards, not one. A test that concurrent direct calls to each
+public emitting mutator produce stream versions in increasing order pins the mutators that
+exist now. The runtime detector below covers the ones that do not yet — which is the half
+that actually protects the next author.
+
+### The waker detects an over-committed watermark
+
+The ordering invariant above has an exact, free detector, and this spec requires it — the
+failure mode is otherwise silent permanent loss, which is the worst possible shape for a
+correctness bug.
+
+> After committing watermark `W`, every subsequently delivered write must have
+> `rv > W`.
+
+That holds by construction when publication is ordered: anything still queued has a
+first-touch version above `W`, so its delivered version is at least that, and a replay
+reads only rows above `W`. So **a delivered write with `rv <= W` is proof the watermark was
+committed above something undelivered.** One comparison per batch entry.
+
+On violation: log at **Error** — this is a broken invariant, not an operational condition
+like a dropped stream — naming the object id, its version and the watermark, then pull the
+watermark back to `rv - 1`. That self-heals the common case, where the late write arrives
+before the stream drops.
+
+Compare each entry against `W` **as it stood when the batch arrived**, not against the value
+the same batch is about to commit; otherwise every batch reports itself.
+
+Three things worth knowing about it:
+
+- **It guards both commit branches.** The empty-receiver rule (`watermark = seen`) is *also*
+  order-dependent: with unordered publication a write committed at 100 could publish after
+  the receiver looked empty at `seen = 101`, and `seen` would skip it. The detector catches
+  that case the same way.
+- **It catches more than a publish-order unit test would.** A test over today's mutators
+  says nothing about a mutator added next year that publishes outside `Within`. This does.
+- **It is a detector, not a guarantee.** In the window where the watermark is over-committed
+  *and* the stream drops before the late write is delivered, the change is still lost. If
+  that residual ever becomes unacceptable, take the first alternative below — it makes the
+  bound correct rather than merely checked.
 
 ### The store carries it through
 
@@ -211,6 +249,14 @@ The starvation case is the point, so test it first and directly:
   in the store, N ≪ M, assert the replay reads ~N rows. This is the property the gap
   broke, so assert it end-to-end rather than trusting the cursor arithmetic.
 
+- **A write delivered at or below the watermark is reported and repairs the cursor.** Drive
+  a delivery below a committed watermark (a fake store can publish out of order directly),
+  and assert an Error is logged and the watermark is pulled back below that write. This is
+  the guard against every future way the ordering invariant could break, so it needs a test
+  of its own rather than being implied by the ordered-publication one.
+- **The detector compares against the pre-batch watermark.** A batch that legitimately
+  advances the cursor must not report itself.
+
 Existing waker tests must stay green — in particular the recovery, low-water-mark and
 backoff tests in `reconciler_test.go`. Any that assert on batch-length semantics are
 testing the mechanism being removed and should be rewritten against the new signal, not
@@ -221,6 +267,34 @@ The repo requires **100% coverage on library packages** (CI enforces it, measure
 signal, never `time.Sleep`. The waker has seams for its retry pause and its clock
 (`waitRetry`, `now`); set them through the fixture's configure hook **before** `start`,
 since the waker reads them on its own goroutine.
+
+## Alternatives considered: order-independent bounds
+
+Both of these make the bound correct under arbitrary send order, rather than correct-by-
+assumption plus checked. Both were rejected for this change; record them here so the choice
+is visible if the residual above ever matters.
+
+The reason neither is needed today: beehive's send order is not incidentally ordered, it is
+*structurally* ordered. One connection serializes commits, `publishMu` serializes
+publication with them, and versions are drawn inside the transaction. Skew requires someone
+to remove `publishMu` or add an emitting store method that publishes outside `Within` —
+conspicuous edits to the store's core, and the detector above catches both.
+
+**Conflate maintains the minimum by rank.** The receiver takes a rank extractor
+(`Hub.WithSequence(seq func(V) int64)`) and keeps a min-heap keyed by it, so
+`OldestPending` is an O(1) query with O(log n) maintenance on enqueue, pop and annihilate.
+Order-independent by construction, because it computes a real minimum instead of using
+queue position as a proxy for version order. Costs a substantially bigger upstream ask, and
+teaches a deliberately domain-agnostic bus what a rank is. **This is the one to take** if
+the detector's residual becomes unacceptable.
+
+**Beehive shadows the outstanding set.** Needs no conflate change at all: beehive is both
+sender and consumer, so on publish it records `outstanding[id] = rv` and pushes to a
+min-heap, and on delivery drops the entry when the delivered version matches. The heap
+minimum is a true minimum whatever order sends arrive in, and the set is bounded by the
+live key set — the same bound the receiver's own pending map has. Rejected because it
+duplicates conflate's bookkeeping, puts a heap push on the publish path of every write, and
+has to be per-subscription since `writeHub` can serve several receivers.
 
 ## Out of scope
 
