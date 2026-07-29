@@ -47,8 +47,11 @@ var ErrNotFound = errors.New("beehive: object not found")
 // hides it as ErrNotFound, a controller reports it.
 var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 
-// ErrConcurrentNestedTx is returned by a nested Within entered from a goroutine
-// other than the one that owns the enclosing frame. A nested Within is a rollback
+// ErrConcurrentNestedTx reports that a transaction ctx was used from more than one
+// goroutine. It is returned by a nested Within entered from a goroutine other than the
+// one that owns the enclosing frame, and by the outermost Within when it is asked to
+// commit while a nested frame is still open — which is the same fault seen from the
+// other end, and the one place it can be caught for certain. A nested Within is a rollback
 // boundary, and boundaries on one transaction form a stack: two goroutines pushing
 // concurrently can interleave so that one unwind discards work the other already
 // committed to its parent. Backends that implement the boundary with savepoints must
@@ -293,6 +296,12 @@ type Store interface {
 	// frame is open may simply be discarded by that frame's unwind. Do not share a
 	// transaction ctx across goroutines; the refusal is a tripwire on the common case,
 	// not a lock.
+	//
+	// The commit is the exception, and there the check is exact: a backend must refuse
+	// to commit while any nested frame is still open. Nested frames unwind before fn
+	// returns on a single goroutine, so a live one at that moment can only belong to
+	// another, and committing would release its savepoint — landing writes it may be
+	// about to roll back, with no way left to undo them.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has

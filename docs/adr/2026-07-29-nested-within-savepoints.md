@@ -76,12 +76,20 @@ Seven things make it correct rather than merely plausible:
   `ControllerClient.Within` around a `Client.Create` around `ObjectsCreate`'s
   self-wrap is three frames in production.
 
-  The check is a tripwire, not a lock. It sees nested `Within`s; a store call that
-  joins the transaction *without* opening a frame — the mutators that do not
+  The entry check is a tripwire, not a lock. It sees nested `Within`s; a store call
+  that joins the transaction *without* opening a frame — the mutators that do not
   self-wrap, reaching the tx through `conn` — is invisible to it, and a write issued
   that way from a second goroutine can be discarded by an open sibling frame's unwind.
+  It is also blind to a frame entered while the stack happened to be empty, which
+  passes `depth == height` legitimately and only becomes a fault by outliving `fn`.
   The contract states the real rule, which the tripwire only samples: a transaction
   ctx belongs to one goroutine.
+
+  **The commit is where that rule is enforced exactly.** Frames unwind in a `defer`,
+  so on one goroutine the stack is empty by the time `fn` returns; a frame still open
+  at the commit can only belong to another goroutine. Committing then would release
+  its savepoint and land writes it may be about to roll back, with nothing left that
+  could undo them — so the outermost `Within` refuses, with the same error.
 
 - **An abandoned frame poisons.** A panic unwinding through a nested frame skips its
   `RELEASE` and leaves the savepoint open. The outermost deferred `tx.Rollback` covers

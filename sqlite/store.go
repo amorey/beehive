@@ -180,6 +180,16 @@ func (st *txState) pushSavepoint(depth int) (name int64, err error) {
 	return st.savepoints, nil
 }
 
+// openFrames reports how many nested frames are still in flight. Every nested frame
+// pops in a defer, so on a single goroutine this is zero by the time fn returns —
+// which makes a nonzero value at the outermost commit proof that the transaction ctx
+// was shared, and the one place that misuse can still be caught for certain.
+func (st *txState) openFrames() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.height
+}
+
 // popSavepoint restores the stack height. It runs on every exit path from an admitted
 // frame, including one whose SAVEPOINT failed: leaving the height raised would give
 // every later sibling on this transaction a spurious ErrConcurrentNestedTx.
@@ -435,6 +445,14 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	// actually discards it.
 	if err := st.poisonErr(); err != nil {
 		return err
+	}
+	// Nor is it enough that *this* goroutine is done. A frame still open belongs to
+	// another one, and COMMIT releases every open savepoint — so committing here would
+	// land that frame's writes and leave it holding an error it can no longer act on.
+	// The depth check cannot see this case: a frame entered while the stack happened
+	// to be empty passes it legitimately, and only outliving fn makes it a fault.
+	if st.openFrames() != 0 {
+		return storeapi.ErrConcurrentNestedTx
 	}
 	if err := tx.Commit(); err != nil {
 		return err

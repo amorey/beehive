@@ -2282,6 +2282,51 @@ func TestAfterCommitOnAnUnwoundFrameIsDiscarded(t *testing.T) {
 	assert.False(t, committed(t, store, "unwound"))
 }
 
+// TestWithinRefusesToCommitWhileANestedFrameIsOpen closes the gap the depth check
+// alone leaves. A goroutine entering a nested Within while no frame happens to be
+// open passes the depth==height test legitimately; if the outer fn then returns
+// before that frame finishes, COMMIT releases its still-open savepoint and lands
+// writes the frame may be about to roll back — and by then nothing can undo them.
+//
+// Every nested frame pops in a defer, so on one goroutine height is always 0 by the
+// time fn returns. A nonzero height at the commit is therefore proof the ctx was
+// shared, which makes it a sound thing to refuse on.
+func TestWithinRefusesToCommitWhileANestedFrameIsOpen(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		go func() {
+			defer close(done)
+			// Errors here are the point of the test, not a failure of it: this frame
+			// outlives its transaction. require would also be illegal off the test
+			// goroutine.
+			_ = store.Within(txCtx, func(nested context.Context) error {
+				_, _ = store.ObjectsCreate(nested, &beehive.RawObject{
+					Group: testGK.Group, Kind: testGK.Kind, Slug: new("orphan"),
+					Spec: []byte(`{}`),
+				})
+				close(entered)
+				<-release
+				return errors.New("too late to matter")
+			})
+		}()
+		<-entered
+		return nil // returns while the child's frame is still open
+	})
+
+	close(release)
+	<-done
+
+	require.ErrorIs(t, err, beehive.ErrConcurrentNestedTx,
+		"committing under an open frame must be refused")
+	assert.False(t, committed(t, store, "orphan"), "and the orphaned frame's write must not land")
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
