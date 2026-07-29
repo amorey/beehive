@@ -91,6 +91,15 @@ Seven things make it correct rather than merely plausible:
   its savepoint and land writes it may be about to roll back, with nothing left that
   could undo them — so the outermost `Within` refuses, with the same error.
 
+  Asking and committing must be one step. A check that reads the height and then
+  releases the lock leaves a gap a frame can be admitted into, and that frame is worse
+  off than the one just refused: its savepoint is released by a commit it never saw.
+  So `sealForCommit` tests the height and shuts the door in the same critical section
+  that admits frames, and `pushSavepoint` refuses once sealed. The seal is separate
+  from `closed` on purpose — between sealing and draining, the transaction is still
+  heading for a successful commit, so a hook arriving there must queue and run rather
+  than be read as belonging to a finished transaction.
+
 - **An abandoned frame poisons.** A panic unwinding through a nested frame skips its
   `RELEASE` and leaves the savepoint open. The outermost deferred `tx.Rollback` covers
   that only while the panic keeps escaping — a caller that recovers inside its own

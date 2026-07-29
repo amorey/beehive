@@ -104,6 +104,12 @@ type txState struct {
 	// "over and durable" are different questions and the pair is not redundant.
 	committed bool
 
+	// sealed latches just before the commit, and is what pushSavepoint refuses on. It
+	// is deliberately not closed: between the seal and the drain the transaction is
+	// still heading for a successful commit, so a hook arriving in that window must
+	// queue and run, not be treated as belonging to a finished transaction.
+	sealed bool
+
 	// dead is the id ranges of frames that unwound. Dropping a frame's queued hooks is
 	// not enough on its own, because its ctx can outlive it: a registration arriving
 	// afterwards would be queued fresh and ride the outer commit, firing for writes
@@ -172,7 +178,7 @@ func (st *txState) pushSavepoint(depth int) (name int64, err error) {
 	if st.poisoned != nil {
 		return 0, st.poisoned
 	}
-	if depth != st.height {
+	if st.sealed || depth != st.height {
 		return 0, storeapi.ErrConcurrentNestedTx
 	}
 	st.height++
@@ -180,14 +186,25 @@ func (st *txState) pushSavepoint(depth int) (name int64, err error) {
 	return st.savepoints, nil
 }
 
-// openFrames reports how many nested frames are still in flight. Every nested frame
-// pops in a defer, so on a single goroutine this is zero by the time fn returns —
-// which makes a nonzero value at the outermost commit proof that the transaction ctx
-// was shared, and the one place that misuse can still be caught for certain.
-func (st *txState) openFrames() int {
+// sealForCommit closes the transaction to new frames and reports whether committing
+// is safe. It answers both questions under the same lock that admits frames, so
+// nothing can be admitted between the check and the commit — a frame slipping into
+// that gap would have its savepoint released by the commit and its writes persisted
+// with no way left to unwind them.
+//
+// Every nested frame pops in a defer, so on a single goroutine the stack is empty by
+// the time fn returns; a live frame here can only belong to another goroutine.
+func (st *txState) sealForCommit() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.height
+	if st.poisoned != nil {
+		return st.poisoned
+	}
+	if st.height != 0 {
+		return storeapi.ErrConcurrentNestedTx
+	}
+	st.sealed = true
+	return nil
 }
 
 // popSavepoint restores the stack height. It runs on every exit path from an admitted
@@ -440,19 +457,17 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	if err := fn(ctx); err != nil {
 		return err // hooks discarded, nothing ran
 	}
-	// A failed unwind somewhere inside leaves state we cannot reason about, so a
-	// clean return from fn is not enough to commit on. The deferred Rollback is what
-	// actually discards it.
-	if err := st.poisonErr(); err != nil {
+	// A clean return from fn is not enough to commit on. A failed unwind inside leaves
+	// state we cannot reason about, and a frame still open belongs to another
+	// goroutine — COMMIT releases every open savepoint, so committing would land that
+	// frame's writes and leave it holding an error it can no longer act on. The depth
+	// check cannot see the latter: a frame entered while the stack happened to be
+	// empty passes it legitimately, and only outliving fn makes it a fault.
+	//
+	// Both are asked, and the door is shut on new frames, in one critical section. The
+	// deferred Rollback is what actually discards the transaction on either answer.
+	if err := st.sealForCommit(); err != nil {
 		return err
-	}
-	// Nor is it enough that *this* goroutine is done. A frame still open belongs to
-	// another one, and COMMIT releases every open savepoint — so committing here would
-	// land that frame's writes and leave it holding an error it can no longer act on.
-	// The depth check cannot see this case: a frame entered while the stack happened
-	// to be empty passes it legitimately, and only outliving fn makes it a fault.
-	if st.openFrames() != 0 {
-		return storeapi.ErrConcurrentNestedTx
 	}
 	if err := tx.Commit(); err != nil {
 		return err

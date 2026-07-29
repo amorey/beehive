@@ -2327,6 +2327,38 @@ func TestWithinRefusesToCommitWhileANestedFrameIsOpen(t *testing.T) {
 	assert.False(t, committed(t, store, "orphan"), "and the orphaned frame's write must not land")
 }
 
+// TestTxStateSealForCommit drives the state machine directly. The window it closes —
+// between observing an empty frame stack and issuing COMMIT — is two adjacent
+// statements, so it is not deterministically reachable through the public path; what
+// *is* testable is that admission and the commit check share one lock, and that the
+// door stays shut once closed. Whitebox tests are the convention here precisely so
+// this kind of invariant can be pinned.
+func TestTxStateSealForCommit(t *testing.T) {
+	t.Run("shuts the door on later frames", func(t *testing.T) {
+		st := &txState{}
+		require.NoError(t, st.sealForCommit())
+
+		_, err := st.pushSavepoint(0)
+		assert.ErrorIs(t, err, beehive.ErrConcurrentNestedTx,
+			"a frame arriving after the seal must be refused, not released by the commit")
+	})
+
+	t.Run("refuses while a frame is open", func(t *testing.T) {
+		st := &txState{}
+		_, err := st.pushSavepoint(0)
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, st.sealForCommit(), beehive.ErrConcurrentNestedTx)
+	})
+
+	t.Run("surfaces poison ahead of either", func(t *testing.T) {
+		st := &txState{}
+		st.poison(assert.AnError)
+
+		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
+	})
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
