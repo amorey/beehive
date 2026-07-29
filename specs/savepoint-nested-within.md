@@ -3,6 +3,14 @@
 - **Status:** Implemented. The accepted design and the measured cost live in
   [the ADR](../docs/adr/2026-07-29-nested-within-savepoints.md); this file is kept for
   the audit and test-plan reasoning, which does not belong in a decision record.
+- **Amended in review, after implementation.** Three things below were specced wrong
+  and are corrected in the ADR: the hook watermark is positional here and must be
+  ownership by frame id (a concurrent `AfterCommit` on an enclosing frame's ctx lands
+  above the mark and would be discarded); the unwind statements must run on
+  `context.WithoutCancel`, since `fn`'s ctx may be canceled by `fn` itself and
+  `ExecContext` would skip the `ROLLBACK TO`; and latching `closed` must share a
+  critical section with the hook drain, or a registration between them sees a
+  committed transaction as a rolled-back one.
 - **Date:** 2026-07-29
 - **Touches:** `sqlite/store.go` (`Within`, `txState`, `AfterCommit`),
   `internal/storeapi/storeapi.go` (the `Within` contract), `sqlite/store_test.go`

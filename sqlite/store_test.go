@@ -2156,6 +2156,67 @@ func TestAfterCommitOnARolledBackTransactionDiscards(t *testing.T) {
 	assert.False(t, ran, "a rolled-back transaction must never run a hook")
 }
 
+// TestWithinNestedUnwindsAfterContextCancellation: fn's ctx is the caller's, and a
+// caller may hand a nested frame a cancellable child. ExecContext returns before it
+// runs a statement on a canceled ctx, so an unwind issued on fn's own ctx would skip
+// the ROLLBACK TO entirely — leaving the frame's writes applied and poisoning a
+// transaction that is otherwise perfectly healthy. The savepoint statements must
+// therefore outlive fn's ctx.
+func TestWithinNestedUnwindsAfterContextCancellation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		createIn(t, store, txCtx, "outer")
+
+		childCtx, cancel := context.WithCancel(txCtx)
+		defer cancel()
+		err := store.Within(childCtx, func(nestedCtx context.Context) error {
+			createIn(t, store, nestedCtx, "nested")
+			cancel() // the caller's own ctx dies mid-frame
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		return nil // swallowed, exactly as the boundary contract allows
+	}))
+
+	assert.True(t, committed(t, store, "outer"), "the outer transaction must still commit")
+	assert.False(t, committed(t, store, "nested"), "and the nested frame must still have unwound")
+}
+
+// TestWithinNestedUnwindKeepsHooksFromEnclosingFrames: a hook queued by an enclosing
+// frame is not this frame's to discard. Slice position cannot tell them apart once
+// another goroutine can append — AfterCommit is not a nested Within, so it stays
+// legal concurrently — which is why ownership is recorded rather than inferred.
+func TestWithinNestedUnwindKeepsHooksFromEnclosingFrames(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	registered := make(chan struct{})
+	var ran []string
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		err := store.Within(txCtx, func(context.Context) error {
+			// Registered against the *enclosing* frame's ctx, from another goroutine,
+			// while this frame is in flight — so it lands above this frame's watermark
+			// while belonging to the frame below it.
+			go func() {
+				defer close(registered)
+				store.AfterCommit(txCtx, func(context.Context) { ran = append(ran, "enclosing") })
+			}()
+			<-registered
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		return nil
+	}))
+
+	assert.Equal(t, []string{"enclosing"}, ran,
+		"the enclosing frame's hook must survive a nested frame's unwind")
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

@@ -30,14 +30,26 @@ error, `RELEASE` on success. The outermost transaction is still the only thing t
 commits, still under `BEGIN IMMEDIATE`. A savepoint adds no fsync, so the durability
 floor is unchanged.
 
-Five things make it correct rather than merely plausible:
+Six things make it correct rather than merely plausible:
 
-- **The hook watermark.** `txState.hooks` is append-only and drains at the outermost
-  commit, so an unwind truncates it back to the length taken at the `SAVEPOINT`.
-  Otherwise a `WithOnCreate` registered inside a rolled-back frame still fires, for a
-  row that is gone. `flushed` needs no consideration during an unwind: `takeHooks`
-  sets it only after the outermost commit, so while a nested frame is in flight the
-  list is provably open.
+- **Queued hooks record their owning frame.** `txState.hooks` drains at the outermost
+  commit, so an unwind must take with it the hooks registered inside the frame —
+  otherwise a `WithOnCreate` fires for a row that is gone. Ownership is the frame's
+  savepoint id, and an unwind drops `id >= name`: ids are monotonic and a frame can
+  only open while its enclosing frame is live, so that is exactly "registered inside
+  this frame". A positional watermark was the first attempt and is wrong, because
+  `AfterCommit` is *not* a nested `Within` and stays legal from another goroutine — a
+  concurrent append lands at a position that says nothing about which frame it belongs
+  to, and truncating by length silently discards an enclosing frame's hook.
+
+- **The savepoint statements outlive `fn`'s context.** `fn` runs on the caller's ctx,
+  and a caller may hand a nested frame a cancellable child and cancel it inside `fn`.
+  `ExecContext` returns before running a statement on a canceled ctx, so an unwind
+  issued on that ctx would skip the `ROLLBACK TO` entirely — leaving the frame's writes
+  applied and poisoning a transaction that is otherwise healthy, which takes the whole
+  outer transaction down with it. `ROLLBACK TO` and `RELEASE` therefore run on
+  `context.WithoutCancel`. Cancellation is the caller's signal about `fn`, not about
+  the bookkeeping that cleans up after it.
 
 - **Depth travels with the transaction state, in one context value** (`txFrame`).
   A key of its own would be sticky — it survives everything that does not explicitly
@@ -74,7 +86,9 @@ Five things make it correct rather than merely plausible:
   it — running it would fire a `WithOnCreate` for a row that never landed). `closed`
   is set immediately after `Commit`, *before* the hook drain, because the drain runs
   inside `Within`'s body and a deferred set would read false for exactly the window
-  it exists to cover.
+  it exists to cover. Latching and draining happen in the *same* critical section, so
+  no registration can fall between them and see a committed transaction wearing the
+  signature of a rolled-back one.
 
 Nothing recovers, and nothing balances the stack on a panic: a panic skips the
 `RELEASE`, and the outermost deferred `tx.Rollback` discards the whole transaction.
@@ -95,20 +109,22 @@ eight self-wrapping creates — the shape `gcCollect` and the owed pass run on):
 
 | | ns/op | B/op | allocs/op |
 |---|---|---|---|
-| before | 450,800 | 42,357 | 1,146 |
-| after | 481,300 | 44,768 | 1,259 |
+| before | 730,800 | 42,367 | 1,145 |
+| after | 785,600 | 44,978 | 1,266 |
 
-**+6.8% wall clock, +113 allocations** — about 14 per nested frame across the two
-extra statements. `modernc.org/sqlite` is a pure-Go translation with no statement
-cache by default, so each `SAVEPOINT`/`RELEASE` pays a fresh prepare-and-step; that,
-not the savepoint itself, is the cost. Statements are built with `strconv.AppendInt`
+**+7.5% wall clock, +121 allocations** — about 15 per nested frame across the two
+extra statements. Take the ratio, not the absolutes: the same two commits measured
+~450k and ~480k ns/op on a quieter machine, so only a back-to-back pair on one host
+means anything. `modernc.org/sqlite` is a pure-Go translation with no statement cache
+by default, so each `SAVEPOINT`/`RELEASE` pays a fresh prepare-and-step; that, not the
+savepoint itself, is the cost. Statements are built with `strconv.AppendInt`
 into a stack array rather than `fmt`, which keeps it to one allocation each. The
 figure is the isolated worst case: eight nested frames doing trivial inserts, where
 the savepoints are the largest share of the work they will ever be.
 
 Accepted as the price of the guarantee. Revisit if a profile shows a transaction
 whose nested-frame count is large *and* whose per-frame work is small — that is the
-only shape where 6.8% could grow.
+only shape where 7.5% could grow.
 
 **A contract change for backend authors.** `type Store = storeapi.Store` is an alias,
 so the boundary is now something any implementation must provide, even though no
