@@ -102,6 +102,12 @@ type txState struct {
 	// would be a silent drop.
 	closed bool
 
+	// dead is the id ranges of frames that unwound. Dropping a frame's queued hooks is
+	// not enough on its own, because its ctx can outlive it: a registration arriving
+	// afterwards would be queued fresh and ride the outer commit, firing for writes
+	// that were rolled back.
+	dead []idRange
+
 	// savepoints counts the savepoints this transaction has opened, ever. It names
 	// them; it is not a stack height. Monotonic on purpose: a depth-indexed name is
 	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
@@ -226,7 +232,7 @@ func (st *txState) nested(ctx context.Context, depth int, fn func(ctx context.Co
 	cleanupCtx := context.WithoutCancel(ctx)
 	ferr := fn(context.WithValue(ctx, txKey{}, &txFrame{st: st, depth: depth + 1, id: name}))
 	if ferr != nil {
-		st.dropHooksFrom(name)
+		st.unwindFrame(name)
 		if _, err := st.tx.ExecContext(cleanupCtx, savepointStmt("ROLLBACK TO", name)); err != nil {
 			settled = true // already poisoned, and with a better error than the defer's
 			st.poison(err)
@@ -260,22 +266,42 @@ type queuedHook struct {
 	fn    func()
 }
 
-// addHook queues fn, reporting whether it took ownership. A false return means the
-// transaction is over, so the caller must run fn itself rather than queue it where
-// nothing will look again.
-//
-// This does not discard hooks for a rolled-back transaction. The guarantee that a
-// rollback runs no hooks is about hooks registered *during* it, which sit in the
-// queue and die with it; one arriving afterwards, on a ctx someone kept, is a
-// registration against no transaction at all.
-func (st *txState) addHook(owner int64, fn func()) bool {
+// idRange is a half of the frame-id space belonging to a frame that unwound: the
+// frame itself, and every frame opened inside it. Ids are monotonic and a frame only
+// opens while its enclosing frame is live, so the descendants of frame lo are exactly
+// the ids issued between lo and the counter's value when lo unwound.
+type idRange struct{ lo, hi int64 }
+
+// hookDisposition is what addHook decided to do with a hook. The two non-queue
+// outcomes answer different questions and must not be collapsed: one is about the
+// transaction being over, the other about the registering frame having rolled back.
+type hookDisposition int
+
+const (
+	hookQueued  hookDisposition = iota // waits for the outermost commit
+	hookRunNow                         // the transaction is over; "after" it is now
+	hookDiscard                        // the registering frame unwound; it must never run
+)
+
+// addHook queues fn and reports what became of it. Queueing where nothing will look
+// again is a silent drop, which is what this return exists to prevent.
+func (st *txState) addHook(owner int64, fn func()) hookDisposition {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	// Checked before closed: a frame that rolled back must not run its hooks whatever
+	// became of the transaction around it.
+	for _, r := range st.dead {
+		if owner >= r.lo && owner <= r.hi {
+			return hookDiscard
+		}
+	}
 	if st.closed {
-		return false
+		// The queue is gone. Running now is what "after the commit" means here, and is
+		// what AfterCommit already does for a ctx that never had a transaction.
+		return hookRunNow
 	}
 	st.hooks = append(st.hooks, queuedHook{owner: owner, fn: fn})
-	return true
+	return hookQueued
 }
 
 // close latches the transaction closed, by either outcome. Idempotent, so the
@@ -303,20 +329,21 @@ func (st *txState) flush() []queuedHook {
 	return hooks
 }
 
-// dropHooksFrom discards the hooks owned by frame owner and by every frame opened
-// inside it — ids are monotonic and a frame can only be opened while its enclosing
-// frame is live, so "registered inside owner" is exactly "id >= owner". Hooks from
-// enclosing frames keep their place and their order.
-func (st *txState) dropHooksFrom(owner int64) {
+// unwindFrame discards the hooks owned by frame name and by every frame opened inside
+// it, and marks that whole id range dead so a later registration against any of them
+// is refused rather than queued fresh. Hooks from enclosing frames keep their place
+// and their order.
+func (st *txState) unwindFrame(name int64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	kept := st.hooks[:0]
 	for _, h := range st.hooks {
-		if h.owner < owner {
+		if h.owner < name {
 			kept = append(kept, h)
 		}
 	}
 	st.hooks = kept
+	st.dead = append(st.dead, idRange{lo: name, hi: st.savepoints})
 }
 
 // txFrom returns the ambient transaction frame, if any.
@@ -425,10 +452,13 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 	// A hook that writes gets a fresh transaction, which is the only thing it could
 	// have meant. Everything else on the ctx is inherited.
 	hookCtx := context.WithValue(ctx, txKey{}, nil)
-	if st.addHook(fr.id, func() { fn(hookCtx) }) {
-		return
+	switch st.addHook(fr.id, func() { fn(hookCtx) }) {
+	case hookRunNow:
+		fn(hookCtx)
+	case hookDiscard:
+		// Deliberately nothing: the frame it was registered against rolled back, so
+		// running it would fire for writes that are gone.
 	}
-	fn(hookCtx)
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.

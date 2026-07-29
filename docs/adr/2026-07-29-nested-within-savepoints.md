@@ -40,7 +40,15 @@ Seven things make it correct rather than merely plausible:
   this frame". A positional watermark was the first attempt and is wrong, because
   `AfterCommit` is *not* a nested `Within` and stays legal from another goroutine — a
   concurrent append lands at a position that says nothing about which frame it belongs
-  to, and truncating by length silently discards an enclosing frame's hook.
+  to, and truncating by length silently discards an enclosing frame's hook. That is
+  reachable on one goroutine: the enclosing ctx is in lexical scope inside the nested
+  fn.
+
+  Dropping the queued hooks is only half of it, because a frame's ctx outlives the
+  frame. An unwind therefore also marks the frame's whole id range dead, and a later
+  registration against any of it is discarded rather than queued fresh — otherwise it
+  would ride the outer commit and fire for writes that were rolled back, which is the
+  guarantee this feature exists for arriving through the back door.
 
 - **The savepoint statements outlive `fn`'s context.** `fn` runs on the caller's ctx,
   and a caller may hand a nested frame a cancellable child and cancel it inside `fn`.
@@ -112,6 +120,9 @@ Seven things make it correct rather than merely plausible:
   hooks": that guarantee covers hooks registered *during* the transaction, which sit
   in the queue and die with it. One arriving afterwards, on a ctx someone kept, was
   never queued against anything.
+
+  A dead *frame* is the opposite case and is checked first: that frame's writes are
+  gone, so its hooks must not run whatever became of the transaction around it.
 
 Nothing recovers, and nothing balances the stack on a panic: a panic skips the
 `RELEASE`, and the outermost deferred `tx.Rollback` discards the whole transaction.

@@ -2200,27 +2200,21 @@ func TestWithinNestedUnwindsAfterContextCancellation(t *testing.T) {
 }
 
 // TestWithinNestedUnwindKeepsHooksFromEnclosingFrames: a hook queued by an enclosing
-// frame is not this frame's to discard. Slice position cannot tell them apart once
-// another goroutine can append — AfterCommit is not a nested Within, so it stays
-// legal concurrently — which is why ownership is recorded rather than inferred.
+// frame is not this frame's to discard, and slice position cannot tell them apart.
+// The enclosing ctx is in lexical scope inside the nested fn, so a single goroutine
+// reaches this without any concurrency — which is what makes it worth defending,
+// since sharing a transaction ctx across goroutines is out of contract anyway.
 func TestWithinNestedUnwindKeepsHooksFromEnclosingFrames(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	sentinel := errors.New("boom")
 
-	registered := make(chan struct{})
 	var ran []string
-
 	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
 		err := store.Within(txCtx, func(context.Context) error {
-			// Registered against the *enclosing* frame's ctx, from another goroutine,
-			// while this frame is in flight — so it lands above this frame's watermark
-			// while belonging to the frame below it.
-			go func() {
-				defer close(registered)
-				store.AfterCommit(txCtx, func(context.Context) { ran = append(ran, "enclosing") })
-			}()
-			<-registered
+			// Registered against the *enclosing* frame while this one is in flight, so
+			// it lands above this frame's position while belonging to the frame below.
+			store.AfterCommit(txCtx, func(context.Context) { ran = append(ran, "enclosing") })
 			return sentinel
 		})
 		assert.ErrorIs(t, err, sentinel)
@@ -2252,6 +2246,37 @@ func TestWithinNestedPanicPoisonsWhenRecovered(t *testing.T) {
 
 	require.Error(t, err, "a frame abandoned by a panic must not be allowed to commit")
 	assert.False(t, committed(t, store, "panicked"), "its writes must not land")
+}
+
+// TestAfterCommitOnAnUnwoundFrameIsDiscarded: dropping a frame's queued hooks at the
+// unwind is not enough, because the frame's ctx can outlive the frame. A registration
+// arriving afterwards would be queued fresh and ride the outer commit, firing a hook
+// for writes that were rolled back — the precise failure the boundary exists to
+// prevent, arriving through the back door.
+//
+// No goroutine needed: capturing the nested ctx into an enclosing variable reaches it
+// on one goroutine, which is the only discipline the contract supports anyway.
+func TestAfterCommitOnAnUnwoundFrameIsDiscarded(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	ran := false
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		var captured context.Context
+		err := store.Within(txCtx, func(nested context.Context) error {
+			captured = nested
+			createIn(t, store, nested, "unwound")
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+
+		store.AfterCommit(captured, func(context.Context) { ran = true })
+		return nil // swallowed; the outer transaction still commits
+	}))
+
+	assert.False(t, ran, "a hook registered against an unwound frame must never run")
+	assert.False(t, committed(t, store, "unwound"))
 }
 
 func TestObjectsListUnsettledIDs(t *testing.T) {
