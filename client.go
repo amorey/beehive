@@ -131,6 +131,19 @@ type Client[Spec, Status any] interface {
 	// hold the write lock across arbitrary user MarshalJSON code.
 	GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
+	// ObjectsWatch streams changes to one object, ObjectsWatchList to every object
+	// of this client's kind: the current state as Added, then Added/Modified/Deleted
+	// as things change, until ctx is cancelled and the channel closes. Both need a
+	// registered controller for the kind and are scoped to it, so another kind's id
+	// streams nothing, and an id that does not exist yet is simply reported as Added
+	// once it appears.
+	//
+	// Both read current state before returning, so a caller may subscribe and then
+	// act: a change it makes afterwards is measured against a snapshot that already
+	// exists, and cannot fall into the gap before the first poll. That costs one
+	// store read on the subscribing goroutine. Everything after it is polled (see
+	// withWatchPollInterval), which is what bounds latency and collapses changes
+	// within one interval into the latest state.
 	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
 	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The

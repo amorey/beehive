@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -147,9 +148,20 @@ func (c *clientImpl[Spec, Status]) scopedRow(
 	return raw, nil
 }
 
-// objectStream is the poll-and-diff engine behind both object watches. It remembers
-// the resource_version of every object it has reported and works out the change type
-// by comparison:
+// objectStream is the poll-and-diff engine behind both object watches.
+//
+// **The first read happens before this returns**, and that is what makes
+// "subscribe, then act" safe: everything the caller does next lands above a
+// snapshot that already exists, so a change it makes — including a delete — is
+// reported. Taking the snapshot on the first tick instead would leave the window
+// between subscribing and that tick invisible, and an object created and collected
+// inside it is never reported at all, so a caller waiting on its Deleted waits
+// forever. The caller waits only for the *read*: the changes it produces are sent
+// from the poll goroutine afterwards, since a send blocks on a subscriber that
+// cannot read until subscribing has returned.
+//
+// It remembers the resource_version of every object it has reported and works out
+// the change type by comparison:
 //
 //   - absent before, present now -> Added
 //   - present in both, version moved -> Modified
@@ -191,73 +203,118 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	mig := c.bh.migratorFor(c.gk)
 	seen := make(map[ObjectID]tracked[Spec, Status])
 	var cursor int64
+	// snapshot is closed once the first poll has read the store, before any of what
+	// it found is sent (see the func doc on why the caller waits for it).
+	snapshot := make(chan struct{})
+	var once sync.Once
+	taken := func() { once.Do(func() { close(snapshot) }) }
 
 	go func() {
 		defer close(out)
+		// A poll that returns early — a store error, a quiet tick — has still looked,
+		// and a caller must not be left waiting on a store that is failing.
+		defer taken()
 		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
-			if err != nil {
-				return c.pollFailed(ctx, "watch", err)
+			changes, ok := c.poll(ctx, list, live, mig, seen, &cursor)
+			// Every read this poll was going to make has now been made, so the caller
+			// may proceed: anything it does from here lands above the snapshot and is
+			// reported by a later poll. Marked before the sends, which block until the
+			// subscriber reads — and it cannot read until this returns.
+			taken()
+			if !ok {
+				return true // logged by poll; one tick lost, not the stream
 			}
-			if at == cursor {
-				// Nothing was created or modified. A delete is still possible and draws
-				// no version, so check that what this stream tracks is still there — one
-				// blob-free read — and skip the expensive listing unless something
-				// actually vanished.
-				gone, err := c.deletedSince(ctx, seen, live)
-				if err != nil {
-					return c.pollFailed(ctx, "watch", err)
-				}
-				if !gone {
-					return true
-				}
-			}
-			raws, err := list(ctx)
-			if err != nil {
-				return c.pollFailed(ctx, "watch", err)
-			}
-			cursor = at
-			present := make(map[ObjectID]struct{}, len(raws))
-			for _, raw := range raws {
-				present[raw.ID] = struct{}{}
-				if prev, known := seen[raw.ID]; known && prev.rv == raw.ResourceVersion {
-					continue // unchanged since the last report
-				}
-				obj, err := rawToTyped[Spec, Status](raw, mig)
-				if err != nil {
-					// Quarantine, don't tear down: skip a poison row and keep the stream
-					// alive so one un-decodable object can't silently kill a live watcher
-					// (mirrors List). Recording the version keeps it from re-warning every
-					// tick until someone rewrites it.
-					seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion}
-					c.warnUndecodable("Watch", raw.ID, err)
-					continue
-				}
-				typ := Modified
-				if _, known := seen[raw.ID]; !known {
-					typ = Added
-				}
-				seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion, obj: obj}
-				if !sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: typ, Object: obj}) {
-					return false
-				}
-			}
-			for id, prev := range seen {
-				if _, ok := present[id]; ok {
-					continue
-				}
-				delete(seen, id)
-				if prev.obj == nil {
-					continue // only ever seen as a poison row: no body to tombstone
-				}
-				if !sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Deleted, Object: prev.obj}) {
+			for _, ch := range changes {
+				if !sendOrDone(ctx, out, ch) {
 					return false
 				}
 			}
 			return true
 		})
 	}()
+
+	// Wait for that first read. A cancelled context ends the wait rather than
+	// holding the caller: the stream is closing anyway.
+	select {
+	case <-snapshot:
+	case <-ctx.Done():
+	}
 	return out
+}
+
+// poll runs one object-watch tick: it reads current state, folds it into seen, and
+// returns the changes to send. ok is false when the read failed, which costs the
+// tick and nothing more.
+//
+// Deriving every change before sending any is what lets objectStream tell its
+// caller the snapshot has been taken: the sends block on a subscriber that cannot
+// read until subscribing returns, so the two must not be interleaved.
+func (c *clientImpl[Spec, Status]) poll(
+	ctx context.Context,
+	list func(context.Context) ([]*RawObject, error),
+	live func(context.Context) ([]ObjectID, error),
+	mig Migrator,
+	seen map[ObjectID]tracked[Spec, Status],
+	cursor *int64,
+) ([]ObjectChange[Spec, Status], bool) {
+	at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
+	if err != nil {
+		return nil, c.pollFailed(ctx, "watch", err)
+	}
+	if at == *cursor {
+		// Nothing was created or modified. A delete is still possible and draws no
+		// version, so check that what this stream tracks is still there — one
+		// blob-free read — and skip the expensive listing unless something actually
+		// vanished.
+		gone, err := c.deletedSince(ctx, seen, live)
+		if err != nil {
+			return nil, c.pollFailed(ctx, "watch", err)
+		}
+		if !gone {
+			return nil, true
+		}
+	}
+	raws, err := list(ctx)
+	if err != nil {
+		return nil, c.pollFailed(ctx, "watch", err)
+	}
+	*cursor = at
+
+	var changes []ObjectChange[Spec, Status]
+	present := make(map[ObjectID]struct{}, len(raws))
+	for _, raw := range raws {
+		present[raw.ID] = struct{}{}
+		if prev, known := seen[raw.ID]; known && prev.rv == raw.ResourceVersion {
+			continue // unchanged since the last report
+		}
+		obj, err := rawToTyped[Spec, Status](raw, mig)
+		if err != nil {
+			// Quarantine, don't tear down: skip a poison row and keep the stream alive
+			// so one un-decodable object can't silently kill a live watcher (mirrors
+			// List). Recording the version keeps it from re-warning every tick until
+			// someone rewrites it.
+			seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion}
+			c.warnUndecodable("Watch", raw.ID, err)
+			continue
+		}
+		typ := Modified
+		if _, known := seen[raw.ID]; !known {
+			typ = Added
+		}
+		seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion, obj: obj}
+		changes = append(changes, ObjectChange[Spec, Status]{Type: typ, Object: obj})
+	}
+	for id, prev := range seen {
+		if _, ok := present[id]; ok {
+			continue
+		}
+		delete(seen, id)
+		if prev.obj == nil {
+			continue // only ever seen as a poison row: no body to tombstone
+		}
+		changes = append(changes, ObjectChange[Spec, Status]{Type: Deleted, Object: prev.obj})
+	}
+	return changes, true
 }
 
 // deletedSince reports whether any object this stream has reported is gone. It is

@@ -436,9 +436,11 @@ Looking the slug up is **atomic with the delete** — the slug goes into the sto
 
 `ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled.
 
+**Subscribe, then act.** Both read current state *before returning*, so a change you make after subscribing is measured against a snapshot that already exists — delete an object on the next line and its `Deleted` is guaranteed, where a snapshot taken one tick later could miss the object entirely. The cost is one store read on your goroutine; everything after it is polled.
+
 Both are **polls, not subscriptions.** Each remembers the `resource_version` it last reported to you and, on each watch-poll tick (1s), sends the difference: a new object is `Added`, a moved version is `Modified`, a row that has gone is `Deleted` and carries its last known state. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
-- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all.
+- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all — but not one that existed when you subscribed, since the snapshot above is what it is compared against.
 - **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the object write log's high-water mark is one indexed query, and only a mark that moved — or an object that vanished, since deletes draw no version — pays for the full listing. Writing to the event log does not move it, so an object watch stays quiet through a controller that records events on every pass.
 
 A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error instead of ending quietly under a subscriber with no way to notice.

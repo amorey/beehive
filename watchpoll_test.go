@@ -710,3 +710,57 @@ func TestWatchSingleObjectSurvivesALivenessProbeFailure(t *testing.T) {
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch poll failed")
 }
+
+// TestWatchTakesItsSnapshotBeforeReturning pins the guarantee that makes
+// "subscribe, then act" safe: the stream reads current state before the
+// subscribing call returns, so a change the caller makes next is measured against
+// a snapshot that already exists.
+//
+// Without it the snapshot is taken by the first tick, and everything between
+// subscribing and that tick is invisible — an object created and collected in the
+// window is never reported at all, so a caller waiting for its Deleted waits
+// forever. The poll interval here is an hour: nothing but the synchronous first
+// read can deliver anything.
+func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	t.Run("list watch", func(t *testing.T) {
+		ch, err := client.ObjectsWatchList(ctx)
+		require.NoError(t, err)
+		ev := recv(t, ch)
+		assert.Equal(t, Added, ev.Type)
+		assert.Equal(t, obj.ID, ev.Object.ID)
+	})
+
+	t.Run("single-object watch", func(t *testing.T) {
+		ch, err := client.ObjectsWatch(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, Added, recv(t, ch).Type)
+	})
+}
+
+// A subscribe whose context is already dead must not wait for a read it will
+// never use: the stream is closing anyway, so the caller gets its (closed)
+// channel back rather than blocking.
+func TestWatchDoesNotWaitForASnapshotOnADeadContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	store, _, client, _ := watchFixture(t)
+	_, err := client.Create(context.Background(), cSpec{Val: "a"})
+	require.NoError(t, err)
+	store.getErr.Store(true) // any read this made would fail
+
+	ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	waitClosed(t, closedWhenDrained(ch), "the stream to close on a cancelled context")
+}

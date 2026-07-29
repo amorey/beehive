@@ -457,7 +457,9 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	// Subscribe before Start so the Deleted event can't be missed.
+	// Subscribe before Start: the watch reads current state before returning, so the
+	// deletion-pending row is in its snapshot and the sweeper cannot collect it out
+	// from under the stream before it has looked.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	w, err := client.ObjectsWatchList(wctx)
@@ -491,7 +493,8 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "doomed"}, WithFinalizers("f"))
 	require.NoError(t, err)
 
-	// Subscribe before deleting so the Deleted event can't be missed.
+	// Subscribe before deleting: the watch reads current state before returning, so
+	// the object is in its snapshot and the Deleted below cannot be missed.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	w, err := client.ObjectsWatch(wctx, obj.ID)
