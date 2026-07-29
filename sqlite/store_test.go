@@ -2438,6 +2438,42 @@ func TestRefsAddEdgeFailureLeavesStamp(t *testing.T) {
 		"the stamp did, and stands as a self-draining spurious wake rather than a lost one")
 }
 
+// blockWatermarkDeletes makes every DELETE from dependency_watermarks abort,
+// isolating EdgesAdd's watermark clear from the stamp before it and the insert
+// after it. The trigger only fires on a row that actually matches, so a test using
+// it has to give the dependent a watermark first.
+func blockWatermarkDeletes(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `
+		CREATE TRIGGER block_watermark_deletes BEFORE DELETE ON dependency_watermarks
+		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	require.NoError(t, err)
+}
+
+// TestRefsAddWatermarkClearFailurePropagates covers the clear's error branch. It
+// sits between the stamp and the insert, so a failure there must abort the call
+// rather than be swallowed: the edge is what a later pass would read the target
+// through, and the residual has to stay on the harmless side of the ordering — a
+// stamp with no edge, never an edge with a stale watermark still standing.
+func TestRefsAddWatermarkClearFailurePropagates(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	old := newRefObject(t, store)
+	a := newDependentObject(t, store, old.ID) // the edge the watermark write gates on
+	b := newRefObject(t, store)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, a.ID, 42))
+	blockWatermarkDeletes(t, store)
+
+	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
+	require.Error(t, err)
+
+	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"),
+		"the insert runs after the clear, so it never happened")
+	against, _, ok := readWatermark(t, store, a.ID)
+	require.True(t, ok, "the blocked delete left the row")
+	assert.Equal(t, int64(42), against)
+}
+
 func TestRefsAddNoVersionBumpNoEvent(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
