@@ -444,7 +444,12 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
 
-	bh, err := New(store, fast()...)
+	// The stale-dependents pass cannot be disabled, and it would re-derive this
+	// dependent's staleness within a tick or two — closing the gap for a reason other
+	// than the one under test. Pushing it past the test's own timeout leaves the
+	// EdgesAdd stamp as the only thing that can requeue the dependent, which is what
+	// this is about.
+	bh, err := New(store, fast(withStaleDependentsInterval(time.Hour))...)
 	require.NoError(t, err)
 
 	gk := GroupKind{Kind: "Widget"}
@@ -495,11 +500,20 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 
 	// The edge is in place and the target's change is still unobserved, so the
 	// dependent must be reconciled again and see Ready.
-	select {
-	case ready := <-ctrl.observed:
-		assert.True(t, ready, "the requeued pass observes the target's change")
-	case <-time.After(testTimeout):
-		t.Fatal("dependent was never requeued: the target changed before the out-of-band DependenciesAdd declared the edge")
+	// Earlier passes may have queued observations: the owed pass lists unsettled
+	// objects every tick, so a dependent that has not settled yet is legitimately
+	// reconciled more than once around startup, and one of those can still be in
+	// flight here. Those passes all read the target as it was before the change, so
+	// they are skipped rather than asserted on — with the backstop pushed out of
+	// reach above, the only pass that can report ready is one the stamp requeued.
+	deadline := time.After(testTimeout)
+	for observedReady := false; !observedReady; {
+		select {
+		case ready := <-ctrl.observed:
+			observedReady = ready
+		case <-deadline:
+			t.Fatal("no pass observed the target's change")
+		}
 	}
 }
 
