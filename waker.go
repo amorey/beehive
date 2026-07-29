@@ -17,9 +17,17 @@ package beehive
 import "context"
 
 // waker requeues the dependents of everything that has changed. On each tick it
-// scans the store's write log from a watermark and wakes what it finds. There is
+// scans the store's write log from a scan watermark and wakes what it finds. There is
 // one per control plane; it is its own type so the cursor it carries between scans
 // has an owner. Only the waker goroutine touches these fields, so none needs a lock.
+//
+// It is an optimisation, not a guarantee. What makes a dependency wake certain is the
+// stale-dependents pass, which re-derives staleness from each dependent's durable
+// watermark (see Beehive.staleDependentsRun) — so a wake this waker drops costs
+// latency until that pass rather than permanent divergence. Read every "the next tick
+// retries it" below against that: holding the cursor is how the waker repairs its own
+// losses promptly, not the only thing standing between a change and a stranded
+// dependent.
 //
 // The scan is store-wide, not per registered kind: a depends_on edge can point at
 // an object of any kind, including one used through Client and never registered.
@@ -69,10 +77,11 @@ func (dw *waker) run(ctx context.Context) {
 // one. On failure the waker stays unseeded and the next tick tries again, taking the
 // cursor as of *then* — so a change committed in between is below the watermark and is
 // never scanned. The reconciler's startup pass covers that only for an object the
-// store records as owed; a settled dependent stranded in the window is not covered by
-// anything, which is the same gap the startup seed race has (see TODO.md). Retrying is
-// still right: an unseeded watermark is zero, and scanning from there would replay
-// every object ever written on the strength of a transient error.
+// store records as owed; a settled dependent stranded in the window is found by the
+// stale-dependents pass instead, which is why this is now a latency gap rather than a
+// hole (the startup seed race in TODO.md is the same shape). Retrying is still right:
+// an unseeded watermark is zero, and scanning from there would replay every object
+// ever written on the strength of a transient error.
 func (dw *waker) seed(ctx context.Context) bool {
 	cursor, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
 	if err != nil {
@@ -93,10 +102,11 @@ func (dw *waker) seed(ctx context.Context) bool {
 // page that fails leaves the cursor alone, and the next tick re-reads what is still
 // owed.
 //
-// The cost is what changed, not what exists, which is why a dropped wake needs no
-// full pass to repair. A settled dependent is invisible to every owed-work listing,
-// because its own generation never moved, so re-deriving state could not find it —
-// but re-reading the change that stranded it can.
+// The cost is what changed, not what exists, which is why this can run once a second
+// where the passes beside it cannot. A settled dependent is invisible to every
+// owed-work listing, because its own generation never moved; re-reading the change
+// that stranded it is how this driver finds one, and comparing dependency watermarks
+// is how the stale-dependents pass finds the ones this driver missed.
 func (dw *waker) scan(ctx context.Context) {
 	// Seeding on this tick sets the cursor and nothing more. Everything at or below
 	// it is accounted for by definition, so this pass has nothing left to read.

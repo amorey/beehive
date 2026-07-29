@@ -296,6 +296,30 @@ func (s *sqliteStore) ObjectsGet(ctx context.Context, id storeapi.ObjectID) (*st
 	return s.attachConditions(ctx, obj)
 }
 
+// ObjectsGetForReconcile is the reconcile loop's opening read (see the contract on
+// storeapi.Store). The cursor and the dependency flag are correlated subqueries —
+// one over the single-row resource_version_seq, one an EXISTS on the edges
+// primary-key prefix — so they ride the row read rather than adding round trips on
+// a pool of one connection.
+func (s *sqliteStore) ObjectsGetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
+	var load storeapi.ReconcileLoad
+	row := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT `+objectColumns+`,
+		       (SELECT value FROM resource_version_seq WHERE id = 1),
+		       EXISTS (SELECT 1 FROM edges
+		                WHERE from_id = objects.id AND relation = 'depends_on')
+		  FROM objects WHERE id = ?`, id)
+	obj, err := scanObject(row, &load.Cursor, &load.HasDependencies)
+	if err != nil {
+		return storeapi.ReconcileLoad{}, err
+	}
+	if _, err := s.attachConditions(ctx, obj); err != nil {
+		return storeapi.ReconcileLoad{}, err
+	}
+	load.Object = *obj
+	return load, nil
+}
+
 // ObjectsGetMeta is getObjectRow exposed across the store boundary: id's row with
 // no conditions assembled, for metadata-only callers (GC collect, ref checks).
 func (s *sqliteStore) ObjectsGetMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
@@ -495,6 +519,107 @@ func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.Ob
 func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0) WHERE id = ?`, observed, id)
+	return err
+}
+
+// DependentsListStale re-derives which dependents are owed a pass (see the
+// contract on storeapi.Store). The join through edges.to_id is total by
+// construction rather than by luck: to_id is ON DELETE RESTRICT, so a target row
+// always outlives every edge pointing at it and there is no window in which a
+// dependent's edge survives a collected target. Nothing here has to handle a
+// missing target, and no LEFT JOIN is needed on that side — only the watermark,
+// whose absence is what "never reconciled against a known point" looks like.
+//
+// **The CROSS JOINs pin the join order, and the query is superlinear without
+// them.** SQLite treats CROSS JOIN as "do not reorder" and nothing else, so the
+// results are unchanged. Left to choose, the planner drives from
+// idx_objects_kind — every object of a registered kind, probing edges per row —
+// and, because that index is keyed on (group, kind, rowid) rather than on
+// from_id, it cannot stream the GROUP BY and materialises a temp B-tree of every
+// remaining match *before* LIMIT applies. Paging to exhaustion then costs one
+// full scan per page. Driving from edges instead gives the bound this method
+// claims. Measured on the 0001 schema, modernc:
+//
+//	SEARCH e USING PRIMARY KEY (from_id>?)
+//	SEARCH d USING INTEGER PRIMARY KEY (rowid=?)
+//	SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+//	SEARCH c USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
+//
+// So: one covering range scan over the depends_on edges above afterID, three
+// rowid seeks each, and no sort at all — the scan already arrives in from_id
+// order, which is what lets LIMIT stop it after `limit` groups. Cost is bounded
+// by the dependency graph rather than by the object count, which is what
+// separates this from a full pass, and the two-column comparison in the last
+// predicate — which no index can serve — is only ever evaluated on rows that scan
+// already reached.
+//
+// GROUP BY, not SELECT DISTINCT: a dependent with several stale targets must
+// appear once, and with the scan in from_id order the grouping is free, where
+// DISTINCT plans a temp B-tree for itself and a second one for the ORDER BY.
+//
+// The kinds list is not chunked under idChunkSize as the id-list reads are. Those
+// take caller data of unbounded size; this takes the registered-kind set, which
+// comes from Register calls in code — a store with enough kinds to exhaust
+// SQLITE_MAX_VARIABLE_NUMBER cannot be written.
+func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.GroupKind, afterID storeapi.ObjectID, limit int) ([]storeapi.ObjectRef, error) {
+	if len(kinds) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(kinds)*2+2)
+	args = append(args, afterID)
+	placeholders := make([]string, len(kinds))
+	for i, gk := range kinds {
+		placeholders[i] = "(?, ?)"
+		args = append(args, gk.Group, gk.Kind)
+	}
+	args = append(args, limit)
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT e.from_id, d."group", d.kind
+		  FROM edges e
+		  CROSS JOIN objects d ON d.id = e.from_id
+		  CROSS JOIN objects t ON t.id = e.to_id
+		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
+		 WHERE e.relation = 'depends_on'
+		   AND e.from_id != e.to_id
+		   AND e.from_id > ?
+		   AND (d."group", d.kind) IN (VALUES `+strings.Join(placeholders, ", ")+`)
+		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
+		 GROUP BY e.from_id
+		 ORDER BY e.from_id
+		 LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanObjectRefs(rows)
+}
+
+// DependencyWatermarkSet upserts id's dependency watermark (see the contract on
+// storeapi.Store). The EXISTS rides the edges primary-key prefix, so the
+// has-dependencies gate costs a b-tree probe and no separate read — and, since a
+// collected object's edges cascade away with it, the same probe is what keeps the
+// foreign key satisfied when gcCollect removes the row mid-pass.
+//
+// The WHERE on DO UPDATE does two jobs, and neither is optional. It makes the
+// stored cursor monotonic, so an out-of-order write cannot regress it and
+// un-converge a dependent. And when the cursor has not advanced it suppresses the
+// write outright — no page dirtied, no WAL frame — which is what keeps a
+// RequeueAfter polling controller that declares dependencies from paying a row
+// write per pass in a store nobody else is writing to. MAX(…) in the SET would give
+// monotonicity alone and still rewrite the row every pass.
+//
+// It is also what couples reconciled_at to reconciled_against structurally: one
+// predicate guards both columns, so the timestamp cannot move on a pass that
+// observed nothing new (see the table comment on why it is not a heartbeat).
+func (s *sqliteStore) DependencyWatermarkSet(ctx context.Context, id storeapi.ObjectID, cursor int64) error {
+	_, err := s.conn(ctx).ExecContext(ctx, `
+		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
+		SELECT ?, ?, ?
+		 WHERE EXISTS (SELECT 1 FROM edges WHERE from_id = ? AND relation = 'depends_on')
+		    ON CONFLICT(object_id) DO UPDATE
+		   SET reconciled_against = excluded.reconciled_against,
+		       reconciled_at      = excluded.reconciled_at
+		 WHERE excluded.reconciled_against > dependency_watermarks.reconciled_against`,
+		id, cursor, toMillis(time.Now().UTC()), id)
 	return err
 }
 
@@ -1678,7 +1803,11 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-func scanObject(sc scanner) (*storeapi.RawObject, error) {
+// scanObject reads objectColumns into a RawObject. extra binds any columns the
+// statement appended *after* objectColumns, for a caller that rides its own values
+// on the row read (see ObjectsGetForReconcile); the positional coupling is why
+// extras go last in both places.
+func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 	var (
 		obj         storeapi.RawObject
 		slug        sql.NullString
@@ -1690,11 +1819,13 @@ func scanObject(sc scanner) (*storeapi.RawObject, error) {
 		createdAt   int64
 		updatedAt   int64
 	)
-	err := sc.Scan(
+	dest := []any{
 		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
 		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
-		&deletionAt, &obj.ReconcileOwed, &finalizers, &createdAt, &updatedAt)
+		&deletionAt, &obj.ReconcileOwed, &finalizers, &createdAt, &updatedAt,
+	}
+	err := sc.Scan(append(dest, extra...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storeapi.ErrNotFound
 	}

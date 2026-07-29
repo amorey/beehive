@@ -25,6 +25,7 @@ directory of archaeology.
 
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
+- [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)

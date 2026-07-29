@@ -174,6 +174,61 @@ CREATE TABLE edges (
 CREATE INDEX idx_edges_to ON edges(to_id, relation);
 
 -- ============================================================
+-- dependency_watermarks
+-- Per-dependent staleness watermark: the store-wide write cursor
+-- (resource_version_seq) as of the moment this object's last
+-- successful reconcile loaded its state. A dependent is stale
+-- when a target it depends_on has a resource_version above it.
+-- ============================================================
+
+-- A side table rather than a column on objects, for one reason: objects rows
+-- carry the spec and status JSON inline, and SQLite rewrites the whole record
+-- on UPDATE — including overflow pages. Storing eight bytes against a
+-- multi-kilobyte row, on every successful reconcile of every dependent, is the
+-- most expensive available way to keep a small integer. Here the write touches
+-- a three-column row.
+--
+-- Sparse by construction: a row exists only once a dependent has reconciled,
+-- so the table is sized by the dependency graph, not by the object count. An
+-- absent row means the same thing a zero cursor would — never reconciled
+-- against a known point, therefore stale — which is why the scan LEFT JOINs
+-- and needs no backfill.
+--
+-- A rowid table, unlike edges. object_id is an INTEGER PRIMARY KEY, so it
+-- *aliases the rowid*: the table is already one b-tree keyed by object_id with
+-- no separate index, and the scan's per-edge probe is a direct rowid seek.
+-- WITHOUT ROWID would demote object_id to an ordinary column stored in the
+-- record payload, paying a header entry and serial type for a key the rowid
+-- form stores as a bare varint. edges is WITHOUT ROWID for the opposite reason,
+-- spelled out above: every one of its columns is in the key, so a rowid table
+-- would store each edge twice. Here there are non-key columns and an integer
+-- key, which is exactly the case the rowid form is best at.
+--
+-- ON DELETE CASCADE because this is derived state with no claim on the
+-- object's lifetime — it disappears with the row, alongside the outgoing edges
+-- that cascade for the same reason.
+--
+-- reconciled_at is observability only; nothing reads it to make a decision. It
+-- moves only when reconciled_against does, which the upsert enforces with a
+-- single WHERE over both columns rather than by discipline. Two consequences,
+-- and both are the same caution objects.observed_at already gives above:
+--
+--   * It is NOT a reconcile heartbeat and cannot be read as "last ran". It
+--     stops moving whenever a pass reconciles against a store nobody has
+--     written to since the last one — rare when the store is busy, routine
+--     when it is quiet. Controller liveness belongs in the events log.
+--   * Its coverage is asymmetric: only dependents get a row at all, and only
+--     successful passes write one. Anything built on it silently omits every
+--     object without dependencies and every failing reconcile.
+--
+-- No index beyond the primary key: every access is by object_id.
+CREATE TABLE dependency_watermarks (
+    object_id          INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
+    reconciled_against INTEGER NOT NULL, -- resource_version_seq value observed at load
+    reconciled_at      INTEGER NOT NULL  -- millis; moves only with reconciled_against
+) STRICT;
+
+-- ============================================================
 -- events
 -- Append-only per-object log, aggregated into contiguous runs:
 -- one row per run of consecutive observations sharing

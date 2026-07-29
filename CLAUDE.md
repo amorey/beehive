@@ -42,17 +42,18 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Nothing is pushed. Every driver is a periodic scan.** A write leaves a durable
   trace, and a driver finds it by scanning the column that moved. `drivers.go` holds
   the two loop shapes: `runDriver` for one cadence, `tickerChan` for a select over
-  several. Five drivers: the owed pass (unsettled specs plus `reconcile_owed`,
+  several. Six drivers: the owed pass (unsettled specs plus `reconcile_owed`,
   per-kind, 30s), the full pass (`WithFullPassInterval`, every object, per-kind, off
   by default), the GC sweeper (`WithGCInterval`, deletion-pending, global, **cannot
-  be disabled**), the dependency waker (the write log, global, 1s) and the watch
-  poll (the client watches, global, 1s). Startup always runs the owed pass; the
+  be disabled**), the dependency waker (the write log, global, 1s), the
+  stale-dependents pass (dependency watermarks, global, 60s, **cannot be disabled**)
+  and the watch poll (the client watches, global, 1s). Startup always runs the owed pass; the
   startup full pass is opt-in (`WithStartupFullPass`), like the periodic one and for
   the same reason — **no reconcile may depend on either full pass**, since both scale
-  with the object count. **Only two of the five are publicly configurable** —
-  `WithFullPassInterval` and `WithGCInterval`. The other three keep unexported
+  with the object count. **Only two of the six are publicly configurable** —
+  `WithFullPassInterval` and `WithGCInterval`. The other four keep unexported
   options (`withOwedPassInterval`, `withDependencyWakeInterval`,
-  `withWatchPollInterval`) that only tests reach; `Client.Requeue` is the public way
+  `withStaleDependentsInterval`, `withWatchPollInterval`) that only tests reach; `Client.Requeue` is the public way
   to beat a cadence. Examples run on production defaults and nudge with `Requeue`
   rather than turning the drivers up.
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md). Every way an object comes to
@@ -65,6 +66,16 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   it was before.
 - **Controllers coordinate through the store, never with each other.** A change
   reaches another controller by being scanned, not by being delivered.
+- **Dependency staleness is re-derived, not recorded.** Each dependent's successful
+  reconcile stamps `dependency_watermarks.reconciled_against` with the store-wide
+  write cursor as of its *load* (an absent row means stale), and the stale-dependents
+  pass enqueues every dependent a target has moved past. That is what makes a
+  dependency wake a guarantee: a wake lost by any means — a crash, a startup seed
+  race, a process with no waker, a bug — costs latency until this pass rather than
+  permanent divergence, so the waker below is an optimisation over it. The write is
+  gated in SQL on an outgoing `depends_on` edge (which is also its foreign-key guard
+  against a mid-pass `gcCollect`) and suppressed entirely when the cursor has not
+  advanced. → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The dependency waker scans from a `resource_version` watermark**
   (`ObjectWritesListSince`, paged; seeded at startup from `ObjectWritesMaxVersion`).
   It is store-wide rather than per-kind, because a `depends_on` edge can point at a

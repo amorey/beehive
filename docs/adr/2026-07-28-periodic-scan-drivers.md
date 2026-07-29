@@ -28,16 +28,31 @@ notification.
 | Owed pass | unsettled specs, `reconcile_owed` | `withOwedPassInterval` (per-kind, unexported) | 30s |
 | Full pass | every object of the kind | `WithFullPassInterval` (per-kind) | 0 (off) |
 | GC sweeper | `deletion_requested_at`, plus event retention | `WithGCInterval` (global) | 30s |
-| Dependency waker | `resource_version` above a watermark | `withDependencyWakeInterval` (global, unexported) | 1s |
+| Dependency waker | `resource_version` above a scan watermark | `withDependencyWakeInterval` (global, unexported) | 1s |
+| Stale dependents | targets above each dependent's watermark | `withStaleDependentsInterval` (global, unexported) | 60s |
 | Client watch | current state, diffed against last reported | `withWatchPollInterval` (global, unexported) | 1s |
 
 They are separate cadences because they are separate jobs with sharply different
 cost curves, and one interval governing several would mean tuning any of them moves
-the rest. All five share two loop shapes in `drivers.go`: `runDriver` (one cadence
-with an eager first pass — the GC sweeper, the waker, each watch) and `tickerChan`
+the rest. All six share two loop shapes in `drivers.go`: `runDriver` (one cadence
+with an eager first pass — the GC sweeper, the waker, the stale-dependents pass,
+each watch) and `tickerChan`
 (a nil channel for a disabled cadence, for the reconciler's select over the owed
 *and* full passes). Keeping them together is what makes "a non-positive interval
 disables this driver" one answer rather than one per driver.
+
+### The stale-dependents pass re-derives what the waker may have missed
+
+`DependentsListStale(kinds, afterID, limit)`, paged to exhaustion on each step, over
+the `depends_on` edges of registered kinds: a dependent is stale when a target sits
+above the watermark its last successful reconcile recorded. It is the correctness
+backstop the waker is an optimisation over, so unlike the waker it **cannot be
+disabled**, and unlike every other driver it asks about current state rather than
+about a column a write moved — which is exactly why it recovers a wake lost by any
+means, including a bug in the wake path or a process that never ran a waker. Its
+cadence is set by acceptable staleness after a crash rather than by cost, since a
+steady-state pass finds nothing and enqueues nothing. Full reasoning in [its
+ADR](2026-07-29-dependency-watermarks.md).
 
 ### The owed pass drains what the store records as owed
 
@@ -86,12 +101,15 @@ beside it, and why a dropped wake needs no full pass to repair. A settled depend
 is invisible to every owed-work listing, because its own generation never moved;
 re-reading the change that stranded it is the only thing that can find it.
 
-The cursor is deliberately **not persisted**. A watermark records *delivery* ("the
-waker reached rv N"), while what has to survive a restart is *convergence* ("the
-dependent actually reconciled against the new state"). Persisting it would buy half
-the hole, leave the twin half open, and charge a write per page on a single
-connection. The residual — a settled dependent stranded by a crash mid-outage — and
-the `observed_cursor` shape that would close it are recorded in TODO.md.
+The scan watermark is deliberately **not persisted**, and this is the argument that
+chose the mechanism beside it. A scan watermark records *delivery* ("the waker
+reached rv N"), while what has to survive a restart is *convergence* ("the dependent
+actually reconciled against the new state"). Persisting it would buy half the hole,
+leave the twin half open, and charge a write per page on a single connection. So
+durability was attached to convergence instead, per dependent and re-derived: see
+[the dependency-watermarks ADR](2026-07-29-dependency-watermarks.md). That is what
+makes a lost wake here cost latency rather than divergence, and it is why this
+driver can stay a pure in-memory optimisation.
 
 **It is store-wide, not per registered kind.** A `depends_on` edge may point at an
 object of any kind, including one only ever used through `Client` with no
@@ -152,15 +170,16 @@ there is nothing such a value could mean.
 ## Only two cadences are public
 
 `WithFullPassInterval` and `WithGCInterval` are exported. The owed pass, the
-dependency waker and the watch poll keep their options unexported —
-`withOwedPassInterval`, `withDependencyWakeInterval`, `withWatchPollInterval` —
-reachable from the package's own tests and nowhere else.
+dependency waker, the stale-dependents pass and the watch poll keep their options
+unexported — `withOwedPassInterval`, `withDependencyWakeInterval`,
+`withStaleDependentsInterval`, `withWatchPollInterval` — reachable from the package's
+own tests and nowhere else.
 
 The split is not "cheap versus expensive"; it is **which cadences a caller has a
-reason to move**. The three unexported ones are each bounded by what is outstanding
-or by what changed rather than by what exists, so they cost about the same in a large
+reason to move**. The four unexported ones are each bounded by what is outstanding, by what changed,
+or by the dependency graph rather than by what exists, so they cost about the same in a large
 deployment as in a small one, and shortening them buys latency the store pays for on
-every tick forever. Two of the three also cannot be turned off without opening a
+every tick forever. Three of the four also cannot be turned off without opening a
 correctness hole, which makes an exported knob mostly a way to break the guarantee
 that convergence is a property of the system rather than of its configuration. The
 one cadence whose cost genuinely scales with the deployment — the full pass — is
@@ -192,9 +211,10 @@ which disqualifies them as a correctness mechanism — a system whose convergenc
 on a sweep converges only while the sweep stays affordable. It also makes the two
 defaults one decision rather than two: the periodic full pass was always off, and the
 startup one now matches it, so a hole cannot hide behind "well, startup catches it".
-Where that leaves the dependency waker's restart behaviour is an open item in
-`TODO.md`, and it is stated there as an open item rather than an answered one
-precisely because the pass that used to cover it was never entitled to.
+The dependency waker's restart behaviour used to be the open item here, for exactly
+that reason — the pass that covered it was never entitled to. It is now carried by
+the stale-dependents pass, whose cost is bounded by the dependency graph rather than
+by the object count, which is what makes it eligible to be depended on.
 
 ## Writes schedule nothing
 

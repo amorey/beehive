@@ -328,16 +328,45 @@ func WithGCInterval(d time.Duration) Option {
 // cheap and already the shortest cadence, there is nothing to tune it toward, and
 // lengthening it only delays wakes that nothing else will find promptly.
 //
-// d <= 0 disables it, which is why tests can reach it: declaring a dependency
-// still stamps reconcile_owed, so a dependent that read a target which moved
-// under it is caught by the owed pass. What is lost is the *later* change — a
-// settled dependent whose dependency is rewritten afterwards. That dependent is
-// invisible to every owed-work listing (its own generation never moved), so only
-// a full pass would find it.
+// d <= 0 disables it, which is why tests can reach it, and what that costs is now
+// only latency: declaring a dependency still stamps reconcile_owed, and a settled
+// dependent whose dependency is rewritten afterwards — invisible to every owed-work
+// listing, since its own generation never moved — is re-derived by the
+// stale-dependents pass, which cannot be turned off (see
+// withStaleDependentsInterval).
 func withDependencyWakeInterval(d time.Duration) Option {
 	return func(target any) error {
 		if t, ok := target.(*Beehive); ok {
 			t.wakeInterval = d
+		}
+		return nil
+	}
+}
+
+// withStaleDependentsInterval sets how often the stale-dependents pass
+// re-derives which dependents a dependency has moved under (see
+// Beehive.staleDependentsRun). It is global — the scan spans every registered
+// kind at once — and meaningful only at New; passed elsewhere it is ignored.
+//
+// It is deliberately unexported, and for a stronger reason than the other
+// unexported intervals: this is the backstop that makes a dependency wake a
+// guarantee rather than a best effort. Everything faster (the waker, the
+// declare-time reconcile_owed stamp) is an optimisation over it, so an embedder
+// tuning this would be tuning how long a lost wake goes unnoticed, which is not a
+// deployment choice.
+//
+// Like WithGCInterval it cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption. A long interval expresses "re-derive rarely"; there is no
+// supported way to express "never", because nothing else re-derives.
+func withStaleDependentsInterval(d time.Duration) Option {
+	return func(target any) error {
+		// Checked before the target switch, as WithGCInterval does: the value is
+		// nonsense wherever it was aimed.
+		if d <= 0 {
+			return fmt.Errorf("%w: withStaleDependentsInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.staleDependentsInterval = d
 		}
 		return nil
 	}
