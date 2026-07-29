@@ -47,6 +47,42 @@ var ErrNotFound = errors.New("beehive: object not found")
 // hides it as ErrNotFound, a controller reports it.
 var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 
+// ErrStaleTxContext is returned by a nested Within whose ctx is not the transaction's
+// live innermost frame. Three things reach it, and only the first involves concurrency:
+//
+//   - The ctx belongs to another goroutine's frame, so this one is not at the top of
+//     the savepoint stack.
+//   - The ctx is an *enclosing* frame's, used while deeper frames are still open —
+//     reachable on one goroutine, since an enclosing ctx stays in lexical scope. Before
+//     the rollback boundary existed this joined the transaction silently; it is now
+//     refused, because a savepoint opened out of stack order unwinds the wrong things.
+//   - The ctx belongs to a frame that already unwound. Its writes are gone, and
+//     admitting it would let them be written again into a transaction that will
+//     commit, while hooks registered on the same ctx are still discarded — the store
+//     answering "is this frame alive" two different ways.
+//
+// The name is about the context, not the caller: "stale" here means "not the frame
+// this transaction is currently in", which a single goroutine can produce by holding
+// a ctx past its scope.
+//
+// Backends implementing the boundary with savepoints must refuse rather than serialise
+// — holding a lock across fn deadlocks as soon as fn waits on another goroutine that
+// also wants the store. Ordinary deep nesting on one goroutine is not this: a
+// Client.Create inside a ControllerClient.Within, with the mutator's own self-wrap
+// below it, is three frames and must be accepted.
+var ErrStaleTxContext = errors.New("beehive: transaction context is not the live frame")
+
+// ErrConcurrentNestedTx is returned by the outermost Within when it is asked to commit
+// while a nested frame is still open. Unlike ErrStaleTxContext this one *proves*
+// concurrency: nested frames unwind in a defer, so on a single goroutine the stack is
+// empty by the time fn returns, and a frame still open can only belong to another
+// goroutine. It is the one place the one-goroutine-per-transaction rule is enforced
+// exactly rather than sampled.
+//
+// Committing there would release that frame's savepoint and persist writes it is still
+// entitled to roll back, with nothing left that could undo them.
+var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
+
 // ErrObservedGenerationFuture is returned by UpdateStatus when observedGeneration is
 // greater than the object's current generation. A controller can only report a
 // generation it actually saw in Reconcile, so a value from the future would mark the
@@ -256,12 +292,54 @@ type Store interface {
 	// the backend, not of this contract, but the contract is where a caller reads
 	// about it: an implementation with a larger pool merely runs the call
 	// concurrently, on a snapshot that does not include fn's uncommitted writes.
+	//
+	// **A nested Within is a rollback boundary.** A Within whose ctx already carries a
+	// transaction joins it rather than opening another, and only the outermost one
+	// commits — but an error returned from the nested fn must still unwind that fn's
+	// writes and the AfterCommit hooks it queued, leaving the store as it was when the
+	// nested call was entered. This holds whatever the outer caller then does with the
+	// error, including swallowing it. Without that, no composition of two writes is
+	// atomic except by the grace of its callers, and a backend cannot promise a caller
+	// that a failed compound operation left nothing behind. The sqlite store implements
+	// it with SAVEPOINT.
+	//
+	// A backend implementing the boundary with a savepoint stack must refuse a nested
+	// Within entered from a goroutine other than the one owning the enclosing frame,
+	// with ErrConcurrentNestedTx — concurrent pushes interleave, and serialising them
+	// deadlocks as soon as fn waits on a goroutine that also wants the store. Ordinary
+	// deep nesting on one goroutine is not that case and must be accepted.
+	//
+	// That refusal covers nested Withins and nothing else, which is the whole of the
+	// guarantee: **a transaction ctx belongs to one goroutine.** A single-statement
+	// call that joins the transaction without opening a frame of its own cannot be
+	// detected this way, so a write issued from a second goroutine while a sibling
+	// frame is open may simply be discarded by that frame's unwind. Do not share a
+	// transaction ctx across goroutines; the refusal is a tripwire on the common case,
+	// not a lock.
+	//
+	// The commit is the exception, and there the check is exact: a backend must refuse
+	// to commit while any nested frame is still open. Nested frames unwind before fn
+	// returns on a single goroutine, so a live one at that moment can only belong to
+	// another, and committing would release its savepoint — landing writes it may be
+	// about to roll back, with no way left to undo them.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has
 	// committed. If ctx carries no transaction the write has already committed, so
-	// fn runs before AfterCommit returns. Hooks run in registration order, and a
-	// rolled-back transaction never runs them.
+	// fn runs before AfterCommit returns. Hooks run in registration order.
+	//
+	// The rule in one line: **fn runs if and only if the transaction it was registered
+	// against committed, and the frame it was registered against did not unwind.** A
+	// rolled-back transaction never runs its hooks — neither those queued in it, which
+	// die with the queue, nor one registered afterwards on a ctx someone kept, which is
+	// discarded. Registering against a nested frame that already unwound is discarded
+	// the same way, even while the outer transaction is still open and heading for a
+	// commit: that frame's writes are gone.
+	//
+	// The one case that runs inline is a registration arriving after a *successful*
+	// commit — from a hook that passed back the ctx it captured, say. There is no queue
+	// left to join and the commit it was owed to has happened, so "after the commit" is
+	// now.
 	//
 	// It exists for one thing, and a backend author should judge their effort by that:
 	// WithOnCreate, the guarantee that a create-conditional side effect never fires for

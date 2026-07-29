@@ -532,10 +532,9 @@ func TestAddDependencyWakesOncePerEdge(t *testing.T) {
 }
 
 // TestAddDependencyStampRidesRefsAdd pins that the durable stamp is not a second
-// store call sequenced after the edge. Were it one, a caller nested in its own
-// Within could handle this method's error and commit the edge with no wake — a
-// stranded dependent, the very thing the stamp exists to prevent — because a
-// nested Within is a bare fn(ctx) that unwinds nothing.
+// store call sequenced after the edge, but a write inside EdgesAdd itself — so the
+// edge and its wake are indivisible in the store rather than by grace of the caller's
+// transaction being a real rollback boundary.
 //
 // That the stamp *cannot* be a second call is now structural: the Store interface
 // carries no standalone increment, so nothing on this path could issue one. What

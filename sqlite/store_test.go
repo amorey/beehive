@@ -1859,6 +1859,582 @@ func TestAfterCommit(t *testing.T) {
 	assert.False(t, rolledBack, "a rolled-back transaction must not run its hooks")
 }
 
+// createIn creates a bare object of testGK on ctx, joining whatever transaction
+// ctx carries. The savepoint tests use slugs to tell writes apart after the fact.
+func createIn(t *testing.T, store beehive.Store, ctx context.Context, slug string) {
+	t.Helper()
+	_, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Slug: new(slug), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+}
+
+// committed reports whether slug is in the committed state, read outside any
+// transaction.
+func committed(t *testing.T, store beehive.Store, slug string) bool {
+	t.Helper()
+	_, err := store.ObjectsGetBySlug(context.Background(), testGK, slug)
+	if errors.Is(err, beehive.ErrNotFound) {
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
+
+// TestWithinNestedErrorUnwindsItsOwnWrites is the whole feature in one test: the
+// outer caller *swallows* the nested error, so nothing but the nested Within
+// itself can be what rolled the nested write back.
+func TestWithinNestedErrorUnwindsItsOwnWrites(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		createIn(t, store, ctx, "outer")
+		err := store.Within(ctx, func(ctx context.Context) error {
+			createIn(t, store, ctx, "nested")
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		return nil // swallowed: the outer transaction still commits
+	}))
+
+	assert.True(t, committed(t, store, "outer"), "the outer write must commit")
+	assert.False(t, committed(t, store, "nested"), "the nested write must have unwound")
+}
+
+// TestWithinNestedErrorDiscardsOnlyItsOwnHooks pins the hook watermark: the hook
+// list is append-only and drains at the outermost commit, so an unwind that did
+// not truncate it would fire WithOnCreate for a row that rolled back.
+func TestWithinNestedErrorDiscardsOnlyItsOwnHooks(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	var ran []string
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		store.AfterCommit(ctx, func(context.Context) { ran = append(ran, "before") })
+		err := store.Within(ctx, func(ctx context.Context) error {
+			store.AfterCommit(ctx, func(context.Context) { ran = append(ran, "nested") })
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		store.AfterCommit(ctx, func(context.Context) { ran = append(ran, "after") })
+		return nil
+	}))
+
+	assert.Equal(t, []string{"before", "after"}, ran,
+		"the nested frame's hook must be discarded, and only it")
+}
+
+// TestWithinNestedSiblingsAreIndependent: a rewind must not take a later sibling
+// with it, which is what a savepoint per frame buys over one shared marker.
+func TestWithinNestedSiblingsAreIndependent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		err := store.Within(ctx, func(ctx context.Context) error {
+			createIn(t, store, ctx, "first")
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		return store.Within(ctx, func(ctx context.Context) error {
+			createIn(t, store, ctx, "second")
+			return nil
+		})
+	}))
+
+	assert.False(t, committed(t, store, "first"), "the failed sibling must have unwound")
+	assert.True(t, committed(t, store, "second"), "the later sibling must commit")
+}
+
+// TestWithinNestedUnwindsToTheRightDepth: an unwind at depth 2 leaves depth 1's
+// writes intact. Ordinary nesting runs this deep in production — a
+// ControllerClient.Within around a Client.Create around ObjectsCreate's self-wrap
+// is three frames — so this is the normal case, not an edge.
+func TestWithinNestedUnwindsToTheRightDepth(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		return store.Within(ctx, func(ctx context.Context) error {
+			createIn(t, store, ctx, "depth1")
+			err := store.Within(ctx, func(ctx context.Context) error {
+				createIn(t, store, ctx, "depth2")
+				return sentinel
+			})
+			assert.ErrorIs(t, err, sentinel)
+			return nil
+		})
+	}))
+
+	assert.True(t, committed(t, store, "depth1"), "depth 1 must be untouched by depth 2's unwind")
+	assert.False(t, committed(t, store, "depth2"), "depth 2 must have unwound")
+}
+
+// TestWithinFailedUnwindPoisonsTheTransaction: if the unwind itself fails the
+// transaction is in an unknown state, so it must neither accept further nested work
+// nor commit. Silently committing after a failed unwind is the exact failure the
+// savepoint boundary exists to make impossible.
+func TestWithinFailedUnwindPoisonsTheTransaction(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	var refused error
+	err := store.Within(ctx, func(ctx context.Context) error {
+		createIn(t, store, ctx, "before")
+
+		nerr := store.Within(ctx, func(ctx context.Context) error {
+			// Pop this frame's savepoint out from under its own unwind, so the
+			// ROLLBACK TO fails with "no such savepoint". That is the shape SQLITE_FULL,
+			// SQLITE_IOERR and SQLITE_NOMEM produce for real: they roll the whole
+			// transaction back, savepoint stack included, and a ROLLBACK TO naming a
+			// savepoint that no longer exists is what fails next.
+			fr, ok := txFrom(ctx)
+			require.True(t, ok)
+			_, err := fr.st.tx.ExecContext(ctx, savepointStmt("RELEASE", fr.st.savepoints))
+			require.NoError(t, err)
+			return sentinel
+		})
+		require.ErrorIs(t, nerr, sentinel, "the caller's own error must still surface")
+
+		// Swallowed, as a careless caller would. Further nested work must be refused
+		// rather than accumulate on a transaction in unknown state.
+		_, refused = store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Slug: new("after"), Spec: []byte(`{}`),
+		})
+		return nil
+	})
+
+	require.Error(t, err, "a poisoned transaction must not commit, even on a clean return")
+	assert.Error(t, refused, "a poisoned transaction must refuse further nested Withins")
+	assert.False(t, committed(t, store, "before"), "the whole transaction rolls back")
+	assert.False(t, committed(t, store, "after"))
+}
+
+// TestWithinOnAClosedTransactionOpensAFreshOne covers the ctx AfterCommit
+// deliberately keeps alive: the contract supports a hook passing back the
+// transaction ctx it captured rather than the detached one it was handed, and that
+// ctx still carries a txState whose *sql.Tx is committed.
+//
+// It must be driven from inside the hook. Doing it after the outer Within returns
+// would exercise only the deferred close and would pass even if closed were set too
+// late — and the hook-drain window is precisely the window the contract promises.
+func TestWithinOnAClosedTransactionOpensAFreshOne(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	var nestedErr, readErr error
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		createIn(t, store, txCtx, "seed")
+		store.AfterCommit(txCtx, func(context.Context) {
+			nestedErr = store.Within(txCtx, func(freshCtx context.Context) error {
+				createIn(t, store, freshCtx, "from-hook")
+				return nil
+			})
+			// conn has to agree with Within, or the same ctx takes a fresh
+			// transaction one way and a dead one the other.
+			_, readErr = store.ObjectsGetBySlug(txCtx, testGK, "seed")
+		})
+		return nil
+	}))
+
+	assert.NoError(t, nestedErr, "a Within on a closed transaction ctx must open a fresh one")
+	assert.True(t, committed(t, store, "from-hook"), "and the write it carries must land")
+	assert.NoError(t, readErr, "a bare read on that ctx must fall back to the pool")
+}
+
+// TestWithinRefusesAConcurrentNestedFrame: savepoints are a stack, so two
+// goroutines nesting on one transaction can interleave such that one's ROLLBACK TO
+// discards work the other already released. Refuse rather than serialise — holding a
+// lock across fn deadlocks the moment fn waits on another goroutine that also wants
+// the store.
+//
+// Its companion is TestWithinNestedUnwindsToTheRightDepth: ordinary deep nesting on
+// one goroutine must stay accepted, which is what makes this a concurrency check
+// rather than a depth limit.
+func TestWithinRefusesAConcurrentNestedFrame(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	tried := make(chan struct{})
+	var sibling error
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		return store.Within(txCtx, func(context.Context) error {
+			// Started from inside the first nested frame, so it is provably in flight;
+			// the frame then waits on the channel rather than on a clock.
+			go func() {
+				defer close(tried)
+				sibling = store.Within(txCtx, func(context.Context) error { return nil })
+			}()
+			select {
+			case <-tried:
+			case <-time.After(10 * time.Second):
+				t.Error("timed out waiting for the sibling goroutine")
+			}
+			return nil
+		})
+	}))
+
+	assert.ErrorIs(t, sibling, beehive.ErrStaleTxContext,
+		"a second goroutine nesting on the same transaction must be refused: its ctx is "+
+			"not the live frame, whoever won the race")
+}
+
+// TestWithinFailedSavepointDoesNotPoison: a SAVEPOINT that never lands pushed
+// nothing on the SQLite side, so the transaction's state is still known and ordinary
+// error handling applies. Poison is for a failed *unwind*, where it is not.
+func TestWithinFailedSavepointDoesNotPoison(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		fr, ok := txFrom(txCtx)
+		require.True(t, ok)
+		// Kill the transaction under the frame without latching txState.closed, so
+		// Within still takes the nested branch and the SAVEPOINT is what fails.
+		require.NoError(t, fr.st.tx.Rollback())
+
+		nerr := store.Within(txCtx, func(context.Context) error {
+			t.Error("fn must not run when its savepoint could not be opened")
+			return nil
+		})
+		assert.Error(t, nerr, "a failed SAVEPOINT must surface")
+		assert.NoError(t, fr.st.poisonErr(), "but it must not poison the transaction")
+		return nerr
+	})
+	assert.Error(t, err)
+}
+
+// TestWithinFailedReleasePoisons is the success-path half of the poison rule: fn
+// returned cleanly, so there is nothing to unwind, but the RELEASE that pops the
+// savepoint still failed and the stack is no longer what we think it is.
+func TestWithinFailedReleasePoisons(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		nerr := store.Within(txCtx, func(inner context.Context) error {
+			fr, ok := txFrom(inner)
+			require.True(t, ok)
+			require.NoError(t, fr.st.tx.Rollback())
+			return nil // clean return; the RELEASE below is what fails
+		})
+		assert.Error(t, nerr, "a failed RELEASE must surface even on a clean return")
+
+		fr, ok := txFrom(txCtx)
+		require.True(t, ok)
+		assert.Error(t, fr.st.poisonErr(), "and must poison the transaction")
+		return nerr
+	})
+	assert.Error(t, err)
+}
+
+// TestAfterCommitOnAFinishedTransaction: a hook runs if and only if the transaction
+// it was registered against committed. "The transaction is over" is not the question
+// — whether it committed is — so the outcome is retained, not just the fact that it
+// closed.
+//
+// A rolled-back outermost transaction is the same event as a nested frame unwinding,
+// one level up (see TestAfterCommitOnAnUnwoundFrameIsDiscarded), and gets the same
+// answer. Consistency with conn and Within, which treat a closed ctx as carrying no
+// transaction, does not extend here: falling back to the pool for a *read* is
+// harmless, firing a side effect for writes that are gone is the failure AfterCommit
+// exists to prevent.
+func TestAfterCommitOnAFinishedTransaction(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	for _, tc := range []struct {
+		name    string
+		outcome error
+		wantRun bool
+	}{
+		{"committed", nil, true},
+		{"rolled back", sentinel, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured context.Context
+			err := store.Within(ctx, func(txCtx context.Context) error {
+				captured = txCtx
+				return tc.outcome
+			})
+			require.ErrorIs(t, err, tc.outcome)
+
+			ran := false
+			store.AfterCommit(captured, func(context.Context) { ran = true })
+			assert.Equal(t, tc.wantRun, ran)
+		})
+	}
+}
+
+// TestWithinNestedUnwindsAfterContextCancellation: fn's ctx is the caller's, and a
+// caller may hand a nested frame a cancellable child. ExecContext returns before it
+// runs a statement on a canceled ctx, so an unwind issued on fn's own ctx would skip
+// the ROLLBACK TO entirely — leaving the frame's writes applied and poisoning a
+// transaction that is otherwise perfectly healthy. The savepoint statements must
+// therefore outlive fn's ctx.
+func TestWithinNestedUnwindsAfterContextCancellation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		createIn(t, store, txCtx, "outer")
+
+		childCtx, cancel := context.WithCancel(txCtx)
+		defer cancel()
+		err := store.Within(childCtx, func(nestedCtx context.Context) error {
+			createIn(t, store, nestedCtx, "nested")
+			cancel() // the caller's own ctx dies mid-frame
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		return nil // swallowed, exactly as the boundary contract allows
+	}))
+
+	assert.True(t, committed(t, store, "outer"), "the outer transaction must still commit")
+	assert.False(t, committed(t, store, "nested"), "and the nested frame must still have unwound")
+}
+
+// TestWithinNestedUnwindKeepsHooksFromEnclosingFrames: a hook queued by an enclosing
+// frame is not this frame's to discard, and slice position cannot tell them apart.
+// The enclosing ctx is in lexical scope inside the nested fn, so a single goroutine
+// reaches this without any concurrency — which is what makes it worth defending,
+// since sharing a transaction ctx across goroutines is out of contract anyway.
+func TestWithinNestedUnwindKeepsHooksFromEnclosingFrames(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	var ran []string
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		err := store.Within(txCtx, func(context.Context) error {
+			// Registered against the *enclosing* frame while this one is in flight, so
+			// it lands above this frame's position while belonging to the frame below.
+			store.AfterCommit(txCtx, func(context.Context) { ran = append(ran, "enclosing") })
+			return sentinel
+		})
+		assert.ErrorIs(t, err, sentinel)
+		return nil
+	}))
+
+	assert.Equal(t, []string{"enclosing"}, ran,
+		"the enclosing frame's hook must survive a nested frame's unwind")
+}
+
+// TestWithinNestedPanicPoisonsWhenRecovered: the outermost deferred tx.Rollback only
+// covers a panic that *escapes* Within. A caller that recovers inside its own fn and
+// returns nil leaves the abandoned frame's savepoint open, and COMMIT releases every
+// open savepoint — landing the writes of a frame that never completed.
+func TestWithinNestedPanicPoisonsWhenRecovered(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		func() {
+			defer func() { _ = recover() }()
+			_ = store.Within(txCtx, func(nestedCtx context.Context) error {
+				createIn(t, store, nestedCtx, "panicked")
+				panic("boom")
+			})
+		}()
+		return nil // recovered, and carrying on as if nothing happened
+	})
+
+	require.Error(t, err, "a frame abandoned by a panic must not be allowed to commit")
+	assert.False(t, committed(t, store, "panicked"), "its writes must not land")
+}
+
+// TestAfterCommitOnAnUnwoundFrameIsDiscarded: dropping a frame's queued hooks at the
+// unwind is not enough, because the frame's ctx can outlive the frame. A registration
+// arriving afterwards would be queued fresh and ride the outer commit, firing a hook
+// for writes that were rolled back — the precise failure the boundary exists to
+// prevent, arriving through the back door.
+//
+// No goroutine needed: capturing the nested ctx into an enclosing variable reaches it
+// on one goroutine, which is the only discipline the contract supports anyway.
+func TestAfterCommitOnAnUnwoundFrameIsDiscarded(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	ran := false
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		var captured context.Context
+		err := store.Within(txCtx, func(nested context.Context) error {
+			captured = nested
+			createIn(t, store, nested, "unwound")
+			return sentinel
+		})
+		require.ErrorIs(t, err, sentinel)
+
+		store.AfterCommit(captured, func(context.Context) { ran = true })
+		return nil // swallowed; the outer transaction still commits
+	}))
+
+	assert.False(t, ran, "a hook registered against an unwound frame must never run")
+	assert.False(t, committed(t, store, "unwound"))
+}
+
+// TestWithinRefusesToCommitWhileANestedFrameIsOpen closes the gap the depth check
+// alone leaves. A goroutine entering a nested Within while no frame happens to be
+// open passes the depth==height test legitimately; if the outer fn then returns
+// before that frame finishes, COMMIT releases its still-open savepoint and lands
+// writes the frame may be about to roll back — and by then nothing can undo them.
+//
+// Every nested frame pops in a defer, so on one goroutine height is always 0 by the
+// time fn returns. A nonzero height at the commit is therefore proof the ctx was
+// shared, which makes it a sound thing to refuse on.
+func TestWithinRefusesToCommitWhileANestedFrameIsOpen(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		go func() {
+			defer close(done)
+			// Errors here are the point of the test, not a failure of it: this frame
+			// outlives its transaction. require would also be illegal off the test
+			// goroutine.
+			_ = store.Within(txCtx, func(nested context.Context) error {
+				_, _ = store.ObjectsCreate(nested, &beehive.RawObject{
+					Group: testGK.Group, Kind: testGK.Kind, Slug: new("orphan"),
+					Spec: []byte(`{}`),
+				})
+				close(entered)
+				<-release
+				return errors.New("too late to matter")
+			})
+		}()
+		<-entered
+		return nil // returns while the child's frame is still open
+	})
+
+	close(release)
+	<-done
+
+	require.ErrorIs(t, err, beehive.ErrConcurrentNestedTx,
+		"committing under an open frame must be refused")
+	assert.False(t, committed(t, store, "orphan"), "and the orphaned frame's write must not land")
+}
+
+// TestTxStateSealForCommit drives the state machine directly. The window it closes —
+// between observing an empty frame stack and issuing COMMIT — is two adjacent
+// statements, so it is not deterministically reachable through the public path; what
+// *is* testable is that admission and the commit check share one lock, and that the
+// door stays shut once closed. Whitebox tests are the convention here precisely so
+// this kind of invariant can be pinned.
+func TestTxStateSealForCommit(t *testing.T) {
+	t.Run("shuts the door on later frames", func(t *testing.T) {
+		st := &txState{}
+		require.NoError(t, st.sealForCommit())
+
+		_, err := st.pushSavepoint(0, 0)
+		assert.ErrorIs(t, err, beehive.ErrStaleTxContext,
+			"a frame arriving after the seal must be refused, not released by the commit")
+	})
+
+	t.Run("refuses while a frame is open", func(t *testing.T) {
+		st := &txState{}
+		_, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, st.sealForCommit(), beehive.ErrConcurrentNestedTx)
+	})
+
+	t.Run("surfaces poison ahead of either", func(t *testing.T) {
+		st := &txState{}
+		st.poison(assert.AnError)
+
+		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
+	})
+}
+
+// TestWithinRefusesAContextFromAnUnwoundFrame: depth is reusable, so it cannot be the
+// whole admission test. Once a frame unwinds, a later sibling restores the height it
+// had, and a ctx captured from the dead frame matches again — on one goroutine, with
+// no concurrency anywhere.
+//
+// Admitting it would split the store's view of that frame: Within and conn would treat
+// it as live and let its rolled-back work commit, while addHook still finds its id
+// dead and discards hooks registered on the same ctx. A committed write whose
+// WithOnCreate never fires is the inverse of the guarantee this feature exists for.
+func TestWithinRefusesAContextFromAnUnwoundFrame(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		var captured context.Context
+		err := store.Within(txCtx, func(nested context.Context) error {
+			captured = nested
+			return sentinel
+		})
+		require.ErrorIs(t, err, sentinel)
+
+		// A live sibling at the same depth: the dead ctx's depth now matches the
+		// height again, which is all admission used to look at.
+		return store.Within(txCtx, func(context.Context) error {
+			_, createErr := store.ObjectsCreate(captured, &beehive.RawObject{
+				Group: testGK.Group, Kind: testGK.Kind, Slug: new("revived"),
+				Spec: []byte(`{}`),
+			})
+			assert.ErrorIs(t, createErr, beehive.ErrStaleTxContext)
+			return nil
+		})
+	}))
+
+	assert.False(t, committed(t, store, "revived"), "a dead frame's ctx must not write")
+}
+
+// TestTxStateUnwindFrameCoalesces: dead ranges are scanned linearly by every
+// admission and every hook registration, so an outer unwind absorbs the ranges of
+// frames opened inside it rather than letting the list grow once per unwind. A long
+// outer Within swallowing many nested errors would otherwise pay O(N²) under the
+// transaction mutex.
+func TestTxStateUnwindFrameCoalesces(t *testing.T) {
+	t.Run("absorbs the ranges of frames opened inside it", func(t *testing.T) {
+		st := &txState{}
+		outer, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+		inner, err := st.pushSavepoint(1, outer)
+		require.NoError(t, err)
+
+		st.unwindFrame(inner)
+		st.popSavepoint()
+		require.Equal(t, []idRange{{lo: inner, hi: inner}}, st.dead)
+
+		st.unwindFrame(outer)
+		assert.Equal(t, []idRange{{lo: outer, hi: inner}}, st.dead,
+			"the outer unwind must absorb the inner range, not stack another on it")
+	})
+
+	t.Run("keeps the ranges of earlier siblings", func(t *testing.T) {
+		st := &txState{}
+		first, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+		st.unwindFrame(first)
+		st.popSavepoint()
+
+		second, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+		st.unwindFrame(second)
+
+		assert.Equal(t, []idRange{{lo: first, hi: first}, {lo: second, hi: second}}, st.dead,
+			"a sibling was never inside this frame, so its range must survive")
+	})
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2373,14 +2949,62 @@ func TestRefsAddStampsOnlyNewEdge(t *testing.T) {
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "still the one wake owed")
 }
 
-// TestRefsAddStampFailureLeavesNoEdge is the ordering guarantee itself. The stamp
-// is a write, so it must land *before* the insert: a nested Within is a bare
-// fn(ctx) with no transaction of its own, so a caller that handles EdgesAdd's
-// error — here by swallowing it and committing the ambient transaction anyway —
-// unwinds nothing. Were the stamp sequenced after the insert, that caller would
-// commit an edge with no wake, stranding the dependent on a stale read where
-// ObjectsListUnsettledIDs cannot see it. Running last, the insert simply never
-// happens.
+// probeEdgeInsertOwed records from_id's reconcile_owed at the instant the edge row
+// lands. That instant is the only place the ordering inside EdgesAdd is observable:
+// once the transaction commits, a stamp written before the insert and one written
+// after are indistinguishable.
+func probeEdgeInsertOwed(t *testing.T, store *sqliteStore) func() int64 {
+	t.Helper()
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `CREATE TABLE edge_insert_probe (owed INTEGER)`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `
+		CREATE TRIGGER edge_insert_probe AFTER INSERT ON edges
+		BEGIN
+			INSERT INTO edge_insert_probe(owed)
+			SELECT reconcile_owed FROM objects WHERE id = NEW.from_id;
+		END`)
+	require.NoError(t, err)
+
+	return func() int64 {
+		t.Helper()
+		var owed int64
+		require.NoError(t, store.db.QueryRowContext(ctx,
+			`SELECT owed FROM edge_insert_probe`).Scan(&owed))
+		return owed
+	}
+}
+
+// TestRefsAddStampsBeforeTheInsert pins the ordering directly, which no other test
+// does: the savepoint boundary now unwinds both writes together, so every
+// after-the-fact assertion reads the same under either order and an insert-then-stamp
+// refactor would go green. The ordering is still load-bearing wherever the boundary
+// does not apply, and there the residual flips from a self-draining spurious wake to a
+// permanently stranded dependent.
+func TestRefsAddStampsBeforeTheInsert(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	owedAtInsert := probeEdgeInsertOwed(t, store)
+
+	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
+	require.NoError(t, err)
+
+	assert.EqualValues(t, 1, owedAtInsert(),
+		"the wake must already be stamped on the row when the edge lands")
+}
+
+// TestRefsAddStampFailureLeavesNoEdge is one half of the ordering guarantee: the
+// stamp fails, and the insert that would have followed it never runs, so there is no
+// edge without a wake. RAISE(ABORT) undoes the statement rather than the transaction,
+// which is what keeps the ambient transaction committable and puts this in the band
+// where ordering — not the savepoint boundary — is what holds.
+//
+// The boundary covers the common failures now, so this is defence for the case where
+// it does not apply. The other half, that the stamp really is issued first, is pinned
+// from inside the transaction by TestRefsAddStampsBeforeTheInsert: from out here both
+// writes are simply present, and either order looks the same.
 func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -2406,19 +3030,22 @@ func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	assert.Zero(t, reconcileOwed(t, store, a.ID))
 }
 
-// TestRefsAddEdgeFailureLeavesStamp is the other side of the ordering tradeoff, and
-// pins that it fails the way the design claims rather than merely asserting it in a
-// comment. Stamp first, insert second means the reverse residual is possible: the
-// insert aborts, the caller swallows EdgesAdd's error and commits the ambient
-// transaction, and a wake is owed for an edge that does not exist.
+// TestRefsAddEdgeFailureUnwindsTheStamp is the other side of the ordering tradeoff.
+// Stamp first, insert second admits a reverse residual: the insert aborts, the
+// caller swallows EdgesAdd's error and commits the ambient transaction, and a wake
+// is owed for an edge that does not exist.
 //
-// That is the deliberately chosen direction. This residual is self-correcting — the
-// count is drained by the next reconcile of that object (TestReconcileDecrementsReconcileOwed
-// drains exactly such an edgeless wake), costing one spurious no-op pass — whereas
-// the opposite ordering leaves an edge with no wake, which nothing re-derives and
-// ObjectsListUnsettledIDs cannot see. One is a wasted reconcile; the other is a permanently
-// stale dependent.
-func TestRefsAddEdgeFailureLeavesStamp(t *testing.T) {
+// That residual is now gone, and this test is what pins it gone. EdgesAdd self-wraps
+// in Within, and a nested Within is a savepoint boundary, so the aborted insert
+// unwinds the stamp issued ahead of it — the caller's swallow commits neither. What
+// used to be "a self-draining spurious wake" is simply nothing.
+//
+// The ordering argument it used to illustrate is unaffected and still governs
+// EdgesAdd: stamp-then-insert is chosen because the opposite leaves an edge with no
+// wake, which nothing re-derives and ObjectsListUnsettledIDs cannot see. Savepoints
+// make the failure atomic; they do not make the ordering arbitrary, and this test
+// would go back to pinning a spurious wake if the self-wrap were ever removed.
+func TestRefsAddEdgeFailureUnwindsTheStamp(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
@@ -2434,8 +3061,8 @@ func TestRefsAddEdgeFailureLeavesStamp(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge did not land")
-	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID),
-		"the stamp did, and stands as a self-draining spurious wake rather than a lost one")
+	assert.Zero(t, reconcileOwed(t, store, a.ID),
+		"and neither did the stamp: EdgesAdd's savepoint unwound it with the failed insert")
 }
 
 // blockWatermarkDeletes makes every DELETE from dependency_watermarks abort,

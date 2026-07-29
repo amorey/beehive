@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,9 +46,29 @@ func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
 
-// txKey carries the in-flight transaction through the context so that Store
+// txKey carries the in-flight transaction frame through the context so that Store
 // calls made with the ctx passed to Within join it.
 type txKey struct{}
+
+// txFrame is one Within frame: the transaction state every frame shares, plus this
+// frame's depth in the savepoint stack.
+//
+// The depth travels *with* the state, never under a key of its own. A separate key
+// would be sticky — it survives everything that does not explicitly clear it, and
+// installing a transaction only installs txKey — so a ctx carrying a stale depth
+// from a finished transaction would install a fresh txState at height 0 while still
+// reporting nonzero depth, and the first nested call inside it would look like a
+// concurrent frame. AfterCommit's hook ctx is exactly such a ctx: it strips txKey and
+// nothing else. Folding the two into one value makes installing a transaction reset
+// the depth by construction, for the same reason txState keeps tx and hooks together.
+type txFrame struct {
+	st    *txState
+	depth int
+	// id is this frame's savepoint number, 0 for the outermost. It records which
+	// frame owns a queued hook, so an unwind can drop the hooks belonging to itself
+	// and to anything nested inside it while leaving enclosing frames' alone.
+	id int64
+}
 
 // txState is what a transaction puts on the context: the connection every store
 // call made with that ctx joins, plus the hooks owed its commit.
@@ -59,41 +80,336 @@ type txKey struct{}
 type txState struct {
 	tx *sql.Tx
 
-	// mu guards hooks against a Within whose fn fans store calls across goroutines
-	// on the tx ctx. flushed latches the list closed: a hook that holds the tx ctx
-	// it was registered on can reach AfterCommit again after commit, and appending
-	// there would be a silent drop.
-	mu      sync.Mutex
-	hooks   []func()
-	flushed bool
+	// mu guards this state against a Within whose fn fans calls across goroutines on
+	// the tx ctx. A nested Within from a sibling goroutine is refused outright (see
+	// pushSavepoint), but AfterCommit and bare reads are not nested Withins and stay
+	// legal concurrently — which is why a queued hook records its owning frame rather
+	// than relying on where it landed in the slice.
+	//
+	mu    sync.Mutex
+	hooks []queuedHook
+
+	// closed latches once the transaction is over, by either outcome, and is the whole
+	// answer to "is this ctx still inside a transaction?". A ctx carrying this txState
+	// outlives the transaction — AfterCommit's contract lets a hook pass back the tx
+	// ctx it captured — so every consumer degrades on it together: Within opens a
+	// fresh transaction, conn falls back to the pool, and AfterCommit runs the hook
+	// inline, which is what it already does for a ctx that never had a transaction.
+	//
+	closed bool
+
+	// committed records *how* it ended, and only flush sets it — which runs only after
+	// tx.Commit returned nil. closed alone cannot answer AfterCommit: a hook runs if
+	// and only if the transaction it was registered against committed, so "over" and
+	// "over and durable" are different questions and the pair is not redundant.
+	committed bool
+
+	// sealed latches just before the commit, and is what pushSavepoint refuses on. It
+	// is deliberately not closed: between the seal and the drain the transaction is
+	// still heading for a successful commit, so a hook arriving in that window must
+	// queue and run, not be treated as belonging to a finished transaction.
+	sealed bool
+
+	// dead is the id ranges of frames that unwound. Dropping a frame's queued hooks is
+	// not enough on its own, because its ctx can outlive it: a registration arriving
+	// afterwards would be queued fresh and ride the outer commit, firing for writes
+	// that were rolled back.
+	dead []idRange
+
+	// savepoints counts the savepoints this transaction has opened, ever. It names
+	// them; it is not a stack height. Monotonic on purpose: a depth-indexed name is
+	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
+	// recent match — correct, but it leaves the next reader proving it.
+	savepoints int64
+
+	// height is the current savepoint stack depth, which a nested frame's ctx depth
+	// must match to be the rightful next frame. Unlike savepoints it goes back down.
+	height int
+
+	// poisoned latches the first failed unwind. After one, the transaction's state is
+	// unknown, so it must neither take further nested work nor commit.
+	//
+	// Not paranoia: SQLite rolls the whole transaction back — savepoint stack
+	// included — on SQLITE_FULL, SQLITE_IOERR and SQLITE_NOMEM, and a ROLLBACK TO
+	// issued after one of those genuinely fails, because the savepoint it names is
+	// gone. The common errors are not in that class: SQLITE_BUSY and constraint
+	// violations abort a statement, not the transaction, so savepoints behave
+	// normally through them.
+	poisoned error
 }
 
-// addHook queues fn, reporting whether it took ownership. A false return means the
-// commit has already run its hooks, so the caller must run fn itself rather than
-// queue it where nothing will look again.
-func (st *txState) addHook(fn func()) bool {
+// poison latches err as the first failed unwind. A later one adds nothing: the
+// state was already unknown.
+func (st *txState) poison(err error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.flushed {
-		return false
+	if st.poisoned == nil {
+		st.poisoned = err
 	}
-	st.hooks = append(st.hooks, fn)
-	return true
 }
 
-// takeHooks drains the queue and latches it closed.
-func (st *txState) takeHooks() []func() {
+func (st *txState) poisonErr() error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.poisoned
+}
+
+// savepointStmt builds "<verb> bh_sp_<n>". The name is interpolated rather than
+// bound because SQLite accepts no parameter where a savepoint name goes; n is an
+// int64 this package owns, so there is nothing to escape. AppendInt over a stack
+// array keeps this off fmt, which matters because modernc.org/sqlite compiles each
+// statement fresh and these are the most trivial statements we issue.
+func savepointStmt(verb string, n int64) string {
+	var buf [40]byte
+	b := append(buf[:0], verb...)
+	b = append(b, " bh_sp_"...)
+	b = strconv.AppendInt(b, n, 10)
+	return string(b)
+}
+
+// pushSavepoint admits a new nested frame, reserving its savepoint name and the hook
+// watermark to unwind to. All under mu, since a Within fn may fan store calls across
+// goroutines — which is also what depth guards against: a frame whose ctx depth does
+// not match the live stack height was entered from somewhere that does not own the
+// top of the stack.
+func (st *txState) pushSavepoint(depth int, caller int64) (name int64, err error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.poisoned != nil {
+		return 0, st.poisoned
+	}
+	// The caller's own frame is checked as well as the depth, because depth alone is
+	// reusable: once a frame unwinds, a later sibling restores the height it had, and a
+	// ctx captured from the dead frame would match again. Admitting it would rewrite
+	// its rolled-back work into a transaction heading for a commit, while addHook goes
+	// on discarding hooks registered on that same ctx — the store answering "is this
+	// frame alive" two different ways.
+	if st.sealed || depth != st.height || st.deadLocked(caller) {
+		return 0, storeapi.ErrStaleTxContext
+	}
+	st.height++
+	st.savepoints++
+	return st.savepoints, nil
+}
+
+// sealForCommit closes the transaction to new frames and reports whether committing
+// is safe. It answers both questions under the same lock that admits frames, so
+// nothing can be admitted between the check and the commit — a frame slipping into
+// that gap would have its savepoint released by the commit and its writes persisted
+// with no way left to unwind them.
+//
+// Every nested frame pops in a defer, so on a single goroutine the stack is empty by
+// the time fn returns; a live frame here can only belong to another goroutine.
+func (st *txState) sealForCommit() error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.poisoned != nil {
+		return st.poisoned
+	}
+	if st.height != 0 {
+		return storeapi.ErrConcurrentNestedTx
+	}
+	st.sealed = true
+	return nil
+}
+
+// popSavepoint restores the stack height. It runs on every exit path from an admitted
+// frame, including one whose SAVEPOINT failed: leaving the height raised would give
+// every later sibling on this transaction a spurious ErrConcurrentNestedTx.
+func (st *txState) popSavepoint() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// Unconditional: every push is paired with exactly one deferred pop, so a guard
+	// here could only hide an imbalance rather than tolerate one.
+	st.height--
+}
+
+// nested runs fn inside a SAVEPOINT on the ambient transaction, so an error fn
+// returns unwinds fn's writes and its queued hooks whatever the outer caller then
+// does with that error — including swallowing it. The outermost transaction is
+// still the only thing that commits, and a savepoint adds no fsync, so durability
+// is unchanged.
+//
+// Nothing here recovers. A panic unwinding through this frame skips the RELEASE and
+// leaves the savepoint open on the SQLite side, so the frame is *abandoned* rather
+// than settled — and COMMIT releases every open savepoint, which would land the
+// writes of a frame that never completed. The outermost deferred tx.Rollback only
+// covers a panic that escapes Within entirely; a caller that recovers inside its own
+// fn and returns nil defeats it. So an abandoned frame poisons, which is the one
+// state that survives a recover.
+func (st *txState) nested(ctx context.Context, depth int, caller int64, fn func(ctx context.Context) error) error {
+	// pushSavepoint refuses outright once an unwind has failed. The outermost check
+	// is what guarantees the rollback; this one keeps a caller that swallowed the
+	// poison error from piling writes onto a transaction in unknown state.
+	name, err := st.pushSavepoint(depth, caller)
+	if err != nil {
+		return err
+	}
+	settled := false
+	defer func() {
+		st.popSavepoint()
+		if !settled {
+			st.poison(errAbandonedFrame)
+		}
+	}()
+	if _, err := st.tx.ExecContext(ctx, savepointStmt("SAVEPOINT", name)); err != nil {
+		// Nothing was pushed on the SQLite side, so the state is still known and the
+		// caller's ordinary error handling is the right answer. No poison.
+		settled = true
+		return err
+	}
+	// The unwind must outlive fn's ctx. That ctx belongs to the caller, who may hand
+	// this frame a cancellable child and cancel it inside fn; ExecContext returns
+	// before running a statement on a canceled ctx, so an unwind issued on it would
+	// silently skip, leaving this frame's writes applied and poisoning a transaction
+	// that is otherwise healthy. Cancellation is the caller's signal about fn, not
+	// about the bookkeeping that cleans up after it.
+	cleanupCtx := context.WithoutCancel(ctx)
+	ferr := fn(context.WithValue(ctx, txKey{}, &txFrame{st: st, depth: depth + 1, id: name}))
+	if ferr != nil {
+		st.unwindFrame(name)
+		if _, err := st.tx.ExecContext(cleanupCtx, savepointStmt("ROLLBACK TO", name)); err != nil {
+			settled = true // already poisoned, and with a better error than the defer's
+			st.poison(err)
+			return errors.Join(ferr, err)
+		}
+	}
+	// RELEASE pops the savepoint on both outcomes: ROLLBACK TO rewinds to it but
+	// leaves it on the stack, so without this the stack would grow for the life of the
+	// transaction. errors.Join drops a nil ferr, so the success path returns the
+	// RELEASE error alone.
+	if _, err := st.tx.ExecContext(cleanupCtx, savepointStmt("RELEASE", name)); err != nil {
+		settled = true // as above: the specific failure beats the generic one
+		st.poison(err)
+		return errors.Join(ferr, err)
+	}
+	settled = true
+	return ferr
+}
+
+// errAbandonedFrame poisons a transaction whose nested frame exited without settling
+// its savepoint — in practice, a panic unwinding through it. The savepoint is still
+// open, and COMMIT would release it and land that frame's writes.
+var errAbandonedFrame = errors.New("beehive: nested transaction frame abandoned without unwinding")
+
+// queuedHook is a hook plus the frame that registered it. Ownership is recorded
+// rather than inferred from slice position: AfterCommit is not a nested Within, so it
+// stays legal from another goroutine, and a concurrent append lands at a position
+// that says nothing about which frame it belongs to.
+type queuedHook struct {
+	owner int64
+	fn    func()
+}
+
+// idRange is a half of the frame-id space belonging to a frame that unwound: the
+// frame itself, and every frame opened inside it. Ids are monotonic and a frame only
+// opens while its enclosing frame is live, so the descendants of frame lo are exactly
+// the ids issued between lo and the counter's value when lo unwound.
+type idRange struct{ lo, hi int64 }
+
+// hookDisposition is what addHook decided to do with a hook. A hook runs if and only
+// if the transaction it was registered against committed and the frame it was
+// registered against did not unwind; the three outcomes are that rule's branches.
+type hookDisposition int
+
+const (
+	hookQueued  hookDisposition = iota // waits for the outermost commit
+	hookRunNow                         // that commit happened already; "after" it is now
+	hookDiscard                        // the writes it was owed to are gone; it must never run
+)
+
+// addHook queues fn and reports what became of it. Queueing where nothing will look
+// again is a silent drop, which is what this return exists to prevent.
+func (st *txState) addHook(owner int64, fn func()) hookDisposition {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// Checked before closed: a frame that rolled back must not run its hooks whatever
+	// became of the transaction around it.
+	if st.deadLocked(owner) {
+		return hookDiscard
+	}
+	if st.closed {
+		if !st.committed {
+			// A rolled-back outermost transaction is a nested frame unwinding, one level
+			// up, and gets the same answer: its writes are gone, so nothing owed to its
+			// commit may fire. Running inline here would be the create-conditional side
+			// effect for a row that never landed — the one failure this exists to stop.
+			return hookDiscard
+		}
+		// Committed and drained, so "after the commit" is now. Queueing would be a
+		// silent drop.
+		return hookRunNow
+	}
+	st.hooks = append(st.hooks, queuedHook{owner: owner, fn: fn})
+	return hookQueued
+}
+
+// close latches the transaction closed, by either outcome. Idempotent, so the
+// commit path can call it eagerly and the deferred call still covers the rest.
+func (st *txState) close() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.closed = true
+}
+
+func (st *txState) isClosed() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.closed
+}
+
+// flush latches the transaction closed *and committed* and drains the queue in one
+// critical section, so no registration can land after the close but before the drain
+// and be queued where nothing will look again. Only the commit path calls it, which
+// is what makes committed trustworthy.
+func (st *txState) flush() []queuedHook {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	hooks := st.hooks
-	st.hooks, st.flushed = nil, true
+	st.hooks, st.closed, st.committed = nil, true, true
 	return hooks
 }
 
-// txFrom returns the ambient transaction state, if any.
-func txFrom(ctx context.Context) (*txState, bool) {
-	st, ok := ctx.Value(txKey{}).(*txState)
-	return st, ok
+// unwindFrame discards the hooks owned by frame name and by every frame opened inside
+// it, and marks that whole id range dead so a later registration against any of them
+// is refused rather than queued fresh. Hooks from enclosing frames keep their place
+// and their order.
+func (st *txState) unwindFrame(name int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	kept := st.hooks[:0]
+	for _, h := range st.hooks {
+		if h.owner < name {
+			kept = append(kept, h)
+		}
+	}
+	st.hooks = kept
+	// Ranges from frames opened inside this one are subsumed by the range about to be
+	// appended, so drop them rather than letting the list grow per unwind and be
+	// rescanned by every addHook.
+	live := st.dead[:0]
+	for _, r := range st.dead {
+		if r.lo < name {
+			live = append(live, r)
+		}
+	}
+	st.dead = append(live, idRange{lo: name, hi: st.savepoints})
+}
+
+// deadLocked reports whether id belongs to a frame that unwound. Callers hold mu.
+func (st *txState) deadLocked(id int64) bool {
+	for _, r := range st.dead {
+		if id >= r.lo && id <= r.hi {
+			return true
+		}
+	}
+	return false
+}
+
+// txFrom returns the ambient transaction frame, if any.
+func txFrom(ctx context.Context) (*txFrame, bool) {
+	fr, ok := ctx.Value(txKey{}).(*txFrame)
+	return fr, ok
 }
 
 // dbtx is the subset of *sql.DB and *sql.Tx the object queries use, so the same
@@ -104,10 +420,20 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// conn returns the ambient transaction if ctx carries one, else the pool.
+// conn returns the ambient transaction if ctx carries a live one, else the pool. A
+// closed txState degrades to the pool for the same reason Within opens a fresh
+// transaction on one: the ctx outlives its transaction, and half of it behaving as
+// "the transaction is over" would be worse than neither half doing so.
+//
+// The cost of that choice, stated plainly: a *write* issued on a captured ctx after
+// its transaction finished used to fail loudly with sql.ErrTxDone and now commits
+// standalone on the pool. Reads are what the fallback is for; writes come along with
+// it, and nothing here can tell them apart. A hook should use the detached ctx it was
+// handed rather than the one it captured — that is what the AfterCommit contract asks
+// for, and it is the only ctx that means "the transaction is over" unambiguously.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
-	if st, ok := txFrom(ctx); ok {
-		return st.tx
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		return fr.st.tx
 	}
 	return s.db
 }
@@ -132,9 +458,15 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // AfterCommit hooks are the one thing deferred to the commit, and they run only
 // on a clean one. A nested Within joins the outer transaction's queue, so a hook
 // registered deep inside a caller's Within still waits for the outermost commit.
+//
+// A nested Within is a real rollback boundary: it runs fn inside a SAVEPOINT, so an
+// error fn returns unwinds fn's own writes and its own queued hooks even if the
+// outer caller swallows that error. Without it, any multi-write composition would be
+// atomic only by the grace of its callers.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
-	if _, ok := txFrom(ctx); ok {
-		return fn(ctx) // nested: joins the outer tx and its hook queue
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		// nested: a savepoint on the outer tx, joining its hook queue
+		return fr.st.nested(ctx, fr.depth, fr.id, fn)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -142,18 +474,35 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		return err
 	}
 	st := &txState{tx: tx}
-	ctx = context.WithValue(ctx, txKey{}, st)
+	defer st.close() // covers the rollback and early-return paths
+	ctx = context.WithValue(ctx, txKey{}, &txFrame{st: st})
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
 	if err := fn(ctx); err != nil {
 		return err // hooks discarded, nothing ran
 	}
+	// A clean return from fn is not enough to commit on. A failed unwind inside leaves
+	// state we cannot reason about, and a frame still open belongs to another
+	// goroutine — COMMIT releases every open savepoint, so committing would land that
+	// frame's writes and leave it holding an error it can no longer act on. The depth
+	// check cannot see the latter: a frame entered while the stack happened to be
+	// empty passes it legitimately, and only outliving fn makes it a fault.
+	//
+	// Both are asked, and the door is shut on new frames, in one critical section. The
+	// deferred Rollback is what actually discards the transaction on either answer.
+	if err := st.sealForCommit(); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// After the commit and outside any lock: a hook is caller code and may write to
-	// the store, which would re-enter Within.
-	for _, hook := range st.takeHooks() {
-		hook()
+	// flush latches closed before the hooks below run — they run inside this function,
+	// so a close deferred to its return would read false for the whole window in which
+	// a hook can hand its captured tx ctx back to the store.
+	hooks := st.flush()
+	// Outside any lock: a hook is caller code and may write to the store, which would
+	// re-enter Within.
+	for _, hook := range hooks {
+		hook.fn()
 	}
 	return nil
 }
@@ -165,20 +514,24 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 // in here after the commit drained the queue, and "run after the commit" is
 // satisfied by running now, not by queueing where nothing will look again.
 func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context)) {
-	st, ok := txFrom(ctx)
+	fr, ok := txFrom(ctx)
 	if !ok {
 		fn(ctx) // nothing to defer to, and nothing to strip
 		return
 	}
+	st := fr.st
 	// Strip the transaction before handing the ctx on: by the time the hook runs
 	// that *sql.Tx is committed, so a store call joining it would fail outright.
 	// A hook that writes gets a fresh transaction, which is the only thing it could
 	// have meant. Everything else on the ctx is inherited.
 	hookCtx := context.WithValue(ctx, txKey{}, nil)
-	if st.addHook(func() { fn(hookCtx) }) {
-		return
+	switch st.addHook(fr.id, func() { fn(hookCtx) }) {
+	case hookRunNow:
+		fn(hookCtx)
+	case hookDiscard:
+		// Deliberately nothing: the frame it was registered against rolled back, so
+		// running it would fire for writes that are gone.
 	}
-	fn(hookCtx)
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.
@@ -1548,14 +1901,14 @@ const edgeIsNew = `NOT EXISTS (
 // writers on one connection.
 //
 // The insert is deliberately the *last* write: every fallible step precedes the
-// edge coming into existence. A nested Within is a bare fn(ctx) with no
-// transaction of its own, so an error returned from here unwinds nothing — a
-// caller sharing an ambient transaction and handling the error would commit
-// whatever already landed. Ordering is therefore the only guarantee available,
-// and it points the residual failure the harmless way: a stamp with no edge is
-// one spurious owed wake, which costs a no-op reconcile and drains back to zero,
-// where an edge with no stamp is a dependent stranded on a stale read that
-// ObjectsListUnsettledIDs structurally cannot see.
+// edge coming into existence. The self-wrap above now makes that atomic on its own —
+// a nested Within is a savepoint boundary, so a caller who swallows this method's
+// error commits neither the stamp nor the edge — and the ordering is kept anyway,
+// because it points the residual failure the harmless way without depending on the
+// boundary holding. A stamp with no edge is one spurious owed wake, which costs a
+// no-op reconcile and drains back to zero; an edge with no stamp is a dependent
+// stranded on a stale read that ObjectsListUnsettledIDs structurally cannot see.
+// Getting the cheap half of that for free is worth not spending the boundary on.
 func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesAddResult, error) {
 	var out storeapi.EdgesAddResult
 	err := s.Within(ctx, func(ctx context.Context) error {

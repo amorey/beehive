@@ -375,49 +375,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   one database file. Revisit before the first real `Migrator` consumer ships a v2, or
   the first time a rollback across a schema bump has to be supported.
 
-- **A nested `Within` is not a rollback boundary**, so no multi-write composition is
-  atomic against a caller that handles its own error — known, not fixed.
-
-  When `sqliteStore.Within` finds a transaction already on the context it just returns
-  `fn(ctx)`: the nested call joins the outer transaction and opens nothing of its own.
-  So an error returned from inside a nested `Within` unwinds nothing. Only the
-  outermost caller, passing it back to the real `Within`, rolls anything back, and a
-  caller that logs and carries on commits every write that already landed. Any pair of
-  writes is therefore atomic only by the grace of its callers. Today that means a
-  controller's own multi-write `Within` block, since every store mutator is a single
-  self-wrapping write.
-
-  `DependenciesAdd` shows the local way out. A stamp issued as a second store call
-  after `EdgesAdd` would let a caller that swallowed the stamp's error commit the edge
-  with no stamp — exactly the stranded dependent the stamp exists to prevent.
-  The answer was ordering: fold the stamp into `EdgesAdd` ahead of the insert, so no
-  write can fail after the edge exists. It works only because there are two writes
-  and one can be moved, so it does
-  not generalize: reorder anything whose second write depends on the first and there is
-  nowhere to put it.
-
-    The general fix is `SAVEPOINT`: the nested branch of `Within` would issue
-  `SAVEPOINT`, then `ROLLBACK TO` on an error and `RELEASE` on success. That would make
-  every nested composition a real boundary and retire the whole class, including the
-  reordering above, which could then be written in whatever order reads best.
-
-  Deferred because the cost is not in the SQL. Two things make it bigger than it looks:
-
-  - The `txState` hook list is append-only and drains at the outermost commit, so a
-    savepoint rollback has to unwind it too. `AfterCommit` hooks would need truncating
-    back to a watermark taken at the `SAVEPOINT`, with the `flushed` latch's
-    late-registration path thought through against that — otherwise a `WithOnCreate`
-    fires for a row that was just rolled back.
-  - It changes the meaning of every nested `Within` at once, on a store where the whole
-    suite runs through this one function. Anything relying on "a nested error unwinds
-    nothing" would quietly start behaving differently, which needs an audit rather than
-    an assumption.
-
-  Two extra statements per nested `Within` is the smaller cost. Revisit when a second
-  case turns up that ordering *cannot* fix — that is the signal the local fixes have
-  run out — or if the hook list grows a watermark for some other reason, which would
-  remove most of the work.
-
 - **`OpenPool` never sets `auto_vacuum`, and that door closes behind us** — known, not
   fixed, and the only item here with a deadline. The mode has to be chosen *before the
   first table exists*; on a database that already has one, switching it requires a full

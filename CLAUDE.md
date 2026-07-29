@@ -110,6 +110,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation that the owed pass lists, a delete sets the `deletion_requested_at` that the
   sweeper lists. `Store.AfterCommit` exists for one thing, the `WithOnCreate` hook.
   → [ADR](docs/adr/2026-07-27-slug-keyed-writes.md)
+- **A nested `Within` is a real rollback boundary.** It runs on a `SAVEPOINT`, so an
+  error unwinds that frame's writes and its queued `AfterCommit` hooks even if the
+  outer caller swallows it; only the outermost transaction commits. Depth rides on the
+  ctx *beside* the transaction state, never under a key of its own — a stale depth
+  would ride into a fresh transaction. A nested `Within` from a sibling goroutine is
+  refused with `ErrConcurrentNestedTx` (ordinary deep nesting is not that case), and a
+  failed unwind poisons the transaction rather than letting it commit. This is what
+  retires the class of bug `EdgesAdd` had to solve by *ordering*.
+  → [ADR](docs/adr/2026-07-29-nested-within-savepoints.md)
 - **The generic boundary is `Register`.** `Register[Spec, Status]` wraps the user's
   typed `Controller` in a `typedController` adapter (`reconciler.go`) that satisfies
   the non-generic `controllerAdapter`. Everything below it — reconciler, work queue,
