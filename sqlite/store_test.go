@@ -1975,6 +1975,47 @@ func TestWithinNestedUnwindsToTheRightDepth(t *testing.T) {
 	assert.False(t, committed(t, store, "depth2"), "depth 2 must have unwound")
 }
 
+// TestWithinFailedUnwindPoisonsTheTransaction: if the unwind itself fails the
+// transaction is in an unknown state, so it must neither accept further nested work
+// nor commit. Silently committing after a failed unwind is the exact failure the
+// savepoint boundary exists to make impossible.
+func TestWithinFailedUnwindPoisonsTheTransaction(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	var refused error
+	err := store.Within(ctx, func(ctx context.Context) error {
+		createIn(t, store, ctx, "before")
+
+		nerr := store.Within(ctx, func(ctx context.Context) error {
+			// Pop this frame's savepoint out from under its own unwind, so the
+			// ROLLBACK TO fails with "no such savepoint". That is the shape SQLITE_FULL,
+			// SQLITE_IOERR and SQLITE_NOMEM produce for real: they roll the whole
+			// transaction back, savepoint stack included, and a ROLLBACK TO naming a
+			// savepoint that no longer exists is what fails next.
+			st, ok := txFrom(ctx)
+			require.True(t, ok)
+			_, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", st.savepoints))
+			require.NoError(t, err)
+			return sentinel
+		})
+		require.ErrorIs(t, nerr, sentinel, "the caller's own error must still surface")
+
+		// Swallowed, as a careless caller would. Further nested work must be refused
+		// rather than accumulate on a transaction in unknown state.
+		_, refused = store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Slug: new("after"), Spec: []byte(`{}`),
+		})
+		return nil
+	})
+
+	require.Error(t, err, "a poisoned transaction must not commit, even on a clean return")
+	assert.Error(t, refused, "a poisoned transaction must refuse further nested Withins")
+	assert.False(t, committed(t, store, "before"), "the whole transaction rolls back")
+	assert.False(t, committed(t, store, "after"))
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

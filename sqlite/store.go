@@ -73,6 +73,33 @@ type txState struct {
 	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
 	// recent match — correct, but it leaves the next reader proving it.
 	savepoints int64
+
+	// poisoned latches the first failed unwind. After one, the transaction's state is
+	// unknown, so it must neither take further nested work nor commit.
+	//
+	// Not paranoia: SQLite rolls the whole transaction back — savepoint stack
+	// included — on SQLITE_FULL, SQLITE_IOERR and SQLITE_NOMEM, and a ROLLBACK TO
+	// issued after one of those genuinely fails, because the savepoint it names is
+	// gone. The common errors are not in that class: SQLITE_BUSY and constraint
+	// violations abort a statement, not the transaction, so savepoints behave
+	// normally through them.
+	poisoned error
+}
+
+// poison latches err as the first failed unwind. A later one adds nothing: the
+// state was already unknown.
+func (st *txState) poison(err error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.poisoned == nil {
+		st.poisoned = err
+	}
+}
+
+func (st *txState) poisonErr() error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.poisoned
 }
 
 // savepointStmt builds "<verb> bh_sp_<n>". The name is interpolated rather than
@@ -123,8 +150,16 @@ func (st *txState) truncateHooks(mark int) {
 // tx.Rollback discards the whole transaction, savepoint stack included. A recover
 // here would turn a panic into a half-committed transaction.
 func (st *txState) nested(ctx context.Context, fn func(ctx context.Context) error) error {
+	// Refuse up front once an unwind has failed. The outermost check below is what
+	// guarantees the rollback; this one keeps a caller that swallowed the poison
+	// error from piling writes onto a transaction in unknown state.
+	if err := st.poisonErr(); err != nil {
+		return err
+	}
 	name, mark := st.pushSavepoint()
 	if _, err := st.tx.ExecContext(ctx, savepointStmt("SAVEPOINT", name)); err != nil {
+		// Nothing was pushed on the SQLite side, so the state is still known and the
+		// caller's ordinary error handling is the right answer. No poison.
 		return err
 	}
 	if ferr := fn(ctx); ferr != nil {
@@ -132,14 +167,17 @@ func (st *txState) nested(ctx context.Context, fn func(ctx context.Context) erro
 		// ROLLBACK TO rewinds to the savepoint but leaves it on the stack; the
 		// RELEASE is what pops it.
 		if _, err := st.tx.ExecContext(ctx, savepointStmt("ROLLBACK TO", name)); err != nil {
+			st.poison(err)
 			return errors.Join(ferr, err)
 		}
 		if _, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", name)); err != nil {
+			st.poison(err)
 			return errors.Join(ferr, err)
 		}
 		return ferr
 	}
 	if _, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", name)); err != nil {
+		st.poison(err)
 		return err
 	}
 	return nil
@@ -228,6 +266,12 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
 	if err := fn(ctx); err != nil {
 		return err // hooks discarded, nothing ran
+	}
+	// A failed unwind somewhere inside leaves state we cannot reason about, so a
+	// clean return from fn is not enough to commit on. The deferred Rollback is what
+	// actually discards it.
+	if err := st.poisonErr(); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
