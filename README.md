@@ -436,6 +436,8 @@ Looking the slug up is **atomic with the delete** — the slug goes into the sto
 
 `ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled.
 
+**Do not open a watch inside `Within`.** The read below happens on your goroutine, and the store runs on a single connection — so it waits for the connection your transaction is holding, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
+
 **Subscribe, then act.** Both read current state *before returning*, so a change you make after subscribing is measured against a snapshot that already exists — delete an object on the next line and its `Deleted` is guaranteed, where a snapshot taken one tick later could miss the object entirely. The cost is one store read on your goroutine, and if that read fails you get the error rather than a stream: a watch with no snapshot could not report that delete, and you would wait for a tombstone that never comes.
 
 Both are **polls, not subscriptions.** Each remembers the `resource_version` it last reported to you and, on each watch-poll tick (1s), sends the difference: a new object is `Added`, a moved version is `Modified`, a row that has gone is `Deleted` and carries its last known state. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:

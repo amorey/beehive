@@ -805,3 +805,27 @@ func TestWatchOnACancelledContextDoesNotSubscribe(t *testing.T) {
 	_, err := client.ObjectsWatchList(ctx)
 	assert.ErrorIs(t, err, context.Canceled)
 }
+
+// The snapshot's own changes are sends like any other, so a subscriber that goes
+// away before reading them must not strand the goroutine holding them. The poll
+// interval is an hour here, so the delivery being abandoned can only be the
+// snapshot's — no tick will ever produce another.
+func TestWatchAbandonsTheSnapshotSendWhenTheSubscriberGoesAway(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	// Nobody reads ch, so the goroutine parks in the send holding the Added the
+	// snapshot found.
+	ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	cancel()
+
+	waitClosed(t, closedWhenDrained(ch), "the stream to close on cancellation")
+}

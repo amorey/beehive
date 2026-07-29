@@ -253,8 +253,17 @@ type Store interface {
 	io.Closer
 
 	// Within runs fn inside a single transaction, committing on a nil error and
-	// rolling back otherwise. Store calls made with the ctx passed to fn join
-	// that transaction; calls made with any other context run standalone.
+	// rolling back otherwise. Store calls made with the ctx passed to fn join that
+	// transaction.
+	//
+	// **Use that ctx for every store call fn makes.** A call with any other context
+	// asks for a connection of its own, which on a single-connection backend (the
+	// sqlite store pins the pool to one) is the connection this transaction is
+	// holding — so it waits for a transaction that cannot commit until it returns,
+	// and the deadlock ends only when its context is cancelled. That is a property of
+	// the backend, not of this contract, but the contract is where a caller reads
+	// about it: an implementation with a larger pool merely runs the call
+	// concurrently, on a snapshot that does not include fn's uncommitted writes.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has

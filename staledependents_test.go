@@ -100,8 +100,9 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 	t.Cleanup(func() { stop(ctx) })
 	waitClosed(t, probe.staleListed, "the stale-dependents listing")
 
-	require.NotEmpty(t, probe.staleKinds)
-	assert.Equal(t, []GroupKind{clientTestGK}, probe.staleKinds[0],
+	asked := probe.kindsAsked()
+	require.NotEmpty(t, asked)
+	assert.Equal(t, []GroupKind{clientTestGK}, asked[0],
 		"the scan is asked only for kinds that have somewhere to enqueue")
 }
 

@@ -684,8 +684,10 @@ type listProbeStore struct {
 	staleListed     chan struct{} // DependentsListStale (global)
 	watermarkSet    chan struct{} // DependencyWatermarksSet (per successful dependent pass)
 
-	// staleKinds records what each stale-dependents listing was asked for, so a test
-	// can pin that the kind filter carries the registered set.
+	// mu guards staleKinds alone. The other fields are channels, but this one is
+	// written by the stale-dependents driver on its own goroutine and read by the
+	// test while that driver is still ticking.
+	mu         sync.Mutex
 	staleKinds [][]GroupKind
 }
 
@@ -732,9 +734,18 @@ func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) 
 
 func (s *listProbeStore) DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]storeapi.ObjectRef, error) {
 	refs, err := s.Store.DependentsListStale(ctx, kinds, afterID, limit)
+	s.mu.Lock()
 	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
+	s.mu.Unlock()
 	probeSignal(s.staleListed)
 	return refs, err
+}
+
+// kindsAsked snapshots what the stale-dependents listings have been asked for.
+func (s *listProbeStore) kindsAsked() [][]GroupKind {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.staleKinds)
 }
 
 // DependencyWatermarksSet signals *after* the write, so a test can order a change
