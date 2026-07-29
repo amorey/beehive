@@ -160,7 +160,7 @@ current state whether each dependent has reconciled against its targets' latest
 versions, so it recovers a wake lost by *any* means — a crash, a startup seed race, a
 process with no waker, a bug in the wake path.
 
-- **Recorded by:** `Store.DependencyWatermarkSet`, from `typedController.reconcile` on
+- **Recorded by:** `Store.DependencyWatermarksSet`, from `typedController.reconcile` on
   every successful pass of an object with dependencies. The value is the write cursor
   as of the pass's *load*, never the end of the pass.
 - **Found by:** `Beehive.staleDependentsSweep` → `DependentsListStale(kinds, afterID,
@@ -189,11 +189,11 @@ process with no waker, a bug in the wake path.
   `TestDependentsListStaleFindsDependentsOfUnregisteredTargets`,
   `TestDependentsListStaleExcludesSelfEdges`, `TestDependentsListStaleFiltersByKind`,
   `TestDependentsListStaleReturnsEachDependentOnce`, `TestDependentsListStalePages`,
-  `TestDependencyWatermarkSetGatesOnOutgoingDependsOn`,
-  `TestDependencyWatermarkSetNeverRegresses`,
-  `TestDependencyWatermarkSetMovesReconciledAtOnlyWithTheCursor`,
-  `TestDependencyWatermarkSetSkipsCollectedObject`,
-  `TestDependencyWatermarkSetBumpsNoResourceVersion`,
+  `TestDependencyWatermarksSetGatesOnOutgoingDependsOn`,
+  `TestDependencyWatermarksSetNeverRegresses`,
+  `TestDependencyWatermarksSetMovesReconciledAtOnlyWithTheCursor`,
+  `TestDependencyWatermarksSetSkipsCollectedObject`,
+  `TestDependencyWatermarksSetBumpsNoResourceVersion`,
   `TestDependencyWatermarksCascadeOnObjectDelete`,
   `TestObjectsGetForReconcileReturnsTheWriteCursor`,
   `TestObjectsGetForReconcileReportsHasDependencies`.

@@ -259,8 +259,8 @@ func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 
-func (s *fakeStore) DependencyWatermarkSet(context.Context, ObjectID, int64) error {
-	panic("not implemented: fakeStore.DependencyWatermarkSet")
+func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.DependencyWatermarksSet")
 }
 
 func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
@@ -682,7 +682,7 @@ type listProbeStore struct {
 	owedListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
 	staleListed     chan struct{} // DependentsListStale (global)
-	watermarkSet    chan struct{} // DependencyWatermarkSet (per successful dependent pass)
+	watermarkSet    chan struct{} // DependencyWatermarksSet (per successful dependent pass)
 
 	// staleKinds records what each stale-dependents listing was asked for, so a test
 	// can pin that the kind filter carries the registered set.
@@ -737,12 +737,12 @@ func (s *listProbeStore) DependentsListStale(ctx context.Context, kinds []GroupK
 	return refs, err
 }
 
-// DependencyWatermarkSet signals *after* the write, so a test can order a change
+// DependencyWatermarksSet signals *after* the write, so a test can order a change
 // to a target against the dependent's pass having already recorded what it
 // observed — without which the change might land under the pass and be recorded
 // as seen.
-func (s *listProbeStore) DependencyWatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
-	err := s.Store.DependencyWatermarkSet(ctx, id, cursor)
+func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
+	err := s.Store.DependencyWatermarksSet(ctx, id, cursor)
 	probeSignal(s.watermarkSet)
 	return err
 }

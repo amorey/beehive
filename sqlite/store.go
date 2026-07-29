@@ -582,7 +582,7 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 	return scanObjectRefs(rows)
 }
 
-// DependencyWatermarkSet upserts id's dependency watermark (see the contract on
+// DependencyWatermarksSet upserts id's dependency watermark (see the contract on
 // storeapi.Store). The EXISTS rides the edges primary-key prefix, so the
 // has-dependencies gate costs a b-tree probe and no separate read — and, since a
 // collected object's edges cascade away with it, the same probe is what keeps the
@@ -599,7 +599,7 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 // It is also what couples reconciled_at to reconciled_against structurally: one
 // predicate guards both columns, so the timestamp cannot move on a pass that
 // observed nothing new (see the table comment on why it is not a heartbeat).
-func (s *sqliteStore) DependencyWatermarkSet(ctx context.Context, id storeapi.ObjectID, cursor int64) error {
+func (s *sqliteStore) DependencyWatermarksSet(ctx context.Context, id storeapi.ObjectID, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
 		SELECT ?, ?, ?

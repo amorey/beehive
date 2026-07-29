@@ -213,7 +213,7 @@ Three methods and one small type. Two methods are the new mechanism; the third
 replaces the reconcile loop's opening read. No change to `RawObject`.
 
 ```go
-// DependencyWatermarkSet records cursor as the store-wide write cursor id's reconcile
+// DependencyWatermarksSet records cursor as the store-wide write cursor id's reconcile
 // observed, for the staleness scan to compare targets against. Upserts, since the
 // row appears on a dependent's first successful pass and is raised on later ones.
 // Bumps no resource_version — it writes no objects row at all, so a recorded
@@ -244,7 +244,7 @@ replaces the reconcile loop's opening read. No change to `RawObject`.
 // past a change it never saw. That is the same unsafe shape as sampling the cursor
 // after the reconcile rather than before, and it is the one way this mechanism can
 // strand a dependent.
-DependencyWatermarkSet(ctx context.Context, id ObjectID, cursor int64) error
+DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
 
 // DependentsListStale returns objects of the given kinds that have a depends_on
 // edge to a target whose resource_version is above their dependency watermark —
@@ -291,7 +291,7 @@ type ReconcileLoad struct {
     Cursor int64
     // HasDependencies reports whether Object had an outgoing depends_on edge at
     // load. It exists only so a reconcile of an object with no dependencies can
-    // skip DependencyWatermarkSet entirely and never take the write lock — see that
+    // skip DependencyWatermarksSet entirely and never take the write lock — see that
     // method, and the reconciler's skip rule.
     HasDependencies bool
 }
@@ -394,10 +394,15 @@ The kind list is chunked under `idChunkSize` (`sqlite/store.go:1532`) like every
 other id-list query, though a store with enough registered kinds to need it does not
 exist.
 
-**Naming.** `DependencyWatermarkSet` stays singular — it sets one object's watermark
-— following `ReconcileOwedDecrement`'s cardinality-in-the-verb reading rather than
-pluralizing for the table. `DependentsListStale` sits in the dependents family
-because it answers a question about objects, not about the table.
+**Naming.** `DependencyWatermarksSet` takes the plural prefix like every other
+family fronting a table of its own. An earlier draft called it
+`DependencyWatermarkSet`, reading `ReconcileOwedDecrement` as licence to put
+cardinality in the verb and leave the noun singular — but the naming ADR settles both
+halves of that against it. Cardinality already lives in the verb *and* the prefix
+stays plural (`EdgesAdd` adds one edge), and `ReconcileOwed*` is exempt for fronting a
+scalar column whose name it should match, not for acting on one row.
+`DependentsListStale` sits in the dependents family because it answers a question
+about objects, not about the table.
 
 The table was `dependency_cursors` through most of this spec's drafting.
 **"Watermark" is the better head noun, and the write's own shape is what settles
@@ -634,7 +639,7 @@ build, bounded by that kind's dependents.
 ### Client-only dependents
 
 An object whose kind is never registered never gets a watermark row —
-`DependencyWatermarkSet` is called only from the reconcile path — so it is stale
+`DependencyWatermarksSet` is called only from the reconcile path — so it is stale
 *forever*.
 
 Unfiltered, that would be a permanent addition to every pass's working set: rows
@@ -799,21 +804,21 @@ New, store-level:
   scan to edges with two registered endpoints,
   `TestDependentsListStaleReturnsEachDependentOnce` (the `GROUP BY`),
   `TestDependentsListStalePages`.
-- `TestDependencyWatermarkSetGatesOnOutgoingDependsOn`.
-- `TestDependencyWatermarkSetUpserts` — the second pass overwrites rather than failing.
-- `TestDependencyWatermarkSetNeverRegresses` — a lower cursor arriving after a higher one
+- `TestDependencyWatermarksSetGatesOnOutgoingDependsOn`.
+- `TestDependencyWatermarksSetUpserts` — the second pass overwrites rather than failing.
+- `TestDependencyWatermarksSetNeverRegresses` — a lower cursor arriving after a higher one
   leaves the stored value alone (the `DO UPDATE ... WHERE`).
-- `TestDependencyWatermarkSetSuppressesNonAdvancingWrites` — re-applying the same cursor
+- `TestDependencyWatermarksSetSuppressesNonAdvancingWrites` — re-applying the same cursor
   reports `changes() == 0`, so the row is not rewritten. Asserts the suppression the
   `RequeueAfter` cost argument depends on.
-- `TestDependencyWatermarkSetMovesReconciledAtWithTheCursor` — and only with it: a
+- `TestDependencyWatermarksSetMovesReconciledAtWithTheCursor` — and only with it: a
   suppressed write leaves the timestamp alone, which is what stops it being read as a
   heartbeat.
-- `TestDependencyWatermarkSetSkipsCollectedObject` — the FK guard: an id whose row was
+- `TestDependencyWatermarksSetSkipsCollectedObject` — the FK guard: an id whose row was
   removed since the load writes nothing and returns no error, rather than `FOREIGN KEY
   constraint failed`. This is the test that pins the gate's second job, so it fails
   loudly if open question 3's remedy is applied without a replacement guard.
-- `TestDependencyWatermarkSetBumpsNoResourceVersion` — it writes no `objects` row at all.
+- `TestDependencyWatermarksSetBumpsNoResourceVersion` — it writes no `objects` row at all.
 - `TestDependencyWatermarksCascadeOnObjectDelete` — the row goes with the object.
 - `TestObjectsGetForReconcileReturnsTheWriteCursor`.
 - `TestObjectsGetForReconcileReportsHasDependencies` — true with an outgoing

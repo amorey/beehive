@@ -162,7 +162,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// would push a self-healing bookkeeping write into the backoff ladder and retry a
 	// whole reconcile over it.
 	if reconcileErr == nil && load.HasDependencies {
-		if err := t.bh.store.DependencyWatermarkSet(ctx, id, load.Cursor); err != nil {
+		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil {
 			log.WarnContext(ctx, "failed to record the dependency watermark; the stale-dependents pass will re-derive it", "err", err)
 		}
 	}

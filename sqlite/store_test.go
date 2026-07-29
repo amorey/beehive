@@ -3694,13 +3694,13 @@ func readWatermark(t *testing.T, store *sqliteStore, id beehive.ObjectID) (again
 }
 
 // A dependent's first successful pass leaves the cursor it observed.
-func TestDependencyWatermarkSetRecordsTheCursor(t *testing.T) {
+func TestDependencyWatermarksSetRecordsTheCursor(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	target := newRefObject(t, store)
 	dep := newDependentObject(t, store, target.ID)
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 42))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 42))
 
 	against, at, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok, "a dependent's pass records a watermark")
@@ -3711,31 +3711,31 @@ func TestDependencyWatermarkSetRecordsTheCursor(t *testing.T) {
 // The write gates on an outgoing depends_on edge: an object that can never be
 // found stale must not get a row the scan would probe forever. owned_by is not
 // a dependency, so it does not open the gate either.
-func TestDependencyWatermarkSetGatesOnOutgoingDependsOn(t *testing.T) {
+func TestDependencyWatermarksSetGatesOnOutgoingDependsOn(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	owner := newRefObject(t, store)
 
 	lone := newRefObject(t, store)
-	require.NoError(t, store.DependencyWatermarkSet(ctx, lone.ID, 7))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, lone.ID, 7))
 	_, _, ok := readWatermark(t, store, lone.ID)
 	assert.False(t, ok, "an object with no edges gets no row")
 
 	owned := newRefObject(t, store)
 	require.NoError(t, addEdge(ctx, store, owned.ID, owner.ID, beehive.RelationOwnedBy))
-	require.NoError(t, store.DependencyWatermarkSet(ctx, owned.ID, 7))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, owned.ID, 7))
 	_, _, ok = readWatermark(t, store, owned.ID)
 	assert.False(t, ok, "owned_by is not a dependency")
 }
 
 // A later pass raises the same row rather than failing on the primary key.
-func TestDependencyWatermarkSetUpserts(t *testing.T) {
+func TestDependencyWatermarksSetUpserts(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 10))
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 20))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 20))
 
 	against, _, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
@@ -3745,13 +3745,13 @@ func TestDependencyWatermarkSetUpserts(t *testing.T) {
 // The FK guard: gcCollect can remove the object between the load and this write,
 // taking its edges with it. The gate then finds no edge and nothing is inserted,
 // so a racing delete costs a no-op rather than "FOREIGN KEY constraint failed".
-func TestDependencyWatermarkSetSkipsCollectedObject(t *testing.T) {
+func TestDependencyWatermarksSetSkipsCollectedObject(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 5))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 5))
 
 	_, _, ok := readWatermark(t, store, dep.ID)
 	assert.False(t, ok)
@@ -3759,13 +3759,13 @@ func TestDependencyWatermarkSetSkipsCollectedObject(t *testing.T) {
 
 // It writes no objects row at all, so recording a reconcile cannot put the object
 // back into the waker's scan and wake every dependent of it.
-func TestDependencyWatermarkSetBumpsNoResourceVersion(t *testing.T) {
+func TestDependencyWatermarksSetBumpsNoResourceVersion(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 9))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 9))
 
 	probe.expectNone()
 }
@@ -3775,7 +3775,7 @@ func TestDependencyWatermarksCascadeOnObjectDelete(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 3))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 3))
 
 	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
 
@@ -3795,13 +3795,13 @@ func stampWatermarkAt(t *testing.T, store *sqliteStore, id beehive.ObjectID, at 
 
 // A write arriving out of order cannot regress the cursor and un-converge a
 // dependent that has already reconciled against a later point.
-func TestDependencyWatermarkSetNeverRegresses(t *testing.T) {
+func TestDependencyWatermarksSetNeverRegresses(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 20))
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 5))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 20))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 5))
 
 	against, _, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
@@ -3811,21 +3811,21 @@ func TestDependencyWatermarkSetNeverRegresses(t *testing.T) {
 // reconciled_at is guarded by the same predicate as the cursor, so a pass that
 // observed no new store state writes nothing at all — no page dirtied, and no
 // timestamp that could be misread as a reconcile heartbeat.
-func TestDependencyWatermarkSetMovesReconciledAtOnlyWithTheCursor(t *testing.T) {
+func TestDependencyWatermarksSetMovesReconciledAtOnlyWithTheCursor(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	const sentinel = int64(1)
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 10))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
 	stampWatermarkAt(t, store, dep.ID, sentinel)
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 10))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
 	_, at, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
 	assert.Equal(t, sentinel, at, "re-applying the same cursor rewrites nothing")
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, 11))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 11))
 	against, at, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
 	assert.Equal(t, int64(11), against)
@@ -3857,13 +3857,13 @@ func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
 	ctx := context.Background()
 	target := newRefObject(t, store)
 	dep := newDependentObject(t, store, target.ID)
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store), "nothing has moved since the watermark")
 
 	moveTarget(t, store, target.ID)
 	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
 
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
 	assert.Empty(t, staleIDs(t, store), "a pass that observed the change settles it")
 }
 
@@ -3940,7 +3940,7 @@ func TestDependentsListStaleFindsDependentsOfUnregisteredTargets(t *testing.T) {
 	})
 	require.NoError(t, err)
 	dep := newDependentObject(t, store, target.ID)
-	require.NoError(t, store.DependencyWatermarkSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store))
 
 	_, _, err = store.ObjectsUpdateSpec(ctx, beehive.GroupKind{Kind: "Gadget"}, target.ID, []byte(`{"v":2}`), 0)

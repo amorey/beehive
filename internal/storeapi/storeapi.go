@@ -191,7 +191,7 @@ type ReconcileLoad struct {
 	Cursor int64
 	// HasDependencies reports whether Object had an outgoing depends_on edge at
 	// load. It exists only so a reconcile of an object with no dependencies can skip
-	// DependencyWatermarkSet entirely and never take the write lock — see that
+	// DependencyWatermarksSet entirely and never take the write lock — see that
 	// method, and the reconciler's skip rule.
 	HasDependencies bool
 }
@@ -572,7 +572,7 @@ type Store interface {
 	// spec and still owe a wake.
 	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
-	// DependencyWatermarkSet records cursor as the store-wide write cursor id's
+	// DependencyWatermarksSet records cursor as the store-wide write cursor id's
 	// reconcile observed, for the staleness scan to compare targets against. Upserts,
 	// since the row appears on a dependent's first successful pass and is raised on
 	// later ones. Bumps no resource_version — it writes no objects row at all, so a
@@ -601,7 +601,7 @@ type Store interface {
 	// past a change it never saw. That is the same unsafe shape as sampling the cursor
 	// after the reconcile rather than before, and it is the one way this mechanism can
 	// strand a dependent.
-	DependencyWatermarkSet(ctx context.Context, id ObjectID, cursor int64) error
+	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
 
 	// DependentsListStale returns objects of the given kinds that have a depends_on
 	// edge to a target whose resource_version is above their dependency watermark —
