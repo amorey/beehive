@@ -2773,6 +2773,56 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 	assert.Empty(t, h.stale(t), "the pass that declared the edge also observed the target")
 }
 
+// TestReconcileMidPassDeclareLeavesTheDependentOwed pins the close of the last
+// strand in "a wake lost by any means costs latency, never divergence": a third
+// party declaring a new dependency for an object *while that object's own pass is
+// in flight*, with a claim the target has not moved past. The declare clears the
+// watermark, but this pass — which never read the new target — rewrites it on
+// success from its load cursor, so the stale scan reads converged; the waker sees
+// nothing either, since the target never moves. What survives is the declare's
+// reconcile_owed stamp: it landed above the count the pass observed at load, so
+// the load-scoped decrement cannot consume it, and the owed pass delivers the
+// reconcile that actually reads the new target.
+func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
+	ctx := context.Background()
+	h := newWatermarkHarness(t, nil)
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+	require.Empty(t, h.stale(t), "settled, with a watermark for the mid-pass declare to clear")
+
+	// A quiet target, created before the pass loads so the pass's cursor covers its
+	// version — the shape that makes the rewritten watermark read as converged.
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	quiet, err := h.store.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+
+	// The third party declares from outside the pass's client, mid-flight, with an
+	// exact claim: the target has not moved past it, so only the edge-new stamp can
+	// carry this wake.
+	h.inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
+		_, err := h.store.EdgesAdd(ctx, h.dep, quiet.ID, RelationDependsOn, quiet.ResourceVersion)
+		return Result{}, err
+	}
+	_, err = h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+
+	// The derived state really is blind here — that blindness was the strand.
+	assert.Empty(t, h.stale(t), "the pass rewrote the watermark from a cursor that never saw the new target")
+
+	// The durable record is not: the stamp survived the pass's decrement, so the
+	// owed pass still delivers the reconcile that reads the new target.
+	got, err := h.store.ObjectsGet(ctx, h.dep)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), got.ReconcileOwed, "the mid-pass stamp outlives the load-scoped decrement")
+	owed, err := h.store.ReconcileOwedListIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{h.dep}, owed, "and the owed listing names the dependent")
+}
+
 // The one case that does cost a pass: an object whose *first* depends_on edge is
 // declared mid-reconcile. HasDependencies was sampled false at load, so the pass
 // skips DependencyWatermarksSet entirely and leaves no row — and an absent row means

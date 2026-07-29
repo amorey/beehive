@@ -77,8 +77,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   against a mid-pass `gcCollect`) and suppressed entirely when the cursor has not
   advanced. `EdgesAdd` is the row's second writer, and only *clears* it: a new
   `depends_on` edge drops the watermark, because a cursor measured over a smaller
-  dependency set cannot speak for a target just added — which is what makes a declare
-  no version claim covers still reach its dependent.
+  dependency set cannot speak for a target just added. The clear keeps the derived
+  state honest; what *guarantees* a fresh declare reaches its dependent is the
+  `reconcile_owed` stamp on every new edge (below), which survives the interleaving
+  the clear alone did not — a pass already in flight rewriting the cleared row.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The dependency waker scans from a `resource_version` watermark**
   (`ObjectWritesListSince`, paged; seeded at startup from `ObjectWritesMaxVersion`).
@@ -138,12 +140,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`schema_version_spec`/`_status`) version independently. A blob that fails to
   decode quarantines its row instead of killing the whole list or stream.
   → [ADR](docs/adr/2026-07-27-schema-version-migration.md)
-- **Declaring a dependency is caller-versioned** (`DependenciesAdd`'s
-  `targetResourceVersion`), which closes the read-then-declare window. The stamp
-  lands only when the edge is new *and* the target has already moved past the version
-  the caller read. It is written to `objects.reconcile_owed` inside `EdgesAdd`, in the
-  same statement sequence as the edge, and drained by the owed pass.
-  → [ADR](docs/adr/2026-07-27-caller-versioned-dependencies.md)
+- **Every new `depends_on` edge stamps an owed reconcile.** `EdgesAdd` increments
+  `objects.reconcile_owed` for every `depends_on` edge it *creates* (self-edges
+  excluded), in the same statement sequence as the edge, drained by the owed pass.
+  The stamp is unconditional on the caller's claim because only recorded owed work
+  survives every interleaving — an increment landing mid-pass sits above the count
+  that pass observed at load, so the decrement cannot consume it. The edge-new gate
+  is what bounds it: re-asserting a dependency set every pass stamps nothing after
+  the first. `DependenciesAdd`'s `targetResourceVersion` remains as validation only —
+  a claim above the target's current version is rejected
+  (`ErrTargetResourceVersionFuture`) before anything is written.
+  → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)
 - **Secondary lookups (owner, dependencies, dependents, owned) are read on request**,
   never folded into the `SELECT` that carries the blobs. Eager `LoadOption`s and lazy
   `Client`/`ControllerClient` getters share the same loaders, and accessors return

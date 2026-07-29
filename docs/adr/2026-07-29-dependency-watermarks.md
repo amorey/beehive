@@ -60,13 +60,13 @@ bookkeeping, no stamp/advance transaction, no ordering constraint between an
 enqueue and a commit, no count to drain. The watermark is monotonic and idempotent;
 writing it twice is writing it once.
 
-`reconcile_owed` stays, unchanged, carrying `EdgesAdd`'s caller-versioned stamp.
-The two are complementary: it is the cheap fast path for the one case that can be
-recorded for free (closing the read-then-declare window at owed-pass latency by
-riding a write `EdgesAdd` was making anyway); the watermark is the backstop for
-every case that cannot. This decision adds **no** new producer of `reconcile_owed`,
-so the "there is deliberately no standalone increment here" block in `storeapi.go`
-stays true — the scan-watermark design would have invalidated it.
+`reconcile_owed` stays, carrying `EdgesAdd`'s stamp (since broadened to
+[every new `depends_on` edge](2026-07-29-stamp-every-new-dependency-edge.md)).
+The two are complementary: it is the durable record for the declare-time cases,
+riding a write `EdgesAdd` was making anyway; the watermark is the backstop for a
+wake lost after the edge exists. This decision adds **no** new producer of
+`reconcile_owed`, so the "there is deliberately no standalone increment here" block
+in `storeapi.go` stays true — the scan-watermark design would have invalidated it.
 
 ### The write
 
@@ -118,15 +118,16 @@ as converged.
 
 So `EdgesAdd` deletes `fromID`'s row when it creates a new `depends_on` edge, gated
 on the same `NOT EXISTS` as the wake stamp and on the same side of the insert. An
-absent row already means stale, so the next staleness pass reconciles the dependent
-against its new target.
+absent row already means stale, so the staleness pass would reconcile the dependent
+against its new target even if nothing else did.
 
-**Without it, one whole declare shape reaches nobody.** Not the stamp — it fires
-only when the target moved past the caller's claim, so an exact claim or `0` is
-silent. Not a write-log scan — the target does not move. Not the staleness scan, per
-above. That shape is precisely an edge declared *on another object's behalf*, which
-the cross-kind edge deliberately allows, and it is also every `0`-claim declare
-against a quiet target.
+What *guarantees* a fresh declare reaches its dependent is no longer this clear but
+the wake stamp beside it, which
+[now fires for every new `depends_on` edge](2026-07-29-stamp-every-new-dependency-edge.md)
+rather than only when the target moved past the caller's claim. The clear stays as
+hygiene for the invariant above: a watermark that outlived a growth of its
+dependency set would misreport convergence to the scan for the window until the
+stamped pass runs and rewrites it honestly.
 
 The cost is nothing in the ordinary case. Re-asserting a dependency set costs
 nothing after the first declare, because of the edge-new gate. A controller
@@ -146,22 +147,16 @@ of every kind, which is precisely the write-lock acquisition `HasDependencies` e
 to avoid. Pinned by
 `TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
 
-**The residual window, and it is a strand.** A *third party* declaring between a
-dependent's load and its own watermark write has its clear immediately undone by that
-pass, which never saw the new target. The dependent then reads as converged against
-that target with nothing left to re-derive it — so if the target never moves again,
-which is exactly the quiet-target case this clear exists to fix, the dependent never
-reconciles against it at all. Calling that "latency until the target moves" would be
-wrong: it is the same failure class the clear closes, narrowed to a race window.
-
-Closing it means recording owed work rather than invalidating derived state —
-stamping `reconcile_owed` on every new edge, dropping the target-moved half of the
-conjunction. That is sound under every interleaving, because the decrement subtracts
-only the count observed at load, and it costs one extra pass per edge ever created.
-It is in `TODO.md` rather than done here because it partly reverses the
-caller-versioned ADR and buys that per-edge pass, and because reaching the window
-needs a cross-object declare landing inside a single `Reconcile` call — not because
-the consequence is mild.
+**The residual window this left was a strand, and it is closed.** A *third party*
+declaring between a dependent's load and its own watermark write had the clear
+immediately undone by that pass, which never saw the new target — the dependent
+read as converged with nothing left to re-derive it, permanently if the target
+never moved again. The clear could never survive that interleaving, because a pass
+in flight legitimately re-derives the state the clear invalidated. Recording owed
+work is what closed it:
+[the stamp on every new edge](2026-07-29-stamp-every-new-dependency-edge.md) lands
+above the count the in-flight pass observed at load, so the load-scoped decrement
+cannot consume it. Pinned by `TestReconcileMidPassDeclareLeavesTheDependentOwed`.
 
 ### A side table, not a column on `objects`
 

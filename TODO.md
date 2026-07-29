@@ -153,46 +153,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   it were a durable schedule. Documenting the boundary is the actual deliverable here,
   not a mechanism.
 
-- **A dependency declared for another object, concurrently with that object's own
-  reconcile, is not re-derived** — known, not fixed, and the residue of a gap that is
-  otherwise closed. `EdgesAdd` clears `fromID`'s `dependency_watermarks` row when it
-  creates a new `depends_on` edge, so a declare no version claim covers still reaches
-  the dependent through the stale-dependents pass (see [the
-  ADR](docs/adr/2026-07-29-dependency-watermarks.md)). What survives is one
-  interleaving: a *third party* declaring between a dependent's `ObjectsGetForReconcile`
-  and that dependent's own watermark write has the clear undone by a pass that never
-  saw the new target.
-
-  **It is a strand, not latency.** The dependent reads as converged against that target
-  with nothing left to re-derive it, so a target that never moves again is never
-  reconciled against — the quiet-target case the clear exists to fix, narrowed to a
-  race window. That is a genuine hole in "a wake lost by any means costs latency rather
-  than permanent divergence", and the only one left in it.
-
-  Reaching it takes a cross-object declare — a controller declaring an edge on another
-  kind's behalf, which the cross-kind edge deliberately allows — landing inside the
-  window a single `Reconcile` call is open. The single connection does not close it:
-  the dependent holds no transaction while its controller runs.
-
-  **The fix is to record owed work instead of invalidating derived state**: stamp
-  `reconcile_owed` on every *new* `depends_on` edge, dropping the target-moved half of
-  `EdgesAdd`'s conjunction. That is sound under every interleaving, because
-  `ReconcileOwedDecrement` subtracts only the count observed at *load* — a stamp landing
-  mid-pass survives the subtraction and keeps the object owed, which is the property the
-  count was built with.
-
-  Deferred on cost, not on doubt. It buys one extra reconcile per edge ever created,
-  where the watermark clear buys none in the ordinary case, and it partly reverses the
-  [caller-versioned ADR](docs/adr/2026-07-27-caller-versioned-dependencies.md), whose
-  conjunction argument still stands for the churn shape it names: a controller that
-  clears and re-declares its dependency set every pass would stamp every pass. Revisit
-  if a controller turns up that declares edges on another kind's behalf as a matter of
-  course, which is what turns this window from narrow into routine.
-
-  **Tripwires.** `TestAddDependencyNoWakeWhenTargetUnmoved` and
-  `TestRefsAddStampsOnlyNewEdge` both pin that an unmoved target stamps nothing —
-  exactly what this fix would change.
-
 - **A controller that never calls `UpdateStatus` is permanently unsettled** — known,
   not fixed. `observed_generation` is NULL until the first `UpdateStatus`, and
   `ObjectsListUnsettledIDs` lists `observed_generation IS NULL OR observed_generation <
@@ -218,8 +178,8 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
 - **`Create` accepts a `WithOwner` naming an already-deleting owner** — known, not
     fixed. This is the ownership version of the read-then-declare race that
-  `DependenciesAdd`'s version claim closes (see [the caller-versioned
-  ADR](docs/adr/2026-07-27-caller-versioned-dependencies.md)): there the edge is
+  `EdgesAdd`'s new-edge stamp closes for dependencies (see [the stamp-every-new-edge
+  ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)): there the edge is
   declared after the *change*, here after the *cascade*.
 
   `insertObject` checks nothing about the owner's lifecycle, and `EdgesAdd` only
@@ -278,10 +238,11 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   client-only object is legal, and the stamp lands on a row whose kind has no reconcile
   loop. Nothing drains it, since only a reconcile calls `ReconcileOwedDecrement`, and
   nothing scans it, since `ReconcileOwedListIDs` is per-kind. So the count and its
-  index entry last as long as the row. Re-declaring the edge — delete, then add again
-  with a claim the target has already moved past — satisfies the edge-new test once
-  more and increments it again, so it is not even bounded by the number of distinct
-  targets. The count is *unread*, which is not the same as harmless.
+  index entry last as long as the row. Every new `depends_on` edge stamps (see
+  [the stamp-every-new-edge ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)),
+  and re-creating a deleted edge satisfies the edge-new test once more and increments
+  it again, so it is not even bounded by the number of distinct targets. The count is
+  *unread*, which is not the same as harmless.
 
   The impact is small and does not compound. Nothing reads the count while the kind
   stays client-only, and if it later gains a controller the first reconcile subtracts

@@ -512,12 +512,15 @@ func TestAddDependencyWakesWhenTargetMovedSinceRead(t *testing.T) {
 	f.requireOwed(t)
 }
 
-// TestAddDependencyNoWakeWhenTargetUnmoved is the anti-spin case, and the reason
-// the check is on the target's version rather than on the edge being new: a
-// level-triggered controller re-asserts its edges every pass, and nothing
-// throttles a self-sustaining requeue. See the rejected wake-when-the-edge-is-new
-// guard in TODO.md.
-func TestAddDependencyNoWakeWhenTargetUnmoved(t *testing.T) {
+// TestAddDependencyWakesOnceWhenTargetUnmoved pins that a declare no version claim
+// covers still reaches the dependent, durably: an unmoved target is exactly the
+// case the waker can never see (nothing changes later) and the stale scan could
+// read as converged, so the edge-creating call itself records the one owed pass.
+// It is also the anti-spin case: a level-triggered controller re-asserts its edges
+// every pass, and nothing throttles a self-sustaining requeue, so only the call
+// that created the edge may stamp — the count staying at 1 across the re-asserts
+// is the bound.
+func TestAddDependencyWakesOnceWhenTargetUnmoved(t *testing.T) {
 	f := newDeclareFixture(t)
 	ctx := context.Background()
 	// Re-assert the same edge repeatedly with a current version, as a controller
@@ -525,7 +528,8 @@ func TestAddDependencyNoWakeWhenTargetUnmoved(t *testing.T) {
 	for range 3 {
 		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
 	}
-	f.requireNotOwed(t)
+	f.requireOwed(t)
+	assert.EqualValues(t, 1, f.owedCount(t), "only the declare that created the edge stamps")
 }
 
 // TestAddDependencyRejectsFutureResourceVersion pins the one wrong value the call
@@ -646,15 +650,21 @@ func TestAddDependencyStaleResourceVersionWakesAtMostOnce(t *testing.T) {
 	assert.EqualValues(t, 1, f.owedCount(t), "the edge is no longer new, so no later pass stamps again")
 }
 
-// TestAddDependencyZeroResourceVersionSkipsCheck pins the sentinel: 0 is "no
+// TestAddDependencyZeroResourceVersionWakesOnce pins the sentinel: 0 is "no
 // opinion", the correct value when the edge is declared before the target is
-// read. It must not mean "wake unconditionally" — that would reproduce the spin
-// above in any caller that passes the zero value.
-func TestAddDependencyZeroResourceVersionSkipsCheck(t *testing.T) {
+// read. The stamp no longer depends on the claim at all — a new edge wakes once
+// whatever was passed — so 0 differs from a real version only at the future-claim
+// rejection, and repeating the declare adds nothing, which is what keeps the zero
+// value spin-free.
+func TestAddDependencyZeroResourceVersionWakesOnce(t *testing.T) {
 	f := newDeclareFixture(t)
 	f.moveTarget(t)
-	require.NoError(t, f.cc.DependenciesAdd(context.Background(), f.dep.ID, f.target.ID, 0))
-	f.requireNotOwed(t)
+	ctx := context.Background()
+	for range 3 {
+		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, 0))
+	}
+	f.requireOwed(t)
+	assert.EqualValues(t, 1, f.owedCount(t), "one wake per edge created, not per declare")
 }
 
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:

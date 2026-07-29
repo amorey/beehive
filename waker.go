@@ -56,9 +56,9 @@ type waker struct {
 const wakeScanPageCap = 256
 
 // run drives the waker for the life of the control plane. A non-positive interval
-// turns it off, which is a supported choice: the reconcile_owed stamp still covers a
-// dependency declared against a target that had already moved, and only a later
-// change to a settled dependency goes unnoticed.
+// turns it off, which is a supported choice: the reconcile_owed stamp still covers
+// every newly declared dependency, and a later change to a settled dependency is
+// re-derived by the stale-dependents pass at its own cadence.
 func (dw *waker) run(ctx context.Context) {
 	// With no registered controllers there is nothing to wake, and the scan is not
 	// free — it would run an edges query per change in the whole store only to find

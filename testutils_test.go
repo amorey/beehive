@@ -593,12 +593,20 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 }
 
 // addEdge declares an edge for test scaffolding: it discards the endpoint metadata
-// EdgesAdd reports and passes no version claim (0), so the common
-// require.NoError(t, addEdge(...)) shape stays a one-liner. Tests that assert on
-// the EdgesAddResult, or on the version guard, call the method directly.
+// EdgesAdd reports, passes no version claim (0), and drains the owed-wake stamp
+// every new depends_on edge now records — scaffolding wants the edge to exist, not
+// the reconcile it buys — so the common require.NoError(t, addEdge(...)) shape
+// stays a one-liner with no side effects on the owed listings. Tests that assert
+// on the EdgesAddResult, the stamp, or the version guard call the method directly.
 func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
-	_, err := store.EdgesAdd(ctx, from, to, relation, 0)
-	return err
+	res, err := store.EdgesAdd(ctx, from, to, relation, 0)
+	if err != nil {
+		return err
+	}
+	if res.ReconcileOwedStamped {
+		return store.ReconcileOwedDecrement(ctx, from, 1)
+	}
+	return nil
 }
 
 // objectRefIDs projects an ObjectRef slice to its ids, for assertions that care

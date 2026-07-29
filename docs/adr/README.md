@@ -29,7 +29,7 @@ directory of archaeology.
 - [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
-- [Caller-versioned dependency declaration](2026-07-27-caller-versioned-dependencies.md)
+- [Every new depends_on edge stamps a durable owed reconcile](2026-07-29-stamp-every-new-dependency-edge.md)
 - [Secondary lookups (owner/dependencies/dependents/owned)](2026-07-27-secondary-lookups.md)
 - [Events API](2026-07-27-events-api.md)
 - [Schedule watch](2026-07-27-schedule-watch.md)
