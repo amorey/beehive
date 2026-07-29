@@ -1,8 +1,9 @@
 # Spec: a nested `Within` is a real rollback boundary
 
-- **Status:** Proposed
+- **Status:** Implemented. The accepted design and the measured cost live in
+  [the ADR](../docs/adr/2026-07-29-nested-within-savepoints.md); this file is kept for
+  the audit and test-plan reasoning, which does not belong in a decision record.
 - **Date:** 2026-07-29
-- **Tracked in:** [TODO.md](../TODO.md), "A nested `Within` is not a rollback boundary"
 - **Touches:** `sqlite/store.go` (`Within`, `txState`, `AfterCommit`),
   `internal/storeapi/storeapi.go` (the `Within` contract), `sqlite/store_test.go`
 

@@ -152,6 +152,12 @@ func (s *fakeStore) Close() error {
 // Within runs fn inline with the same context: the fake has no real transaction,
 // so "standalone" and "joined" collapse to a direct call. This lets client code
 // that wraps writes in Within reach the overridden mutators below.
+//
+// It satisfies the nested-rollback-boundary contract only vacuously — there is no
+// transaction, so there is nothing to unwind — while the overridden mutators really
+// do mutate in-memory maps, and those mutations will not unwind. **No test may use
+// fakeStore to exercise that guarantee.** The savepoint behaviour is tested against
+// the real store, in sqlite/store_test.go.
 func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }

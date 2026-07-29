@@ -269,6 +269,22 @@ type Store interface {
 	// the backend, not of this contract, but the contract is where a caller reads
 	// about it: an implementation with a larger pool merely runs the call
 	// concurrently, on a snapshot that does not include fn's uncommitted writes.
+	//
+	// **A nested Within is a rollback boundary.** A Within whose ctx already carries a
+	// transaction joins it rather than opening another, and only the outermost one
+	// commits — but an error returned from the nested fn must still unwind that fn's
+	// writes and the AfterCommit hooks it queued, leaving the store as it was when the
+	// nested call was entered. This holds whatever the outer caller then does with the
+	// error, including swallowing it. Without that, no composition of two writes is
+	// atomic except by the grace of its callers, and a backend cannot promise a caller
+	// that a failed compound operation left nothing behind. The sqlite store implements
+	// it with SAVEPOINT.
+	//
+	// A backend implementing the boundary with a savepoint stack must refuse a nested
+	// Within entered from a goroutine other than the one owning the enclosing frame,
+	// with ErrConcurrentNestedTx — concurrent pushes interleave, and serialising them
+	// deadlocks as soon as fn waits on a goroutine that also wants the store. Ordinary
+	// deep nesting on one goroutine is not that case and must be accepted.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has
