@@ -75,7 +75,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   permanent divergence, so the waker below is an optimisation over it. The write is
   gated in SQL on an outgoing `depends_on` edge (which is also its foreign-key guard
   against a mid-pass `gcCollect`) and suppressed entirely when the cursor has not
-  advanced. → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
+  advanced. `EdgesAdd` is the row's second writer, and only *clears* it: a new
+  `depends_on` edge drops the watermark, because a cursor measured over a smaller
+  dependency set cannot speak for a target just added — which is what makes a declare
+  no version claim covers still reach its dependent.
+  → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The dependency waker scans from a `resource_version` watermark**
   (`ObjectWritesListSince`, paged; seeded at startup from `ObjectWritesMaxVersion`).
   It is store-wide rather than per-kind, because a `depends_on` edge can point at a
@@ -146,7 +150,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ErrNotLoaded` for a relation nobody asked for. `OwnedObjectsList` is the typed form
   of `OwnedList`. → [ADR](docs/adr/2026-07-27-secondary-lookups.md)
 - **Events are an append-only log, aggregated into runs.** One log per object,
-  partitioned by `category`. `ControllerClient.EventsRecord` extends the latest run
+  partitioned by `category`. `ControllerClient.EventsAdd` extends the latest run
   when `(type, reason)` matches and appends otherwise. `Detail` goes in typed and
   comes out opaque, and is not versioned. Reads live on `Client`; retention runs in
   the GC sweeper. "Event" means this log and nothing else — the object-change streams

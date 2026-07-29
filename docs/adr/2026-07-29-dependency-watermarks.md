@@ -108,6 +108,61 @@ leave the cursor where it was, so the object stays stale and is found again. Tha
 self-healing property is why the write is logged-and-swallowed rather than returned:
 returning it would push a bookkeeping write into the backoff ladder.
 
+### A new edge clears the watermark
+
+A cursor measures how much of the store a pass observed *given the dependency set it
+had*. Add a target and the measurement no longer covers it — and the failure is
+silent, because the scan compares that target's `resource_version` against a
+watermark recorded later than it. A target that has simply been sitting there reads
+as converged.
+
+So `EdgesAdd` deletes `fromID`'s row when it creates a new `depends_on` edge, gated
+on the same `NOT EXISTS` as the wake stamp and on the same side of the insert. An
+absent row already means stale, so the next staleness pass reconciles the dependent
+against its new target.
+
+**Without it, one whole declare shape reaches nobody.** Not the stamp — it fires
+only when the target moved past the caller's claim, so an exact claim or `0` is
+silent. Not a write-log scan — the target does not move. Not the staleness scan, per
+above. That shape is precisely an edge declared *on another object's behalf*, which
+the cross-kind edge deliberately allows, and it is also every `0`-claim declare
+against a quiet target.
+
+The cost is nothing in the ordinary case. Re-asserting a dependency set costs
+nothing after the first declare, because of the edge-new gate. A controller
+declaring from inside its own `Reconcile` mostly pays nothing either: that pass
+rewrites the watermark when it succeeds, from the cursor it loaded at — which is
+sound for exactly the reason above, since the controller's read of the new target
+happened after the load. Self-edges are skipped, matching `DependentsListStale`,
+which excludes them.
+
+One case does cost a pass, and it is not this change's doing: an object's **first**
+`depends_on` edge. `ReconcileLoad.HasDependencies` is sampled at load, before that
+edge existed, so the reconciler skips `DependencyWatermarksSet` and leaves no row —
+and an absent row means stale. The object is reconciled once more and settles. It is
+bounded at once per object ever, self-extinguishing, and in the over-reconcile
+direction; the alternative is issuing the gated write on every successful reconcile
+of every kind, which is precisely the write-lock acquisition `HasDependencies` exists
+to avoid. Pinned by
+`TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
+
+**The residual window, and it is a strand.** A *third party* declaring between a
+dependent's load and its own watermark write has its clear immediately undone by that
+pass, which never saw the new target. The dependent then reads as converged against
+that target with nothing left to re-derive it — so if the target never moves again,
+which is exactly the quiet-target case this clear exists to fix, the dependent never
+reconciles against it at all. Calling that "latency until the target moves" would be
+wrong: it is the same failure class the clear closes, narrowed to a race window.
+
+Closing it means recording owed work rather than invalidating derived state —
+stamping `reconcile_owed` on every new edge, dropping the target-moved half of the
+conjunction. That is sound under every interleaving, because the decrement subtracts
+only the count observed at load, and it costs one extra pass per edge ever created.
+It is in `TODO.md` rather than done here because it partly reverses the
+caller-versioned ADR and buys that per-edge pass, and because reaching the window
+needs a cross-object declare landing inside a single `Reconcile` call — not because
+the consequence is mild.
+
 ### A side table, not a column on `objects`
 
 `objects` rows carry `spec` and `status` inline, SQLite rewrites the whole record on

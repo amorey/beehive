@@ -340,6 +340,18 @@ type Store interface {
 	// alone it would strand and RESTRICT-block its owner's delete forever.
 	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
 
+	// EventsAdd records an observation about id in the (id, ev.Category) timeline,
+	// grouping consecutive ones into runs. Adding does not always insert: if the
+	// latest run there has the same (Type, Reason) it is extended instead — Count
+	// goes up, LastAt moves, Message and Detail are re-sampled. Otherwise a new run
+	// is appended with Count 1.
+	//
+	// Only ev's Category, Type, Reason, Message and Detail are read; the store fills in
+	// the rest and returns the run. The comparison is scoped to (id, Category), so an
+	// event in another category can't break this run. Scoped to gk: another kind's id
+	// gives ErrWrongKind, a missing id ErrNotFound.
+	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
+
 	// EventsGetLatest returns the most recent run in id's category timeline, or nil
 	// if that timeline has no events. Reads by object id only (not kind-scoped).
 	EventsGetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
@@ -348,17 +360,6 @@ type Store interface {
 	// id). The zero EventQuery returns every run for the object. Reads by object id
 	// only — not kind-scoped, like the ref-list reads.
 	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
-
-	// EventsRecord records an observation about id in the (id, ev.Category) timeline,
-	// grouping consecutive ones into runs. If the latest run there has the same (Type,
-	// Reason) it is extended: Count goes up, LastAt moves, Message and Detail are
-	// re-sampled. Otherwise a new run is appended with Count 1.
-	//
-	// Only ev's Category, Type, Reason, Message and Detail are read; the store fills in
-	// the rest and returns the run. The comparison is scoped to (id, Category), so a
-	// record in another category can't break this run. Scoped to gk: another kind's id
-	// gives ErrWrongKind, a missing id ErrNotFound.
-	EventsRecord(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
 
 	// EventsSweep trims the event log to the retention bounds and returns how many runs
 	// it deleted. perObject > 0 caps each (object, category) timeline to its newest
@@ -500,6 +501,39 @@ type Store interface {
 	// kind of durable marker — undecodable rows, say — gets its own column and its own
 	// cadence rather than joining this count.
 	//
+	// Third, and independently of the claim: creating a **new depends_on** edge
+	// clears fromID's dependency_watermarks row, on the same side of the insert as
+	// the other two writes. A watermark describes how much of the store a dependent
+	// has reconciled against, and it was recorded when the dependency set was
+	// smaller, so it cannot speak for a target just added — one whose
+	// resource_version may sit below it, where DependentsListStale would read
+	// converged. An absent row already means stale, so dropping it is what puts
+	// fromID in the next stale-dependents pass. Without it, a declare whose claim is
+	// exact or zero against a target that is not about to move is found by no
+	// mechanism at all: not the stamp (the target has not moved past the claim), not
+	// a write-log scan (the target does not move), and not the staleness scan. That
+	// is the ordinary shape of an edge declared on another object's behalf, which
+	// the cross-kind edge deliberately allows.
+	//
+	// Gated on the same edge-new test as the stamp, so re-asserting a dependency set
+	// every pass costs nothing after the first, and skipped for a self-edge, which
+	// DependentsListStale excludes anyway. A controller declaring from inside its own
+	// Reconcile mostly pays nothing either: that pass writes the watermark again when
+	// it succeeds, from the cursor it loaded at. The exception is an object's *first*
+	// depends_on edge — ReconcileLoad.HasDependencies was sampled before it existed,
+	// so the pass skips the write and the object is found stale once. Bounded at once
+	// per object ever, and in the over-reconcile direction.
+	//
+	// It leaves one window, and it is a strand rather than latency: an edge declared
+	// by *another* writer between a dependent's load and its own watermark write is
+	// cleared and then immediately re-recorded by that pass, which never saw the new
+	// target. The dependent then reads as converged against that target with nothing
+	// left to re-derive it, so a target that never moves again is never reconciled
+	// against — the same failure class this clear closes, narrowed to a race window.
+	// Closing it needs the declare to record owed work rather than to invalidate
+	// derived state: a stamp on every new edge, which is sound under every
+	// interleaving and costs one extra pass per edge ever created (see TODO.md).
+	//
 	// The stamp does not depend on fromID's kind having a controller. The store cannot
 	// know which kinds do, and gating would cost the caller a pre-read of fromID's kind
 	// on every declare. A kind with no reconcile loop never drains its count, and
@@ -610,6 +644,11 @@ type Store interface {
 	// past a change it never saw. That is the same unsafe shape as sampling the cursor
 	// after the reconcile rather than before, and it is the one way this mechanism can
 	// strand a dependent.
+	//
+	// This is not the only writer of the row: EdgesAdd *clears* it when it creates a
+	// new depends_on edge, because a cursor recorded over a smaller dependency set
+	// cannot speak for a target just added. See EdgesAdd for why that has to happen
+	// there, and for the interleaving it leaves open.
 	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
 
 	// DependentsListStale returns objects of the given kinds that have a depends_on

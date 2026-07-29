@@ -13,7 +13,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   Almost any write sustains it: changed status bytes, a byte-identical `UpdateStatus`
   at a generation the object has not settled at, any real condition write, or
-  `FinalizersDelete`. Keeping status byte-stable is no defence. Only `EventsRecord` is
+  `FinalizersDelete`. Keeping status byte-stable is no defence. Only `EventsAdd` is
   safe, because it bumps no object `resource_version`.
 
   **What it costs.** The wake interval bounds the rate to one round trip per tick, so
@@ -153,28 +153,45 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   it were a durable schedule. Documenting the boundary is the actual deliverable here,
   not a mechanism.
 
-- **A client-only kind created with `WithFinalizers` can never be collected** — known,
-  not fixed. `WithFinalizers` is a create option on `Client`, and `Create` performs no
-  registration check, so the row is legal to make. Clearing a finalizer is
-  `ControllerClient.FinalizersDelete`, which folds the controller's own kind into the
-  store mutator — so no other kind's controller can reach it either, and gets
-  `ErrWrongKind` for trying. `gcCollect` returns early while `len(obj.Finalizers) > 0`.
+- **A dependency declared for another object, concurrently with that object's own
+  reconcile, is not re-derived** — known, not fixed, and the residue of a gap that is
+  otherwise closed. `EdgesAdd` clears `fromID`'s `dependency_watermarks` row when it
+  creates a new `depends_on` edge, so a declare no version claim covers still reaches
+  the dependent through the stale-dependents pass (see [the
+  ADR](docs/adr/2026-07-29-dependency-watermarks.md)). What survives is one
+  interleaving: a *third party* declaring between a dependent's `ObjectsGetForReconcile`
+  and that dependent's own watermark write has the clear undone by a pass that never
+  saw the new target.
 
-  The row is therefore deletion-pending forever: re-listed by every GC sweep, making
-  no progress on any of them, and its `owned_by` edge RESTRICT-blocks its owner's
-  delete permanently. That is precisely the failure the global sweeper exists to
-  prevent for client-only kinds — the sweeper reaches the row, it just has nothing it
-  is allowed to do with it.
+  **It is a strand, not latency.** The dependent reads as converged against that target
+  with nothing left to re-derive it, so a target that never moves again is never
+  reconciled against — the quiet-target case the clear exists to fix, narrowed to a
+  race window. That is a genuine hole in "a wake lost by any means costs latency rather
+  than permanent divergence", and the only one left in it.
 
-  **The fix is to reject `WithFinalizers` at create time for a kind with no registered
-  controller**, which `bh.isRegistered` already answers; the watch surface (`watchpoll.go`)
-  uses it for the same class of contract the store cannot enforce. Deferred because
-  `Create` does no registration check today at all, and adding one puts a `bh.mu`
-  acquisition on the create path for a case that is a caller mistake rather than a
-  race. If that is judged too expensive, the alternative is to document it under
-  `WithFinalizers` as the one option that is meaningful only on a registered kind —
-  but silence is the wrong answer either way, since the symptom surfaces much later
-  and as an unrelated-looking stuck delete on the *owner*.
+  Reaching it takes a cross-object declare — a controller declaring an edge on another
+  kind's behalf, which the cross-kind edge deliberately allows — landing inside the
+  window a single `Reconcile` call is open. The single connection does not close it:
+  the dependent holds no transaction while its controller runs.
+
+  **The fix is to record owed work instead of invalidating derived state**: stamp
+  `reconcile_owed` on every *new* `depends_on` edge, dropping the target-moved half of
+  `EdgesAdd`'s conjunction. That is sound under every interleaving, because
+  `ReconcileOwedDecrement` subtracts only the count observed at *load* — a stamp landing
+  mid-pass survives the subtraction and keeps the object owed, which is the property the
+  count was built with.
+
+  Deferred on cost, not on doubt. It buys one extra reconcile per edge ever created,
+  where the watermark clear buys none in the ordinary case, and it partly reverses the
+  [caller-versioned ADR](docs/adr/2026-07-27-caller-versioned-dependencies.md), whose
+  conjunction argument still stands for the churn shape it names: a controller that
+  clears and re-declares its dependency set every pass would stamp every pass. Revisit
+  if a controller turns up that declares edges on another kind's behalf as a matter of
+  course, which is what turns this window from narrow into routine.
+
+  **Tripwires.** `TestAddDependencyNoWakeWhenTargetUnmoved` and
+  `TestRefsAddStampsOnlyNewEdge` both pin that an unmoved target stamps nothing —
+  exactly what this fix would change.
 
 - **A controller that never calls `UpdateStatus` is permanently unsettled** — known,
   not fixed. `observed_generation` is NULL until the first `UpdateStatus`, and

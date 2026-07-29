@@ -178,7 +178,7 @@ func (c *clientImpl[Spec, Status]) scopedRow(
 // The cursor is the object write log's high-water mark, not the version counter
 // behind it, and the difference decides whether this optimization survives contact
 // with a real workload: the counter is shared with the event log, so a single
-// EventsRecord anywhere in the store would move it while touching no objects row —
+// EventsAdd anywhere in the store would move it while touching no objects row —
 // and a controller that records an event per reconcile, the shape the events example
 // encourages, would defeat it permanently.
 //
@@ -352,7 +352,7 @@ func (c *clientImpl[Spec, Status]) deletedSince(
 // EventsWatch streams id's event log. See the Client interface for the contract.
 //
 // Runs are keyed by their own id and compared by resource_version, so a run extended
-// between ticks — EventsRecord bumping its count — is sent again with its new state,
+// between ticks — EventsAdd bumping its count — is sent again with its new state,
 // the same convergence the object watches give. There are no tombstones, because an
 // append-only log means a run only appears or grows. A run that both appears and is
 // trimmed by retention inside one interval is never seen.

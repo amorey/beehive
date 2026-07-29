@@ -276,6 +276,7 @@ func TestCollectDeletesSelfDependentObject(t *testing.T) {
 func TestCollectKeepsFinalizedObject(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	obj, err := client.Create(ctx, cSpec{Val: "guarded"}, WithFinalizers("f"))
 	require.NoError(t, err)

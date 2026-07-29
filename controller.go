@@ -107,11 +107,13 @@ type ControllerClient[Status any] interface {
 	// resource clears its finalizer only once nothing with a live claim references
 	// the object, so the resource outlives its last real user.
 	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
-	// EventsRecord appends an observation to id's event log, aggregating into
-	// contiguous runs (see EventSpec). Like the other writes it is kind-folded and
-	// composes in Within, so a controller can record an event and update a
-	// condition atomically.
-	EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error
+	// EventsAdd adds an observation to id's event log, aggregating into contiguous
+	// runs (see EventSpec): repeating the latest run's (Category, Type, Reason)
+	// extends that run rather than appending a second one, so a controller can
+	// report every poll without growing the log per poll. Like the other writes it
+	// is kind-folded and composes in Within, so a controller can record an event and
+	// update a condition atomically.
+	EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error
 	FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
 	// OwnedList returns the objects id owns (its incoming owned_by edges).
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
@@ -186,12 +188,12 @@ func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id 
 	return err
 }
 
-// EventsRecord marshals the event's optional Detail — typed in, opaque out, like
+// EventsAdd marshals the event's optional Detail — typed in, opaque out, like
 // Spec and Status — and appends the run through the store, which folds in the
 // controller's kind. Nothing is published: the row is the record, and an EventsWatch
 // poll finds it once the write commits. A nil Detail stays nil, and the store groups
 // runs by (Category, Type, Reason).
-func (c *controllerClientImpl[Status]) EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error {
+func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error {
 	var detail []byte
 	if event.Detail != nil {
 		var err error
@@ -199,7 +201,7 @@ func (c *controllerClientImpl[Status]) EventsRecord(ctx context.Context, id Obje
 			return err
 		}
 	}
-	_, err := c.bh.store.EventsRecord(ctx, c.gk, id, storeapi.Event{
+	_, err := c.bh.store.EventsAdd(ctx, c.gk, id, storeapi.Event{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,

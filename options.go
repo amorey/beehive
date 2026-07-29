@@ -187,6 +187,21 @@ func WithSlug(slug string) Option {
 
 // WithFinalizers attaches finalizers that must be cleared before an object is
 // physically deleted.
+//
+// It is the one create option that is meaningful only on a kind **this process has
+// registered a controller for**, and the call is rejected with ErrInvalidOption
+// otherwise. Clearing a finalizer is ControllerClient.FinalizersDelete, which folds
+// the calling controller's own kind into the store mutator, so a client-only kind's
+// finalizer can be removed by nothing — not by another kind's controller, which gets
+// ErrWrongKind for trying. The row would sit deletion-pending forever, re-listed by
+// every GC sweep, with its owned_by edge RESTRICT-blocking its owner's delete
+// permanently.
+//
+// The check is process-local and evaluated when the call is made, because the store
+// tracks no registrations. So it also refuses a create issued before this process's
+// own Register, and one issued from a process that does not register the kind at all
+// even if another over the same store does. Register the kind first, from whichever
+// process creates these rows.
 func WithFinalizers(f ...string) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {

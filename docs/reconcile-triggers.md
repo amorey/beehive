@@ -35,6 +35,11 @@ definition. The fourth is a cursor scan, so a restart finds only what is above t
 watermark it seeds with — which is why the fifth exists: it is the backstop that makes
 the fourth an optimisation. The last does not survive a restart at all.
 
+The fifth has two writers, and the second one only *clears*: declaring a new
+`depends_on` edge drops the dependent's watermark, because a cursor recorded over a
+smaller dependency set cannot speak for a target just added (case 6b). Nothing is
+recorded — an absent row already means stale.
+
 Startup runs exactly three things: `enqueueOwedPass` (`reconciler.run`, before its
 workers start), the GC sweeper's eager first sweep, and the stale-dependents pass's
 eager first step (both `runDriver`). The first two are unconditional; the third runs
@@ -128,12 +133,15 @@ statement sequence as the edge insert, so the two cannot come apart.
 - **Normal:** ✅ 1s scan. A failed page or a failed edges lookup holds the cursor so the
   next tick re-reads it; the self-edge is skipped; a wake arriving mid-reconcile is held
   by `workQueue`'s dirty bit and re-dispatched by `done`.
-- **Restart:** ❌ **not by this mechanism** — `seed` re-reads the store's *current*
-  cursor, so a change made while the process was down is never scanned, and a settled
-  dependent stranded by one is invisible to every owed-work listing: its own generation
-  never moved, and nothing stamped `reconcile_owed`. This mechanism leaves no durable
-  trace, by design. Case 7 below is what covers it, at its own cadence, and the same
-  goes for a wake lost mid-process to a failed lookup or a bug.
+- **Restart:** ✅ **by case 7, not by this mechanism.** `seed` re-reads the store's
+  *current* cursor, so a change made while the process was down is never scanned, and a
+  settled dependent stranded by one is invisible to every owed-work listing: its own
+  generation never moved, and nothing stamped `reconcile_owed`. This mechanism leaves no
+  durable trace, **by design** — it is an optimisation over case 7, which re-derives the
+  same wake from durable state at its own cadence. A wake lost mid-process to a failed
+  lookup or a bug is covered the same way. The cost is latency (one stale-pass interval
+  instead of one waker tick), never divergence; there is no fix owed here, and
+  `TODO.md` carries none.
 - **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheStoreCursor`,
   `TestWakerRetriesSeedOnTheNextTick`, `TestWakerHoldsTheWatermarkOnScanFailure`,
   `TestWakerHoldsTheWatermarkOnLookupFailure`, `TestWakerPagesTheScan`,
@@ -145,13 +153,55 @@ statement sequence as the edge insert, so the two cannot come apart.
 **What bumps a target's `resource_version`** — i.e. what wakes its dependents — is
 broader than "a spec change": `ObjectsCreate`, `ObjectsUpdateSpec`, the content and
 handshake-only paths of `ObjectsUpdateStatus`, `ConditionsSet`, `ConditionsDelete`,
-`FinalizersDelete`, `markForDeletion`, and the cascade mark. `EventsRecord` is the one
+`FinalizersDelete`, `markForDeletion`, and the cascade mark. `EventsAdd` is the one
 write that does not, by design.
 
 A target of a **client-only kind** is covered too: the waker scans store-wide rather
 than per registered kind, precisely because a `depends_on` edge may point at a kind no
 per-kind query could name. Tests: `TestClientOnlyTargetWakesDependent`,
 `TestClientOnlyTargetCreatedAfterStart`, `TestClientOnlyTargetDeletionUnwedges`.
+
+### 6b. A dependency was declared that no version claim covers (durable)
+
+The other half of case 5, and it needs no claim to be right. `EdgesAdd` **clears the
+dependent's `dependency_watermarks` row** when it creates a new `depends_on` edge, so
+case 7 finds it. An absent row already means stale; nothing new is recorded.
+
+Without it, a declare whose claim is exact or `0`, against a target that is not about
+to move, reaches nobody: case 5's stamp needs the target to have moved past the claim,
+case 6 needs it to move *later*, and case 7 compares that target's `resource_version`
+against a watermark recorded after it — reading converged. That is the ordinary shape
+of an edge declared **on another object's behalf**, which the cross-kind edge
+deliberately allows.
+
+- **Recorded by:** nothing — it *un*-records, inside `sqliteStore.EdgesAdd`, in the
+  same statement sequence as the edge and the stamp.
+- **Found by:** case 7's scan, on the absent-row arm.
+- **Normal:** ✅ 60s (case 7's cadence). Gated on the same edge-new test as the stamp,
+  so re-asserting a dependency set costs nothing after the first declare; self-edges
+  are skipped, matching what the scan excludes.
+- **Restart:** ✅ the row is durable, and so is its absence.
+- **Costs the declarer's own pass nothing, with one exception:** a controller declaring
+  from inside its own `Reconcile` rewrites the watermark when the pass succeeds, from
+  the cursor it loaded at — sound because its read of the new target happened after that
+  load. The exception is the object's *first* `depends_on` edge, where
+  `ReconcileLoad.HasDependencies` was sampled before it existed, so the pass skips the
+  write and the object is found stale once. Once per object ever, self-extinguishing,
+  and not this mechanism's doing. Test:
+  `TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
+- **Not covered — and this one is a strand, not latency:** a *third party* declaring
+  between a dependent's load and that dependent's own watermark write has the clear
+  immediately undone by a pass that never saw the new target. The dependent reads as
+  converged against it with nothing left to re-derive, so a target that never moves
+  again is never reconciled against — the same failure this case exists to close,
+  narrowed to a race window. See [`TODO.md`](../TODO.md) for the fix (stamp every new
+  edge) and what it costs.
+- **Tests:** `TestRefsAddClearsTheDependentsWatermark`,
+  `TestRefsAddClearsTheWatermarkOnAnExactClaim`,
+  `TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge`,
+  `TestRefsAddKeepsTheWatermarkOnAnOwnerEdge`,
+  `TestRefsAddKeepsTheWatermarkOnASelfEdge`,
+  `TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge`.
 
 ### 7. A dependency moved and nobody noticed (re-derived)
 
@@ -227,6 +277,10 @@ All three cases share one trace and one driver:
    pending, or `EdgesHasIncoming` reporting a referrer under RESTRICT. Nothing signals
    the unblocking either: an owner freed by its last child's removal, or by a
    `DependenciesDelete`, is simply still deletion-pending when the next sweep runs.
+   Every block is temporary by construction: the one that was not — a finalizer on a
+   client-only kind, which no `FinalizersDelete` can reach — is now rejected at create
+   (`TestClientCreateRejectsFinalizersOnUnregisteredKind`), so a sweep always has a
+   route to progress.
    Tests: `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
    `TestIntegrationGCDeletesAfterFinalizerCleared`, `TestIntegrationGCDeleteDependencyUnblocksTarget`,
    `TestIntegrationGCBreaksDependencyCycle`, `TestCollectBreaksSelfDependency`.
@@ -277,7 +331,7 @@ Worth stating, because each looks like one:
   controller.** The waker skips the self-edge deliberately: a spec write already leaves
   the object unsettled, and a status write came from the pass that just ran. Test:
   `TestWakerSkipsTheSelfEdge`.
-- **`EventsRecord` wakes nothing** — it bumps no object `resource_version`, which is also
+- **`EventsAdd` wakes nothing** — it bumps no object `resource_version`, which is also
   what makes it the one write safe inside a dependency cycle.
 - **A schedule change wakes nothing** — `SchedulesWatch` reports an in-memory gauge; it
   bumps no generation or `resource_version`.

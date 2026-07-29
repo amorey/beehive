@@ -283,11 +283,83 @@ func TestClientCreate(t *testing.T) {
 	assert.Equal(t, "hello", obj.Spec.Val)
 }
 
+// A finalizer on a kind with no controller is unclearable, not merely useless:
+// FinalizersDelete is a ControllerClient method folded to the caller's own kind, so
+// nothing in the process can remove it, gcCollect returns early while it stands,
+// and the row's owned_by edge RESTRICT-blocks its owner's delete forever. Rejecting
+// at create is the only point where the mistake is still cheap — the symptom
+// otherwise surfaces much later, and as an unrelated-looking stuck delete on the
+// *owner*.
+func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("cleanup"))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.Contains(t, err.Error(), "WithFinalizers")
+	// Rejected before any store work, so there is no row to collect either.
+	objs, listErr := client.List(ctx)
+	require.NoError(t, listErr)
+	assert.Empty(t, objs, "the create wrote nothing")
+}
+
+// GetOrCreate takes the same options, so it makes the same check — on the branch
+// that would actually insert and on the one that would not, since resolving
+// happens before the slug lookup.
+func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"}, WithFinalizers("cleanup"))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.False(t, created)
+}
+
+// It fires on the found branch too, where no row is created and the option would
+// have been ignored. That is the eager-validation rule GetOrCreate documents:
+// deferring to the insert would make the same call pass wherever the row already
+// exists and strand the first time it does not.
+func TestClientGetOrCreateRejectsFinalizersOnTheFoundBranch(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
+	require.NoError(t, err, "the row exists, so the create branch is not reached")
+
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"}, WithFinalizers("cleanup"))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.False(t, created)
+}
+
+// The check is gated on the option being used, so an ordinary create on a
+// client-only kind stays legal — client-only kinds are a supported shape, and only
+// the finalizer makes one uncollectable.
+func TestClientCreateWithoutFinalizersAllowsUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+
+	require.NoError(t, err)
+	assert.Empty(t, obj.Finalizers)
+}
+
 func TestClientCreateWithOptions(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -518,6 +590,7 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	// The finalizer keeps the tombstone around after Delete, so the slug is still
@@ -960,6 +1033,7 @@ func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"},
@@ -1176,6 +1250,7 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
@@ -1895,6 +1970,9 @@ func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus],
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	// One consumer of this fixture creates a child WithFinalizers, which is legal
+	// only on a registered kind.
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
 
 	owners := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Owner"})
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2637,7 +2715,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 }
 
 // The motivating use case, end-to-end through the public API: a flapping cluster's
-// connection-probe outcomes emitted via ControllerClient.EventsRecord render as the
+// connection-probe outcomes emitted via ControllerClient.EventsAdd render as the
 // aggregated, newest-first timeline the health panel shows.
 func TestEventsConnectionPanelTimeline(t *testing.T) {
 	ctx := context.Background()
@@ -2654,7 +2732,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
 		for i := 0; i < n; i++ {
-			require.NoError(t, cc.EventsRecord(ctx, cluster.ID, EventSpec{
+			require.NoError(t, cc.EventsAdd(ctx, cluster.ID, EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: msg, Detail: detail,
 			}))
 		}
@@ -2714,7 +2792,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
-	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	plain, err := client.Get(ctx, obj.ID)
@@ -2743,9 +2821,9 @@ func TestClientListLoadsEvents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	_, err = store.EventsRecord(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	_, err = store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
-	_, err = store.EventsRecord(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
+	_, err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
 	require.NoError(t, err)
 
 	objs, err := client.List(ctx, LoadEvents())
@@ -2773,7 +2851,7 @@ func TestClientListEvents(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := func(cat, typ, reason string) {
-		_, err := store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
+		_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
 		require.NoError(t, err)
 	}
 	rec("connection", "Warning", "ProbeFailed")
@@ -2804,7 +2882,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	got, ok, err := client.EventsGetLatest(ctx, obj.ID, "connection")
@@ -2834,7 +2912,7 @@ func TestClientWatchEvents(t *testing.T) {
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	select {

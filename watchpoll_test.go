@@ -508,7 +508,7 @@ func TestEventsWatchWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	later, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
 	require.Equal(t, next, later.ID, "the store assigns ids in order")
-	require.NoError(t, cc.EventsRecord(ctx, later.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
+	require.NoError(t, cc.EventsAdd(ctx, later.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
 
 	assert.Equal(t, "Started", recv(t, ch).Reason, "the stream picks the object up once it exists")
 }
@@ -526,7 +526,7 @@ func TestEventsWatchIsKindScoped(t *testing.T) {
 
 	foreign, err := NewClient[cSpec, cStatus](bh, other).Create(ctx, cSpec{Val: "foreign"})
 	require.NoError(t, err)
-	require.NoError(t, otherCC.EventsRecord(ctx, foreign.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
+	require.NoError(t, otherCC.EventsAdd(ctx, foreign.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
 
 	ch, err := client.EventsWatch(ctx, foreign.ID)
 	require.NoError(t, err)
@@ -562,7 +562,7 @@ func TestEventsWatchSurvivesReadFailures(t *testing.T) {
 	waitClosed(t, chanAfter(store.eventsFailed, 2), "a poll while the log read fails")
 	store.eventsErr.Store(false)
 
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Recovered"}))
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Recovered"}))
 	assert.Equal(t, "Recovered", recv(t, ch).Reason, "the stream outlived both failures")
 	assert.Contains(t, buf.String(), "event watch poll failed", "the skipped polls are reported")
 }
@@ -577,7 +577,7 @@ func TestEventsWatchEmitsOnlyWhatChanged(t *testing.T) {
 	store, _, client, cc := watchFixture(t)
 	obj, err := client.Create(ctx, cSpec{Val: "a"})
 	require.NoError(t, err)
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -587,7 +587,7 @@ func TestEventsWatchEmitsOnlyWhatChanged(t *testing.T) {
 	// it, the receive below would return "Probing" again instead of the new run.
 	waitClosed(t, chanAfter(store.eventsListed, 3), "polls that re-list the unchanged run")
 
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
 	assert.Equal(t, "Connected", recv(t, ch).Reason, "only the new run is delivered")
 }
 
@@ -599,7 +599,7 @@ func TestEventsWatchAbandonsASendOnCancel(t *testing.T) {
 
 	obj, err := client.Create(ctx, cSpec{Val: "a"})
 	require.NoError(t, err)
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -615,7 +615,7 @@ func TestEventsWatchAbandonsASendOnCancel(t *testing.T) {
 // TestWatchStaysQuietThroughEventWrites pins what the quiet-tick gate asks. The
 // event log draws its resource_version from the same sequence the objects do, so a
 // gate that compared the sequence itself would be defeated by a single
-// EventsRecord anywhere in the store — and a controller that records an event per
+// EventsAdd anywhere in the store — and a controller that records an event per
 // reconcile, the shape examples/events encourages, would defeat it permanently,
 // turning every subscriber into a full blob-bearing listing per tick.
 func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
@@ -632,7 +632,7 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 	drainProbe(store.listed)
 
 	// An event write bumps the shared sequence and no objects row.
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probed"}))
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probed"}))
 
 	waitClosed(t, chanAfter(store.polled, 3), "three polls after the event write")
 	select {

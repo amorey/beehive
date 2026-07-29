@@ -214,11 +214,11 @@ func EventDetail[T any](e Event) (T, error)
 
 `Message` is *sampled*, not part of the run key. Recording the same `(Category, Type, Reason)` with a new message extends the current run and updates the message shown, rather than starting a new run.
 
-`Detail` is the machine-readable companion to `Message`: an optional structured payload, so `ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`. Like `Spec` and `Status` it goes in **typed and comes out opaque**. On write it is any JSON-marshalable value, which `EventsRecord` marshals. On read it is a `json.RawMessage` you decode when you need it, with `EventDetail[T](e)`. Decoding per event, with the type that event's `Reason` implies, is what lets one timeline mix reasons carrying different payload shapes without making the API generic.
+`Detail` is the machine-readable companion to `Message`: an optional structured payload, so `ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`. Like `Spec` and `Status` it goes in **typed and comes out opaque**. On write it is any JSON-marshalable value, which `EventsAdd` marshals. On read it is a `json.RawMessage` you decode when you need it, with `EventDetail[T](e)`. Decoding per event, with the type that event's `Reason` implies, is what lets one timeline mix reasons carrying different payload shapes without making the API generic.
 
 `Detail` is sampled like `Message` — latest occurrence wins, and it is not part of the run key — so a payload that varies never splits a run. If you need every occurrence's payload, that event shouldn't aggregate: give it a unique `Reason`. Unlike `Spec` and `Status`, `Detail` is **not** schema-versioned, so reshaping it breaks decoding of older rows. That is tolerable only because retention ages events out; put a version inside the payload if you need more.
 
-Only controllers write events. `ControllerClient.EventsRecord` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`EventsList`, `EventsWatch`, `EventsGetLatest`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
+Only controllers write events. `ControllerClient.EventsAdd` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`EventsList`, `EventsWatch`, `EventsGetLatest`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
 
 A connection-health panel renders one category's timeline directly — `client.EventsList(ctx, id, WithEventCategory("connection"))` yields, newest first:
 
@@ -372,8 +372,8 @@ Use `GetOrCreate` when a controller has to make sure a child exists **without ev
 
 The example uses two surfaces, and they are not interchangeable. `GetOrCreate` is on
 `Client` — here the child kind's client, built with `NewClient` and held by the
-controller. `EventsRecord` is on the `ControllerClient` that `Reconcile` receives,
-for writes about the object being reconciled. `Client` has no `EventsRecord` and
+controller. `EventsAdd` is on the `ControllerClient` that `Reconcile` receives,
+for writes about the object being reconciled. `Client` has no `EventsAdd` and
 `ControllerClient` has no `GetOrCreate`: a controller creates children through a
 `Client` for their kind.
 
@@ -399,8 +399,8 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
         return beehive.Result{RequeueAfter: 5 * time.Second}, nil
     }
     if created {
-        // EventsRecord is about obj (this controller's object), not the child.
-        if err := cc.EventsRecord(ctx, obj.ID, beehive.EventSpec{
+        // EventsAdd is about obj (this controller's object), not the child.
+        if err := cc.EventsAdd(ctx, obj.ID, beehive.EventSpec{
             Category: "lifecycle", Reason: "ClusterCreated",
         }); err != nil {
             return beehive.Result{}, err
@@ -503,7 +503,7 @@ type ControllerClient[Status any] interface {
     UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
     ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error
     ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error
-    EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error
+    EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error
     FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
     DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
     DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
@@ -521,7 +521,7 @@ type ControllerClient[Status any] interface {
 
 The generation handshake is the exception. `observedGeneration` and `ObservedAt` are recorded even when the content is unchanged, so a reconcile that legitimately changed no status still settles the object instead of being re-queued by every owed-pass tick. That write does bump `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees the object converge. It happens at most once per generation: the next unchanged pass finds the generation already recorded and writes nothing.
 
-`ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `EventsRecord` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
+`ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `EventsAdd` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
 
 → [ADR: the generation handshake and content no-ops](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md), for how the no-op splits the two halves of the write and why it is gated on the schema version.
 
@@ -529,7 +529,7 @@ The generation handshake is the exception. `observedGeneration` and `ObservedAt`
 
 `EdgesHasIncoming` is a different question, used by GC: does anything with a live claim still point at `id`? That means an owned child, or a dependent that is not itself being deleted — one that is going away has no claim. You cannot rebuild it from `DependentsList`, because it folds in owned children as well. A finalizer can wait on it: a controller holding a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
-`EventsRecord` appends an observation to the object's event log — see [Event](#event). Like `ConditionsSet` it is scoped to the controller's kind (`ErrWrongKind` for another kind's id) and composes inside `Within`, so a controller can record an event and flip a condition together.
+`EventsAdd` adds an observation to the object's event log — see [Event](#event). Adding is not always an insert: repeating the latest run's `(Category, Type, Reason)` extends that run instead of appending a second one, which is what lets a controller report every poll without growing the log per poll. Like `ConditionsSet` it is scoped to the controller's kind (`ErrWrongKind` for another kind's id) and composes inside `Within`, so a controller can record an event and flip a condition together.
 
 ### Controller
 
@@ -578,7 +578,7 @@ A kind with no migrator is untouched; its columns stay `0`. Only registered kind
 type Option interface{ apply(any) }
 
 func WithSlug(slug string) Option                  // set a human-readable slug; fails if already exists
-func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers
+func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers; registered kinds only
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
 func WithFullPassInterval(d time.Duration) Option  // how often to re-dispatch EVERY object (default: 0, off)
@@ -590,6 +590,10 @@ func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log
 ```
 
 `WithOwner` writes an `owned_by` edge in the same transaction as the `Create`. Deleting the owner then cascades to the child through GC.
+
+`WithFinalizers` is the one create option that needs a kind **this process has registered a controller for**; otherwise the call fails with `ErrInvalidOption`. Only `ControllerClient.FinalizersDelete` can clear a finalizer, and it folds the calling controller's own kind into the write — so a client-only kind's finalizer is removable by nothing, and the row would stay deletion-pending forever while its `owned_by` edge blocks its owner's delete.
+
+The check is **process-local and evaluated at call time**, since the store records no registrations: it also refuses a create issued before this process's own `Register`, and one from a process that never registers the kind even if another over the same store does. Register the kind first, from whichever process creates these rows. It runs before any store work and only when the option is used, so an ordinary create on a client-only kind is unaffected — and like every other create-option check it is eager, so `GetOrCreate` rejects it on the found branch too rather than only when a row is really inserted.
 
 `WithOnCreate` is the safe way to run a side effect only if the row is really created — an external call, an in-memory counter. It waits for the *outermost* commit, so it runs once and never after a rollback; it is the only thing in beehive deferred that way. `Create` always fires it, `GetOrCreate` only when it inserts. Prefer it to branching on `GetOrCreate`'s `created` bool, which is returned synchronously: inside an enclosing `ControllerClient.Within` that bool is set before the transaction commits, so acting on it fires your side effect for a row a rollback may still discard.
 

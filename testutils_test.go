@@ -226,8 +226,8 @@ func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
-func (s *fakeStore) EventsRecord(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
-	panic("not implemented: fakeStore.EventsRecord")
+func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
+	panic("not implemented: fakeStore.EventsAdd")
 }
 func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
 	panic("not implemented: fakeStore.EventsList")
@@ -385,6 +385,18 @@ type noopController[Spec, Status any] struct{}
 
 func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) (Result, error) {
 	return Result{}, nil
+}
+
+// registerNoop registers a do-nothing controller for gk, making the kind count as
+// registered without standing up any reconcile behaviour. Tests that create rows
+// WithFinalizers need it: a finalizer on a client-only kind is rejected at create,
+// because nothing in the process could ever clear it (see clientImpl.resolveCreate).
+// It registers only — nothing starts — so a fixture that never calls Start is
+// otherwise unchanged.
+func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
+	t.Helper()
+	_, err := Register(bh, gk, &noopController[Spec, Status]{})
+	require.NoError(t, err)
 }
 
 // signal is a one-shot notification from a test fake to the test: a callback
