@@ -212,25 +212,23 @@ func (st *txState) nested(ctx context.Context, depth int, fn func(ctx context.Co
 		// caller's ordinary error handling is the right answer. No poison.
 		return err
 	}
-	if ferr := fn(ctx); ferr != nil {
+	ferr := fn(ctx)
+	if ferr != nil {
 		st.truncateHooks(mark)
-		// ROLLBACK TO rewinds to the savepoint but leaves it on the stack; the
-		// RELEASE is what pops it.
 		if _, err := st.tx.ExecContext(ctx, savepointStmt("ROLLBACK TO", name)); err != nil {
 			st.poison(err)
 			return errors.Join(ferr, err)
 		}
-		if _, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", name)); err != nil {
-			st.poison(err)
-			return errors.Join(ferr, err)
-		}
-		return ferr
 	}
+	// RELEASE pops the savepoint on both outcomes: ROLLBACK TO rewinds to it but
+	// leaves it on the stack, so without this the stack would grow for the life of the
+	// transaction. errors.Join drops a nil ferr, so the success path returns the
+	// RELEASE error alone.
 	if _, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", name)); err != nil {
 		st.poison(err)
-		return err
+		return errors.Join(ferr, err)
 	}
-	return nil
+	return ferr
 }
 
 // hookDisposition is what addHook decided to do with a hook. The two non-queue

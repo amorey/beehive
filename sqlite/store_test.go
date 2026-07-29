@@ -2085,6 +2085,77 @@ func TestWithinRefusesAConcurrentNestedFrame(t *testing.T) {
 		"a second goroutine nesting on the same transaction must be refused")
 }
 
+// TestWithinFailedSavepointDoesNotPoison: a SAVEPOINT that never lands pushed
+// nothing on the SQLite side, so the transaction's state is still known and ordinary
+// error handling applies. Poison is for a failed *unwind*, where it is not.
+func TestWithinFailedSavepointDoesNotPoison(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		fr, ok := txFrom(txCtx)
+		require.True(t, ok)
+		// Kill the transaction under the frame without latching txState.closed, so
+		// Within still takes the nested branch and the SAVEPOINT is what fails.
+		require.NoError(t, fr.st.tx.Rollback())
+
+		nerr := store.Within(txCtx, func(context.Context) error {
+			t.Error("fn must not run when its savepoint could not be opened")
+			return nil
+		})
+		assert.Error(t, nerr, "a failed SAVEPOINT must surface")
+		assert.NoError(t, fr.st.poisonErr(), "but it must not poison the transaction")
+		return nerr
+	})
+	assert.Error(t, err)
+}
+
+// TestWithinFailedReleasePoisons is the success-path half of the poison rule: fn
+// returned cleanly, so there is nothing to unwind, but the RELEASE that pops the
+// savepoint still failed and the stack is no longer what we think it is.
+func TestWithinFailedReleasePoisons(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		nerr := store.Within(txCtx, func(inner context.Context) error {
+			fr, ok := txFrom(inner)
+			require.True(t, ok)
+			require.NoError(t, fr.st.tx.Rollback())
+			return nil // clean return; the RELEASE below is what fails
+		})
+		assert.Error(t, nerr, "a failed RELEASE must surface even on a clean return")
+
+		fr, ok := txFrom(txCtx)
+		require.True(t, ok)
+		assert.Error(t, fr.st.poisonErr(), "and must poison the transaction")
+		return nerr
+	})
+	assert.Error(t, err)
+}
+
+// TestAfterCommitOnARolledBackTransactionDiscards covers the third disposition. The
+// hook must not run — that is the guarantee AfterCommit exists for — and must not be
+// queued either, since nothing will ever drain a rolled-back transaction's queue.
+// Both readings look identical from outside, which is why the arm is named in code
+// rather than inferred.
+func TestAfterCommitOnARolledBackTransactionDiscards(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	var captured context.Context
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		captured = txCtx
+		return sentinel
+	})
+	require.ErrorIs(t, err, sentinel)
+
+	ran := false
+	store.AfterCommit(captured, func(context.Context) { ran = true })
+	assert.False(t, ran, "a rolled-back transaction must never run a hook")
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
