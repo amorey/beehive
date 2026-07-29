@@ -86,9 +86,13 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	return c.objectStream(ctx, func(ctx context.Context) ([]*RawObject, error) {
-		return c.bh.store.ObjectsList(ctx, c.gk)
-	}), nil
+	return c.objectStream(ctx,
+		func(ctx context.Context) ([]*RawObject, error) {
+			return c.bh.store.ObjectsList(ctx, c.gk)
+		},
+		func(ctx context.Context) ([]ObjectID, error) {
+			return c.bh.store.ObjectsListIDs(ctx, c.gk)
+		})
 }
 
 // ObjectsWatch streams changes to the single object id. It polls the same way
@@ -99,24 +103,63 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	return c.objectStream(ctx, func(ctx context.Context) ([]*RawObject, error) {
-		raw, err := c.bh.store.ObjectsGet(ctx, id)
-		if errors.Is(err, ErrNotFound) {
-			return nil, nil // not there (yet): an empty listing, not an error
-		}
-		if err != nil {
-			return nil, err
-		}
-		if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
-			return nil, nil // foreign id: invisible through this kind's client, as Get is
-		}
-		return []*RawObject{raw}, nil
-	}), nil
+	return c.objectStream(ctx,
+		func(ctx context.Context) ([]*RawObject, error) {
+			raw, err := c.scopedRow(ctx, id, c.bh.store.ObjectsGet)
+			if raw == nil || err != nil {
+				return nil, err
+			}
+			return []*RawObject{raw}, nil
+		},
+		// The liveness probe is scoped to this one id rather than listing the kind:
+		// this stream can only ever have that id in seen, so asking for every id of
+		// the kind would make the cheap half of the poll the expensive half, and scale
+		// it with the kind rather than with the watch.
+		func(ctx context.Context) ([]ObjectID, error) {
+			raw, err := c.scopedRow(ctx, id, c.bh.store.ObjectsGetMeta)
+			if raw == nil || err != nil {
+				return nil, err
+			}
+			return []ObjectID{raw.ID}, nil
+		})
 }
 
-// objectStream is the poll-and-diff engine behind both object watches. It remembers
-// the resource_version of every object it has reported and works out the change type
-// by comparison:
+// scopedRow reads id through read and folds both "not visible through this kind's
+// client" cases into (nil, nil): a missing id, so an id that does not exist yet
+// streams nothing until it is created, and a foreign one, as invisible here as it
+// is through Get. read is a parameter so the same fold serves the blob-bearing
+// watch read and the blob-free liveness probe.
+func (c *clientImpl[Spec, Status]) scopedRow(
+	ctx context.Context,
+	id ObjectID,
+	read func(context.Context, ObjectID) (*RawObject, error),
+) (*RawObject, error) {
+	raw, err := read(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+		return nil, nil
+	}
+	return raw, nil
+}
+
+// objectStream is the poll-and-diff engine behind both object watches.
+//
+// **A returned stream always carries a snapshot**, and that is what makes
+// "subscribe, then act" safe: everything the caller does next lands above state
+// this stream already holds, so a change it makes — including a delete — is
+// reported. Taking the snapshot on the first tick instead would leave the window
+// between subscribing and that tick invisible, and an object created and collected
+// inside it is never reported at all, so a caller waiting on its Deleted waits
+// forever. A failed first read therefore returns an error instead of a stream: the
+// alternative is handing back a watch whose guarantee is quietly void.
+//
+// It remembers the resource_version of every object it has reported and works out
+// the change type by comparison:
 //
 //   - absent before, present now -> Added
 //   - present in both, version moved -> Modified
@@ -129,8 +172,15 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 // cursor that has not moved proves no row was created or modified anywhere. The one
 // thing it cannot show is a delete, since a removed row draws no version. So a tick
 // reads the scalar cursor, and pays for the listing that carries specs and statuses
-// only when that moved or the kind's id set shrank. In a quiet system a subscriber
-// costs one scalar read plus one id listing per tick.
+// only when that moved or the ids it tracks have shrunk. In a quiet system a
+// subscriber costs one scalar read plus one blob-free liveness read per tick.
+//
+// The cursor is the object write log's high-water mark, not the version counter
+// behind it, and the difference decides whether this optimization survives contact
+// with a real workload: the counter is shared with the event log, so a single
+// EventsRecord anywhere in the store would move it while touching no objects row —
+// and a controller that records an event per reconcile, the shape the events example
+// encourages, would defeat it permanently.
 //
 // A Deleted change carries the object's last known state, because the row is gone by
 // the time the poll notices and there is nothing left to read. That body can be one
@@ -143,101 +193,156 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
 	list func(context.Context) ([]*RawObject, error),
-) <-chan ObjectChange[Spec, Status] {
-	out := make(chan ObjectChange[Spec, Status])
+	live func(context.Context) ([]ObjectID, error),
+) (<-chan ObjectChange[Spec, Status], error) {
 	// The migrator is invariant for the stream's lifetime; resolve it once rather
 	// than re-locking the registry on every poll.
 	mig := c.bh.migratorFor(c.gk)
 	seen := make(map[ObjectID]tracked[Spec, Status])
 	var cursor int64
 
+	// The snapshot, on the caller's goroutine. Its failure is returned rather than
+	// logged, because it is the one poll whose failure the caller can act on and the
+	// only one that leaves nothing behind: a stream handed back after a failed first
+	// read would carry no state to compare against, so an object deleted next would
+	// never be reported — the exact hole the guarantee above closes. Every later
+	// failure costs one tick, since the state from the last good poll is still there.
+	initial, err := c.poll(ctx, list, live, mig, seen, &cursor)
+	if err != nil {
+		return nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+			c.gk.Group, c.gk.Kind, err)
+	}
+
+	out := make(chan ObjectChange[Spec, Status])
 	go func() {
 		defer close(out)
+		// The snapshot's changes are what the driver's eager first step delivers, so
+		// that step spends itself handing over a read that has already happened rather
+		// than repeating it, and polling begins on the tick after. Sending them here
+		// rather than above is not a choice: a send blocks until the subscriber reads,
+		// and it cannot read until objectStream has returned.
+		pending, delivered := initial, false
 		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
-			if err != nil {
-				return c.pollFailed(ctx, "watch", err)
-			}
-			if at == cursor {
-				// No write anywhere in the store since the last poll, so nothing was
-				// created or modified. A delete is still possible and draws no version,
-				// so check the id set — one blob-free indexed listing — and skip the
-				// expensive read unless something actually vanished.
-				gone, err := c.deletedSince(ctx, seen)
+			if delivered {
+				var err error
+				pending, err = c.poll(ctx, list, live, mig, seen, &cursor)
 				if err != nil {
 					return c.pollFailed(ctx, "watch", err)
 				}
-				if !gone {
-					return true
-				}
 			}
-			raws, err := list(ctx)
-			if err != nil {
-				return c.pollFailed(ctx, "watch", err)
-			}
-			cursor = at
-			present := make(map[ObjectID]struct{}, len(raws))
-			for _, raw := range raws {
-				present[raw.ID] = struct{}{}
-				if prev, known := seen[raw.ID]; known && prev.rv == raw.ResourceVersion {
-					continue // unchanged since the last report
-				}
-				obj, err := rawToTyped[Spec, Status](raw, mig)
-				if err != nil {
-					// Quarantine, don't tear down: skip a poison row and keep the stream
-					// alive so one un-decodable object can't silently kill a live watcher
-					// (mirrors List). Recording the version keeps it from re-warning every
-					// tick until someone rewrites it.
-					seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion}
-					c.warnUndecodable("Watch", raw.ID, err)
-					continue
-				}
-				typ := Modified
-				if _, known := seen[raw.ID]; !known {
-					typ = Added
-				}
-				seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion, obj: obj}
-				if !sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: typ, Object: obj}) {
+			delivered = true
+			for _, ch := range pending {
+				if !sendOrDone(ctx, out, ch) {
 					return false
 				}
 			}
-			for id, prev := range seen {
-				if _, ok := present[id]; ok {
-					continue
-				}
-				delete(seen, id)
-				if prev.obj == nil {
-					continue // only ever seen as a poison row: no body to tombstone
-				}
-				if !sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Deleted, Object: prev.obj}) {
-					return false
-				}
-			}
+			pending = nil // the snapshot's objects are not held past their delivery
 			return true
 		})
 	}()
-	return out
+	return out, nil
 }
 
-// deletedSince reports whether any object this stream has reported is no longer
-// in the kind. It is the cheap half of the poll: ObjectsListIDs is one indexed,
-// blob-free column read, where the listing it gates carries every row's spec and
-// status. Only ever consulted when the write cursor has not moved, so a create
-// cannot be in flight — a shrunk id set means a delete.
-func (c *clientImpl[Spec, Status]) deletedSince(ctx context.Context, seen map[ObjectID]tracked[Spec, Status]) (bool, error) {
+// poll runs one object-watch tick: it reads current state, folds it into seen, and
+// returns the changes to send. The error is returned rather than handled, because
+// the same read means different things to its two callers — fatal for the snapshot,
+// one lost tick for the loop.
+//
+// Deriving every change before sending any is what lets the snapshot run on the
+// caller's goroutine: the sends block on a subscriber that cannot read until
+// subscribing returns, so the two must not be interleaved.
+func (c *clientImpl[Spec, Status]) poll(
+	ctx context.Context,
+	list func(context.Context) ([]*RawObject, error),
+	live func(context.Context) ([]ObjectID, error),
+	mig Migrator,
+	seen map[ObjectID]tracked[Spec, Status],
+	cursor *int64,
+) ([]ObjectChange[Spec, Status], error) {
+	at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if at == *cursor {
+		// Nothing was created or modified. A delete is still possible and draws no
+		// version, so check that what this stream tracks is still there — one
+		// blob-free read — and skip the expensive listing unless something actually
+		// vanished.
+		gone, err := c.deletedSince(ctx, seen, live)
+		if err != nil {
+			return nil, err
+		}
+		if !gone {
+			return nil, nil
+		}
+	}
+	raws, err := list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	*cursor = at
+
+	var changes []ObjectChange[Spec, Status]
+	present := make(map[ObjectID]struct{}, len(raws))
+	for _, raw := range raws {
+		present[raw.ID] = struct{}{}
+		if prev, known := seen[raw.ID]; known && prev.rv == raw.ResourceVersion {
+			continue // unchanged since the last report
+		}
+		obj, err := rawToTyped[Spec, Status](raw, mig)
+		if err != nil {
+			// Quarantine, don't tear down: skip a poison row and keep the stream alive
+			// so one un-decodable object can't silently kill a live watcher (mirrors
+			// List). Recording the version keeps it from re-warning every tick until
+			// someone rewrites it.
+			seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion}
+			c.warnUndecodable("Watch", raw.ID, err)
+			continue
+		}
+		typ := Modified
+		if _, known := seen[raw.ID]; !known {
+			typ = Added
+		}
+		seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion, obj: obj}
+		changes = append(changes, ObjectChange[Spec, Status]{Type: typ, Object: obj})
+	}
+	for id, prev := range seen {
+		if _, ok := present[id]; ok {
+			continue
+		}
+		delete(seen, id)
+		if prev.obj == nil {
+			continue // only ever seen as a poison row: no body to tombstone
+		}
+		changes = append(changes, ObjectChange[Spec, Status]{Type: Deleted, Object: prev.obj})
+	}
+	return changes, nil
+}
+
+// deletedSince reports whether any object this stream has reported is gone. It is
+// the cheap half of the poll: live is a blob-free read scoped to what the stream
+// tracks — the kind's id column for a list watch, one row for a single-object one —
+// where the listing it gates carries every row's spec and status. Only ever
+// consulted when no object write has landed, so a create cannot be in flight and a
+// shrunk id set means a delete.
+func (c *clientImpl[Spec, Status]) deletedSince(
+	ctx context.Context,
+	seen map[ObjectID]tracked[Spec, Status],
+	live func(context.Context) ([]ObjectID, error),
+) (bool, error) {
 	if len(seen) == 0 {
 		return false, nil
 	}
-	ids, err := c.bh.store.ObjectsListIDs(ctx, c.gk)
+	ids, err := live(ctx)
 	if err != nil {
 		return false, err
 	}
-	live := make(map[ObjectID]struct{}, len(ids))
+	stillThere := make(map[ObjectID]struct{}, len(ids))
 	for _, id := range ids {
-		live[id] = struct{}{}
+		stillThere[id] = struct{}{}
 	}
 	for id := range seen {
-		if _, ok := live[id]; !ok {
+		if _, ok := stillThere[id]; !ok {
 			return true, nil
 		}
 	}
@@ -287,18 +392,27 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 			if err != nil {
 				return c.pollFailed(ctx, "event watch", err, "id", id)
 			}
+			// Rebuilt per tick rather than added to, so the map is bounded by what the
+			// query returns instead of by every run the stream has ever seen: retention
+			// physically deletes runs, and their ids would otherwise be held for the
+			// life of the stream. A run that leaves the window and comes back must have
+			// been extended to get there, so its version moved and it is owed a
+			// delivery anyway.
+			next := make(map[EventID]int64, len(runs))
 			// EventsList is newest-first; deliver oldest-first so the timeline builds
 			// in order, as a reader of an append-only log expects.
 			for i := len(runs) - 1; i >= 0; i-- {
 				run := runs[i]
-				if prev, ok := seen[run.ID]; ok && prev == run.ResourceVersion {
+				prev, known := seen[run.ID]
+				next[run.ID] = run.ResourceVersion
+				if known && prev == run.ResourceVersion {
 					continue
 				}
-				seen[run.ID] = run.ResourceVersion
 				if !sendOrDone(ctx, out, eventFromRaw(run)) {
 					return false
 				}
 			}
+			seen = next
 			return true
 		})
 	}()

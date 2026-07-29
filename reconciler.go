@@ -65,7 +65,7 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
 	log := t.log().With("id", id)
 
-	raw, err := t.bh.store.ObjectsGet(ctx, id)
+	load, err := t.bh.store.ObjectsGetForReconcile(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// The queued object is already gone (collected by a prior pass, a cascade,
 		// or the backstop between enqueue and now). Nothing to reconcile — a no-op
@@ -76,6 +76,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	if err != nil {
 		return Result{}, err
 	}
+	raw := &load.Object
 	// The already-loaded row's deletion flag is a fast path: it lets a
 	// non-finalizing reconcile (the common case) skip collect's separate
 	// transaction entirely, while still running GC on the pass where the controller
@@ -139,6 +140,30 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	if reconcileErr == nil && raw.ReconcileOwed != 0 {
 		if err := t.bh.store.ReconcileOwedDecrement(ctx, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
+		}
+	}
+	// The dependency watermark: what this pass observed of the rest of the store, so
+	// the stale-dependents pass can re-derive whether a dependency has moved since.
+	// It is an independent write with an independent gate — the decrement above fires
+	// when something was owed, this fires when the object has dependencies — and the
+	// cursor comes from the *load*, never from here: every read the controller made
+	// happened after it, so a target that moved during the pass stays counted as owed
+	// and is reconciled once more. Sampling it now would instead land above a change
+	// the pass never saw, and leave the dependent stale with nothing left to find it.
+	//
+	// HasDependencies only skips the call; the store's own gate still runs when it is
+	// true, which is what keeps the write safe against the gcCollect below removing
+	// the row mid-pass. A false flag that went stale during the pass is safe too: the
+	// object then has no watermark row, an absent row already means stale, and the
+	// error is in the over-reconcile direction this design errs in throughout.
+	//
+	// A failed write is logged and swallowed, as the decrement above is: it leaves the
+	// object stale, so the next stale pass re-derives it, where returning the error
+	// would push a self-healing bookkeeping write into the backoff ladder and retry a
+	// whole reconcile over it.
+	if reconcileErr == nil && load.HasDependencies {
+		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil {
+			log.WarnContext(ctx, "failed to record the dependency watermark; the stale-dependents pass will re-derive it", "err", err)
 		}
 	}
 	// GC runs in its own transaction over the controller's committed writes, so a

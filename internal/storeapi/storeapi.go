@@ -177,6 +177,25 @@ type RawObject struct {
 	UpdatedAt     time.Time
 }
 
+// ReconcileLoad is everything one reconcile pass needs from its opening read. A
+// struct rather than extra return values: this is the load path most likely to
+// grow, and each addition would otherwise be a Store break of its own.
+type ReconcileLoad struct {
+	Object RawObject
+	// Cursor is the store-wide write cursor as of the same statement that read
+	// Object — the value to record on success. Reading it here rather than
+	// separately saves a round trip on a pool of one connection, and is marginally
+	// safer than two statements: it is at or below the true cursor when the
+	// controller reads its dependencies, because those reads all happen after this
+	// returns.
+	Cursor int64
+	// HasDependencies reports whether Object had an outgoing depends_on edge at
+	// load. It exists only so a reconcile of an object with no dependencies can skip
+	// DependencyWatermarksSet entirely and never take the write lock — see that
+	// method, and the reconciler's skip rule.
+	HasDependencies bool
+}
+
 // Relation is the kind of edge in the edges table. The schema's CHECK constraint
 // permits exactly these two values.
 type Relation string
@@ -234,8 +253,17 @@ type Store interface {
 	io.Closer
 
 	// Within runs fn inside a single transaction, committing on a nil error and
-	// rolling back otherwise. Store calls made with the ctx passed to fn join
-	// that transaction; calls made with any other context run standalone.
+	// rolling back otherwise. Store calls made with the ctx passed to fn join that
+	// transaction.
+	//
+	// **Use that ctx for every store call fn makes.** A call with any other context
+	// asks for a connection of its own, which on a single-connection backend (the
+	// sqlite store pins the pool to one) is the connection this transaction is
+	// holding — so it waits for a transaction that cannot commit until it returns,
+	// and the deadlock ends only when its context is cancelled. That is a property of
+	// the backend, not of this contract, but the contract is where a caller reads
+	// about it: an implementation with a larger pool merely runs the call
+	// concurrently, on a snapshot that does not include fn's uncommitted writes.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has
@@ -360,6 +388,13 @@ type Store interface {
 	// ObjectsGetBySlug loads the object with the given slug within gk, or returns
 	// ErrNotFound.
 	ObjectsGetBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error)
+
+	// ObjectsGetForReconcile is the reconcile loop's opening read: the object (with
+	// its conditions, as ObjectsGet returns it), the store-wide write cursor as of the
+	// same statement, and whether the object has dependencies. Both extra values ride
+	// the statement that reads the row rather than adding round trips. Returns
+	// ErrNotFound like ObjectsGet when the row is gone.
+	ObjectsGetForReconcile(ctx context.Context, id ObjectID) (ReconcileLoad, error)
 
 	// ObjectsGetMeta is ObjectsGet without the conditions query, so the returned
 	// Conditions is always nil. Callers that only need metadata — GC, edge bookkeeping
@@ -546,6 +581,69 @@ type Store interface {
 	// spec and still owe a wake.
 	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
+	// DependencyWatermarksSet records cursor as the store-wide write cursor id's
+	// reconcile observed, for the staleness scan to compare targets against. Upserts,
+	// since the row appears on a dependent's first successful pass and is raised on
+	// later ones. Bumps no resource_version — it writes no objects row at all, so a
+	// recorded reconcile cannot put the object back into the waker's own scan and wake
+	// every dependent of an object whose only change was that record.
+	//
+	// The stored cursor never decreases, and a pass that advances nothing writes
+	// nothing: the upsert rejects a non-advancing value outright. That makes the write
+	// both order-independent — free insurance today, since the work queue serialises
+	// passes per id — and free of charge on a pass that observed no new store state,
+	// which is the common case for a polling controller in a quiet store.
+	//
+	// It also sets a reconciled-at timestamp under the same predicate, so the timestamp
+	// cannot move without the cursor. That timestamp is observability only; nothing
+	// reads it to decide anything, and it is not a reconcile heartbeat.
+	//
+	// The write gates on id having at least one outgoing depends_on edge. An object
+	// with no dependencies can never be found stale, so a row for it is dead weight the
+	// scan would probe forever. The gate is also what keeps the write safe when the
+	// object is collected mid-pass: its edges cascade away with it, so the gate closes
+	// and nothing is written, rather than the write failing against a missing row.
+	//
+	// Advancing the cursor asserts that this pass observed its dependencies' state as
+	// of cursor. The store cannot check that, and one caller shape breaks it: a
+	// controller that swallows a failed read of a dependency and returns nil advances
+	// past a change it never saw. That is the same unsafe shape as sampling the cursor
+	// after the reconcile rather than before, and it is the one way this mechanism can
+	// strand a dependent.
+	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
+
+	// DependentsListStale returns objects of the given kinds that have a depends_on
+	// edge to a target whose resource_version is above their dependency watermark —
+	// everything owed a dependency reconcile as of now, re-derived rather than
+	// recorded. Ordered by id and paged from afterID (pass 0 to start), at most limit
+	// rows. An empty kinds slice returns nothing.
+	//
+	// Filtered by kind for the same reason ReconcileOwedListIDs is: only a registered
+	// kind has a reconcile loop to enqueue into. Filtering here rather than in the
+	// driver is what keeps a client-only dependent — which never gets a watermark
+	// written and is therefore stale forever — from being re-scanned, re-joined and
+	// re-paged on every pass for the life of the row. A kind that gains a controller in
+	// a later build appears in the list and is found on the next pass, so nothing is
+	// lost.
+	//
+	// The kind filter applies to the DEPENDENT and must never be extended to the
+	// TARGET. A registered object may depend on a client-only one — that is the whole
+	// reason the waker's scan is store-wide rather than per-kind — so a target's kind
+	// is irrelevant to whether its dependents are owed a pass. Narrowing the scan to
+	// edges whose *both* endpoints are registered looks like a free optimisation and
+	// would silently strand every registered dependent of a client-only target, which
+	// is the exact failure class this mechanism exists to remove.
+	//
+	// A missing watermark counts as stale: an object that has never reconciled against
+	// a known point cannot have converged, mirroring how the unsettled index treats a
+	// NULL observed_generation.
+	//
+	// Self-edges are excluded. An object that depends on itself bumps its own
+	// resource_version whenever its reconcile writes, which would leave it stale
+	// against itself for an extra pass every time it does any work — the same reason
+	// the waker skips them.
+	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
+
 	// ObjectWritesListSince returns the live writes above afterRV in cursor order, at
 	// most limit of them. It carries no blobs and spans every kind, for a consumer
 	// advancing a watermark over the store's write log. A row gives an id and the
@@ -560,9 +658,18 @@ type Store interface {
 	// that was.
 	ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
 
-	// ObjectWritesMaxVersion returns the store-wide write cursor as of now: every
-	// write committed before the call is at or below it. A consumer that wants to
-	// start from "changes from here on" seeds its watermark with this rather than
-	// replaying the whole log from zero.
+	// ObjectWritesMaxVersion returns the high-water mark of the object write log as of
+	// now: every object write committed before the call is at or below it, and
+	// ObjectWritesListSince returns nothing above it. A consumer that wants to start
+	// from "changes from here on" seeds its watermark with this rather than replaying
+	// the whole log from zero, and one polling for change compares against it.
+	//
+	// It is the maximum over live rows, not the version counter, so it is *not*
+	// monotonic: deleting the highest-versioned row lowers it. That is sound for both
+	// uses — nothing exists at the versions it steps back over, so a seed cannot skip
+	// a live write, and a poller that re-reads because the mark moved backwards finds
+	// exactly the delete that moved it. It also means a write to some *other* log
+	// drawing from the same counter (events do) cannot masquerade here as an object
+	// change.
 	ObjectWritesMaxVersion(ctx context.Context) (int64, error)
 }

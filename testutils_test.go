@@ -78,9 +78,19 @@ const testTimeout = 2 * time.Second
 // its own reads.
 const fastTick = 2 * time.Millisecond
 
+// staleDependentsTick paces the stale-dependents backstop in tests, and is
+// deliberately slower than fastTick. That pass is the one driver whose purpose is a
+// slow cadence — it re-derives what the fast paths missed — so running it at every
+// other driver's rate makes every integration test pay for its three-join query
+// hundreds of times a second, on the single connection all of them share, to
+// observe a backstop it is not testing. At ten ticks a test that does exercise it
+// still has a hundred-fold margin inside testTimeout, and production's ratio (60s
+// against the waker's 1s) is far wider than this.
+const staleDependentsTick = 10 * fastTick
+
 // fast bundles the tick intervals an integration test needs, plus whatever else
 // the caller passes. Kept as one bundle so a test reads as "run the drivers
-// fast" rather than as four numbers each test picked for itself; a test that
+// fast" rather than as five numbers each test picked for itself; a test that
 // means to disable a specific driver appends its own option, which wins by
 // arriving later.
 func fast(opts ...Option) []Option {
@@ -88,6 +98,7 @@ func fast(opts ...Option) []Option {
 		withOwedPassInterval(fastTick),
 		WithGCInterval(fastTick),
 		withDependencyWakeInterval(fastTick),
+		withStaleDependentsInterval(staleDependentsTick),
 		withWatchPollInterval(fastTick),
 	}, opts...)
 }
@@ -154,6 +165,9 @@ func (s *fakeStore) ObjectsCreate(context.Context, *RawObject) (*RawObject, erro
 func (s *fakeStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsGet")
 }
+func (s *fakeStore) ObjectsGetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
+	panic("not implemented: fakeStore.ObjectsGetForReconcile")
+}
 func (s *fakeStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsGetMeta")
 }
@@ -170,6 +184,13 @@ func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]Objec
 	return nil, nil
 }
 func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+// DependentsListStale answers empty like the listings above it, rather than
+// panicking: the stale-dependents driver runs in every Beehive that has
+// controllers, so a panic would make the fake unusable for anything calling Start.
+func (s *fakeStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
 func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
@@ -246,6 +267,10 @@ func (s *fakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) er
 }
 func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
+}
+
+func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.DependencyWatermarksSet")
 }
 
 func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
@@ -406,8 +431,10 @@ func chanAfter(ch <-chan struct{}, n int) <-chan struct{} {
 }
 
 // drainProbe empties a probe channel, so a later wait is answered by a signal the
-// test caused rather than by one still buffered from earlier.
-func drainProbe(ch <-chan struct{}) {
+// test caused rather than by one still buffered from earlier. Generic because the
+// same "discard what happened before now" step applies to a probe's tokens and to
+// a controller's report of which ids it reconciled.
+func drainProbe[T any](ch <-chan T) {
 	for {
 		select {
 		case <-ch:
@@ -428,6 +455,25 @@ func closedWhenDrained[V any](ch <-chan V) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// awaitMatch waits for a value satisfying match, discarding the ones that do not:
+// a driver reports every object it reconciled, and the one under test is not
+// necessarily the next. It is the failsafe-timeout counterpart of recv for a
+// stream a test has to filter.
+func awaitMatch[T any](t *testing.T, ch <-chan T, match func(T) bool, what string) {
+	t.Helper()
+	deadline := time.After(testTimeout)
+	for {
+		select {
+		case v := <-ch:
+			if match(v) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
 }
 
 // waitClosed blocks until ch is closed, failing the test if that takes longer
@@ -645,6 +691,14 @@ type listProbeStore struct {
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
 	owedListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
+	staleListed     chan struct{} // DependentsListStale (global)
+	watermarkSet    chan struct{} // DependencyWatermarksSet (per successful dependent pass)
+
+	// mu guards staleKinds alone. The other fields are channels, but this one is
+	// written by the stale-dependents driver on its own goroutine and read by the
+	// test while that driver is still ticking.
+	mu         sync.Mutex
+	staleKinds [][]GroupKind
 }
 
 // probeSignal reports one listing. The send is non-blocking so a late pass after
@@ -675,4 +729,41 @@ func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.O
 	rows, err := s.Store.DeletionRequestsList(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
+}
+
+// reconcileLoadOf wraps a scripted row as the reconcile loop's opening read, for
+// the fakes that serve one. The loop reads through ObjectsGetForReconcile, so a
+// double keeps its row in its ObjectsGet and delegates here; the cursor and the
+// dependency flag stay zero, which is "no dependencies, nothing to record".
+func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) {
+	if err != nil {
+		return storeapi.ReconcileLoad{}, err
+	}
+	return storeapi.ReconcileLoad{Object: *obj}, nil
+}
+
+func (s *listProbeStore) DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]storeapi.ObjectRef, error) {
+	refs, err := s.Store.DependentsListStale(ctx, kinds, afterID, limit)
+	s.mu.Lock()
+	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
+	s.mu.Unlock()
+	probeSignal(s.staleListed)
+	return refs, err
+}
+
+// kindsAsked snapshots what the stale-dependents listings have been asked for.
+func (s *listProbeStore) kindsAsked() [][]GroupKind {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.staleKinds)
+}
+
+// DependencyWatermarksSet signals *after* the write, so a test can order a change
+// to a target against the dependent's pass having already recorded what it
+// observed — without which the change might land under the pass and be recorded
+// as seen.
+func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
+	err := s.Store.DependencyWatermarksSet(ctx, id, cursor)
+	probeSignal(s.watermarkSet)
+	return err
 }

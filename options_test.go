@@ -189,6 +189,30 @@ func TestWatchPollIntervalRejectsNonPositive(t *testing.T) {
 	}
 }
 
+// TestStaleDependentsIntervalRejectsNonPositive pins the third mandatory
+// interval, and the one with the strongest claim to be mandatory: the
+// stale-dependents pass is what makes a dependency wake a guarantee rather than a
+// best effort, so nothing else re-derives an owed wake if it never runs. "Rarely"
+// is expressible, "never" is not.
+func TestStaleDependentsIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{staleDependentsInterval: time.Minute}
+			err := withStaleDependentsInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "withStaleDependentsInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.staleDependentsInterval, "a rejected option must not have written")
+
+			// Checked before the target switch, like the two above it.
+			require.ErrorIs(t, withStaleDependentsInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, withStaleDependentsInterval(d)("unrelated"), ErrInvalidOption)
+
+			_, err = New(&fakeStore{}, withStaleDependentsInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
+}
+
 func TestWithLoggerDispatch(t *testing.T) {
 	l := slog.New(slog.DiscardHandler)
 

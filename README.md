@@ -119,9 +119,10 @@ Every driver is one of these. They run on separate intervals because they are se
 | full pass | **every** object of the kind, converged or not | the object count | `WithFullPassInterval`, default 0 (off) |
 | GC sweep | deletion-pending rows, plus event-log retention | rows being deleted | `WithGCInterval`, default 30s |
 | dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | 1s, fixed |
+| stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | 60s, fixed |
 | watch poll | current state, for each live `Client` watch | one cheap read per subscriber per tick; a full listing only when something changed | 1s, fixed |
 
-**Only two of the five are configurable.** The other three are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding or what changed rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
+**Only two of the six are configurable.** The other four are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding, by what changed, or by the dependency graph rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
 
 The full pass is opt-in because it is the only driver whose cost is unbounded by outstanding work. It is also the only one that reaches an object the store records nothing about: state that belongs to a process and a restart invalidated, such as a liveness condition, which reads as "verifying" until a controller in *this* process rewrites it. Set it well above the 30s owed pass, which it subsumes.
 
@@ -435,12 +436,16 @@ Looking the slug up is **atomic with the delete** — the slug goes into the sto
 
 `ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled.
 
+**Do not open a watch inside `Within`.** The read below happens on your goroutine, and the store runs on a single connection — so it waits for the connection your transaction is holding, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
+
+**Subscribe, then act.** Both read current state *before returning*, so a change you make after subscribing is measured against a snapshot that already exists — delete an object on the next line and its `Deleted` is guaranteed, where a snapshot taken one tick later could miss the object entirely. The cost is one store read on your goroutine, and if that read fails you get the error rather than a stream: a watch with no snapshot could not report that delete, and you would wait for a tombstone that never comes.
+
 Both are **polls, not subscriptions.** Each remembers the `resource_version` it last reported to you and, on each watch-poll tick (1s), sends the difference: a new object is `Added`, a moved version is `Modified`, a row that has gone is `Deleted` and carries its last known state. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
-- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all.
-- **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the store-wide write cursor is one scalar query, and only a cursor that moved — or an id set that shrank, since deletes draw no version — pays for the full listing.
+- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all — but not one that existed when you subscribed, since the snapshot above is what it is compared against.
+- **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the object write log's high-water mark is one indexed query, and only a mark that moved — or an object that vanished, since deletes draw no version — pays for the full listing. Writing to the event log does not move it, so an object watch stays quiet through a controller that records events on every pass.
 
-A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error instead of ending quietly under a subscriber with no way to notice.
+A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error instead of ending quietly under a subscriber with no way to notice. That applies to every poll after the first — the first one's failure is returned to you, since there is no earlier state for the stream to fall back on.
 
 Both need a **registered controller** for the kind, as `EventsWatch` does, and both are scoped to it: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet — an absent object is just an empty listing, and the stream reports it as `Added` once it is created.
 
@@ -598,7 +603,9 @@ A version *above* the target's current one is rejected with `ErrTargetResourceVe
 
 The check fires at most once per edge, because it is also gated on this call being the one that created the edge — after that, every change reaches an edge the waker can already see. So re-asserting your edges on every pass costs nothing after the first, and a stale version costs one extra reconcile rather than a loop. It survives a crash: the record is a durable count on the row (`reconcile_owed`), written with the edge, and the owed pass drains it.
 
-→ [ADR: caller-versioned dependency declaration](docs/adr/2026-07-27-caller-versioned-dependencies.md), for why both halves are required and how the count is kept atomic with the edge. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md).
+**A dependency wake is a guarantee, not a best effort.** The scan above is fast and lives in memory, so a crash, a restart, or a process that never ran one can drop a wake — and a dependent that has already settled is invisible to every listing of owed work, because its own generation never moved. So beehive records, on each successful reconcile of an object that has dependencies, the store-wide write cursor that pass observed; a slower pass (60s) then enqueues every dependent whose targets have moved past it. Nothing about that is bookkeeping you can lose: it compares current state, so it recovers a wake lost by any means. A failed reconcile records nothing and is therefore found again. What you get is a wake within a second in the ordinary case, and within a minute in every case.
+
+→ [ADR: caller-versioned dependency declaration](docs/adr/2026-07-27-caller-versioned-dependencies.md), for why both halves are required and how the count is kept atomic with the edge. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md), and the backstop under it is [dependency watermarks](docs/adr/2026-07-29-dependency-watermarks.md).
 
 Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned):
 

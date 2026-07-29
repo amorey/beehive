@@ -35,6 +35,14 @@ so the next reader can tell "we decided against this" from "nobody thought of it
      it turns "forever, at speed" into "forever, once per interval", which removes the
      contention.
 
+  **The stale-dependents pass raises the value of fixing this, and removes the one
+  escape hatch.** It sustains a cycle exactly as the waker does — two mutually
+  dependent controllers that write on every pass keep re-staling each other — but
+  unlike the waker it cannot be turned off, since it is what makes a dependency wake a
+  guarantee. Where a test could previously quiet a cycle by disabling the waker,
+  nothing can now. Its 60s cadence is noise against the 1s waker, so this changes the
+  cost of a cycle not at all; it changes only whether there is a way out.
+
   Option 2 is the one to try first. It cannot reuse `addAfter`, whose newest-wins alarm
   would push the item back on every fresh wake and starve it; it needs an oldest-wins
   watermark on `addLocked`, which is the path every wake takes. The cost is that
@@ -81,142 +89,43 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   `DeletionRequestsCreate` gets the same treatment — its absent path has always had
   this shape, so the probe would belong in `requestDeletion` for both.
 
-- **The waker seeds on its own goroutine, so a write racing startup is never
-  scanned** — known, not fixed. This is the one waker gap that needs neither a crash
-  nor an opt-out, and it is the reason the two items below cannot be read as "the
-  restart cases all require something to go wrong first".
+- **The waker's startup seed race costs latency, not convergence** — known, no longer
+  a correctness hole. `Start` launches the waker with `bh.wg.Go` and returns; `seed`
+  runs whenever the Go runtime first schedules that goroutine, and `runDriver`'s eager
+  first step is a seed that reads `ObjectWritesMaxVersion` and returns without
+  scanning. Nothing orders those against `Start`'s return, so a caller that writes
+  target T as soon as `Start` hands back its stop func can commit T's new version
+  *below* the watermark the waker then takes. A failed seed is the same hole by another
+  route: the next tick seeds from the cursor as of *then*, so everything committed in
+  between is below the watermark and never scanned.
 
-  `Start` launches the waker with `bh.wg.Go` and returns; `seed` runs whenever the Go
-  runtime first schedules that goroutine, and `runDriver`'s eager first step is a seed
-  that reads `ObjectWritesMaxVersion` and returns without scanning. Nothing orders
-  those against `Start`'s return. So a caller that writes target T as soon as `Start`
-  hands back its stop func can commit T's new version *below* the watermark the waker
-  then takes, and that change is never read by any scan.
+  Either way that change is never read by any scan — and a settled dependent D of T is
+  invisible to every owed-work listing, since D's own generation never moved and
+  nothing stamped `reconcile_owed`. **What closes it is the stale-dependents pass**,
+  which re-derives staleness from `dependency_watermarks` rather than from anything the
+  waker recorded (see [the ADR](docs/adr/2026-07-29-dependency-watermarks.md)). So D
+  converges within one stale-pass interval instead of never, and what is left here is
+  60 seconds of latency where the waker promises one.
 
-  A settled dependent D is stranded by it, and stranded the way the other waker items
-  describe: `ObjectsListUnsettledIDs` cannot see D, because D's own generation never
-  moved, and nothing stamped `reconcile_owed`, because the edge was not new. Enabling
-  the startup full pass does not even paper over this one the way it does the restart
-  cases: it enqueues D, but whether D's *reconcile* runs before or after T's write is
-  unordered too, and only the "after" half converges.
-
-  **A failed seed is the same hole by another route.** `seed` returning false leaves the
-  waker unseeded, and the next tick seeds from the cursor as of *then* — so everything
-  committed in between is below the watermark and never scanned. Retrying is still the
-  right behaviour (scanning from an unseeded zero would replay the whole table on a
-  transient error), which is why this is one defect with two entrances rather than two
-  defects: in both, the watermark is taken later than the writes it is supposed to
-  precede.
-
-  **The fix is to seed synchronously in `Start`**, under `startCtx`, before the
+  **The fix is still to seed synchronously in `Start`**, under `startCtx`, before the
   reconcile loops are launched: the watermark then provably precedes every write any
-  caller could make, because no caller holds the stop func yet. It is a few lines and
-  needs no schema change, which is what separates it from `observed_cursor` below.
-  It closes the scheduling race outright and narrows the failed-seed one to a store
-  that is already failing at startup; only `observed_cursor` closes that half fully.
-  Not done yet only because it moves a store read into `Start`'s critical section,
-  where it is the first thing that can fail there for a reason unrelated to
-  configuration — and the answer to "does a failed seed abort startup" has to be no,
-  which means keeping the retry-on-next-tick path alive rather than replacing it.
+  caller could make, because no caller holds the stop func yet. A few lines, no schema
+  change. Not done because it moves a store read into `Start`'s critical section, where
+  it is the first thing that can fail there for a reason unrelated to configuration —
+  and the answer to "does a failed seed abort startup" has to be no, which means
+  keeping the retry-on-next-tick path alive rather than replacing it. Worth doing on
+  latency grounds alone, but no longer urgent.
 
   **Tripwires.** `TestWakerSeedsFromTheStoreCursor` pins that the first scan starts at
   the seed. `TestWakerRetriesSeedOnTheNextTick` is the one that constrains the fix: a
   seed that fails must leave the waker unseeded and scanning nothing, so a synchronous
   seed in `Start` must fall back to that path rather than returning an error.
 
-- **A crash during a waker outage strands a settled dependent, and no in-memory
-  recovery can fix it** — analyzed, not fixed, and deliberately out of scope for the
-  watermark (see [the drivers ADR](docs/adr/2026-07-28-periodic-scan-drivers.md)).
-  The waker repairs its own losses within a process; this is the half a restart
-  reopens.
-
-    The scenario: D depends on T, the waker fails a lookup and holds its cursor, and the
-  process dies before the retry. The restart re-seeds the cursor from the store's
-  current version, so that change is never re-read.
-
-  Nothing else finds it either. `enqueueOwedPass` runs at every startup, but it lists
-  unsettled objects and `reconcile_owed` stamps, and a settled dependent has neither:
-  its own generation never moved and nothing stamped it. `enqueueAll` would catch it,
-  but it is gated on `startupFullPass`, **which is now off by default** — so the
-  exposure is a crash mid-outage on stock configuration, not a crash plus an opt-out.
-  Enabling `WithStartupFullPass(true)` still masks it, and that is exactly what it may
-  not be relied on to do: a full pass scales with the object count, so a deployment
-  that outgrows the sweep silently loses the cover. Treat this as an open hole with a
-  workaround, not a narrow corner.
-
-  **Persisting the watermark is not the fix**, and that is the part of this analysis
-  worth keeping. A watermark records *delivery*: the waker reached version N. What has
-  to survive a restart is *convergence*: D actually reconciled against T's new state.
-  Those come apart in the ordinary case — if the waker queues D, advances past T, and
-  the process dies before D's reconcile runs, a persisted cursor is already past T and
-  D is stranded anyway. Persisting closes half the hole, leaves the other half open,
-  and costs a write per page on a single connection.
-
-    The cheap durable trick is not available either. You cannot stamp `reconcile_owed`
-  on the dependent when the lookup fails, because that failed lookup is the only thing
-  that could have named the dependents. Recording an intent means knowing who to record
-  it against, which is exactly what the failure destroyed.
-
-  **The fix is `observed_cursor`**: per-object, so durability attaches to the thing
-  that has to converge, and derived rather than recorded, so it needs no knowledge of
-  who was missed. Deferred only on the size of the change — it touches the schema and
-  every write path — and no longer on how narrow the exposure is, since the default
-  that used to make it narrow is gone. It is now the highest-value item in this file:
-  it is the one change that would make a dependency wake converge under *any*
-  configuration, which is what "no reconcile depends on a full pass" requires of this
-  path specifically.
-
-- **A target change landing *mid-reconcile* is safe in memory, but is not durable** —
-  analyzed; the in-memory half is sound, the durable half is not fixed. The scenario: D
-  depends on T, T changes and wakes D, then T changes *again* while D's reconcile is
-  still running. Is that second change lost to the pass already in flight?
-
-  **In memory, no.** `workQueue` keeps two sets: `dirty` for queued ids and
-  `processing` for ids handed to a worker. `get` moves an id from `dirty` to
-  `processing`. A wake arriving mid-pass goes through `addLocked`, which sets
-  `dirty[id]` but sees the id in `processing` and deliberately does not push it to
-  `items`. After `adapter.reconcile` returns, error or not, `runWorker` always calls
-  `done(id)`, which finds the dirty bit and makes the id dispatchable straight away. So
-  the second change costs one extra pass and is never lost. The producing side is
-  correct trivially: the waker scans committed rows, so a requeue can never point at an
-  uncommitted one. The harmless variant — T changing after `get` but before D reads T —
-  is just a level-triggered re-pass over a value D already saw.
-
-  **What is missing is durability.** This wake exists only in memory. `reconcile_owed`
-  covers the declare window and nothing else, so an ordinary target-change wake has no
-  persisted record. A crash between T's commit and D's re-dispatch loses it, and D has
-  settled at its own generation, so no owed-work listing can see it. The mid-reconcile
-  timing widens the window — the owed wake waits behind a whole reconcile pass rather
-  than a queue hop — but the way it is lost is the same.
-
-  **The loss is permanent, on stock defaults, and used not to be.** The owed-pass tick
-  sees only what the store records as owed, and the waker's own replay cannot reach it
-  either, since nothing *observed* the loss — the wake was delivered, so the watermark
-  legitimately advanced past T. Restart does not help now that the startup full pass is
-  off by default: the next process drains owed work, and D is not owed anything any
-  listing can name. So the gap is "a stranded dependent until something writes to it
-  again", which for a dependent nothing else touches means indefinitely.
-
-    `WithStartupFullPass(true)` or `WithFullPassInterval` still recovers it, and either
-  is the right operational answer today — but neither is a *fix*, because a reconcile
-  may not depend on a full pass (see the drivers ADR). This is the item that most
-  sharply shows why: the behaviour it describes was correct-looking only for as long as
-  a count-scaled sweep was quietly holding it up.
-
-  Deferred because a durable fix is not local to this timing. Stamping
-  `reconcile_owed` in `dependentsWake` would mean a write per dependent on every target
-  change, which is exactly the cost `reconcile_owed` avoids today by riding a write
-  `EdgesAdd` was making anyway. The decrement is per-pass, so a stamp per change would
-  need the count-not-flag reasoning worked out again against far higher write volume.
-  `observed_cursor` remains the alternative that would make it durable under any
-  configuration, because it re-derives staleness instead of tracking each owed wake.
-
-  This item exists so the in-memory analysis is not done twice, and so "the queue
-  handles it" is not mistaken for "it survives a restart".
-
 - **A `RequeueAfter` chain does not survive a restart** — known, not fixed. The
-  dependency-wake half of this is covered by the two items above; this is the
-  self-scheduling half, and it is lost the same way for a different reason.
+  dependency-wake half is closed: staleness is re-derived from
+  `dependency_watermarks`, so a wake lost with the process that owed it is found again
+  by the stale-dependents pass. This is the self-scheduling half, and nothing
+  re-derives it, because there is nothing in the store to re-derive it from.
 
   A controller that keeps itself running with `Result.RequeueAfter` — polling an
   external system, re-checking a lease — leaves *no durable trace at all* once its

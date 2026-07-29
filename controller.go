@@ -133,6 +133,13 @@ type ControllerClient[Status any] interface {
 	// otherwise commits on its own — so a controller uses Within only for the
 	// writes that must be atomic. The transaction holds the store's write lock for
 	// fn's whole duration, so keep external I/O outside it.
+	//
+	// **Pass fn's ctx to every store call it makes, including reads.** The store runs
+	// on one connection, so a call made with any other context waits for the
+	// connection this transaction holds and deadlocks against itself. The one call
+	// that cannot be made here at all is opening a watch: it reads current state
+	// before returning (see Client.ObjectsWatch), and its stream must outlive the
+	// transaction, so neither ctx is the right one. Subscribe outside Within.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 

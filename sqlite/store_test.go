@@ -16,6 +16,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -3014,7 +3015,9 @@ func breakConditionRowRead(t *testing.T, store *sqliteStore, objID storeapi.Obje
 
 // TestConditionAssemblyError corrupts a condition row so the read-path scan
 // fails, exercising the conditions-assembly error branches in ObjectsGet (via
-// loadConditions) and ObjectsList (via conditionsByIDs).
+// loadConditions), ObjectsList (via conditionsByIDs) and ObjectsGetForReconcile,
+// which attaches conditions like ObjectsGet and must surface the failure rather
+// than hand a reconcile an object missing them.
 func TestConditionAssemblyError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3027,6 +3030,9 @@ func TestConditionAssemblyError(t *testing.T) {
 
 	_, err = store.ObjectsList(ctx, testGK)
 	require.Error(t, err, "ObjectsList surfaces a conditions scan error")
+
+	_, err = store.ObjectsGetForReconcile(ctx, obj.ID)
+	require.Error(t, err, "ObjectsGetForReconcile surfaces a conditions scan error")
 }
 
 // TestConditionResourceVersionError drops the resource_version sequence so the
@@ -3659,4 +3665,442 @@ func TestObjectsDeleteRefusesAReferencedRow(t *testing.T) {
 	// first, and the row it was holding open becomes collectable.
 	require.NoError(t, store.EdgesDelete(ctx, dependent.ID, target.ID, beehive.RelationDependsOn))
 	assert.NoError(t, store.ObjectsDelete(ctx, target.ID))
+}
+
+// newDependentObject creates an object of testGK with an outgoing depends_on
+// edge to target, which is the shape every dependency-watermark test needs: the
+// write gates on that edge existing.
+func newDependentObject(t *testing.T, store beehive.Store, target beehive.ObjectID) *beehive.RawObject {
+	t.Helper()
+	obj := newRefObject(t, store)
+	require.NoError(t, addEdge(context.Background(), store, obj.ID, target, beehive.RelationDependsOn))
+	return obj
+}
+
+// readWatermark returns the stored watermark row for id, or ok=false when the
+// object has none. It reads the table directly because nothing on the Store
+// surface exposes it — DependentsListStale consumes it in a join, and a test
+// asserting on the write itself needs the columns.
+func readWatermark(t *testing.T, store *sqliteStore, id beehive.ObjectID) (against, at int64, ok bool) {
+	t.Helper()
+	err := store.db.QueryRowContext(context.Background(),
+		`SELECT reconciled_against, reconciled_at FROM dependency_watermarks WHERE object_id = ?`,
+		id).Scan(&against, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, false
+	}
+	require.NoError(t, err)
+	return against, at, true
+}
+
+// A dependent's first successful pass leaves the cursor it observed.
+func TestDependencyWatermarksSetRecordsTheCursor(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 42))
+
+	against, at, ok := readWatermark(t, store, dep.ID)
+	require.True(t, ok, "a dependent's pass records a watermark")
+	assert.Equal(t, int64(42), against)
+	assert.NotZero(t, at)
+}
+
+// The write gates on an outgoing depends_on edge: an object that can never be
+// found stale must not get a row the scan would probe forever. owned_by is not
+// a dependency, so it does not open the gate either.
+func TestDependencyWatermarksSetGatesOnOutgoingDependsOn(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+
+	lone := newRefObject(t, store)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, lone.ID, 7))
+	_, _, ok := readWatermark(t, store, lone.ID)
+	assert.False(t, ok, "an object with no edges gets no row")
+
+	owned := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, owned.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, owned.ID, 7))
+	_, _, ok = readWatermark(t, store, owned.ID)
+	assert.False(t, ok, "owned_by is not a dependency")
+}
+
+// A later pass raises the same row rather than failing on the primary key.
+func TestDependencyWatermarksSetUpserts(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 20))
+
+	against, _, ok := readWatermark(t, store, dep.ID)
+	require.True(t, ok)
+	assert.Equal(t, int64(20), against)
+}
+
+// The FK guard: gcCollect can remove the object between the load and this write,
+// taking its edges with it. The gate then finds no edge and nothing is inserted,
+// so a racing delete costs a no-op rather than "FOREIGN KEY constraint failed".
+func TestDependencyWatermarksSetSkipsCollectedObject(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 5))
+
+	_, _, ok := readWatermark(t, store, dep.ID)
+	assert.False(t, ok)
+}
+
+// It writes no objects row at all, so recording a reconcile cannot put the object
+// back into the waker's scan and wake every dependent of it.
+func TestDependencyWatermarksSetBumpsNoResourceVersion(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	probe := newWriteProbe(t, store)
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 9))
+
+	probe.expectNone()
+}
+
+// Derived state with no claim on the object's lifetime: the row goes with it.
+func TestDependencyWatermarksCascadeOnObjectDelete(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 3))
+
+	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
+
+	_, _, ok := readWatermark(t, store, dep.ID)
+	assert.False(t, ok)
+}
+
+// stampWatermarkAt back-dates id's reconciled_at to a sentinel, so a later
+// assertion can tell a suppressed write (the sentinel survives) from one that
+// rewrote the row.
+func stampWatermarkAt(t *testing.T, store *sqliteStore, id beehive.ObjectID, at int64) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(),
+		`UPDATE dependency_watermarks SET reconciled_at = ? WHERE object_id = ?`, at, id)
+	require.NoError(t, err)
+}
+
+// A write arriving out of order cannot regress the cursor and un-converge a
+// dependent that has already reconciled against a later point.
+func TestDependencyWatermarksSetNeverRegresses(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 20))
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 5))
+
+	against, _, ok := readWatermark(t, store, dep.ID)
+	require.True(t, ok)
+	assert.Equal(t, int64(20), against, "a lower cursor leaves the stored value alone")
+}
+
+// reconciled_at is guarded by the same predicate as the cursor, so a pass that
+// observed no new store state writes nothing at all — no page dirtied, and no
+// timestamp that could be misread as a reconcile heartbeat.
+func TestDependencyWatermarksSetMovesReconciledAtOnlyWithTheCursor(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	const sentinel = int64(1)
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
+	stampWatermarkAt(t, store, dep.ID, sentinel)
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
+	_, at, ok := readWatermark(t, store, dep.ID)
+	require.True(t, ok)
+	assert.Equal(t, sentinel, at, "re-applying the same cursor rewrites nothing")
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 11))
+	against, at, ok := readWatermark(t, store, dep.ID)
+	require.True(t, ok)
+	assert.Equal(t, int64(11), against)
+	assert.Greater(t, at, sentinel, "an advancing cursor carries the timestamp with it")
+}
+
+// cursorNow is the store-wide write cursor as a reconcile's load would observe
+// it — what a dependent records as its watermark.
+func cursorNow(t *testing.T, store beehive.Store) int64 {
+	t.Helper()
+	rv, err := store.ObjectWritesMaxVersion(context.Background())
+	require.NoError(t, err)
+	return rv
+}
+
+// staleIDs is DependentsListStale over testGK from the start, projected to ids.
+func staleIDs(t *testing.T, store beehive.Store) []beehive.ObjectID {
+	t.Helper()
+	refs, err := store.DependentsListStale(context.Background(),
+		[]beehive.GroupKind{testGK}, 0, 100)
+	require.NoError(t, err)
+	return refIDs(refs)
+}
+
+// A dependent is stale exactly while a target it depends on sits above its
+// watermark, and converges out of the listing once it records a later one.
+func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.Empty(t, staleIDs(t, store), "nothing has moved since the watermark")
+
+	moveTarget(t, store, target.ID)
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	assert.Empty(t, staleIDs(t, store), "a pass that observed the change settles it")
+}
+
+// A dependent that has never reconciled against a known point cannot have
+// converged, mirroring how the unsettled index treats a NULL observed_generation
+// — and it is what makes the table need no backfill.
+func TestDependentsListStaleTreatsMissingWatermarkAsStale(t *testing.T) {
+	store := newRawStore(t)
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
+}
+
+// No kinds means no reconcile loop to enqueue into, so there is nothing to ask
+// for.
+func TestDependentsListStaleReturnsNothingForNoKinds(t *testing.T) {
+	store := newRawStore(t)
+	newDependentObject(t, store, newRefObject(t, store).ID)
+
+	refs, err := store.DependentsListStale(context.Background(), nil, 0, 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs)
+}
+
+// A self-dependent object would be stale against itself for an extra pass every
+// time its own reconcile writes anything, so the edge is excluded — the same
+// reason the waker skips it.
+func TestDependentsListStaleExcludesSelfEdges(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, beehive.RelationDependsOn))
+	require.Empty(t, staleIDs(t, store))
+
+	// The case the exclusion is for: its own reconcile writes, which raises its own
+	// resource_version above any watermark it just recorded.
+	moveTarget(t, store, obj.ID)
+
+	assert.Empty(t, staleIDs(t, store), "an object cannot be stale against itself")
+}
+
+// Only a registered kind has a reconcile loop to enqueue into, so a client-only
+// dependent — stale forever, since nothing ever writes it a watermark — is left
+// out rather than re-scanned on every pass. Registering the kind later is all it
+// takes for the same row to appear.
+func TestDependentsListStaleFiltersByKind(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	other := beehive.GroupKind{Kind: "Gadget"}
+	target := newRefObject(t, store)
+	dep, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: other.Group, Kind: other.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
+
+	assert.Empty(t, staleIDs(t, store), "a kind with no controller is not listed")
+
+	refs, err := store.DependentsListStale(ctx, []beehive.GroupKind{testGK, other}, 0, 100)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "and appears once its kind is registered")
+}
+
+// The kind filter binds the dependent alone. A registered object may depend on a
+// client-only target — the whole reason the waker's scan is store-wide — so
+// narrowing the scan to edges with two registered endpoints would silently strand
+// every dependent of a client-only target. This is the test that fails if someone
+// does that.
+func TestDependentsListStaleFindsDependentsOfUnregisteredTargets(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: "", Kind: "Gadget", Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	dep := newDependentObject(t, store, target.ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.Empty(t, staleIDs(t, store))
+
+	_, _, err = store.ObjectsUpdateSpec(ctx, beehive.GroupKind{Kind: "Gadget"}, target.ID, []byte(`{"v":2}`), 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store),
+		"a registered dependent of a client-only target is still owed a pass")
+}
+
+// A dependent with several stale targets is owed one pass, not one per target.
+func TestDependentsListStaleReturnsEachDependentOnce(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	first, second := newRefObject(t, store), newRefObject(t, store)
+	dep := newDependentObject(t, store, first.ID)
+	require.NoError(t, addEdge(ctx, store, dep.ID, second.ID, beehive.RelationDependsOn))
+
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
+}
+
+// Paging is by dependent id, so a caller resumes from the last id it saw.
+func TestDependentsListStalePages(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	first := newDependentObject(t, store, target.ID)
+	second := newDependentObject(t, store, target.ID)
+
+	page, err := store.DependentsListStale(ctx, []beehive.GroupKind{testGK}, 0, 1)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{first.ID}, refIDs(page))
+
+	page, err = store.DependentsListStale(ctx, []beehive.GroupKind{testGK}, first.ID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{second.ID}, refIDs(page))
+
+	page, err = store.DependentsListStale(ctx, []beehive.GroupKind{testGK}, second.ID, 1)
+	require.NoError(t, err)
+	assert.Empty(t, page)
+}
+
+// The reconcile load carries the write cursor as of the same statement that read
+// the object, which is the value a successful pass records: every dependency read
+// the controller makes happens after this returns, so the cursor is at or below
+// the true one when it does.
+func TestObjectsGetForReconcileReturnsTheWriteCursor(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	load, err := store.ObjectsGetForReconcile(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, load.Object.ID)
+	assert.Equal(t, cursorNow(t, store), load.Cursor)
+
+	moveTarget(t, store, obj.ID)
+	load, err = store.ObjectsGetForReconcile(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, cursorNow(t, store), load.Cursor, "the cursor tracks the store, not the object")
+}
+
+// HasDependencies is the flag that lets a reconcile of an object with no
+// dependencies skip the watermark write entirely and never take the write lock.
+// owned_by is not a dependency.
+func TestObjectsGetForReconcileReportsHasDependencies(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+
+	dep := newDependentObject(t, store, target.ID)
+	load, err := store.ObjectsGetForReconcile(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.True(t, load.HasDependencies)
+
+	owned := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, owned.ID, target.ID, beehive.RelationOwnedBy))
+	load, err = store.ObjectsGetForReconcile(ctx, owned.ID)
+	require.NoError(t, err)
+	assert.False(t, load.HasDependencies, "owned_by is not a dependency")
+
+	load, err = store.ObjectsGetForReconcile(ctx, target.ID)
+	require.NoError(t, err)
+	assert.False(t, load.HasDependencies)
+}
+
+// It is a Get, so a collected id is ErrNotFound — the reconcile loop's
+// "already gone" skip reads it exactly as it read ObjectsGet's.
+func TestObjectsGetForReconcileReportsMissingObject(t *testing.T) {
+	store := newRawStore(t)
+
+	_, err := store.ObjectsGetForReconcile(context.Background(), 404)
+	assert.ErrorIs(t, err, storeapi.ErrNotFound)
+}
+
+// The load carries the object's conditions, like ObjectsGet: a controller reads
+// them from the object it is handed.
+func TestObjectsGetForReconcileAttachesConditions(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	_, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	load, err := store.ObjectsGetForReconcile(ctx, obj.ID)
+	require.NoError(t, err)
+	require.Len(t, load.Object.Conditions, 1)
+	assert.Equal(t, "Ready", load.Object.Conditions[0].Type)
+}
+
+// The staleness scan surfaces a failed query rather than reporting an empty
+// listing, which the sweep would read as "nothing is owed".
+func TestDependentsListStaleQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.DependentsListStale(context.Background(), []beehive.GroupKind{testGK}, 0, 10)
+	require.Error(t, err)
+}
+
+// The write log's high-water mark is the maximum over live objects rows, not the
+// version counter behind them. The two differ exactly where it matters: the event
+// log draws from the same counter, so a mark taken from the counter would move for
+// a write no ObjectWritesListSince consumer can ever be shown.
+func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	before := cursorNow(t, store)
+	require.Equal(t, obj.ResourceVersion, before, "the mark is the newest object write")
+
+	_, err := store.EventsRecord(ctx, testGK, obj.ID, storeapi.Event{
+		Type: "Normal", Reason: "Probed",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, before, cursorNow(t, store), "an event write is not an object write")
+	writes, err := store.ObjectWritesListSince(ctx, before, 10)
+	require.NoError(t, err)
+	assert.Empty(t, writes, "and the listing agrees: nothing above the mark")
+}
+
+// An empty store has no objects to take a maximum over, which reads as 0 — the
+// same value a consumer starting from scratch would use, so there is nothing to
+// special-case.
+func TestObjectWritesMaxVersionOnAnEmptyStore(t *testing.T) {
+	assert.Zero(t, cursorNow(t, newRawStore(t)))
+}
+
+// The mark is not monotonic: removing the highest-versioned row lowers it. That is
+// sound for both of its uses — nothing exists at the versions it steps back over,
+// so a seeded watermark cannot skip a live write, and a poller that re-reads
+// because the mark moved finds exactly the delete that moved it.
+func TestObjectWritesMaxVersionFallsWhenTheNewestRowGoes(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	first := newRefObject(t, store)
+	second := newRefObject(t, store)
+	require.Equal(t, second.ResourceVersion, cursorNow(t, store))
+
+	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
+
+	assert.Equal(t, first.ResourceVersion, cursorNow(t, store))
 }

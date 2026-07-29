@@ -41,6 +41,14 @@ const (
 	// query that returns nothing in a quiet system — so it runs an order of
 	// magnitude more often than the passes that scale with the object count.
 	defaultWakeInterval = 1 * time.Second
+	// The stale-dependents pass is the waker's backstop, so its cadence is set by
+	// acceptable staleness after a crash rather than by cost: the scan is reads-only,
+	// bounded by the depends_on edges of registered kinds, and in a steady state finds
+	// nothing and enqueues nothing. Five minutes of silent divergence is a long time
+	// for a control plane whose ordinary wake latency is one second; 60s keeps the
+	// backstop in the same order as the owed pass and the GC sweeper while staying
+	// above them.
+	defaultStaleDependentsInterval = 60 * time.Second
 	// The client's watch surface polls, so this is the latency a subscriber sees.
 	defaultWatchPollInterval = 1 * time.Second
 )
@@ -76,6 +84,11 @@ type Beehive struct {
 	// rather than with what exists or what is owed, which is what lets it run often
 	// and cost nothing in a quiet system. Non-positive turns it off.
 	wakeInterval time.Duration
+	// staleDependentsInterval paces the stale-dependents pass, which re-derives owed
+	// dependency reconciles from the durable watermarks rather than from anything the
+	// waker recorded (see staleDependentsRun). It is always positive when the Beehive
+	// came from New, since withStaleDependentsInterval rejects a non-positive value.
+	staleDependentsInterval time.Duration
 	// watchPollInterval paces the client's watch surface, which polls the store and
 	// diffs (see watchpoll.go). It bounds how stale a subscriber's view can be.
 	watchPollInterval time.Duration
@@ -172,6 +185,14 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		})
 	}
 
+	// The stale-dependents pass, the waker's backstop. It needs no ordering against
+	// the loops below either: it reads current state, so whatever it finds on its
+	// first step is owed a pass whether or not the loops are up yet, and the work
+	// queue holds the enqueue until one is.
+	bh.wg.Go(func() {
+		bh.staleDependentsRun(runCtx)
+	})
+
 	// The global GC sweeper collects deletion-pending objects of client-only
 	// kinds, which no per-controller backstop reaches. Counted in wg so Stop
 	// drains it.
@@ -219,7 +240,7 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 	rows, err := bh.store.DeletionRequestsList(ctx)
 	if err != nil {
-		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
+		bh.log().Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return
 	}
 	for _, row := range rows {
@@ -229,7 +250,7 @@ func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 		// RESTRICT-block its owner's delete forever. ErrNotFound is the benign
 		// already-collected race and stays quiet.
 		if err := bh.deletionAdvance(ctx, row.GroupKind(), row.ID); err != nil && !errors.Is(err, ErrNotFound) {
-			bh.logger.Warn("gc sweep: collecting object failed; retry next sweep",
+			bh.log().Warn("gc sweep: collecting object failed; retry next sweep",
 				"group", row.Group, "kind", row.Kind, "id", row.ID, "err", err)
 		}
 	}
@@ -310,15 +331,16 @@ func (bh *Beehive) stop(ctx context.Context) error {
 // returned Beehive before calling Start.
 func New(s Store, opts ...Option) (*Beehive, error) {
 	bh := &Beehive{
-		store:             s,
-		startupFullPass:   defaultStartupFullPass,
-		owedPassInterval:  defaultOwedPassInterval,
-		fullPassInterval:  defaultFullPassInterval,
-		gcInterval:        defaultGCInterval,
-		wakeInterval:      defaultWakeInterval,
-		watchPollInterval: defaultWatchPollInterval,
-		reconcilers:       make(map[GroupKind]*reconciler),
-		migrators:         make(map[GroupKind]Migrator),
+		store:                   s,
+		startupFullPass:         defaultStartupFullPass,
+		owedPassInterval:        defaultOwedPassInterval,
+		fullPassInterval:        defaultFullPassInterval,
+		gcInterval:              defaultGCInterval,
+		wakeInterval:            defaultWakeInterval,
+		watchPollInterval:       defaultWatchPollInterval,
+		staleDependentsInterval: defaultStaleDependentsInterval,
+		reconcilers:             make(map[GroupKind]*reconciler),
+		migrators:               make(map[GroupKind]Migrator),
 	}
 	bh.waker = &waker{bh: bh}
 	for _, o := range opts {

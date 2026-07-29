@@ -1257,6 +1257,10 @@ func (s *getObjectBadSpecStore) ObjectsGet(_ context.Context, id ObjectID) (*Raw
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json")}, nil
 }
 
+func (s *getObjectBadSpecStore) ObjectsGetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	return reconcileLoadOf(s.ObjectsGet(ctx, id))
+}
+
 // TestTypedControllerReconcileRawToTypedError pins the quarantine: an undecodable
 // row (not deletion-pending) is a no-op success, not a retryable error — returning
 // the error would retry the identical bytes forever under backoff, and the full pass
@@ -1289,6 +1293,10 @@ type owedBadSpecStore struct {
 
 func (s *owedBadSpecStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), ReconcileOwed: 2}, nil
+}
+
+func (s *owedBadSpecStore) ObjectsGetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	return reconcileLoadOf(s.ObjectsGet(ctx, id))
 }
 
 func (s *owedBadSpecStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
@@ -1367,6 +1375,10 @@ func (s *undecodableDeletingCollectErrorStore) ObjectsGet(_ context.Context, id 
 	return &RawObject{ID: id, Kind: "Widget", Spec: []byte("not-json"), DeletionRequestedAt: &deletedAt}, nil
 }
 
+func (s *undecodableDeletingCollectErrorStore) ObjectsGetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	return reconcileLoadOf(s.ObjectsGet(ctx, id))
+}
+
 func (s *undecodableDeletingCollectErrorStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
 	return nil, errBoom
 }
@@ -1399,6 +1411,10 @@ func (s *getObjectErrorStore) ObjectsGet(_ context.Context, _ ObjectID) (*RawObj
 	return nil, errBoom
 }
 
+func (s *getObjectErrorStore) ObjectsGetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	return reconcileLoadOf(s.ObjectsGet(ctx, id))
+}
+
 func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 	bh := &Beehive{store: &getObjectErrorStore{}}
 	inner := &noopController[tSpec, tStatus]{}
@@ -1420,6 +1436,10 @@ type notFoundStore struct {
 
 func (s *notFoundStore) ObjectsGet(_ context.Context, _ ObjectID) (*RawObject, error) {
 	return nil, ErrNotFound
+}
+
+func (s *notFoundStore) ObjectsGetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	return reconcileLoadOf(s.ObjectsGet(ctx, id))
 }
 
 func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
@@ -1592,6 +1612,31 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	assert.NotNil(t, got.ObservedGeneration)
 }
 
+// wrapStore applies a harness's optional store decoration, so the harnesses read
+// as "the controller writes through this" while their assertions keep reading the
+// real store underneath.
+func wrapStore(s Store, wrap func(Store) Store) Store {
+	if wrap == nil {
+		return s
+	}
+	return wrap(s)
+}
+
+// newSyncController wires a typedController over s with its ControllerClient and a
+// funcController the caller scripts. Nothing here starts a loop: reconcile is
+// called directly, so a pass's bookkeeping writes have landed by the time it
+// returns, which is what lets these tests assert on them without waiting.
+func newSyncController(s Store) (*typedController[cSpec, cStatus], *funcController) {
+	bh := &Beehive{store: s}
+	inner := &funcController{}
+	return &typedController[cSpec, cStatus]{
+		gk:     clientTestGK,
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
+		inner:  inner,
+	}, inner
+}
+
 // reconcileOwedHarness builds a typedController over a real store, driven
 // synchronously so the decrement has run by the time reconcile returns. wrap, if
 // non-nil, decorates the store the controller writes through (to inject a failing
@@ -1613,18 +1658,7 @@ func reconcileOwedHarness(t *testing.T, wrap func(Store) Store) (*typedControlle
 	raw, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
 	require.NoError(t, err)
 
-	var store Store = s
-	if wrap != nil {
-		store = wrap(store)
-	}
-	bh := &Beehive{store: store}
-	inner := &funcController{}
-	tc := &typedController[cSpec, cStatus]{
-		gk:     clientTestGK,
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
-		inner:  inner,
-	}
+	tc, inner := newSyncController(wrapStore(s, wrap))
 	count := func(t *testing.T) int64 {
 		t.Helper()
 		got, err := s.ObjectsGet(ctx, raw.ID)
@@ -2550,16 +2584,7 @@ func settleFirstPass(t *testing.T, client Client[tSpec, tStatus], ch chan *Objec
 // awaitReconcile waits for a reconcile of id, ignoring any others.
 func awaitReconcile(t *testing.T, ch chan *Object[tSpec, tStatus], id ObjectID, msg string) {
 	t.Helper()
-	for {
-		select {
-		case obj := <-ch:
-			if obj.ID == id {
-				return
-			}
-		case <-time.After(testTimeout):
-			t.Fatal(msg)
-		}
-	}
+	awaitMatch(t, ch, func(obj *Object[tSpec, tStatus]) bool { return obj.ID == id }, msg)
 }
 
 // TestClientOnlyTargetWakesDependent is the defect: a depends_on edge may point
@@ -2649,4 +2674,273 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	require.NoError(t, err)
 	_, err = store.ObjectsGet(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")
+}
+
+// watermarkHarness is a typedController over a real store with one dependent and
+// one target, driven synchronously so the watermark write has run by the time
+// reconcile returns. wrap, if non-nil, decorates the store the controller writes
+// through; the staleness query always reads the real store underneath it.
+//
+// Staleness is the observable rather than the table itself: what the watermark is
+// *for* is whether the stale-dependents pass would find this object again.
+type watermarkHarness struct {
+	tc     *typedController[cSpec, cStatus]
+	inner  *funcController
+	store  Store
+	dep    ObjectID
+	target ObjectID
+}
+
+func newWatermarkHarness(t *testing.T, wrap func(Store) Store) *watermarkHarness {
+	t.Helper()
+	ctx := context.Background()
+	s := newClientTestStore(t)
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	target, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+	dep, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, s, dep.ID, target.ID, RelationDependsOn))
+
+	tc, inner := newSyncController(wrapStore(s, wrap))
+	return &watermarkHarness{tc: tc, inner: inner, store: s, dep: dep.ID, target: target.ID}
+}
+
+// stale is what the stale-dependents pass would enqueue right now.
+func (h *watermarkHarness) stale(t *testing.T) []ObjectID {
+	t.Helper()
+	refs, err := h.store.DependentsListStale(context.Background(), []GroupKind{clientTestGK}, 0, 100)
+	require.NoError(t, err)
+	return objectRefIDs(refs)
+}
+
+// touchTarget writes the target's spec, so it moves above any watermark recorded
+// before now.
+func (h *watermarkHarness) touchTarget(t *testing.T, spec string) {
+	t.Helper()
+	_, _, err := h.store.ObjectsUpdateSpec(context.Background(), clientTestGK, h.target, []byte(spec), 0)
+	require.NoError(t, err)
+}
+
+// TestReconcileRecordsDependencyWatermark pins the write: a dependent is stale
+// until a pass records the cursor it reconciled against, and settles once one
+// does.
+func TestReconcileRecordsDependencyWatermark(t *testing.T) {
+	ctx := context.Background()
+	h := newWatermarkHarness(t, nil)
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	require.Equal(t, []ObjectID{h.dep}, h.stale(t), "a dependent that never reconciled is stale")
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+	assert.Empty(t, h.stale(t), "the pass recorded what it reconciled against")
+
+	h.touchTarget(t, `{"val":"moved"}`)
+	assert.Equal(t, []ObjectID{h.dep}, h.stale(t), "and the next change makes it stale again")
+}
+
+// watermarkProbeStore records every dependency-watermark write, so a test can
+// assert on the call rather than on the row. The point of the skip is the write
+// lock not taken — on a pool of one connection an INSERT that writes no rows still
+// serialises against every other statement — which a row-count assertion could
+// not catch.
+type watermarkProbeStore struct {
+	Store
+	sets []ObjectID
+	err  error
+}
+
+func (s *watermarkProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
+	s.sets = append(s.sets, id)
+	if s.err != nil {
+		return s.err
+	}
+	return s.Store.DependencyWatermarksSet(ctx, id, cursor)
+}
+
+// TestReconcileSkipsDependencyWatermarkWithoutDependencies pins the skip: an
+// object with no depends_on edge can never be found stale, so its pass must not
+// reach the store at all.
+func TestReconcileSkipsDependencyWatermarkWithoutDependencies(t *testing.T) {
+	ctx := context.Background()
+	var probe *watermarkProbeStore
+	h := newWatermarkHarness(t, func(s Store) Store {
+		probe = &watermarkProbeStore{Store: s}
+		return probe
+	})
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.target)
+	require.NoError(t, err)
+	assert.Empty(t, probe.sets, "an object with no dependencies never takes the write lock")
+
+	_, err = h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{h.dep}, probe.sets, "a dependent does record one")
+}
+
+// TestReconcileRecordsCursorFromTheLoad pins where the cursor comes from. A
+// target that moves *during* the pass was not observed by it, so the dependent
+// must stay stale: recording a cursor sampled after the controller's reads would
+// land above a change the pass never saw, leaving the dependent stranded with
+// nothing left to find it. Erring the other way costs one extra pass.
+func TestReconcileRecordsCursorFromTheLoad(t *testing.T) {
+	ctx := context.Background()
+	h := newWatermarkHarness(t, nil)
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		h.touchTarget(t, `{"val":"moved mid-pass"}`)
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+
+	assert.Equal(t, []ObjectID{h.dep}, h.stale(t),
+		"a change the pass could not have observed leaves the dependent owed another")
+}
+
+// TestReconcileHoldsDependencyWatermarkOnFailure pins the self-healing property
+// the whole design rests on: a failed pass records nothing, so the object stays
+// stale and is found again with no retry bookkeeping of its own.
+func TestReconcileHoldsDependencyWatermarkOnFailure(t *testing.T) {
+	ctx := context.Background()
+	h := newWatermarkHarness(t, nil)
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, errBoom
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.ErrorIs(t, err, errBoom)
+
+	assert.Equal(t, []ObjectID{h.dep}, h.stale(t), "a failed pass leaves the dependent owed one")
+}
+
+// TestReconcileHoldsDependencyWatermarkOnUndecodableRow pins the quarantine's
+// half of that, mirroring the reconcile_owed assertion beside it: the controller
+// never saw the object, so recording a watermark would silently mark a poison row
+// as converged against its dependencies — exactly the discard the quarantine
+// exists to avoid.
+func TestReconcileHoldsDependencyWatermarkOnUndecodableRow(t *testing.T) {
+	ctx := context.Background()
+	var probe *watermarkProbeStore
+	h := newWatermarkHarness(t, func(s Store) Store {
+		probe = &watermarkProbeStore{Store: s}
+		return probe
+	})
+	// A valid create always decodes, so the poison bytes go in directly.
+	_, _, err := h.store.ObjectsUpdateSpec(ctx, clientTestGK, h.dep, []byte("not-json"), 0)
+	require.NoError(t, err)
+
+	_, err = h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err, "an undecodable row is still a no-op success")
+
+	assert.Empty(t, probe.sets, "a pass that never ran records nothing")
+	assert.Equal(t, []ObjectID{h.dep}, h.stale(t))
+}
+
+// TestReconcileWarnsAndContinuesOnCursorWriteFailure pins the failure contract:
+// no error escapes into the backoff ladder over a bookkeeping write that the next
+// stale pass re-derives anyway.
+func TestReconcileWarnsAndContinuesOnCursorWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	h := newWatermarkHarness(t, func(s Store) Store {
+		return &watermarkProbeStore{Store: s, err: errBoom}
+	})
+	logger, logs := captureLogger(slog.LevelWarn)
+	h.tc.logger = logger
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+
+	require.NoError(t, err, "a failed watermark write must not fail the reconcile")
+	assert.Contains(t, logs.String(), "failed to record the dependency watermark")
+	assert.Equal(t, []ObjectID{h.dep}, h.stale(t), "and the dependent is still found by the next pass")
+}
+
+// TestDependencyWakeSurvivesRestart is the mechanism's reason for existing, end
+// to end. A dependent settles against a target, the process stops, and only then
+// does the target change — so the wake is owed to a process that no longer exists
+// and was never recorded anywhere: the edge predates the change (nothing stamps
+// reconcile_owed), and the dependent's own generation never moved (no owed-work
+// listing can name it).
+//
+// The restart runs with the waker off and both full passes off, which is
+// load-bearing. The waker cannot help — the change is below any watermark it
+// would seed — and a full pass would heal this for reasons that have nothing to
+// do with dependencies, so the test would prove nothing. What is left is the
+// stale-dependents pass, re-deriving the wake from the durable watermark.
+func TestDependencyWakeSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	// One store, two control planes: the rows outlive the process, everything
+	// in-memory does not. Owned by the test, since stop leaves the store open.
+	db, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	gk := GroupKind{Kind: "Widget"}
+
+	// --- first process: settle the dependent on a not-Ready target ---
+	bh1, err := New(db)
+	require.NoError(t, err)
+	ctrl1 := &dependentController{observed: make(chan bool, 8)}
+	cc, err := Register(bh1, gk, ctrl1, WithFullPassInterval(0))
+	require.NoError(t, err)
+
+	client1 := NewClient[tSpec, tStatus](bh1, gk)
+	ctrl1.client = client1
+
+	target, err := client1.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	dep, err := client1.Create(ctx, tSpec{})
+	require.NoError(t, err)
+	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
+	// Declared before the change, and with no version claim, so nothing durable
+	// records that a wake is owed later: this is the ordinary settled dependency,
+	// not the read-then-declare race.
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID, 0))
+
+	stop1, err := bh1.Start(ctx)
+	require.NoError(t, err)
+	select {
+	case ready := <-ctrl1.observed:
+		require.False(t, ready, "the startup pass reads the target before it goes Ready")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent's startup reconcile did not run")
+	}
+	require.NoError(t, stop1(ctx))
+
+	// --- the crash window: the target changes with nobody running ---
+	_, err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	// --- second process over the same store ---
+	bh2, err := New(db, withDependencyWakeInterval(0))
+	require.NoError(t, err)
+	ctrl2 := &dependentController{
+		observed: make(chan bool, 8),
+		depID:    dep.ID,
+		targetID: target.ID,
+	}
+	_, err = Register(bh2, gk, ctrl2, WithFullPassInterval(0), WithStartupFullPass(false))
+	require.NoError(t, err)
+	ctrl2.client = NewClient[tSpec, tStatus](bh2, gk)
+
+	stop2, err := bh2.Start(ctx)
+	require.NoError(t, err)
+	defer stop2(ctx)
+
+	select {
+	case ready := <-ctrl2.observed:
+		assert.True(t, ready, "the re-derived pass observes the target's change")
+	case <-time.After(testTimeout):
+		t.Fatal("dependent was never reconciled after restart: the wake died with the process that owed it")
+	}
 }

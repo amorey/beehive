@@ -29,9 +29,14 @@ import (
 // processing is remembered (dirty) and re-queued by done, so no wakeup is lost.
 // This is the standard Kubernetes work-queue discipline.
 type workQueue struct {
-	mu         sync.Mutex
-	dirty      map[ObjectID]struct{} // queued (in items) and awaiting dispatch
-	processing map[ObjectID]struct{} // handed out via get, not yet done
+	mu sync.Mutex
+	// dirty maps a queued id to the moment it became due. The value is what makes
+	// the schedule a gauge rather than a clock: nextRequeueAt answers with it, so an
+	// id that sits queued behind a slow reconcile reports the same time on every
+	// poll, where time.Now() would differ on each one and make SchedulesWatch emit
+	// forever (see the schedule-watch ADR: a repeated value must be impossible).
+	dirty      map[ObjectID]time.Time // queued (in items) and awaiting dispatch
+	processing map[ObjectID]struct{}  // handed out via get, not yet done
 	items      []ObjectID
 	ready      chan struct{}       // pulsed when items are available
 	stopped    bool                // set by stop; adds become no-ops
@@ -48,7 +53,7 @@ type alarm struct {
 
 func newWorkQueue() *workQueue {
 	return &workQueue{
-		dirty:      make(map[ObjectID]struct{}),
+		dirty:      make(map[ObjectID]time.Time),
 		processing: make(map[ObjectID]struct{}),
 		ready:      make(chan struct{}, 1),
 		alarms:     make(map[ObjectID]*alarm),
@@ -71,7 +76,7 @@ func (q *workQueue) addLocked(id ObjectID) {
 	if _, ok := q.dirty[id]; ok {
 		return
 	}
-	q.dirty[id] = struct{}{}
+	q.dirty[id] = time.Now()
 	if _, ok := q.processing[id]; !ok {
 		q.items = append(q.items, id)
 		q.signal()
@@ -143,8 +148,8 @@ func (q *workQueue) requeueNow(id ObjectID) {
 }
 
 // nextRequeueAt reports when id is next due to be dispatched: an id already
-// queued for immediate dispatch returns now (it is due); otherwise a pending
-// delayed add returns its fire time. Queued-now is checked first because an id
+// queued for immediate dispatch returns the moment it became due (already past —
+// it is dispatchable now); otherwise a pending delayed add returns its fire time. Queued-now is checked first because an id
 // can hold both — a future backoff/RequeueAfter timer plus an immediate add from
 // a store change or requeue — and "due now" is the truthful answer then, not the
 // stale future time. ok is false when nothing is firmly scheduled — an id that is
@@ -158,8 +163,8 @@ func (q *workQueue) nextRequeueAt(id ObjectID) (time.Time, bool) {
 
 // nextRequeueAtLocked is the lock-free core of nextRequeueAt. Caller holds mu.
 func (q *workQueue) nextRequeueAtLocked(id ObjectID) (time.Time, bool) {
-	if _, ok := q.dirty[id]; ok {
-		return time.Now(), true
+	if at, ok := q.dirty[id]; ok {
+		return at, true
 	}
 	if a := q.alarms[id]; a != nil {
 		return a.fireAt, true

@@ -131,6 +131,29 @@ type Client[Spec, Status any] interface {
 	// hold the write lock across arbitrary user MarshalJSON code.
 	GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
+	// ObjectsWatch streams changes to one object, ObjectsWatchList to every object
+	// of this client's kind: the current state as Added, then Added/Modified/Deleted
+	// as things change, until ctx is cancelled and the channel closes. Both need a
+	// registered controller for the kind and are scoped to it, so another kind's id
+	// streams nothing, and an id that does not exist yet is simply reported as Added
+	// once it appears.
+	//
+	// Both read current state before returning, so a caller may subscribe and then
+	// act: a change it makes afterwards is measured against a snapshot that already
+	// exists, and cannot fall into the gap before the first poll. That costs one
+	// store read on the subscribing goroutine, and its failure is returned — a
+	// stream handed back always holds a snapshot, where one that did not would be a
+	// watch with nothing to compare against, silently unable to report the delete
+	// the caller is about to make. Every later poll failure costs a tick instead,
+	// since the last good poll's state is still there.
+	//
+	// Everything after that read is polled (see withWatchPollInterval), which is what
+	// bounds latency and collapses changes within one interval into the latest state.
+	//
+	// That read is also why a watch cannot be opened inside a transaction: the store
+	// runs on one connection, so the read waits for the connection the transaction
+	// holds, and passing the transaction's own ctx instead would tie the stream's
+	// life to it. Subscribe outside Within (see ControllerClient.Within).
 	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
 	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
@@ -186,9 +209,12 @@ type Client[Spec, Status any] interface {
 	// registered controller.
 	Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error
 	// SchedulesGet reports id's Schedule: when the reconcile loop has scheduled id to
-	// be requeued — a pending backoff retry or RequeueAfter delay, or now if it is
-	// already queued — in Schedule.NextRequeueAt, or the zero time if nothing is
-	// scheduled. The Schedule wrapper leaves room for fields to be added later, such
+	// be requeued — a pending backoff retry or RequeueAfter delay, or, for an id
+	// already queued, the moment it became due — in Schedule.NextRequeueAt, or the
+	// zero time if nothing is scheduled. A queued id therefore reads as a time in the
+	// past (it is dispatchable now, and has been since then), and that time holds
+	// still while it waits, which is what lets SchedulesWatch treat "still queued" as
+	// a repeated value rather than a moving one. The Schedule wrapper leaves room for fields to be added later, such
 	// as a reschedule trigger.
 	//
 	// It is a non-blocking read of in-memory state and touches no store, so the error
