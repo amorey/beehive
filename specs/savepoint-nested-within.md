@@ -10,7 +10,12 @@
   `context.WithoutCancel`, since `fn`'s ctx may be canceled by `fn` itself and
   `ExecContext` would skip the `ROLLBACK TO`; and latching `closed` must share a
   critical section with the hook drain, or a registration between them sees a
-  committed transaction as a rolled-back one.
+  committed transaction as a rolled-back one. A second review added two more: a frame
+  abandoned by a panic must poison (the outermost `tx.Rollback` only covers a panic
+  that keeps escaping, and `COMMIT` releases open savepoints), and `AfterCommit` on a
+  closed ctx runs the hook inline rather than discarding it — reversing the
+  "deliberate drop" this spec argued for, because `Within` and `conn` already treat a
+  closed ctx as carrying no transaction and three consumers should not disagree.
 - **Date:** 2026-07-29
 - **Touches:** `sqlite/store.go` (`Within`, `txState`, `AfterCommit`),
   `internal/storeapi/storeapi.go` (the `Within` contract), `sqlite/store_test.go`

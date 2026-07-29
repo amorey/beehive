@@ -30,7 +30,7 @@ error, `RELEASE` on success. The outermost transaction is still the only thing t
 commits, still under `BEGIN IMMEDIATE`. A savepoint adds no fsync, so the durability
 floor is unchanged.
 
-Six things make it correct rather than merely plausible:
+Seven things make it correct rather than merely plausible:
 
 - **Queued hooks record their owning frame.** `txState.hooks` drains at the outermost
   commit, so an unwind must take with it the hooks registered inside the frame —
@@ -68,6 +68,22 @@ Six things make it correct rather than merely plausible:
   `ControllerClient.Within` around a `Client.Create` around `ObjectsCreate`'s
   self-wrap is three frames in production.
 
+  The check is a tripwire, not a lock. It sees nested `Within`s; a store call that
+  joins the transaction *without* opening a frame — the mutators that do not
+  self-wrap, reaching the tx through `conn` — is invisible to it, and a write issued
+  that way from a second goroutine can be discarded by an open sibling frame's unwind.
+  The contract states the real rule, which the tripwire only samples: a transaction
+  ctx belongs to one goroutine.
+
+- **An abandoned frame poisons.** A panic unwinding through a nested frame skips its
+  `RELEASE` and leaves the savepoint open. The outermost deferred `tx.Rollback` covers
+  that only while the panic keeps escaping — a caller that recovers inside its own
+  `fn` and returns nil reaches `COMMIT`, which releases every open savepoint and lands
+  the writes of a frame that never completed. So a frame that exits without settling
+  its savepoint poisons the transaction, which is the one state a recover cannot
+  paper over. Nothing here recovers; poisoning is how an abandoned frame is noticed,
+  not how it is handled.
+
 - **A failed unwind poisons.** If `ROLLBACK TO` or `RELEASE` fails, the state is
   unknown: the outermost `Within` refuses to commit and falls to its deferred
   rollback, and the nested branch refuses further frames so a caller that swallowed
@@ -85,10 +101,17 @@ Six things make it correct rather than merely plausible:
   distinguishes committed-and-drained (run the hook now) from rolled-back (discard
   it — running it would fire a `WithOnCreate` for a row that never landed). `closed`
   is set immediately after `Commit`, *before* the hook drain, because the drain runs
-  inside `Within`'s body and a deferred set would read false for exactly the window
-  it exists to cover. Latching and draining happen in the *same* critical section, so
-  no registration can fall between them and see a committed transaction wearing the
-  signature of a rolled-back one.
+  inside `Within`'s body and a deferred set would read false for exactly the window it
+  exists to cover, and latching and draining share one critical section so nothing
+  lands between them.
+
+  It is a single flag, not a closed/committed pair, because the two would disagree
+  and every consumer wants the same answer. `AfterCommit` on a closed ctx runs the
+  hook inline — the same thing it does for a ctx that never had a transaction —
+  rather than discarding it. That is not a hole in "a rolled-back transaction runs no
+  hooks": that guarantee covers hooks registered *during* the transaction, which sit
+  in the queue and die with it. One arriving afterwards, on a ctx someone kept, was
+  never queued against anything.
 
 Nothing recovers, and nothing balances the stack on a panic: a panic skips the
 `RELEASE`, and the outermost deferred `tx.Rollback` discards the whole transaction.

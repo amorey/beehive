@@ -2134,26 +2134,40 @@ func TestWithinFailedReleasePoisons(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestAfterCommitOnARolledBackTransactionDiscards covers the third disposition. The
-// hook must not run — that is the guarantee AfterCommit exists for — and must not be
-// queued either, since nothing will ever drain a rolled-back transaction's queue.
-// Both readings look identical from outside, which is why the arm is named in code
-// rather than inferred.
-func TestAfterCommitOnARolledBackTransactionDiscards(t *testing.T) {
+// TestAfterCommitOnAClosedTransactionRunsInline: a closed ctx means one thing
+// everywhere. Within opens a fresh transaction on it and conn falls back to the pool,
+// so AfterCommit treats it as a registration against no transaction — which its own
+// contract already says runs inline.
+//
+// This is not a hole in "a rolled-back transaction never runs its hooks". That
+// guarantee is about hooks registered *during* the transaction, which sit in the
+// queue and die with it; TestAfterCommit's last arm pins it. A hook arriving
+// afterwards, on a ctx someone kept, was never queued against anything.
+func TestAfterCommitOnAClosedTransactionRunsInline(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	sentinel := errors.New("boom")
 
-	var captured context.Context
-	err := store.Within(ctx, func(txCtx context.Context) error {
-		captured = txCtx
-		return sentinel
-	})
-	require.ErrorIs(t, err, sentinel)
+	for _, tc := range []struct {
+		name string
+		fn   func(context.Context) error
+	}{
+		{"rolled back", func(context.Context) error { return sentinel }},
+		{"committed", func(context.Context) error { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured context.Context
+			err := store.Within(ctx, func(txCtx context.Context) error {
+				captured = txCtx
+				return tc.fn(txCtx)
+			})
+			require.Equal(t, tc.fn(ctx) != nil, err != nil)
 
-	ran := false
-	store.AfterCommit(captured, func(context.Context) { ran = true })
-	assert.False(t, ran, "a rolled-back transaction must never run a hook")
+			ran := false
+			store.AfterCommit(captured, func(context.Context) { ran = true })
+			assert.True(t, ran, "a hook registered on a finished transaction runs now")
+		})
+	}
 }
 
 // TestWithinNestedUnwindsAfterContextCancellation: fn's ctx is the caller's, and a
@@ -2215,6 +2229,29 @@ func TestWithinNestedUnwindKeepsHooksFromEnclosingFrames(t *testing.T) {
 
 	assert.Equal(t, []string{"enclosing"}, ran,
 		"the enclosing frame's hook must survive a nested frame's unwind")
+}
+
+// TestWithinNestedPanicPoisonsWhenRecovered: the outermost deferred tx.Rollback only
+// covers a panic that *escapes* Within. A caller that recovers inside its own fn and
+// returns nil leaves the abandoned frame's savepoint open, and COMMIT releases every
+// open savepoint — landing the writes of a frame that never completed.
+func TestWithinNestedPanicPoisonsWhenRecovered(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(txCtx context.Context) error {
+		func() {
+			defer func() { _ = recover() }()
+			_ = store.Within(txCtx, func(nestedCtx context.Context) error {
+				createIn(t, store, nestedCtx, "panicked")
+				panic("boom")
+			})
+		}()
+		return nil // recovered, and carrying on as if nothing happened
+	})
+
+	require.Error(t, err, "a frame abandoned by a panic must not be allowed to commit")
+	assert.False(t, committed(t, store, "panicked"), "its writes must not land")
 }
 
 func TestObjectsListUnsettledIDs(t *testing.T) {

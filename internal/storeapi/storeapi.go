@@ -285,6 +285,14 @@ type Store interface {
 	// with ErrConcurrentNestedTx — concurrent pushes interleave, and serialising them
 	// deadlocks as soon as fn waits on a goroutine that also wants the store. Ordinary
 	// deep nesting on one goroutine is not that case and must be accepted.
+	//
+	// That refusal covers nested Withins and nothing else, which is the whole of the
+	// guarantee: **a transaction ctx belongs to one goroutine.** A single-statement
+	// call that joins the transaction without opening a frame of its own cannot be
+	// detected this way, so a write issued from a second goroutine while a sibling
+	// frame is open may simply be discarded by that frame's unwind. Do not share a
+	// transaction ctx across goroutines; the refusal is a tripwire on the common case,
+	// not a lock.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has
