@@ -2081,8 +2081,9 @@ func TestWithinRefusesAConcurrentNestedFrame(t *testing.T) {
 		})
 	}))
 
-	assert.ErrorIs(t, sibling, beehive.ErrConcurrentNestedTx,
-		"a second goroutine nesting on the same transaction must be refused")
+	assert.ErrorIs(t, sibling, beehive.ErrStaleTxContext,
+		"a second goroutine nesting on the same transaction must be refused: its ctx is "+
+			"not the live frame, whoever won the race")
 }
 
 // TestWithinFailedSavepointDoesNotPoison: a SAVEPOINT that never lands pushed
@@ -2272,7 +2273,7 @@ func TestAfterCommitOnAnUnwoundFrameIsDiscarded(t *testing.T) {
 			createIn(t, store, nested, "unwound")
 			return sentinel
 		})
-		assert.ErrorIs(t, err, sentinel)
+		require.ErrorIs(t, err, sentinel)
 
 		store.AfterCommit(captured, func(context.Context) { ran = true })
 		return nil // swallowed; the outer transaction still commits
@@ -2338,14 +2339,14 @@ func TestTxStateSealForCommit(t *testing.T) {
 		st := &txState{}
 		require.NoError(t, st.sealForCommit())
 
-		_, err := st.pushSavepoint(0)
-		assert.ErrorIs(t, err, beehive.ErrConcurrentNestedTx,
+		_, err := st.pushSavepoint(0, 0)
+		assert.ErrorIs(t, err, beehive.ErrStaleTxContext,
 			"a frame arriving after the seal must be refused, not released by the commit")
 	})
 
 	t.Run("refuses while a frame is open", func(t *testing.T) {
 		st := &txState{}
-		_, err := st.pushSavepoint(0)
+		_, err := st.pushSavepoint(0, 0)
 		require.NoError(t, err)
 
 		assert.ErrorIs(t, st.sealForCommit(), beehive.ErrConcurrentNestedTx)
@@ -2356,6 +2357,81 @@ func TestTxStateSealForCommit(t *testing.T) {
 		st.poison(assert.AnError)
 
 		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
+	})
+}
+
+// TestWithinRefusesAContextFromAnUnwoundFrame: depth is reusable, so it cannot be the
+// whole admission test. Once a frame unwinds, a later sibling restores the height it
+// had, and a ctx captured from the dead frame matches again — on one goroutine, with
+// no concurrency anywhere.
+//
+// Admitting it would split the store's view of that frame: Within and conn would treat
+// it as live and let its rolled-back work commit, while addHook still finds its id
+// dead and discards hooks registered on the same ctx. A committed write whose
+// WithOnCreate never fires is the inverse of the guarantee this feature exists for.
+func TestWithinRefusesAContextFromAnUnwoundFrame(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sentinel := errors.New("boom")
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		var captured context.Context
+		err := store.Within(txCtx, func(nested context.Context) error {
+			captured = nested
+			return sentinel
+		})
+		require.ErrorIs(t, err, sentinel)
+
+		// A live sibling at the same depth: the dead ctx's depth now matches the
+		// height again, which is all admission used to look at.
+		return store.Within(txCtx, func(context.Context) error {
+			_, createErr := store.ObjectsCreate(captured, &beehive.RawObject{
+				Group: testGK.Group, Kind: testGK.Kind, Slug: new("revived"),
+				Spec: []byte(`{}`),
+			})
+			assert.ErrorIs(t, createErr, beehive.ErrStaleTxContext)
+			return nil
+		})
+	}))
+
+	assert.False(t, committed(t, store, "revived"), "a dead frame's ctx must not write")
+}
+
+// TestTxStateUnwindFrameCoalesces: dead ranges are scanned linearly by every
+// admission and every hook registration, so an outer unwind absorbs the ranges of
+// frames opened inside it rather than letting the list grow once per unwind. A long
+// outer Within swallowing many nested errors would otherwise pay O(N²) under the
+// transaction mutex.
+func TestTxStateUnwindFrameCoalesces(t *testing.T) {
+	t.Run("absorbs the ranges of frames opened inside it", func(t *testing.T) {
+		st := &txState{}
+		outer, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+		inner, err := st.pushSavepoint(1, outer)
+		require.NoError(t, err)
+
+		st.unwindFrame(inner)
+		st.popSavepoint()
+		require.Equal(t, []idRange{{lo: inner, hi: inner}}, st.dead)
+
+		st.unwindFrame(outer)
+		assert.Equal(t, []idRange{{lo: outer, hi: inner}}, st.dead,
+			"the outer unwind must absorb the inner range, not stack another on it")
+	})
+
+	t.Run("keeps the ranges of earlier siblings", func(t *testing.T) {
+		st := &txState{}
+		first, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+		st.unwindFrame(first)
+		st.popSavepoint()
+
+		second, err := st.pushSavepoint(0, 0)
+		require.NoError(t, err)
+		st.unwindFrame(second)
+
+		assert.Equal(t, []idRange{{lo: first, hi: first}, {lo: second, hi: second}}, st.dead,
+			"a sibling was never inside this frame, so its range must survive")
 	})
 }
 
@@ -2873,14 +2949,62 @@ func TestRefsAddStampsOnlyNewEdge(t *testing.T) {
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "still the one wake owed")
 }
 
-// TestRefsAddStampFailureLeavesNoEdge is the ordering guarantee itself. The stamp
-// is a write, so it must land *before* the insert: a nested Within is a bare
-// fn(ctx) with no transaction of its own, so a caller that handles EdgesAdd's
-// error — here by swallowing it and committing the ambient transaction anyway —
-// unwinds nothing. Were the stamp sequenced after the insert, that caller would
-// commit an edge with no wake, stranding the dependent on a stale read where
-// ObjectsListUnsettledIDs cannot see it. Running last, the insert simply never
-// happens.
+// probeEdgeInsertOwed records from_id's reconcile_owed at the instant the edge row
+// lands. That instant is the only place the ordering inside EdgesAdd is observable:
+// once the transaction commits, a stamp written before the insert and one written
+// after are indistinguishable.
+func probeEdgeInsertOwed(t *testing.T, store *sqliteStore) func() int64 {
+	t.Helper()
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `CREATE TABLE edge_insert_probe (owed INTEGER)`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `
+		CREATE TRIGGER edge_insert_probe AFTER INSERT ON edges
+		BEGIN
+			INSERT INTO edge_insert_probe(owed)
+			SELECT reconcile_owed FROM objects WHERE id = NEW.from_id;
+		END`)
+	require.NoError(t, err)
+
+	return func() int64 {
+		t.Helper()
+		var owed int64
+		require.NoError(t, store.db.QueryRowContext(ctx,
+			`SELECT owed FROM edge_insert_probe`).Scan(&owed))
+		return owed
+	}
+}
+
+// TestRefsAddStampsBeforeTheInsert pins the ordering directly, which no other test
+// does: the savepoint boundary now unwinds both writes together, so every
+// after-the-fact assertion reads the same under either order and an insert-then-stamp
+// refactor would go green. The ordering is still load-bearing wherever the boundary
+// does not apply, and there the residual flips from a self-draining spurious wake to a
+// permanently stranded dependent.
+func TestRefsAddStampsBeforeTheInsert(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	owedAtInsert := probeEdgeInsertOwed(t, store)
+
+	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
+	require.NoError(t, err)
+
+	assert.EqualValues(t, 1, owedAtInsert(),
+		"the wake must already be stamped on the row when the edge lands")
+}
+
+// TestRefsAddStampFailureLeavesNoEdge is one half of the ordering guarantee: the
+// stamp fails, and the insert that would have followed it never runs, so there is no
+// edge without a wake. RAISE(ABORT) undoes the statement rather than the transaction,
+// which is what keeps the ambient transaction committable and puts this in the band
+// where ordering — not the savepoint boundary — is what holds.
+//
+// The boundary covers the common failures now, so this is defence for the case where
+// it does not apply. The other half, that the stamp really is issued first, is pinned
+// from inside the transaction by TestRefsAddStampsBeforeTheInsert: from out here both
+// writes are simply present, and either order looks the same.
 func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()

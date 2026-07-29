@@ -81,9 +81,17 @@ Seven things make it correct rather than merely plausible:
   self-wrap, reaching the tx through `conn` — is invisible to it, and a write issued
   that way from a second goroutine can be discarded by an open sibling frame's unwind.
   It is also blind to a frame entered while the stack happened to be empty, which
-  passes `depth == height` legitimately and only becomes a fault by outliving `fn`.
-  The contract states the real rule, which the tripwire only samples: a transaction
-  ctx belongs to one goroutine.
+  passes admission legitimately and only becomes a fault by outliving `fn`. The
+  contract states the real rule, which the tripwire only samples: a transaction ctx
+  belongs to one goroutine.
+
+  **`ErrStaleTxContext` is not only a concurrency signal**, and its name says so. A
+  single goroutine reaches it by using an *enclosing* frame's ctx while deeper frames
+  are open — the enclosing ctx stays in lexical scope, and the same pattern is blessed
+  for `AfterCommit` a few lines away. Before the boundary existed that call joined the
+  transaction silently; it is refused now, because a savepoint opened out of stack
+  order unwinds the wrong things. `ErrConcurrentNestedTx` is kept for the commit-time
+  check alone, which is the only one that *proves* a second goroutine.
 
   **The commit is where that rule is enforced exactly.** Frames unwind in a `defer`,
   so on one goroutine the stack is empty by the time `fn` returns; a frame still open

@@ -172,14 +172,20 @@ func savepointStmt(verb string, n int64) string {
 // goroutines — which is also what depth guards against: a frame whose ctx depth does
 // not match the live stack height was entered from somewhere that does not own the
 // top of the stack.
-func (st *txState) pushSavepoint(depth int) (name int64, err error) {
+func (st *txState) pushSavepoint(depth int, caller int64) (name int64, err error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.poisoned != nil {
 		return 0, st.poisoned
 	}
-	if st.sealed || depth != st.height {
-		return 0, storeapi.ErrConcurrentNestedTx
+	// The caller's own frame is checked as well as the depth, because depth alone is
+	// reusable: once a frame unwinds, a later sibling restores the height it had, and a
+	// ctx captured from the dead frame would match again. Admitting it would rewrite
+	// its rolled-back work into a transaction heading for a commit, while addHook goes
+	// on discarding hooks registered on that same ctx — the store answering "is this
+	// frame alive" two different ways.
+	if st.sealed || depth != st.height || st.deadLocked(caller) {
+		return 0, storeapi.ErrStaleTxContext
 	}
 	st.height++
 	st.savepoints++
@@ -231,11 +237,11 @@ func (st *txState) popSavepoint() {
 // covers a panic that escapes Within entirely; a caller that recovers inside its own
 // fn and returns nil defeats it. So an abandoned frame poisons, which is the one
 // state that survives a recover.
-func (st *txState) nested(ctx context.Context, depth int, fn func(ctx context.Context) error) error {
+func (st *txState) nested(ctx context.Context, depth int, caller int64, fn func(ctx context.Context) error) error {
 	// pushSavepoint refuses outright once an unwind has failed. The outermost check
 	// is what guarantees the rollback; this one keeps a caller that swallowed the
 	// poison error from piling writes onto a transaction in unknown state.
-	name, err := st.pushSavepoint(depth)
+	name, err := st.pushSavepoint(depth, caller)
 	if err != nil {
 		return err
 	}
@@ -319,10 +325,8 @@ func (st *txState) addHook(owner int64, fn func()) hookDisposition {
 	defer st.mu.Unlock()
 	// Checked before closed: a frame that rolled back must not run its hooks whatever
 	// became of the transaction around it.
-	for _, r := range st.dead {
-		if owner >= r.lo && owner <= r.hi {
-			return hookDiscard
-		}
+	if st.deadLocked(owner) {
+		return hookDiscard
 	}
 	if st.closed {
 		if !st.committed {
@@ -380,7 +384,26 @@ func (st *txState) unwindFrame(name int64) {
 		}
 	}
 	st.hooks = kept
-	st.dead = append(st.dead, idRange{lo: name, hi: st.savepoints})
+	// Ranges from frames opened inside this one are subsumed by the range about to be
+	// appended, so drop them rather than letting the list grow per unwind and be
+	// rescanned by every addHook.
+	live := st.dead[:0]
+	for _, r := range st.dead {
+		if r.lo < name {
+			live = append(live, r)
+		}
+	}
+	st.dead = append(live, idRange{lo: name, hi: st.savepoints})
+}
+
+// deadLocked reports whether id belongs to a frame that unwound. Callers hold mu.
+func (st *txState) deadLocked(id int64) bool {
+	for _, r := range st.dead {
+		if id >= r.lo && id <= r.hi {
+			return true
+		}
+	}
+	return false
 }
 
 // txFrom returns the ambient transaction frame, if any.
@@ -443,7 +466,7 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
 		// nested: a savepoint on the outer tx, joining its hook queue
-		return fr.st.nested(ctx, fr.depth, fn)
+		return fr.st.nested(ctx, fr.depth, fr.id, fn)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)

@@ -37,9 +37,14 @@ type RawEvent = storeapi.Event
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
-// ErrConcurrentNestedTx is returned by a nested Within entered from a goroutine other
-// than the one owning the enclosing frame. Deep nesting on one goroutine is fine; two
-// goroutines nesting on the same transaction is not.
+// ErrStaleTxContext is returned by a nested Within whose ctx is not the transaction's
+// live innermost frame — another goroutine's frame, an enclosing frame used while
+// deeper ones are open, or a frame that already unwound. Deep nesting on one goroutine
+// is fine; using a ctx from outside the frame you are in is not.
+var ErrStaleTxContext = storeapi.ErrStaleTxContext
+
+// ErrConcurrentNestedTx is returned by the outermost Within when a nested frame is
+// still open at the commit, which can only mean another goroutine holds one.
 var ErrConcurrentNestedTx = storeapi.ErrConcurrentNestedTx
 
 // ErrObservedGenerationFuture is returned by UpdateStatus when the caller reports

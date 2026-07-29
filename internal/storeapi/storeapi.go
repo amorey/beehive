@@ -47,21 +47,41 @@ var ErrNotFound = errors.New("beehive: object not found")
 // hides it as ErrNotFound, a controller reports it.
 var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 
-// ErrConcurrentNestedTx reports that a transaction ctx was used from more than one
-// goroutine. It is returned by a nested Within entered from a goroutine other than the
-// one that owns the enclosing frame, and by the outermost Within when it is asked to
-// commit while a nested frame is still open — which is the same fault seen from the
-// other end, and the one place it can be caught for certain. A nested Within is a rollback
-// boundary, and boundaries on one transaction form a stack: two goroutines pushing
-// concurrently can interleave so that one unwind discards work the other already
-// committed to its parent. Backends that implement the boundary with savepoints must
-// refuse rather than serialise — holding a lock across fn deadlocks as soon as fn
-// waits on another goroutine that also wants the store.
+// ErrStaleTxContext is returned by a nested Within whose ctx is not the transaction's
+// live innermost frame. Three things reach it, and only the first involves concurrency:
 //
-// Ordinary deep nesting on a single goroutine is not this: a Client.Create inside a
-// ControllerClient.Within, with the mutator's own self-wrap below it, is three frames
-// and must be accepted.
-var ErrConcurrentNestedTx = errors.New("beehive: concurrent nested transaction")
+//   - The ctx belongs to another goroutine's frame, so this one is not at the top of
+//     the savepoint stack.
+//   - The ctx is an *enclosing* frame's, used while deeper frames are still open —
+//     reachable on one goroutine, since an enclosing ctx stays in lexical scope. Before
+//     the rollback boundary existed this joined the transaction silently; it is now
+//     refused, because a savepoint opened out of stack order unwinds the wrong things.
+//   - The ctx belongs to a frame that already unwound. Its writes are gone, and
+//     admitting it would let them be written again into a transaction that will
+//     commit, while hooks registered on the same ctx are still discarded — the store
+//     answering "is this frame alive" two different ways.
+//
+// The name is about the context, not the caller: "stale" here means "not the frame
+// this transaction is currently in", which a single goroutine can produce by holding
+// a ctx past its scope.
+//
+// Backends implementing the boundary with savepoints must refuse rather than serialise
+// — holding a lock across fn deadlocks as soon as fn waits on another goroutine that
+// also wants the store. Ordinary deep nesting on one goroutine is not this: a
+// Client.Create inside a ControllerClient.Within, with the mutator's own self-wrap
+// below it, is three frames and must be accepted.
+var ErrStaleTxContext = errors.New("beehive: transaction context is not the live frame")
+
+// ErrConcurrentNestedTx is returned by the outermost Within when it is asked to commit
+// while a nested frame is still open. Unlike ErrStaleTxContext this one *proves*
+// concurrency: nested frames unwind in a defer, so on a single goroutine the stack is
+// empty by the time fn returns, and a frame still open can only belong to another
+// goroutine. It is the one place the one-goroutine-per-transaction rule is enforced
+// exactly rather than sampled.
+//
+// Committing there would release that frame's savepoint and persist writes it is still
+// entitled to roll back, with nothing left that could undo them.
+var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
 
 // ErrObservedGenerationFuture is returned by UpdateStatus when observedGeneration is
 // greater than the object's current generation. A controller can only report a
