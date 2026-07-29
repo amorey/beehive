@@ -37,6 +37,11 @@ type RawEvent = storeapi.Event
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
+// ErrConcurrentNestedTx is returned by a nested Within entered from a goroutine other
+// than the one owning the enclosing frame. Deep nesting on one goroutine is fine; two
+// goroutines nesting on the same transaction is not.
+var ErrConcurrentNestedTx = storeapi.ErrConcurrentNestedTx
+
 // ErrObservedGenerationFuture is returned by UpdateStatus when the caller reports
 // a generation greater than the object's current one — a convergence-handshake
 // violation (a controller must pass the generation it received in Reconcile).

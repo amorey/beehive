@@ -47,6 +47,19 @@ var ErrNotFound = errors.New("beehive: object not found")
 // hides it as ErrNotFound, a controller reports it.
 var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 
+// ErrConcurrentNestedTx is returned by a nested Within entered from a goroutine
+// other than the one that owns the enclosing frame. A nested Within is a rollback
+// boundary, and boundaries on one transaction form a stack: two goroutines pushing
+// concurrently can interleave so that one unwind discards work the other already
+// committed to its parent. Backends that implement the boundary with savepoints must
+// refuse rather than serialise — holding a lock across fn deadlocks as soon as fn
+// waits on another goroutine that also wants the store.
+//
+// Ordinary deep nesting on a single goroutine is not this: a Client.Create inside a
+// ControllerClient.Within, with the mutator's own self-wrap below it, is three frames
+// and must be accepted.
+var ErrConcurrentNestedTx = errors.New("beehive: concurrent nested transaction")
+
 // ErrObservedGenerationFuture is returned by UpdateStatus when observedGeneration is
 // greater than the object's current generation. A controller can only report a
 // generation it actually saw in Reconcile, so a value from the future would mark the

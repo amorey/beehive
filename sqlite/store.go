@@ -46,9 +46,25 @@ func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
 
-// txKey carries the in-flight transaction through the context so that Store
+// txKey carries the in-flight transaction frame through the context so that Store
 // calls made with the ctx passed to Within join it.
 type txKey struct{}
+
+// txFrame is one Within frame: the transaction state every frame shares, plus this
+// frame's depth in the savepoint stack.
+//
+// The depth travels *with* the state, never under a key of its own. A separate key
+// would be sticky — it survives everything that does not explicitly clear it, and
+// installing a transaction only installs txKey — so a ctx carrying a stale depth
+// from a finished transaction would install a fresh txState at height 0 while still
+// reporting nonzero depth, and the first nested call inside it would look like a
+// concurrent frame. AfterCommit's hook ctx is exactly such a ctx: it strips txKey and
+// nothing else. Folding the two into one value makes installing a transaction reset
+// the depth by construction, for the same reason txState keeps tx and hooks together.
+type txFrame struct {
+	st    *txState
+	depth int
+}
 
 // txState is what a transaction puts on the context: the connection every store
 // call made with that ctx joins, plus the hooks owed its commit.
@@ -80,6 +96,10 @@ type txState struct {
 	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
 	// recent match — correct, but it leaves the next reader proving it.
 	savepoints int64
+
+	// height is the current savepoint stack depth, which a nested frame's ctx depth
+	// must match to be the rightful next frame. Unlike savepoints it goes back down.
+	height int
 
 	// poisoned latches the first failed unwind. After one, the transaction's state is
 	// unknown, so it must neither take further nested work nor commit.
@@ -122,13 +142,34 @@ func savepointStmt(verb string, n int64) string {
 	return string(b)
 }
 
-// pushSavepoint reserves the next savepoint name and the hook watermark to unwind
-// to, both under mu since a Within fn may fan store calls across goroutines.
-func (st *txState) pushSavepoint() (name int64, mark int) {
+// pushSavepoint admits a new nested frame, reserving its savepoint name and the hook
+// watermark to unwind to. All under mu, since a Within fn may fan store calls across
+// goroutines — which is also what depth guards against: a frame whose ctx depth does
+// not match the live stack height was entered from somewhere that does not own the
+// top of the stack.
+func (st *txState) pushSavepoint(depth int) (name int64, mark int, err error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.poisoned != nil {
+		return 0, 0, st.poisoned
+	}
+	if depth != st.height {
+		return 0, 0, storeapi.ErrConcurrentNestedTx
+	}
+	st.height++
 	st.savepoints++
-	return st.savepoints, len(st.hooks)
+	return st.savepoints, len(st.hooks), nil
+}
+
+// popSavepoint restores the stack height. It runs on every exit path from an admitted
+// frame, including one whose SAVEPOINT failed: leaving the height raised would give
+// every later sibling on this transaction a spurious ErrConcurrentNestedTx.
+func (st *txState) popSavepoint() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.height > 0 {
+		st.height--
+	}
 }
 
 // truncateHooks drops every hook queued since mark, so an unwind takes the frame's
@@ -156,14 +197,16 @@ func (st *txState) truncateHooks(mark int) {
 // unwinding through this skips the RELEASE, and the outermost Within's deferred
 // tx.Rollback discards the whole transaction, savepoint stack included. A recover
 // here would turn a panic into a half-committed transaction.
-func (st *txState) nested(ctx context.Context, fn func(ctx context.Context) error) error {
-	// Refuse up front once an unwind has failed. The outermost check below is what
-	// guarantees the rollback; this one keeps a caller that swallowed the poison
-	// error from piling writes onto a transaction in unknown state.
-	if err := st.poisonErr(); err != nil {
+func (st *txState) nested(ctx context.Context, depth int, fn func(ctx context.Context) error) error {
+	// pushSavepoint refuses outright once an unwind has failed. The outermost check
+	// is what guarantees the rollback; this one keeps a caller that swallowed the
+	// poison error from piling writes onto a transaction in unknown state.
+	name, mark, err := st.pushSavepoint(depth)
+	if err != nil {
 		return err
 	}
-	name, mark := st.pushSavepoint()
+	defer st.popSavepoint()
+	ctx = context.WithValue(ctx, txKey{}, &txFrame{st: st, depth: depth + 1})
 	if _, err := st.tx.ExecContext(ctx, savepointStmt("SAVEPOINT", name)); err != nil {
 		// Nothing was pushed on the SQLite side, so the state is still known and the
 		// caller's ordinary error handling is the right answer. No poison.
@@ -245,10 +288,10 @@ func (st *txState) takeHooks() []func() {
 	return hooks
 }
 
-// txFrom returns the ambient transaction state, if any.
-func txFrom(ctx context.Context) (*txState, bool) {
-	st, ok := ctx.Value(txKey{}).(*txState)
-	return st, ok
+// txFrom returns the ambient transaction frame, if any.
+func txFrom(ctx context.Context) (*txFrame, bool) {
+	fr, ok := ctx.Value(txKey{}).(*txFrame)
+	return fr, ok
 }
 
 // dbtx is the subset of *sql.DB and *sql.Tx the object queries use, so the same
@@ -264,8 +307,8 @@ type dbtx interface {
 // transaction on one: the ctx outlives its transaction, and half of it behaving as
 // "the transaction is over" would be worse than neither half doing so.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
-	if st, ok := txFrom(ctx); ok && !st.isClosed() {
-		return st.tx
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		return fr.st.tx
 	}
 	return s.db
 }
@@ -296,8 +339,9 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // outer caller swallows that error. Without it, any multi-write composition would be
 // atomic only by the grace of its callers.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
-	if st, ok := txFrom(ctx); ok && !st.isClosed() {
-		return st.nested(ctx, fn) // nested: a savepoint on the outer tx and its hook queue
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		// nested: a savepoint on the outer tx, joining its hook queue
+		return fr.st.nested(ctx, fr.depth, fn)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -306,7 +350,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	}
 	st := &txState{tx: tx}
 	defer st.close() // covers the rollback and early-return paths
-	ctx = context.WithValue(ctx, txKey{}, st)
+	ctx = context.WithValue(ctx, txKey{}, &txFrame{st: st})
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
 	if err := fn(ctx); err != nil {
 		return err // hooks discarded, nothing ran
@@ -339,11 +383,12 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 // in here after the commit drained the queue, and "run after the commit" is
 // satisfied by running now, not by queueing where nothing will look again.
 func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context)) {
-	st, ok := txFrom(ctx)
+	fr, ok := txFrom(ctx)
 	if !ok {
 		fn(ctx) // nothing to defer to, and nothing to strip
 		return
 	}
+	st := fr.st
 	// Strip the transaction before handing the ctx on: by the time the hook runs
 	// that *sql.Tx is committed, so a store call joining it would fail outright.
 	// A hook that writes gets a fresh transaction, which is the only thing it could

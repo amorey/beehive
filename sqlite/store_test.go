@@ -1994,9 +1994,9 @@ func TestWithinFailedUnwindPoisonsTheTransaction(t *testing.T) {
 			// SQLITE_IOERR and SQLITE_NOMEM produce for real: they roll the whole
 			// transaction back, savepoint stack included, and a ROLLBACK TO naming a
 			// savepoint that no longer exists is what fails next.
-			st, ok := txFrom(ctx)
+			fr, ok := txFrom(ctx)
 			require.True(t, ok)
-			_, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", st.savepoints))
+			_, err := fr.st.tx.ExecContext(ctx, savepointStmt("RELEASE", fr.st.savepoints))
 			require.NoError(t, err)
 			return sentinel
 		})
@@ -2046,6 +2046,43 @@ func TestWithinOnAClosedTransactionOpensAFreshOne(t *testing.T) {
 	assert.NoError(t, nestedErr, "a Within on a closed transaction ctx must open a fresh one")
 	assert.True(t, committed(t, store, "from-hook"), "and the write it carries must land")
 	assert.NoError(t, readErr, "a bare read on that ctx must fall back to the pool")
+}
+
+// TestWithinRefusesAConcurrentNestedFrame: savepoints are a stack, so two
+// goroutines nesting on one transaction can interleave such that one's ROLLBACK TO
+// discards work the other already released. Refuse rather than serialise — holding a
+// lock across fn deadlocks the moment fn waits on another goroutine that also wants
+// the store.
+//
+// Its companion is TestWithinNestedUnwindsToTheRightDepth: ordinary deep nesting on
+// one goroutine must stay accepted, which is what makes this a concurrency check
+// rather than a depth limit.
+func TestWithinRefusesAConcurrentNestedFrame(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	tried := make(chan struct{})
+	var sibling error
+
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		return store.Within(txCtx, func(context.Context) error {
+			// Started from inside the first nested frame, so it is provably in flight;
+			// the frame then waits on the channel rather than on a clock.
+			go func() {
+				defer close(tried)
+				sibling = store.Within(txCtx, func(context.Context) error { return nil })
+			}()
+			select {
+			case <-tried:
+			case <-time.After(10 * time.Second):
+				t.Error("timed out waiting for the sibling goroutine")
+			}
+			return nil
+		})
+	}))
+
+	assert.ErrorIs(t, sibling, beehive.ErrConcurrentNestedTx,
+		"a second goroutine nesting on the same transaction must be refused")
 }
 
 func TestObjectsListUnsettledIDs(t *testing.T) {
