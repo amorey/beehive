@@ -760,3 +760,23 @@ type Store interface {
 	// change.
 	ObjectWritesMaxVersion(ctx context.Context) (int64, error)
 }
+
+// FreePagesReleaser is an optional Store capability: a backend that can hand space
+// freed by deleted rows back to the operating system implements it, and the GC
+// sweeper calls it after collecting rows and trimming the event log — the two things
+// that produce the free space. A Store that does not implement it is simply not
+// drained, so this is deliberately NOT a member of Store: reclaiming pages is one
+// backend's concern (SQLite's auto_vacuum), and putting it in the contract would
+// make every implementation, and every test double, answer a question only that
+// backend has.
+//
+// Implementations may release fewer pages than asked, including none at all — a
+// backend is free to decide a small amount of free space is worth more kept than
+// returned, since it is space the next writes would have reused without growing the
+// file. The returned count is therefore a report, not a guarantee, and is advisory
+// besides: it may be measured across concurrent writes. Callers log it.
+type FreePagesReleaser interface {
+	// FreePagesRelease releases up to maxPages of reclaimable space and returns how
+	// many pages were actually released. A non-positive maxPages releases nothing.
+	FreePagesRelease(ctx context.Context, maxPages int) (int, error)
+}

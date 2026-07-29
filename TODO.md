@@ -375,28 +375,8 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   one database file. Revisit before the first real `Migrator` consumer ships a v2, or
   the first time a rollback across a schema bump has to be supported.
 
-- **`OpenPool` never sets `auto_vacuum`, and that door closes behind us** — known, not
-  fixed, and the only item here with a deadline. The mode has to be chosen *before the
-  first table exists*; on a database that already has one, switching it requires a full
-  `VACUUM` rewrite. `0001_init.sql` sets nothing, so every file we have ever written is
-  `auto_vacuum=NONE` and stays there unless someone pays that rewrite.
-
-  We do delete rows, so free pages genuinely accumulate: `gcCollect` removes collected
-  objects and their edges, and event retention trims the log on the GC sweeper's
-  cadence. A long-lived store whose object count churns therefore keeps its high-water
-  page count forever. Nothing is incorrect — the pages are reused by later inserts —
-  and the file simply never shrinks.
-
-  Deferred because the cost is unmeasured and the fix is not free either: `INCREMENTAL`
-  needs someone to actually call `PRAGMA incremental_vacuum`, which is a new
-  responsibility with no obvious owner (the GC sweeper is the natural home, and it is
-  the one driver that cannot be disabled), and `FULL` moves that work onto every commit
-  on the single write connection. Revisit before the first deployment that expects to
-  run for months with heavy object churn — after that, every existing file needs the
-  `VACUUM`, so the decision gets strictly more expensive to reverse the longer it waits.
-
 - **The page cache and `mmap_size` are untuned, and it is unclear whether tuning them
-  buys anything here** — known, not fixed. `OpenPool` sets four pragmas and leaves
+  buys anything here** — known, not fixed. `OpenPool` sets five pragmas and leaves
   SQLite's stock ~2MB cache and disabled memory mapping alone.
 
   Two things make this less obviously a win than the standard advice suggests. We run

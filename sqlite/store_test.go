@@ -4815,3 +4815,223 @@ func TestObjectWritesMaxVersionFallsWhenTheNewestRowGoes(t *testing.T) {
 
 	assert.Equal(t, first.ResourceVersion, cursorNow(t, store))
 }
+
+// ---------------------------------------------------------------------------
+// FreePagesRelease
+// ---------------------------------------------------------------------------
+
+// pageCounts reads the two pragmas the drain is judged by.
+func pageCounts(t *testing.T, store *sqliteStore) (pages, free int) {
+	t.Helper()
+	require.NoError(t, store.db.QueryRow(`PRAGMA page_count`).Scan(&pages))
+	require.NoError(t, store.db.QueryRow(`PRAGMA freelist_count`).Scan(&free))
+	return pages, free
+}
+
+// churnStore grows the database with fat spec blobs and then deletes every row,
+// leaving a freelist well past the drain floor — the state a long-lived store
+// reaches through ordinary object churn plus event retention.
+func churnStore(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	ctx := context.Background()
+	spec := make([]byte, 4096)
+	for i := range spec {
+		spec[i] = 'x'
+	}
+	blob := append(append([]byte(`{"v":"`), spec...), []byte(`"}`)...)
+	for i := 0; i < 600; i++ {
+		_, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Spec: blob,
+		})
+		require.NoError(t, err)
+	}
+	_, err := store.db.ExecContext(ctx, `DELETE FROM objects`)
+	require.NoError(t, err)
+
+	pages, free := pageCounts(t, store)
+	require.Greater(t, free, freePagesFloor, "test setup should leave a freelist past the floor")
+	require.Greater(t, free, pages/freePagesFloorDivisor, "test setup should leave a freelist past the fraction gate")
+}
+
+// A freelist past the gate is drained, and never by more than the cap. The
+// assertion is deliberately "at most the cap", not "exactly": the pragma promises
+// up to N pages. It still pins the bug that matters — PRAGMA incremental_vacuum
+// frees one page per step, so an implementation that goes through Query and closes
+// the rows without draining them releases exactly 1.
+func TestFreePagesReleaseDrainsPastTheFloor(t *testing.T) {
+	store := newRawStore(t)
+	churnStore(t, store)
+	before, freeBefore := pageCounts(t, store)
+
+	released, err := store.FreePagesRelease(context.Background(), 50)
+	require.NoError(t, err)
+
+	after, freeAfter := pageCounts(t, store)
+	assert.Greater(t, released, 1, "one page released means the pragma was stepped once, not Exec'd")
+	assert.LessOrEqual(t, released, 50)
+	assert.Equal(t, freeBefore-freeAfter, released, "released should be the drop in the freelist")
+	assert.Equal(t, before-after, released, "released pages should leave the file")
+}
+
+// Below either half of the gate the drain does nothing at all: free pages are what
+// the next insert would have reused, so releasing them just to re-grow the file is
+// work traded for nothing. A fresh store is the small-freelist case.
+func TestFreePagesReleaseSkipsASmallFreelist(t *testing.T) {
+	store := newRawStore(t)
+	before, _ := pageCounts(t, store)
+
+	released, err := store.FreePagesRelease(context.Background(), 1000)
+	require.NoError(t, err)
+
+	after, _ := pageCounts(t, store)
+	assert.Zero(t, released)
+	assert.Equal(t, before, after)
+}
+
+// The gate is hysteresis, not a one-shot: repeated ticks walk a churned freelist
+// down until it falls back under the floor, and then stop. Without the stop the
+// sweeper would fight page reuse on every tick forever.
+func TestFreePagesReleaseStopsOnceUnderTheFloor(t *testing.T) {
+	store := newRawStore(t)
+	churnStore(t, store)
+	ctx := context.Background()
+
+	// Generous bound: each pass takes up to 200 pages off a freelist a few
+	// thousand long, so a converging drain is done well inside this.
+	var last int
+	for i := 0; i < 100; i++ {
+		n, err := store.FreePagesRelease(ctx, 200)
+		require.NoError(t, err)
+		if n == 0 {
+			last = i
+			break
+		}
+		require.Less(t, i, 99, "drain never fell back under the floor")
+	}
+	assert.Greater(t, last, 0, "the churned store should have taken at least one pass")
+
+	_, free := pageCounts(t, store)
+	pages, _ := pageCounts(t, store)
+	assert.True(t, free <= freePagesFloor || free <= pages/freePagesFloorDivisor,
+		"drain should stop with the freelist back under the gate, got %d free of %d pages", free, pages)
+}
+
+// A dead pool surfaces as an error rather than a silent zero — the sweeper logs it
+// and retries on the next tick.
+func TestFreePagesReleaseErrorsOnAClosedStore(t *testing.T) {
+	store := newRawStore(t)
+	require.NoError(t, store.Close())
+
+	_, err := store.FreePagesRelease(context.Background(), 100)
+	assert.Error(t, err)
+}
+
+// scriptedDBTX answers the two counter pragmas from a scripted list and otherwise
+// delegates to a real connection, so the drain can be driven into states SQLite will
+// not produce on demand: a fault on a specific read, a failing vacuum, and a freelist
+// that grew between the two measurements. The reads still go through a real driver —
+// the script only chooses the value or the error — so a scan that stops compiling
+// against *sql.Row is still a test failure.
+type scriptedDBTX struct {
+	inner      dbtx
+	values     []int // one per counter read, in call order
+	reads      int
+	readErrAt  int   // 1-based read that errors instead of answering (0 = never)
+	execErr    error // non-nil makes the vacuum fail
+	execCalled bool
+}
+
+func (s *scriptedDBTX) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	s.reads++
+	if s.reads == s.readErrAt {
+		// A real driver error, not a fabricated one: the column does not exist.
+		return s.inner.QueryRowContext(ctx, `SELECT no_such_column`)
+	}
+	return s.inner.QueryRowContext(ctx, `SELECT ?`, s.values[s.reads-1])
+}
+
+func (s *scriptedDBTX) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	s.execCalled = true
+	if s.execErr != nil {
+		return nil, s.execErr
+	}
+	return s.inner.ExecContext(ctx, q, args...)
+}
+
+func (s *scriptedDBTX) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	return s.inner.QueryContext(ctx, q, args...)
+}
+
+// A drain past the gate, driven by the script: 900 free pages of 1000, then 400 after
+// the vacuum.
+func scripted(t *testing.T, values []int) *scriptedDBTX {
+	t.Helper()
+	return &scriptedDBTX{inner: newRawStore(t).db, values: values}
+}
+
+// Nothing to do, and nothing read: the sweeper passes a positive cap, but a store
+// built field by field in a test need not.
+func TestFreePagesReleaseIgnoresANonPositiveCap(t *testing.T) {
+	store := newRawStore(t)
+	churnStore(t, store)
+	before, _ := pageCounts(t, store)
+
+	released, err := store.FreePagesRelease(context.Background(), 0)
+	require.NoError(t, err)
+
+	after, _ := pageCounts(t, store)
+	assert.Zero(t, released)
+	assert.Equal(t, before, after, "a non-positive cap should not drain a freelist that is past the floor")
+}
+
+// Each of the three reads and the vacuum itself can fail mid-drain. All four are the
+// same answer — give up and report — because the sweeper's next tick retries and
+// nothing is incorrect in the meantime.
+func TestFreePagesReleaseReportsMidDrainFaults(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("page_count read", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900})
+		c.readErrAt = 1
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "read page_count")
+		assert.False(t, c.execCalled, "a failed measurement must not drain")
+	})
+
+	t.Run("freelist_count read", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900})
+		c.readErrAt = 2
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "read freelist_count")
+		assert.False(t, c.execCalled, "a failed measurement must not drain")
+	})
+
+	t.Run("the vacuum itself", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900})
+		c.execErr = errors.New("disk is angry")
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "incremental_vacuum")
+	})
+
+	t.Run("the read back", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900, 1000})
+		c.readErrAt = 3
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "read page_count")
+		assert.True(t, c.execCalled, "the drain ran; only the measurement of it failed")
+	})
+}
+
+// The count is a difference of two reads taken around the drain, so on a pool wider
+// than one connection another writer can free pages between them and leave the
+// freelist longer than it started. Report nothing rather than a negative count: the
+// number is advisory and only ever logged.
+func TestFreePagesReleaseClampsAGrowingFreelist(t *testing.T) {
+	c := scripted(t, []int{1000, 900, 1000, 950})
+
+	released, err := freePagesRelease(context.Background(), c, 100)
+
+	require.NoError(t, err)
+	assert.Zero(t, released)
+	assert.True(t, c.execCalled)
+}

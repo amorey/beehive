@@ -49,6 +49,19 @@ func TestOpenMemoryAppliesMigrations(t *testing.T) {
 	}
 }
 
+// TestOpenMemorySetsAutoVacuum keeps the in-memory store on the same on-disk
+// format as production, so the tests that exercise FreePagesRelease are exercising
+// the mode Open actually ships.
+func TestOpenMemorySetsAutoVacuum(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+
+	var mode int
+	require.NoError(t, store.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode))
+	assert.Equal(t, 2, mode) // 2 = INCREMENTAL
+}
+
 // TestOpenApplyError covers the error path in open() by passing a closed *sql.DB
 // to open so Apply fails and the DB is closed inside open.
 func TestOpenApplyError(t *testing.T) {

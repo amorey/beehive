@@ -134,6 +134,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   referrers remain and is safe to repeat, so the overlap is harmless. A cascade
   advances one step per sweep: `gcCollect` marks children and returns, and that mark
   is what puts them in the next sweep's listing.
+- **The store is `auto_vacuum=INCREMENTAL`, and the sweeper drains the freelist.**
+  The mode is set on `OpenPool`/`OpenMemory`'s DSN, never in a migration: SQLite
+  writes it into the file header at the first `CREATE TABLE` and ignores the pragma
+  on a non-empty database and inside a transaction, both of which a migration is.
+  The GC sweeper's third step releases up to `freePagesPerSweep` pages through the
+  optional `FreePagesReleaser`, but only once the freelist passes both an absolute
+  floor and a fraction of the file — free pages are what the next inserts would have
+  reused, so draining a small one trades work for nothing. `PRAGMA
+  incremental_vacuum` frees one page per step and so **must be `Exec`'d, never
+  `Query`'d**; the `Query` path releases exactly one page and reports no error.
+  → [ADR](docs/adr/2026-07-29-auto-vacuum-incremental.md)
 - **The generation handshake.** `Generation` increments on every spec change;
   `ObservedGeneration` records what the controller last settled, and is `nil` until
   the first `UpdateStatus` (which takes the generation explicitly). Mutators skip a

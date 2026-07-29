@@ -117,7 +117,7 @@ Every driver is one of these. They run on separate intervals because they are se
 |---|---|---|---|
 | owed pass | work the store *records* as owed — unconverged specs (`observed_generation < generation`) and owed dependency wakes | what is actually outstanding | 30s, fixed |
 | full pass | **every** object of the kind, converged or not | the object count | `WithFullPassInterval`, default 0 (off) |
-| GC sweep | deletion-pending rows, plus event-log retention | rows being deleted | `WithGCInterval`, default 30s |
+| GC sweep | deletion-pending rows, event-log retention, then the free space those two leave behind | rows being deleted | `WithGCInterval`, default 30s |
 | dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | 1s, fixed |
 | stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | 60s, fixed |
 | watch poll | current state, for each live `Client` watch | one cheap read per subscriber per tick; a full listing only when something changed | 1s, fixed |
@@ -582,7 +582,7 @@ func WithFinalizers(f ...string) Option            // declare finalizers before 
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
 func WithFullPassInterval(d time.Duration) Option  // how often to re-dispatch EVERY object (default: 0, off)
-func WithGCInterval(d time.Duration) Option        // how often to collect dead rows + prune the event log (default: 30s; New only; must be > 0)
+func WithGCInterval(d time.Duration) Option        // how often to collect dead rows + prune the event log + release free pages (default: 30s; New only; must be > 0)
 func WithStartupFullPass(enabled bool) Option      // also re-dispatch settled objects once at startup (default: false, off)
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)

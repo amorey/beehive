@@ -24,6 +24,7 @@ directory of archaeology.
 ## Index
 
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
+- [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)

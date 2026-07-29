@@ -24,6 +24,13 @@ import "github.com/amorey/beehive/internal/storeapi"
 // id, resource_version, and timestamps without a re-read.
 type Store = storeapi.Store
 
+// FreePagesReleaser is an optional capability a Store may implement to hand space
+// freed by deleted rows back to the operating system. The GC sweeper calls it after
+// its other two steps, which are what produce that space; a Store that does not
+// implement it is skipped. The sqlite store implements it on top of
+// auto_vacuum=INCREMENTAL.
+type FreePagesReleaser = storeapi.FreePagesReleaser
+
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON bytes; everything else is Beehive-owned metadata that mirrors the
 // objects table. The reconciler and client decode Spec/Status into typed
