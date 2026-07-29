@@ -86,8 +86,15 @@ func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, 
 		return 0, fmt.Errorf("free pages: acquire conn: %w", err)
 	}
 	defer conn.Close()
+	return freePagesRelease(ctx, conn, maxPages)
+}
 
-	pages, free, err := pageCounters(ctx, conn)
+// freePagesRelease is FreePagesRelease once the connection is in hand. Split out so
+// the drain's arithmetic can be tested against a scripted dbtx: its remaining
+// branches are a mid-drain fault and a freelist that grew under it, neither of which
+// a real connection can be asked for on demand.
+func freePagesRelease(ctx context.Context, c dbtx, maxPages int) (int, error) {
+	pages, free, err := pageCounters(ctx, c)
 	if err != nil {
 		return 0, err
 	}
@@ -96,11 +103,11 @@ func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, 
 	}
 
 	// Exec, not Query — see above.
-	if _, err := conn.ExecContext(ctx, `PRAGMA incremental_vacuum(`+strconv.Itoa(maxPages)+`)`); err != nil {
+	if _, err := c.ExecContext(ctx, `PRAGMA incremental_vacuum(`+strconv.Itoa(maxPages)+`)`); err != nil {
 		return 0, fmt.Errorf("free pages: incremental_vacuum: %w", err)
 	}
 
-	_, freeAfter, err := pageCounters(ctx, conn)
+	_, freeAfter, err := pageCounters(ctx, c)
 	if err != nil {
 		return 0, err
 	}
@@ -114,11 +121,11 @@ func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, 
 }
 
 // pageCounters reads page_count and freelist_count off one connection.
-func pageCounters(ctx context.Context, conn *sql.Conn) (pages, free int, err error) {
-	if err := conn.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pages); err != nil {
+func pageCounters(ctx context.Context, c dbtx) (pages, free int, err error) {
+	if err := c.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pages); err != nil {
 		return 0, 0, fmt.Errorf("free pages: read page_count: %w", err)
 	}
-	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&free); err != nil {
+	if err := c.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&free); err != nil {
 		return 0, 0, fmt.Errorf("free pages: read freelist_count: %w", err)
 	}
 	return pages, free, nil

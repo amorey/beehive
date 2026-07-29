@@ -4925,3 +4925,113 @@ func TestFreePagesReleaseErrorsOnAClosedStore(t *testing.T) {
 	_, err := store.FreePagesRelease(context.Background(), 100)
 	assert.Error(t, err)
 }
+
+// scriptedDBTX answers the two counter pragmas from a scripted list and otherwise
+// delegates to a real connection, so the drain can be driven into states SQLite will
+// not produce on demand: a fault on a specific read, a failing vacuum, and a freelist
+// that grew between the two measurements. The reads still go through a real driver —
+// the script only chooses the value or the error — so a scan that stops compiling
+// against *sql.Row is still a test failure.
+type scriptedDBTX struct {
+	inner      dbtx
+	values     []int // one per counter read, in call order
+	reads      int
+	readErrAt  int   // 1-based read that errors instead of answering (0 = never)
+	execErr    error // non-nil makes the vacuum fail
+	execCalled bool
+}
+
+func (s *scriptedDBTX) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	s.reads++
+	if s.reads == s.readErrAt {
+		// A real driver error, not a fabricated one: the column does not exist.
+		return s.inner.QueryRowContext(ctx, `SELECT no_such_column`)
+	}
+	return s.inner.QueryRowContext(ctx, `SELECT ?`, s.values[s.reads-1])
+}
+
+func (s *scriptedDBTX) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	s.execCalled = true
+	if s.execErr != nil {
+		return nil, s.execErr
+	}
+	return s.inner.ExecContext(ctx, q, args...)
+}
+
+func (s *scriptedDBTX) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	return s.inner.QueryContext(ctx, q, args...)
+}
+
+// A drain past the gate, driven by the script: 900 free pages of 1000, then 400 after
+// the vacuum.
+func scripted(t *testing.T, values []int) *scriptedDBTX {
+	t.Helper()
+	return &scriptedDBTX{inner: newRawStore(t).db, values: values}
+}
+
+// Nothing to do, and nothing read: the sweeper passes a positive cap, but a store
+// built field by field in a test need not.
+func TestFreePagesReleaseIgnoresANonPositiveCap(t *testing.T) {
+	store := newRawStore(t)
+	churnStore(t, store)
+	before, _ := pageCounts(t, store)
+
+	released, err := store.FreePagesRelease(context.Background(), 0)
+	require.NoError(t, err)
+
+	after, _ := pageCounts(t, store)
+	assert.Zero(t, released)
+	assert.Equal(t, before, after, "a non-positive cap should not drain a freelist that is past the floor")
+}
+
+// Each of the three reads and the vacuum itself can fail mid-drain. All four are the
+// same answer — give up and report — because the sweeper's next tick retries and
+// nothing is incorrect in the meantime.
+func TestFreePagesReleaseReportsMidDrainFaults(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("page_count read", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900})
+		c.readErrAt = 1
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "read page_count")
+		assert.False(t, c.execCalled, "a failed measurement must not drain")
+	})
+
+	t.Run("freelist_count read", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900})
+		c.readErrAt = 2
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "read freelist_count")
+		assert.False(t, c.execCalled, "a failed measurement must not drain")
+	})
+
+	t.Run("the vacuum itself", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900})
+		c.execErr = errors.New("disk is angry")
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "incremental_vacuum")
+	})
+
+	t.Run("the read back", func(t *testing.T) {
+		c := scripted(t, []int{1000, 900, 1000})
+		c.readErrAt = 3
+		_, err := freePagesRelease(ctx, c, 100)
+		require.ErrorContains(t, err, "read page_count")
+		assert.True(t, c.execCalled, "the drain ran; only the measurement of it failed")
+	})
+}
+
+// The count is a difference of two reads taken around the drain, so on a pool wider
+// than one connection another writer can free pages between them and leave the
+// freelist longer than it started. Report nothing rather than a negative count: the
+// number is advisory and only ever logged.
+func TestFreePagesReleaseClampsAGrowingFreelist(t *testing.T) {
+	c := scripted(t, []int{1000, 900, 1000, 950})
+
+	released, err := freePagesRelease(context.Background(), c, 100)
+
+	require.NoError(t, err)
+	assert.Zero(t, released)
+	assert.True(t, c.execCalled)
+}
