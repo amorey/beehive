@@ -201,7 +201,7 @@ const (
 )
 
 // EventSpec is the caller-supplied portion of an event, passed to
-// ControllerClient.EventsRecord. It excludes the store-owned run fields (id,
+// ControllerClient.EventsAdd. It excludes the store-owned run fields (id,
 // count, window) so a caller can't set them. Consecutive emissions sharing
 // (Category, Type, Reason) coalesce into one run; Message and Detail are sampled
 // (latest wins), not part of that key.

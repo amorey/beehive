@@ -630,7 +630,7 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 // It reads the objects rows rather than resource_version_seq, which is the same
 // number only when nothing else draws from that sequence — and the event log does.
 // A consumer of this pair (this and ObjectWritesListSince, which selects objects)
-// must not see the cursor move for a write it can never be shown: an EventsRecord
+// must not see the cursor move for a write it can never be shown: an EventsAdd
 // bumping the sequence would otherwise read as "something changed", and a
 // controller recording an event per reconcile would make that permanent.
 func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
@@ -1164,11 +1164,11 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 }
 
 // latestEventKey returns just the run key (id, type, reason) of the newest run
-// for (id, category), or ok=false if that timeline is empty. EventsRecord needs
+// for (id, category), or ok=false if that timeline is empty. EventsAdd needs
 // only the key to decide extend-vs-append, so it deliberately does not decode the
 // full row (unlike EventsGetLatest): probing the columns it is about to discard
 // would let a decode fault in an older run mask — rather than surface through —
-// the write EventsRecord is about to make.
+// the write EventsAdd is about to make.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
@@ -1183,7 +1183,7 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 	return evID, typ, reason, true, nil
 }
 
-func (s *sqliteStore) EventsRecord(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
+func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
 	// Within serializes the read-latest-then-write (via _txlock=immediate) so the
 	// run-boundary decision can't race, and joins the caller's tx when nested.
 	var result *storeapi.Event

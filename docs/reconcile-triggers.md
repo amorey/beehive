@@ -153,7 +153,7 @@ statement sequence as the edge insert, so the two cannot come apart.
 **What bumps a target's `resource_version`** — i.e. what wakes its dependents — is
 broader than "a spec change": `ObjectsCreate`, `ObjectsUpdateSpec`, the content and
 handshake-only paths of `ObjectsUpdateStatus`, `ConditionsSet`, `ConditionsDelete`,
-`FinalizersDelete`, `markForDeletion`, and the cascade mark. `EventsRecord` is the one
+`FinalizersDelete`, `markForDeletion`, and the cascade mark. `EventsAdd` is the one
 write that does not, by design.
 
 A target of a **client-only kind** is covered too: the waker scans store-wide rather
@@ -323,7 +323,7 @@ Worth stating, because each looks like one:
   controller.** The waker skips the self-edge deliberately: a spec write already leaves
   the object unsettled, and a status write came from the pass that just ran. Test:
   `TestWakerSkipsTheSelfEdge`.
-- **`EventsRecord` wakes nothing** — it bumps no object `resource_version`, which is also
+- **`EventsAdd` wakes nothing** — it bumps no object `resource_version`, which is also
   what makes it the one write safe inside a dependency cycle.
 - **A schedule change wakes nothing** — `SchedulesWatch` reports an in-memory gauge; it
   bumps no generation or `resource_version`.

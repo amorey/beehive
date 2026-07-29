@@ -74,7 +74,7 @@ The tax is a verb in the middle on qualified lists (`ObjectsListUnsettledIDs`,
 `EdgesListOutgoingByRelation`). The alternative, qualifier-before-verb, reads worse;
 it is paid on about six methods.
 
-Four judgment calls worth recording, since each has a defensible other answer:
+Five judgment calls worth recording, since each has a defensible other answer:
 
 - **`OwnersGet` for an at-most-one relation.** The prefix names the family (the store
   holds many owners), the verb carries cardinality. Folding all four relations under
@@ -110,6 +110,25 @@ Four judgment calls worth recording, since each has a defensible other answer:
   There is no public `Ref` alias beside it: one type wants one name, and every other
   alias in the package (`GroupKind`, `ObjectID`, `Relation`, `ChangeType`)
   re-exports the internal name unchanged.
+- **`EventsAdd`, not `EventsRecord`.** The rule fixes the shape but not the verb, and
+  `EventsRecord` satisfied it — `Record` also said the true thing, that a call may
+  extend the latest run instead of inserting a row. It lost on grammar. The verb slot
+  in `NounsVerb` is read as a verb only by habit: `ObjectsList` is also "a list of
+  objects" and `ConditionsSet` "a set of conditions", and what disarms those is that
+  `List` and `Set` appear dozens of times each. `Record` appeared once, so it got no
+  such help and read as a noun in the register of `EventSpec` and `ObjectRef` — a
+  method named like a type. `Add` is a verb only, and it is already this package's
+  verb for writing to a table of its own (`EdgesAdd`, `DependenciesAdd`), which is
+  the same category the prefix rule above puts events in.
+
+  What `Add` gives up is that it overclaims: the common call extends a run and
+  inserts nothing. That is tolerable because the surface already reads its write
+  verbs as intent rather than as a row count — `DeletionRequestsCreate` documents
+  that "repeat calls do nothing", and `EdgesAdd` stamps only when the edge was new.
+  The aggregation moved into the doc comments on both `EventsAdd` declarations, which
+  is where a caller needs it in prose anyway. `EventsEmit` and `EventsObserve` are
+  the other verb-only candidates and both mislead: nothing is pushed here, and
+  "observe" is spoken for by the generation handshake.
 
 Left undone: `EventsWatch` still streams a bare `Event`, so a consumer cannot
 tell a new run from a count-bump on an existing one — the one place a log does face

@@ -2697,7 +2697,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 }
 
 // The motivating use case, end-to-end through the public API: a flapping cluster's
-// connection-probe outcomes emitted via ControllerClient.EventsRecord render as the
+// connection-probe outcomes emitted via ControllerClient.EventsAdd render as the
 // aggregated, newest-first timeline the health panel shows.
 func TestEventsConnectionPanelTimeline(t *testing.T) {
 	ctx := context.Background()
@@ -2714,7 +2714,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
 		for i := 0; i < n; i++ {
-			require.NoError(t, cc.EventsRecord(ctx, cluster.ID, EventSpec{
+			require.NoError(t, cc.EventsAdd(ctx, cluster.ID, EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: msg, Detail: detail,
 			}))
 		}
@@ -2774,7 +2774,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
-	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	plain, err := client.Get(ctx, obj.ID)
@@ -2803,9 +2803,9 @@ func TestClientListLoadsEvents(t *testing.T) {
 	require.NoError(t, err)
 	b, err := client.Create(ctx, cSpec{Val: "b"})
 	require.NoError(t, err)
-	_, err = store.EventsRecord(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	_, err = store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
-	_, err = store.EventsRecord(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
+	_, err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
 	require.NoError(t, err)
 
 	objs, err := client.List(ctx, LoadEvents())
@@ -2833,7 +2833,7 @@ func TestClientListEvents(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := func(cat, typ, reason string) {
-		_, err := store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
+		_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
 		require.NoError(t, err)
 	}
 	rec("connection", "Warning", "ProbeFailed")
@@ -2864,7 +2864,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	got, ok, err := client.EventsGetLatest(ctx, obj.ID, "connection")
@@ -2894,7 +2894,7 @@ func TestClientWatchEvents(t *testing.T) {
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	_, err = store.EventsRecord(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	select {

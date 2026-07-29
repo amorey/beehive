@@ -37,7 +37,7 @@ func TestSweepEventRetention(t *testing.T) {
 	obj, err := store.ObjectsCreate(ctx, &RawObject{Group: gk.Group, Kind: gk.Kind, Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	for _, r := range []string{"R1", "R2", "R3", "R4"} {
-		_, err := store.EventsRecord(ctx, gk, obj.ID, RawEvent{Category: "c", Type: "Normal", Reason: r})
+		_, err := store.EventsAdd(ctx, gk, obj.ID, RawEvent{Category: "c", Type: "Normal", Reason: r})
 		require.NoError(t, err)
 	}
 

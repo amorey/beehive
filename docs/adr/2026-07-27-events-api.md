@@ -9,7 +9,7 @@
 A per-object event log (`events` table) partitioned by `category` into independent
 timelines.
 
-`ControllerClient.EventsRecord` is the sole writer. Inside one `Within` it probes
+`ControllerClient.EventsAdd` is the sole writer. Inside one `Within` it probes
 the latest run for `(object_id, category)`
 (`WHERE object_id=? AND category=? ORDER BY id DESC LIMIT 1`) and either
 
@@ -26,7 +26,7 @@ It is the long form of conditions, which keep only the current run per type.
 
 ## `Detail` is typed in, opaque out
 
-`EventSpec.Detail` (`any`, marshaled by `EventsRecord`) → the opaque `detail` blob
+`EventSpec.Detail` (`any`, marshaled by `EventsAdd`) → the opaque `detail` blob
 column → `Event.Detail` (`json.RawMessage`), decoded by the free generic helper
 `EventDetail[T]`.
 
@@ -56,7 +56,7 @@ Retention runs in `gcSweeperRun`: a per-`(object, category)` cap-N ring plus opt
 `maxAge` (`WithEventRetention`). `events.object_id` is `FK … ON DELETE CASCADE`, so
 object deletion cascades the log.
 
-Store quartet: `EventsRecord` / `EventsGetLatest` / `EventsList` / `EventsSweep`.
+Store quartet: `EventsAdd` / `EventsGetLatest` / `EventsList` / `EventsSweep`.
 The store has no event watch — the watch is a client-side poll over `EventsList`.
 
 ## Naming: "event(s)" is reserved for the log

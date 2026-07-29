@@ -13,7 +13,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   Almost any write sustains it: changed status bytes, a byte-identical `UpdateStatus`
   at a generation the object has not settled at, any real condition write, or
-  `FinalizersDelete`. Keeping status byte-stable is no defence. Only `EventsRecord` is
+  `FinalizersDelete`. Keeping status byte-stable is no defence. Only `EventsAdd` is
   safe, because it bumps no object `resource_version`.
 
   **What it costs.** The wake interval bounds the rate to one round trip per tick, so

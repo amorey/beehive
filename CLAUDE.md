@@ -150,7 +150,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ErrNotLoaded` for a relation nobody asked for. `OwnedObjectsList` is the typed form
   of `OwnedList`. → [ADR](docs/adr/2026-07-27-secondary-lookups.md)
 - **Events are an append-only log, aggregated into runs.** One log per object,
-  partitioned by `category`. `ControllerClient.EventsRecord` extends the latest run
+  partitioned by `category`. `ControllerClient.EventsAdd` extends the latest run
   when `(type, reason)` matches and appends otherwise. `Detail` goes in typed and
   comes out opaque, and is not versioned. Reads live on `Client`; retention runs in
   the GC sweeper. "Event" means this log and nothing else — the object-change streams

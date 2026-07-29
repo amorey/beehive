@@ -340,6 +340,18 @@ type Store interface {
 	// alone it would strand and RESTRICT-block its owner's delete forever.
 	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
 
+	// EventsAdd records an observation about id in the (id, ev.Category) timeline,
+	// grouping consecutive ones into runs. Adding does not always insert: if the
+	// latest run there has the same (Type, Reason) it is extended instead — Count
+	// goes up, LastAt moves, Message and Detail are re-sampled. Otherwise a new run
+	// is appended with Count 1.
+	//
+	// Only ev's Category, Type, Reason, Message and Detail are read; the store fills in
+	// the rest and returns the run. The comparison is scoped to (id, Category), so an
+	// event in another category can't break this run. Scoped to gk: another kind's id
+	// gives ErrWrongKind, a missing id ErrNotFound.
+	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
+
 	// EventsGetLatest returns the most recent run in id's category timeline, or nil
 	// if that timeline has no events. Reads by object id only (not kind-scoped).
 	EventsGetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
@@ -348,17 +360,6 @@ type Store interface {
 	// id). The zero EventQuery returns every run for the object. Reads by object id
 	// only — not kind-scoped, like the ref-list reads.
 	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
-
-	// EventsRecord records an observation about id in the (id, ev.Category) timeline,
-	// grouping consecutive ones into runs. If the latest run there has the same (Type,
-	// Reason) it is extended: Count goes up, LastAt moves, Message and Detail are
-	// re-sampled. Otherwise a new run is appended with Count 1.
-	//
-	// Only ev's Category, Type, Reason, Message and Detail are read; the store fills in
-	// the rest and returns the run. The comparison is scoped to (id, Category), so a
-	// record in another category can't break this run. Scoped to gk: another kind's id
-	// gives ErrWrongKind, a missing id ErrNotFound.
-	EventsRecord(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
 
 	// EventsSweep trims the event log to the retention bounds and returns how many runs
 	// it deleted. perObject > 0 caps each (object, category) timeline to its newest

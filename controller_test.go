@@ -225,9 +225,9 @@ func TestControllerClientWithin(t *testing.T) {
 	assert.NotNil(t, findCondition(got.Conditions, "Ready"))
 }
 
-// EventsRecord writes an aggregated run through the store, marshaling EventSpec's
+// EventsAdd writes an aggregated run through the store, marshaling EventSpec's
 // Detail; the run reads back with the mapped fields and a decodable payload.
-func TestControllerClientRecordEvent(t *testing.T) {
+func TestControllerClientAddEvent(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -237,7 +237,7 @@ func TestControllerClientRecordEvent(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "x"})
 	require.NoError(t, err)
 
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{
 		Category: "connection", Type: EventWarning, Reason: "ProbeFailed",
 		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
 	}))
@@ -255,20 +255,20 @@ func TestControllerClientRecordEvent(t *testing.T) {
 	assert.Equal(t, probeDetail{Endpoint: "h:443", LatencyMs: 5000}, detail)
 }
 
-// EventsRecord surfaces a Detail that cannot be JSON-marshaled, before touching
+// EventsAdd surfaces a Detail that cannot be JSON-marshaled, before touching
 // the store.
-func TestControllerClientRecordEventMarshalError(t *testing.T) {
+func TestControllerClientAddEventMarshalError(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 
-	err = cc.EventsRecord(context.Background(), 1, EventSpec{Detail: make(chan int)})
+	err = cc.EventsAdd(context.Background(), 1, EventSpec{Detail: make(chan int)})
 	assert.Error(t, err, "an unmarshalable Detail fails the write")
 }
 
-// EventsRecord is kind-folded like the other writes: a controller may not record
+// EventsAdd is kind-folded like the other writes: a controller may not record
 // events on an object of another kind.
-func TestControllerClientRecordEventWrongKind(t *testing.T) {
+func TestControllerClientAddEventWrongKind(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -278,13 +278,13 @@ func TestControllerClientRecordEventWrongKind(t *testing.T) {
 	require.NoError(t, err)
 
 	other := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Other"}}
-	err = other.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
+	err = other.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
 	assert.ErrorIs(t, err, ErrWrongKind)
 }
 
-// EventsRecord composes in Within: a run recorded inside a transaction that later
+// EventsAdd composes in Within: a run recorded inside a transaction that later
 // errors is rolled back with the rest.
-func TestControllerClientRecordEventWithinRollback(t *testing.T) {
+func TestControllerClientAddEventWithinRollback(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -296,7 +296,7 @@ func TestControllerClientRecordEventWithinRollback(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	err = cc.Within(ctx, func(ctx context.Context) error {
-		if err := cc.EventsRecord(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
+		if err := cc.EventsAdd(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
 			return err
 		}
 		return sentinel
@@ -305,7 +305,7 @@ func TestControllerClientRecordEventWithinRollback(t *testing.T) {
 
 	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "c")
 	require.NoError(t, err)
-	assert.Nil(t, run, "a EventsRecord inside a rolled-back Within must not persist")
+	assert.Nil(t, run, "an EventsAdd inside a rolled-back Within must not persist")
 }
 
 func TestControllerClientSetAndDeleteCondition(t *testing.T) {
