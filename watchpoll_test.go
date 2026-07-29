@@ -60,13 +60,19 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "a"})
 	require.NoError(t, err)
 
-	store.failures.Store(2) // the first two polls fail
 	ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, obj.ID, recv(t, ch).Object.ID, "the snapshot reports the object")
+
+	// The next two listings fail. Only a tick that has something to list reaches
+	// them, so give it a change to find.
+	store.failures.Store(2)
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
-	assert.Equal(t, Added, ev.Type, "the stream survives the failed polls and reports the object")
-	assert.Equal(t, obj.ID, ev.Object.ID)
+	assert.Equal(t, Modified, ev.Type, "the stream survives the failed polls and reports the change")
+	assert.Equal(t, "b", ev.Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch poll failed", "the skipped polls are reported")
 }
 
@@ -242,6 +248,7 @@ type pollProbeStore struct {
 	eventsListed chan struct{}
 	metaRead     chan struct{}
 	eventsFailed chan struct{}
+	listErr      atomic.Bool
 	listIDsErr   atomic.Bool
 	getErr       atomic.Bool
 	eventsErr    atomic.Bool
@@ -258,6 +265,9 @@ func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context) (int64, err
 // tests need: past it the only thing left that can observe a cancelled context is
 // the send itself.
 func (s *pollProbeStore) ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+	if s.listErr.Load() {
+		return nil, errBoom
+	}
 	out, err := s.Store.ObjectsList(ctx, gk)
 	probeSignal(s.listed)
 	return out, err
@@ -331,17 +341,23 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	obj, err := client.Create(ctx, cSpec{Val: "a"})
 	require.NoError(t, err)
 
-	store.getErr.Store(true)
 	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
+	require.Equal(t, Added, recv(t, ch).Type)
 
-	// Wait for a tick to have failed before letting reads succeed, so the recovery
-	// below is the stream outliving a failure rather than never meeting one.
-	waitClosed(t, chanAfter(store.polled, 2), "a poll while the read fails")
+	// A change to find, and a read that fails while it tries. Wait for ticks that
+	// come *after* the failure is armed, so the recovery below is the stream
+	// outliving a failure rather than never meeting one.
+	store.getErr.Store(true)
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	drainProbe(store.polled)
+	waitClosed(t, chanAfter(store.polled, 2), "polls while the read fails")
 	store.getErr.Store(false)
+
 	ev := recv(t, ch)
-	assert.Equal(t, Added, ev.Type)
-	assert.Equal(t, obj.ID, ev.Object.ID)
+	assert.Equal(t, Modified, ev.Type)
+	assert.Equal(t, "b", ev.Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch poll failed", "the skipped poll is reported")
 }
 
@@ -366,6 +382,7 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	// With the object reported and no further writes, the cursor stops moving, so
 	// every tick from here consults the id listing — which now fails.
 	store.listIDsErr.Store(true)
+	drainProbe(store.polled)
 	waitClosed(t, chanAfter(store.polled, 2), "polls while the delete check fails")
 	store.listIDsErr.Store(false)
 
@@ -701,6 +718,7 @@ func TestWatchSingleObjectSurvivesALivenessProbeFailure(t *testing.T) {
 	// With the object reported and no further writes, every tick from here consults
 	// the liveness probe — which now fails.
 	store.metaErr.Store(true)
+	drainProbe(store.polled)
 	waitClosed(t, chanAfter(store.polled, 2), "polls while the liveness probe fails")
 	store.metaErr.Store(false)
 
@@ -748,19 +766,42 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	})
 }
 
-// A subscribe whose context is already dead must not wait for a read it will
-// never use: the stream is closing anyway, so the caller gets its (closed)
-// channel back rather than blocking.
-func TestWatchDoesNotWaitForASnapshotOnADeadContext(t *testing.T) {
+// TestWatchReportsAFailedFirstRead pins the other half of the subscribe-then-act
+// guarantee: a stream is handed back only when it holds a snapshot. A failed first
+// read returns an error instead, because the alternative is a watch whose guarantee
+// is quietly void — it would hold no state to compare against, so an object deleted
+// next would never be reported, and the caller would wait for a tombstone that
+// cannot come. Every *later* failure costs one tick, since the last good poll's
+// state is still there.
+func TestWatchReportsAFailedFirstRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, _ := watchFixture(t)
+	_, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	store.listErr.Store(true)
+	ch, err := client.ObjectsWatchList(ctx)
+	require.ErrorIs(t, err, errBoom, "the caller learns the snapshot failed")
+	assert.Nil(t, ch, "and gets no stream to wait on")
+	assert.Contains(t, err.Error(), "initial read failed")
+
+	// It is the read that failed, not the subscription: with the store answering
+	// again, subscribing works.
+	store.listErr.Store(false)
+	ch, err = client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, Added, recv(t, ch).Type)
+}
+
+// A context already cancelled at subscribe is the same story told by the store:
+// the snapshot read fails, so there is no stream to hand back.
+func TestWatchOnACancelledContextDoesNotSubscribe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	store, _, client, _ := watchFixture(t)
-	_, err := client.Create(context.Background(), cSpec{Val: "a"})
-	require.NoError(t, err)
-	store.getErr.Store(true) // any read this made would fail
-
-	ch, err := client.ObjectsWatchList(ctx)
-	require.NoError(t, err)
-	waitClosed(t, closedWhenDrained(ch), "the stream to close on a cancelled context")
+	_, _, client, _ := watchFixture(t)
+	_, err := client.ObjectsWatchList(ctx)
+	assert.ErrorIs(t, err, context.Canceled)
 }

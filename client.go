@@ -141,9 +141,14 @@ type Client[Spec, Status any] interface {
 	// Both read current state before returning, so a caller may subscribe and then
 	// act: a change it makes afterwards is measured against a snapshot that already
 	// exists, and cannot fall into the gap before the first poll. That costs one
-	// store read on the subscribing goroutine. Everything after it is polled (see
-	// withWatchPollInterval), which is what bounds latency and collapses changes
-	// within one interval into the latest state.
+	// store read on the subscribing goroutine, and its failure is returned — a
+	// stream handed back always holds a snapshot, where one that did not would be a
+	// watch with nothing to compare against, silently unable to report the delete
+	// the caller is about to make. Every later poll failure costs a tick instead,
+	// since the last good poll's state is still there.
+	//
+	// Everything after that read is polled (see withWatchPollInterval), which is what
+	// bounds latency and collapses changes within one interval into the latest state.
 	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
 	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The

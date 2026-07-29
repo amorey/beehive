@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -93,7 +92,7 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan
 		},
 		func(ctx context.Context) ([]ObjectID, error) {
 			return c.bh.store.ObjectsListIDs(ctx, c.gk)
-		}), nil
+		})
 }
 
 // ObjectsWatch streams changes to the single object id. It polls the same way
@@ -122,7 +121,7 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 				return nil, err
 			}
 			return []ObjectID{raw.ID}, nil
-		}), nil
+		})
 }
 
 // scopedRow reads id through read and folds both "not visible through this kind's
@@ -150,15 +149,14 @@ func (c *clientImpl[Spec, Status]) scopedRow(
 
 // objectStream is the poll-and-diff engine behind both object watches.
 //
-// **The first read happens before this returns**, and that is what makes
-// "subscribe, then act" safe: everything the caller does next lands above a
-// snapshot that already exists, so a change it makes — including a delete — is
+// **A returned stream always carries a snapshot**, and that is what makes
+// "subscribe, then act" safe: everything the caller does next lands above state
+// this stream already holds, so a change it makes — including a delete — is
 // reported. Taking the snapshot on the first tick instead would leave the window
 // between subscribing and that tick invisible, and an object created and collected
 // inside it is never reported at all, so a caller waiting on its Deleted waits
-// forever. The caller waits only for the *read*: the changes it produces are sent
-// from the poll goroutine afterwards, since a send blocks on a subscriber that
-// cannot read until subscribing has returned.
+// forever. A failed first read therefore returns an error instead of a stream: the
+// alternative is handing back a watch whose guarantee is quietly void.
 //
 // It remembers the resource_version of every object it has reported and works out
 // the change type by comparison:
@@ -196,33 +194,40 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
 	list func(context.Context) ([]*RawObject, error),
 	live func(context.Context) ([]ObjectID, error),
-) <-chan ObjectChange[Spec, Status] {
-	out := make(chan ObjectChange[Spec, Status])
+) (<-chan ObjectChange[Spec, Status], error) {
 	// The migrator is invariant for the stream's lifetime; resolve it once rather
 	// than re-locking the registry on every poll.
 	mig := c.bh.migratorFor(c.gk)
 	seen := make(map[ObjectID]tracked[Spec, Status])
 	var cursor int64
-	// snapshot is closed once the first poll has read the store, before any of what
-	// it found is sent (see the func doc on why the caller waits for it).
-	snapshot := make(chan struct{})
-	var once sync.Once
-	taken := func() { once.Do(func() { close(snapshot) }) }
 
+	// The snapshot, on the caller's goroutine. Its failure is returned rather than
+	// logged, because it is the one poll whose failure the caller can act on and the
+	// only one that leaves nothing behind: a stream handed back after a failed first
+	// read would carry no state to compare against, so an object deleted next would
+	// never be reported — the exact hole the guarantee above closes. Every later
+	// failure costs one tick, since the state from the last good poll is still there.
+	initial, err := c.poll(ctx, list, live, mig, seen, &cursor)
+	if err != nil {
+		return nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+			c.gk.Group, c.gk.Kind, err)
+	}
+
+	out := make(chan ObjectChange[Spec, Status])
 	go func() {
 		defer close(out)
-		// A poll that returns early — a store error, a quiet tick — has still looked,
-		// and a caller must not be left waiting on a store that is failing.
-		defer taken()
+		// What the snapshot found, delivered first: the sends could not happen on the
+		// caller's goroutine, since a send blocks until the subscriber reads and it
+		// cannot read until this call has returned.
+		for _, ch := range initial {
+			if !sendOrDone(ctx, out, ch) {
+				return
+			}
+		}
 		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			changes, ok := c.poll(ctx, list, live, mig, seen, &cursor)
-			// Every read this poll was going to make has now been made, so the caller
-			// may proceed: anything it does from here lands above the snapshot and is
-			// reported by a later poll. Marked before the sends, which block until the
-			// subscriber reads — and it cannot read until this returns.
-			taken()
-			if !ok {
-				return true // logged by poll; one tick lost, not the stream
+			changes, err := c.poll(ctx, list, live, mig, seen, &cursor)
+			if err != nil {
+				return c.pollFailed(ctx, "watch", err)
 			}
 			for _, ch := range changes {
 				if !sendOrDone(ctx, out, ch) {
@@ -232,23 +237,17 @@ func (c *clientImpl[Spec, Status]) objectStream(
 			return true
 		})
 	}()
-
-	// Wait for that first read. A cancelled context ends the wait rather than
-	// holding the caller: the stream is closing anyway.
-	select {
-	case <-snapshot:
-	case <-ctx.Done():
-	}
-	return out
+	return out, nil
 }
 
 // poll runs one object-watch tick: it reads current state, folds it into seen, and
-// returns the changes to send. ok is false when the read failed, which costs the
-// tick and nothing more.
+// returns the changes to send. The error is returned rather than handled, because
+// the same read means different things to its two callers — fatal for the snapshot,
+// one lost tick for the loop.
 //
-// Deriving every change before sending any is what lets objectStream tell its
-// caller the snapshot has been taken: the sends block on a subscriber that cannot
-// read until subscribing returns, so the two must not be interleaved.
+// Deriving every change before sending any is what lets the snapshot run on the
+// caller's goroutine: the sends block on a subscriber that cannot read until
+// subscribing returns, so the two must not be interleaved.
 func (c *clientImpl[Spec, Status]) poll(
 	ctx context.Context,
 	list func(context.Context) ([]*RawObject, error),
@@ -256,10 +255,10 @@ func (c *clientImpl[Spec, Status]) poll(
 	mig Migrator,
 	seen map[ObjectID]tracked[Spec, Status],
 	cursor *int64,
-) ([]ObjectChange[Spec, Status], bool) {
+) ([]ObjectChange[Spec, Status], error) {
 	at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
 	if err != nil {
-		return nil, c.pollFailed(ctx, "watch", err)
+		return nil, err
 	}
 	if at == *cursor {
 		// Nothing was created or modified. A delete is still possible and draws no
@@ -268,15 +267,15 @@ func (c *clientImpl[Spec, Status]) poll(
 		// vanished.
 		gone, err := c.deletedSince(ctx, seen, live)
 		if err != nil {
-			return nil, c.pollFailed(ctx, "watch", err)
+			return nil, err
 		}
 		if !gone {
-			return nil, true
+			return nil, nil
 		}
 	}
 	raws, err := list(ctx)
 	if err != nil {
-		return nil, c.pollFailed(ctx, "watch", err)
+		return nil, err
 	}
 	*cursor = at
 
@@ -314,7 +313,7 @@ func (c *clientImpl[Spec, Status]) poll(
 		}
 		changes = append(changes, ObjectChange[Spec, Status]{Type: Deleted, Object: prev.obj})
 	}
-	return changes, true
+	return changes, nil
 }
 
 // deletedSince reports whether any object this stream has reported is gone. It is
