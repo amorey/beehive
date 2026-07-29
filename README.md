@@ -578,7 +578,7 @@ A kind with no migrator is untouched; its columns stay `0`. Only registered kind
 type Option interface{ apply(any) }
 
 func WithSlug(slug string) Option                  // set a human-readable slug; fails if already exists
-func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers
+func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers; registered kinds only
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
 func WithFullPassInterval(d time.Duration) Option  // how often to re-dispatch EVERY object (default: 0, off)
@@ -590,6 +590,8 @@ func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log
 ```
 
 `WithOwner` writes an `owned_by` edge in the same transaction as the `Create`. Deleting the owner then cascades to the child through GC.
+
+`WithFinalizers` is the one create option that needs a **registered** kind; on a client-only kind the create fails with `ErrInvalidOption`. Only `ControllerClient.FinalizersDelete` can clear a finalizer, and it folds the calling controller's own kind into the write — so a client-only kind's finalizer is removable by nothing, and the row would stay deletion-pending forever while its `owned_by` edge blocks its owner's delete. The check runs before any store work and only when the option is used, so an ordinary create on a client-only kind is unaffected.
 
 `WithOnCreate` is the safe way to run a side effect only if the row is really created — an external call, an in-memory counter. It waits for the *outermost* commit, so it runs once and never after a rollback; it is the only thing in beehive deferred that way. `Create` always fires it, `GetOrCreate` only when it inserts. Prefer it to branching on `GetOrCreate`'s `created` bool, which is returned synchronously: inside an enclosing `ControllerClient.Within` that bool is set before the transaction commits, so acting on it fires your side effect for a row a rollback may still discard.
 

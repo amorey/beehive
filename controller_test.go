@@ -718,13 +718,19 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
 	require.NoError(t, err)
+	// "Gadget" gets a controller of its own so the finalizer below is legal to
+	// create. It is foreign to cc either way — that is the point of the test — and
+	// having its own controller is what makes ErrWrongKind the *only* thing standing
+	// between cc and the row.
+	gadgetGK := GroupKind{Kind: "Gadget"}
+	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
 
-	// A "Gadget" is a foreign kind to this controller. Give it a finalizer so the
-	// FinalizersDelete attempt has a target to (fail to) remove.
-	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
+	// Give the Gadget a finalizer so the FinalizersDelete attempt has a target to
+	// (fail to) remove.
+	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
 	gadget, err := gadgets.Create(ctx, cSpec{Val: "v1"}, WithFinalizers("f"))
 	require.NoError(t, err)
 

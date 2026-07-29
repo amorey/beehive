@@ -153,29 +153,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   it were a durable schedule. Documenting the boundary is the actual deliverable here,
   not a mechanism.
 
-- **A client-only kind created with `WithFinalizers` can never be collected** — known,
-  not fixed. `WithFinalizers` is a create option on `Client`, and `Create` performs no
-  registration check, so the row is legal to make. Clearing a finalizer is
-  `ControllerClient.FinalizersDelete`, which folds the controller's own kind into the
-  store mutator — so no other kind's controller can reach it either, and gets
-  `ErrWrongKind` for trying. `gcCollect` returns early while `len(obj.Finalizers) > 0`.
-
-  The row is therefore deletion-pending forever: re-listed by every GC sweep, making
-  no progress on any of them, and its `owned_by` edge RESTRICT-blocks its owner's
-  delete permanently. That is precisely the failure the global sweeper exists to
-  prevent for client-only kinds — the sweeper reaches the row, it just has nothing it
-  is allowed to do with it.
-
-  **The fix is to reject `WithFinalizers` at create time for a kind with no registered
-  controller**, which `bh.isRegistered` already answers; the watch surface (`watchpoll.go`)
-  uses it for the same class of contract the store cannot enforce. Deferred because
-  `Create` does no registration check today at all, and adding one puts a `bh.mu`
-  acquisition on the create path for a case that is a caller mistake rather than a
-  race. If that is judged too expensive, the alternative is to document it under
-  `WithFinalizers` as the one option that is meaningful only on a registered kind —
-  but silence is the wrong answer either way, since the symptom surfaces much later
-  and as an unrelated-looking stuck delete on the *owner*.
-
 - **A dependency declared for another object, concurrently with that object's own
   reconcile, is not re-derived** — known, not fixed, and the residue of a gap that is
   otherwise closed. `EdgesAdd` clears `fromID`'s `dependency_watermarks` row when it

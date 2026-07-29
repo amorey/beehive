@@ -269,6 +269,10 @@ All three cases share one trace and one driver:
    pending, or `EdgesHasIncoming` reporting a referrer under RESTRICT. Nothing signals
    the unblocking either: an owner freed by its last child's removal, or by a
    `DependenciesDelete`, is simply still deletion-pending when the next sweep runs.
+   Every block is temporary by construction: the one that was not — a finalizer on a
+   client-only kind, which no `FinalizersDelete` can reach — is now rejected at create
+   (`TestClientCreateRejectsFinalizersOnUnregisteredKind`), so a sweep always has a
+   route to progress.
    Tests: `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
    `TestIntegrationGCDeletesAfterFinalizerCleared`, `TestIntegrationGCDeleteDependencyUnblocksTarget`,
    `TestIntegrationGCBreaksDependencyCycle`, `TestCollectBreaksSelfDependency`.

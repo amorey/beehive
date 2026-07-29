@@ -283,11 +283,65 @@ func TestClientCreate(t *testing.T) {
 	assert.Equal(t, "hello", obj.Spec.Val)
 }
 
+// A finalizer on a kind with no controller is unclearable, not merely useless:
+// FinalizersDelete is a ControllerClient method folded to the caller's own kind, so
+// nothing in the process can remove it, gcCollect returns early while it stands,
+// and the row's owned_by edge RESTRICT-blocks its owner's delete forever. Rejecting
+// at create is the only point where the mistake is still cheap — the symptom
+// otherwise surfaces much later, and as an unrelated-looking stuck delete on the
+// *owner*.
+func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("cleanup"))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.Contains(t, err.Error(), "WithFinalizers")
+	// Rejected before any store work, so there is no row to collect either.
+	objs, listErr := client.List(ctx)
+	require.NoError(t, listErr)
+	assert.Empty(t, objs, "the create wrote nothing")
+}
+
+// GetOrCreate takes the same options, so it makes the same check — on the branch
+// that would actually insert and on the one that would not, since resolving
+// happens before the slug lookup.
+func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"}, WithFinalizers("cleanup"))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.False(t, created)
+}
+
+// The check is gated on the option being used, so an ordinary create on a
+// client-only kind stays legal — client-only kinds are a supported shape, and only
+// the finalizer makes one uncollectable.
+func TestClientCreateWithoutFinalizersAllowsUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+
+	require.NoError(t, err)
+	assert.Empty(t, obj.Finalizers)
+}
+
 func TestClientCreateWithOptions(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh, err := New(store)
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -518,6 +572,7 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	// The finalizer keeps the tombstone around after Delete, so the slug is still
@@ -960,6 +1015,7 @@ func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"},
@@ -1176,6 +1232,7 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
@@ -1895,6 +1952,9 @@ func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus],
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
+	// One consumer of this fixture creates a child WithFinalizers, which is legal
+	// only on a registered kind.
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
 
 	owners := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Owner"})
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)

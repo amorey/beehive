@@ -387,6 +387,18 @@ func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerCli
 	return Result{}, nil
 }
 
+// registerNoop registers a do-nothing controller for gk, making the kind count as
+// registered without standing up any reconcile behaviour. Tests that create rows
+// WithFinalizers need it: a finalizer on a client-only kind is rejected at create,
+// because nothing in the process could ever clear it (see clientImpl.resolveCreate).
+// It registers only — nothing starts — so a fixture that never calls Start is
+// otherwise unchanged.
+func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
+	t.Helper()
+	_, err := Register(bh, gk, &noopController[Spec, Status]{})
+	require.NoError(t, err)
+}
+
 // signal is a one-shot notification from a test fake to the test: a callback
 // that may run many times calls fire, and the test awaits it with wait. Firing
 // is idempotent by contract — oneshot reports a second Send as ErrClosed, where

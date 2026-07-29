@@ -265,7 +265,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	if err != nil {
 		return nil, err
 	}
-	co, err := resolveCreate(opts)
+	co, err := c.resolveCreate(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +297,38 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 		return nil, err
 	}
 	return obj, nil
+}
+
+// resolveCreate folds the create-time options and then applies the one validation
+// that needs the control plane rather than the option values alone: a finalizer is
+// only meaningful on a kind that has a controller to clear it. It runs before any
+// store work, like the package-level resolveCreate it wraps, so a caller mistake
+// never takes the store's write lock.
+//
+// WithFinalizers on a client-only kind is unclearable, not merely useless.
+// FinalizersDelete lives on ControllerClient and folds the caller's own GroupKind
+// into the store mutator, so no other kind's controller can reach the row either —
+// it gets ErrWrongKind for trying. gcCollect returns early while any finalizer
+// remains, so the row stays deletion-pending forever: re-listed by every GC sweep,
+// making no progress on any of them, and its owned_by edge RESTRICT-blocks its
+// owner's delete permanently. That is exactly the strand the global sweeper exists
+// to prevent for client-only kinds — the sweeper reaches the row, it just has
+// nothing it is allowed to do with it.
+//
+// The registration read is gated on the option actually being used, so the ordinary
+// create path never takes bh.mu: this is a caller mistake to reject, not a race to
+// close, and the registration set is frozen after Start anyway.
+func (c *clientImpl[Spec, Status]) resolveCreate(opts []Option) (*createOptions, error) {
+	co, err := resolveCreate(opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(co.finalizers) > 0 && !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("%w: WithFinalizers needs a registered controller for %s/%s to clear them; "+
+			"a finalizer on a client-only kind can never be removed, and the row would stay deletion-pending forever",
+			ErrInvalidOption, c.gk.Group, c.gk.Kind)
+	}
+	return co, nil
 }
 
 // insertObject inserts one new row of this client's kind and wires its owner
@@ -393,7 +425,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	if err != nil {
 		return nil, false, err
 	}
-	co, err := resolveCreate(opts)
+	co, err := c.resolveCreate(opts)
 	if err != nil {
 		return nil, false, err
 	}
