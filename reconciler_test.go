@@ -2743,6 +2743,36 @@ func TestReconcileRecordsDependencyWatermark(t *testing.T) {
 	assert.Equal(t, []ObjectID{h.dep}, h.stale(t), "and the next change makes it stale again")
 }
 
+// A controller that declares a *new* dependency mid-pass costs itself nothing. The
+// declare clears the dependent's watermark — which is what makes a third party's
+// declare leave the dependent stale, since the new target may sit below a watermark
+// the stale scan would otherwise report as converged — but this pass's own write
+// lands after it, from the cursor it loaded at. Without that ordering every first
+// declare would buy a spurious extra pass, forever, for every controller that
+// declares its edges from inside Reconcile.
+func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T) {
+	ctx := context.Background()
+	h := newWatermarkHarness(t, nil)
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+	require.Empty(t, h.stale(t), "settled, with a watermark for the declare below to clear")
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	second, err := h.store.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+	h.inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, cc.DependenciesAdd(ctx, h.dep, second.ID, 0)
+	}
+
+	_, err = h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+	assert.Empty(t, h.stale(t), "the pass that declared the edge also observed the target")
+}
+
 // watermarkProbeStore records every dependency-watermark write, so a test can
 // assert on the call rather than on the row. The point of the skip is the write
 // lock not taken — on a pool of one connection an INSERT that writes no rows still

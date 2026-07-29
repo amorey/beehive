@@ -176,6 +176,41 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   but silence is the wrong answer either way, since the symptom surfaces much later
   and as an unrelated-looking stuck delete on the *owner*.
 
+- **A dependency declared for another object, concurrently with that object's own
+  reconcile, is not re-derived** — known, not fixed, and the residue of a gap that is
+  otherwise closed. `EdgesAdd` clears `fromID`'s `dependency_watermarks` row when it
+  creates a new `depends_on` edge, so a declare no version claim covers still reaches
+  the dependent through the stale-dependents pass (see [the
+  ADR](docs/adr/2026-07-29-dependency-watermarks.md)). What survives is one
+  interleaving: a *third party* declaring between a dependent's `ObjectsGetForReconcile`
+  and that dependent's own watermark write has the clear undone by a pass that never
+  saw the new target. The dependent then reads as converged until the target next
+  moves.
+
+  Reaching it takes a cross-object declare — a controller declaring an edge on another
+  kind's behalf, which the cross-kind edge deliberately allows — landing inside the
+  window a single `Reconcile` call is open. The single connection does not close it:
+  the dependent holds no transaction while its controller runs.
+
+  **The fix is to record owed work instead of invalidating derived state**: stamp
+  `reconcile_owed` on every *new* `depends_on` edge, dropping the target-moved half of
+  `EdgesAdd`'s conjunction. That is sound under every interleaving, because
+  `ReconcileOwedDecrement` subtracts only the count observed at *load* — a stamp landing
+  mid-pass survives the subtraction and keeps the object owed, which is the property the
+  count was built with.
+
+  Deferred on cost, not on doubt. It buys one extra reconcile per edge ever created,
+  where the watermark clear buys none in the ordinary case, and it partly reverses the
+  [caller-versioned ADR](docs/adr/2026-07-27-caller-versioned-dependencies.md), whose
+  conjunction argument still stands for the churn shape it names: a controller that
+  clears and re-declares its dependency set every pass would stamp every pass. Revisit
+  if a controller turns up that declares edges on another kind's behalf as a matter of
+  course, which is what turns this window from narrow into routine.
+
+  **Tripwires.** `TestAddDependencyNoWakeWhenTargetUnmoved` and
+  `TestRefsAddStampsOnlyNewEdge` both pin that an unmoved target stamps nothing —
+  exactly what this fix would change.
+
 - **A controller that never calls `UpdateStatus` is permanently unsettled** — known,
   not fixed. `observed_generation` is NULL until the first `UpdateStatus`, and
   `ObjectsListUnsettledIDs` lists `observed_generation IS NULL OR observed_generation <

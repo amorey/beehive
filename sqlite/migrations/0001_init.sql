@@ -194,6 +194,11 @@ CREATE INDEX idx_edges_to ON edges(to_id, relation);
 -- against a known point, therefore stale — which is why the scan LEFT JOINs
 -- and needs no backfill.
 --
+-- That absence is also load-bearing on the write side: declaring a *new*
+-- depends_on edge deletes the row (see EdgesAdd). A cursor recorded while the
+-- dependency set was smaller cannot speak for a target just added, whose
+-- resource_version may sit below it — where the scan would read converged.
+--
 -- A rowid table, unlike edges. object_id is an INTEGER PRIMARY KEY, so it
 -- *aliases the rowid*: the table is already one b-tree keyed by object_id with
 -- no separate index, and the scan's per-edge probe is a direct rowid seek.

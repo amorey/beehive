@@ -1527,6 +1527,16 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	return nil
 }
 
+// edgeIsNew is the "this call is the one creating the edge" test, as a WHERE
+// fragment over (from_id, to_id, relation) — a probe straight down the edges
+// primary key, which is the table itself since edges is WITHOUT ROWID, so a
+// statement carrying it costs no extra round trip and no pre-read. Two of
+// EdgesAdd's statements are gated on it and both must decide it identically; it
+// is a const so they cannot drift, which is the property the alternative — one
+// pre-read feeding both — would have bought with a round trip.
+const edgeIsNew = `NOT EXISTS (
+	SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?)`
+
 // EdgesAdd inserts a (from_id, to_id, relation) edge, stamping an owed dependency
 // wake when the caller's version claim says the target moved under it (see
 // storeapi.Store.EdgesAdd for the contract, and ControllerClient.DependenciesAdd for
@@ -1582,15 +1592,12 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		// The durable wake stamp, on the same side of the insert as the rejection
 		// above and for the same reason. Its NOT EXISTS is the edge-new test, a probe
 		// straight down the edges primary key — which, edges being WITHOUT ROWID, is
-		// the table itself, so it is one statement with no extra round-trip. And it
-		// is the *only* place edge-newness is decided, so there is no second
-		// derivation of it to fall out of agreement with.
+		// the table itself, so it is one statement with no extra round-trip.
 		var stamped bool
 		if targetResourceVersion > 0 && targetRV > targetResourceVersion {
 			res, err := s.conn(ctx).ExecContext(ctx, `
 				UPDATE objects SET reconcile_owed = reconcile_owed + 1
-				WHERE id = ? AND NOT EXISTS (
-					SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?)`,
+				WHERE id = ? AND `+edgeIsNew,
 				fromID, fromID, toID, string(relation))
 			if err != nil {
 				return err
@@ -1602,6 +1609,34 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 			// skipped wake, and a lost dependency wake is permanent and invisible.
 			n, _ := res.RowsAffected()
 			stamped = n > 0
+		}
+		// A new depends_on edge invalidates the dependent's staleness watermark, so
+		// drop it: an absent row already means "never reconciled against a known
+		// point", which is what puts fromID in the next stale-dependents pass.
+		//
+		// Without this, a dependency declared against a target that has *not* moved
+		// past the caller's claim is found by nothing at all. The stamp above needs
+		// the target to have moved; the waker needs it to move *later*; and the stale
+		// scan compares the target's resource_version against a watermark that already
+		// sits above it, so it reports converged. That is the ordinary shape of an edge
+		// declared on another object's behalf — which the cross-kind edge deliberately
+		// allows — and of any declare whose claim is exact or zero.
+		//
+		// Gated on the same edge-new test as the stamp, so re-asserting a dependency
+		// set every pass still costs nothing after the first. Self-edges are skipped to
+		// match DependentsListStale, which excludes them: clearing for one would drop a
+		// watermark no scan will ever re-derive from that edge.
+		//
+		// It costs the declarer's own pass nothing: a controller that declares its edge
+		// mid-reconcile rewrites the watermark when the pass succeeds, from the cursor
+		// it loaded at.
+		if relation == storeapi.RelationDependsOn && fromID != toID {
+			if _, err := s.conn(ctx).ExecContext(ctx, `
+				DELETE FROM dependency_watermarks
+				 WHERE object_id = ? AND `+edgeIsNew,
+				fromID, fromID, toID, string(relation)); err != nil {
+				return err
+			}
 		}
 		if _, err := s.conn(ctx).ExecContext(ctx, `
 			INSERT INTO edges (from_id, to_id, relation) VALUES (?, ?, ?)

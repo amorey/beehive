@@ -3867,6 +3867,98 @@ func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
 	assert.Empty(t, staleIDs(t, store), "a pass that observed the change settles it")
 }
 
+// A *new* depends_on edge invalidates the dependent's watermark, which the
+// declare drops. Without that, this dependency reaches the dependent by no route
+// at all: the wake stamp needs the target to have moved past the caller's claim,
+// the waker needs it to move later still, and the stale scan compares the target's
+// resource_version against a watermark that already sits above it — so a target
+// that has simply been sitting there is reported converged. That is the ordinary
+// shape of an edge declared on another object's behalf, which the cross-kind edge
+// deliberately allows.
+func TestRefsAddClearsTheDependentsWatermark(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store) // never moves again
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.Empty(t, staleIDs(t, store), "the dependent has converged")
+
+	// A third party declares the edge: no version claim, because it did not read
+	// the target on the dependent's behalf.
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
+
+	_, _, ok := readWatermark(t, store, dep.ID)
+	assert.False(t, ok, "the watermark no longer describes the dependency set")
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store),
+		"so the next stale-dependents pass reconciles against the new target")
+}
+
+// An exact version claim is the case the wake stamp deliberately does not fire on
+// — the caller read the target at the version it still holds — so before the
+// watermark was cleared here, a truthful declare was the one that reached nobody.
+func TestRefsAddClearsTheWatermarkOnAnExactClaim(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+
+	_, err := store.EdgesAdd(ctx, dep.ID, target.ID, beehive.RelationDependsOn, target.ResourceVersion)
+	require.NoError(t, err)
+
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
+}
+
+// Gated on the same edge-new test as the wake stamp, so a controller that
+// re-asserts its dependency set every pass pays for the first declare and nothing
+// after it. Without the gate this would re-stale the dependent on every pass, which
+// is the loop the stamp's conjunction exists to avoid.
+func TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
+
+	_, _, ok := readWatermark(t, store, dep.ID)
+	assert.True(t, ok, "re-asserting an existing edge changes nothing")
+	assert.Empty(t, staleIDs(t, store))
+}
+
+// An owner edge carries no staleness: the watermark tracks depends_on targets, and
+// the cascade reaches children through the GC sweeper rather than through a wake.
+func TestRefsAddKeepsTheWatermarkOnAnOwnerEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+
+	require.NoError(t, addEdge(ctx, store, dep.ID, owner.ID, beehive.RelationOwnedBy))
+
+	_, _, ok := readWatermark(t, store, dep.ID)
+	assert.True(t, ok)
+	assert.Empty(t, staleIDs(t, store))
+}
+
+// A self-edge is excluded from the staleness scan, so clearing for one would drop a
+// watermark that edge could never re-derive — the object would just be stale
+// against its other targets for a pass, for nothing.
+func TestRefsAddKeepsTheWatermarkOnASelfEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dep := newDependentObject(t, store, newRefObject(t, store).ID)
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+
+	require.NoError(t, addEdge(ctx, store, dep.ID, dep.ID, beehive.RelationDependsOn))
+
+	_, _, ok := readWatermark(t, store, dep.ID)
+	assert.True(t, ok)
+	assert.Empty(t, staleIDs(t, store))
+}
+
 // A dependent that has never reconciled against a known point cannot have
 // converged, mirroring how the unsettled index treats a NULL observed_generation
 // — and it is what makes the table need no backfill.

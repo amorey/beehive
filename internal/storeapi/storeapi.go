@@ -500,6 +500,33 @@ type Store interface {
 	// kind of durable marker — undecodable rows, say — gets its own column and its own
 	// cadence rather than joining this count.
 	//
+	// Third, and independently of the claim: creating a **new depends_on** edge
+	// clears fromID's dependency_watermarks row, on the same side of the insert as
+	// the other two writes. A watermark describes how much of the store a dependent
+	// has reconciled against, and it was recorded when the dependency set was
+	// smaller, so it cannot speak for a target just added — one whose
+	// resource_version may sit below it, where DependentsListStale would read
+	// converged. An absent row already means stale, so dropping it is what puts
+	// fromID in the next stale-dependents pass. Without it, a declare whose claim is
+	// exact or zero against a target that is not about to move is found by no
+	// mechanism at all: not the stamp (the target has not moved past the claim), not
+	// a write-log scan (the target does not move), and not the staleness scan. That
+	// is the ordinary shape of an edge declared on another object's behalf, which
+	// the cross-kind edge deliberately allows.
+	//
+	// Gated on the same edge-new test as the stamp, so re-asserting a dependency set
+	// every pass costs nothing after the first, and skipped for a self-edge, which
+	// DependentsListStale excludes anyway. It costs a controller that declares from
+	// inside its own Reconcile nothing either: that pass writes the watermark again
+	// when it succeeds, from the cursor it loaded at.
+	//
+	// It leaves one window: an edge declared by *another* writer between a
+	// dependent's load and its own watermark write is cleared and then immediately
+	// re-recorded by that pass, which never saw the new target. The dependent
+	// converges when the target next moves. Closing it needs the declare to record
+	// owed work rather than to invalidate derived state — a stamp on every new edge,
+	// which costs one extra pass per edge ever created (see TODO.md).
+	//
 	// The stamp does not depend on fromID's kind having a controller. The store cannot
 	// know which kinds do, and gating would cost the caller a pre-read of fromID's kind
 	// on every declare. A kind with no reconcile loop never drains its count, and
@@ -610,6 +637,11 @@ type Store interface {
 	// past a change it never saw. That is the same unsafe shape as sampling the cursor
 	// after the reconcile rather than before, and it is the one way this mechanism can
 	// strand a dependent.
+	//
+	// This is not the only writer of the row: EdgesAdd *clears* it when it creates a
+	// new depends_on edge, because a cursor recorded over a smaller dependency set
+	// cannot speak for a target just added. See EdgesAdd for why that has to happen
+	// there, and for the interleaving it leaves open.
 	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
 
 	// DependentsListStale returns objects of the given kinds that have a depends_on
