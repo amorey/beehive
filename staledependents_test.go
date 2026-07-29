@@ -16,6 +16,8 @@ package beehive
 
 import (
 	"context"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -101,4 +103,50 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 	require.NotEmpty(t, probe.staleKinds)
 	assert.Equal(t, []GroupKind{clientTestGK}, probe.staleKinds[0],
 		"the scan is asked only for kinds that have somewhere to enqueue")
+}
+
+// staleListErrorStore fails the staleness listing, for the sweep's failure arm.
+type staleListErrorStore struct {
+	fakeStore
+	calls atomic.Int64
+}
+
+func (s *staleListErrorStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]ObjectRef, error) {
+	s.calls.Add(1)
+	return nil, errBoom
+}
+
+// TestStaleDependentsSweepWarnsAndRetriesOnListFailure pins the failure contract:
+// a sweep that cannot read gives up on this pass and says so. There is no cursor
+// to hold and nothing was drained — the listing derives its answer from current
+// state — so the next tick re-derives the same set, which is why abandoning the
+// sweep is the whole of the repair.
+func TestStaleDependentsSweepWarnsAndRetriesOnListFailure(t *testing.T) {
+	ctx := context.Background()
+	store := &staleListErrorStore{}
+	logger, logs := captureLogger(slog.LevelWarn)
+	bh := &Beehive{store: store, logger: logger}
+	kinds := []GroupKind{clientTestGK}
+
+	bh.staleDependentsSweep(ctx, kinds)
+	require.EqualValues(t, 1, store.calls.Load(), "a failed page abandons the sweep")
+	assert.Contains(t, logs.String(), "listing stale dependents failed")
+
+	bh.staleDependentsSweep(ctx, kinds)
+	assert.EqualValues(t, 2, store.calls.Load(), "and the next pass asks again from the start")
+}
+
+// TestStaleDependentsSweepIsQuietOnShutdown separates the two reasons a listing
+// fails. Stop cancels the same ctx the sweep reads on, so a pass in flight when
+// the control plane goes down fails for no reason of its own — warning there
+// would report a fault on every clean shutdown.
+func TestStaleDependentsSweepIsQuietOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	logger, logs := captureLogger(slog.LevelWarn)
+	bh := &Beehive{store: &staleListErrorStore{}, logger: logger}
+
+	bh.staleDependentsSweep(ctx, []GroupKind{clientTestGK})
+
+	assert.Empty(t, logs.String(), "a cancelled read is shutdown, not a lost pass")
 }

@@ -3015,7 +3015,9 @@ func breakConditionRowRead(t *testing.T, store *sqliteStore, objID storeapi.Obje
 
 // TestConditionAssemblyError corrupts a condition row so the read-path scan
 // fails, exercising the conditions-assembly error branches in ObjectsGet (via
-// loadConditions) and ObjectsList (via conditionsByIDs).
+// loadConditions), ObjectsList (via conditionsByIDs) and ObjectsGetForReconcile,
+// which attaches conditions like ObjectsGet and must surface the failure rather
+// than hand a reconcile an object missing them.
 func TestConditionAssemblyError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3028,6 +3030,9 @@ func TestConditionAssemblyError(t *testing.T) {
 
 	_, err = store.ObjectsList(ctx, testGK)
 	require.Error(t, err, "ObjectsList surfaces a conditions scan error")
+
+	_, err = store.ObjectsGetForReconcile(ctx, obj.ID)
+	require.Error(t, err, "ObjectsGetForReconcile surfaces a conditions scan error")
 }
 
 // TestConditionResourceVersionError drops the resource_version sequence so the
@@ -4043,4 +4048,14 @@ func TestObjectsGetForReconcileAttachesConditions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, load.Object.Conditions, 1)
 	assert.Equal(t, "Ready", load.Object.Conditions[0].Type)
+}
+
+// The staleness scan surfaces a failed query rather than reporting an empty
+// listing, which the sweep would read as "nothing is owed".
+func TestDependentsListStaleQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.DependentsListStale(context.Background(), []beehive.GroupKind{testGK}, 0, 10)
+	require.Error(t, err)
 }
