@@ -84,9 +84,9 @@ the leftover failure the harmless way: a stamp with no edge is one spurious owed
 wake that drains back to 0, while an edge with no stamp is invisible forever. The
 stamp's own `WHERE … NOT EXISTS` is the **only** edge-new test (a probe down the
 `WITHOUT ROWID` primary key, so no pre-read), shared verbatim with the watermark
-clear via the `edgeIsNew` const so the two cannot drift. The rejection sits on the
-same side of the insert for the same reason. `EdgesAdd` self-wraps in `Within`, so
-endpoint check, rejection, stamp, clear and insert are one atomic unit however it
+clear via the `edgeIsNew` const so the two cannot drift. Every other fallible step
+sits on the same side of the insert for the same reason. `EdgesAdd` self-wraps in
+`Within`, so endpoint check, stamp, clear and insert are one atomic unit however it
 is called.
 
 **The stamp lands on `fromID`'s row and is routed by `fromID`'s kind.** The edge is

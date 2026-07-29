@@ -1592,8 +1592,11 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		// created. Self-edges are skipped, as every scan skips them: an object's own
 		// pass always reads its current self, so there is nothing a self-wake could
 		// deliver.
+		// One predicate for both writes below, so a future edit to either gate cannot
+		// silently split the stamp from the clear.
+		newDependency := relation == storeapi.RelationDependsOn && fromID != toID
 		var stamped bool
-		if relation == storeapi.RelationDependsOn && fromID != toID {
+		if newDependency {
 			res, err := s.conn(ctx).ExecContext(ctx, `
 				UPDATE objects SET reconcile_owed = reconcile_owed + 1
 				WHERE id = ? AND `+edgeIsNew,
@@ -1623,7 +1626,7 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		// set every pass still costs nothing after the first. Self-edges are skipped to
 		// match DependentsListStale, which excludes them: clearing for one would drop a
 		// watermark no scan will ever re-derive from that edge.
-		if relation == storeapi.RelationDependsOn && fromID != toID {
+		if newDependency {
 			if _, err := s.conn(ctx).ExecContext(ctx, `
 				DELETE FROM dependency_watermarks
 				 WHERE object_id = ? AND `+edgeIsNew,

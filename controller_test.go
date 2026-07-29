@@ -416,8 +416,8 @@ type declareFixture struct {
 	depGK       GroupKind
 	dep, target *Object[tSpec, tStatus]
 	// witness is a second dependent of dep's kind whose edge to the target exists
-	// from the start, so the "a rejected declaration leaves no edge" assertions can
-	// name what the edge listing should still contain.
+	// from the start, so an assertion that a declaration left no edge can name what
+	// the listing should still contain rather than merely expecting it empty.
 	witness *Object[tSpec, tStatus]
 }
 
@@ -452,15 +452,13 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 	return f
 }
 
-// moveTarget changes the target and returns the version it held before, i.e. the
-// one a decision taken before the change was based on.
-func (f *declareFixture) moveTarget(t *testing.T) int64 {
+// moveTarget changes the target, so a declaration that follows is one whose read
+// of it predates the change.
+func (f *declareFixture) moveTarget(t *testing.T) {
 	t.Helper()
-	before := f.target.ResourceVersion
 	_, err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	return before
 }
 
 // owed returns the dependent kind's owed-wake listing — what the owed-pass tick

@@ -203,7 +203,6 @@ invariant rather than anyone's only route to a wake.
   and not this mechanism's doing. Test:
   `TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
 - **Tests:** `TestRefsAddClearsTheDependentsWatermark`,
-  `TestRefsAddClearsTheWatermarkOnAnExactClaim`,
   `TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge`,
   `TestRefsAddKeepsTheWatermarkOnAnOwnerEdge`,
   `TestRefsAddKeepsTheWatermarkOnASelfEdge`,
