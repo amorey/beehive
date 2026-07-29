@@ -4059,3 +4059,48 @@ func TestDependentsListStaleQueryError(t *testing.T) {
 	_, err := store.DependentsListStale(context.Background(), []beehive.GroupKind{testGK}, 0, 10)
 	require.Error(t, err)
 }
+
+// The write log's high-water mark is the maximum over live objects rows, not the
+// version counter behind them. The two differ exactly where it matters: the event
+// log draws from the same counter, so a mark taken from the counter would move for
+// a write no ObjectWritesListSince consumer can ever be shown.
+func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	before := cursorNow(t, store)
+	require.Equal(t, obj.ResourceVersion, before, "the mark is the newest object write")
+
+	_, err := store.EventsRecord(ctx, testGK, obj.ID, storeapi.Event{
+		Type: "Normal", Reason: "Probed",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, before, cursorNow(t, store), "an event write is not an object write")
+	writes, err := store.ObjectWritesListSince(ctx, before, 10)
+	require.NoError(t, err)
+	assert.Empty(t, writes, "and the listing agrees: nothing above the mark")
+}
+
+// An empty store has no objects to take a maximum over, which reads as 0 — the
+// same value a consumer starting from scratch would use, so there is nothing to
+// special-case.
+func TestObjectWritesMaxVersionOnAnEmptyStore(t *testing.T) {
+	assert.Zero(t, cursorNow(t, newRawStore(t)))
+}
+
+// The mark is not monotonic: removing the highest-versioned row lowers it. That is
+// sound for both of its uses — nothing exists at the versions it steps back over,
+// so a seeded watermark cannot skip a live write, and a poller that re-reads
+// because the mark moved finds exactly the delete that moved it.
+func TestObjectWritesMaxVersionFallsWhenTheNewestRowGoes(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	first := newRefObject(t, store)
+	second := newRefObject(t, store)
+	require.Equal(t, second.ResourceVersion, cursorNow(t, store))
+
+	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
+
+	assert.Equal(t, first.ResourceVersion, cursorNow(t, store))
+}

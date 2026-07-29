@@ -198,17 +198,6 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	return rv, err
 }
 
-// currentResourceVersion reads the global write cursor without advancing it. Read
-// in the same transaction as a snapshot, it is the exact resource version that
-// snapshot reflects: every write committed at or below it is included, every
-// later write is not.
-func currentResourceVersion(ctx context.Context, c dbtx) (int64, error) {
-	var rv int64
-	err := c.QueryRowContext(ctx,
-		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
-	return rv, err
-}
-
 // scanWritten scans a mutator's RETURNING row and assembles its conditions.
 // Mutators share it, so the returned object carries the full conditions set
 // regardless of which column the write touched, matching Get/List.
@@ -633,12 +622,22 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// ObjectWritesMaxVersion reads the global write cursor without advancing it: every
-// write committed before the call is at or below it. A consumer seeding a
-// watermark takes this instead of starting at zero, which would replay the whole
-// table.
+// ObjectWritesMaxVersion reads the high-water mark of the object write log: the
+// highest resource_version any live objects row holds. Covered by idx_objects_rv,
+// so it is an index-max lookup rather than a scan, and NULL (an empty store) reads
+// as 0.
+//
+// It reads the objects rows rather than resource_version_seq, which is the same
+// number only when nothing else draws from that sequence — and the event log does.
+// A consumer of this pair (this and ObjectWritesListSince, which selects objects)
+// must not see the cursor move for a write it can never be shown: an EventsRecord
+// bumping the sequence would otherwise read as "something changed", and a
+// controller recording an event per reconcile would make that permanent.
 func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
-	return currentResourceVersion(ctx, s.conn(ctx))
+	var rv sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT MAX(resource_version) FROM objects`).Scan(&rv)
+	return rv.Int64, err
 }
 
 // ObjectWritesListSince returns the writes above afterRV: live rows, in cursor

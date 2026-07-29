@@ -649,9 +649,18 @@ type Store interface {
 	// that was.
 	ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
 
-	// ObjectWritesMaxVersion returns the store-wide write cursor as of now: every
-	// write committed before the call is at or below it. A consumer that wants to
-	// start from "changes from here on" seeds its watermark with this rather than
-	// replaying the whole log from zero.
+	// ObjectWritesMaxVersion returns the high-water mark of the object write log as of
+	// now: every object write committed before the call is at or below it, and
+	// ObjectWritesListSince returns nothing above it. A consumer that wants to start
+	// from "changes from here on" seeds its watermark with this rather than replaying
+	// the whole log from zero, and one polling for change compares against it.
+	//
+	// It is the maximum over live rows, not the version counter, so it is *not*
+	// monotonic: deleting the highest-versioned row lowers it. That is sound for both
+	// uses — nothing exists at the versions it steps back over, so a seed cannot skip
+	// a live write, and a poller that re-reads because the mark moved backwards finds
+	// exactly the delete that moved it. It also means a write to some *other* log
+	// drawing from the same counter (events do) cannot masquerade here as an object
+	// change.
 	ObjectWritesMaxVersion(ctx context.Context) (int64, error)
 }

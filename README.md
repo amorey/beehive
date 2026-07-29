@@ -119,9 +119,10 @@ Every driver is one of these. They run on separate intervals because they are se
 | full pass | **every** object of the kind, converged or not | the object count | `WithFullPassInterval`, default 0 (off) |
 | GC sweep | deletion-pending rows, plus event-log retention | rows being deleted | `WithGCInterval`, default 30s |
 | dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | 1s, fixed |
+| stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | 60s, fixed |
 | watch poll | current state, for each live `Client` watch | one cheap read per subscriber per tick; a full listing only when something changed | 1s, fixed |
 
-**Only two of the five are configurable.** The other three are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding or what changed rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
+**Only two of the six are configurable.** The other four are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding, by what changed, or by the dependency graph rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
 
 The full pass is opt-in because it is the only driver whose cost is unbounded by outstanding work. It is also the only one that reaches an object the store records nothing about: state that belongs to a process and a restart invalidated, such as a liveness condition, which reads as "verifying" until a controller in *this* process rewrites it. Set it well above the 30s owed pass, which it subsumes.
 
@@ -438,7 +439,7 @@ Looking the slug up is **atomic with the delete** — the slug goes into the sto
 Both are **polls, not subscriptions.** Each remembers the `resource_version` it last reported to you and, on each watch-poll tick (1s), sends the difference: a new object is `Added`, a moved version is `Modified`, a row that has gone is `Deleted` and carries its last known state. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
 - **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all.
-- **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the store-wide write cursor is one scalar query, and only a cursor that moved — or an id set that shrank, since deletes draw no version — pays for the full listing.
+- **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the object write log's high-water mark is one indexed query, and only a mark that moved — or an object that vanished, since deletes draw no version — pays for the full listing. Writing to the event log does not move it, so an object watch stays quiet through a controller that records events on every pass.
 
 A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error instead of ending quietly under a subscriber with no way to notice.
 

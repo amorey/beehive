@@ -850,3 +850,26 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	waitForDeletions(t, w, obj.ID)
 }
+
+// listFailStore fails the sweep's own listing, before any row is reached.
+type listFailStore struct {
+	collectFakeStore
+}
+
+func (s *listFailStore) DeletionRequestsList(context.Context) ([]ObjectRef, error) {
+	return nil, errBoom
+}
+
+// TestGCSweepLogsListFailureWithoutALogger pins that the sweep's two log sites go
+// through the nil-safe accessor. A Beehive built without WithLogger has no logger
+// until Start resolves one, and the sweep is reachable before that — from a test,
+// or from any caller driving a pass by hand — so reaching for the field directly
+// turns a store error into a nil-pointer panic on the error path, which is the one
+// path least likely to be exercised before it matters.
+func TestGCSweepLogsListFailureWithoutALogger(t *testing.T) {
+	bh, err := New(&listFailStore{})
+	require.NoError(t, err)
+	require.Nil(t, bh.logger, "New leaves the logger unresolved; Start is what fills it in")
+
+	assert.NotPanics(t, func() { bh.deletionPendingSweep(context.Background()) })
+}

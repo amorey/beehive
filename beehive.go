@@ -240,7 +240,7 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 	rows, err := bh.store.DeletionRequestsList(ctx)
 	if err != nil {
-		bh.logger.Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
+		bh.log().Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return
 	}
 	for _, row := range rows {
@@ -250,7 +250,7 @@ func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 		// RESTRICT-block its owner's delete forever. ErrNotFound is the benign
 		// already-collected race and stays quiet.
 		if err := bh.deletionAdvance(ctx, row.GroupKind(), row.ID); err != nil && !errors.Is(err, ErrNotFound) {
-			bh.logger.Warn("gc sweep: collecting object failed; retry next sweep",
+			bh.log().Warn("gc sweep: collecting object failed; retry next sweep",
 				"group", row.Group, "kind", row.Kind, "id", row.ID, "err", err)
 		}
 	}

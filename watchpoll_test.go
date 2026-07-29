@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -170,28 +171,23 @@ func TestWatchSingleObjectIsKindScoped(t *testing.T) {
 	}
 }
 
-// SchedulesWatch is a gauge, so it repeats nothing: the same value on two
+// SchedulesWatch is a gauge, so it repeats nothing: the same state on two
 // consecutive polls is one delivery. A subscriber reads it to learn when the next
-// requeue is, and a stream that re-sent an unchanged time every tick would be a
+// requeue is, and a stream that re-sent an unchanged schedule every tick would be a
 // heartbeat rather than a schedule.
+//
+// An object watch over the same Beehive is the clock. It polls the shared interval
+// and signals the store on every tick, so a token proves another poll came round —
+// which is what lets this assert on deliveries that must *not* happen without
+// timing anything itself.
 func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	store, bh, client, _ := watchFixture(t)
 	r, ok := bh.reconcilerFor(clientTestGK)
 	require.True(t, ok)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-
-	// A queued id reports time.Now() on every poll, so its schedule differs every
-	// tick. That makes a second watch a usable clock: each value it delivers proves
-	// another poll of the shared interval has come round.
-	r.work.add(2)
-	clock, err := client.SchedulesWatch(ctx, 2)
+	_, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	ch, err := client.SchedulesWatch(ctx, 1)
@@ -200,20 +196,33 @@ func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 	// The zero Schedule is a real gauge value, not an absence, so it is delivered.
 	assert.True(t, recv(t, ch).NextRequeueAt.IsZero(), "an unscheduled id reads as the zero Schedule")
 
-	// Three more polls pass with id 1 still unscheduled. Nothing may arrive for it,
-	// though the clock keeps ticking throughout.
-	for range 3 {
-		recv(t, clock)
-	}
+	// Three more polls pass with the id still unscheduled. Nothing may arrive.
+	waitClosed(t, chanAfter(store.polled, 3), "three polls over the unscheduled id")
 	select {
-	case s := <-ch:
-		t.Fatalf("an unchanged schedule must not be re-sent, got %+v", s)
+	case sc := <-ch:
+		t.Fatalf("an unchanged schedule must not be re-sent, got %+v", sc)
 	default:
 	}
 
-	// A real change is the next thing the subscriber sees.
-	r.work.addAfter(1, testTimeout)
-	assert.False(t, recv(t, ch).NextRequeueAt.IsZero(), "the next delivery is the change, not a repeat")
+	// Queued for immediate dispatch: due now, reported once. The queue answers this
+	// state with the time the id became due rather than with time.Now(), which is
+	// what keeps "still queued" a repeated value instead of a moving one — otherwise
+	// an id waiting behind a slow reconcile emits on every tick forever.
+	r.work.add(1)
+	due := recv(t, ch)
+	require.False(t, due.NextRequeueAt.IsZero(), "a queued id carries a due-now time")
+	assert.False(t, due.NextRequeueAt.After(time.Now()), "due-now is not in the future")
+
+	waitClosed(t, chanAfter(store.polled, 3), "three polls while it sits queued")
+	select {
+	case sc := <-ch:
+		t.Fatalf("a queued id must not re-report on every tick, got %+v", sc)
+	default:
+	}
+
+	// Dispatch clears the queued state, which is a change like any other.
+	drainQueue(r.work)
+	assert.True(t, recv(t, ch).NextRequeueAt.IsZero(), "dispatch emits the unscheduled zero")
 }
 
 // pollProbeStore signals each time the watch surface reads, so a test can wait for
@@ -222,8 +231,8 @@ func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 type pollProbeStore struct {
 	Store
 	// polled fires once per object-watch tick. It hangs off the store-wide cursor
-	// read because that is the one call every tick makes: the listings past it are
-	// exactly what a quiet tick skips.
+	// read because that is the one call every tick makes: the write-log probe and the
+	// listings past it are exactly what a quiet tick skips.
 	polled chan struct{}
 	// listed fires after a listing returns, so a test can cancel knowing the read
 	// already succeeded and the goroutine is on its way to the send.
@@ -584,4 +593,120 @@ func TestEventsWatchAbandonsASendOnCancel(t *testing.T) {
 	cancel()
 
 	waitClosed(t, closedWhenDrained(ch), "the stream to close on cancellation")
+}
+
+// TestWatchStaysQuietThroughEventWrites pins what the quiet-tick gate asks. The
+// event log draws its resource_version from the same sequence the objects do, so a
+// gate that compared the sequence itself would be defeated by a single
+// EventsRecord anywhere in the store — and a controller that records an event per
+// reconcile, the shape examples/events encourages, would defeat it permanently,
+// turning every subscriber into a full blob-bearing listing per tick.
+func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, cc := watchFixture(t)
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Added, recv(t, ch).Type, "the create is reported once")
+	drainProbe(store.listed)
+
+	// An event write bumps the shared sequence and no objects row.
+	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probed"}))
+
+	waitClosed(t, chanAfter(store.polled, 3), "three polls after the event write")
+	select {
+	case <-store.listed:
+		t.Fatal("an event write must not make the object watch pay for a listing")
+	default:
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("an event write is not an object change, got %+v", ev)
+	default:
+	}
+}
+
+// TestWatchSingleObjectFindsADeleteWithoutListingTheKind pins the cheap half of a
+// single-object poll. The watch's liveness probe is scoped to the one id it
+// tracks, not to the kind: asking for every id of the kind would make the cheap
+// half the expensive half and scale it with the kind rather than with the watch.
+//
+// The removal under test draws no version and does not move the write log's
+// high-water mark — another object was written after the deletion mark — so the
+// quiet path is the only thing that can notice it. The kind-wide listing is wired
+// to fail throughout, so a probe that reached for it could not answer at all.
+func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The fixture starts nothing, so every step below is the test's own: no sweeper
+	// and no reconcile loop can collect the row out from under the ordering.
+	store, bh, client, _ := watchFixture(t)
+	store.listIDsErr.Store(true)
+	watched, err := client.Create(ctx, cSpec{Val: "watched"})
+	require.NoError(t, err)
+	newer, err := client.Create(ctx, cSpec{Val: "newer"})
+	require.NoError(t, err)
+
+	ch, err := client.ObjectsWatch(ctx, watched.ID)
+	require.NoError(t, err)
+	require.Equal(t, Added, recv(t, ch).Type)
+
+	// The deletion mark is an ordinary write, so it arrives as a Modified.
+	require.NoError(t, client.Delete(ctx, watched.ID))
+	require.Equal(t, Modified, recv(t, ch).Type)
+
+	// Put another object's write above that mark, and let the stream take it in, so
+	// the collect below cannot move the high-water mark it compares against.
+	_, err = client.Update(ctx, newer.ID, cSpec{Val: "newest"})
+	require.NoError(t, err)
+	// Wait for a *quiet* tick, not merely for ticks. The liveness probe only runs on
+	// a tick that found the high-water mark unmoved, so a token here proves the
+	// cursor has caught up to that write — and until it has, the collect below would
+	// be found by an ordinary listing rather than by the probe.
+	drainProbe(store.metaRead)
+	waitClosed(t, chanAfter(store.metaRead, 2), "a quiet poll after the newer write")
+
+	gone, err := bh.gcCollect(ctx, watched.ID)
+	require.NoError(t, err)
+	require.True(t, gone, "the row is finalizer-free, so the collect removes it")
+
+	ev := recv(t, ch)
+	assert.Equal(t, Deleted, ev.Type)
+	assert.Equal(t, watched.ID, ev.Object.ID)
+	assert.Equal(t, "watched", ev.Object.Spec.Val, "the tombstone carries the last known state")
+}
+
+// The liveness probe can fail like any other read, and costs the same one tick:
+// ending the stream would leave the subscriber with no way to learn it should
+// resubscribe.
+func TestWatchSingleObjectSurvivesALivenessProbeFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, bh, client, _ := watchFixture(t)
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh.logger = logger
+
+	obj, err := client.Create(ctx, cSpec{Val: "a"})
+	require.NoError(t, err)
+	ch, err := client.ObjectsWatch(ctx, obj.ID)
+	require.NoError(t, err)
+	require.Equal(t, Added, recv(t, ch).Type)
+
+	// With the object reported and no further writes, every tick from here consults
+	// the liveness probe — which now fails.
+	store.metaErr.Store(true)
+	waitClosed(t, chanAfter(store.polled, 2), "polls while the liveness probe fails")
+	store.metaErr.Store(false)
+
+	// A real change proves the stream is still live and still diffing.
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
+	assert.Contains(t, buf.String(), "watch poll failed")
 }

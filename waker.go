@@ -72,8 +72,9 @@ func (dw *waker) run(ctx context.Context) {
 	})
 }
 
-// seed takes the store's current cursor as the starting watermark, so the first scan
-// reports changes from startup rather than all history. It reports whether it got
+// seed takes the object write log's current high-water mark as the starting
+// watermark, so the first scan reports changes from startup rather than all
+// history. It reports whether it got
 // one. On failure the waker stays unseeded and the next tick tries again, taking the
 // cursor as of *then* — so a change committed in between is below the watermark and is
 // never scanned. The reconciler's startup pass covers that only for an object the

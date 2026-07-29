@@ -86,9 +86,13 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	return c.objectStream(ctx, func(ctx context.Context) ([]*RawObject, error) {
-		return c.bh.store.ObjectsList(ctx, c.gk)
-	}), nil
+	return c.objectStream(ctx,
+		func(ctx context.Context) ([]*RawObject, error) {
+			return c.bh.store.ObjectsList(ctx, c.gk)
+		},
+		func(ctx context.Context) ([]ObjectID, error) {
+			return c.bh.store.ObjectsListIDs(ctx, c.gk)
+		}), nil
 }
 
 // ObjectsWatch streams changes to the single object id. It polls the same way
@@ -99,19 +103,48 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	return c.objectStream(ctx, func(ctx context.Context) ([]*RawObject, error) {
-		raw, err := c.bh.store.ObjectsGet(ctx, id)
-		if errors.Is(err, ErrNotFound) {
-			return nil, nil // not there (yet): an empty listing, not an error
-		}
-		if err != nil {
-			return nil, err
-		}
-		if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
-			return nil, nil // foreign id: invisible through this kind's client, as Get is
-		}
-		return []*RawObject{raw}, nil
-	}), nil
+	return c.objectStream(ctx,
+		func(ctx context.Context) ([]*RawObject, error) {
+			raw, err := c.scopedRow(ctx, id, c.bh.store.ObjectsGet)
+			if raw == nil || err != nil {
+				return nil, err
+			}
+			return []*RawObject{raw}, nil
+		},
+		// The liveness probe is scoped to this one id rather than listing the kind:
+		// this stream can only ever have that id in seen, so asking for every id of
+		// the kind would make the cheap half of the poll the expensive half, and scale
+		// it with the kind rather than with the watch.
+		func(ctx context.Context) ([]ObjectID, error) {
+			raw, err := c.scopedRow(ctx, id, c.bh.store.ObjectsGetMeta)
+			if raw == nil || err != nil {
+				return nil, err
+			}
+			return []ObjectID{raw.ID}, nil
+		}), nil
+}
+
+// scopedRow reads id through read and folds both "not visible through this kind's
+// client" cases into (nil, nil): a missing id, so an id that does not exist yet
+// streams nothing until it is created, and a foreign one, as invisible here as it
+// is through Get. read is a parameter so the same fold serves the blob-bearing
+// watch read and the blob-free liveness probe.
+func (c *clientImpl[Spec, Status]) scopedRow(
+	ctx context.Context,
+	id ObjectID,
+	read func(context.Context, ObjectID) (*RawObject, error),
+) (*RawObject, error) {
+	raw, err := read(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+		return nil, nil
+	}
+	return raw, nil
 }
 
 // objectStream is the poll-and-diff engine behind both object watches. It remembers
@@ -129,8 +162,15 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 // cursor that has not moved proves no row was created or modified anywhere. The one
 // thing it cannot show is a delete, since a removed row draws no version. So a tick
 // reads the scalar cursor, and pays for the listing that carries specs and statuses
-// only when that moved or the kind's id set shrank. In a quiet system a subscriber
-// costs one scalar read plus one id listing per tick.
+// only when that moved or the ids it tracks have shrunk. In a quiet system a
+// subscriber costs one scalar read plus one blob-free liveness read per tick.
+//
+// The cursor is the object write log's high-water mark, not the version counter
+// behind it, and the difference decides whether this optimization survives contact
+// with a real workload: the counter is shared with the event log, so a single
+// EventsRecord anywhere in the store would move it while touching no objects row —
+// and a controller that records an event per reconcile, the shape the events example
+// encourages, would defeat it permanently.
 //
 // A Deleted change carries the object's last known state, because the row is gone by
 // the time the poll notices and there is nothing left to read. That body can be one
@@ -143,6 +183,7 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
 	list func(context.Context) ([]*RawObject, error),
+	live func(context.Context) ([]ObjectID, error),
 ) <-chan ObjectChange[Spec, Status] {
 	out := make(chan ObjectChange[Spec, Status])
 	// The migrator is invariant for the stream's lifetime; resolve it once rather
@@ -159,11 +200,11 @@ func (c *clientImpl[Spec, Status]) objectStream(
 				return c.pollFailed(ctx, "watch", err)
 			}
 			if at == cursor {
-				// No write anywhere in the store since the last poll, so nothing was
-				// created or modified. A delete is still possible and draws no version,
-				// so check the id set — one blob-free indexed listing — and skip the
-				// expensive read unless something actually vanished.
-				gone, err := c.deletedSince(ctx, seen)
+				// Nothing was created or modified. A delete is still possible and draws
+				// no version, so check that what this stream tracks is still there — one
+				// blob-free read — and skip the expensive listing unless something
+				// actually vanished.
+				gone, err := c.deletedSince(ctx, seen, live)
 				if err != nil {
 					return c.pollFailed(ctx, "watch", err)
 				}
@@ -219,25 +260,30 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	return out
 }
 
-// deletedSince reports whether any object this stream has reported is no longer
-// in the kind. It is the cheap half of the poll: ObjectsListIDs is one indexed,
-// blob-free column read, where the listing it gates carries every row's spec and
-// status. Only ever consulted when the write cursor has not moved, so a create
-// cannot be in flight — a shrunk id set means a delete.
-func (c *clientImpl[Spec, Status]) deletedSince(ctx context.Context, seen map[ObjectID]tracked[Spec, Status]) (bool, error) {
+// deletedSince reports whether any object this stream has reported is gone. It is
+// the cheap half of the poll: live is a blob-free read scoped to what the stream
+// tracks — the kind's id column for a list watch, one row for a single-object one —
+// where the listing it gates carries every row's spec and status. Only ever
+// consulted when no object write has landed, so a create cannot be in flight and a
+// shrunk id set means a delete.
+func (c *clientImpl[Spec, Status]) deletedSince(
+	ctx context.Context,
+	seen map[ObjectID]tracked[Spec, Status],
+	live func(context.Context) ([]ObjectID, error),
+) (bool, error) {
 	if len(seen) == 0 {
 		return false, nil
 	}
-	ids, err := c.bh.store.ObjectsListIDs(ctx, c.gk)
+	ids, err := live(ctx)
 	if err != nil {
 		return false, err
 	}
-	live := make(map[ObjectID]struct{}, len(ids))
+	stillThere := make(map[ObjectID]struct{}, len(ids))
 	for _, id := range ids {
-		live[id] = struct{}{}
+		stillThere[id] = struct{}{}
 	}
 	for id := range seen {
-		if _, ok := live[id]; !ok {
+		if _, ok := stillThere[id]; !ok {
 			return true, nil
 		}
 	}
@@ -287,18 +333,27 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 			if err != nil {
 				return c.pollFailed(ctx, "event watch", err, "id", id)
 			}
+			// Rebuilt per tick rather than added to, so the map is bounded by what the
+			// query returns instead of by every run the stream has ever seen: retention
+			// physically deletes runs, and their ids would otherwise be held for the
+			// life of the stream. A run that leaves the window and comes back must have
+			// been extended to get there, so its version moved and it is owed a
+			// delivery anyway.
+			next := make(map[EventID]int64, len(runs))
 			// EventsList is newest-first; deliver oldest-first so the timeline builds
 			// in order, as a reader of an append-only log expects.
 			for i := len(runs) - 1; i >= 0; i-- {
 				run := runs[i]
-				if prev, ok := seen[run.ID]; ok && prev == run.ResourceVersion {
+				prev, known := seen[run.ID]
+				next[run.ID] = run.ResourceVersion
+				if known && prev == run.ResourceVersion {
 					continue
 				}
-				seen[run.ID] = run.ResourceVersion
 				if !sendOrDone(ctx, out, eventFromRaw(run)) {
 					return false
 				}
 			}
+			seen = next
 			return true
 		})
 	}()

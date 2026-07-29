@@ -86,9 +86,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   no owed-work listing sees.
 - **Client watches poll and diff** (`watchpoll.go`). Each stream remembers the
   `resource_version` it last reported and emits `Added`/`Modified`/`Deleted` from the
-  comparison. A quiet tick costs one scalar cursor read plus one id listing; the
-  listing that carries specs and statuses is paid only when the cursor moved or the
-  id set shrank. Deletes are found by absence, since a deleted row draws no version.
+  comparison. A quiet tick costs one high-water-mark read plus one blob-free liveness
+  read (the kind's ids for a list watch, one row for a single-object one); the listing
+  that carries specs and statuses is paid only when the mark moved or something it
+  tracks vanished. Deletes are found by absence, since a deleted row draws no version.
+  `ObjectWritesMaxVersion` is the maximum over live `objects` rows rather than the
+  `resource_version_seq` counter, because the event log draws from that counter too —
+  a mark taken from it would move for writes no consumer of this pair can be shown.
 - **`Spec`/`Status` separation is structural.** The user-facing `Client` has no
   status-write path. Only `Controller`/`ControllerClient` does.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on its
