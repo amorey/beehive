@@ -16,54 +16,33 @@ package beehive
 
 import "context"
 
-// pendingWakes collects ref targets to requeue after Reconcile returns. A
-// ControllerClient call that frees a target (DependenciesDelete) registers it here;
-// typedController.reconcile drains it once Reconcile returns (the freeing write has
-// already committed). It rides on the context so the long-lived, shared
-// ControllerClient holds no per-reconcile state, and a single reconcile's Reconcile
-// runs on one goroutine, so the slice needs no locking.
-type pendingWakes struct {
-	targets []ObjectRef
-}
-
-type pendingWakesKey struct{}
-
-// withPendingWakes attaches a fresh collector to ctx for one reconcile.
-func withPendingWakes(ctx context.Context, w *pendingWakes) context.Context {
-	return context.WithValue(ctx, pendingWakesKey{}, w)
-}
-
-// pendingWakesFrom returns the collector for the current reconcile, or nil when
-// called outside one (e.g. a ControllerClient used directly in a test).
-func pendingWakesFrom(ctx context.Context) *pendingWakes {
-	w, _ := ctx.Value(pendingWakesKey{}).(*pendingWakes)
-	return w
-}
-
-// gcCollect is the garbage-collection step for a single object, run after its
-// controller's Reconcile returns (see typedController.reconcile) and on the global
-// GC sweep (see deletionPendingSweep). It runs in its own transaction. It is a no-op
-// unless the object is finalizing.
+// gcCollect is the garbage-collection step for one object. It runs after that
+// object's Reconcile returns (see typedController.reconcile) and on the global sweep
+// (see deletionPendingSweep), in its own transaction, and does nothing unless the
+// object is finalizing.
 //
-// Two things happen for a finalizing object:
+// For a finalizing object, two things happen:
 //
-//   - Cascade: every object that owns_by this one is itself marked for deletion
-//     and requeued, so deleting an owner tears its children down with it.
-//   - Physical delete: once the object has no finalizers left AND nothing still
-//     references it, its row is removed. The edges table's ON DELETE RESTRICT
-//     makes that ordering mandatory — an owner cannot be removed while a child
-//     still points at it — and ON DELETE CASCADE on the child side means
-//     removing the last child drops the edge that was blocking the owner. The
-//     freed owner is re-examined by the global GC sweep.
+//   - Cascade: every object owned by this one is marked for deletion too, so
+//     deleting an owner tears its children down with it.
+//   - Delete: once the object has no finalizers left and nothing still references
+//     it, the row is removed. ON DELETE RESTRICT on the edges table makes that
+//     order mandatory, since an owner cannot be removed while a child still points
+//     at it, and ON DELETE CASCADE on the child side means removing the last child
+//     drops the edge that was blocking the owner. The GC sweep picks the freed
+//     owner up next time round.
 //
-// The whole step runs in one transaction so the cascade writes and the delete
-// commit together; the watch events they emit publish only on commit.
+// Both happen in one transaction, so the cascade writes and the delete commit
+// together.
+//
+// Nothing is woken here — neither the cascaded children nor the targets a removed row
+// was holding open. All of them are deletion-pending rows, so the sweeper's own
+// listing finds them on its next tick. That is the only collector a client-only kind
+// has anyway, and it is guaranteed, because WithGCInterval cannot be disabled. Waking
+// them here would save one tick of latency on a multi-level cascade, at the cost of
+// running recursive deletes on the caller's goroutine and ctx, where a caller that
+// cancels right after its commit could abandon the cascade half-done.
 func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
-	// toWake accumulates objects to requeue after the transaction commits: the
-	// cascaded children, plus (when the row is removed) the targets it was holding
-	// open. Waking post-commit means a rollback never leaves a phantom enqueue,
-	// matching the dependency waker's post-commit pattern.
-	var toWake []ObjectRef
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
 		obj, err := bh.store.ObjectsGetMeta(ctx, id)
 		if err != nil {
@@ -74,13 +53,12 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 			return nil
 		}
 
-		// Cascade deletion to owned children, requeuing them all (see
-		// DeletionRequestsCreateFromOwner for the steady-state single-read path).
-		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
-		if err != nil {
+		// Cascade deletion to owned children (see DeletionRequestsCreateFromOwner for
+		// the steady-state single-read path). Marking them is all that is needed: the
+		// mark is what puts them in the sweeper's listing.
+		if _, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id); err != nil {
 			return err
 		}
-		toWake = append(toWake, children...)
 
 		// Finalizers still pending: the controller hasn't finished cleanup.
 		if len(obj.Finalizers) > 0 {
@@ -94,7 +72,8 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 			return err
 		}
 		// Still referenced (owned children or live dependents): RESTRICT forbids the
-		// delete. Leave the row; a referrer's own removal will wake us (below).
+		// delete. Leave the row; once the referrer is gone a later sweep gets here
+		// again and the delete succeeds.
 		referenced, err := bh.store.EdgesHasIncoming(ctx, id)
 		if err != nil {
 			return err
@@ -104,80 +83,17 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Removing this row drops its outgoing edges (ON DELETE CASCADE), which may
-		// unblock a deletion-pending target RESTRICT was holding. Capture those
-		// targets before the delete so we can wake them — the event-driven path that
-		// lets a cascade finish without waiting on the next GC sweep.
-		referents, err := bh.store.EdgesListOutgoing(ctx, id)
-		if err != nil {
-			return err
-		}
+		// unblock a deletion-pending target RESTRICT was holding. That target is
+		// already in the sweeper's listing — it is deletion-pending, which is how it
+		// got here — so the next tick retries it and finds the block gone.
 		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
 			return err
 		}
-		toWake = append(toWake, referents...)
 		deleted = true
 		return nil
 	})
 	if err != nil {
 		return false, err
 	}
-	for _, w := range toWake {
-		bh.gcAdvance(ctx, w.GroupKind(), w.ID)
-	}
 	return deleted, nil
-}
-
-// gcAdvance moves (gk, id) forward toward collection after a deletion-related
-// change, once the caller's transaction (if any) has committed.
-//
-// The post-commit hook is what makes it safe to call from inside a transaction —
-// Client.Delete nested in a controller's ControllerClient.Within, or collect's own
-// toWake loop when collect itself is nested. Running inline there would wake a
-// reconciler for an uncommitted deletion: a phantom wake if the caller rolls back,
-// and otherwise a controller reading a row whose tombstone is not visible yet.
-// Deferring costs nothing when there is no transaction: AfterCommit runs the hook
-// inline.
-//
-// Collection stays correct across the deferral because collect is level-triggered:
-// it re-reads DeletionRequestedAt, so if the caller rolled the deletion back there
-// is simply nothing to collect.
-//
-// Now that advanceGCNow only requeues, this is mechanically what wakeAfterCommit
-// does. The two are kept as separate names because they answer separate questions —
-// a spec write owes the object a reconcile, a deletion owes it a collect — and
-// advanceGCNow is where the second one's answer changes if it ever grows past a
-// requeue (a durable stamp, say, as reconcile_owed is for dependency wakes).
-func (bh *Beehive) gcAdvance(ctx context.Context, gk GroupKind, id ObjectID) {
-	bh.store.AfterCommit(ctx, func(context.Context) {
-		bh.gcAdvanceNow(gk, id)
-	})
-}
-
-// wakeAfterCommit schedules a reconciler wake for gk/id once the ambient
-// transaction commits and its watch events are out — the wake sibling of
-// gcAdvance, kept non-generic here rather than on the typed client. Registering
-// on the store rather than enqueuing after Within is what keeps the ordering
-// under nesting: a caller may have wrapped the write in ControllerClient.Within,
-// and the nested Within returns while that outer transaction is still open — so a
-// wake issued there could reach a controller before the spec event (letting a
-// Modified overtake the Added), or at all for a row the outer transaction then
-// rolls back. Outside a transaction AfterCommit runs it inline.
-func (bh *Beehive) wakeAfterCommit(ctx context.Context, gk GroupKind, id ObjectID) {
-	bh.store.AfterCommit(ctx, func(context.Context) { bh.enqueueIfRegistered(gk, id) })
-}
-
-// gcAdvanceNow is gcAdvance's body, run with no transaction in flight. A
-// registered kind is requeued so its own reconcile loop runs collect; a
-// client-only kind has no loop to requeue onto, and the global sweeper's next
-// tick is its backstop — which is exactly what enqueueIfRegistered's no-op arm
-// leaves it to.
-//
-// That backstop is unconditional, which is why this needs no second arm: the
-// sweeper always has a cadence (WithGCInterval rejects a non-positive interval),
-// so the wait is bounded by one tick. Collecting inline here instead would run a
-// recursive cascade of physical deletes on the caller's goroutine and ctx — so a
-// caller cancelling right after its commit could abandon the cascade mid-flight,
-// with nothing scheduled to resume it.
-func (bh *Beehive) gcAdvanceNow(gk GroupKind, id ObjectID) {
-	bh.enqueueIfRegistered(gk, id)
 }

@@ -16,19 +16,16 @@ One file per decision, named `YYYY-MM-DD-slug.md`, opening with:
 `CLAUDE.md` stays lean by holding only a one- or two-sentence summary of each
 decision plus a link here. When a design discussion grows past a couple of
 sentences in `CLAUDE.md`, move it into a new ADR and leave the summary behind.
-Records are not rewritten as the design evolves beyond them — supersede them with
-a new record and mark the old one `Superseded by <file>`.
+Every record here describes code that exists. When a decision is replaced, fold
+whatever still governs live code into the new record and delete the old file — git
+holds the previous text, and a directory of live records is worth more than a
+directory of archaeology.
 
 ## Index
 
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
-- [One store-wide change stream for the dependency waker](2026-07-27-store-wide-dependency-change-stream.md)
-- [Three independent periodic drivers](2026-07-27-periodic-reconcile-drivers.md)
-- [Dependency-wake failures escalate the catchup tick](2026-07-27-dependency-wake-escalation.md) (superseded)
-- [The waker recovers missed wakes by replaying a resource_version watermark](2026-07-27-waker-watermark-replay.md)
-- [The watermark's bound comes from the receiver's backlog head](2026-07-28-watermark-bound-from-backlog-head.md)
-- [Watch fan-out conflates per object](2026-07-27-conflating-watch-fanout.md)
-- [Slug-keyed writes and post-commit wakes](2026-07-27-writes-and-post-commit-wakes.md)
+- [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
+- [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
 - [Caller-versioned dependency declaration](2026-07-27-caller-versioned-dependencies.md)

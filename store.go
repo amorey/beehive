@@ -55,28 +55,10 @@ const (
 	RelationDependsOn = storeapi.RelationDependsOn
 )
 
-// ObjectsSubscription is a closeable subscription to a kind's change stream,
-// returned by the store's ObjectsWatch/ObjectsWatchList. The client decodes its
-// raw changes into the typed ObjectChange[Spec, Status] surface.
-type ObjectsSubscription = storeapi.ObjectsSubscription
-
-// EventsSubscription is a subscription to one object's event log, returned by the
-// store's EventsWatch. The client decodes its raw runs into public Events.
-type EventsSubscription = storeapi.EventsSubscription
-
-// ObjectWritesSubscription is a subscription to the store-wide write stream,
-// returned by the store's ObjectWritesSubscribe. It is internal machinery for the
-// dependency waker, which needs only identity — hence batches of blob-free
-// ObjectWrites.
-type ObjectWritesSubscription = storeapi.ObjectWritesSubscription
-
-// ObjectWrite names one written object and how it changed, with no row attached.
-// The id is the object's — a write has no identity of its own.
+// ObjectWrite names one object whose version is above a scan's cursor, with no
+// row attached. It is what a scan of the store's write log returns, which is the
+// only change-notification path there is.
 type ObjectWrite = storeapi.ObjectWrite
-
-// ObjectWriteBatch is one delivery from the store-wide write stream: the writes
-// that were ready together, plus how far behind them the backlog reaches.
-type ObjectWriteBatch = storeapi.ObjectWriteBatch
 
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType

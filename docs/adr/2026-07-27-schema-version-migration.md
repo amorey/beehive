@@ -6,8 +6,8 @@
 
 ## Context
 
-Spec and Status are opaque JSON, so a consumer that reshapes a struct breaks
-decode of old rows.
+Spec and Status are stored as opaque JSON, so reshaping one of those structs breaks
+decoding of older rows.
 
 ## Decision
 
@@ -17,13 +17,13 @@ unmarshal.
 
 ### Per-column versions
 
-The `objects` table carries `schema_version_spec` and `schema_version_status`
-(both `NOT NULL DEFAULT 0`), opaque ints the store persists and returns but never
-interprets — exactly like `resource_version`.
+The `objects` table carries `schema_version_spec` and `schema_version_status`, both
+`NOT NULL DEFAULT 0`. They are opaque ints the store persists and returns but never
+interprets, exactly like `resource_version`.
 
-That is what makes lazy convert-on-read sound: a status-only write re-stamps only
-`schema_version_status`, and each blob converts independently from its own stored
-version. There is no "rewrite the whole row" rule.
+Two columns is what makes lazy conversion sound. A status-only write re-stamps only
+`schema_version_status`, and each blob converts from its own stored version. Nothing
+ever has to rewrite the whole row.
 
 ### Convert on read
 
@@ -36,10 +36,11 @@ version. There is no "rewrite the whole row" rule.
 
 ### Stamp on write
 
-Lazily: `Create` / `CreateOrUpdate` / `Update` stamp `SchemaVersionSpec()` (via
-`migratorSpecVersion`, 0 if nil), `ControllerClient.UpdateStatus` stamps
-`SchemaVersionStatus()` — the *separate* status-write client, easy to miss.
-Condition and finalizer mutators write other rows and carry no version.
+Lazily. `Create`, `CreateOrUpdate` and `Update` stamp `SchemaVersionSpec()`, through
+`migratorSpecVersion`, which is 0 when there is no migrator.
+`ControllerClient.UpdateStatus` stamps `SchemaVersionStatus()` — note that this is the
+separate status-write surface, which is easy to miss. The condition and finalizer
+mutators write other tables and carry no version.
 
 The never-downward stamping rule and its interaction with the content no-op live
 in [the generation handshake ADR](2026-07-27-generation-handshake-and-noop-writes.md).
@@ -55,12 +56,11 @@ so a kind can't be migrated on one path but not the other.
 
 ### Quarantine
 
-A convert error, a downgrade, or a post-convert `json.Unmarshal` error are all
-decode failures. `List` and `adaptObjectStream` (the live watch) skip-and-log the bad
-row and continue rather than aborting the whole list or killing the stream;
-`Get` / `GetBySlug` still return the error.
+A failed conversion, a downgrade and a failed `json.Unmarshal` after conversion are
+all decode failures. `List` and the watch polls in `watchpoll.go` log the bad row and
+skip it rather than failing the whole list or ending the stream. `Get` and
+`GetBySlug` still return the error.
 
 ## Consequences
 
-A kind with no migrator behaves byte-identically to before: columns stay 0, no
-conversion runs.
+A kind with no migrator is unaffected: its columns stay 0 and no conversion runs.

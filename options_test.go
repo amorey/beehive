@@ -23,17 +23,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWithResyncIntervalDispatch(t *testing.T) {
+func TestWithFullPassIntervalDispatch(t *testing.T) {
 	bh := &Beehive{}
-	require.NoError(t, WithResyncInterval(5*time.Second)(bh))
-	assert.Equal(t, 5*time.Second, bh.resyncInterval)
+	require.NoError(t, WithFullPassInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.fullPassInterval)
 
 	r := &reconciler{}
-	require.NoError(t, WithResyncInterval(3*time.Second)(r))
-	assert.Equal(t, 3*time.Second, r.resyncInterval)
+	require.NoError(t, WithFullPassInterval(3*time.Second)(r))
+	assert.Equal(t, 3*time.Second, r.fullPassInterval)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithResyncInterval(time.Second)("unrelated"))
+	require.NoError(t, WithFullPassInterval(time.Second)("unrelated"))
 }
 
 // resolveEvents folds the per-call EventOptions into one EventQuery; the empty
@@ -100,30 +100,30 @@ func TestWithConcurrencyDispatch(t *testing.T) {
 	require.NoError(t, WithConcurrency(1)("unrelated"))
 }
 
-func TestWithStartupResyncDispatch(t *testing.T) {
-	bh := &Beehive{startupResync: true}
-	require.NoError(t, WithStartupResync(false)(bh))
-	assert.False(t, bh.startupResync)
+func TestWithStartupFullPassDispatch(t *testing.T) {
+	bh := &Beehive{startupFullPass: true}
+	require.NoError(t, WithStartupFullPass(false)(bh))
+	assert.False(t, bh.startupFullPass)
 
 	r := &reconciler{}
-	require.NoError(t, WithStartupResync(true)(r))
-	assert.True(t, r.startupResync)
+	require.NoError(t, WithStartupFullPass(true)(r))
+	assert.True(t, r.startupFullPass)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithStartupResync(true)("unrelated"))
+	require.NoError(t, WithStartupFullPass(true)("unrelated"))
 }
 
-func TestWithCatchupIntervalDispatch(t *testing.T) {
+func TestOwedPassIntervalOptionDispatch(t *testing.T) {
 	bh := &Beehive{}
-	require.NoError(t, WithCatchupInterval(5*time.Second)(bh))
-	assert.Equal(t, 5*time.Second, bh.catchupInterval)
+	require.NoError(t, withOwedPassInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.owedPassInterval)
 
 	r := &reconciler{}
-	require.NoError(t, WithCatchupInterval(time.Minute)(r))
-	assert.Equal(t, time.Minute, r.catchupInterval)
+	require.NoError(t, withOwedPassInterval(time.Minute)(r))
+	assert.Equal(t, time.Minute, r.owedPassInterval)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithCatchupInterval(time.Second)("unrelated"))
+	require.NoError(t, withOwedPassInterval(time.Second)("unrelated"))
 }
 
 func TestWithGCIntervalDispatch(t *testing.T) {
@@ -160,6 +160,30 @@ func TestWithGCIntervalRejectsNonPositive(t *testing.T) {
 
 			// And it surfaces from New, which is where a real caller meets it.
 			_, err = New(&fakeStore{}, WithGCInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
+}
+
+// TestWatchPollIntervalRejectsNonPositive pins the other mandatory interval,
+// which is mandatory for a different reason than GC's. The watch poll is not a
+// backstop but the delivery mechanism itself, so a watch that never polls is a
+// stream that never emits — there is nothing such a value could mean.
+func TestWatchPollIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{watchPollInterval: time.Minute}
+			err := withWatchPollInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "withWatchPollInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.watchPollInterval, "a rejected option must not have written")
+
+			// Checked before the target switch, like WithGCInterval: a value that means
+			// nothing at one call site means nothing at any of them.
+			require.ErrorIs(t, withWatchPollInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, withWatchPollInterval(d)("unrelated"), ErrInvalidOption)
+
+			_, err = New(&fakeStore{}, withWatchPollInterval(d))
 			require.ErrorIs(t, err, ErrInvalidOption)
 		})
 	}

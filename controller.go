@@ -17,29 +17,26 @@ package beehive
 import (
 	"context"
 	"encoding/json"
-	"errors"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
-// ErrWrongKind is returned by a ControllerClient write when the target id names
-// an object of a different kind than the controller's own. A controller may only
-// write status, conditions, and finalizers on objects of its registered kind;
-// passing an id from another kind (a dependency, an owner) is a bug that would
-// otherwise persist this controller's Status JSON into a foreign row and make
-// later typed reads of that kind fail to decode. The store folds the controller's
-// kind into each write, turning that silent corruption into a loud, retrying
-// reconcile failure. Aliased from storeapi like ErrNotFound.
+// ErrWrongKind is returned by a ControllerClient write whose target id belongs to
+// another kind. A controller may only write status, conditions and finalizers on its
+// own kind. Passing another kind's id — a dependency, an owner — would otherwise
+// store this controller's status JSON in that row and break later typed reads of it.
+// The store folds the controller's kind into every write, which turns silent
+// corruption into a loud, retrying reconcile failure. Aliased from storeapi, like
+// ErrNotFound.
 var ErrWrongKind = storeapi.ErrWrongKind
 
 // ErrTargetResourceVersionFuture is returned by DependenciesAdd when
-// targetResourceVersion exceeds the target's current ResourceVersion. An object's
-// version only moves forward, so a version above the target's own cannot have come
-// from reading it — the caller passed some other object's version, or some other
-// field. The declaration is rejected rather than silently ignored: the guard that
-// value drives would otherwise never fire, leaving the read-then-declare window
-// open with nothing to say so. The store checks it before inserting, so a rejected
-// call writes nothing. Aliased from storeapi like ErrNotFound.
+// targetResourceVersion is above the target's current ResourceVersion. Versions only
+// move forward, so such a value cannot have come from reading the target — it is
+// another object's version, or another field. The declaration is rejected rather than
+// ignored, because the guard that value drives would otherwise never fire and nothing
+// would say so. The store checks before inserting, so a rejected call writes
+// nothing. Aliased from storeapi, like ErrNotFound.
 var ErrTargetResourceVersionFuture = storeapi.ErrTargetResourceVersionFuture
 
 // Controller is the user-supplied reconcile logic for a resource kind.
@@ -56,53 +53,47 @@ type Controller[Spec, Status any] interface {
 type ControllerClient[Status any] interface {
 	ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error
 	ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error
-	// DependenciesAdd records that fromID depends on toID, so Beehive requeues
-	// fromID when toID changes.
+	// DependenciesAdd records that fromID depends on toID, so beehive reconciles
+	// fromID again when toID changes.
 	//
-	// targetResourceVersion is the version of toID that the decision to depend on
-	// it was based on — the ResourceVersion of the object you read, not toID's
-	// current one. Re-reading toID immediately before this call to obtain it
-	// defeats the purpose: a version fresher than the read claims to have seen
-	// changes the decision did not.
+	// targetResourceVersion is the version of toID your decision was based on: the
+	// ResourceVersion of the object you actually read, not toID's current one.
+	// Re-reading toID just to fill this in defeats the point, since a fresher version
+	// claims to have seen changes your decision did not.
 	//
-	// It closes the read-then-declare window. A change to toID landing between the
-	// read and the declaration reaches nobody — the dependency waker resolves
-	// dependents at the instant of the change, and the edge does not exist yet —
-	// and the dependent then settles at its own generation on the stale read,
-	// where ObjectsListUnsettledIDs structurally cannot see it. So if toID has moved past
-	// targetResourceVersion by the time the edge commits, fromID is requeued: it
-	// declared a dependency on a version that is already superseded.
+	// It closes the gap between reading a target and declaring the edge. A change to
+	// toID that lands in that gap reaches nobody: the waker resolves dependents when
+	// its scan passes the change, and the edge may not exist yet, so the dependent
+	// settles at its own generation on the stale read — where ObjectsListUnsettledIDs
+	// cannot see it. So if toID has already moved past targetResourceVersion when the
+	// edge commits, fromID is recorded as owing another pass.
 	//
-	// Pass 0 to skip the check — "no opinion", the correct value when the edge is
-	// declared *before* reading toID, which is already race-free (the edge is in
-	// place, so the waker covers every later change).
+	// Pass 0 for "no opinion". That is the right value when you declare the edge
+	// before reading toID, which has no gap to close: the edge is already in place, so
+	// the waker covers every later change.
 	//
 	// A targetResourceVersion above toID's current version is rejected with
-	// ErrTargetResourceVersionFuture, and rejected before anything is written, so
-	// no edge is declared — including when this call is nested in a caller's
-	// Within, where returning an error unwinds nothing on its own. Versions only
-	// move forward, so such a value cannot have come from reading toID. That
-	// catches the value taken from the wrong object,
-	// but not one taken from the right object at the wrong time — a stale version
-	// is indistinguishable from an old read, and a freshly re-read one from a
-	// decision made this instant. Those stay the caller's contract to honour.
+	// ErrTargetResourceVersionFuture, before anything is written, so no edge is
+	// declared — including inside a caller's Within, where returning an error unwinds
+	// nothing by itself. This catches a version read from the wrong object. It cannot
+	// catch one read from the right object at the wrong time: a stale version looks
+	// like an old read, and a freshly re-read one looks like a decision made this
+	// instant. Those remain yours to get right.
 	//
-	// The requeue fires at most once per edge: it is gated on this call being the
-	// one that created the edge. So a caller that re-asserts its edges each pass
-	// costs nothing after the first, and one that passes a stale version — a value
-	// cached across passes, say — gets at most one spurious requeue rather than a
-	// self-sustaining loop.
+	// The check fires at most once per edge, because it is also gated on this call
+	// being the one that created the edge. Re-asserting your edges every pass
+	// therefore costs nothing after the first, and passing a stale version — one
+	// cached across passes, say — costs one extra pass rather than a loop.
 	//
-	// The cost of that bound is that this cannot repair a wake lost elsewhere. Once
-	// the edge exists, delivering toID's changes is the dependency waker's job, and
-	// the waker can drop one (a swallowed lookup error, a dead subscription, a
-	// process that exits before dispatching — see TODO.md). In that case a later
-	// pass re-declaring the edge would have the evidence to notice, and this
-	// deliberately does not act on it. Covering it means waking whenever the target
-	// moved, which for a caller whose version never advances is an unbounded loop —
-	// a worse failure than the miss, and not one the caller can see. Repairing lost
-	// wakes belongs to a backstop that derives staleness rather than to a guard that
-	// records an intent.
+	// The price of that bound is that this cannot repair a wake lost elsewhere. Once
+	// the edge exists, delivering toID's changes is the waker's job, and the waker can
+	// still drop one: a restart re-seeds its watermark from the store's current
+	// cursor, so changes it never scanned are not replayed (see TODO.md). A later pass
+	// re-declaring the edge would have the evidence to notice, and deliberately does
+	// not act on it — waking whenever the target has moved would loop forever for a
+	// caller whose version never advances, which is worse than the miss and invisible
+	// to the caller. Repairing lost wakes belongs to a backstop that derives staleness,
+	// not to a guard that records an intent.
 	DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
 	DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
 	// DependenciesList returns the objects id depends on (outgoing depends_on).
@@ -153,13 +144,13 @@ type controllerClientImpl[Status any] struct {
 	gk GroupKind
 }
 
-// The store folds the controller's kind into each write below: a foreign id
-// (a dependency, an owner) matches no row and is rejected with ErrWrongKind, so
-// this controller's status/condition/finalizer writes can never corrupt another
-// kind's row. There's no separate kind check to keep atomic with the write, so
-// each mutator self-wraps in Within (joining the controller's own Within when
-// nested) — the per-write withinKind transaction this used to need is gone. A
-// missing id surfaces as ErrNotFound (the store distinguishes it from a foreign id).
+// The store folds the controller's kind into each write below, so another kind's id
+// matches no row and is rejected with ErrWrongKind. A controller's status, condition
+// and finalizer writes therefore cannot corrupt another kind's row. Because the kind
+// check is part of the write, there is no separate check to keep atomic with it: each
+// mutator self-wraps in Within, joining the controller's own Within when nested. A
+// missing id comes back as ErrNotFound, which the store tells apart from another
+// kind's id.
 
 func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
 	b, err := json.Marshal(status)
@@ -188,11 +179,11 @@ func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id 
 	return err
 }
 
-// EventsRecord marshals the event's optional Detail (typed-in, opaque-out, like
-// Spec/Status) and appends the run through the store, which folds in the
-// controller's kind and emits the run into the transaction's collector so it
-// publishes to watchers only after the write commits. A nil Detail stays nil (no
-// payload); the store aggregates by (Category, Type, Reason).
+// EventsRecord marshals the event's optional Detail — typed in, opaque out, like
+// Spec and Status — and appends the run through the store, which folds in the
+// controller's kind. Nothing is published: the row is the record, and an EventsWatch
+// poll finds it once the write commits. A nil Detail stays nil, and the store groups
+// runs by (Category, Type, Reason).
 func (c *controllerClientImpl[Status]) EventsRecord(ctx context.Context, id ObjectID, event EventSpec) error {
 	var detail []byte
 	if event.Detail != nil {
@@ -218,90 +209,51 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 
 // DependenciesAdd implements the contract documented on ControllerClient. The
 // relation is always "depends_on" (owner edges come from WithOwner at create
-// time). Both writes — the edge and the durable wake stamp — live inside EdgesAdd,
-// which is atomic on its own, so the Within here is not what makes either safe;
-// it is only the seam for this method's own composition, joining a controller's
-// Within when nested rather than opening a second transaction.
+// time).
 //
-// They are in the store rather than sequenced here precisely because a nested
-// Within unwinds nothing: a stamp issued as a second call after EdgesAdd returned
-// would leave a caller who handles this method's error free to commit the edge
-// without it — a dependent stranded on a stale read, which is the race this
-// method exists to close. Ordering inside one store call is the guarantee (see
-// EdgesAdd), and ReconcileOwedStamped reports what it did rather than having the conjunction
-// recomputed here, where the two halves could drift apart.
+// It is one store call, not a composition. Both writes — the edge and the durable
+// wake stamp — live inside EdgesAdd, and they are there rather than sequenced here
+// precisely because a nested Within unwinds nothing: a stamp issued as a second
+// call after EdgesAdd returned would leave a caller who handles this method's error
+// free to commit the edge without it, stranding a dependent on a stale read, which
+// is the race this method exists to close. Indivisibility inside one store call is
+// the guarantee.
 //
-// The wake is a conjunction — the edge is new *and* the target moved — and both
+// The stamp is a conjunction — the edge is new *and* the target moved — and both
 // halves are load-bearing: either alone re-fires every pass for some ordinary
 // controller, and nothing throttles that (the dispatch path has no already-settled
 // skip, and workQueue.addLocked has no rate limiter). TODO.md records the two
 // rejected one-sided guards; the interface doc covers what the conjunction gives
 // up. The edge-new half costs nothing, riding the stamp statement's own NOT EXISTS.
 //
-// The requeue is routed by fromID's own GroupKind, not the caller's — the edge is
-// deliberately cross-kind, so a controller may declare one on another kind's
-// behalf, and enqueuing a foreign id onto the caller's reconciler would decode
-// another kind's bytes as this one's Spec. wakeAfterCommit (not the
-// reconcile-scoped pendingWakes, which is nil for the out-of-band call) registers
-// it post-commit, so it can't reach a controller before the edge it is about, or
-// at all if the transaction rolls back. It is in-memory, and deliberately the
-// expendable half: a process that dies before it runs still finds the stamp on
-// restart, and the backstop that drains reconcile_owed makes the reconcile happen
-// late rather than never.
+// Nothing is scheduled here, and the store's EdgesAddResult is discarded for that
+// reason: reconcile_owed is a durable count the owed pass drains, routed by
+// fromID's own GroupKind inside the store — the edge is deliberately cross-kind, so
+// a controller may declare one on another kind's behalf. The count is the whole
+// mechanism: it is durable, so a crash between the commit and the pass loses
+// nothing.
+//
+// The store rejects a version above the target's own before it inserts (see
+// ErrTargetResourceVersionFuture), so a bad claim leaves no edge — including inside
+// a caller's Within, since nothing was written to unwind.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error {
-	return c.bh.store.Within(ctx, func(ctx context.Context) error {
-		// The store rejects a version above the target's own before it inserts (see
-		// ErrTargetResourceVersionFuture), so a bad claim leaves no edge regardless
-		// of whose transaction this is running in.
-		res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
-		if err != nil {
-			return err
-		}
-		if res.ReconcileOwedStamped {
-			// The durable half already landed with the edge (reconcile_owed is a count of
-			// outstanding wakes, decremented by the reconcile that services one, so a
-			// wake owed mid-pass is not lost — see the reconcile_owed column). This is the
-			// latency half: the in-memory requeue, so the dependent reconciles now rather
-			// than waiting for the backstop. It self-gates on registration via
-			// enqueueIfRegistered — which is also why the stamp doesn't need gating: an
-			// unregistered kind simply owes a count nothing scans.
-			c.bh.wakeAfterCommit(ctx, res.From, fromID)
-		}
-		return nil
-	})
+	_, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
+	return err
 }
 
+// DependenciesDelete drops the edge and does nothing else. Dropping it can unblock
+// toID's deletion, since edges are RESTRICT, but nothing is scheduled for that: a
+// finalizing toID is already in the GC sweeper's listing — being deletion-pending is
+// what puts it there — so the next tick retries the collect and finds the block gone.
+// That tick is guaranteed, because WithGCInterval cannot be disabled.
 func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
-	return c.bh.store.Within(ctx, func(ctx context.Context) error {
-		if err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn); err != nil {
-			return err
-		}
-		// Removing the edge can unblock toID's physical deletion (edges are RESTRICT).
-		// If toID is finalizing, register it for a post-commit re-check so GC removes
-		// it without waiting on the resync backstop (which may be disabled). Outside a
-		// reconcile there's no collector — nothing to schedule.
-		wakes := pendingWakesFrom(ctx)
-		if wakes == nil {
-			return nil
-		}
-		target, err := c.bh.store.ObjectsGetMeta(ctx, toID)
-		if errors.Is(err, ErrNotFound) {
-			return nil // target already gone
-		}
-		if err != nil {
-			return err
-		}
-		if target.DeletionRequestedAt != nil {
-			wakes.targets = append(wakes.targets, ObjectRef{ID: toID, Group: target.Group, Kind: target.Kind})
-		}
-		return nil
-	})
+	return c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
 }
 
 // EdgesHasIncoming reports whether anything still claims id. It is a plain read that
-// commits on its own; to gate a write on it atomically — e.g. clearing a finalizer
-// only if nothing references the object — a controller runs both inside Within, so
-// the read and the write share one transaction snapshot.
+// commits on its own. To gate a write on it atomically — clearing a finalizer only if
+// nothing references the object, say — run both inside Within so the read and the
+// write share one transaction.
 // OwnersGet/DependenciesList/DependentsList/OwnedList read ref edges directly,
 // like EdgesHasIncoming above — no kind-scoping, since a controller reasons about
 // its own object's relationships.

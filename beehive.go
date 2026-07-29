@@ -22,20 +22,27 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sync"
 	"time"
-
-	"github.com/amorey/gobus/conflate"
 )
 
 const (
-	defaultCatchupInterval = 30 * time.Second
-	// The full pass scales with the object count rather than with what is owed, so
-	// it is opt-in: the catchup tick and the startup pass cover convergence, and a
-	// deployment that wants periodic re-confirmation asks for it.
-	defaultResyncInterval time.Duration = 0
-	defaultGCInterval                   = 30 * time.Second
+	defaultOwedPassInterval = 30 * time.Second
+	// Both full passes scale with the object count rather than with what is owed, so
+	// both are opt-in, and nothing may depend on either: convergence is carried by the
+	// owed pass, which drains what the store *records* as owed. A deployment that wants
+	// periodic or at-startup re-confirmation of process-scoped state asks for it. The
+	// two are declared together because they are one choice made at two cadences —
+	// keep their defaults in step. See WithStartupFullPass for the argument.
+	defaultFullPassInterval time.Duration = 0
+	defaultStartupFullPass                = false
+	defaultGCInterval                     = 30 * time.Second
+	// The dependency-wake scan is the cheapest of the drivers — one indexed range
+	// query that returns nothing in a quiet system — so it runs an order of
+	// magnitude more often than the passes that scale with the object count.
+	defaultWakeInterval = 1 * time.Second
+	// The client's watch surface polls, so this is the latency a subscriber sees.
+	defaultWatchPollInterval = 1 * time.Second
 )
 
 type beehiveState uint8
@@ -51,28 +58,37 @@ const (
 // Stop.
 type Beehive struct {
 	store Store
-	// catchupInterval paces the cheap tick that drains work the store has recorded
-	// as owed. Separate from resyncInterval because the two scale differently: the
-	// owed set is bounded by what is actually outstanding, a full pass by the
-	// object count.
-	catchupInterval time.Duration
-	resyncInterval  time.Duration
-	// gcInterval paces the global GC sweeper (deletion-pending collection and
-	// event-log retention). It is deliberately separate from the reconcile
-	// intervals: collecting dead rows and re-confirming live ones are different
-	// jobs with different costs, and one number governing both means tuning either
-	// moves the other. Always positive when the Beehive came from New: WithGCInterval
-	// rejects a non-positive value (see its doc for why GC alone can't be disabled),
-	// so every error path in the sweeper has a next tick to retry on.
-	gcInterval  time.Duration
-	concurrency int // default worker count for all controllers; 0/1 = single-threaded
+	// owedPassInterval paces the cheap tick that drains work the store records as
+	// owed. It is separate from fullPassInterval because the two scale differently: owed
+	// work is bounded by what is outstanding, a full pass by the object count.
+	owedPassInterval time.Duration
+	fullPassInterval time.Duration
+	// gcInterval paces the global GC sweeper: collecting deletion-pending rows and
+	// trimming the event log. It is separate from the reconcile intervals because
+	// collecting dead rows and re-confirming live ones are different jobs with
+	// different costs, and one number for both would mean tuning either moves the
+	// other. It is always positive when the Beehive came from New, since
+	// WithGCInterval rejects a non-positive value, so every error path in the sweeper
+	// has a next tick to retry on.
+	gcInterval time.Duration
+	// wakeInterval paces the dependency waker's scan of the write log (see waker). It
+	// is separate from the reconcile intervals because it scales with what *changed*
+	// rather than with what exists or what is owed, which is what lets it run often
+	// and cost nothing in a quiet system. Non-positive turns it off.
+	wakeInterval time.Duration
+	// watchPollInterval paces the client's watch surface, which polls the store and
+	// diffs (see watchpoll.go). It bounds how stale a subscriber's view can be.
+	watchPollInterval time.Duration
+	concurrency       int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper (see WithEventRetention).
 	// Zero on both disables the sweep — the log grows unbounded until configured.
 	eventRetentionPerObject int
 	eventRetentionMaxAge    time.Duration
-	// startupResync is the default startup full-pass choice copied into each
-	// reconciler. Its zero value is false, so New sets the true default explicitly.
-	startupResync bool
+	// startupFullPass is the default startup full-pass choice copied into each
+	// reconciler. Off unless asked for, like fullPassInterval and for the same
+	// reason: no reconcile may depend on a pass that scales with the object count,
+	// so its zero value is also the correct default (see WithStartupFullPass).
+	startupFullPass bool
 	// logger and logLevel are the user-supplied logging config (nil logger =
 	// disabled). They stay raw until Start resolves them via resolveLogger; each
 	// reconciler inherits them as its own default (see Register).
@@ -86,9 +102,8 @@ type Beehive struct {
 	// (the user-facing client and the reconciler), so a migrator can't be wired to
 	// one but not the other. nil entry / missing key means the kind has none.
 	migrators map[GroupKind]Migrator
-	// order preserves registration order so Start subscribes dependency wakers
-	// and launches reconcile loops deterministically, rather than in random map
-	// order.
+	// order preserves registration order so Start launches reconcile loops
+	// deterministically, rather than in random map order.
 	order  []*reconciler
 	waker  *waker
 	state  beehiveState
@@ -105,15 +120,15 @@ func (bh *Beehive) log() *slog.Logger {
 	return bh.logger
 }
 
-// Start brings the control plane up: it launches the dependency wakers, the
-// per-controller reconcile loops, and the GC sweeper. On success it returns a
-// stop function that tears the control plane back down (see stop). It is an
-// error to start twice or after stop; on error the returned stop is nil. Beehive
-// is a one-shot object: once stopped, create a new instance.
+// Start brings the control plane up: the dependency waker, the per-controller
+// reconcile loops, and the GC sweeper. All of them are periodic, since nothing is
+// pushed at them. On success it returns a stop function that tears everything back
+// down (see stop). Starting twice, or after stop, is an error, and the returned stop
+// is nil in that case. A Beehive is one-shot: once stopped, make a new one.
 //
-// startCtx bounds the startup phase only — a startCtx that's already cancelled
-// aborts startup. The long-lived reconcile loops do not derive from startCtx;
-// the run lifetime ends only when the returned stop is called.
+// startCtx covers startup only. If it is already cancelled, startup aborts. The
+// long-lived loops do not derive from it — the run ends when the returned stop is
+// called.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
@@ -125,7 +140,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	}
 
 	// Resolve the control plane's own logger once: nil becomes the discard logger
-	// so the goroutines below (GC sweeper, dependency wakers) log unconditionally.
+	// so the goroutines below (GC sweeper, dependency waker) log unconditionally.
 	bh.logger = resolveLogger(bh.logger, bh.logLevel)
 
 	// runCtx lives for the lifetime of the control plane and drives the
@@ -141,14 +156,14 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		return nil, fmt.Errorf("beehive: start aborted: %w", err)
 	}
 
-	// Subscribe the dependency waker BEFORE launching any reconcile loop: a
-	// controller's startup reconcile can modify a target the instant it runs, and
-	// that change must not be published before the waker's receiver is registered —
-	// otherwise dependents go unwoken under configurations that rely on dependency
-	// events (e.g. a settled dependent, which no owed-work listing can see, with
-	// every ticker disabled). start subscribes synchronously for that reason; only
-	// consuming and retrying are asynchronous.
-	bh.waker.start(runCtx)
+	// The dependency waker scans the write log on its own interval. It needs no
+	// ordering against the reconcile loops below, because its first scan is bounded by
+	// a cursor read rather than by when it happened to start: a change made before the
+	// goroutine runs is either below the seed, and covered by the startup pass, or
+	// above it, and picked up by the first tick.
+	bh.wg.Go(func() {
+		bh.waker.run(runCtx)
+	})
 
 	// Now launch the reconcile loops.
 	for _, r := range bh.order {
@@ -169,37 +184,22 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	return func(stopCtx context.Context) error { return bh.stop(stopCtx) }, nil
 }
 
-// gcSweeperRun is the global garbage-collection backstop. The per-controller
-// reconcile loop runs collect for its own kind; this sweeps every kind, so a
-// deletion-pending object of a client-only kind (no registered controller) is
-// still collected — otherwise it would strand and RESTRICT-block its owner's
-// delete forever. It sweeps once at startup and then on the GC cadence.
+// gcSweeperRun is the global garbage-collection backstop. Each reconcile loop
+// collects its own kind; this one sweeps every kind, so a deletion-pending object of
+// a client-only kind is still collected instead of stranding and RESTRICT-blocking
+// its owner's delete forever. It sweeps once at startup, then on the GC interval.
 //
-// Every failure inside a sweep is logged and swallowed, which is only sound
-// because there is always a next tick: WithGCInterval rejects a non-positive
-// interval, so a transient error costs one cadence of latency rather than
-// stranding a row for the life of the process.
+// Failures inside a sweep are logged and swallowed, which is only safe because there
+// is always a next tick: WithGCInterval rejects a non-positive interval, so a
+// transient error costs one interval of latency rather than stranding a row for the
+// life of the process. (runDriver still honours a non-positive interval by not
+// running, which a Beehive built field by field in a test can reach.)
 func (bh *Beehive) gcSweeperRun(ctx context.Context) {
-	if bh.gcInterval <= 0 {
-		// Unreachable through New — the default is positive and WithGCInterval rejects
-		// anything else. Guarded anyway so a Beehive assembled field-by-field (tests
-		// that want the sweeper's own enqueues out of the way) simply has no sweeper
-		// instead of panicking in NewTicker.
-		return
-	}
-	bh.deletionPendingSweep(ctx)
-	bh.eventRetentionSweep(ctx)
-	ticker := time.NewTicker(bh.gcInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			bh.deletionPendingSweep(ctx)
-			bh.eventRetentionSweep(ctx)
-		}
-	}
+	runDriver(ctx, bh.gcInterval, func(ctx context.Context) bool {
+		bh.deletionPendingSweep(ctx)
+		bh.eventRetentionSweep(ctx)
+		return true
+	})
 }
 
 // eventRetentionSweep trims the event log to the configured retention (see
@@ -215,7 +215,7 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 }
 
 // deletionPendingSweep drives every deletion-pending object one step closer to
-// removal (see advanceDeletion for the routing).
+// removal (see deletionAdvance for the routing).
 func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 	rows, err := bh.store.DeletionRequestsList(ctx)
 	if err != nil {
@@ -236,23 +236,23 @@ func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 }
 
 // deletionAdvance drives one deletion-pending object a step closer to removal,
-// routing on whether its kind has a controller. The GC sweeper is its only caller
-// — the event-driven path (advanceGCNow) deliberately only requeues, leaving every
-// collect to run on the sweeper's goroutine rather than a caller's.
+// routing on whether its kind has a controller. The GC sweeper is its only caller,
+// since a delete records deletion_requested_at and nothing else, so every collect
+// runs on the sweeper's goroutine and ctx rather than on whoever requested the
+// delete.
 //
-// The routing is load-bearing, not an optimization. collect cannot clear a
-// finalizer: it cascades to owned children and then returns while any finalizer
-// remains, because releasing one is the controller's decision. So an object of a
-// registered kind must be *enqueued*, letting its reconcile loop run the
-// controller (which clears the finalizer and collects in the same pass); calling
-// collect on it directly would make no progress, on every sweep, forever. A
-// client-only kind has no reconcile loop to enqueue onto, so it is collected
-// here — which is the whole reason the global sweep exists.
+// The routing matters for correctness, not speed. gcCollect cannot clear a finalizer:
+// it cascades to owned children, then returns while any finalizer remains, because
+// releasing one is the controller's decision. So an object of a registered kind has
+// to be *queued*, letting its reconcile loop run the controller, which clears the
+// finalizer and collects in the same pass. Calling gcCollect directly would make no
+// progress, on every sweep, forever. A client-only kind has no loop to queue onto, so
+// it is collected here — which is the whole reason the global sweep exists.
 //
-// Both arms are safe to repeat: enqueue coalesces, and collect is a no-op while
-// finalizers or live referrers remain and idempotent if another path got there
-// first. The collect error is returned rather than logged so the caller can report
-// it in its own terms; the enqueue arm always returns nil.
+// Both arms are safe to repeat: queueing coalesces, and gcCollect does nothing while
+// finalizers or live referrers remain and is harmless if another path got there
+// first. The collect error is returned rather than logged, so the caller can report
+// it in its own terms; the queueing arm always returns nil.
 func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectID) error {
 	if r, ok := bh.reconcilerFor(gk); ok {
 		r.enqueue(id)
@@ -260,510 +260,6 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 	}
 	_, err := bh.gcCollect(ctx, id)
 	return err
-}
-
-// waker is the dependency waker: it rides the store-wide write stream and requeues
-// the dependents of every object that changes. One per control plane, and its own
-// type so the state it accumulates while running — a resume cursor, and the test
-// seams that pace its retries — has an owner. Every field is touched by the waker
-// goroutine alone; nothing outside it has any business reading them, which is why
-// they need no synchronisation.
-type waker struct {
-	bh *Beehive
-
-	// watermark is the highest resource_version this waker has consumed. It is the
-	// resume point for a recovery: the store-wide cursor is globally monotonic and
-	// never reused, so "everything above this" names exactly what was missed. Owned
-	// by the waker goroutine — seeded by serve, advanced by dependentsWake — so it
-	// needs no synchronisation.
-	watermark int64
-
-	// graceFloor is the version below which a delivery cannot be evidence of anything.
-	// Two paths legitimately hand the cursor versions the stream is still about to
-	// deliver: subscribing registers the receiver *before* reading the cursor, so a
-	// write caught in that window is both buffered and at or below it; and a replay
-	// reads rows the receiver may already be holding. Both over-deliver on purpose —
-	// coalescing is not loss — but a detector that did not know it would report every
-	// one of them as a broken invariant. Raised to the watermark whenever one of those
-	// paths moves it; see overCommitted.
-	graceFloor int64
-
-	// seen is the highest version processed since the last safe point, which is not
-	// the same thing as the watermark. The stream delivers in first-touch order, not
-	// version order — a re-written object coalesces into its existing queue position
-	// — so the newest version in a batch can sit far above changes still queued
-	// behind it. Taking it as the resume point would step over them. seen only
-	// becomes the watermark on a drained batch, where there is nothing left queued
-	// for it to step over.
-	seen int64
-
-	// now replaces the clock when set, so a test can decide how long a stream
-	// appeared to last without one actually lasting that long.
-	now func() time.Time
-
-	// waitRetry replaces the retry delay when set. The recovery loop is the only thing
-	// standing between a dropped subscription and a control plane that has silently
-	// stopped honouring depends_on, so tests have to drive it — and they must do that
-	// without waiting on a real interval, which would be the sleep-paced test the
-	// conventions rule out.
-	waitRetry func(ctx context.Context, d time.Duration) bool
-}
-
-// commitRule says which quantity a processed batch lets the watermark move to. The
-// two delivery paths make different promises: a live batch is in first-touch order
-// and carries its own bound for what is still queued behind it, while a replay page
-// is version-ordered and complete up to its own last row.
-type commitRule int
-
-const (
-	commitBounded commitRule = iota // a live batch: bounded by what is still queued
-	commitOrdered                   // a replay page: complete up to its own high
-)
-
-const (
-	// wakerRetryBase is the first resubscribe delay; wakerRetryCap bounds every
-	// later one. The ceiling is on the interval and never on the number of attempts:
-	// a waker that gave up is the dead waker this recovery exists to kill, reached by
-	// a slower route. A store unhappy enough to fail a subscription will fail the
-	// next one too, and a tight loop against its single connection makes the outage
-	// worse.
-	wakerRetryBase = 100 * time.Millisecond
-	wakerRetryCap  = 30 * time.Second
-)
-
-// start launches the single waker over one store-wide change
-// stream. Driving requeues off change-events (which the store suppresses for
-// no-ops) rather than off every reconcile means a steady state stops waking and
-// cycles settle.
-//
-// Store-wide rather than per registered kind: a depends_on edge may point at an
-// object of any kind, including one used through Client with no Register. Such a
-// target has no reconciler, so a per-kind subscription list — however it is
-// computed — cannot name it, and changes to it would reach no waker at all.
-// Routing stays correct because it was never keyed on the subscription:
-// dependentsWake enqueues each dependent through enqueueIfRegistered, by the
-// dependent's own kind.
-//
-// With no registered controllers there is nothing to wake, and the stream is not
-// free: it would pay a edges query per change in the whole store only to reach
-// enqueueIfRegistered's no-op arm.
-func (dw *waker) start(runCtx context.Context) {
-	if len(dw.bh.order) == 0 {
-		return
-	}
-	// Subscribe here rather than on the goroutine, so the ordering promise Start
-	// makes actually holds: registering the receiver is what starts buffering, and
-	// it has to happen before any reconcile loop can publish. Draining it can wait —
-	// the hub holds what arrives in the meantime, conflated per object.
-	w, cursor, err := dw.bh.store.ObjectWritesSubscribe(runCtx)
-	dw.bh.wg.Go(func() { dw.serve(runCtx, w, cursor, err) })
-}
-
-// serve keeps a subscription alive for the life of the control plane, replaying
-// whatever each gap swallowed. It is the driver the watermark needs: a cursor says
-// where to resume, but something has to still be running to decide to. Nothing was
-// before — a failed subscribe returned, and a closed stream ended the loop — so
-// both losses were permanent, repaired only by escalating a periodic pass that at
-// the default configuration may not exist.
-//
-// It takes the first subscription from start rather than opening its own, so the
-// stream is established before Start returns. Round 0 has missed nothing and simply
-// takes its cursor; every later round has a gap below it and replays instead —
-// including the one after a failed first attempt, since writes really could have
-// been missed before any cursor was known.
-func (dw *waker) serve(ctx context.Context, w *ObjectWritesSubscription, cursor int64, err error) {
-	var attempt int
-	// seeded says a cursor has been taken. Distinct from "watermark != 0", which a
-	// legitimately-zero cursor cannot express.
-	var seeded bool
-	for round := 0; ctx.Err() == nil; round++ {
-		if round > 0 {
-			w, cursor, err = dw.bh.store.ObjectWritesSubscribe(ctx)
-		}
-		switch {
-		case err != nil:
-			if ctx.Err() != nil {
-				return // shutdown, not a loss
-			}
-			// Every change in the store is reaching no dependent while this holds, for
-			// every kind — this is the process's only stream.
-			dw.bh.log().WarnContext(ctx, "dependency waker subscription failed; retrying, and dependency wakes are not being delivered for any kind until it succeeds",
-				"attempt", attempt+1, "err", err)
-		default:
-			switch {
-			case !seeded && round == 0:
-				dw.watermark, dw.seen, dw.graceFloor = cursor, cursor, cursor
-			case !seeded:
-				// The first subscribe failed, so no cursor was ever known and a replay
-				// would start at zero — every live object, paged, with an edges lookup
-				// each, on the connection every writer shares. That is the whole-world
-				// pass this design replaced, bought with one transient error, so take
-				// this cursor instead and say plainly what it skips: changes made during
-				// the outage are not replayed. The reconciler's startup pass covers them
-				// unless it was turned off (see WithStartupResync).
-				dw.bh.log().WarnContext(ctx, "dependency waker subscribed after an initial failure; changes made before it are not replayed, and the startup pass is what covers them",
-					"cursor", cursor)
-				dw.watermark, dw.seen, dw.graceFloor = cursor, cursor, cursor
-			default:
-				// A new stream: nothing staged against the old one can be trusted against
-				// this one, so the staging area restarts from the cursor itself.
-				dw.seen = dw.watermark
-				// Keep replaying until one gets through, exactly as the in-run path does.
-				// Dropping a failed replay would leave the watermark below the gap while
-				// the live stream carried it past — and those changes would never wake
-				// their dependents, which is the loss this branch exists to prevent.
-				// Its own counter: attempt paces resubscribes and doubles as the
-				// threshold a stream must outlive to reset it, so folding replay retries
-				// into it would make a healthy stream look like a flap.
-				for retry := 0; !dw.replay(ctx); retry++ {
-					if !dw.backoff(ctx, retry) {
-						// Giving up on this subscription without handing it to run, which
-						// is what would otherwise have closed it. Whoever abandons the
-						// stream releases it.
-						w.Close()
-						return
-					}
-				}
-			}
-			seeded = true
-			started := dw.clock()
-			dw.run(ctx, w)
-			// Reset only when the stream outlived the pause we would have taken for it.
-			// "It delivered something" is not that test: a store handing out a
-			// subscription, sending one batch and closing it again would satisfy it every
-			// round, hold attempt at zero, and loop at the 100ms floor — a subscribe, a
-			// replay and an edges query ten times a second on the connection every writer
-			// shares, which is the hammering the backoff exists to stop. Duration says
-			// what progress cannot: a stream that ran longer than the retry it would have
-			// cost was a working stream, however quiet, and one that did not was a flap,
-			// however busy.
-			if dw.clock().Sub(started) > retryDelay(attempt) {
-				attempt = 0
-			}
-			if ctx.Err() != nil {
-				return
-			}
-		}
-		// Whichever way this round ended, pause before the next subscribe: a store
-		// that fails them, or closes streams as fast as it hands them out, would
-		// otherwise spin against the single connection every writer shares.
-		if !dw.backoff(ctx, attempt) {
-			return
-		}
-		attempt++
-	}
-}
-
-// clock reads the waker's notion of now, which tests replace.
-func (dw *waker) clock() time.Time {
-	if dw.now != nil {
-		return dw.now()
-	}
-	return time.Now()
-}
-
-// retryDelay is the pause before retry number attempt, doubling to wakerRetryCap.
-//
-// The inner min is an overflow guard, not a second cap: attempt is unbounded (the
-// loop never gives up), and shifting past 63 wraps to a negative duration, which a
-// timer fires immediately — turning the backoff into the spin it exists to prevent.
-func retryDelay(attempt int) time.Duration {
-	return min(wakerRetryBase<<min(attempt, 16), wakerRetryCap)
-}
-
-// backoff waits before the next retry, reporting false if the control plane went
-// away first. The delay doubles to wakerRetryCap and stays there; the caller keeps
-// trying regardless of how many attempts that takes.
-func (dw *waker) backoff(ctx context.Context, attempt int) bool {
-	d := retryDelay(attempt)
-	if dw.waitRetry != nil {
-		return dw.waitRetry(ctx, d)
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
-}
-
-// replayPageCap bounds one replay page. The query is a covering-index range scan,
-// so a page is cheap to *run*; what costs is the number of round trips, since each
-// page also drives an edges lookup and every one of those serializes against every
-// writer on the store's single connection. Sized well above the live stream's batch
-// cap for that reason — the point of the bound is to keep an unbounded read from
-// materialising the whole table after a long outage, not to keep any one read short.
-const replayPageCap = 256
-
-// replay feeds everything above the watermark back through the wake path, a page
-// at a time, and reports whether it got through. This is the repair: rather than
-// re-deriving every object of every kind to find the dependents a lost change
-// stranded, it re-reads the changes themselves, so the cost is what was missed
-// rather than what exists.
-//
-// The cursor advances per page, which is sound here and nowhere else: pages come
-// back in resource_version order, so a page that succeeded really does mean
-// everything below it is done. A page that fails leaves the cursor where it was —
-// the changes are still owed, and the caller retries from there.
-func (dw *waker) replay(ctx context.Context) bool {
-	for {
-		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, replayPageCap)
-		if err != nil {
-			if ctx.Err() != nil {
-				return false // shutdown cancelled this read; not a loss of its own
-			}
-			dw.bh.log().WarnContext(ctx, "replaying missed changes failed; dependency wakes for them are still owed",
-				"watermark", dw.watermark, "err", err)
-			return false
-		}
-		if len(page) == 0 {
-			// Caught up. The rows just replayed may also be sitting in the receiver,
-			// buffered before the cursor overtook them, so the floor moves with the
-			// cursor: those deliveries are expected, not evidence of misordering.
-			dw.graceFloor = max(dw.graceFloor, dw.watermark)
-			return true
-		}
-		// dependentsWake advances the watermark itself, which is what makes the next
-		// page start where this one ended.
-		if !dw.dependentsWake(ctx, page, commitOrdered, 0) {
-			return false
-		}
-		if len(page) < replayPageCap {
-			// A short page means nothing was live above it when the store answered.
-			// Anything committed since is already on the live stream — the subscription
-			// is established before a replay runs — so stopping here saves the empty
-			// query that would otherwise end every replay.
-			dw.graceFloor = max(dw.graceFloor, dw.watermark)
-			return true
-		}
-	}
-}
-
-// run consumes one subscription until ctx is cancelled or the stream ends. It
-// requeues dependents when a target changes, until ctx is
-// cancelled or the stream ends. The stream is store-wide and established by
-// Start (events-only, no snapshot: the reconciler's own startup pass already
-// covers existing objects), and it arrives in batches — a burst of changes costs
-// one edges query rather than one per change. The ctx.Done() arm is needed
-// because a watcher's channel may never close on its own.
-func (dw *waker) run(ctx context.Context, w *ObjectWritesSubscription) {
-	defer w.Close()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case batch, ok := <-w.Changes():
-			if !ok {
-				// Stop closes the stream by cancelling this same ctx, so on shutdown
-				// both select arms are ready at once and Go may pick this one. Re-check
-				// before calling it a loss: escalating here would arm every later tick
-				// of a control plane that is going away, on a stream that ended
-				// normally.
-				if ctx.Err() != nil {
-					return
-				}
-				// The stream ended without the control plane stopping (that arrives on
-				// ctx.Done above, and is not a loss). Nothing re-subscribes, and this is
-				// the process's only change stream, so until it is back no change of any
-				// kind reaches a dependent.
-				dw.bh.log().Warn("dependency waker change stream ended for every kind; resubscribing and replaying the changes it missed")
-				return
-			}
-			if !dw.dependentsWake(ctx, batch.Writes, commitBounded, batch.OldestPending) {
-				// The batch was dropped and the watermark still points below it, so the
-				// changes are recoverable by re-reading them. Keep replaying until one
-				// gets through, before consuming anything further: taking the next batch
-				// first would interleave a success past a failure, and the cursor may only
-				// move once everything below it is done. Stalling here is safe because the
-				// hub conflates per object — what a paused consumer holds is bounded by
-				// the store's live key set, not by how much churn it missed.
-				//
-				// Paced, because the lookup that failed is the one a replay makes again:
-				// a store unhappy enough to fail it will fail the retry too, and retrying
-				// at stream speed would add two queries per incoming batch to the single
-				// connection that is already struggling.
-				for attempt := 0; !dw.replay(ctx); attempt++ {
-					if !dw.backoff(ctx, attempt) {
-						return
-					}
-				}
-			}
-		}
-	}
-}
-
-// dependentsWake requeues every object that depends_on one of targetIDs,
-// each in its own kind's reconciler. Over-eager wakes are harmless: unregistered
-// kinds are ignored and the work queue coalesces duplicates.
-//
-// It resolves the whole batch in one edges query, which is not merely an
-// optimization: the store runs on a single connection, so every lookup the waker
-// makes serializes against every writer in the process — and the waker sees every
-// change in the store, not just the registered kinds'. One query per burst rather
-// than one per change is what keeps a write-heavy kind from taxing them all.
-//
-// It wakes on any present-state change. Added matters as much as Modified: the
-// conflating store hub coalesces a create-then-modify into a single Added, so
-// skipping it would drop the modify's wake. A brand-new object usually has no
-// dependents, so the extra lookup is a cheap no-op — the over-wake is harmless.
-// Deleted carries nothing to requeue (a gone object has no dependents).
-// Duplicates are collapsed by scan rather than by a map: the hub already
-// coalesces per object so a repeat is rare, and the batch is bounded, but the
-// wake policy must not depend on how its input was produced.
-//
-// It addresses dependents by bare id, both to skip the self-edge and to route
-// through d.GroupKind(), because an ObjectID is unique across every kind
-// (objects.id is one AUTOINCREMENT primary key for the whole table). Under a
-// per-kind id scheme the self-edge compare would also need the GroupKind, or it
-// would silently drop a foreign object's wake.
-func (dw *waker) dependentsWake(ctx context.Context, batch []ObjectWrite, commit commitRule, oldestPending int64) bool {
-	var high int64
-	// floor is the ceiling this batch's own contents prove the cursor must respect,
-	// or -1 if it proved nothing. Versions start at 1, so a real floor is never
-	// negative.
-	floor := int64(-1)
-	ids := make([]ObjectID, 0, len(batch))
-	for _, ref := range batch {
-		// Every reference that *arrives* counts toward the cursor, including the ones
-		// with nothing to wake: a delete carries no dependents, but its version is
-		// still a version this consumer has accounted for, and on a delete-heavy store
-		// those are most of what arrives. (A transient the consumer never observed does
-		// not arrive at all — writeSignalMerge annihilates the slot — so its version is
-		// simply never accounted for, and the next arrival's higher version covers it.)
-		high = max(high, ref.ResourceVersion)
-		// A write at or below the cursor is proof the cursor was committed over
-		// something undelivered, which can only happen if publication went out of
-		// version order. Report it and give the ground back; see overCommitted.
-		//
-		// Versions start at 1, so a zero carries no cursor information at all: a
-		// backend that does not populate it has opted out of the cursor rather than
-		// misordered anything, and contributes nothing to high either, so the watermark
-		// simply never advances from it. Below the grace floor is the seed/replay
-		// overlap, which is expected over-delivery rather than evidence.
-		if ref.ResourceVersion > dw.graceFloor && ref.ResourceVersion <= dw.watermark {
-			dw.overCommitted(ctx, ref)
-			if f := ref.ResourceVersion - 1; floor < 0 || f < floor {
-				floor = f
-			}
-		}
-		if ref.Type != Added && ref.Type != Modified {
-			continue
-		}
-		if !slices.Contains(ids, ref.ID) {
-			ids = append(ids, ref.ID)
-		}
-	}
-	// Give the ground back before anything else, so a batch that then fails its
-	// lookup still leaves the cursor where a replay can reach the missed changes.
-	dw.clampTo(floor)
-	// A batch with nothing to wake is still consumed, so the assignments below cover
-	// both: the cursor moves exactly when this reports success.
-	if len(ids) > 0 && !dw.dependentsEnqueue(ctx, ids) {
-		return false
-	}
-	dw.seen = max(dw.seen, high)
-	switch commit {
-	case commitBounded:
-		// oldestPending is the version of the oldest write still queued behind this
-		// batch, so everything below it is delivered — or superseded by something
-		// pending, whose own version is at or above the bound and therefore above the
-		// cursor, where a replay will find it.
-		switch {
-		case oldestPending > 0:
-			dw.watermark = max(dw.watermark, oldestPending-1)
-		case oldestPending == 0:
-			// The backlog was empty, so everything published has reached us and the
-			// highest version delivered is the most that can be claimed.
-			dw.watermark = max(dw.watermark, dw.seen)
-		default:
-			// The backend could not tell — a closed handle abandons whatever it was
-			// holding, so there may be writes below anything seen that will never
-			// arrive. Hold the cursor; a replay from here is always sound.
-		}
-	case commitOrdered:
-		// A replay page: version-ordered and complete, so everything up to this page's
-		// own high is done — but nothing above it is, whatever seen may hold from an
-		// earlier live batch. Jumping to seen here would step over the range between.
-		dw.watermark = max(dw.watermark, high)
-	}
-	// And again after the commit: seen is precisely what a version-ordering violation
-	// makes untrustworthy, so the empty-backlog branch above would otherwise hand back
-	// the ground this batch just proved the cursor cannot have.
-	dw.clampTo(floor)
-	return true
-}
-
-// clampTo lowers the cursor to floor when this batch proved it had claimed more than
-// it should. A negative floor means it proved nothing.
-//
-// seen comes down with it, and that is the whole repair rather than a detail: seen is
-// what the empty-backlog branch commits, so leaving it high would let the very next
-// batch jump straight back over the reserved range with no replay in between — the
-// clamp would lower the watermark and change nothing.
-func (dw *waker) clampTo(floor int64) {
-	if floor >= 0 {
-		dw.watermark = min(dw.watermark, floor)
-		dw.seen = min(dw.seen, floor)
-	}
-}
-
-// overCommitted reports a delivered write at or below the watermark and gives back
-// the ground the cursor should not have claimed.
-//
-// The invariant: after committing watermark W, every later delivery has a version
-// above W — anything still queued has a first-touch version above W, so the version
-// it is delivered with is at least that, and a replay reads only rows above W. So a
-// delivery at or below W cannot happen while publication is in version order, and
-// this is the one place that notices when it is not. Error rather than Warn: unlike
-// a dropped stream this is a broken invariant, not an operating condition.
-//
-// Pulling the cursor back to just below the offender (see clampTo) repairs the
-// common case, where the late write arrives before anything drops the stream. It
-// cannot repair the case where the stream drops first — that needs the bound to be
-// right rather than checked, which is what the store's publication ordering is for.
-func (dw *waker) overCommitted(ctx context.Context, ref ObjectWrite) {
-	dw.bh.log().ErrorContext(ctx, "dependency waker received a write at or below its cursor, so the cursor was advanced past an undelivered change; object writes are being published out of version order",
-		"objectID", ref.ID, "resourceVersion", ref.ResourceVersion, "watermark", dw.watermark)
-}
-
-// dependentsEnqueue resolves the dependents of targetIDs in one edges query and
-// requeues each on its own kind's reconciler, reporting whether the lookup got
-// through. A false answer means these changes are still owed: the caller holds the
-// watermark so a replay can re-read them.
-func (dw *waker) dependentsEnqueue(ctx context.Context, targetIDs []ObjectID) bool {
-	byTarget, err := dw.bh.store.EdgesGroupIncomingByID(ctx, targetIDs, RelationDependsOn)
-	if err != nil {
-		// Shutdown cancels this same ctx, so a change already dequeued when Stop
-		// lands fails here for no reason of its own — the same re-check the
-		// stream-ended path makes, for the same reason.
-		if ctx.Err() != nil {
-			return false
-		}
-		// Every dependent of these targets just missed their changes, and a dependent
-		// that has settled is invisible to every owed-work listing — its own
-		// generation never moved. Nothing here can name who was missed: the lookup
-		// that failed is exactly the one that would have said. Replaying the changes
-		// themselves is what repairs it.
-		dw.bh.log().WarnContext(ctx, "dependents lookup failed; replaying these changes from the watermark",
-			"targetIDs", targetIDs, "err", err)
-		return false
-	}
-	for _, targetID := range targetIDs {
-		for _, d := range byTarget[targetID] {
-			if d.ID == targetID {
-				// Self-edge: nothing here is owed a wake. A spec write requeues through
-				// wakeAfterCommit; a status or condition write is this object's own pass,
-				// which just ran. Waking it re-enqueues at full speed with nothing to
-				// converge it. Cycles of two or more still do; see the cycle entry in
-				// TODO.md.
-				continue
-			}
-			dw.bh.enqueueIfRegistered(d.GroupKind(), d.ID)
-		}
-	}
-	return true
 }
 
 // stop tears the control plane down: it cancels the reconcile loops and waits
@@ -781,8 +277,8 @@ func (bh *Beehive) stop(ctx context.Context) error {
 		return nil
 	}
 	// Transition and cancel under the lock, then release it before waiting on wg.
-	// The dependency wakers (counted in wg) acquire bh.mu via enqueueIfRegistered;
-	// holding it across wg.Wait would deadlock a waker mid-event against Stop when
+	// The dependency waker (counted in wg) acquires bh.mu to resolve reconcilers;
+	// holding it across wg.Wait would deadlock a waker mid-scan against Stop when
 	// ctx is unbounded. order is frozen after Start, so it's safe to read unlocked.
 	bh.state = beehiveStopped
 	bh.cancel()
@@ -803,9 +299,9 @@ func (bh *Beehive) stop(ctx context.Context) error {
 		drainErr = ctx.Err()
 	}
 
-	// Watch subscriptions are owned by the store, not the control plane, so stop
-	// does not terminate them: an active watcher ends when its context is
-	// cancelled or the store is closed.
+	// Client watch streams poll the store directly and are not counted in wg, so
+	// stop does not terminate them: one ends when its own context is cancelled or
+	// the store is closed under it.
 	bh.log().Info("control plane stopped")
 	return drainErr
 }
@@ -814,13 +310,15 @@ func (bh *Beehive) stop(ctx context.Context) error {
 // returned Beehive before calling Start.
 func New(s Store, opts ...Option) (*Beehive, error) {
 	bh := &Beehive{
-		store:           s,
-		startupResync:   true,
-		catchupInterval: defaultCatchupInterval,
-		resyncInterval:  defaultResyncInterval,
-		gcInterval:      defaultGCInterval,
-		reconcilers:     make(map[GroupKind]*reconciler),
-		migrators:       make(map[GroupKind]Migrator),
+		store:             s,
+		startupFullPass:   defaultStartupFullPass,
+		owedPassInterval:  defaultOwedPassInterval,
+		fullPassInterval:  defaultFullPassInterval,
+		gcInterval:        defaultGCInterval,
+		wakeInterval:      defaultWakeInterval,
+		watchPollInterval: defaultWatchPollInterval,
+		reconcilers:       make(map[GroupKind]*reconciler),
+		migrators:         make(map[GroupKind]Migrator),
 	}
 	bh.waker = &waker{bh: bh}
 	for _, o := range opts {
@@ -850,27 +348,24 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		gk:               gk,
 		store:            bh.store,
 		work:             newWorkQueue(),
-		scheduleHub:      conflate.New[ObjectID](scheduleMerge),
-		catchupInterval:  bh.catchupInterval,
-		resyncInterval:   bh.resyncInterval,
+		owedPassInterval: bh.owedPassInterval,
+		fullPassInterval: bh.fullPassInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
 		concurrency:      bh.concurrency,
-		startupResync:    bh.startupResync,
+		startupFullPass:  bh.startupFullPass,
 		backoffFor:       make(map[ObjectID]time.Duration),
 		// Inherit the control plane's logging config as the default; the options
 		// below may override it for this controller.
 		logger:   bh.logger,
 		logLevel: bh.logLevel,
 	}
-	// Feed the work queue's schedule changes into the hub (see schedulePublish).
-	r.work.onSchedule = r.schedulePublish
 	// Build the client once here so it's allocated per kind, not per reconcile,
 	// and hand the same instance to both the adapter and the caller.
 	client := &controllerClientImpl[Status]{bh: bh, gk: gk}
 	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c, client: client}
 	r.adapter = adapter
 
-	// Per-controller option overrides (e.g. WithResyncInterval, WithMaxRetryInterval).
+	// Per-controller option overrides (e.g. WithFullPassInterval, WithMaxRetryInterval).
 	for _, o := range opts {
 		if err := o(r); err != nil {
 			return nil, err
@@ -925,10 +420,26 @@ func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 	return r, ok
 }
 
-// enqueueIfRegistered wakes the reconciler for (gk, id) if one exists.
-// It is a no-op when gk has no registered controller (e.g. a client-only kind).
-func (bh *Beehive) enqueueIfRegistered(gk GroupKind, id ObjectID) {
-	if r, ok := bh.reconcilerFor(gk); ok {
-		r.enqueue(id)
+// enqueuerForPage returns an enqueue function that resolves each kind once and then
+// caches it, for a caller queueing many ids across a few kinds at once. Resolving per
+// id would take bh.mu every time, and one page of the dependency waker's scan can
+// reach thousands of dependents — thousands of acquisitions of a mutex Register and
+// stop also want.
+//
+// The registration set is frozen after Start (Register rejects a late call), so a
+// cache that outlives one page would still be correct; it is scoped to the caller
+// anyway, since nothing needs it longer and a per-call map needs no locking of
+// its own.
+func (bh *Beehive) enqueuerForPage() func(GroupKind, ObjectID) {
+	resolved := map[GroupKind]*reconciler{}
+	return func(gk GroupKind, id ObjectID) {
+		r, ok := resolved[gk]
+		if !ok {
+			r, _ = bh.reconcilerFor(gk) // nil for a client-only kind, cached as such
+			resolved[gk] = r
+		}
+		if r != nil {
+			r.enqueue(id)
+		}
 	}
 }

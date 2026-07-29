@@ -533,34 +533,33 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	assert.NotNil(t, obj.DeletionRequestedAt)
 }
 
-// TestClientGetOrCreateEnqueuesOnlyOnCreate pins the found branch's defining
-// property: returning an existing row is a pure read and must not wake the
-// reconciler. Registering without Start gives a reconciler whose queue nothing
-// drains, so the enqueues are directly observable.
-func TestClientGetOrCreateEnqueuesOnlyOnCreate(t *testing.T) {
+// GetOrCreate's create branch leaves the new object unsettled — which is what the
+// owed pass drains — while its found branch writes nothing at all, so an
+// existing row keeps whatever settled state it had. That asymmetry is the whole
+// contract: GetOrCreate never mutates a row it did not create.
+func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
+	store := newClientTestStore(t)
+	bh, err := New(store)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
-	r, ok := bh.reconcilerFor(clientTestGK)
-	require.True(t, ok)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
 	require.NoError(t, err)
 	require.True(t, created)
-	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "create must enqueue the new object")
+	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a new object is owed its first pass")
 
-	// Drain first: addLocked early-returns for an already-dirty id, so a still-queued
-	// id would mask a missing guard on the found branch.
-	drainQueue(r.work)
-	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+	// Settle it, so the found branch below starts from "nothing owed".
+	_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+	require.NoError(t, err)
+	require.Empty(t, unsettledIDs(t, store), "precondition: settled")
 
 	_, created, err = client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
 	require.NoError(t, err)
 	require.False(t, created)
-	assert.Empty(t, queuedIDs(r.work), "returning an existing row must not enqueue")
+	assert.Empty(t, unsettledIDs(t, store), "returning an existing row writes nothing, so it owes nothing")
 }
 
 // badDecodeSpec marshals to valid JSON that does not unmarshal back into the
@@ -777,12 +776,16 @@ func TestClientWithOnCreateFiresOnlyAfterOuterCommit(t *testing.T) {
 	}
 }
 
-// TestClientWritesWakeOnlyAfterOuterCommit pins the post-commit wake. A write
-// nested in ControllerClient.Within joins that transaction, so enqueuing when the
-// nested store.Within returns would wake the controller while the row is still
-// uncommitted and its spec event still buffered — letting a Modified event
-// overtake the Added, and waking at all for a row that never lands.
-func TestClientWritesWakeOnlyAfterOuterCommit(t *testing.T) {
+// TestClientWritesAreOwedOnlyAfterOuterCommit pins what a write leaves behind for
+// the owed pass to find. Nothing is scheduled at write time any more: a spec
+// write bumps the generation, which is exactly what makes the object unsettled,
+// and the unsettled listing is what the owed-pass tick drains.
+//
+// The rollback case is the point. A write nested in ControllerClient.Within joins
+// that transaction, so a rolled-back write must leave no trace at all — and here
+// that is structural rather than something the client has to remember to skip:
+// the row is gone, so no listing can name it.
+func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 	writes := []struct {
 		name  string
 		write func(ctx context.Context, c Client[cSpec, cStatus], seeded ObjectID) error
@@ -809,27 +812,24 @@ func TestClientWritesWakeOnlyAfterOuterCommit(t *testing.T) {
 		t.Run(w.name, func(t *testing.T) {
 			runCommitRollback(t, func(t *testing.T, commit bool) {
 				ctx := context.Background()
-				bh, err := New(newClientTestStore(t))
+				store := newClientTestStore(t)
+				bh, err := New(store)
 				require.NoError(t, err)
-				// Registering without Start leaves a reconciler whose queue nothing
-				// drains, so the enqueues are directly observable.
+				// Registered but never started, so nothing drains what the writes owe.
 				_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 				require.NoError(t, err)
-				r, ok := bh.reconcilerFor(clientTestGK)
-				require.True(t, ok)
 
 				client := NewClient[cSpec, cStatus](bh, clientTestGK)
 				seeded, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("seed"))
 				require.NoError(t, err)
-				// Drain: addLocked early-returns for an already-dirty id, so the
-				// seed's own wake would mask the write's.
-				drainQueue(r.work)
-				require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+				// Settle the seed so its own unconverged spec doesn't mask the write's.
+				_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
+				require.NoError(t, err)
+				require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
 				cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 				err = cc.Within(ctx, func(ctx context.Context) error {
 					require.NoError(t, w.write(ctx, client, seeded.ID))
-					assert.Empty(t, queuedIDs(r.work), "the wake must wait for the outer commit")
 					if !commit {
 						return errBoom
 					}
@@ -838,22 +838,22 @@ func TestClientWritesWakeOnlyAfterOuterCommit(t *testing.T) {
 
 				if commit {
 					require.NoError(t, err)
-					assert.NotEmpty(t, queuedIDs(r.work), "a committed write must wake the reconciler")
+					assert.NotEmpty(t, unsettledIDs(t, store), "a committed write leaves the object owed a pass")
 				} else {
 					require.ErrorIs(t, err, errBoom)
-					assert.Empty(t, queuedIDs(r.work), "a rolled-back write must not wake the reconciler")
+					assert.Empty(t, unsettledIDs(t, store), "a rolled-back write leaves nothing owed")
 				}
 			})
 		})
 	}
 }
 
-// TestClientNoOpUpdateDoesNotWake pins the wake to a real row change. ObjectsUpdateSpec
-// suppresses an identical-bytes write entirely — no generation bump, no
-// resource_version bump, no event — so a wake would be the lone signal claiming
-// something happened. It also closes a spin: a controller that idempotently
-// re-applies its own kind's spec each pass would otherwise wake itself forever.
-func TestClientNoOpUpdateDoesNotWake(t *testing.T) {
+// TestClientNoOpUpdateOwesNothing pins the follow-up to a real row change.
+// ObjectsUpdateSpec suppresses an identical-bytes write entirely — no generation
+// bump, no resource_version bump — so a settled object stays settled and no
+// listing reports it. It also closes a spin: a controller that idempotently
+// re-applies its own kind's spec each pass would otherwise re-owe itself forever.
+func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	writes := []struct {
 		name  string
 		write func(ctx context.Context, c Client[cSpec, cStatus], id ObjectID) error
@@ -871,67 +871,67 @@ func TestClientNoOpUpdateDoesNotWake(t *testing.T) {
 	for _, w := range writes {
 		t.Run(w.name, func(t *testing.T) {
 			ctx := context.Background()
-			bh, err := New(newClientTestStore(t))
+			store := newClientTestStore(t)
+			bh, err := New(store)
 			require.NoError(t, err)
 			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 			require.NoError(t, err)
-			r, ok := bh.reconcilerFor(clientTestGK)
-			require.True(t, ok)
 
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 			obj, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
 			require.NoError(t, err)
-			drainQueue(r.work) // drop the create's own wake
-			require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
+			// Settle it, so anything the writes below owe is theirs.
+			_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+			require.NoError(t, err)
+			require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
 			require.NoError(t, w.write(ctx, client, obj.ID))
-			assert.Empty(t, queuedIDs(r.work), "re-applying the identical spec must not wake")
+			assert.Empty(t, unsettledIDs(t, store), "re-applying the identical spec leaves it settled")
 
-			// A real change still does, so the suppression is scoped to the no-op.
+			// A real change still unsettles it, so the suppression is scoped to the no-op.
 			_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 			require.NoError(t, err)
-			assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a real spec change must wake")
+			assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a real spec change is owed a pass")
 		})
 	}
 }
 
 // TestClientDeleteAdvancesGCOnlyAfterOuterCommit covers Delete, whose follow-up is
-// gcAdvance rather than a plain wake. It must wait for the outer commit for the same
+// a collect rather than a reconcile. It must wait for the outer commit for the same
 // reason every other write's wake does: a reconciler woken mid-transaction would
 // either read a row whose tombstone is not visible yet, or be woken for a deletion
 // the caller then rolls back.
-func TestClientDeleteAdvancesGCOnlyAfterOuterCommit(t *testing.T) {
+func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 	runCommitRollback(t, func(t *testing.T, commit bool) {
 		ctx := context.Background()
-		bh, err := New(newClientTestStore(t))
+		store := newClientTestStore(t)
+		bh, err := New(store)
 		require.NoError(t, err)
 		_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 		require.NoError(t, err)
-		r, ok := bh.reconcilerFor(clientTestGK)
-		require.True(t, ok)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 		obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("test/hold"))
 		require.NoError(t, err)
-		drainQueue(r.work) // drop the create's own wake
-		require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
 		cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 		err = cc.Within(ctx, func(ctx context.Context) error {
 			require.NoError(t, client.Delete(ctx, obj.ID))
-			assert.Empty(t, queuedIDs(r.work), "the GC wake must wait for the outer commit")
 			if !commit {
 				return errBoom
 			}
 			return nil
 		})
 
+		pending, listErr := store.DeletionRequestsList(ctx)
+		require.NoError(t, listErr)
 		if commit {
 			require.NoError(t, err)
-			assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a committed delete must wake the reconciler")
+			require.Len(t, pending, 1, "a committed delete is in the sweeper's listing")
+			assert.Equal(t, obj.ID, pending[0].ID)
 		} else {
 			require.ErrorIs(t, err, errBoom)
-			assert.Empty(t, queuedIDs(r.work), "a rolled-back delete must not wake the reconciler")
+			assert.Empty(t, pending, "a rolled-back delete leaves nothing for the sweeper to find")
 		}
 	})
 }
@@ -1123,7 +1123,7 @@ func TestClientDelete(t *testing.T) {
 	require.NoError(t, err)
 
 	// object still present (no finalizers cleared), but marked for deletion. The
-	// default resync is enabled, so the client-only object isn't collected
+	// the default full pass is enabled, so the client-only object isn't collected
 	// synchronously by Delete — the idle sweeper is its backstop.
 	got, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
@@ -1197,31 +1197,32 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	assert.Equal(t, pending.ResourceVersion, got.ResourceVersion)
 }
 
-// gcAdvance's registered-kind branch: the object must be handed to its controller
+// the sweeper's registered-kind branch: the object must be handed to its controller
 // to clear finalizers, the one part of Delete's tail DeleteBySlug still runs itself
 // now that the store resolves and marks in one statement. A slug that matches no
 // row must wake nobody.
-func TestClientDeleteBySlugAdvancesGC(t *testing.T) {
+func TestClientDeleteBySlugMarksForCollection(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
+	store := newClientTestStore(t)
+	bh, err := New(store)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
-	r, ok := bh.reconcilerFor(clientTestGK)
-	require.True(t, ok)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
 	require.NoError(t, err)
-	drainQueue(r.work) // drop the create's own wake
-	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
 	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
-	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+	pending, err := store.DeletionRequestsList(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "the mark is the whole signal: it puts the row in the sweeper's listing")
+	assert.Equal(t, obj.ID, pending[0].ID)
 
-	drainQueue(r.work)
 	require.NoError(t, client.DeleteBySlug(ctx, "absent"))
-	assert.Empty(t, queuedIDs(r.work), "an unresolved slug must not enqueue anything")
+	pending, err = store.DeletionRequestsList(ctx)
+	require.NoError(t, err)
+	assert.Len(t, pending, 1, "an unresolved slug marks nothing")
 }
 
 // A slug is per-kind, so another kind's row holding the same slug is invisible:
@@ -1282,28 +1283,6 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	assert.Equal(t, "v1", got.Spec.Val)
 	assert.Equal(t, int64(1), got.Generation)
 	assert.Nil(t, got.DeletionRequestedAt)
-}
-
-// TestRawToTypedDecodesNullSpecTombstone pins the contract the lag-recovery
-// tombstone relies on: a Deleted tombstone carries a JSON null spec (see
-// sqlite/watch.go), and the typed watch decodes every event's spec through
-// rawToTyped. null must decode into an arbitrary Spec as the zero value — here a
-// scalar Spec, for which the old "{}" tombstone would fail to unmarshal and
-// silently close the watch.
-func TestRawToTypedDecodesNullSpecTombstone(t *testing.T) {
-	// Scalar (non-object) spec: json.Unmarshal of "{}" into this errors.
-	type scalarSpec = string
-
-	tombstone := &RawObject{ID: 7, Kind: "Widget", Spec: []byte("null")}
-	obj, err := rawToTyped[scalarSpec, cStatus](tombstone, nil)
-	require.NoError(t, err)
-	assert.Equal(t, ObjectID(7), obj.ID)
-	assert.Equal(t, "", obj.Spec) // zero value, no Status to decode
-
-	// Guard the premise: the previous "{}" tombstone would have failed here,
-	// which is exactly the silent-close bug the null spec avoids.
-	_, err = rawToTyped[scalarSpec, cStatus](&RawObject{ID: 7, Kind: "Widget", Spec: []byte("{}")}, nil)
-	require.Error(t, err)
 }
 
 // createBadJSONStore returns bad JSON from ObjectsCreate so rawToTyped fails.
@@ -1407,17 +1386,6 @@ func (s *badJSONStore) ObjectsList(_ context.Context, _ GroupKind) ([]*RawObject
 	return []*RawObject{{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}}, nil
 }
 
-// newWatchClient registers gk with a fake controller (so the client-side
-// isRegistered check passes) and returns a client backed by store.
-func newWatchClient(t *testing.T, store Store, gk GroupKind) Client[tSpec, tStatus] {
-	t.Helper()
-	bh, err := New(store)
-	require.NoError(t, err)
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
-	return NewClient[tSpec, tStatus](bh, gk)
-}
-
 func TestClientCreateStoreError(t *testing.T) {
 	bh, err := New(&errorObjectsCreateStore{})
 	require.NoError(t, err)
@@ -1450,22 +1418,6 @@ func TestClientUpdateRawToTypedError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestClientWatchPropagatesStoreError verifies the client surfaces an error
-// returned by the store's Watch/WatchList (e.g. a failed snapshot load).
-func TestClientWatchPropagatesStoreError(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&watcherStore{err: errBoom})
-	require.NoError(t, err)
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	_, err = client.ObjectsWatch(context.Background(), 1)
-	require.ErrorIs(t, err, errBoom)
-	_, err = client.ObjectsWatchList(context.Background())
-	require.ErrorIs(t, err, errBoom)
-}
-
 func TestClientListStoreError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	bh, err := New(&errorListObjectsStore{})
@@ -1488,111 +1440,6 @@ func TestClientListRawToTypedError(t *testing.T) {
 	assert.Empty(t, objs, "the only row was un-decodable, so none are returned")
 }
 
-// TestClientAdaptWatcherConversionError verifies a raw event whose Spec is
-// invalid JSON is skipped (quarantined) and the stream stays open, rather than
-// closing the typed channel. A following good event still flows.
-func TestClientAdaptWatcherConversionError(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	w := newFakeObjectStream()
-	client := newWatchClient(t, &watcherStore{w: w}, gk)
-
-	ch, err := client.ObjectsWatchList(context.Background())
-	require.NoError(t, err)
-
-	w.push(Modified, &RawObject{ID: 1, Spec: []byte("not-json")})
-	w.push(Added, &RawObject{ID: 2, Spec: []byte(`{}`)})
-
-	select {
-	case evt, ok := <-ch:
-		require.True(t, ok, "stream must stay open past the poison event")
-		assert.EqualValues(t, 2, evt.Object.ID, "the good event flows after the skipped one")
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the good event")
-	}
-}
-
-// TestClientAdaptWatcherForwardsThenClosesOnCancel verifies a decodable event is
-// forwarded as a typed ObjectChange, and cancelling the context closes the channel.
-func TestClientAdaptWatcherForwardsThenClosesOnCancel(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	w := newFakeObjectStream()
-	client := newWatchClient(t, &watcherStore{w: w}, gk)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := client.ObjectsWatchList(ctx)
-	require.NoError(t, err)
-
-	w.push(Added, &RawObject{ID: 1, Spec: []byte(`{}`)})
-	select {
-	case evt, ok := <-ch:
-		require.True(t, ok)
-		assert.Equal(t, Added, evt.Type)
-		assert.EqualValues(t, 1, evt.Object.ID)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for forwarded event")
-	}
-
-	cancel()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "channel must close on ctx cancel")
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for channel to close")
-	}
-}
-
-// TestClientAdaptWatcherSendParkCtxDone covers the adapter exiting on ctx
-// cancellation while parked sending a typed event: an event is delivered to the
-// adapter but never read downstream, then the context is cancelled.
-func TestClientAdaptWatcherSendParkCtxDone(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	w := newFakeObjectStream()
-	client := newWatchClient(t, &watcherStore{w: w}, gk)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := client.ObjectsWatchList(ctx)
-	require.NoError(t, err)
-
-	// push returns once the adapter has taken the event; with no reader on ch it
-	// then parks on its inner send. Cancelling makes that send take the ctx.Done
-	// arm. Synchronize on the goroutine's exit (Close) rather than reading ch:
-	// a read here could satisfy the pending send and race the closed-vs-delivered
-	// outcome (notably under -race).
-	w.push(Added, &RawObject{ID: 1, Spec: []byte(`{}`)})
-	cancel()
-	select {
-	case <-w.closed:
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for adapter goroutine to exit")
-	}
-
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "channel must close when ctx is cancelled mid-send")
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for channel to close")
-	}
-}
-
-// TestClientAdaptWatcherClosesWhenStreamEnds verifies the typed channel closes
-// when the underlying store watcher's stream ends.
-func TestClientAdaptWatcherClosesWhenStreamEnds(t *testing.T) {
-	gk := GroupKind{Kind: "Widget"}
-	w := newFakeObjectStream()
-	client := newWatchClient(t, &watcherStore{w: w}, gk)
-
-	ch, err := client.ObjectsWatchList(context.Background())
-	require.NoError(t, err)
-
-	w.endStream()
-	select {
-	case _, ok := <-ch:
-		assert.False(t, ok, "channel must close when the watcher stream ends")
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for channel to close")
-	}
-}
-
 // recv waits for the next value on ch, failing the test if none arrives within
 // the failsafe timeout.
 func recv[T any](t *testing.T, ch <-chan T) T {
@@ -1603,7 +1450,7 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 			t.Fatal("watch channel closed unexpectedly")
 		}
 		return v
-	case <-time.After(2 * time.Second):
+	case <-time.After(testTimeout):
 		t.Fatal("timed out waiting for a watch value")
 		panic("unreachable")
 	}
@@ -1613,7 +1460,7 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 func assertChanClosed[T any](t *testing.T, ch <-chan T) {
 	t.Helper()
 	// Drain any buffered values, then expect close.
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(testTimeout)
 	for {
 		select {
 		case _, ok := <-ch:
@@ -1630,7 +1477,7 @@ func assertChanClosed[T any](t *testing.T, ch <-chan T) {
 // controller for clientTestGK. No Start is needed for client-side event tests.
 func watchTestBH(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
 	t.Helper()
-	bh, err := New(newClientTestStore(t))
+	bh, err := New(newClientTestStore(t), fast()...)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -1720,16 +1567,25 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	recv(t, ch) // drain first Modified
 
-	// Second Delete is idempotent; no new event should arrive.
+	// Second Delete is idempotent. Pinned at the mechanism first: the watch emits
+	// off resource_version, so a write that leaves it alone is invisible to the
+	// poller no matter when it looks.
+	before, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	select {
-	case evt, ok := <-ch:
-		if ok {
-			t.Fatalf("unexpected event on idempotent delete: %v", evt)
-		}
-	case <-time.After(100 * time.Millisecond):
-		// correct — nothing arrived
-	}
+	after, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion,
+		"an idempotent delete bumped resource_version, which is what the watch emits on")
+
+	// And on the stream: a fresh object gives the poller something it *must* report,
+	// so anything the idempotent delete emitted has to show up at or before that
+	// frame. Reading until the Added arrives therefore sees every stray there is.
+	other, err := client.Create(ctx, cSpec{})
+	require.NoError(t, err)
+	evt := recv(t, ch)
+	require.Equal(t, other.ID, evt.Object.ID, "unexpected event on idempotent delete: %v", evt.Type)
+	assert.Equal(t, Added, evt.Type)
 }
 
 // TestWatchReceivesOnlyMatchingID verifies that Watch(id) filters out events
@@ -1798,7 +1654,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	ctx := context.Background()
 
 	// watchTestBH already registered one; we need a fresh beehive for this test.
-	bh2, err := New(newClientTestStore(t))
+	bh2, err := New(newClientTestStore(t), fast()...)
 	require.NoError(t, err)
 	cc, err := Register(bh2, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -1878,7 +1734,8 @@ func TestWatchInitialSnapshot(t *testing.T) {
 }
 
 // TestStartAfterStopErrors verifies that Beehive is a one-shot object: calling
-// Start after Stop returns an error instead of silently reusing closed hubs.
+// Start after Stop returns an error instead of silently re-driving a torn-down
+// control plane.
 func TestStartAfterStopErrors(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -2670,7 +2527,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 func TestClientWatchScheduleLive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t))
+	bh, err := New(newClientTestStore(t), fast()...)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -2737,9 +2594,6 @@ func (eventErrStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) 
 func (eventErrStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	return nil, errBoom
 }
-func (eventErrStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
-	return nil, errBoom
-}
 func (eventErrStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
 	return 0, errBoom
 }
@@ -2759,8 +2613,6 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	_, err = client.EventsList(ctx, obj.ID)
 	assert.ErrorIs(t, err, errBoom)
 	_, _, err = client.EventsGetLatest(ctx, obj.ID, "c")
-	assert.ErrorIs(t, err, errBoom)
-	_, err = client.EventsWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, errBoom)
 	_, err = client.Get(ctx, obj.ID, LoadEvents())
 	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on Get")
@@ -2782,47 +2634,6 @@ func TestClientListEventsEmpty(t *testing.T) {
 	got, err := client.EventsList(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Empty(t, got)
-}
-
-// fakeEventStream is a controllable EventsSubscription for adaptEventStream tests.
-type fakeEventStream struct{ ch chan RawEvent }
-
-func (w *fakeEventStream) sub() *EventsSubscription {
-	return storeapi.NewSubscription[RawEvent](w.ch, func() {})
-}
-
-// adaptEventStream closes its output when the source stream ends, when ctx is
-// cancelled while waiting, and when ctx is cancelled mid-send.
-func TestAdaptEventStream(t *testing.T) {
-	t.Run("closes when the stream ends", func(t *testing.T) {
-		w := &fakeEventStream{ch: make(chan RawEvent)}
-		out := adaptEventStream(context.Background(), w.sub())
-		close(w.ch)
-		_, ok := <-out
-		assert.False(t, ok)
-	})
-
-	t.Run("exits when ctx cancelled while waiting", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		w := &fakeEventStream{ch: make(chan RawEvent)} // never sends or closes
-		out := adaptEventStream(ctx, w.sub())
-		cancel()
-		_, ok := <-out
-		assert.False(t, ok)
-	})
-
-	t.Run("exits when ctx cancelled mid-send", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		w := &fakeEventStream{ch: make(chan RawEvent)} // unbuffered
-		out := adaptEventStream(ctx, w.sub())
-		// This send returns only once the goroutine has received the event, so it is
-		// then parked on `out <- ev` (nothing reads out). Cancelling makes the inner
-		// select take ctx.Done.
-		w.ch <- RawEvent{Reason: "pending"}
-		cancel()
-		for range out { // drain to closure
-		}
-	})
 }
 
 // The motivating use case, end-to-end through the public API: a flapping cluster's
@@ -3030,7 +2841,7 @@ func TestClientWatchEvents(t *testing.T) {
 	case ev := <-ch:
 		assert.Equal(t, "ProbeFailed", ev.Reason)
 		assert.Equal(t, EventWarning, ev.Type)
-	case <-time.After(2 * time.Second):
+	case <-time.After(testTimeout):
 		t.Fatal("timed out waiting for event")
 	}
 

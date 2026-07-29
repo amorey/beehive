@@ -13,7 +13,9 @@
 // limitations under the License.
 
 // Package sqlite provides a durable, SQLite-backed implementation of the
-// beehive Store, including the conflating watch fan-out and schema migrations.
+// beehive Store: rows, edges, the event log, the write cursor every change
+// notification is derived from, and schema migrations. It holds no in-memory
+// fan-out — consumers scan the write log from a watermark.
 package sqlite
 
 import (
@@ -22,9 +24,7 @@ import (
 	"embed"
 	"time"
 
-	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlitemigrate"
-	"github.com/amorey/gobus/conflate"
 	_ "modernc.org/sqlite"
 )
 
@@ -59,9 +59,5 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		// processStart, so a sub-ms processStart would wrongly flag a condition
 		// written in the same millisecond the process started.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
-		hubs:         make(map[storeapi.GroupKind]*conflate.Hub[storeapi.ObjectID, storeapi.RawObjectChange]),
-		eventHubs:    make(map[storeapi.GroupKind]*conflate.Hub[eventKey, storeapi.Event]),
-		writeHub:     conflate.New[storeapi.ObjectID](writeSignalMerge),
-		done:         make(chan struct{}),
 	}, nil
 }

@@ -1,0 +1,242 @@
+# How an object becomes owed a reconcile
+
+Every way an object can come to owe a reconcile pass, what records it, which driver
+finds it, and whether that survives a restart. This is a coverage map, not a design
+record — the decisions behind it live in [the drivers ADR](adr/2026-07-28-periodic-scan-drivers.md)
+and [the caller-versioned dependencies ADR](adr/2026-07-27-caller-versioned-dependencies.md).
+
+It exists because the guarantee is distributed: no single file holds it. A write
+leaves a trace in one column, a driver in another file scans for it, and whether a
+restart still finds it depends on a third. Reading any one of those in isolation makes
+the system look more push-driven than it is.
+
+**Keep it in step with the code.** When you add a way for work to be owed, it belongs
+here with its recording site, its finding site, and its restart answer. Gaps are not
+listed here — they are in [`TODO.md`](../TODO.md), and linked from the case they
+belong to.
+
+## The shape of the answer
+
+Nothing is pushed, and **no write schedules a reconcile**. A write leaves a durable
+trace and a periodic driver finds it. There are exactly four traces, plus one
+mechanism that has no trace at all:
+
+| Trace | Column | Listed by | Driver |
+|---|---|---|---|
+| Spec not converged | `generation` vs `observed_generation` | `ObjectsListUnsettledIDs` | owed pass, per kind, 30s |
+| Wake owed | `reconcile_owed` | `ReconcileOwedListIDs` | owed pass, per kind, 30s |
+| Deletion requested | `deletion_requested_at` | `DeletionRequestsList` | GC sweeper, global, 30s, **cannot be disabled** |
+| Anything changed | `resource_version` | `ObjectWritesListSince` | dependency waker, global, 1s |
+| *(none)* | — | — | `workQueue`, in memory only |
+
+The first three are re-derived from state, so a restart finds them by definition. The
+fourth is a cursor scan, so a restart finds only what is above the watermark it seeds
+with. The fifth does not survive a restart at all.
+
+Startup runs exactly two things, both unconditionally: `enqueueOwedPass`
+(`reconciler.run`, before its workers start) and the GC sweeper's eager first sweep
+(`runDriver`). That is the whole of what a restart guarantees.
+
+**The full pass is not in this document, and that is deliberate.** Neither
+`WithFullPassInterval` nor `WithStartupFullPass` is on by default, and **no reconcile
+may depend on either**: both scale with the object count rather than with what is
+outstanding, so a guarantee resting on one holds only while the sweep stays
+affordable. A full pass is a re-confirm tool for process-scoped state — see
+[section E](#e-not-triggers) — never an answer to "how does this work get found". If
+the only answer for some path is "the full pass picks it up", that path is a defect,
+and it belongs in [`TODO.md`](../TODO.md) rather than in a coverage column here.
+
+---
+
+## A. Spec-derived
+
+All four cases below leave the same trace and are found the same way, so the coverage
+argument is shared:
+
+- **Found by:** `reconciler.enqueueUnsettled` → `ObjectsListUnsettledIDs`
+  (`observed_generation IS NULL OR observed_generation < generation`).
+- **Normal:** ✅ the owed-pass tick, 30s. Nothing schedules it sooner — a create or
+  update returns without touching a queue, which is why the examples call
+  `Client.Requeue` rather than turning intervals down.
+- **Restart:** ✅ `reconciler.run` calls `enqueueOwedPass` before its workers start, and
+  it is *not* gated on `startupFullPass`.
+- **Tests:** `TestIntegrationStartupEnqueuesUnsettled`, `TestStartupAlwaysDrainsOwedWork`
+  (pins that the drain happens even under `WithStartupFullPass(false)`),
+  `TestEnqueueUnsettledEnqueuesReturnedIDs`, `TestObjectsListUnsettledIDs`.
+
+1. **Create** — `Create` / `CreateOrUpdate` / `GetOrCreate` insert with `generation=1`
+   and `observed_generation` NULL (`sqliteStore.objectsCreate`). Tests:
+   `TestIntegrationCreateTriggersReconcile`, `TestClientGetOrCreateOwesAPassOnlyOnCreate`,
+   `TestClientWritesAreOwedOnlyAfterOuterCommit`.
+2. **Spec update** — `ObjectsUpdateSpec` bumps `generation`. Suppressed on equal bytes
+   at the same schema version, which is what stops a controller re-applying its own
+   spec from waking itself forever. Tests: `TestIntegrationUpdateTriggersReconcile`,
+   `TestObjectsUpdateSpecBumpsGeneration`, `TestClientNoOpUpdateOwesNothing`,
+   `TestSameVersionNoOpWritesNothing`.
+3. **Schema-version re-stamp** — equal bytes at a *different* spec version deliberately
+   falls through the no-op gate and bumps generation, because bytes in a different
+   shape are not comparable. Tests: `TestCrossVersionWriteIsNotANoOp`,
+   `TestNoOpWriteStampsUpwardWhileConverging`.
+4. **A stale status write re-unsettles** — `UpdateStatus` reporting an
+   `observedGeneration` behind the current one writes it unclamped on the content path,
+   so the object goes back to unsettled and the stale status gets re-derived. Tests:
+   `TestUpdateStatusChangedStaleGenerationUnsettles`, `TestUpdateStatusAcceptsStaleGeneration`.
+
+## B. Dependency-derived
+
+Two mechanisms, and the split between them is the whole design: one covers the window
+a scan structurally cannot see, the other covers everything else.
+
+### 5. The declare-race stamp (durable)
+
+A dependent that read its target, then declared the edge, may have read a version the
+target has already moved past. `EdgesAdd` increments `reconcile_owed` when the edge is
+**new** *and* the target's `resource_version` exceeds the caller's claim — in the same
+statement sequence as the edge insert, so the two cannot come apart.
+
+- **Recorded by:** `sqliteStore.EdgesAdd`, via `ControllerClient.DependenciesAdd`.
+- **Found by:** `reconciler.enqueueReconcileOwed` → `ReconcileOwedListIDs`. Drained by
+  `ReconcileOwedDecrement` in `typedController.reconcile`, which subtracts the whole
+  count observed at load, not one.
+- **Normal:** ✅ owed-pass tick.
+- **Restart:** ✅ durable and drained unconditionally at startup — a crash between the
+  commit and the dispatch loses nothing. This is the case `TestDependencyRequeueLostAcrossRestart`
+  pins, deliberately under `WithStartupFullPass(false)` so the full pass cannot heal it
+  for unrelated reasons.
+- **Tests:** `TestAddDependencyWakesWhenTargetMovedSinceRead`,
+  `TestAddDependencyNoWakeWhenTargetUnmoved`, `TestAddDependencyStampRidesRefsAdd`,
+  `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
+  `TestRefsAddStampFailureLeavesNoEdge`, `TestRefsAddEdgeFailureLeavesStamp`,
+  `TestAddDependencyNoWakeOnRollback`, `TestDependencyRequeueRaceOnDeclare`,
+  `TestDependencyRequeueRaceOnOutOfBandDeclare`, `TestReconcileDecrementsReconcileOwed`,
+  `TestReconcileDrainsMultipleOwedPasses`, `TestReconcileOwedSurvivesConcurrentIncrement`,
+  `TestOwedPassTickDispatchesOwedWake`.
+
+### 6. An ordinary target change (in memory)
+
+- **Recorded by:** nothing specific — the target's `resource_version` moving *is* the
+  record.
+- **Found by:** `waker.scan` → `ObjectWritesListSince` from an in-memory watermark, then
+  `dependentsWake` → `EdgesGroupIncomingByID` resolves a whole page in one query and
+  enqueues each dependent under its own kind.
+- **Normal:** ✅ 1s scan. A failed page or a failed edges lookup holds the cursor so the
+  next tick re-reads it; the self-edge is skipped; a wake arriving mid-reconcile is held
+  by `workQueue`'s dirty bit and re-dispatched by `done`.
+- **Restart:** ❌ **not covered — an open gap.** `seed` re-reads the store's *current*
+  cursor, so a change made while the process was down is never scanned, and a settled
+  dependent stranded by one is invisible to every owed-work listing: its own generation
+  never moved, and nothing stamped `reconcile_owed`. There is no durable trace to find.
+  Enabling a full pass masks it and is the operational workaround today, but it is not
+  coverage and is not counted as such here. The fix is `observed_cursor`; see the three
+  waker items in [`TODO.md`](../TODO.md), one of which is a startup race that needs
+  nothing to go wrong at all.
+- **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheStoreCursor`,
+  `TestWakerRetriesSeedOnTheNextTick`, `TestWakerHoldsTheWatermarkOnScanFailure`,
+  `TestWakerHoldsTheWatermarkOnLookupFailure`, `TestWakerPagesTheScan`,
+  `TestWakerStopsOnAShortPage`, `TestWakerResolvesEachTargetOnce`,
+  `TestWakerSkipsTheSelfEdge`, `TestWakerSkipsUnregisteredKinds`,
+  `TestStartWithNoControllersSkipsWaker`, `TestDependencyRequeue`,
+  `TestSelfDependentObjectWakesOnSpecChange`.
+
+**What bumps a target's `resource_version`** — i.e. what wakes its dependents — is
+broader than "a spec change": `ObjectsCreate`, `ObjectsUpdateSpec`, the content and
+handshake-only paths of `ObjectsUpdateStatus`, `ConditionsSet`, `ConditionsDelete`,
+`FinalizersDelete`, `markForDeletion`, and the cascade mark. `EventsRecord` is the one
+write that does not, by design.
+
+A target of a **client-only kind** is covered too: the waker scans store-wide rather
+than per registered kind, precisely because a `depends_on` edge may point at a kind no
+per-kind query could name. Tests: `TestClientOnlyTargetWakesDependent`,
+`TestClientOnlyTargetCreatedAfterStart`, `TestClientOnlyTargetDeletionUnwedges`.
+
+## C. Deletion-derived
+
+All three cases share one trace and one driver:
+
+- **Found by:** `Beehive.deletionPendingSweep` → `DeletionRequestsList` (kind-agnostic),
+  routed by `deletionAdvance`: a registered kind is **enqueued** so its controller can
+  clear finalizers, a client-only kind is collected directly by `gcCollect`. The routing
+  is correctness, not speed — `gcCollect` cannot clear a finalizer, so calling it on a
+  registered kind would make no progress forever.
+- **Normal:** ✅ GC sweeper, 30s, and `WithGCInterval` rejects a non-positive value, so
+  every error path has a next tick.
+- **Restart:** ✅ `runDriver` sweeps eagerly before its first tick. Test:
+  `TestIntegrationGCResumesDanglingDeleteOnStartup`.
+- **Tests:** `TestGCSweepsOnItsOwnInterval`, `TestGCSweepDispatchesRegisteredKind`,
+  `TestIntegrationGCSweepsClientOnlyKind`, `TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete`,
+  `TestGCSweepLogsCollectFailure`, `TestWithGCIntervalRejectsNonPositive`.
+
+7. **A delete request** — `Delete` / `DeleteBySlug` stamp `deletion_requested_at` and
+   nothing else. Tests: `TestIntegrationDeleteTriggersReconcile`,
+   `TestDeletionRequestsCreateIsIdempotent`, `TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion`.
+8. **Cascade to owned children** — `gcCollect` marks them via
+   `DeletionRequestsCreateFromOwner` and returns; the mark is what puts them in the next
+   sweep's listing, so a cascade advances one level per sweep. Tests:
+   `TestIntegrationGCCascadeDeletesOwnerAndChild`, `TestIntegrationGCCascadeWithFullPassDisabled`,
+   `TestCollectCascadesAndBlocksOnChild`, `TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp`.
+9. **A blocked collect retries by never leaving the listing** — finalizers still
+   pending, or `EdgesHasIncoming` reporting a referrer under RESTRICT. Nothing signals
+   the unblocking either: an owner freed by its last child's removal, or by a
+   `DependenciesDelete`, is simply still deletion-pending when the next sweep runs.
+   Tests: `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
+   `TestIntegrationGCDeletesAfterFinalizerCleared`, `TestIntegrationGCDeleteDependencyUnblocksTarget`,
+   `TestIntegrationGCBreaksDependencyCycle`, `TestCollectBreaksSelfDependency`.
+
+## D. In-memory only
+
+None of these leave a trace, and `workQueue.stop` cancels every pending timer at
+shutdown. **Restart: ❌ lost** — recovered only if the object *also* carries a durable
+trace, which is the case for the two that matter: a reconcile that failed on an
+unconverged spec is still unsettled (A), and one that failed servicing a wake still
+holds its `reconcile_owed` count, because `ReconcileOwedDecrement` runs only on success
+(B5). A retry for a *settled* object with neither has nothing to recover it.
+
+10. **`Result.RequeueAfter`** — `runWorker` → `workQueue.addAfter`. Tests:
+    `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfter`, `TestWorkQueueAddAfterNewestWins`,
+    `TestTypedControllerReconcileDropsRequeueWhenCollected`. A chain of these on a
+    settled object is the case with no durable trace at all: it does not survive a
+    restart, and no driver brings it back. See [`TODO.md`](../TODO.md) — the open
+    question there is whether a self-polling controller should be written this way
+    rather than owning its own ticker and calling `Client.Requeue`.
+11. **Failure backoff** — `reconciler.backoffNext` → `addAfter`, doubling to
+    `maxRetryInterval`, cleared only by a successful reconcile. Tests:
+    `TestReconcilerRequeuesOnError`, `TestReconcilerClearsBackoffOnSuccess`,
+    `TestReconcilerRequeueBackoffLadder`, `TestNextBackoffDoubles`, `TestNextBackoffCaps`.
+12. **`Client.Requeue`** — `reconciler.requeue` → `workQueue.requeueNow`, cancelling any
+    pending alarm. The public way to beat a cadence. Tests: `TestClientRequeue`,
+    `TestClientRequeueNoController`, `TestReconcilerRequeueNow`, `TestWorkQueueRequeueNow`.
+## E. Not triggers
+
+Worth stating, because each looks like one:
+
+- **The full pass is not a coverage mechanism.** `enqueueAll` → `ObjectsListIDs`
+  re-dispatches every object of the kind, once at startup under `WithStartupFullPass`
+  and periodically under `WithFullPassInterval` — **both off by default**. Its job is
+  the one thing no owed-work listing can express: re-confirming state that belongs to
+  a *process* rather than to the store, such as a liveness condition reading
+  "verifying" until a controller in this process rewrites it. It is not listed as a
+  trigger above because nothing may be owed a reconcile *by way of it*. It does
+  incidentally re-dispatch settled objects that other mechanisms failed to reach, and
+  that is exactly the property not to lean on: it turns an open gap into an
+  intermittent one, scaled by object count, and hides it from anyone reading this
+  document for what guarantees convergence. Where a gap exists it is named as a gap
+  here and tracked in [`TODO.md`](../TODO.md). Tests:
+  `TestStartupEnqueuesAllNotJustUnsettled`, `TestStartupFullPassReconcilesSettled`,
+  `TestStartupFullPassDisabledSkipsSettled`, `TestFullPassTickReconcilesSettled`,
+  `TestDefaultConfigDoesNotFullPass`, `TestSelfDrivenRecovery`.
+- **A status or condition write on an object does not wake that object's own
+  controller.** The waker skips the self-edge deliberately: a spec write already leaves
+  the object unsettled, and a status write came from the pass that just ran. Test:
+  `TestWakerSkipsTheSelfEdge`.
+- **`EventsRecord` wakes nothing** — it bumps no object `resource_version`, which is also
+  what makes it the one write safe inside a dependency cycle.
+- **A schedule change wakes nothing** — `SchedulesWatch` reports an in-memory gauge; it
+  bumps no generation or `resource_version`.
+- **An object of a client-only kind is never reconciled.** It has no reconcile loop, so
+  an unsettled spec on one is inert; only its deletion is ever acted on, by the sweeper.
+- **A queued id whose row is gone is a no-op success**, not a retry — `ObjectsGet`
+  returning `ErrNotFound` drops it. Test: `TestTypedControllerReconcileMissingIDIsTerminal`.
+- **An undecodable row is quarantined**, not retried: it is skipped as a no-op success so
+  the worker drops it, while its `reconcile_owed` count is deliberately left standing.
+  Tests: `TestTypedControllerReconcileRawToTypedError`,
+  `TestTypedControllerReconcileQuarantineKeepsReconcileOwed`.

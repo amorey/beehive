@@ -123,9 +123,11 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 		return beehive.Result{}, err
 	}
 
-	// Requeue ourselves until the pool is full; once ready, settle.
+	// Requeue ourselves until the pool is full; once ready, settle. The delay is
+	// longer than the watch poll so each step lands in its own poll and the
+	// progression is visible; a shorter one would still converge, just invisibly.
 	if !ready {
-		return beehive.Result{RequeueAfter: 200 * time.Millisecond}, nil
+		return beehive.Result{RequeueAfter: 1500 * time.Millisecond}, nil
 	}
 	return beehive.Result{}, nil
 }
@@ -141,6 +143,11 @@ func main() {
 	exitOnErr(err)
 	defer store.Close()
 
+	// Production defaults. Nothing is pushed, so the create below is nudged with
+	// Requeue rather than left to the 30s owed-pass tick; every pass after that is
+	// paced by the RequeueAfter the controller returns. Note what is *not* set here:
+	// a short WithFullPassInterval would re-dispatch the object on its own cadence
+	// and drive the loop faster than the controller asked for.
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
@@ -154,7 +161,9 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[ServerSpec, ServerStatus](bh, ServerGroupKind)
 
-	// Subscribe before creating so we don't miss the controller's first writes.
+	// Watch before creating, so the create arrives as an Added and the controller's
+	// writes as the Modifieds after it. A watch is a poll, so it converges on
+	// current state either way — starting first is what keeps the sequence legible.
 	watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
@@ -162,6 +171,10 @@ func main() {
 	exitOnErr(err)
 
 	fmt.Printf("created Server id=%d replicas=%d\n", obj.ID, obj.Spec.Replicas)
+
+	// A write schedules nothing; this is what starts the sequence now rather than in
+	// 30s. The RequeueAfter the controller returns paces every step after it.
+	exitOnErr(client.Requeue(ctx, obj.ID))
 
 	waitForReady(obj.ID, watchCh)
 }

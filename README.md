@@ -84,15 +84,17 @@ func main() {
 
 ## Architecture
 
-- **Declarative core.** Users write `spec` (desired state); controllers continuously reconcile actual state toward it. Reconciliation is level-triggered — driven by current state, not event sequences — so the system self-heals on restart and is robust to missed events. A cold start is just a reconcile from persisted desired state.
+- **Declarative core.** You write `spec`, the desired state. Controllers reconcile actual state toward it, working from current state rather than from a sequence of events. That is what makes the system self-healing: it converges on restart, and a missed event costs nothing because the next pass reads the same state anyway. A cold start is just a reconcile from stored desired state.
 
-- **Coordination through the store.** Controllers never call each other. They read/write the shared store and wake on change-events. Events are a latency optimization: an object whose spec has not converged, or which is owed a recorded dependency wake, is re-derived by the catchup tick and at startup, so a dropped event costs latency rather than convergence. The one case events alone cover is a *settled* object whose state changed for a reason the store did not record — for that, enable `WithResyncInterval` or rely on the next startup pass.
+- **Coordination through the store.** Controllers never call each other. They read and write the shared store, and a change reaches another controller by being found there rather than delivered to it. Nothing is pushed: every write leaves a durable trace — a bumped generation, an owed-wake count, a deletion mark, a higher `resource_version` — and each driver scans for the trace it cares about. So a missed tick costs latency and nothing else. The record is still there next time.
 
-- **`spec`/`status` separation.** Only controllers may write `status`. This is structural in the API: the user-facing `Client` surface has no status-write path; only the `Controller` surface does.
+- **Every driver is a tick.** Reconcile passes, garbage collection, dependency wakes and client watches are all periodic scans, each on its own interval (see [Periodic drivers](#periodic-drivers)). Those intervals are the latency the system runs at; two of them are yours to choose.
 
-- **Schema-version migration.** `Spec` and `Status` are opaque JSON, so reshaping a struct would break decode of older rows. A per-kind `Migrator` converts an old blob up *on read*, before unmarshal. Spec and Status version and convert independently; conversion is lazy — re-stamped only when the blob is next written, never by a bulk rewrite.
+- **`spec`/`status` separation.** Only controllers write `status`, and the API enforces it: the user-facing `Client` has no status-write path, only the `Controller` surface does.
 
-The decisions behind these — and the trade-offs each one closed — are recorded in [docs/adr](docs/adr/README.md), linked from the relevant sections below.
+- **Schema-version migration.** `Spec` and `Status` are stored as opaque JSON, so reshaping a struct would break decoding of older rows. A per-kind `Migrator` converts an old blob up *on read*, before unmarshal. Spec and status version independently, and conversion is lazy — a row is re-stamped when it is next written, never by a bulk rewrite.
+
+The reasoning behind each of these is recorded in [docs/adr](docs/adr/README.md), linked from the sections below.
 
 ## API
 
@@ -103,25 +105,33 @@ func New(store Store, opts ...Option) (*Beehive, error)
 func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) (ControllerClient[Status], error)
 ```
 
-`Register` returns the kind's `ControllerClient` — the status-write surface — so the embedding application can write status out-of-band (e.g. from its own goroutines) without beehive handing it over via a callback. A `ControllerClient` is obtainable *only* by registering a controller for that kind, which keeps the "only the owning controller writes its status" boundary intact.
+`Register` returns the kind's `ControllerClient`, the status-write surface, so your application can write status from its own goroutines without beehive handing it over through a callback. Registering a controller is the only way to get one, which is what keeps status writes limited to the kind's owner.
 
-Options are dispatched by caller type — `WithResyncInterval` passed to `New` sets the global default; passed to `Register` it overrides for that controller only. Unrecognised options for a given caller are ignored. (`WithGCInterval` is the exception: garbage collection is global, spanning kinds that have no controller at all, so it is meaningful only at `New`.)
+Where you pass an option decides its scope. `WithFullPassInterval` at `New` sets the default for every kind; at `Register` it overrides that one controller. An option a given call site doesn't recognize is ignored. `WithGCInterval` is global and therefore only meaningful at `New` — garbage collection covers kinds with no controller.
 
 #### Periodic drivers
 
-Three independent cadences, because they are three different jobs with different costs:
+Every driver is one of these. They run on separate intervals because they are separate jobs with very different costs — a single interval would mean tuning one of them moves the rest:
 
-| option | what it re-dispatches | cost scales with | default |
+| driver | what it scans | cost scales with | interval |
 |---|---|---|---|
-| `WithCatchupInterval` | work the store *records* as owed — unconverged specs (`observed_generation < generation`) and owed dependency wakes | what is actually outstanding | 30s |
-| `WithResyncInterval` | **every** object, converged or not | the object count | 0 (off) |
-| `WithGCInterval` | deletion-pending rows, plus event-log retention | rows being deleted | 30s |
+| owed pass | work the store *records* as owed — unconverged specs (`observed_generation < generation`) and owed dependency wakes | what is actually outstanding | 30s, fixed |
+| full pass | **every** object of the kind, converged or not | the object count | `WithFullPassInterval`, default 0 (off) |
+| GC sweep | deletion-pending rows, plus event-log retention | rows being deleted | `WithGCInterval`, default 30s |
+| dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | 1s, fixed |
+| watch poll | current state, for each live `Client` watch | one cheap read per subscriber per tick; a full listing only when something changed | 1s, fixed |
 
-The full resync is opt-in because its cost is the only one unbounded by outstanding work, and because it is the only driver that reaches an object nothing recorded as owing anything — process-scoped state a restart invalidated (a liveness condition reads as "verifying" until a controller in *this* process rewrites it), or a dependency wake lost for a reason nothing observed. The startup pass covers that ground once per process.
+**Only two of the five are configurable.** The other three are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding or what changed rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
 
-Disabling a driver is supported for the two reconcile cadences and logged at startup, so a knob left at 0 by accident is visible rather than silent. **GC is the exception: it cannot be disabled** — `WithGCInterval` rejects a non-positive interval with `ErrInvalidOption`. A long interval says "collect rarely"; there is no way to say "never".
+The full pass is opt-in because it is the only driver whose cost is unbounded by outstanding work. It is also the only one that reaches an object the store records nothing about: state that belongs to a process and a restart invalidated, such as a liveness condition, which reads as "verifying" until a controller in *this* process rewrites it. Set it well above the 30s owed pass, which it subsumes.
 
-→ [ADR: three independent periodic drivers](docs/adr/2026-07-27-periodic-reconcile-drivers.md), for why they were split and why GC alone is mandatory.
+Both of its cadences are off by default — `WithFullPassInterval` for the periodic one, `WithStartupFullPass` for the once-per-process one — and that is a correctness position, not a cost saving. **Nothing may depend on a full pass to converge.** Work that is genuinely owed is recorded in a column and drained by the owed pass and the GC sweeper, both of which run at every startup no matter how these two are set. Enable a full pass to re-confirm process-scoped state, and for nothing else: a convergence bug it happens to hide is a bug that comes back the moment an embedder turns it off or the object set outgrows what a sweep can carry.
+
+To reconcile something sooner than the next pass, use `Client.Requeue` rather than shortening a cadence: it is a latency hint aimed at one object, where an interval is a cost paid by every object forever. The examples under `examples/` all do this — it is what lets them run on production defaults.
+
+**GC cannot be disabled**: `WithGCInterval` rejects a non-positive interval with `ErrInvalidOption`. A long interval means "collect rarely"; there is no way to say "never". `WithFullPassInterval` can be set to 0, and startup logs when it is off, so a value left at 0 by accident is visible rather than silent.
+
+→ [ADR: every driver is a periodic scan of the store](docs/adr/2026-07-28-periodic-scan-drivers.md), for why the cadences are separate, why GC alone is mandatory, and what each driver's cost is bounded by.
 
 ### GroupKind
 
@@ -152,14 +162,17 @@ type Condition struct {
 }
 ```
 
-`Liveness` marks a condition derived from a live, in-process resource: it is valid
-only within the process that wrote it. A liveness condition written by a prior
-process is downgraded to `ConditionUnknown` ("verifying") on read until a controller
-re-confirms it. The default (`false`) is durable store-truth that survives restarts.
+`Liveness` marks a condition that describes a live, in-process resource, and so is
+only valid inside the process that wrote it. On read, a liveness condition left by an
+earlier process is downgraded to `ConditionUnknown` ("verifying") until a controller
+confirms it again. The default, `false`, means the condition is durable and survives
+restarts.
 
 ### Event
 
-Events are a per-object, append-only log of observations, aggregated into runs. Consecutive emissions that share `(Category, Type, Reason)` coalesce into a single `Event` whose `Count` grows and whose `[FirstAt, LastAt]` window widens; a change in any of those fields starts a new run. This is *contiguous-run* aggregation, not global dedup — a value that recurs after a different value starts a fresh run, so a flapping object yields a timeline of alternating runs rather than one ever-growing row. An event log is the un-collapsed sibling of a Condition: where a Condition keeps only the current run per type (its `Status`/`Reason` overwritten in place), the event log keeps the whole history.
+Events are a per-object, append-only log of observations, grouped into runs. Consecutive records sharing `(Category, Type, Reason)` merge into one `Event`: its `Count` grows and its `[FirstAt, LastAt]` window widens. Change any of those three fields and a new run starts.
+
+Runs are *consecutive*, not deduplicated globally. A value that comes back after a different one starts a fresh run, so a flapping object produces a timeline of alternating runs rather than one row that grows forever. Think of the log as the long form of a Condition: a Condition keeps only the current run per type, overwriting its `Status` and `Reason` in place, while the log keeps the history.
 
 ```go
 type EventType string
@@ -196,11 +209,15 @@ type Event struct {
 func EventDetail[T any](e Event) (T, error)
 ```
 
-`Category` partitions the aggregation domain: each `(object, category)` is an independent timeline, so unrelated concerns on the same object — say connection probes and config sync — never break each other's runs. Both `Category` and `Reason` are free labels the app chooses per emit (`string`, like `Condition.Reason`); declare typed-string constants for a closed, typo-safe vocabulary if you like. `Message` is *sampled*, not keyed: re-emitting the same `(Category, Type, Reason)` with a new message extends the current run and updates the shown message rather than starting a new one.
+`Category` splits an object's log into independent timelines, one per `(object, category)`, so unrelated concerns — connection probes and config sync, say — never break each other's runs. `Category` and `Reason` are both free-form strings you choose per record, like `Condition.Reason`; declare typed string constants if you want a fixed, typo-proof vocabulary.
 
-`Detail` is the machine-readable companion to `Message` — an optional structured payload (`ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`). It follows the `Spec`/`Status` convention of **typed in, opaque out**: on write it is any JSON-marshalable value (`EventsRecord` marshals it, just as `Create` marshals `Spec`); on read it returns as `json.RawMessage`, decoded on demand with the free generic helper `EventDetail[T](e)` — applied per event with the type its `Reason` implies, so a single timeline can mix reasons carrying different detail shapes without the API becoming generic. Like `Message`, `Detail` is *sampled* (latest occurrence wins) and not part of the run key, so a varying payload never fragments a run — if you need every occurrence's payload retained, that event shouldn't aggregate (use a unique `Reason`). Unlike `Spec`/`Status`, `Detail` is **not** schema-versioned; reshaping it breaks decode of older rows, which is acceptable only because retention ages events out — version inside the payload if you need forward-compatibility.
+`Message` is *sampled*, not part of the run key. Recording the same `(Category, Type, Reason)` with a new message extends the current run and updates the message shown, rather than starting a new run.
 
-Only controllers write events — `ControllerClient.EventsRecord` is the sole write path, because events are observations and (like `status`) have no user-facing writer. Reads are on the `Client` (`EventsList` / `EventsWatch` / `EventsGetLatest`), plus the eager `LoadEvents()` / `Object.Events()` pair that follows the same loaded-gating as the secondary lookups (`ErrNotLoaded` when not requested).
+`Detail` is the machine-readable companion to `Message`: an optional structured payload, so `ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`. Like `Spec` and `Status` it goes in **typed and comes out opaque**. On write it is any JSON-marshalable value, which `EventsRecord` marshals. On read it is a `json.RawMessage` you decode when you need it, with `EventDetail[T](e)`. Decoding per event, with the type that event's `Reason` implies, is what lets one timeline mix reasons carrying different payload shapes without making the API generic.
+
+`Detail` is sampled like `Message` — latest occurrence wins, and it is not part of the run key — so a payload that varies never splits a run. If you need every occurrence's payload, that event shouldn't aggregate: give it a unique `Reason`. Unlike `Spec` and `Status`, `Detail` is **not** schema-versioned, so reshaping it breaks decoding of older rows. That is tolerable only because retention ages events out; put a version inside the payload if you need more.
+
+Only controllers write events. `ControllerClient.EventsRecord` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`EventsList`, `EventsWatch`, `EventsGetLatest`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
 
 A connection-health panel renders one category's timeline directly — `client.EventsList(ctx, id, WithEventCategory("connection"))` yields, newest first:
 
@@ -242,7 +259,7 @@ type Object[Spec, Status any] struct {
 type ObjectRef = storeapi.ObjectRef // { ID ObjectID; Group, Kind string }
 ```
 
-The secondary-lookup data is filled only when the read asked for it. Read it through the accessors, which return `ErrNotLoaded` if the relation wasn't requested — so forgetting the `Load*()` option fails loudly instead of looking empty. These are bare accessors, with no verb to add: cardinality is in the return type, `(ObjectRef, bool, error)` for the at-most-one owner against `([]ObjectRef, error)` for the rest.
+Secondary-lookup data is filled in only when the read asked for it, and you read it through the accessors below. They return `ErrNotLoaded` for a relation nobody requested, so forgetting a `Load*()` option fails loudly instead of looking empty. The return type carries the cardinality — `(ObjectRef, bool, error)` for the at-most-one owner, `([]ObjectRef, error)` for the rest — so the accessors need no verb in their names.
 
 ```go
 func (o *Object[Spec, Status]) Owner() (ObjectRef, bool, error) // bool: an owner exists; err: not loaded
@@ -252,7 +269,7 @@ func (o *Object[Spec, Status]) Owned() ([]ObjectRef, error)
 func (o *Object[Spec, Status]) Events() ([]Event, error)
 ```
 
-Once loaded, an empty slice (or `Owner`'s `ok == false`) means genuinely none. `ErrNotLoaded` is caller misuse — fetch the relation eagerly with the `Load*()` option, or lazily via the `Client`/`ControllerClient` methods below.
+Once loaded, an empty slice — or `ok == false` from `Owner` — means there really are none. `ErrNotLoaded` means you forgot to ask: fetch the relation eagerly with a `Load*()` option, or lazily through the `Client`/`ControllerClient` methods below.
 
 ### Result
 
@@ -271,7 +288,7 @@ type Schedule struct {
 }
 ```
 
-`Schedule` is the value the [scheduling API](#scheduling) reports: an object's **next reconcile time, as a gauge**. It is a struct rather than a bare `time.Time` so fields can be added — e.g. a reschedule **trigger** (backoff vs. success-cadence vs. manual poke), reserved but not yet populated — without a breaking change. `NextRequeueAt` reflects only per-id timers (a pending backoff retry or `RequeueAfter` delay, or now if already queued) and is the zero time when nothing is scheduled.
+`Schedule` is what the [scheduling API](#scheduling) reports: an object's **next reconcile time**, as a gauge. It is a struct rather than a bare `time.Time` so fields can be added later without breaking anything — a reschedule trigger, for instance (backoff, success cadence, or manual poke), which is reserved but not yet filled in. `NextRequeueAt` covers per-id timers only: a pending backoff retry or `RequeueAfter` delay, or now if the object is already queued, or the zero time if nothing is scheduled.
 
 ### Client
 
@@ -328,7 +345,7 @@ func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 
 #### Writes
 
-`Create` leaves the slug **unset** unless `beehive.WithSlug` is provided — it is `nil`, stored as SQL `NULL`, and nothing is generated for you. NULL slugs don't collide (`NULL != NULL` in SQLite), so any number of slugless objects of a kind coexist; they are reachable by `ObjectID` and `List`, just not by name. If a slug *is* given and already exists, `Create` fails on the `UNIQUE ("group", kind, slug)` constraint. All subsequent operations use `ObjectID` — safe against operating on a different incarnation after a delete/recreate. Finalizers and other metadata are set via options:
+`Create` leaves the slug unset unless you pass `beehive.WithSlug`. It stays `nil`, stored as SQL `NULL`, and nothing is generated for you. NULL slugs never collide (`NULL != NULL` in SQLite), so a kind can hold any number of slugless objects; you reach them by `ObjectID` and `List`, just not by name. If you do pass a slug and it is taken, `Create` fails on the `UNIQUE ("group", kind, slug)` constraint. Everything after the create takes an `ObjectID`, so a delete and recreate under the same slug can't make you act on the wrong row. Finalizers and other metadata are options:
 
 ```go
 client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
@@ -336,9 +353,9 @@ obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithSlug("prod-cluster"),
 client.Update(ctx, obj.ID, ClusterSpec{...})
 ```
 
-**A slug is an opaque key, and beehive does not validate it** — no charset rule, no length limit, no normalization. The empty string is therefore a perfectly ordinary slug: a real value under the unique constraint, and distinct from `NULL`. `GetOrCreate(ctx, "", spec)` creates *the* empty-slug object of that kind, and the next caller passing `""` gets that same row back with `created=false` — exactly as two callers passing `"prod"` would. That is the contract rather than a collision bug, but it has a sharp edge worth knowing: a slug derived from configuration is `""` when the config field is unset, which silently keys every such caller to one shared object. Validate slugs at the edge if they come from outside your code, and when you mean "no name" use `nil` — `Create` without `WithSlug` — not `""`.
+**A slug is an opaque key and beehive does not validate it** — no character rules, no length limit, no normalization. So the empty string is an ordinary slug: a real value under the unique constraint, and distinct from `NULL`. `GetOrCreate(ctx, "", spec)` creates *the* empty-slug object of that kind, and the next caller passing `""` gets that same row back with `created=false`, exactly as two callers passing `"prod"` would. That is the contract, not a collision bug, but it has a sharp edge: a slug read from configuration is `""` when the field is unset, which quietly points every such caller at one shared object. Validate slugs that come from outside your code, and when you mean "no name" pass no `WithSlug` at all rather than `""`.
 
-The three slug-keyed writes differ **only in what they do when the slug is already taken**, and the table holds under concurrency too. `CreateOrUpdate` and `GetOrCreate` wrap their read-and-write in one transaction, so two callers racing on the same slug never both insert: the loser observes the winner's row and updates or returns it. `Create` does no lookup — it inserts — so the loser of the same race fails on `UNIQUE`, exactly as it would against a pre-existing row:
+The three slug-keyed writes differ **only in what they do when the slug is taken**, and that holds under concurrency. `CreateOrUpdate` and `GetOrCreate` do their read and write in one transaction, so two callers racing on a slug never both insert — the loser sees the winner's row and updates or returns it. `Create` does no lookup at all, so the loser of that race fails on `UNIQUE`, just as it would against a row that was already there:
 
 | Slug already held by    | `Create`         | `CreateOrUpdate`     | `GetOrCreate`                         |
 | ----------------------- | ---------------- | -------------------- | ------------------------------------- |
@@ -346,18 +363,18 @@ The three slug-keyed writes differ **only in what they do when the slug is alrea
 | a live row              | fails (`UNIQUE`) | updates it to `spec` | returns it untouched, `created=false` |
 | a deletion-pending row  | fails (`UNIQUE`) | updates it to `spec` | returns it untouched, `created=false` |
 
-Where `CreateOrUpdate` says "updates it", re-applying the spec the row already holds is a **complete** no-op: no generation bump, no `resource_version` bump, no watch event, and no reconciler wake. That last part matters if a controller re-applies a spec of its own kind on every pass — it converges instead of waking itself in a loop. The same holds for `Update`.
+Where the table says `CreateOrUpdate` "updates it", re-applying the spec the row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever. `Update` behaves the same way.
 
-Every write **validates before it commits.** `Create`, `CreateOrUpdate`, `GetOrCreate`, and `Update` decode the written row back into `Spec`/`Status` *inside* the write transaction, so a spec that marshals but does not round-trip — typically an asymmetric `MarshalJSON`/`UnmarshalJSON` — rolls the write back rather than committing a row the process cannot read. **An error from a write therefore means nothing was committed:** no poison row, no reconciler wake, no `UNIQUE` left behind for a retry to trip on, and for `Update`/`CreateOrUpdate` the prior good spec is preserved. `GetOrCreate` in particular returns `created=false` on such an error, since nothing was created. The cost is that the write holds the store's single writer across the decode (`json.Marshal` still runs *before* the transaction). This guards only the write path; a row can still become undecodable *later* — e.g. a schema downgrade — which is a read/reconcile concern handled by quarantine (see [Migrator](#migrator)).
+Every write **validates before it commits.** `Create`, `CreateOrUpdate`, `GetOrCreate` and `Update` decode the written row back into `Spec`/`Status` *inside* the transaction. A spec that marshals but does not round-trip — usually a `MarshalJSON`/`UnmarshalJSON` pair that disagree — rolls the write back instead of committing a row this process cannot read. **So an error from a write means nothing was committed:** no unreadable row, nothing added to a driver's listing, no `UNIQUE` left behind for the retry to trip on, and for `Update`/`CreateOrUpdate` the previous spec is still there. `GetOrCreate` returns `created=false` in that case, since nothing was created. The cost is that the write holds the store's single writer across the decode (`json.Marshal` still runs before the transaction opens). This only guards the write path — a row can still become unreadable later, say after a schema downgrade, which the read path handles by quarantining it (see [Migrator](#migrator)).
 
-Reach for `GetOrCreate` when a controller must idempotently ensure a child exists **without ever mutating it** — the pattern otherwise open-coded as `GetBySlug` → `Create` → re-`GetBySlug` on conflict, where the fallback path tends to drift from the primary one's checks. Its found branch performs no write at all, so a deletion-pending row comes back as-is with `DeletionRequestedAt` set rather than being resurrected by an `ObjectsUpdateSpec`:
+Use `GetOrCreate` when a controller has to make sure a child exists **without ever changing it**. The alternative is open-coding `GetBySlug` → `Create` → `GetBySlug` again on conflict, where the fallback path tends to drift out of step with the primary one. Its found branch writes nothing, so a deletion-pending row comes back as it is, with `DeletionRequestedAt` set, rather than being resurrected by a spec update:
 
-Two surfaces appear in the example below, and they are not interchangeable:
-`GetOrCreate` is on `Client` (the child kind's client, built with `NewClient` and
-held by the controller), while `EventsRecord` is on the `ControllerClient` that
-`Reconcile` is handed for writes about the object being reconciled. `Client` has no
-`EventsRecord`, and `ControllerClient` has no `GetOrCreate` — a controller creates
-children through a `Client` for that kind.
+The example uses two surfaces, and they are not interchangeable. `GetOrCreate` is on
+`Client` — here the child kind's client, built with `NewClient` and held by the
+controller. `EventsRecord` is on the `ControllerClient` that `Reconcile` receives,
+for writes about the object being reconciled. `Client` has no `EventsRecord` and
+`ControllerClient` has no `GetOrCreate`: a controller creates children through a
+`Client` for their kind.
 
 ```go
 type ProjectController struct {
@@ -392,72 +409,85 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
 }
 ```
 
-`created` reports whether this call inserted the row: on create the `Added` event is emitted and the object enqueued, exactly as with `Create`; returning an existing row emits and enqueues nothing. Both are post-commit — nested in an outer `ControllerClient.Within`, they fire after the *outermost* commit, and not at all if it rolls back (`Create`, `CreateOrUpdate`, and `Update` behave the same way). The return value can't be deferred that way, so `created=true` is provisional until the outer transaction commits; for a side effect that must run only if the row lands, use `WithOnCreate` (below), which is deferred to the same post-commit point as the wake.
+`created` reports whether this call inserted the row. A new object has a generation nothing has observed yet, so the owed pass picks it up, exactly as it would after `Create`. Returning an existing row writes nothing and so owes nothing. Neither case schedules anything at write time — the row is the record, so a rollback leaves nothing behind.
 
-The options apply **only on the create branch** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). `WithSlug` is **rejected** with `ErrConflictingOption`: the slug is positional here, so the option can only contradict it, and dropping it silently would put the row under one slug while the caller went looking for it under another. (This is narrower than the general option rule — an inapplicable option is still ignored by design; a contradiction is a caller mistake.)
+`created` is returned synchronously, so inside an enclosing `ControllerClient.Within` a `created=true` is provisional until that transaction commits. For a side effect that must run only if the row really lands, use `WithOnCreate` (below), which waits for the outermost commit.
 
-That last point has a sharp edge worth stating plainly: on the found branch the options are ignored outright, so **`created=false` does not mean "exists and matches your options."** A row created earlier by a path that passed no `WithOwner` comes back with no owner edge, and a caller that assumes otherwise gets a child the GC cascade will never collect when the parent is deleted. If you depend on the owner edge, verify it — `GetOrCreate` then `OwnersGet` (or a `Get(ctx, id, LoadOwner())`) — and reconcile the difference yourself. Beehive deliberately does not adopt the row for you: `owner` is single, so adding the edge to a row that already has a *different* owner would produce a two-owner object, and choosing which owner wins is your policy, not the library's.
+The options apply **only when the call creates the row** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). `WithSlug` is rejected with `ErrConflictingOption`, because the slug is already a positional argument here — the option could only contradict it, and dropping it silently would file the row under one slug while you looked for it under another. (Options that simply don't apply are still ignored, as everywhere else; this one is a caller mistake.)
 
-`DeleteBySlug` is the remove half of that ensure/remove pair: `GetOrCreate` creates-if-absent, `DeleteBySlug` deletes-if-present, and both are idempotent and tombstone-aware, so a controller that ensures a slug-keyed child on one branch and removes it on another spells each side as a single call. It collapses what is otherwise open-coded as `GetBySlug` → `ErrNotFound`-is-success → `DeletionRequestedAt`-is-a-no-op → `Delete`:
+That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `OwnersGet`, or `Get(ctx, id, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
+
+`DeleteBySlug` is the other half of the pair: `GetOrCreate` creates if absent, `DeleteBySlug` deletes if present. Both are idempotent and both understand tombstones, so a controller that ensures a slug-keyed child on one branch and removes it on another writes one call for each. It replaces the usual open-coding of `GetBySlug`, treating `ErrNotFound` as success, treating `DeletionRequestedAt` as a no-op, then `Delete`:
 
 | Slug held by           | `DeleteBySlug`                                              |
 | ---------------------- | ----------------------------------------------------------- |
 | nothing                | `nil` — already gone                                         |
 | a live row             | soft-deletes it (sets `DeletionRequestedAt`), advances GC    |
-| a deletion-pending row | no-op — no write, no event — advances GC; `nil`              |
+| a deletion-pending row | no-op — no write at all — advances GC; `nil`                 |
 
-Like `Delete` it soft-deletes and hands the object to the controller to clear its finalizers; physical removal follows once they clear, and only then is the slug released. It is kind-scoped like `GetBySlug` — a slug is per-kind, so another kind's row holding the same slug is simply not found, and reported as success rather than as a wrong-kind error.
+Like `Delete`, it marks the object and hands it to the controller to clear its finalizers. The row is removed once they clear, and only then is the slug free again. It is scoped to the kind, like `GetBySlug`: another kind's row holding the same slug is simply not found, which is reported as success rather than as a wrong-kind error.
 
-The resolve is **atomic with the delete**, in the same sense the table above holds for `CreateOrUpdate`/`GetOrCreate`: the slug is folded into the store's write, not looked up first and deleted after, so no concurrent collection can retire the row and hand the slug to a replacement in between. `nil` therefore means "no object of this kind holds this slug" rather than "the row I happened to resolve is gone." What it does *not* promise — and no implementation could — is that the slug is still free when the call returns: a concurrent `GetOrCreate` may take it the instant the delete commits. As everywhere in Beehive, the next reconcile re-derives from current state.
+Looking the slug up is **atomic with the delete** — the slug goes into the store's `WHERE` clause rather than being resolved first and deleted after, so no concurrent collection can retire the row and hand its slug to a replacement in between. A `nil` return means "no object of this kind holds this slug", not "the row I resolved is gone". What it cannot promise, and no implementation could, is that the slug is still free when the call returns: a concurrent `GetOrCreate` may take it the instant the delete commits. As always, the next reconcile works from current state.
 
-→ [ADR: slug-keyed writes and post-commit wakes](docs/adr/2026-07-27-writes-and-post-commit-wakes.md), for the transaction boundaries and why every wake runs after the outermost commit.
+→ [ADR: slug-keyed writes](docs/adr/2026-07-27-slug-keyed-writes.md), for the transaction boundaries.
 
 #### Watching
 
-`ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled. Changes are conflated per object: a watcher that falls behind converges to each object's latest state (a delete still carries its final body) rather than seeing every intermediate version — consistent with Beehive's level-triggered model. (The event *log* — `EventsList`/`EventsWatch` below — is a separate concept: `ObjectChange` is an object-change notification, `Event` is a recorded log entry.)
+`ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled.
 
-→ [ADR: watch fan-out conflates per object](docs/adr/2026-07-27-conflating-watch-fanout.md), for why there is no ring, no lag error, and no relist.
+Both are **polls, not subscriptions.** Each remembers the `resource_version` it last reported to you and, on each watch-poll tick (1s), sends the difference: a new object is `Added`, a moved version is `Modified`, a row that has gone is `Deleted` and carries its last known state. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
+
+- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all.
+- **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the store-wide write cursor is one scalar query, and only a cursor that moved — or an id set that shrank, since deletes draw no version — pays for the full listing.
+
+A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error instead of ending quietly under a subscriber with no way to notice.
+
+Both need a **registered controller** for the kind, as `EventsWatch` does, and both are scoped to it: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet — an absent object is just an empty listing, and the stream reports it as `Added` once it is created.
+
+(The event *log* below, `EventsList`/`EventsWatch`, is a different thing: an `ObjectChange` says an object changed, an `Event` is a log entry.)
+
+→ [ADR: every driver is a periodic scan of the store](docs/adr/2026-07-28-periodic-scan-drivers.md), for what a poll costs and the constraints any push path above it would have to satisfy.
 
 #### Secondary lookups (owner / dependencies / dependents / owned)
 
 An object's ref edges are fetched on request, two ways:
 
 - **Eager** — pass `LoadOption`s to a read: `Get(ctx, id, LoadOwner())`, `List(ctx, LoadDependencies(), LoadDependents())`. The returned objects carry the data (read via the accessors). On `List` each relation is one batched query, not one per object.
-- **Lazy** — call `OwnersGet` / `DependenciesList` / `DependentsList` / `OwnedList` when the data is actually needed. These hit the edge query directly and do **not** kind-scope `id` (no validating read in front): a foreign id reads that kind's edges and a missing id reads empty, neither as `ErrNotFound`. Reserve them for ids the client owns.
+- **Lazy** — call `OwnersGet` / `DependenciesList` / `DependentsList` / `OwnedList` when you actually need the data. These run the edge query directly, with no validating read in front, so they do **not** check the kind: another kind's id returns that kind's edges, and a missing id returns nothing, neither as `ErrNotFound`. Use them for ids the client owns.
 
 `OwnedList` (and the eager `LoadOwned()` / `Object.Owned()`) is the inverse of `OwnersGet` over `owned_by`: it returns the objects a given owner owns, the same way `DependentsList` inverts `DependenciesList` over `depends_on`.
 
-`OwnedObjectsList(ownerID)` is its typed counterpart: where `OwnedList` returns untyped `ObjectRef`s across *every* owned kind — leaving the caller to filter by `Kind` and `Get` each child through that kind's client — `OwnedObjectsList` returns the fully decoded `*Object[Spec, Status]` children of **this client's kind**, in one store query (the kind filter and the row read are folded into the edge semi-join, so there is no `Get` per child). Same ordering (by id) and same missing-owner behavior as `OwnedList`; deletion-pending children are included, so a caller that wants to skip them checks `DeletionRequestedAt` itself. It takes the same `LoadOption`s as `List`, batched the same way — without them the children carry nothing loaded and their accessors return `ErrNotLoaded`.
+`OwnedObjectsList(ownerID)` is the typed version. `OwnedList` returns untyped `ObjectRef`s across every owned kind, leaving you to filter by `Kind` and `Get` each child through its own client. `OwnedObjectsList` returns decoded `*Object[Spec, Status]` children of **this client's kind** in a single query, because the kind filter and the row read fold into the edge join — no `Get` per child. Ordering (by id) and missing-owner behaviour match `OwnedList`. Deletion-pending children are included, so skip them yourself by checking `DeletionRequestedAt`. It takes the same `LoadOption`s as `List`, batched the same way; without them the children have nothing loaded and their accessors return `ErrNotLoaded`.
 
-Both issue the same secondary query (edges are a separate indexed lookup, never joined into the object's blob-bearing `SELECT`); eager just attaches the result to the object and batches across a `List`.
+Eager and lazy run the same query — edges are always a separate indexed lookup, never joined into the `SELECT` that carries specs and statuses. Eager just attaches the result to the object and batches it across a `List`.
 
 → [ADR: secondary lookups](docs/adr/2026-07-27-secondary-lookups.md), for the loader sharing, the accessor naming rule, and the store's semi-join.
 
 #### Reconcile control
 
-`Requeue` requeues an object for immediate reconcile — the manual counterpart to the store-write and dependency-change wakes. It is a **latency hint, not a synchronous run**: it returns once the object is enqueued, and a worker reconciles it on its own schedule. A missed or coalesced requeue is harmless whenever the object is *owed* something the store records, since the catchup tick re-derives that. It is also the supported way to drive reconciles yourself when every periodic driver is disabled. Use it to promptly re-examine an object after out-of-band state the controller reads has changed.
+`Requeue` queues an object for reconcile now, and is the only way to reconcile something without waiting for a tick. It is a **latency hint, not a synchronous run**: it returns once the object is queued, and a worker gets to it on its own schedule. Losing one is harmless whenever the store records that the object is owed a pass, because the owed pass finds it anyway. It is also how you drive reconciles yourself with every periodic driver switched off. Use it to re-examine an object promptly after state the controller reads has changed elsewhere.
 
-By default `Requeue` **preserves the object's retry backoff ladder**. A requeue is the ordinary event-driven nudge (config change, dependency update, manual poke) and almost never proves the failing condition is resolved; the only event that proves recovery is a successful reconcile, which already clears backoff. The invariant: **backoff is cleared by a successful reconcile or an explicit `WithResetBackoff()`, never by a plain requeue.** Pass `beehive.WithResetBackoff()` only when the caller knows the failure is resolved and the next retry should restart from the base interval — the analog of controller-runtime's `Forget`. (This mirrors controller-runtime's split between `Add`/`AddAfter`, which requeue without resetting, and `Forget`, which explicitly resets.)
+By default `Requeue` **keeps the object's retry backoff**. A requeue is an ordinary nudge — a config change, a dependency update, a manual poke — and almost never proves the failure is over. The one thing that does prove it is a successful reconcile, which clears backoff already. So: **backoff is cleared by a successful reconcile or by an explicit `WithResetBackoff()`, never by a plain requeue.** Pass `beehive.WithResetBackoff()` only when you know the failure is resolved and the next retry should start from the base interval. (controller-runtime draws the same line between `Add`/`AddAfter` and `Forget`.)
 
-`Requeue` validates the id against the client's kind first (`ErrNotFound` for a missing or foreign id), then requires a registered controller (`ErrNoController` for a client-only kind, which has no reconcile loop to schedule against). It is `Client`-only — a controller schedules itself with `Result.RequeueAfter` and influences other objects through the store, never by poking another reconcile loop directly.
+`Requeue` checks the id against the client's kind first, returning `ErrNotFound` for a missing or foreign id, then requires a registered controller, returning `ErrNoController` for a client-only kind that has no reconcile loop. It is on `Client` only: a controller schedules itself with `Result.RequeueAfter` and reaches other objects through the store, never by poking another reconcile loop.
 
 #### Scheduling
 
-The scheduling API observes when an object is **next due to reconcile** — a [`Schedule`](#schedule) gauge whose `NextRequeueAt` is a pending backoff retry or `RequeueAfter` delay, or now if the object is already queued, and the zero time when nothing is scheduled.
+The scheduling API reports when an object is **next due to reconcile**, as a [`Schedule`](#schedule) whose `NextRequeueAt` is a pending backoff retry or `RequeueAfter` delay — or now, if the object is already queued, or the zero time if nothing is scheduled.
 
-`SchedulesGet` is the point read. It is a non-blocking, best-effort read of in-memory schedule state — no store lookup, no kind guard — so it returns no error today (the error is reserved for symmetry). A missing, foreign, or client-only-kind id reads as the zero-value `Schedule`, indistinguishable from a real object with nothing scheduled.
+`SchedulesGet` is the point read: a non-blocking read of in-memory state, with no store lookup and no kind check, so it returns no error today (the error is reserved for symmetry with the rest of the surface). A missing id, another kind's id and a client-only kind all read as the zero `Schedule`, which looks the same as a real object with nothing scheduled.
 
-`SchedulesWatch` streams that schedule live as a **gauge**: the current value on subscribe, then a new `Schedule` on every (re)schedule — backoff step, `RequeueAfter`, resync or dependency wake, dispatch, or `Requeue`. None of these fire the object `ObjectsWatch`/`ObjectsWatchList` (a reschedule bumps no generation or resource version) and no other signal captures them all, so this is the only way to reliably observe reschedules — e.g. to drive a "next attempt" countdown that stays accurate for an object whose spec/status has stopped changing. Delivery mirrors `EventsWatch`: snapshot-then-live, conflated **per object** so a lagging reader converges to the latest value (it can miss intermediate values but never the current one), and the channel closes when `ctx` is cancelled or the control plane stops. Unlike `SchedulesGet`, `SchedulesWatch` returns `ErrNoController` for a client-only kind — a live stream that can never emit should say so rather than hang — but `id` need not exist: an unscheduled id simply streams the zero `Schedule` until something schedules it.
+`SchedulesWatch` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `ObjectsWatch`/`ObjectsWatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It polls on the same 1s cadence as the object watches and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `SchedulesGet` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
 
-Both are `Client`-only and read **only per-id timers**, so neither is a prediction of the next reconcile: the actual next reconcile can be **earlier** than reported (the catchup tick — kind-wide, conditional on the object being owed something — plus the full resync, dependency-change wakes and store-write enqueues are not per-id timers), and a **zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee.
+Both are on `Client` only, and both read **per-id timers only**. Neither predicts the next reconcile: the real one can come **earlier**, because the owed pass, the full pass and the dependency wake are not per-id timers, and **a zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee.
 
 → [ADR: the schedule watch](docs/adr/2026-07-27-schedule-watch.md), for why it is an in-memory gauge rather than an event-log surface.
 
 #### Events
 
-`EventsList` returns an object's runs most-recent-first (`LastAt` descending); `WithEventCategory` narrows to a single timeline, and the other `EventOption`s filter by type/reason/time or cap the count. `EventsWatch` delivers the current recent runs as a snapshot, then streams extends and new runs — matching `ObjectsWatch`/`ObjectsWatchList`'s snapshot-then-live contract — conflated on `EventID`, so a subscriber sees one update per run (a count-bump updates the run in place) rather than one per occurrence. `EventsGetLatest` returns the current run in a category; its `bool` folds away the no-events-yet case, like `OwnersGet`.
+`EventsList` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `EventsWatch` sends the current runs first, then streams new runs and extensions to existing ones, on the same interval and the same snapshot-then-poll contract as the object watches. Runs are matched by `EventID`, so you see at most one update per run per interval — a count bump updates the run in place instead of arriving as a new one. There are no tombstones, since an append-only log means a run can only appear or grow. `EventsGetLatest` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `OwnersGet` does.
 
-Retention is bounded per `(object, category)` by `WithEventRetention`: a cap-N ring keeps the newest N runs per timeline — so a flapping timeline can't evict a quiet one on the same object — plus an optional global max-age. The global GC sweeper enforces it, and events cascade-delete with their object.
+`WithEventRetention` bounds the log per `(object, category)`: a ring that keeps the newest N runs in each timeline, so a flapping timeline can't evict a quiet one on the same object, plus an optional maximum age. The GC sweeper enforces it, and deleting an object deletes its events.
 
 → [ADR: the events API](docs/adr/2026-07-27-events-api.md), for the run-aggregation rule, why `Detail` stays off the generic boundary, and the watch-surface naming.
 
@@ -482,19 +512,19 @@ type ControllerClient[Status any] interface {
 }
 ```
 
-`UpdateStatus` is a **no-op when the status marshals to the bytes already stored**: no `resource_version` bump and no watch event, exactly as re-applying an unchanged spec is a no-op on the `Client` side. So a controller reports its observed state unconditionally — no hand-rolled equality guard — and a dependent that free-rides on this kind's status changes isn't woken by a poll that found nothing new.
+`UpdateStatus` **does nothing when the status marshals to the bytes already stored**. There is no `resource_version` bump, so a watch poll and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
 
-The generation handshake is the exception. `observedGeneration`/`ObservedAt` are recorded even when the content didn't change, so a reconcile that legitimately changed no status still settles the object rather than being re-enqueued by every catchup tick — and that write *does* bump `resource_version` and emit, so a watcher gating on `ObservedGeneration == Generation` sees the object converge. It fires at most once per generation: the next unchanged poll finds the generation already recorded and writes nothing.
+The generation handshake is the exception. `observedGeneration` and `ObservedAt` are recorded even when the content is unchanged, so a reconcile that legitimately changed no status still settles the object instead of being re-queued by every owed-pass tick. That write does bump `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees the object converge. It happens at most once per generation: the next unchanged pass finds the generation already recorded and writes nothing.
 
-So `ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran. Don't build a controller-liveness check on it — a reconcile that calls no `UpdateStatus` at all never moved it either. For "when did we last check", record an event: `EventsRecord` extends the current run and bumps its `LastAt` on every poll, which is exactly that signal, retained and rate-shaped.
+`ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `EventsRecord` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
 
 → [ADR: the generation handshake and content no-ops](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md), for how the no-op splits the two halves of the write and why it is gated on the schema version.
 
-`OwnersGet`/`DependenciesList`/`DependentsList`/`OwnedList` mirror the `Client` lazy lookups — a `Reconcile` receives the object directly (no read call site), so it reads related edges through these. `OwnersGet` returns the owner via `owned_by`, `OwnedList` the inverse (the owner's children); `DependentsList` is the inverse of `DependenciesList` over `depends_on`. Distinct from `EdgesHasIncoming`, which is a GC predicate: it folds in owned children *and* excludes finalizing dependents, so it can't be reconstructed from `DependentsList`.
+`OwnersGet`, `DependenciesList`, `DependentsList` and `OwnedList` are the same lazy lookups the `Client` has. `Reconcile` is handed its object directly, with no read call of its own, so these are how it reads related edges. `OwnersGet` returns the owner over `owned_by` and `OwnedList` the reverse, the owner's children; `DependentsList` is the reverse of `DependenciesList` over `depends_on`.
 
-`EdgesHasIncoming` reports whether any object with a live claim still points at `id` — an owned child, or a dependent that is not itself being deleted (a finalizing dependent is excluded, since it's going away too). A finalizer can gate teardown on it — e.g. a controller that owns a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
+`EdgesHasIncoming` is a different question, used by GC: does anything with a live claim still point at `id`? That means an owned child, or a dependent that is not itself being deleted — one that is going away has no claim. You cannot rebuild it from `DependentsList`, because it folds in owned children as well. A finalizer can wait on it: a controller holding a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
-`EventsRecord` appends an observation to the object's event log — see [Event](#event). Like `ConditionsSet` it is a scoped, transactional write (kind-folded; `ErrWrongKind` for a foreign id) and composes inside `Within`, so a controller can record an observation and flip a condition in one atomic step.
+`EventsRecord` appends an observation to the object's event log — see [Event](#event). Like `ConditionsSet` it is scoped to the controller's kind (`ErrWrongKind` for another kind's id) and composes inside `Within`, so a controller can record an event and flip a condition together.
 
 ### Controller
 
@@ -504,11 +534,11 @@ type Controller[Spec, Status any] interface {
 }
 ```
 
-A controller owns **no lifecycle** in beehive — it implements only `Reconcile`, which receives the kind's `ControllerClient` as a parameter. Any background work (timers, subscriptions, engines) belongs to the embedding application, which already owns its own lifecycle and obtains a `ControllerClient` from `Register`. Beehive owns the reconcile lifecycle only: the work queue, backoff, the periodic drivers, dependency wakers, GC, and drain ordering.
+A controller has **no lifecycle** in beehive. It implements `Reconcile` and nothing else, and receives the kind's `ControllerClient` as a parameter. Background work — timers, subscriptions, engines — belongs to your application, which already has its own lifecycle and can get a `ControllerClient` from `Register`. Beehive owns only the reconcile lifecycle: the work queue, backoff, the periodic drivers and shutdown ordering.
 
-`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed — the level loop simply re-derives from the persisted state on the next pass, so make `Reconcile` idempotent. (Each write is still internally atomic, and the `obj` snapshot a concurrent spec change can race is covered by the generation handshake: `UpdateStatus` rejects a future `observedGeneration`, and an older one leaves the object unsettled to reconcile again.)
+`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed. The next pass works from the stored state, so write `Reconcile` to be idempotent. Each write is still atomic on its own, and the generation handshake covers a concurrent spec change racing the `obj` you were handed: `UpdateStatus` rejects a generation from the future, and an older one leaves the object unsettled so it reconciles again.
 
-When several writes must be atomic — all land together or none do — wrap them in `ControllerClient.Within(ctx, func(ctx) error { … })`. Writes made with the inner `ctx` join one transaction that commits on a `nil` return and rolls back on error, `Client` writes included. That transaction holds the store's single write lock for the whole duration of the function, so keep external I/O outside it. Side effects wait for it: the reconciler wake, and for `Delete` the garbage-collection follow-up, run after the outermost commit and are skipped on rollback, so a controller can create or delete children inside `Within` without waking anything at a row that never lands. → [ADR](docs/adr/2026-07-27-writes-and-post-commit-wakes.md)
+When several writes must land together or not at all, wrap them in `ControllerClient.Within(ctx, func(ctx) error { … })`. Writes made with the inner `ctx` join one transaction, which commits when the function returns `nil` and rolls back on error — `Client` writes included. That transaction holds the store's single write lock for as long as the function runs, so keep external I/O out of it. Nothing waits on it, because nothing is scheduled: a rolled-back transaction leaves no rows, so no driver can list them. That makes it safe to create or delete children inside `Within`. The one thing deferred past the commit is `WithOnCreate`, which is skipped on rollback. → [ADR](docs/adr/2026-07-27-slug-keyed-writes.md)
 
 A non-nil error triggers an automatic retry with exponential backoff starting at 1s and capped at 30s by default. Configurable per-controller with `WithMaxRetryInterval`.
 
@@ -523,9 +553,17 @@ type Migrator interface {
 }
 ```
 
-Attach a `Migrator` per kind with `WithMigrator` passed to `Register`. The store persists the version each blob was written at in two opaque per-row columns (spec and status). On read, a blob below the current version is run through `ConvertSpec`/`ConvertStatus`; an equal version (or a current version of `0`, "not versioned") passes through; a *greater* version is a downgrade and is rejected as a decode error. `from == 0` is the unversioned baseline, so once a migrator is enabled its converters must handle it.
+Attach a `Migrator` per kind by passing `WithMigrator` to `Register`. The store records the version each blob was written at in two per-row columns, one for spec and one for status. On read, a blob below the current version goes through `ConvertSpec`/`ConvertStatus`; an equal version passes through, as does anything when the current version is `0` ("not versioned"); a *higher* version means the data was written by a newer build and is rejected as a decode error. `from == 0` is the unversioned baseline, so once you enable a migrator its converters have to handle it.
 
-Conversion is lazy and per-column — a blob is re-stamped only when next written, so a status-only write re-stamps just the status version. A blob that fails to convert, fails to unmarshal, or is a downgrade is a decode failure, and each read path handles it in the way that fails safest for it: `List` and live watches skip-and-log the bad row and continue; `Get`/`GetBySlug` return the error; and the **reconcile loop quarantines** it — a row it cannot decode cannot be reconciled and its bytes won't change until someone rewrites the spec, so it logs and treats the pass as a no-op success rather than retrying the same bytes forever under backoff (a deletion-pending row is still collected, since GC needs only the id). Because the catchup tick re-enqueues an unsettled poison row every time, this warning recurs at that cadence — deliberately, so a persistent bad row stays visible rather than logging once and going silent. A kind with no migrator is unchanged — its columns stay `0`. Only `Register`ed kinds can have a migrator; client-only kinds cannot.
+Conversion is lazy and per column: a blob is re-stamped when it is next written, so a status-only write re-stamps only the status version.
+
+A blob that fails to convert, fails to unmarshal, or came from a newer build is a decode failure, and each read path handles it in the way that fails safest:
+
+- `List` and the watches skip the bad row, log it and carry on. A watch remembers its version, so it warns once per change rather than once per poll.
+- `Get`/`GetBySlug` return the error.
+- **The reconcile loop quarantines the row.** It cannot reconcile what it cannot decode, and the bytes will not change until someone rewrites the spec, so it logs and treats the pass as a successful no-op rather than retrying the same bytes forever under backoff. A deletion-pending row is still collected, since GC needs only the id. The owed pass re-queues the unsettled row every tick, so the warning repeats at that interval — deliberately, so a bad row stays visible instead of logging once and going quiet.
+
+A kind with no migrator is untouched; its columns stay `0`. Only registered kinds can have a migrator, so client-only kinds cannot.
 
 → [ADR: schema-version migration](docs/adr/2026-07-27-schema-version-migration.md), for convert-on-read / stamp-on-write and why stamping is never downward.
 
@@ -538,30 +576,29 @@ func WithSlug(slug string) Option                  // set a human-readable slug;
 func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
-func WithCatchupInterval(d time.Duration) Option   // how often to drain recorded owed work (default: 30s; 0 disables)
-func WithResyncInterval(d time.Duration) Option    // how often to re-dispatch EVERY object (default: 0, off)
+func WithFullPassInterval(d time.Duration) Option  // how often to re-dispatch EVERY object (default: 0, off)
 func WithGCInterval(d time.Duration) Option        // how often to collect dead rows + prune the event log (default: 30s; New only; must be > 0)
-func WithStartupResync(enabled bool) Option        // also re-dispatch settled objects once at startup (default: true)
+func WithStartupFullPass(enabled bool) Option      // also re-dispatch settled objects once at startup (default: false, off)
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
 func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring + optional age bound (0 = no age bound)
 ```
 
-`WithOwner` sets an `owned_by` edge in `edges` atomically with the `Create` call. When the owner is deleted, Beehive triggers deletion of the child via the GC reconciler.
+`WithOwner` writes an `owned_by` edge in the same transaction as the `Create`. Deleting the owner then cascades to the child through GC.
 
-`WithOnCreate` is the commit-safe channel for a create-conditional side effect (an external call, an in-memory counter). It is registered on the same post-commit path as the reconciler wake, so it runs once after the *outermost* commit and never on a rollback. `Create` always fires it; `GetOrCreate` fires it only on the create branch, not when it returns an existing row. Prefer it over branching on `GetOrCreate`'s returned `created` bool: that bool is synchronous, so inside a caller's `ControllerClient.Within` it is set before the enclosing transaction commits, and acting on it there fires the side effect for a row a later rollback would discard.
+`WithOnCreate` is the safe way to run a side effect only if the row is really created — an external call, an in-memory counter. It waits for the *outermost* commit, so it runs once and never after a rollback; it is the only thing in beehive deferred that way. `Create` always fires it, `GetOrCreate` only when it inserts. Prefer it to branching on `GetOrCreate`'s `created` bool, which is returned synchronously: inside an enclosing `ControllerClient.Within` that bool is set before the transaction commits, so acting on it fires your side effect for a row a rollback may still discard.
 
-`DependenciesAdd` and `DependenciesDelete` on `ControllerClient` manage `depends_on` edges during reconcile. When a target's conditions change, Beehive automatically requeues the dependent. Each commits on its own, or joins a `Within` if the controller opened one.
+`DependenciesAdd` and `DependenciesDelete` manage `depends_on` edges during reconcile. When a target changes, the next dependency-wake scan queues the dependent. Each commits on its own, or joins a `Within` the controller opened.
 
-The target may be of **any** kind, including one you only ever use through `Client` and never `Register` — configuration, secrets, any reference data your application writes and your controllers read. Beehive observes changes to every object in the store, not only to kinds that have controllers, so such a target wakes its dependents like any other.
+The target can be **any** kind, including one you only ever use through `Client` and never register — configuration, secrets, any reference data your app writes and your controllers read. The waker scans the whole store's write log rather than only the kinds with controllers, so such a target wakes its dependents like any other.
 
-`DependenciesAdd` takes `targetResourceVersion`: the `ResourceVersion` of the target *as the decision to depend on it was read*, not a freshly fetched one. A change to the target that lands between that read and the edge's commit would otherwise reach nobody — the waker resolves dependents at the instant of the change, and the edge does not exist yet — so if the target has moved past the version you pass, the dependent is requeued. Pass `0` to skip the check; that is the right value when you declare the edge *before* reading the target, which needs no check.
+`DependenciesAdd` takes `targetResourceVersion`: the `ResourceVersion` of the target *as you read it when deciding to depend on it*, not one fetched fresh for the call. Without it, a change to the target landing between that read and the edge's commit would reach nobody — the waker resolves dependents when its scan passes the change, and the edge doesn't exist yet. So if the target has already moved past the version you pass, beehive records that the dependent owes a pass. Pass `0` to skip the check, which is right when you declare the edge *before* reading the target.
 
-A version *above* the target's current one is rejected with `ErrTargetResourceVersionFuture` — versions only move forward, so it cannot have come from reading the target. The rejection happens before anything is written, so no edge is declared even if you call it inside your own `Within` and ignore the error.
+A version *above* the target's current one is rejected with `ErrTargetResourceVersionFuture`, since versions only move forward and it cannot have come from reading the target. Nothing is written before that check, so no edge is declared even if you call it inside your own `Within` and ignore the error.
 
-The requeue fires at most once per edge — it is also gated on the call that creates the edge, and every change after that reaches an edge the waker already sees. So re-asserting your edges on every pass costs nothing after the first, and a stale version costs at most one spurious reconcile rather than a loop. It survives a crash: the same conjunction records the owed wake durably, and the catchup tick drains it.
+The check fires at most once per edge, because it is also gated on this call being the one that created the edge — after that, every change reaches an edge the waker can already see. So re-asserting your edges on every pass costs nothing after the first, and a stale version costs one extra reconcile rather than a loop. It survives a crash: the record is a durable count on the row (`reconcile_owed`), written with the edge, and the owed pass drains it.
 
-→ [ADR: caller-versioned dependency declaration](docs/adr/2026-07-27-caller-versioned-dependencies.md), for why both halves are required and how the durable twin is kept atomic with the edge. The waker itself is [one store-wide change stream](docs/adr/2026-07-27-store-wide-dependency-change-stream.md).
+→ [ADR: caller-versioned dependency declaration](docs/adr/2026-07-27-caller-versioned-dependencies.md), for why both halves are required and how the count is kept atomic with the edge. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md).
 
 Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned):
 

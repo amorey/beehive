@@ -22,11 +22,13 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/gochan/oneshot"
+	"github.com/stretchr/testify/require"
 )
 
 // errBoom is a sentinel error shared by tests that exercise error-propagation
@@ -64,6 +66,31 @@ func (m *fakeMigrator) ConvertStatus(from int, raw json.RawMessage) (json.RawMes
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
 // fail rather than block forever. Tests never rely on it to pace anything.
 const testTimeout = 2 * time.Second
+
+// fastTick is the cadence every integration test runs its drivers at. Nothing is
+// pushed — a reconcile after a write, a collect after a delete and a dependency wake
+// all arrive on a tick — so a test observes a write propagate within a tick or two,
+// never immediately. The production defaults (seconds to tens of seconds) would
+// simply time these out.
+//
+// Short enough that a handful of ticks fit inside testTimeout, long enough that
+// the drivers are not hammering the store's single connection while the test does
+// its own reads.
+const fastTick = 2 * time.Millisecond
+
+// fast bundles the tick intervals an integration test needs, plus whatever else
+// the caller passes. Kept as one bundle so a test reads as "run the drivers
+// fast" rather than as four numbers each test picked for itself; a test that
+// means to disable a specific driver appends its own option, which wins by
+// arriving later.
+func fast(opts ...Option) []Option {
+	return append([]Option{
+		withOwedPassInterval(fastTick),
+		WithGCInterval(fastTick),
+		withDependencyWakeInterval(fastTick),
+		withWatchPollInterval(fastTick),
+	}, opts...)
+}
 
 // captureLogger returns a logger that records everything at or above level into
 // the returned buffer, for tests asserting that a code path announces itself.
@@ -221,118 +248,109 @@ func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 
-// ObjectsWatch/ObjectsWatchList default to a dead subscription (never fires, no-op Close) rather
-// than panicking, so client tests that only exercise the snapshot or
-// registration error paths reach their target without each fake overriding them.
-func (s *fakeStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
-	return deadSubscription[storeapi.RawObjectChange](), nil
-}
-func (s *fakeStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
-	return deadSubscription[storeapi.RawObjectChange](), nil
-}
 func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
-func (s *fakeStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
-	return deadSubscription[storeapi.ObjectWriteBatch](), 0, nil
-}
-func (s *fakeStore) EventsWatch(context.Context, GroupKind, ObjectID, storeapi.EventQuery) (*EventsSubscription, error) {
-	panic("not implemented: fakeStore.EventsWatch")
-}
-
-// deadSubscription is a subscription whose stream never fires and whose Close
-// does nothing — a nil channel blocks forever, which is what "never fires" means
-// to a select.
-func deadSubscription[V any]() *storeapi.Subscription[V] {
-	return storeapi.NewSubscription[V](nil, func() {})
+func (s *fakeStore) ObjectWritesMaxVersion(context.Context) (int64, error) {
+	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
+	// panic would make the fake unusable for anything that calls Start.
+	return 0, nil
 }
 
-// watcherStore is a fakeStore whose object watches return a preset stream and
-// error, so client-layer tests can drive the typed-adapter goroutine directly.
-type watcherStore struct {
+// depsStore serves a per-target dependent set from the waker's batched lookup
+// and records what it was asked, so a test can control the exact edges — and
+// their order — that the waker walks, and assert that a batch of targets costs
+// one query rather than one per target.
+type depsStore struct {
 	fakeStore
-	w      *fakeObjectStream
-	writes *fakeWriteStream // served by ObjectWritesSubscribe, for the dependency waker
-	// writesCursor is the starting cursor ObjectWritesSubscribe reports, for tests
-	// that drive the waker's resume position.
-	writesCursor int64
-	err          error
+	deps  map[ObjectID][]ObjectRef
+	err   error
+	calls atomic.Int64
+	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *watcherStore) ObjectsWatch(context.Context, GroupKind, ObjectID) (*ObjectsSubscription, error) {
+func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
+	s.calls.Add(1)
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.w.sub, nil
+	s.seen = append(s.seen, slices.Clone(toIDs))
+	out := make(map[ObjectID][]ObjectRef, len(toIDs))
+	for _, id := range toIDs {
+		if deps, ok := s.deps[id]; ok {
+			out[id] = deps
+		}
+	}
+	return out, nil
 }
-func (s *watcherStore) ObjectsWatchList(context.Context, GroupKind) (*ObjectsSubscription, error) {
+
+// changedAt is changed with explicit resource versions, for the watermark: every
+// row in the write log carries the version it was last written at.
+func changedAt(versions ...int64) []ObjectWrite {
+	refs := make([]ObjectWrite, 0, len(versions))
+	for i, rv := range versions {
+		refs = append(refs, ObjectWrite{ID: ObjectID(i + 1), ResourceVersion: rv})
+	}
+	return refs
+}
+
+// replayStore serves ObjectWritesListSince from a fixed set of rows, recording the
+// cursor and limit of every page it was asked for. It is the whole of what the
+// waker can see, so a test scripts a scan by setting rows and reads back what the
+// waker asked for.
+type replayStore struct {
+	depsStore
+	rows    []ObjectWrite // every live row, in version order
+	seed    int64         // what ObjectWritesMaxVersion reports
+	pages   [][2]int64    // (afterRV, limit) per call
+	read    int           // rows actually served, across every page
+	listed  *signal       // fires on the first page request, when set
+	err     error
+	seedErr error
+}
+
+func (s *replayStore) ObjectWritesMaxVersion(context.Context) (int64, error) {
+	if s.seedErr != nil {
+		return 0, s.seedErr
+	}
+	return s.seed, nil
+}
+
+// cursors returns the afterRV of every scan so far, which is how a test sees
+// whether the watermark moved.
+func (s *replayStore) cursors() []int64 {
+	out := make([]int64, 0, len(s.pages))
+	for _, p := range s.pages {
+		out = append(out, p[0])
+	}
+	return out
+}
+
+func (s *replayStore) ObjectWritesListSince(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
+	if s.listed != nil {
+		s.listed.fire()
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.w.sub, nil
-}
-func (s *watcherStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
-	if s.err != nil {
-		return nil, 0, s.err
+	var out []ObjectWrite
+	for _, r := range s.rows {
+		if r.ResourceVersion > afterRV && len(out) < limit {
+			out = append(out, r)
+		}
 	}
-	return s.writes.sub, s.writesCursor, nil
+	s.read += len(out)
+	return out, nil
 }
 
-// fakeStream is the shared body of the controllable subscription doubles: an
-// unbuffered channel of whatever the stream carries, plus a closed signal so a
-// test can synchronize on the consumer goroutine's exit instead of reading the
-// channel — which could itself satisfy a pending send and race the outcome.
-// sub is the read side handed to the code under test; Subscription.Close is
-// idempotent, so the signal needs no Once of its own.
-type fakeStream[V any] struct {
-	ch     chan V
-	closed chan struct{}
-	sub    *storeapi.Subscription[V]
-}
-
-func newFakeStream[V any]() fakeStream[V] {
-	s := fakeStream[V]{ch: make(chan V), closed: make(chan struct{})}
-	s.sub = storeapi.NewSubscription[V](s.ch, func() { close(s.closed) })
-	return s
-}
-
-// endStream closes the channel, signalling the stream has ended.
-func (w *fakeStream[V]) endStream() { close(w.ch) }
-
-// fakeObjectStream is a controllable ObjectsSubscription, backing the client
-// adaptObjectStream tests.
-type fakeObjectStream struct {
-	fakeStream[storeapi.RawObjectChange]
-}
-
-func newFakeObjectStream() *fakeObjectStream {
-	return &fakeObjectStream{newFakeStream[storeapi.RawObjectChange]()}
-}
-
-// push delivers a raw change to the adapter goroutine.
-func (w *fakeObjectStream) push(typ ChangeType, obj *RawObject) {
-	w.ch <- storeapi.RawObjectChange{Type: typ, Object: obj}
-}
-
-// fakeWriteStream is fakeObjectStream's store-wide twin, backing the
-// dependency-waker tests. A batch is the push unit deliberately — the waker
-// resolves a whole batch in one query, so a double that could only deliver one
-// write at a time would hide that.
-type fakeWriteStream struct{ fakeStream[ObjectWriteBatch] }
-
-func newFakeWriteStream() *fakeWriteStream {
-	return &fakeWriteStream{newFakeStream[ObjectWriteBatch]()}
-}
-
-// push delivers one batch to the waker, reporting no backlog behind it.
-func (w *fakeWriteStream) push(writes ...ObjectWrite) {
-	w.ch <- ObjectWriteBatch{Writes: writes}
-}
-
-// pushBounded delivers one batch that reports oldestPending still queued behind it,
-// which is what bounds how far the waker may advance its cursor.
-func (w *fakeWriteStream) pushBounded(oldestPending int64, writes ...ObjectWrite) {
-	w.ch <- ObjectWriteBatch{Writes: writes, OldestPending: oldestPending}
+// replayRows builds count live rows at versions 1..count.
+func replayRows(count int) []ObjectWrite {
+	rows := make([]ObjectWrite, 0, count)
+	for i := 1; i <= count; i++ {
+		rows = append(rows, ObjectWrite{ID: ObjectID(i), ResourceVersion: int64(i)})
+	}
+	return rows
 }
 
 // noopController is a no-op test double for Controller, used wherever a test
@@ -374,6 +392,44 @@ func (s *signal) wait(t *testing.T, what string) {
 	waitClosed(t, s.rx.Chan(), what)
 }
 
+// chanAfter returns a channel closed once n values have arrived on ch, for a test
+// that needs "the poll ran again" as something to wait on rather than assume.
+func chanAfter(ch <-chan struct{}, n int) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range n {
+			<-ch
+		}
+	}()
+	return done
+}
+
+// drainProbe empties a probe channel, so a later wait is answered by a signal the
+// test caused rather than by one still buffered from earlier.
+func drainProbe(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// closedWhenDrained returns a channel closed once ch is closed, discarding
+// whatever ch still holds. A watch closes its channel on cancellation, so this is
+// how a test waits for the stream to end without caring what was in flight.
+func closedWhenDrained[V any](ch <-chan V) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range ch {
+		}
+	}()
+	return done
+}
+
 // waitClosed blocks until ch is closed, failing the test if that takes longer
 // than the failsafe timeout (i.e. the expected event never happened).
 func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
@@ -383,6 +439,42 @@ func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	case <-time.After(testTimeout):
 		t.Fatalf("timed out waiting for %s", what)
 	}
+}
+
+// reconcilerStartedMsg is the record run logs once its startup passes have
+// enqueued everything they are going to and its workers are up. Tests key a
+// barrier off it rather than off the wall clock.
+const reconcilerStartedMsg = "reconciler started"
+
+// messageSignalHandler closes ch the first time a record with the given message
+// is logged, and discards everything else. WithAttrs/WithGroup return the same
+// handler on purpose: Register decorates the reconciler's logger with group/kind
+// attrs, and the signal has to survive that.
+type messageSignalHandler struct {
+	msg  string
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (h *messageSignalHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *messageSignalHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.once.Do(func() { close(h.ch) })
+	}
+	return nil
+}
+
+func (h *messageSignalHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *messageSignalHandler) WithGroup(string) slog.Handler      { return h }
+
+// loggerSignallingOn returns a logger and a channel closed the first time msg is
+// logged through it. It is how a test waits on a point *inside* the loop instead
+// of guessing at a duration: the log line is emitted at a known place in run, so
+// it orders the test's next action against everything the loop did before it.
+func loggerSignallingOn(msg string) (*slog.Logger, <-chan struct{}) {
+	h := &messageSignalHandler{msg: msg, ch: make(chan struct{})}
+	return slog.New(h), h.ch
 }
 
 // findCondition returns the condition of the given type, or nil.
@@ -395,9 +487,18 @@ func findCondition(conds []Condition, condType string) *Condition {
 	return nil
 }
 
+// unsettledIDs is what the owed pass would find owed for the client test kind.
+// It is the observable a write leaves behind now that no write schedules anything
+// itself: a spec change bumps the generation, and this listing is what notices.
+func unsettledIDs(t *testing.T, store Store) []ObjectID {
+	t.Helper()
+	ids, err := store.ObjectsListUnsettledIDs(context.Background(), clientTestGK)
+	require.NoError(t, err)
+	return ids
+}
+
 // drainQueue removes every dispatchable item from q (get + done, so nothing is
-// left holding a processing slot), leaving the queue empty — used by tests that
-// need a clean queue after a create-time enqueue.
+// left holding a processing slot), leaving the queue empty.
 func drainQueue(q *workQueue) {
 	for id, ok := q.get(); ok; id, ok = q.get() {
 		q.done(id)
@@ -574,14 +675,4 @@ func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.O
 	rows, err := s.Store.DeletionRequestsList(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
-}
-
-// wakerOf returns bh's dependency waker, wiring one on demand. New does this, but
-// most waker tests build a Beehive literal to control exactly which collaborators
-// exist, so they have no waker until they ask for one.
-func wakerOf(bh *Beehive) *waker {
-	if bh.waker == nil {
-		bh.waker = &waker{bh: bh}
-	}
-	return bh.waker
 }

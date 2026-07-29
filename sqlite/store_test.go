@@ -633,10 +633,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	settled, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	again, changed, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
 	require.NoError(t, err)
@@ -647,7 +644,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	require.NotNil(t, again.ObservedGeneration)
 	assert.EqualValues(t, again.Generation, *again.ObservedGeneration, "object stays settled after a no-op update")
 	// No watcher churn: an idempotent update emits no Modified event.
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 }
 
 func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
@@ -771,10 +768,7 @@ func TestUpdateStatusIdenticalStatusIsNoOp(t *testing.T) {
 	first, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	again, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
@@ -782,7 +776,7 @@ func TestUpdateStatusIdenticalStatusIsNoOp(t *testing.T) {
 	assert.Equal(t, first.ResourceVersion, again.ResourceVersion, "identical status must not bump resource_version")
 	assert.Equal(t, first.UpdatedAt, again.UpdatedAt, "identical status must not touch updated_at")
 	assert.JSONEq(t, `{"msg":"hi"}`, string(again.Status))
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 }
 
 func TestUpdateStatusChangedStatusWrites(t *testing.T) {
@@ -797,17 +791,14 @@ func TestUpdateStatusChangedStatusWrites(t *testing.T) {
 	first, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	again, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 0)
 	require.NoError(t, err)
 
 	assert.Greater(t, again.ResourceVersion, first.ResourceVersion, "a real status change bumps resource_version")
 	assert.JSONEq(t, `{"msg":"bye"}`, string(again.Status))
-	assert.Equal(t, beehive.Modified, recvEvent(t, w).Type)
+	probe.expectWrite()
 }
 
 // The future-generation guard is a caller-bug check, not a write guard: it must
@@ -853,10 +844,10 @@ func TestUpdateStatusScopedOnBothBranches(t *testing.T) {
 // TestUpdateStatusNoOpAdvancesObservedGeneration pins the design decision: a
 // content no-op still advances observed_generation/observed_at. The handshake
 // records that the controller ran, not what it wrote — stranding it would leave
-// the object unsettled and re-enqueued by every resync. The advance is a real
+// the object unsettled and re-enqueued by every full pass. The advance is a real
 // transition (the object just settled at a new generation), so it bumps
 // resource_version and emits, or a watcher gating on convergence would sit
-// blind until the next resync. The repeat call, already settled, is silent.
+// blind until the next full pass. The repeat call, already settled, is silent.
 func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -875,10 +866,7 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	again, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
@@ -889,12 +877,15 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	assert.Greater(t, again.ResourceVersion, bumped.ResourceVersion,
 		"settling at a new generation is a real transition, so it bumps resource_version")
 	assert.Equal(t, bumped.UpdatedAt, again.UpdatedAt, "the handshake write doesn't touch updated_at")
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Modified, ev.Type, "watchers see the object converge")
-	require.NotNil(t, ev.Object.ObservedGeneration)
-	assert.EqualValues(t, bumped.Generation, *ev.Object.ObservedGeneration)
+	// The convergence is observable: a consumer scanning the write log finds the
+	// row and re-reads it at the generation the controller settled.
+	assert.Equal(t, again.ResourceVersion, probe.expectWrite().ResourceVersion)
+	reread, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reread.ObservedGeneration)
+	assert.EqualValues(t, bumped.Generation, *reread.ObservedGeneration)
 
-	// It really settled: the resync backstop no longer sees it.
+	// It really settled: the owed-pass backstop no longer sees it.
 	unsettled, err := store.ObjectsListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.NotContains(t, unsettled, created.ID)
@@ -905,14 +896,14 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, again.ObservedAt, third.ObservedAt, "no observed_at churn once the generation is recorded")
 	assert.Equal(t, again.ResourceVersion, third.ResourceVersion)
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 }
 
 // TestUpdateStatusNoOpKeepsNewerObservedGeneration pins the handshake as
 // forward-only. Two reconciles can be in flight for one object and the older can
 // commit last; a content no-op reporting a generation already covered by a newer
 // recorded one must stay silent, not write observed_generation backwards —
-// regressing it would re-unsettle a converged object for the resync backstop and
+// regressing it would re-unsettle a converged object for the owed-pass backstop and
 // emit a Modified that wakes every dependent.
 func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 	store := newTestStore(t)
@@ -933,10 +924,7 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 	require.NotNil(t, settled.ObservedGeneration)
 	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// The straggler, still holding generation 1, reports identical status.
 	late, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
@@ -947,9 +935,9 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 		"a stale report must not roll the handshake back")
 	assert.Equal(t, settled.ResourceVersion, late.ResourceVersion, "nothing moved, so no version bump")
 	assert.Equal(t, settled.ObservedAt, late.ObservedAt)
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 
-	// The object is still converged as far as the resync backstop is concerned.
+	// The object is still converged as far as the owed-pass backstop is concerned.
 	unsettled, err := store.ObjectsListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.NotContains(t, unsettled, created.ID)
@@ -958,7 +946,7 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 // TestUpdateStatusChangedStaleGenerationUnsettles is the content-changed
 // counterpart, and pins the opposite behavior on purpose. Here the stale reporter
 // overwrote the status with content derived from an older spec, so its generation
-// is written back verbatim: the object goes unsettled and the resync backstop
+// is written back verbatim: the object goes unsettled and the owed-pass backstop
 // re-derives the content. Clamping it forward — correct on the no-op path, where
 // identical bytes mean there is nothing to heal — would pin stale status as
 // converged with nothing left to revisit it.
@@ -990,7 +978,7 @@ func TestUpdateStatusChangedStaleGenerationUnsettles(t *testing.T) {
 		"the stale generation is recorded verbatim, unlike on the no-op path")
 	assert.Greater(t, late.ResourceVersion, settled.ResourceVersion, "a content write is a real transition")
 
-	// The point of not clamping: the object is unsettled again, so the resync
+	// The point of not clamping: the object is unsettled again, so the full pass
 	// backstop re-reconciles it and the stale content gets re-derived.
 	unsettled, err := store.ObjectsListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
@@ -1017,10 +1005,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	settled, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// Same status bytes, newer status schema version: a real write, announced.
 	statusStamped, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 2)
@@ -1029,7 +1014,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	assert.Equal(t, 1, statusStamped.SpecVersion, "and leaves the spec version alone")
 	assert.Greater(t, statusStamped.ResourceVersion, settled.ResourceVersion,
 		"a shape change is watch-visible even with identical bytes")
-	assert.Equal(t, beehive.Modified, recvEvent(t, w).Type)
+	probe.expectWrite()
 
 	// Same spec bytes, newer spec schema version: likewise, and changed=true so the
 	// client wakes the controller to re-derive from the reinterpreted spec.
@@ -1040,7 +1025,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	assert.Equal(t, 2, specStamped.StatusVersion, "and leaves the status version alone")
 	assert.Greater(t, specStamped.Generation, created.Generation, "and unsettles the object")
 	assert.Greater(t, specStamped.ResourceVersion, statusStamped.ResourceVersion)
-	assert.Equal(t, beehive.Modified, recvEvent(t, w).Type)
+	probe.expectWrite()
 
 	// Both stamps survive a re-read.
 	reread, err := store.ObjectsGet(ctx, created.ID)
@@ -1063,10 +1048,7 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 	settled, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	again, err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
 	require.NoError(t, err)
@@ -1078,7 +1060,7 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 	assert.EqualValues(t, created.Generation, sameSpec.Generation, "no generation bump")
 	assert.Equal(t, settled.ResourceVersion, sameSpec.ResourceVersion, "no resource_version bump")
 
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 }
 
 // TestNoOpWritesNeverStampSchemaVersionDownward pins the direction of the
@@ -1100,10 +1082,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, settled.StatusVersion)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// A build that lost the kind's migrator (reporting 0) has no version opinion:
 	// the write goes through and leaves the tag alone.
@@ -1122,7 +1101,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	assert.Equal(t, 3, reread.SpecVersion)
 	assert.Equal(t, 3, reread.StatusVersion)
 	assert.Equal(t, settled.ResourceVersion, reread.ResourceVersion)
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 }
 
 // TestNoOpWriteStampsUpwardWhileConverging covers the crossing case: the
@@ -1310,8 +1289,8 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
-// ObjectsGetMeta returns the same row as ObjectsGet but skips assembling conditions
-// (the over-fetch the GC/ref metadata-only callers used to pay).
+// ObjectsGetMeta returns the same row as ObjectsGet but skips assembling
+// conditions, which the metadata-only GC and edge callers never read.
 func TestGetObjectMetaSkipsConditions(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1354,16 +1333,14 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, childA, owner, beehive.RelationOwnedBy))
 	require.NoError(t, addEdge(ctx, store, childB, owner, beehive.RelationOwnedBy))
 
-	// Watch live changes only (no snapshot) so each cascade's events are isolated.
-	w, _, err := store.ObjectWritesSubscribe(ctx)
-	require.NoError(t, err)
-	defer w.Close()
+	// Probe from here, so each cascade's writes are isolated from the setup's.
+	probe := newWriteProbe(t, store)
 
-	// First cascade marks both children (a Modified each) and returns both.
+	// First cascade marks both children (one write each) and returns both.
 	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	assertObjectChanges(t, w, 2, beehive.Modified)
+	probe.expectWrites(2)
 	a1, err := store.ObjectsGetMeta(ctx, childA)
 	require.NoError(t, err)
 	require.NotNil(t, a1.DeletionRequestedAt, "child A marked for deletion")
@@ -1372,11 +1349,11 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	require.NotNil(t, b1.DeletionRequestedAt, "child B marked for deletion")
 
 	// Second cascade over the now-deleting children: still returns both, but writes
-	// nothing and emits nothing — no resource_version churn, no events.
+	// nothing — no resource_version churn, and nothing new in the write log.
 	got2, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
 	require.Len(t, got2, 2)
-	assertNoBatch(t, w, 100*time.Millisecond)
+	probe.expectNone()
 	a2, err := store.ObjectsGetMeta(ctx, childA)
 	require.NoError(t, err)
 	assert.Equal(t, a1.ResourceVersion, a2.ResourceVersion, "no re-mark, no rv churn")
@@ -1427,10 +1404,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// Removing a present finalizer is a real change: only that finalizer drops,
 	// resource_version bumps, and watchers see a Modified event.
@@ -1439,9 +1413,8 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	assert.Equal(t, []string{"b"}, got.Finalizers)
 	assert.Greater(t, got.ResourceVersion, created.ResourceVersion)
 
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Modified, ev.Type)
-	assert.Equal(t, []string{"b"}, ev.Object.Finalizers)
+	assert.Equal(t, got.ResourceVersion, probe.expectWrite().ResourceVersion,
+		"the finalizer removal is observable in the write log")
 
 	// Persisted, not just reflected in the returned struct.
 	reloaded, err := store.ObjectsGet(ctx, created.ID)
@@ -1459,10 +1432,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// Removing a finalizer that isn't present changes nothing: the list is intact,
 	// resource_version is unbumped, and no event fires (a watcher would otherwise
@@ -1471,7 +1441,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a"}, got.Finalizers)
 	assert.Equal(t, created.ResourceVersion, got.ResourceVersion)
-	assertNoEvent(t, w, 100*time.Millisecond)
+	probe.expectNone()
 }
 
 func TestDeleteFinalizerMissingObject(t *testing.T) {
@@ -1870,13 +1840,12 @@ func TestAfterCommit(t *testing.T) {
 	}))
 	assert.Equal(t, []string{"first", "second"}, chained, "a hook registered from a hook must run")
 
-	// emit/emitEvent carry the same guard (publish instead of buffering once the
-	// collector is drained). No test drives them: reaching that path needs a ctx
-	// holding the drained collector *without* its committed transaction, and every
-	// mutator that could carry one either fails on the dead tx first or self-wraps
-	// in Within, which installs a fresh collector. The guard is uniformity, not a
-	// reachable bug — see TestFlushedCollectorRefusesLateAdds for the unit-level
-	// proof that the collector reports the drop.
+	// addHook's took-ownership return covers the late registration that arrives
+	// after the hooks were taken: it runs the hook inline rather than queueing it
+	// where nothing will drain it. No test drives that arm directly — reaching it
+	// needs a ctx holding the drained txState *without* its committed transaction,
+	// and every mutator that could carry one either fails on the dead tx first or
+	// self-wraps in Within, which installs a fresh txState.
 
 	// A rolled-back transaction discards its hooks along with its writes.
 	sentinel := errors.New("boom")
@@ -1967,6 +1936,65 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	_, err = store.ObjectsGetBySlug(ctx, testGK, "nested")
 	assert.ErrorIs(t, err, beehive.ErrNotFound,
 		"nested Within joins the outer tx, so the outer rollback discards its write")
+}
+
+// writeProbe answers "what would a consumer have seen?" for these tests: opened
+// before a write, asked afterwards. It holds a cursor into the write log and reports
+// the rows above it, which is the whole of the change-notification surface — nothing
+// is pushed, so "an observer sees this write" means "this write is above the
+// cursor".
+//
+// It reports versions and ids, never rows: the log carries no body and no
+// lifecycle type, so a test that needs the written content re-reads it. That is
+// the point of the probe rather than a shim — it makes the tests assert what a
+// real consumer can actually learn.
+type writeProbe struct {
+	t     *testing.T
+	store beehive.Store
+	rv    int64
+}
+
+// newWriteProbe seeds a probe at the store's current cursor, so it reports only
+// what lands after this call.
+func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
+	t.Helper()
+	rv, err := store.ObjectWritesMaxVersion(context.Background())
+	require.NoError(t, err)
+	return &writeProbe{t: t, store: store, rv: rv}
+}
+
+// writes returns everything above the cursor without moving it.
+func (p *writeProbe) writes() []storeapi.ObjectWrite {
+	p.t.Helper()
+	got, err := p.store.ObjectWritesListSince(context.Background(), p.rv, 100)
+	require.NoError(p.t, err)
+	return got
+}
+
+// expectWrite asserts exactly one write landed above the cursor, advances past
+// it, and returns it.
+func (p *writeProbe) expectWrite() storeapi.ObjectWrite {
+	p.t.Helper()
+	got := p.writes()
+	require.Len(p.t, got, 1, "expected exactly one observable write")
+	p.rv = got[0].ResourceVersion
+	return got[0]
+}
+
+// expectWrites asserts n writes landed above the cursor and advances past them.
+func (p *writeProbe) expectWrites(n int) []storeapi.ObjectWrite {
+	p.t.Helper()
+	got := p.writes()
+	require.Len(p.t, got, n, "expected exactly %d observable writes", n)
+	p.rv = got[len(got)-1].ResourceVersion
+	return got
+}
+
+// expectNone asserts the write was a true no-op: nothing above the cursor, so no
+// consumer can ever learn of it.
+func (p *writeProbe) expectNone() {
+	p.t.Helper()
+	assert.Empty(p.t, p.writes(), "a no-op write must leave nothing for a consumer to find")
 }
 
 // newRawStore returns a *sqliteStore directly so tests can close store.db to
@@ -2306,8 +2334,8 @@ func moveTarget(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
 // caller's behalf: the stamp lands only when the edge is new *and* the target has
 // moved past the claimed version. Each half is withdrawn in turn, and each one
 // alone suppresses the stamp. It doubles as the coverage for the target's
-// resource_version, which EdgesAdd reads but no longer reports — the stamp is how
-// that read is observable.
+// resource_version, which EdgesAdd reads but does not report — the stamp is the only
+// way that read is observable.
 func TestEdgesAddStampsReconcileOwed(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -2440,15 +2468,10 @@ func TestRefsAddNoVersionBumpNoEvent(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	// Drain the snapshot Added events for the two pre-existing objects.
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
+	probe := newWriteProbe(t, store)
 
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
-	assertNoEvent(t, w, 200*time.Millisecond)
+	probe.expectNone()
 
 	gotA, err := store.ObjectsGet(ctx, a.ID)
 	require.NoError(t, err)
@@ -2479,14 +2502,10 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
 	require.NoError(t, store.EdgesDelete(ctx, a.ID, 9999, "depends_on"))
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
+	probe := newWriteProbe(t, store)
 
 	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
-	assertNoEvent(t, w, 200*time.Millisecond)
+	probe.expectNone()
 }
 
 func TestRefsAddJoinsTransaction(t *testing.T) {
@@ -2755,20 +2774,14 @@ func TestSetConditionEmitsAndBumpsResourceVersion(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "watched")
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	// Drain the snapshot Added for the pre-existing object.
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type)
+	probe := newWriteProbe(t, store)
 
 	got, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	assert.Greater(t, got.ResourceVersion, obj.ResourceVersion, "a condition change bumps resource_version")
 
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Modified, ev.Type)
-	assert.Equal(t, got.ResourceVersion, ev.Object.ResourceVersion)
-	require.NotNil(t, findCondition(ev.Object.Conditions, "Ready"), "emitted object carries the new condition")
+	assert.Equal(t, got.ResourceVersion, probe.expectWrite().ResourceVersion,
+		"the condition write is observable in the write log")
 }
 
 func TestSetConditionNoOpSuppressed(t *testing.T) {
@@ -2779,16 +2792,13 @@ func TestSetConditionNoOpSuppressed(t *testing.T) {
 	first, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"})
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// An identical write changes nothing: no resource_version bump, no event.
 	again, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"})
 	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, again.ResourceVersion, "identical condition write is a no-op")
-	assertNoEvent(t, w, 200*time.Millisecond)
+	probe.expectNone()
 }
 
 func TestDeleteCondition(t *testing.T) {
@@ -2801,19 +2811,15 @@ func TestDeleteCondition(t *testing.T) {
 	_, err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Healthy", Status: "True"})
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	got, err := store.ConditionsDelete(ctx, testGK, obj.ID, "Ready")
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "Ready removed")
 	require.NotNil(t, findCondition(got.Conditions, "Healthy"), "Healthy untouched")
 
-	ev := recvEvent(t, w)
-	assert.Equal(t, beehive.Modified, ev.Type)
-	assert.Equal(t, got.ResourceVersion, ev.Object.ResourceVersion)
+	assert.Equal(t, got.ResourceVersion, probe.expectWrite().ResourceVersion,
+		"the condition removal is observable in the write log")
 }
 
 func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
@@ -2821,15 +2827,12 @@ func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "absent")
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	got, err := store.ConditionsDelete(ctx, testGK, obj.ID, "Ready")
 	require.NoError(t, err)
 	assert.Equal(t, obj.ResourceVersion, got.ResourceVersion, "deleting an absent condition is a no-op")
-	assertNoEvent(t, w, 200*time.Millisecond)
+	probe.expectNone()
 }
 
 // TestNonConditionWritesPreserveConditions verifies that mutators which don't
@@ -2843,33 +2846,30 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	_, err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	w, err := store.ObjectsWatchList(ctx, testGK)
-	require.NoError(t, err)
-	defer w.Close()
-	require.Equal(t, beehive.Added, recvEvent(t, w).Type) // snapshot
+	probe := newWriteProbe(t, store)
 
 	// UpdateStatus return + emitted event both carry the existing condition.
 	updated, err := store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"v":1}`), 0)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(updated.Conditions, "Ready"), "UpdateStatus result carries conditions")
-	require.NotNil(t, findCondition(recvEvent(t, w).Object.Conditions, "Ready"), "UpdateStatus event carries conditions")
+	probe.expectWrite()
 
 	// ObjectsUpdateSpec too.
 	spec, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"s":1}`), 0)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(spec.Conditions, "Ready"), "ObjectsUpdateSpec result carries conditions")
-	require.NotNil(t, findCondition(recvEvent(t, w).Object.Conditions, "Ready"), "ObjectsUpdateSpec event carries conditions")
+	probe.expectWrite()
 
 	// DeletionRequestsCreate (the row persists; conditions still exist).
 	del, _, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(del.Conditions, "Ready"), "DeletionRequestsCreate result carries conditions")
-	require.NotNil(t, findCondition(recvEvent(t, w).Object.Conditions, "Ready"), "DeletionRequestsCreate event carries conditions")
+	probe.expectWrite()
 }
 
 // TestNonConditionWriteAssemblyError drops the conditions table so the
 // post-write condition assembly fails, covering that error branch in the shared
-// scanAndEmit (UpdateStatus/ObjectsUpdateSpec) and in DeletionRequestsCreate.
+// scanWritten (UpdateStatus/ObjectsUpdateSpec) and in DeletionRequestsCreate.
 func TestNonConditionWriteAssemblyError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3433,8 +3433,8 @@ func TestObjectWritesListSince(t *testing.T) {
 	got, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
-		{ID: second.ID, Type: beehive.Modified, ResourceVersion: second.ResourceVersion},
-		{ID: third.ID, Type: beehive.Modified, ResourceVersion: third.ResourceVersion},
+		{ID: second.ID, ResourceVersion: second.ResourceVersion},
+		{ID: third.ID, ResourceVersion: third.ResourceVersion},
 	}, got, "cursor-ordered, exclusive of afterRV, spanning kinds")
 
 	// A limit truncates from the low end, so the caller can page forward by taking
@@ -3535,37 +3535,29 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 	}
 }
 
-// ObjectsCreate and ObjectsDelete draw the resource version inside their own
-// transaction, so a failure there aborts the write with nothing published. Dropping
-// the sequence is the only way in: a closed database fails at BeginTx instead,
-// before the version is ever drawn.
+// ObjectsCreate draws the resource version inside its own transaction, so a
+// failure there aborts the insert rather than committing an unversioned row.
+// Dropping the sequence is the only way in: a closed database fails at BeginTx
+// instead, before the version is ever drawn.
+//
+// There is no delete counterpart: a delete draws no version at all. The row it
+// would have stamped is gone, so there is nothing left for a scan of the write
+// log to report — removals are derived from a row's absence, not from a version.
 func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
 	ctx := context.Background()
-
-	t.Run("create", func(t *testing.T) {
-		store := newRawStore(t)
-		_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
-		require.NoError(t, err)
-		_, err = store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
-		require.Error(t, err)
-	})
-
-	t.Run("delete", func(t *testing.T) {
-		store := newRawStore(t)
-		obj, err := store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
-		require.NoError(t, err)
-		_, err = store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
-		require.NoError(t, err)
-		require.Error(t, store.ObjectsDelete(ctx, obj.ID))
-	})
+	store := newRawStore(t)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+	require.NoError(t, err)
+	_, err = store.ObjectsCreate(ctx, &beehive.RawObject{Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`)})
+	require.Error(t, err)
 }
 
-// DeletionRequestsCreateFromOwner stamps several children, each drawing a version and
-// publishing, so it has to hold one transaction across the lot. Outside one, two of
-// its own writes can reach the store-wide stream in the wrong order — which corrupts
-// the backlog bound a consumer reads as a cursor. The in-tree caller already wraps it;
-// this pins the public entry point for the callers Store's surface admits.
-func TestDeletionRequestsCreateFromOwnerPublishesInVersionOrder(t *testing.T) {
+// DeletionRequestsCreateFromOwner stamps several children, each drawing its own
+// version, so it has to hold one transaction across the lot: a scan of the write
+// log reads versions as a cursor, and a cascade whose rows landed out of order
+// would let a consumer advance past one it never saw. The in-tree caller already
+// wraps it; this pins the public entry point for the callers Store's surface admits.
+func TestDeletionRequestsCreateFromOwnerWritesInVersionOrder(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -3581,20 +3573,16 @@ func TestDeletionRequestsCreateFromOwnerPublishesInVersionOrder(t *testing.T) {
 		require.NoError(t, addEdge(ctx, store, mk(), owner, beehive.RelationOwnedBy))
 	}
 
-	w, _, err := store.ObjectWritesSubscribe(ctx)
-	require.NoError(t, err)
-	defer w.Close()
+	probe := newWriteProbe(t, store)
 
 	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
 	require.Len(t, got, 3)
 
-	// Every version the cascade published, in the order it arrived.
+	// Every version the cascade wrote, as a scan returns them.
 	var versions []int64
-	for len(versions) < 3 {
-		for _, ref := range recvBatch(t, w) {
-			versions = append(versions, ref.ResourceVersion)
-		}
+	for _, w := range probe.expectWrites(3) {
+		versions = append(versions, w.ResourceVersion)
 	}
 	assert.IsIncreasing(t, versions, "the cascade's own writes must not overtake each other")
 }
@@ -3606,4 +3594,69 @@ func TestDeletionRequestsCreateFromOwnerListError(t *testing.T) {
 	store.db.Close()
 	_, err := store.deletionRequestsCreateFromOwner(context.Background(), 1)
 	require.Error(t, err)
+}
+
+// A failed COMMIT is reported to the caller rather than swallowed. The rollback
+// deferred inside Within is a no-op by then, so nothing else can report it: a
+// caller that saw a nil error here would believe writes landed that did not.
+func TestWithinReportsACommitFailure(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	err := store.Within(ctx, func(ctx context.Context) error {
+		// End the transaction underneath database/sql, so its own Commit finds no
+		// transaction to commit. This is the one failure Within cannot rule out by
+		// construction: the statement it runs last is the one it cannot check first.
+		_, err := store.conn(ctx).ExecContext(ctx, `ROLLBACK`)
+		return err
+	})
+	require.Error(t, err, "a failed commit must reach the caller")
+}
+
+// Deleting a row that is already gone reports ErrNotFound rather than succeeding
+// silently. GC leans on that: two collectors racing the same object both call
+// ObjectsDelete, and the loser has to be able to tell "I collected it" from
+// "somebody else already did".
+func TestObjectsDeleteMissingRowIsNotFound(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	obj, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	assert.ErrorIs(t, store.ObjectsDelete(ctx, obj.ID), storeapi.ErrNotFound,
+		"the second delete finds no row")
+	assert.ErrorIs(t, store.ObjectsDelete(ctx, obj.ID+404), storeapi.ErrNotFound,
+		"an id that never existed reads the same way")
+}
+
+// A physical delete fails while another object still points at the row. That
+// RESTRICT is what the GC ordering rests on — a child has to be removed before its
+// owner — so the error has to reach the caller rather than being read as success.
+func TestObjectsDeleteRefusesAReferencedRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	target, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	dependent, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, err = store.EdgesAdd(ctx, dependent.ID, target.ID, beehive.RelationDependsOn, 0)
+	require.NoError(t, err)
+
+	err = store.ObjectsDelete(ctx, target.ID)
+	require.Error(t, err, "the edge's RESTRICT must block the delete")
+	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "the row is there; the constraint is what failed")
+
+	// Dropping the edge releases it, which is the order GC drives: the referrer goes
+	// first, and the row it was holding open becomes collectable.
+	require.NoError(t, store.EdgesDelete(ctx, dependent.ID, target.ID, beehive.RelationDependsOn))
+	assert.NoError(t, store.ObjectsDelete(ctx, target.ID))
 }

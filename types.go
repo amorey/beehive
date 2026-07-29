@@ -149,7 +149,7 @@ func (o *Object[Spec, Status]) Events() ([]Event, error) {
 // Result is returned by a controller's Reconcile to influence requeueing.
 type Result struct {
 	// RequeueAfter requeues the object after the given delay. Zero means no
-	// explicit requeue (the object still resyncs on the periodic timer).
+	// explicit requeue (the object is still picked up by the periodic passes).
 	RequeueAfter time.Duration
 }
 
@@ -159,8 +159,8 @@ type Result struct {
 type Schedule struct {
 	// NextRequeueAt is when the reconcile loop has scheduled the object to be
 	// requeued, or the zero time when nothing is scheduled. It reflects only per-id
-	// timers (backoff, RequeueAfter, an immediate enqueue), not the periodic resync
-	// or event-driven wakes. Reported by Client.SchedulesGet and SchedulesWatch.
+	// timers (backoff, RequeueAfter, an immediate enqueue), not any of the periodic
+	// drivers. Reported by Client.SchedulesGet and SchedulesWatch.
 	NextRequeueAt time.Time
 	// Reserved: a future Trigger/Reason enum (backoff vs success-cadence vs manual
 	// poke) may be added here. Not populated yet.

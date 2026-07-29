@@ -16,7 +16,6 @@ package beehive
 
 import (
 	"context"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,11 +70,12 @@ func TestNewAppliesDefaults(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)
 	// Literals, not the constants: comparing a default to its own constant passes
-	// whatever the value is, so it would not notice a default changing. These three
-	// are the contract — cheap owed-work drain and GC on, the object-count-scaled
-	// full pass off — so changing one should be a deliberate edit here.
-	assert.Equal(t, 30*time.Second, bh.catchupInterval, "owed work drains by default")
-	assert.Equal(t, time.Duration(0), bh.resyncInterval, "the full pass is opt-in")
+	// whatever the value is, so it would not notice a default changing. These four
+	// are the contract — cheap owed-work drain and GC on, both object-count-scaled
+	// full passes off — so changing one should be a deliberate edit here.
+	assert.Equal(t, 30*time.Second, bh.owedPassInterval, "owed work drains by default")
+	assert.Equal(t, time.Duration(0), bh.fullPassInterval, "the periodic full pass is opt-in")
+	assert.False(t, bh.startupFullPass, "the startup full pass is opt-in too; no reconcile may depend on it")
 	assert.Equal(t, 30*time.Second, bh.gcInterval, "dead rows are collected by default")
 	assert.NotNil(t, bh.reconcilers)
 }
@@ -96,8 +96,8 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	r, ok := bh.reconcilers[gk]
 	require.True(t, ok, "reconciler should be registered under its GroupKind")
 	assert.Equal(t, gk, r.gk)
-	assert.Equal(t, defaultCatchupInterval, r.catchupInterval, "inherits the Beehive default")
-	assert.Equal(t, defaultResyncInterval, r.resyncInterval, "inherits the Beehive default")
+	assert.Equal(t, defaultOwedPassInterval, r.owedPassInterval, "inherits the Beehive default")
+	assert.Equal(t, defaultFullPassInterval, r.fullPassInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
 }
 
@@ -150,28 +150,28 @@ func TestRegisterRejectedAfterStart(t *testing.T) {
 
 func TestRegisterPerControllerOverride(t *testing.T) {
 	// Global default set at New; one controller overrides it, another inherits.
-	bh, err := New(&fakeStore{}, WithResyncInterval(10*time.Second))
+	bh, err := New(&fakeStore{}, WithFullPassInterval(10*time.Second))
 	require.NoError(t, err)
-	assert.Equal(t, 10*time.Second, bh.resyncInterval)
+	assert.Equal(t, 10*time.Second, bh.fullPassInterval)
 
 	overridden := GroupKind{Kind: "Overridden"}
 	_, err = Register(bh, overridden, &noopController[tSpec, tStatus]{},
-		WithResyncInterval(2*time.Second), WithMaxRetryInterval(7*time.Second))
+		WithFullPassInterval(2*time.Second), WithMaxRetryInterval(7*time.Second))
 	require.NoError(t, err)
 
 	inherited := GroupKind{Kind: "Inherited"}
 	_, err = Register(bh, inherited, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
-	assert.Equal(t, 2*time.Second, bh.reconcilers[overridden].resyncInterval)
+	assert.Equal(t, 2*time.Second, bh.reconcilers[overridden].fullPassInterval)
 	assert.Equal(t, 7*time.Second, bh.reconcilers[overridden].maxRetryInterval)
-	assert.Equal(t, 10*time.Second, bh.reconcilers[inherited].resyncInterval,
+	assert.Equal(t, 10*time.Second, bh.reconcilers[inherited].fullPassInterval,
 		"controller without an override inherits the Beehive default")
 }
 
 func TestStartStopLifecycle(t *testing.T) {
-	// Disable resync so the reconcile loop just blocks on ctx until Stop.
-	bh, err := New(&fakeStore{}, WithResyncInterval(0))
+	// Disable the full pass so the reconcile loop just blocks on ctx until Stop.
+	bh, err := New(&fakeStore{}, WithFullPassInterval(0))
 	require.NoError(t, err)
 
 	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
@@ -208,7 +208,7 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 }
 
 func TestStopReturnsWithExpiredContext(t *testing.T) {
-	bh, err := New(&fakeStore{}, WithResyncInterval(0))
+	bh, err := New(&fakeStore{}, WithFullPassInterval(0))
 	require.NoError(t, err)
 
 	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
@@ -253,7 +253,7 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 }
 
 // TestRunGCSweeperTicks covers gcSweeperRun's periodic branch: after the startup
-// pass it sweeps again on every resync tick. The store signals each sweep, so the
+// pass it sweeps again on every full-pass tick. The store signals each sweep, so the
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
 	store := &listProbeStore{Store: &fakeStore{}, gcSwept: make(chan struct{}, 8)}
@@ -266,53 +266,4 @@ func TestRunGCSweeperTicks(t *testing.T) {
 
 	recv(t, store.gcSwept) // startup pass
 	recv(t, store.gcSwept) // a periodic tick
-}
-
-// countingChangeStreamStore counts change-stream subscriptions, so a test can
-// assert how many the control plane opens.
-type countingChangeStreamStore struct {
-	fakeStore
-	subscriptions atomic.Int64
-}
-
-func (s *countingChangeStreamStore) ObjectWritesSubscribe(context.Context) (*ObjectWritesSubscription, int64, error) {
-	s.subscriptions.Add(1)
-	return deadSubscription[storeapi.ObjectWriteBatch](), 0, nil
-}
-
-// TestStartSubscribesOneChangeStream verifies the waker rides a single
-// store-wide subscription rather than one per registered kind. The count is the
-// point: a per-kind stream can only ever see the kinds that have controllers,
-// which is exactly the set a dependency target need not belong to.
-func TestStartSubscribesOneChangeStream(t *testing.T) {
-	store := &countingChangeStreamStore{}
-	bh, err := New(store)
-	require.NoError(t, err)
-	for _, kind := range []string{"Widget", "Gadget", "Gizmo"} {
-		_, err := Register(bh, GroupKind{Kind: kind}, &noopController[tSpec, tStatus]{})
-		require.NoError(t, err)
-	}
-
-	stop, err := bh.Start(context.Background())
-	require.NoError(t, err)
-	require.NoError(t, stop(context.Background()))
-
-	assert.Equal(t, int64(1), store.subscriptions.Load(), "one stream for the whole store, not one per kind")
-}
-
-// TestStartWithNoControllersSkipsWaker verifies a Beehive with nothing
-// registered opens no change stream. There is nothing to wake — every dependent
-// would land on enqueueIfRegistered's no-op arm — and the stream is not free: it
-// costs a edges query per change in the whole store, on the single connection
-// every writer shares.
-func TestStartWithNoControllersSkipsWaker(t *testing.T) {
-	store := &countingChangeStreamStore{}
-	bh, err := New(store)
-	require.NoError(t, err)
-
-	stop, err := bh.Start(context.Background())
-	require.NoError(t, err)
-	defer stop(context.Background())
-
-	assert.Zero(t, store.subscriptions.Load(), "no controllers, no stream")
 }

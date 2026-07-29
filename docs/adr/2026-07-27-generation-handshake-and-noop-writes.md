@@ -7,7 +7,7 @@
 
 `Object.Generation` increments on every spec change. `Object.ObservedGeneration`
 records the generation the controller last settled; `nil` until the first
-`UpdateStatus` call. The reconciler and resync skip objects where
+`UpdateStatus` call. The reconciler and the full pass skip objects where
 `ObservedGeneration == Generation` (already settled).
 
 Controllers report which generation they reconciled by passing `obj.Generation`
@@ -27,43 +27,41 @@ a bug regardless of whether the bytes changed.
 
 ## The content no-op splits the two halves of the write
 
-Every mutator skips a write whose bytes match what's stored (`ObjectsUpdateSpec`,
-`FinalizersDelete`, `ConditionsDelete`, `UpdateStatus`) — no `resource_version` bump,
-no `updated_at`, no emit, since a watcher would otherwise see a spurious diff and
-any dependent free-riding on this kind's status `Modified` would reconcile for
-nothing on each unchanged poll.
+Every mutator skips a write whose bytes already match what is stored:
+`ObjectsUpdateSpec`, `FinalizersDelete`, `ConditionsDelete` and `UpdateStatus`. No
+`resource_version` bump, no `updated_at`. Otherwise a watch poll would report a change
+that didn't happen, and any dependent riding on this kind's status would reconcile for
+nothing on every unchanged pass.
 
-But `UpdateStatus` alone also carries `observed_generation` / `observed_at`, which
-record *that the controller ran*, not what it wrote, and `ObjectsListUnsettledIDs` keys
-off `observed_generation < generation`. So the no-op branch still advances those
-two columns when they'd move — skipping them would strand a legitimately converged
-object unsettled and re-enqueued forever — and that advance **does** bump
-`resource_version` and emit `Modified`, identical bytes or not: the object just
-settled at a generation it hadn't settled at before, and anything gating on
-`ObservedGeneration == Generation` would otherwise sit blind until the next
-resync.
+`UpdateStatus` is different in one way: it also carries `observed_generation` and
+`observed_at`, which record *that the controller ran*, not what it wrote — and
+`ObjectsListUnsettledIDs` selects on `observed_generation < generation`. So the no-op
+branch still advances those two columns when they would move. Skipping them would
+leave a genuinely converged object unsettled and re-queued forever.
 
-It can't spin a controller re-applying its own status, because it fires at most
-once per generation — the repeat poll finds the generation already recorded and
+That advance **does** bump `resource_version`, identical bytes or not, because the
+object just settled at a generation it had not settled at before. Anything waiting for
+`ObservedGeneration == Generation` would otherwise stay blind until the next full
+pass. It cannot spin a controller that re-applies its own status, because it happens
+at most once per generation: the next pass finds the generation already recorded and
 takes the silent path.
 
 ## The no-op is gated on the schema version, not just the bytes
 
-The byte compare is only meaningful when both sides are in the same shape, and
-convert-on-read leaves a row tagged at the version it was written in (see
+Comparing bytes only means something when both sides have the same shape, and
+converting on read leaves a row tagged at the version it was written in (see
 [schema-version migration](2026-07-27-schema-version-migration.md)). A caller at a
-*newer* version is handing over bytes in a different shape, where equal bytes can
-carry different values — a converter reading v1's absent field as a default the v2
-shape spells explicitly. Suppressing that as a no-op would change what every later
-read decodes while reporting `changed=false`, bumping no `resource_version` and
-emitting nothing, so no watcher learns and the client skips the controller wake.
+*newer* version is handing over a different shape, where identical bytes can mean
+different things — a converter might read a field v1 leaves out as the default that v2
+writes explicitly. Treating that as a no-op would change what every later read decodes
+while reporting `changed=false` and bumping no `resource_version`, so no scan could
+tell anything had moved.
 
-Both mutators therefore take the no-op branch only when `stampVersion`'s result
-equals the row's current tag; a mismatch falls through to the content write, which
-stamps, bumps and emits like any real change. That subsumes the old silent
-re-stamp path (a `restamp` helper writing the version column alone, with no rv bump
-and no emit): re-tagging is now always visible, at worst costing one spurious
-reconcile per row per version bump, which the level-triggered loop absorbs.
+Both mutators therefore take the no-op branch only when `stampVersion`'s result equals
+the row's current tag. A mismatch falls through to the content write, which stamps and
+bumps like any real change. So re-tagging is always visible, and there is no silent
+path that writes the version column alone. At worst it costs one extra reconcile per
+row per version bump, which a level-triggered loop absorbs.
 
 ## The stamp is never downward, on either branch
 
@@ -79,21 +77,21 @@ content write:
   surfacing, not a case to clamp silently.
 - otherwise stamp `incoming`.
 
-The content branch needs it because `convertBlob`'s `current == 0` identity lets an
-unversioned build decode v3 bytes untouched and marshal them straight back —
-stamping 0 there would label v3-shaped bytes as unversioned, and a later build with
-the migrator restored would see `from < current` and convert already-converted data
-instead of getting the downgrade error the read path owes it.
+The content branch needs this because `convertBlob` passes a blob through untouched
+when the current version is 0, so a build with no migrator can decode v3 bytes and
+marshal them straight back. Stamping 0 there would label v3-shaped bytes as
+unversioned, and a later build with the migrator restored would see `from < current`
+and convert already-converted data instead of getting the downgrade error it is owed.
 
 ## `observed_at` is a handshake timestamp, not a reconcile heartbeat
 
-Identical bytes at the row's own schema version, with the generation already
-recorded, writes nothing at all. So `observed_at` records when the object settled
-at `observed_generation` and stops ticking once it has — a reconcile that calls no
-`UpdateStatus` never moved it either, so it was never a faithful "last ran" signal.
+Identical bytes at the row's own schema version, with the generation already recorded,
+write nothing at all. So `observed_at` records when the object settled at
+`observed_generation` and stops moving once it has. It was never a faithful "last ran"
+signal anyway: a reconcile that calls no `UpdateStatus` never moved it either.
 
-Controller liveness belongs in the events log, whose runs bump `last_at` per poll.
-`Condition.Liveness` is the other timestamp-carries-meaning case, and it breaks the
-no-op suppression deliberately (`conditionUnchanged` returns false for a
-process-stale liveness condition) because that refresh is bounded to once per
-process, not once per reconcile.
+Controller liveness belongs in the event log, whose runs bump `last_at` every time.
+`Condition.Liveness` is the other case where a timestamp carries meaning, and it breaks
+no-op suppression on purpose — `conditionUnchanged` returns false for a liveness
+condition left by an earlier process — because that refresh happens once per process,
+not once per reconcile.

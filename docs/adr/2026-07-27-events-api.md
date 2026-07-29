@@ -1,6 +1,6 @@
 # Events API: an append-only, contiguous-run aggregated log
 
-- **Status:** Accepted — implemented in `sqlite/store.go`, `sqlite/watch.go`,
+- **Status:** Accepted — implemented in `sqlite/store.go`, `watchpoll.go`,
   `client.go`, `controller.go`, `sqlite/migrations/0001_init.sql`.
 - **Date:** 2026-07-27 (recorded retroactively)
 
@@ -17,12 +17,12 @@ the latest run for `(object_id, category)`
   `resource_version`) when `(type, reason)` matches, or
 - *appends* a new run otherwise.
 
-That is the "compare-to-latest, don't blind-upsert" rule, which yields a flapping
-timeline instead of Kubernetes-style global dedup. The `category` scoping is what
-keeps unrelated concerns on one object from shredding each other's runs.
+That is the "compare to the latest, don't blindly upsert" rule. It produces a
+flapping timeline rather than Kubernetes-style global deduplication, and scoping the
+comparison to a category is what keeps unrelated concerns on one object from breaking
+each other's runs.
 
-It is the un-collapsed sibling of conditions, which keep only the current run per
-type.
+It is the long form of conditions, which keep only the current run per type.
 
 ## `Detail` is typed in, opaque out
 
@@ -30,13 +30,14 @@ type.
 column → `Event.Detail` (`json.RawMessage`), decoded by the free generic helper
 `EventDetail[T]`.
 
-Like `Spec` / `Status`, but *unversioned* — no `Migrator`; retention ages old shapes
-out — and *sampled* like `message`: not in the run key, so a varying payload never
-fragments a run.
+It works like `Spec` and `Status` with two differences. It is *unversioned* — no
+`Migrator`, because retention ages old shapes out — and it is *sampled* like
+`message`, so it is not part of the run key and a payload that varies never splits a
+run.
 
-`Detail` stays off the generic boundary deliberately: a timeline mixes reasons with
-heterogeneous payloads, so a per-`Client` / per-`Event` `Detail` type param can't
-express it. The per-event `EventDetail[T]` helper does.
+`Detail` stays off the generic boundary deliberately. One timeline mixes reasons whose
+payloads have different shapes, which a `Detail` type parameter on `Client` or `Event`
+could not express. The per-event `EventDetail[T]` helper can.
 
 ## Reads and retention
 
@@ -44,31 +45,30 @@ Reads live on `Client`: `EventsList` / `EventsGetLatest` / `EventsWatch` (lazy),
 eager `LoadEvents()` → `Object.Events()`, gated by `LoadEventsBit` in the same
 `LoadSet` and returning `ErrNotLoaded` when unrequested.
 
-`EventsWatch` is snapshot-then-live over a conflating hub keyed on **`EventID`, not
-object id**, so a run's count-bump conflates into that run's own slot. It publishes
-through the same post-commit `eventCollector` → `flush` path as object writes.
+`EventsWatch` polls `Store.EventsList` on the watch-poll interval and diffs against
+what it last reported, keyed on **`EventID`, not object id**, so a run extended
+between ticks re-emits as itself rather than as a new row. Runs are delivered
+oldest-first within a tick, so an append-only log builds in order. Like every other
+driver it finds the write by reading, and the interval is the resolution — a run that
+appears and is trimmed by retention inside one tick is never seen.
 
 Retention runs in `gcSweeperRun`: a per-`(object, category)` cap-N ring plus optional
 `maxAge` (`WithEventRetention`). `events.object_id` is `FK … ON DELETE CASCADE`, so
 object deletion cascades the log.
 
-Store trio: `EventsRecord` / `EventsList` / `EventsSweep`.
+Store quartet: `EventsRecord` / `EventsGetLatest` / `EventsList` / `EventsSweep`.
+The store has no event watch — the watch is a client-side poll over `EventsList`.
 
 ## Naming: "event(s)" is reserved for the log
 
-The other streams are deliberately named apart:
+The object-change surfaces are deliberately named apart:
 
-- The dependency waker's live-only object-*change* stream is
-  `Store.ObjectWritesSubscribe(ctx)` — store-wide, snapshot-less, returning an
-  `*ObjectWritesSubscription` whose `Changes()` channel yields `[]ObjectWrite` (id plus
-  `ChangeType` = `Added` / `Modified` / `Deleted`, no row). It replaced the per-kind
-  `WatchChanges(gk)`, which had no other caller.
+- The dependency waker reads the store's write log through
+  `Store.ObjectWritesListSince(ctx, afterRV, limit)` — store-wide, paged, yielding
+  `[]ObjectWrite` (id plus `ChangeType` = `Added` / `Modified` / `Deleted`, no row).
 - Typed `ObjectChange[Spec,Status]` values reach users through `Client.ObjectsWatch` /
-  `ObjectsWatchList`, riding `ObjectsSubscription.Changes()`.
-- `Store.EventsWatch` / `Client.EventsWatch` stream the log's aggregated `Event`s
-  over an `EventsSubscription.Changes()` channel.
+  `ObjectsWatchList`, which poll and diff.
+- `Client.EventsWatch` streams the log's aggregated `Event`s — the value itself, not
+  a `Change`, because an append-only log has nothing for a change type to say.
 
-Every one of them returns a `*storeapi.Subscription[V]` with the single accessor
-`Changes()`; see the naming ADR. With `WatchChanges` gone, `watch()` has no
-snapshot-less caller left — hence no `hasSnapshot` parameter and an always-present
-`seenIDs`.
+See the naming ADR for the return-shape rule each follows.

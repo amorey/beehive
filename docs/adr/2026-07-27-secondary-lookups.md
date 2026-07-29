@@ -5,30 +5,30 @@
 
 ## Context
 
-ObjectRef edges are read on request, never folded into the object's blob-bearing
-`SELECT` — a one-to-many join would re-send the spec/status JSON per edge.
+Edges are read on request, never folded into the `SELECT` that carries the object's
+spec and status. A one-to-many join would repeat that JSON once per edge.
 
 ## Decision: two paths, one set of loaders
 
-- **Eager** — per-call `LoadOption`s on `Get` / `GetBySlug` / `List` /
-  `OwnedObjectsList` (`resolveLoads` → `LoadSet` bitset; `loadObjectRelated` for
-  one object, `loadListRelated` for a `List` — one batched `…ByIDs` query per
-  relation, not per object).
+- **Eager** — `LoadOption`s passed to `Get`, `GetBySlug`, `List` or
+  `OwnedObjectsList`. `resolveLoads` folds them into a `LoadSet` bitset;
+  `loadObjectRelated` handles one object and `loadListRelated` a list, running one
+  batched query per relation rather than one per object.
 - **Lazy** — `Client.OwnersGet` / `DependenciesList` / `DependentsList` /
-  `OwnedList`, and the same quartet on `ControllerClient`, since a `Reconcile` has
-  no read call site to pass options to.
+  `OwnedList`, and the same four on `ControllerClient`, since a `Reconcile` has no
+  read call to hang options off.
 
-Both issue the same secondary query; eager just attaches the result and batches
+Both run the same query. Eager just attaches the result to the object and batches it
 across a list.
 
-Store primitives: the relation-filtered `EdgesListOutgoingByRelation` (single) and
-the batched `EdgesGroupOutgoingByID` / `EdgesGroupIncomingByID` (returning a
-`map[id][]ObjectRef`, not a slice — hence `Group…ByID`, not `List…`; one shared
-`edgesByIDs` helper, routeCol/joinCol swapped). The unfiltered `EdgesListOutgoing`
-stays for GC.
+The store primitives are `EdgesListOutgoingByRelation` for a single object, and
+`EdgesGroupOutgoingByID` / `EdgesGroupIncomingByID` for many. The batched pair return
+`map[id][]ObjectRef` rather than a slice, which is why they are named `Group…ByID`
+rather than `List…`; one `edgesByIDs` helper serves both, with the two columns
+swapped. The unfiltered `EdgesListOutgoing` stays for GC.
 
-There is no standing default-loads option: per-call plus lazy cover every case
-without a "queries you didn't use" footgun.
+There is no option to set default loads. Per-call plus lazy covers every case without
+leaving a way to pay for queries nobody used.
 
 ## `owned` is the inverse of `owner`
 
@@ -64,33 +64,32 @@ all (they are bare nouns — `Owner()`, `Dependencies()`) while the `Client` /
 It returns the decoded `[]*Object[Spec, Status]` children of *this client's kind*,
 where `OwnedList` returns untyped refs across every owned kind.
 
-It is deliberately not a fifth lazy ref lookup: the kind filter and the row read
-fold into one store primitive, `ObjectsListByIncomingEdge(gk, toID, relation)`, so the
-Go-side `ref.Kind` filter and the `Get`-per-child the untyped shape forces on
-callers never happen. Its contract otherwise tracks `OwnedList`'s (see the godoc),
-and it takes `List`'s `LoadOption`s through the same `loadListRelated` — a list read
-whose children can't be eager-loaded would just push the per-child `Get` back one
-level.
+It is deliberately not a fifth lazy lookup. The kind filter and the row read fold
+into one store primitive, `ObjectsListByIncomingEdge(gk, toID, relation)`, so neither
+the Go-side `ref.Kind` filter nor the `Get` per child that the untyped shape forces on
+callers ever happens. Its contract otherwise follows `OwnedList`'s, and it takes
+`List`'s `LoadOption`s through the same `loadListRelated` — a list read whose children
+could not be eager-loaded would only push the per-child `Get` down a level.
 
-It has no `ControllerClient` twin because it can't: `ControllerClient[Status]`
-carries no `Spec` parameter, so `[]*Object[Spec, Status]` is inexpressible there —
-which is exactly why that surface's quartet is untyped refs.
+It cannot have a `ControllerClient` twin: `ControllerClient[Status]` has no `Spec`
+parameter, so `[]*Object[Spec, Status]` cannot be written there. That is exactly why
+that surface's four lookups return untyped refs.
 
 ## The store's two multi-row object reads share one predicate seam
 
-`listObjectsWhere(tail, args…)`: the blob-bearing `SELECT` runs the internal WHERE
-fragment **once**, and the batched conditions read (`conditionsByIDs`, chunked under
-`idChunkSize` like `edgesByIDs`) keys off the ids it returned.
+`listObjectsWhere(tail, args…)` runs the caller's WHERE fragment **once**, in the
+`SELECT` that carries the blobs. The batched conditions read — `conditionsByIDs`,
+chunked under `idChunkSize` like `edgesByIDs` — then keys off the ids that returned.
 
-Re-running the predicate for the conditions half would be a skew bug, not a shared
-seam — the two statements aren't in one transaction, so a concurrent ref/object
-write between them could drop the conditions of a row already scanned. Keying off
-the ids also avoids paying the edges semi-join twice. An empty result skips the
-conditions round-trip.
+Running the predicate a second time for the conditions would be a skew bug rather than
+a shared seam. The two statements are not in one transaction, so a write landing
+between them could drop the conditions of a row already scanned. Keying off the ids
+also avoids paying for the edges semi-join twice, and an empty result skips the second
+round trip entirely.
 
-`ObjectsList` supplies the kind tail; `ObjectsListByIncomingEdge` a kind tail plus
-`o.id IN (SELECT from_id FROM edges …)` — a **semi-join, not a join**. Written as a
-join, the planner drives from `idx_objects_kind` (which already satisfies
-`ORDER BY o.id`) and probes `edges` once per object *of the kind*; `IN (SELECT …)`
-lets `idx_edges_to` drive, so the work scales with the owner's children instead of
-the table.
+`ObjectsList` supplies a kind tail. `ObjectsListByIncomingEdge` supplies a kind tail
+plus `o.id IN (SELECT from_id FROM edges …)` — a **semi-join, not a join**. Written as
+a join, the planner drives from `idx_objects_kind`, which already satisfies
+`ORDER BY o.id`, and probes `edges` once per object *of the kind*. Written as
+`IN (SELECT …)`, `idx_edges_to` drives instead, so the work scales with the owner's
+children rather than with the table.

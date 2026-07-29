@@ -117,7 +117,16 @@ func main() {
 	exitOnErr(err)
 	defer store.Close()
 
-	bh, err := beehive.New(store)
+	// Every driver here is periodic — nothing is pushed — and a cascade advances one
+	// step per GC tick: mark the children, wait for their finalizers to clear,
+	// collect them, then collect the owner they were blocking. At the production
+	// defaults that is tens of seconds, so this demo turns the cadences down to a
+	// human timescale. The watch poll that paces the printout below is fixed at 1s,
+	// so GC is set just above it — a sweep faster than one poll would still cascade
+	// correctly, but its steps would coalesce into a single delivery.
+	// The reconciles that get each object to converged are nudged with Requeue below,
+	// so GC is the only cadence this demo has to set.
+	bh, err := beehive.New(store, beehive.WithGCInterval(1500*time.Millisecond))
 	exitOnErr(err)
 
 	_, err = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
@@ -133,7 +142,8 @@ func main() {
 	clusterClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	// Subscribe before creating so no lifecycle event is missed.
+	// Watch before creating, so each object's lifecycle reads in order from Added.
+	// A poll coalesces, so a step shorter than the interval can still be skipped.
 	clusterCh, err := clusterClient.ObjectsWatchList(ctx)
 	exitOnErr(err)
 	cacheCh, err := cacheClient.ObjectsWatchList(ctx)
@@ -145,12 +155,16 @@ func main() {
 		beehive.WithFinalizers(connectionFinalizer))
 	exitOnErr(err)
 	fmt.Printf("created Cluster %d (endpoint=%s, finalizers=%v)\n", cluster.ID, cluster.Spec.Endpoint, cluster.Finalizers)
+	exitOnErr(clusterClient.Requeue(ctx, cluster.ID))
 
 	for range numCaches {
 		cache, err := cacheClient.Create(ctx, ClusterCacheSpec{ClusterID: cluster.ID},
 			beehive.WithOwner(cluster.ID), beehive.WithFinalizers(cacheFlushFinalizer))
 		exitOnErr(err)
 		fmt.Printf("created ClusterCache %d owned by Cluster %d (finalizers=%v)\n", cache.ID, cluster.ID, cache.Finalizers)
+		// A write schedules nothing, so nudge each object rather than waiting out the
+		// owed-pass tick.
+		exitOnErr(cacheClient.Requeue(ctx, cache.ID))
 	}
 
 	watchCascade(ctx, clusterClient, clusterCh, cacheCh, cluster.ID)
@@ -189,7 +203,7 @@ func watchCascade(
 		exitOnErr(clusterClient.Delete(ctx, clusterID))
 	}
 
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(30 * time.Second)
 	for !clusterRemoved || cachesRemoved < numCaches {
 		select {
 		case ev := <-clusterCh:

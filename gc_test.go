@@ -143,7 +143,6 @@ type collectFakeStore struct {
 	dropDependsErr  error    // EdgesDeleteFinalizingDependsOn
 	hasEdges        bool     // EdgesHasIncoming result
 	hasEdgesErr     error    // EdgesHasIncoming error
-	outgoingErr     error    // EdgesListOutgoing error
 	deleteObjectErr error    // ObjectsDelete error
 }
 
@@ -162,9 +161,6 @@ func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, Objec
 }
 func (s *collectFakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return s.hasEdges, s.hasEdgesErr
-}
-func (s *collectFakeStore) EdgesListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
-	return nil, s.outgoingErr
 }
 func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	return s.deleteObjectErr
@@ -198,14 +194,6 @@ func TestCollectHasIncomingRefsError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-func TestCollectListOutgoingRefsError(t *testing.T) {
-	// hasEdges false so collect proceeds to the delete prep where EdgesListOutgoing runs.
-	bh, err := New(&collectFakeStore{outgoingErr: errBoom})
-	require.NoError(t, err)
-	_, err = bh.gcCollect(context.Background(), 1)
-	require.ErrorIs(t, err, errBoom)
-}
-
 func TestCollectDeleteObjectError(t *testing.T) {
 	bh, err := New(&collectFakeStore{deleteObjectErr: errBoom})
 	require.NoError(t, err)
@@ -215,10 +203,10 @@ func TestCollectDeleteObjectError(t *testing.T) {
 
 // gcFixture builds a Beehive over a real sqlite store plus a client, so collect
 // tests can exercise real DeletionRequestsCreate/ObjectsDelete/ref semantics. No
-// controller is started: collect is driven directly. The default resync is left
-// enabled, so collect's post-commit wakes for this client-only kind defer to the
-// (idle) sweeper rather than recursively collecting synchronously — letting these
-// tests observe each intermediate state one collect call at a time.
+// controller is started: collect is driven directly, one call at a time, so these
+// tests observe each intermediate state. Nothing cascades on its own — collect
+// marks children and returns, leaving the next step to the sweeper that is not
+// running here.
 func gcFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
 	t.Helper()
 	bh, err := New(newClientTestStore(t))
@@ -376,8 +364,8 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 
-	// Resync disabled: the cycle must break purely event-driven.
-	bh, err := New(store, WithResyncInterval(0))
+	// Full pass disabled: the cycle must break purely event-driven.
+	bh, err := New(store, fast(WithFullPassInterval(0))...)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
@@ -409,8 +397,8 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 
-	// Resync disabled: the finalizer gate must clear purely event-driven.
-	bh, err := New(store, WithResyncInterval(0))
+	// Full pass disabled: the finalizer gate must clear purely event-driven.
+	bh, err := New(store, fast(WithFullPassInterval(0))...)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &hasIncomingEdgesGatingController{finalizer: "gate"})
 	require.NoError(t, err)
@@ -457,14 +445,14 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	_, _, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
-	// A fresh Beehive with no spec-startup pass and resync disabled: the GC
+	// A fresh Beehive with no spec-startup pass and the full pass disabled: the GC
 	// sweeper's unconditional startup pass is the only thing that can drive this row
-	// to removal. It is the sweeper's alone now — the reconciler no longer keeps a
-	// per-kind deletion-pending listing that duplicated it.
-	bh, err := New(store, WithResyncInterval(0))
+	// to removal: deletion-pending work is the sweeper's alone, listed cross-kind
+	// rather than per-kind.
+	bh, err := New(store, fast(WithFullPassInterval(0))...)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{},
-		WithStartupResync(false))
+		WithStartupFullPass(false))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -488,9 +476,9 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	ctx := context.Background()
 
-	// Resync disabled: the post-reconcile GC hook alone must remove the row once
+	// Full pass disabled: the post-reconcile GC hook alone must remove the row once
 	// the controller clears the finalizer in the same pass.
-	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
 	require.NoError(t, err)
 
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"})
@@ -516,13 +504,13 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestIntegrationGCCascadeWithResyncDisabled(t *testing.T) {
+func TestIntegrationGCCascadeWithFullPassDisabled(t *testing.T) {
 	ctx := context.Background()
 
-	// Resync disabled: the cascade must complete purely event-driven. Deleting the
+	// Full pass disabled: the cascade must complete purely event-driven. Deleting the
 	// child frees the owner's RESTRICT, and removing the child must wake the owner
 	// directly — there is no backstop tick to re-check it.
-	bh, err := New(newClientTestStore(t), WithResyncInterval(0))
+	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
 	require.NoError(t, err)
 
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
@@ -549,9 +537,9 @@ func TestIntegrationGCCascadeWithResyncDisabled(t *testing.T) {
 func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	ctx := context.Background()
 
-	// A short resync drives the deletion-pending backstop, which re-checks the
+	// A short full-pass interval drives the deletion-pending backstop, which re-checks the
 	// owner once its child (and the owned_by edge) is gone.
-	bh, err := New(newClientTestStore(t), WithGCInterval(5*time.Millisecond))
+	bh, err := New(newClientTestStore(t), fast(WithGCInterval(5*time.Millisecond))...)
 	require.NoError(t, err)
 
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{})
@@ -590,7 +578,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), WithGCInterval(5*time.Millisecond))
+	bh, err := New(newClientTestStore(t), fast(WithGCInterval(5*time.Millisecond))...)
 	require.NoError(t, err)
 
 	// Only the owner kind has a controller; the child kind is client-only.
@@ -711,9 +699,9 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 
-	// Resync disabled: when the dependent releases its depends_on edge, that ref
+	// Full pass disabled: when the dependent releases its depends_on edge, that ref
 	// removal must wake the target directly — there's no backstop to re-check it.
-	bh, err := New(store, WithResyncInterval(0))
+	bh, err := New(store, fast(WithFullPassInterval(0))...)
 	require.NoError(t, err)
 
 	ctrl := &depDroppingController{}
@@ -763,7 +751,7 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 //
 // The row is marked deletion-pending only after the sweeper's startup pass has
 // provably run, and through the store rather than the client, so neither that
-// pass nor gcAdvance's post-Delete wake can be what collects it: a periodic sweep
+// pass nor anything the Delete call itself did can be what collects it: a periodic sweep
 // is the only path left. The kind has no registered controller, so nothing
 // dispatches a reconcile either.
 func TestGCSweepsOnItsOwnInterval(t *testing.T) {
@@ -777,7 +765,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	require.NoError(t, err)
 
 	// Reconcile tick off, GC on: the sweeper must still run on its own timer.
-	bh, err := New(store, WithResyncInterval(0), WithGCInterval(10*time.Millisecond))
+	bh, err := New(store, WithFullPassInterval(0), WithGCInterval(10*time.Millisecond))
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -806,7 +794,8 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 // reconcile loop run the controller; calling collect directly makes no progress,
 // forever.
 //
-// Every other driver is removed: resync is off, the startup pass is None, and the
+// Every other driver is removed: the full pass is off, the startup pass is None,
+// and the
 // row is marked deletion-pending only after both startup listings have provably
 // run — so neither the reconciler's own startup enqueue nor the sweeper's startup
 // pass can be what dispatches it. A periodic GC sweep is the only path left.
@@ -819,12 +808,12 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 		gcSwept:    make(chan struct{}, 8),
 	}
 
-	bh, err := New(store, WithResyncInterval(0), WithGCInterval(10*time.Millisecond))
+	bh, err := New(store, fast(WithFullPassInterval(0), WithGCInterval(10*time.Millisecond))...)
 	require.NoError(t, err)
 	// The controller clears "gate" once the object is finalizing, which is the step
 	// only a reconcile can take.
 	_, err = Register(bh, clientTestGK, &finalizerClearingController{finalizer: "gate"},
-		WithStartupResync(false))
+		WithStartupFullPass(false))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -854,7 +843,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 		}
 	}
 
-	// Mark it deletion-pending through the store, so the client's own gcAdvance
+	// Mark it deletion-pending through the store, so nothing the client's own Delete does
 	// wake isn't what drives this either.
 	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)

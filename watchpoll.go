@@ -1,0 +1,339 @@
+// Copyright 2026 Andres Morey
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package beehive
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// This file is the client's whole watch surface. The store pushes nothing, so a
+// watch polls and diffs: read current state on a tick, compare it with what this
+// subscriber was last told, send the difference. So a subscriber sees the same
+// level-triggered view as the rest of beehive — it converges on current state and is
+// never handed a history.
+//
+// Two consequences the doc comments repeat, because they are what callers trip on:
+//
+//   - Intermediate states are invisible. Three writes between two ticks produce one
+//     Modified carrying the third, and an object created and deleted inside one
+//     interval is never reported at all.
+//   - Latency is the poll interval (withWatchPollInterval), not the write.
+
+// watchPoll returns the interval the watches poll at. The option rejects a
+// non-positive value, so the fallback is only for a Beehive built field by field in a
+// test rather than through New — the same reason Beehive.log guards against nil.
+func (bh *Beehive) watchPoll() time.Duration {
+	if bh.watchPollInterval <= 0 {
+		return defaultWatchPollInterval
+	}
+	return bh.watchPollInterval
+}
+
+// sendOrDone delivers v unless ctx is cancelled first, and reports whether it
+// landed. Every send in this file goes through it, so a subscriber that stops reading
+// cannot wedge its own poll goroutine past cancellation.
+func sendOrDone[V any](ctx context.Context, out chan<- V, v V) bool {
+	select {
+	case out <- v:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// pollFailed logs a failed poll and says whether to keep going. A transient store
+// error costs one tick, not the stream: ending the stream would leave the subscriber
+// receiving nothing, with no way to notice it should resubscribe. A cancelled context
+// is shutdown rather than failure, and ends the loop quietly.
+func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, err error, args ...any) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	c.bh.log().WarnContext(ctx, "beehive: "+what+" poll failed; retrying on the next tick",
+		append([]any{"group", c.gk.Group, "kind", c.gk.Kind, "err", err}, args...)...)
+	return true
+}
+
+// tracked is what an object watch remembers about an object it has reported: the
+// version, and the body to build a tombstone from if the row later disappears. obj is
+// nil for a row that failed to decode; its version is still tracked, so the failure is
+// reported once per change rather than once per tick, but there is nothing to
+// tombstone.
+type tracked[Spec, Status any] struct {
+	rv  int64
+	obj *Object[Spec, Status]
+}
+
+// ObjectsWatchList streams changes to every object of this client's kind. See the
+// Client interface for the contract, and this file's header for what polling
+// costs a subscriber.
+func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error) {
+	if !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+	}
+	return c.objectStream(ctx, func(ctx context.Context) ([]*RawObject, error) {
+		return c.bh.store.ObjectsList(ctx, c.gk)
+	}), nil
+}
+
+// ObjectsWatch streams changes to the single object id. It polls the same way
+// ObjectsWatchList does, over a one-row listing: a missing id is an empty listing,
+// so an id that does not exist yet streams nothing until it is created, and its
+// removal reads as a Deleted.
+func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error) {
+	if !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+	}
+	return c.objectStream(ctx, func(ctx context.Context) ([]*RawObject, error) {
+		raw, err := c.bh.store.ObjectsGet(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil // not there (yet): an empty listing, not an error
+		}
+		if err != nil {
+			return nil, err
+		}
+		if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+			return nil, nil // foreign id: invisible through this kind's client, as Get is
+		}
+		return []*RawObject{raw}, nil
+	}), nil
+}
+
+// objectStream is the poll-and-diff engine behind both object watches. It remembers
+// the resource_version of every object it has reported and works out the change type
+// by comparison:
+//
+//   - absent before, present now -> Added
+//   - present in both, version moved -> Modified
+//   - present before, absent now -> Deleted
+//
+// A version that has not moved sends nothing, which is what keeps the steady state
+// silent instead of re-sending the world every tick.
+//
+// Most ticks skip the listing entirely. resource_version is a store-wide cursor, so a
+// cursor that has not moved proves no row was created or modified anywhere. The one
+// thing it cannot show is a delete, since a removed row draws no version. So a tick
+// reads the scalar cursor, and pays for the listing that carries specs and statuses
+// only when that moved or the kind's id set shrank. In a quiet system a subscriber
+// costs one scalar read plus one id listing per tick.
+//
+// A Deleted change carries the object's last known state, because the row is gone by
+// the time the poll notices and there is nothing left to read. That body can be one
+// interval stale, but it is the object's final state either way — nothing was written
+// after it. Keeping those bodies is what a list watch costs in memory: the decoded
+// state of the kind, for as long as the stream runs.
+//
+// A row that fails to decode is quarantined the same way List does it, so one bad
+// object cannot kill the stream.
+func (c *clientImpl[Spec, Status]) objectStream(
+	ctx context.Context,
+	list func(context.Context) ([]*RawObject, error),
+) <-chan ObjectChange[Spec, Status] {
+	out := make(chan ObjectChange[Spec, Status])
+	// The migrator is invariant for the stream's lifetime; resolve it once rather
+	// than re-locking the registry on every poll.
+	mig := c.bh.migratorFor(c.gk)
+	seen := make(map[ObjectID]tracked[Spec, Status])
+	var cursor int64
+
+	go func() {
+		defer close(out)
+		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+			at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
+			if err != nil {
+				return c.pollFailed(ctx, "watch", err)
+			}
+			if at == cursor {
+				// No write anywhere in the store since the last poll, so nothing was
+				// created or modified. A delete is still possible and draws no version,
+				// so check the id set — one blob-free indexed listing — and skip the
+				// expensive read unless something actually vanished.
+				gone, err := c.deletedSince(ctx, seen)
+				if err != nil {
+					return c.pollFailed(ctx, "watch", err)
+				}
+				if !gone {
+					return true
+				}
+			}
+			raws, err := list(ctx)
+			if err != nil {
+				return c.pollFailed(ctx, "watch", err)
+			}
+			cursor = at
+			present := make(map[ObjectID]struct{}, len(raws))
+			for _, raw := range raws {
+				present[raw.ID] = struct{}{}
+				if prev, known := seen[raw.ID]; known && prev.rv == raw.ResourceVersion {
+					continue // unchanged since the last report
+				}
+				obj, err := rawToTyped[Spec, Status](raw, mig)
+				if err != nil {
+					// Quarantine, don't tear down: skip a poison row and keep the stream
+					// alive so one un-decodable object can't silently kill a live watcher
+					// (mirrors List). Recording the version keeps it from re-warning every
+					// tick until someone rewrites it.
+					seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion}
+					c.warnUndecodable("Watch", raw.ID, err)
+					continue
+				}
+				typ := Modified
+				if _, known := seen[raw.ID]; !known {
+					typ = Added
+				}
+				seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion, obj: obj}
+				if !sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: typ, Object: obj}) {
+					return false
+				}
+			}
+			for id, prev := range seen {
+				if _, ok := present[id]; ok {
+					continue
+				}
+				delete(seen, id)
+				if prev.obj == nil {
+					continue // only ever seen as a poison row: no body to tombstone
+				}
+				if !sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Deleted, Object: prev.obj}) {
+					return false
+				}
+			}
+			return true
+		})
+	}()
+	return out
+}
+
+// deletedSince reports whether any object this stream has reported is no longer
+// in the kind. It is the cheap half of the poll: ObjectsListIDs is one indexed,
+// blob-free column read, where the listing it gates carries every row's spec and
+// status. Only ever consulted when the write cursor has not moved, so a create
+// cannot be in flight — a shrunk id set means a delete.
+func (c *clientImpl[Spec, Status]) deletedSince(ctx context.Context, seen map[ObjectID]tracked[Spec, Status]) (bool, error) {
+	if len(seen) == 0 {
+		return false, nil
+	}
+	ids, err := c.bh.store.ObjectsListIDs(ctx, c.gk)
+	if err != nil {
+		return false, err
+	}
+	live := make(map[ObjectID]struct{}, len(ids))
+	for _, id := range ids {
+		live[id] = struct{}{}
+	}
+	for id := range seen {
+		if _, ok := live[id]; !ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// EventsWatch streams id's event log. See the Client interface for the contract.
+//
+// Runs are keyed by their own id and compared by resource_version, so a run extended
+// between ticks — EventsRecord bumping its count — is sent again with its new state,
+// the same convergence the object watches give. There are no tombstones, because an
+// append-only log means a run only appears or grows. A run that both appears and is
+// trimmed by retention inside one interval is never seen.
+func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error) {
+	if !c.bh.isRegistered(c.gk) {
+		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+	}
+	q := resolveEvents(opts)
+	out := make(chan Event)
+	seen := make(map[EventID]int64)
+	// scoped latches the kind check below. An object's group and kind are fixed at
+	// insert and its id is never reused, so the answer cannot change while the
+	// stream runs — checking it once keeps the steady-state cost at one query per
+	// tick rather than two.
+	var scoped bool
+
+	go func() {
+		defer close(out)
+		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+			if !scoped {
+				// Kind-scope the read: the object watches are scoped, and an unscoped log
+				// read would let a foreign id stream another kind's events through this
+				// client. A missing id simply streams nothing until it exists.
+				raw, err := c.bh.store.ObjectsGetMeta(ctx, id)
+				if errors.Is(err, ErrNotFound) {
+					return true
+				}
+				if err != nil {
+					return c.pollFailed(ctx, "event watch", err, "id", id)
+				}
+				if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+					return true // foreign id: nothing of this kind's to stream, ever
+				}
+				scoped = true
+			}
+			runs, err := c.bh.store.EventsList(ctx, id, q)
+			if err != nil {
+				return c.pollFailed(ctx, "event watch", err, "id", id)
+			}
+			// EventsList is newest-first; deliver oldest-first so the timeline builds
+			// in order, as a reader of an append-only log expects.
+			for i := len(runs) - 1; i >= 0; i-- {
+				run := runs[i]
+				if prev, ok := seen[run.ID]; ok && prev == run.ResourceVersion {
+					continue
+				}
+				seen[run.ID] = run.ResourceVersion
+				if !sendOrDone(ctx, out, eventFromRaw(run)) {
+					return false
+				}
+			}
+			return true
+		})
+	}()
+	return out, nil
+}
+
+// SchedulesWatch streams id's schedule as a gauge. It requires a registered
+// controller (the reconcile loop that owns the work queue); a client-only kind has
+// none, so it returns ErrNoController. See the Client interface for the full
+// contract.
+//
+// Unlike the other watches this polls in-memory state rather than the store, so the
+// interval costs nothing but latency. The zero Schedule ("nothing scheduled") is a
+// real value rather than an absence, so it is sent like any other; the first flag is
+// what separates "never reported" from "last reported the zero value".
+func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
+	r, ok := c.bh.reconcilerFor(c.gk)
+	if !ok {
+		return nil, ErrNoController
+	}
+	out := make(chan Schedule)
+	var last Schedule
+	first := true
+
+	go func() {
+		defer close(out)
+		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+			at, _ := r.nextRequeueAt(id) // zero time when nothing is scheduled
+			cur := Schedule{NextRequeueAt: at}
+			if !first && cur == last {
+				return true
+			}
+			first, last = false, cur
+			return sendOrDone(ctx, out, cur)
+		})
+	}()
+	return out, nil
+}

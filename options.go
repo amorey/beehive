@@ -131,8 +131,8 @@ func WithEventReason(reason string) EventOption {
 	return func(q *storeapi.EventQuery) { q.Reason = reason }
 }
 
-// WithEventLimit caps a read to the newest n runs. It bounds only the snapshot of
-// a EventsWatch subscription, not its live stream.
+// WithEventLimit caps a read to the newest n runs. On EventsWatch it bounds every
+// poll, so the stream reports only runs inside that window.
 func WithEventLimit(n int) EventOption {
 	return func(q *storeapi.EventQuery) { q.Limit = n }
 }
@@ -216,9 +216,10 @@ func WithOwner(id ObjectID) Option {
 // ControllerClient.Within it reports true before the enclosing transaction
 // commits — act on it for a non-store side effect (an external call, an
 // in-memory counter) and a later rollback leaves that effect fired for a row
-// that never landed. fn is deferred through the same post-commit path as the
-// reconcile wake (Store.AfterCommit), so a rollback simply never runs it. Put
-// such side effects here rather than gating them on the returned bool.
+// that never landed. fn is deferred to the outermost commit (Store.AfterCommit),
+// so a rollback simply never runs it. Put such side effects here rather than
+// gating them on the returned bool. It is the only thing beehive defers past a
+// commit — no write schedules any reconcile.
 func WithOnCreate(fn func(ctx context.Context)) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {
@@ -228,57 +229,54 @@ func WithOnCreate(fn func(ctx context.Context)) Option {
 	}
 }
 
-// WithCatchupInterval sets how often a controller drains work the store has
+// withOwedPassInterval sets how often a controller drains work the store has
 // recorded as owed: objects whose spec has not converged
 // (observed_generation < generation) and objects owed a durable dependency wake.
-// A value <= 0 disables the catchup tick.
+// A value <= 0 disables the owed-pass tick.
 //
-// It is separate from WithResyncInterval because the two scale differently. The
-// owed set is bounded by what is actually outstanding — indexed listings that
-// return nothing in a converged system — while a full pass scales with the object
-// count. One interval governing both would mean tuning either moves the other.
-//
-// Passed to New it sets the default for all controllers; passed to Register it
-// overrides that default for one.
-func WithCatchupInterval(d time.Duration) Option {
+// It is deliberately unexported. The owed pass is what makes convergence a
+// guarantee rather than a setting, and its cost is bounded by what is actually
+// outstanding — indexed listings that return nothing in a converged system — so
+// there is little for an embedder to gain by moving it and a correctness hole to
+// fall into by disabling it. Tests reach it in-package; the knob a caller gets is
+// WithFullPassInterval, which subsumes this set.
+func withOwedPassInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.catchupInterval = d
+			t.owedPassInterval = d
 		case *reconciler:
-			t.catchupInterval = d
+			t.owedPassInterval = d
 		}
 		return nil
 	}
 }
 
-// WithResyncInterval sets how often a controller re-dispatches *every* object it
+// WithFullPassInterval sets how often a controller re-dispatches *every* object it
 // owns, converged or not. The default is 0, which disables it.
 //
 // This is the expensive pass, and the only one that reaches an object nothing has
 // recorded as owing work: process-scoped state a restart invalidated (liveness
 // conditions read as "verifying" until this process rewrites them), and a
-// dependency wake lost for a reason nothing observed. Both are invisible to
-// WithCatchupInterval, whose listings are driven by columns.
+// dependency wake lost for a reason nothing observed. Both are invisible to the
+// owed pass, whose listings are driven by columns.
 //
 // It is opt-in because its cost scales with the object count rather than with what
 // is outstanding, and because the two cheaper drivers already cover convergence:
-// the catchup tick drains recorded work, and the startup pass re-confirms
+// the owed-pass tick drains recorded work, and the startup pass re-confirms
 // everything once per process. Reach for this when the gap until the next restart
-// is itself too long — then set it well above WithCatchupInterval, since a full
-// pass subsumes the catchup set.
+// is itself too long.
 //
-// Note for callers upgrading: this option previously paced the owed-work tick,
-// which is now WithCatchupInterval. A call left unchanged still compiles and now
-// buys a full pass at that cadence — likely more work than intended, and the
-// catchup tick keeps running at its own default regardless.
-func WithResyncInterval(d time.Duration) Option {
+// It does not pace the owed-work tick, which is not configurable and runs at its
+// own interval regardless of this one. A full pass subsumes the owed set, so
+// there is no reason to set this shorter than that interval (30s).
+func WithFullPassInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.resyncInterval = d
+			t.fullPassInterval = d
 		case *reconciler:
-			t.resyncInterval = d
+			t.fullPassInterval = d
 		}
 		return nil
 	}
@@ -288,14 +286,14 @@ func WithResyncInterval(d time.Duration) Option {
 // deletion-pending objects (of every kind, including ones with no registered
 // controller) and applies event-log retention.
 //
-// It is separate from the reconcile intervals on purpose. Removing dead rows and
+// It is separate from WithFullPassInterval on purpose. Removing dead rows and
 // re-dispatching live ones are different jobs with different costs, and a single
 // interval for both means tuning one moves the other. GC is also global rather
 // than per-kind — the sweeper covers kinds no controller watches — so this is
 // meaningful only at New; passed elsewhere it is ignored.
 //
-// Unlike the reconcile intervals, it cannot be disabled: d <= 0 is rejected with
-// ErrInvalidOption. Those two knobs pace work that has another way through —
+// Unlike WithFullPassInterval, it cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption. That knob paces work that has another way through —
 // Client.Requeue drives a reconcile by hand — but nothing on the public surface
 // triggers collect, so a sweeper-less Beehive would let deletion-pending rows
 // accumulate with no recourse, each one's owned_by edge RESTRICT-blocking its
@@ -312,6 +310,72 @@ func WithGCInterval(d time.Duration) Option {
 		}
 		if t, ok := target.(*Beehive); ok {
 			t.gcInterval = d
+		}
+		return nil
+	}
+}
+
+// withDependencyWakeInterval sets how often the dependency waker scans the
+// store's write log and requeues the dependents of everything that changed since
+// its last scan. It is global — a depends_on edge may point at a kind with no
+// controller, so the scan cannot be per-kind — and is meaningful only at New;
+// passed elsewhere it is ignored.
+//
+// It is deliberately unexported. This is the cheapest of the periodic drivers:
+// the scan is a single covering-index range query bounded by what has *changed*,
+// so it returns nothing in a quiet system, where the passes it sits beside scale
+// with what exists (the full pass) or with what is owed (the owed pass). Being
+// cheap and already the shortest cadence, there is nothing to tune it toward, and
+// lengthening it only delays wakes that nothing else will find promptly.
+//
+// d <= 0 disables it, which is why tests can reach it: declaring a dependency
+// still stamps reconcile_owed, so a dependent that read a target which moved
+// under it is caught by the owed pass. What is lost is the *later* change — a
+// settled dependent whose dependency is rewritten afterwards. That dependent is
+// invisible to every owed-work listing (its own generation never moved), so only
+// a full pass would find it.
+func withDependencyWakeInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.wakeInterval = d
+		}
+		return nil
+	}
+}
+
+// withWatchPollInterval sets how often the Client watch surface
+// (ObjectsWatch, ObjectsWatchList, EventsWatch, SchedulesWatch) reads current
+// state and emits what changed. It is global and meaningful only at New; passed
+// elsewhere it is ignored.
+//
+// It is deliberately unexported: watch latency and resolution are part of the
+// contract the streams document, not a per-embedder setting.
+//
+// It is the latency a subscriber sees, and also the resolution: changes to one
+// object within a single interval coalesce into one delivery carrying the latest
+// state, and an object created and deleted inside one interval is never reported
+// at all. Both follow from the streams being level-triggered — a subscriber is
+// told what *is*, not what happened — which is the same contract the rest of
+// beehive keeps.
+//
+// A short interval costs one listing per subscriber per tick, on the store's
+// single connection, which every writer in the process shares.
+//
+// Like WithGCInterval, it cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption. A watch that never polls is a stream that never delivers, and
+// a caller who wanted no watch would not open one — so there is nothing a
+// non-positive value could mean. (withDependencyWakeInterval differs because
+// disabling it has a coherent reading: the durable stamp still covers the
+// declare-time case.)
+func withWatchPollInterval(d time.Duration) Option {
+	return func(target any) error {
+		// Checked before the target switch, as WithGCInterval does: the value is
+		// nonsense wherever it was aimed.
+		if d <= 0 {
+			return fmt.Errorf("%w: withWatchPollInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.watchPollInterval = d
 		}
 		return nil
 	}
@@ -348,37 +412,34 @@ func WithMigrator(m Migrator) Option {
 	}
 }
 
-// WithStartupResync sets whether a controller re-dispatches *every* object once
-// at startup, converged ones included. The default is true.
+// WithStartupFullPass sets whether a controller re-dispatches *every* object once
+// at startup, converged ones included. The default is false, matching
+// WithFullPassInterval: neither full pass runs unless asked for.
 //
 // The pass re-confirms process-scoped state that a restart invalidated — liveness
 // conditions, for instance, read as "verifying" until a controller in this process
 // rewrites them — which no owed-work listing can see, because nothing in the store
-// records it as outstanding.
+// records it as outstanding. Enable it for that, and for that only.
 //
-// It does not govern work that *is* recorded as owed. An object whose spec has not
-// converged, and one owed a durable dependency wake, are resumed at startup either
-// way: they are already owed a pass, and declining them is a correctness hole
-// rather than a saving. In-progress deletions are likewise resumed, by the GC
-// sweeper's own startup pass.
+// **No reconcile may depend on it**, which is what makes off the right default. A
+// pass whose cost scales with the object count cannot be the thing that guarantees
+// convergence, and a correctness hole it happens to paper over is a hole that
+// reappears the moment an embedder turns it off or the object set grows past what
+// it can sweep. Work that is genuinely owed is *recorded* — an unconverged spec, a
+// durable dependency wake, a pending deletion — and startup resumes all three
+// regardless of this setting, via enqueueOwedPass and the GC sweeper's own eager
+// sweep. If some path needs this pass to converge, that path is the defect; see
+// docs/reconcile-triggers.md for the map and TODO.md for the open ones.
 //
-// Set it false for a large object set where the re-confirm is not worth its cost,
-// or where the embedder drives its own reconciles. Passed to New it sets the
-// default for all controllers; passed to Register it overrides that default for
-// one.
-//
-// Setting it false also opts out of crash recovery for *settled dependents*. The
-// dependency waker's resume cursor is per-process, so a crash during a waker outage
-// leaves a dependent whose target changed in that window stale: its own generation
-// never moved, so no owed-work listing can see it, and this pass is what would
-// otherwise have caught it. See the observed_cursor entry in TODO.md.
-func WithStartupResync(enabled bool) Option {
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithStartupFullPass(enabled bool) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.startupResync = enabled
+			t.startupFullPass = enabled
 		case *reconciler:
-			t.startupResync = enabled
+			t.startupFullPass = enabled
 		}
 		return nil
 	}
