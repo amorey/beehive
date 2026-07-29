@@ -417,3 +417,65 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   case turns up that ordering *cannot* fix — that is the signal the local fixes have
   run out — or if the hook list grows a watermark for some other reason, which would
   remove most of the work.
+
+- **`OpenPool` never sets `auto_vacuum`, and that door closes behind us** — known, not
+  fixed, and the only item here with a deadline. The mode has to be chosen *before the
+  first table exists*; on a database that already has one, switching it requires a full
+  `VACUUM` rewrite. `0001_init.sql` sets nothing, so every file we have ever written is
+  `auto_vacuum=NONE` and stays there unless someone pays that rewrite.
+
+  We do delete rows, so free pages genuinely accumulate: `gcCollect` removes collected
+  objects and their edges, and event retention trims the log on the GC sweeper's
+  cadence. A long-lived store whose object count churns therefore keeps its high-water
+  page count forever. Nothing is incorrect — the pages are reused by later inserts —
+  and the file simply never shrinks.
+
+  Deferred because the cost is unmeasured and the fix is not free either: `INCREMENTAL`
+  needs someone to actually call `PRAGMA incremental_vacuum`, which is a new
+  responsibility with no obvious owner (the GC sweeper is the natural home, and it is
+  the one driver that cannot be disabled), and `FULL` moves that work onto every commit
+  on the single write connection. Revisit before the first deployment that expects to
+  run for months with heavy object churn — after that, every existing file needs the
+  `VACUUM`, so the decision gets strictly more expensive to reverse the longer it waits.
+
+- **The page cache and `mmap_size` are untuned, and it is unclear whether tuning them
+  buys anything here** — known, not fixed. `OpenPool` sets four pragmas and leaves
+  SQLite's stock ~2MB cache and disabled memory mapping alone.
+
+  Two things make this less obviously a win than the standard advice suggests. We run
+  on `modernc.org/sqlite`, a pure-Go translation rather than a cgo binding, so whether
+  `mmap_size` maps anything at all there is **unverified** — that is the first thing to
+  check, and if it is a no-op the item halves. And the store is one connection, so a
+  larger cache is not shared across concurrent readers the way the advice assumes; it
+  helps only by keeping the drivers' repeated scans off the disk.
+
+  Those scans are the one real argument for it. The owed pass, the stale-dependents
+  pass, the waker and the watch poll all re-read the same indexes on a fixed cadence
+  forever, which is exactly the working set a page cache is for. Deferred because it is
+  a tuning change with no measurement behind it, and adding pragmas we cannot show a
+  number for is how a config grows cargo. Revisit with a benchmark on a store large
+  enough that the scans miss cache — until then there is nothing to compare against.
+
+- **Nothing writes down why `synchronous=NORMAL` is safe for us** — a documentation gap,
+  not a defect. The pragma's usual summary is that WAL plus `NORMAL` cannot corrupt the
+  database, which is true and is not the property we actually depend on: a power loss
+  can also lose the *most recently committed* transactions. Stated plainly, that reads
+  as a direct contradiction of the crash-safety the whole `reconcile_owed` design exists
+  to provide.
+
+  It is safe for a specific reason, and the reason is the interesting part. The loss is
+  transactionally consistent at the tail: `EdgesAdd` stamps `reconcile_owed` in the same
+  statement sequence as the edge it stamps for, so a lost commit takes the edge *and*
+  its stamp together. There is no interleaving in which the durable trace survives and
+  the work it owes does not — which is precisely the strand the stamp-every-new-edge ADR
+  argues against. The same holds for a spec write and the generation it bumps.
+
+  So the durability floor is "we may lose the last few commits entirely", never "we may
+  lose the wake but keep the write". That distinction is load-bearing and lives nowhere
+  — `OpenPool`'s comment lists the pragma without it. It belongs next to the
+  [stamp-every-new-edge ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)'s
+  interleaving argument, which is where a reader is already thinking about exactly this.
+  Deferred only because it is prose; it is cheap and should be written the next time
+  that ADR is touched. If the invariant ever stops holding — a design that records owed
+  work in a *different* transaction from the change that owes it — the answer is
+  `synchronous=FULL`, and that is the tripwire to watch for.
