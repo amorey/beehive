@@ -2134,38 +2134,41 @@ func TestWithinFailedReleasePoisons(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestAfterCommitOnAClosedTransactionRunsInline: a closed ctx means one thing
-// everywhere. Within opens a fresh transaction on it and conn falls back to the pool,
-// so AfterCommit treats it as a registration against no transaction — which its own
-// contract already says runs inline.
+// TestAfterCommitOnAFinishedTransaction: a hook runs if and only if the transaction
+// it was registered against committed. "The transaction is over" is not the question
+// — whether it committed is — so the outcome is retained, not just the fact that it
+// closed.
 //
-// This is not a hole in "a rolled-back transaction never runs its hooks". That
-// guarantee is about hooks registered *during* the transaction, which sit in the
-// queue and die with it; TestAfterCommit's last arm pins it. A hook arriving
-// afterwards, on a ctx someone kept, was never queued against anything.
-func TestAfterCommitOnAClosedTransactionRunsInline(t *testing.T) {
+// A rolled-back outermost transaction is the same event as a nested frame unwinding,
+// one level up (see TestAfterCommitOnAnUnwoundFrameIsDiscarded), and gets the same
+// answer. Consistency with conn and Within, which treat a closed ctx as carrying no
+// transaction, does not extend here: falling back to the pool for a *read* is
+// harmless, firing a side effect for writes that are gone is the failure AfterCommit
+// exists to prevent.
+func TestAfterCommitOnAFinishedTransaction(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	sentinel := errors.New("boom")
 
 	for _, tc := range []struct {
-		name string
-		fn   func(context.Context) error
+		name    string
+		outcome error
+		wantRun bool
 	}{
-		{"rolled back", func(context.Context) error { return sentinel }},
-		{"committed", func(context.Context) error { return nil }},
+		{"committed", nil, true},
+		{"rolled back", sentinel, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var captured context.Context
 			err := store.Within(ctx, func(txCtx context.Context) error {
 				captured = txCtx
-				return tc.fn(txCtx)
+				return tc.outcome
 			})
-			require.Equal(t, tc.fn(ctx) != nil, err != nil)
+			require.ErrorIs(t, err, tc.outcome)
 
 			ran := false
 			store.AfterCommit(captured, func(context.Context) { ran = true })
-			assert.True(t, ran, "a hook registered on a finished transaction runs now")
+			assert.Equal(t, tc.wantRun, ran)
 		})
 	}
 }

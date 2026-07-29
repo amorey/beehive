@@ -297,8 +297,20 @@ type Store interface {
 
 	// AfterCommit registers fn to run once the transaction ctx belongs to has
 	// committed. If ctx carries no transaction the write has already committed, so
-	// fn runs before AfterCommit returns. Hooks run in registration order, and a
-	// rolled-back transaction never runs them.
+	// fn runs before AfterCommit returns. Hooks run in registration order.
+	//
+	// The rule in one line: **fn runs if and only if the transaction it was registered
+	// against committed, and the frame it was registered against did not unwind.** A
+	// rolled-back transaction never runs its hooks — neither those queued in it, which
+	// die with the queue, nor one registered afterwards on a ctx someone kept, which is
+	// discarded. Registering against a nested frame that already unwound is discarded
+	// the same way, even while the outer transaction is still open and heading for a
+	// commit: that frame's writes are gone.
+	//
+	// The one case that runs inline is a registration arriving after a *successful*
+	// commit — from a hook that passed back the ctx it captured, say. There is no queue
+	// left to join and the commit it was owed to has happened, so "after the commit" is
+	// now.
 	//
 	// It exists for one thing, and a backend author should judge their effort by that:
 	// WithOnCreate, the guarantee that a create-conditional side effect never fires for

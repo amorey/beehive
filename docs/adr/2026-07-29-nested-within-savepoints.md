@@ -113,16 +113,16 @@ Seven things make it correct rather than merely plausible:
   exists to cover, and latching and draining share one critical section so nothing
   lands between them.
 
-  It is a single flag, not a closed/committed pair, because the two would disagree
-  and every consumer wants the same answer. `AfterCommit` on a closed ctx runs the
-  hook inline — the same thing it does for a ctx that never had a transaction —
-  rather than discarding it. That is not a hole in "a rolled-back transaction runs no
-  hooks": that guarantee covers hooks registered *during* the transaction, which sit
-  in the queue and die with it. One arriving afterwards, on a ctx someone kept, was
-  never queued against anything.
-
-  A dead *frame* is the opposite case and is checked first: that frame's writes are
-  gone, so its hooks must not run whatever became of the transaction around it.
+  `AfterCommit` does **not** share that rule, and the difference is the point.
+  `Within` and `conn` are answering "how do I reach the store from this ctx", where
+  degrading to a fresh transaction or the pool is harmless. `AfterCommit` is
+  answering "should this side effect fire", where it is not. Its rule is its own:
+  **a hook runs if and only if the transaction it was registered against committed,
+  and the frame it was registered against did not unwind.** So `closed` is paired
+  with `committed`, a rolled-back transaction discards a late registration rather
+  than running it inline, and a registration against an unwound frame is discarded
+  even while the outer transaction is still heading for a commit. A rolled-back
+  outermost transaction is a frame unwinding one level up, and gets the same answer.
 
 Nothing recovers, and nothing balances the stack on a panic: a panic skips the
 `RELEASE`, and the outermost deferred `tx.Rollback` discards the whole transaction.

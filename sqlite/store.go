@@ -96,11 +96,13 @@ type txState struct {
 	// fresh transaction, conn falls back to the pool, and AfterCommit runs the hook
 	// inline, which is what it already does for a ctx that never had a transaction.
 	//
-	// One flag rather than a closed/flushed pair, because the pair could disagree.
-	// Whether the transaction committed does not change the answer here: a hook
-	// arriving after the queue is gone has to run now either way, since queueing it
-	// would be a silent drop.
 	closed bool
+
+	// committed records *how* it ended, and only flush sets it — which runs only after
+	// tx.Commit returned nil. closed alone cannot answer AfterCommit: a hook runs if
+	// and only if the transaction it was registered against committed, so "over" and
+	// "over and durable" are different questions and the pair is not redundant.
+	committed bool
 
 	// dead is the id ranges of frames that unwound. Dropping a frame's queued hooks is
 	// not enough on its own, because its ctx can outlive it: a registration arriving
@@ -272,15 +274,15 @@ type queuedHook struct {
 // the ids issued between lo and the counter's value when lo unwound.
 type idRange struct{ lo, hi int64 }
 
-// hookDisposition is what addHook decided to do with a hook. The two non-queue
-// outcomes answer different questions and must not be collapsed: one is about the
-// transaction being over, the other about the registering frame having rolled back.
+// hookDisposition is what addHook decided to do with a hook. A hook runs if and only
+// if the transaction it was registered against committed and the frame it was
+// registered against did not unwind; the three outcomes are that rule's branches.
 type hookDisposition int
 
 const (
 	hookQueued  hookDisposition = iota // waits for the outermost commit
-	hookRunNow                         // the transaction is over; "after" it is now
-	hookDiscard                        // the registering frame unwound; it must never run
+	hookRunNow                         // that commit happened already; "after" it is now
+	hookDiscard                        // the writes it was owed to are gone; it must never run
 )
 
 // addHook queues fn and reports what became of it. Queueing where nothing will look
@@ -296,8 +298,15 @@ func (st *txState) addHook(owner int64, fn func()) hookDisposition {
 		}
 	}
 	if st.closed {
-		// The queue is gone. Running now is what "after the commit" means here, and is
-		// what AfterCommit already does for a ctx that never had a transaction.
+		if !st.committed {
+			// A rolled-back outermost transaction is a nested frame unwinding, one level
+			// up, and gets the same answer: its writes are gone, so nothing owed to its
+			// commit may fire. Running inline here would be the create-conditional side
+			// effect for a row that never landed — the one failure this exists to stop.
+			return hookDiscard
+		}
+		// Committed and drained, so "after the commit" is now. Queueing would be a
+		// silent drop.
 		return hookRunNow
 	}
 	st.hooks = append(st.hooks, queuedHook{owner: owner, fn: fn})
@@ -318,14 +327,15 @@ func (st *txState) isClosed() bool {
 	return st.closed
 }
 
-// flush latches the transaction closed and drains the queue in one critical section,
-// so no registration can land after the close but before the drain and be queued
-// where nothing will look again.
+// flush latches the transaction closed *and committed* and drains the queue in one
+// critical section, so no registration can land after the close but before the drain
+// and be queued where nothing will look again. Only the commit path calls it, which
+// is what makes committed trustworthy.
 func (st *txState) flush() []queuedHook {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	hooks := st.hooks
-	st.hooks, st.closed = nil, true
+	st.hooks, st.closed, st.committed = nil, true, true
 	return hooks
 }
 
@@ -364,6 +374,13 @@ type dbtx interface {
 // closed txState degrades to the pool for the same reason Within opens a fresh
 // transaction on one: the ctx outlives its transaction, and half of it behaving as
 // "the transaction is over" would be worse than neither half doing so.
+//
+// The cost of that choice, stated plainly: a *write* issued on a captured ctx after
+// its transaction finished used to fail loudly with sql.ErrTxDone and now commits
+// standalone on the pool. Reads are what the fallback is for; writes come along with
+// it, and nothing here can tell them apart. A hook should use the detached ctx it was
+// handed rather than the one it captured — that is what the AfterCommit contract asks
+// for, and it is the only ctx that means "the transaction is over" unambiguously.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
 		return fr.st.tx
@@ -1828,14 +1845,14 @@ const edgeIsNew = `NOT EXISTS (
 // writers on one connection.
 //
 // The insert is deliberately the *last* write: every fallible step precedes the
-// edge coming into existence. A nested Within is a bare fn(ctx) with no
-// transaction of its own, so an error returned from here unwinds nothing — a
-// caller sharing an ambient transaction and handling the error would commit
-// whatever already landed. Ordering is therefore the only guarantee available,
-// and it points the residual failure the harmless way: a stamp with no edge is
-// one spurious owed wake, which costs a no-op reconcile and drains back to zero,
-// where an edge with no stamp is a dependent stranded on a stale read that
-// ObjectsListUnsettledIDs structurally cannot see.
+// edge coming into existence. The self-wrap above now makes that atomic on its own —
+// a nested Within is a savepoint boundary, so a caller who swallows this method's
+// error commits neither the stamp nor the edge — and the ordering is kept anyway,
+// because it points the residual failure the harmless way without depending on the
+// boundary holding. A stamp with no edge is one spurious owed wake, which costs a
+// no-op reconcile and drains back to zero; an edge with no stamp is a dependent
+// stranded on a stale read that ObjectsListUnsettledIDs structurally cannot see.
+// Getting the cheap half of that for free is worth not spending the boundary on.
 func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesAddResult, error) {
 	var out storeapi.EdgesAddResult
 	err := s.Within(ctx, func(ctx context.Context) error {
