@@ -63,14 +63,6 @@ var ErrObservedGenerationFuture = errors.New("beehive: observed generation excee
 // already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
-// ErrTargetResourceVersionFuture is returned by EdgesAdd when the caller's claimed
-// version of the target is above the target's current one. Versions only move
-// forward, so such a value cannot have come from reading the target — it is another
-// object's version, or another field. It is checked before the insert, so a rejected
-// call writes nothing. Same argument as ErrObservedGenerationFuture: a caller can
-// only report what it could have seen.
-var ErrTargetResourceVersionFuture = errors.New("beehive: target resource version is ahead of the target")
-
 // ChangeType classifies a Change.
 type ChangeType string
 
@@ -216,10 +208,10 @@ type EdgesAddResult struct {
 	// its own kind.
 	From GroupKind
 	// ReconcileOwedStamped reports whether this call incremented fromID's
-	// reconcile_owed, which happens when the edge was new *and* the target had already
-	// moved past the claimed version. A caller can read it instead of working the
-	// condition out again, and there is deliberately no second, separately derived
-	// report of "was the edge new" for it to disagree with.
+	// reconcile_owed, which happens when the call created a new depends_on edge
+	// (self-edges excluded). A caller can read it instead of working the condition
+	// out again, and there is deliberately no second, separately derived report of
+	// "was the edge new" for it to disagree with.
 	ReconcileOwedStamped bool
 }
 
@@ -479,60 +471,36 @@ type Store interface {
 	// idempotent, and both endpoints must exist or it returns ErrNotFound. The edge is
 	// not part of the object, so it bumps no version.
 	//
-	// targetResourceVersion is the caller's claimed version of toID — the version its
-	// decision to depend on toID was based on — or 0 for no claim. It drives two
-	// things, and every implementation owes both.
-	//
-	// First, a claim above toID's current version is rejected with
-	// ErrTargetResourceVersionFuture *before* the insert, so nothing is written. The
-	// rejection cannot rely on the caller unwinding a transaction that may hold other
-	// writes it means to keep.
-	//
-	// Second, a claim toID has already moved past, on an edge this call creates,
+	// Every **new depends_on** edge this call creates (self-edges excluded)
 	// increments fromID's reconcile_owed — the durable record that a wake is owed —
-	// and reports it as EdgesAddResult.ReconcileOwedStamped. That write must land on
-	// the same side of the insert as the rejection, for the same reason: as a separate
-	// call after EdgesAdd returned, a caller sharing an ambient transaction could
-	// handle its error and commit the edge with no wake, which is exactly the stranded
-	// dependent the claim exists to prevent. So the endpoint check, the stamp and the
-	// insert are one atomic unit, and an implementation must not split them.
+	// and reports it as EdgesAddResult.ReconcileOwedStamped. The stamp is
+	// unconditional because it is the only mechanism sound under every
+	// interleaving: an increment landing while fromID's own reconcile is in flight
+	// sits above the count that pass observed at load, so it survives the decrement
+	// and keeps the object owed — where invalidating derived state (the watermark
+	// clear below) is undone by that same pass. The edge-new gate bounds the cost at
+	// one extra pass per edge ever created; a caller that deletes and re-declares its
+	// set every pass pays per re-create, which is the trade recorded in the ADR.
+	// The stamp must land *before* the insert: issued as a separate call after
+	// EdgesAdd returned, a caller sharing an ambient transaction could handle its
+	// error and commit the edge with no wake — a stranded dependent. So the endpoint
+	// check, the stamp and the insert are one atomic unit, and an implementation
+	// must not split them.
 	//
 	// The count holds durable, owed *work*, and nothing else writes to it. A second
 	// kind of durable marker — undecodable rows, say — gets its own column and its own
 	// cadence rather than joining this count.
 	//
-	// Third, and independently of the claim: creating a **new depends_on** edge
-	// clears fromID's dependency_watermarks row, on the same side of the insert as
-	// the other two writes. A watermark describes how much of the store a dependent
-	// has reconciled against, and it was recorded when the dependency set was
-	// smaller, so it cannot speak for a target just added — one whose
-	// resource_version may sit below it, where DependentsListStale would read
-	// converged. An absent row already means stale, so dropping it is what puts
-	// fromID in the next stale-dependents pass. Without it, a declare whose claim is
-	// exact or zero against a target that is not about to move is found by no
-	// mechanism at all: not the stamp (the target has not moved past the claim), not
-	// a write-log scan (the target does not move), and not the staleness scan. That
-	// is the ordinary shape of an edge declared on another object's behalf, which
-	// the cross-kind edge deliberately allows.
-	//
-	// Gated on the same edge-new test as the stamp, so re-asserting a dependency set
-	// every pass costs nothing after the first, and skipped for a self-edge, which
-	// DependentsListStale excludes anyway. A controller declaring from inside its own
-	// Reconcile mostly pays nothing either: that pass writes the watermark again when
-	// it succeeds, from the cursor it loaded at. The exception is an object's *first*
-	// depends_on edge — ReconcileLoad.HasDependencies was sampled before it existed,
-	// so the pass skips the write and the object is found stale once. Bounded at once
-	// per object ever, and in the over-reconcile direction.
-	//
-	// It leaves one window, and it is a strand rather than latency: an edge declared
-	// by *another* writer between a dependent's load and its own watermark write is
-	// cleared and then immediately re-recorded by that pass, which never saw the new
-	// target. The dependent then reads as converged against that target with nothing
-	// left to re-derive it, so a target that never moves again is never reconciled
-	// against — the same failure class this clear closes, narrowed to a race window.
-	// Closing it needs the declare to record owed work rather than to invalidate
-	// derived state: a stamp on every new edge, which is sound under every
-	// interleaving and costs one extra pass per edge ever created (see TODO.md).
+	// Creating a new depends_on edge also clears fromID's dependency_watermarks row,
+	// on the same side of the insert as the other writes and behind the same
+	// edge-new gate, skipping self-edges (which DependentsListStale excludes
+	// anyway). A watermark describes how much of the store a dependent has
+	// reconciled against, and it was recorded when the dependency set was smaller,
+	// so it cannot speak for a target just added — one whose resource_version may
+	// sit below it, where DependentsListStale would read converged. The stamp above
+	// is what guarantees the dependent a pass; the clear keeps the derived state
+	// honest for the window until that pass runs, and an absent row already means
+	// stale, so nothing new is recorded.
 	//
 	// The stamp does not depend on fromID's kind having a controller. The store cannot
 	// know which kinds do, and gating would cost the caller a pre-read of fromID's kind
@@ -542,7 +510,7 @@ type Store interface {
 	// re-declaring an edge raises it again. Reclaiming those wants a cross-kind sweeper
 	// (see TODO.md), not a gate here: refusing to stamp would lose the wake outright
 	// for a kind that gains a controller later.
-	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (EdgesAddResult, error)
+	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 
 	// EdgesDelete removes the (fromID, toID, relation) edge; removing one that isn't
 	// there does nothing. Like EdgesAdd it bumps no version.
@@ -647,8 +615,10 @@ type Store interface {
 	//
 	// This is not the only writer of the row: EdgesAdd *clears* it when it creates a
 	// new depends_on edge, because a cursor recorded over a smaller dependency set
-	// cannot speak for a target just added. See EdgesAdd for why that has to happen
-	// there, and for the interleaving it leaves open.
+	// cannot speak for a target just added. The reconcile the same call's
+	// reconcile_owed stamp guarantees is what closes the interleaving the clear alone
+	// left open — a pass in flight rewriting the cleared row from a cursor that never
+	// saw the new target.
 	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
 
 	// DependentsListStale returns objects of the given kinds that have a depends_on

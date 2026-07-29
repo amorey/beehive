@@ -3,7 +3,7 @@
 Every way an object can come to owe a reconcile pass, what records it, which driver
 finds it, and whether that survives a restart. This is a coverage map, not a design
 record — the decisions behind it live in [the drivers ADR](adr/2026-07-28-periodic-scan-drivers.md)
-and [the caller-versioned dependencies ADR](adr/2026-07-27-caller-versioned-dependencies.md).
+and [the stamp-every-new-edge ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md).
 
 It exists because the guarantee is distributed: no single file holds it. A write
 leaves a trace in one column, a driver in another file scans for it, and whether a
@@ -38,7 +38,8 @@ the fourth an optimisation. The last does not survive a restart at all.
 The fifth has two writers, and the second one only *clears*: declaring a new
 `depends_on` edge drops the dependent's watermark, because a cursor recorded over a
 smaller dependency set cannot speak for a target just added (case 6b). Nothing is
-recorded — an absent row already means stale.
+recorded there — but the same declare records case 5's stamp, which is what
+guarantees the dependent a pass whatever else is in flight.
 
 Startup runs exactly three things: `enqueueOwedPass` (`reconciler.run`, before its
 workers start), the GC sweeper's eager first sweep, and the stale-dependents pass's
@@ -93,17 +94,25 @@ argument is shared:
 
 ## B. Dependency-derived
 
-Three mechanisms, and the split between them is the whole design. Two are fast records
-of a wake — one covers the window a scan structurally cannot see, the other covers
-every ordinary change — and the third records nothing, re-deriving from state whatever
-the first two lost.
+Three mechanisms, and the split between them is the whole design. One is a durable
+record made at declare time — every new edge stamps the pass it owes, which is what
+no scan can be trusted to see under every interleaving. One is a fast in-memory scan
+covering every ordinary change to an existing target. And one records nothing,
+re-deriving from state whatever the other two lost.
 
-### 5. The declare-race stamp (durable)
+### 5. The new-edge stamp (durable)
 
-A dependent that read its target, then declared the edge, may have read a version the
-target has already moved past. `EdgesAdd` increments `reconcile_owed` when the edge is
-**new** *and* the target's `resource_version` exceeds the caller's claim — in the same
-statement sequence as the edge insert, so the two cannot come apart.
+Every `depends_on` edge `EdgesAdd` **creates** (self-edges excluded) increments the
+dependent's `reconcile_owed` — in the same statement sequence as the edge insert, so
+the two cannot come apart. The stamp is unconditional,
+because recorded owed work is the only mechanism sound under every interleaving: an
+increment landing while the dependent's own pass is in flight sits above the count
+that pass observed at load, so the load-scoped decrement cannot consume it. That is
+what covers the declare-race (a target that moved between the caller's read and the
+declare), the quiet-target declare (case 6b's shape), and the mid-pass third-party
+declare that used to be a strand — with one reconcile per edge ever created as the
+price, bounded by the edge-new gate.
+→ [ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md)
 
 - **Recorded by:** `sqliteStore.EdgesAdd`, via `ControllerClient.DependenciesAdd`.
 - **Found by:** `reconciler.enqueueReconcileOwed` → `ReconcileOwedListIDs`. Drained by
@@ -114,13 +123,13 @@ statement sequence as the edge insert, so the two cannot come apart.
   commit and the dispatch loses nothing. This is the case `TestDependencyRequeueLostAcrossRestart`
   pins, deliberately under `WithStartupFullPass(false)` so the full pass cannot heal it
   for unrelated reasons.
-- **Tests:** `TestAddDependencyWakesWhenTargetMovedSinceRead`,
-  `TestAddDependencyNoWakeWhenTargetUnmoved`, `TestAddDependencyStampRidesRefsAdd`,
+- **Tests:** `TestAddDependencyWakesOncePerEdge`, `TestAddDependencyStampRidesRefsAdd`,
   `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
   `TestRefsAddStampFailureLeavesNoEdge`, `TestRefsAddEdgeFailureLeavesStamp`,
   `TestAddDependencyNoWakeOnRollback`, `TestDependencyRequeueRaceOnDeclare`,
   `TestDependencyRequeueRaceOnOutOfBandDeclare`, `TestReconcileDecrementsReconcileOwed`,
   `TestReconcileDrainsMultipleOwedPasses`, `TestReconcileOwedSurvivesConcurrentIncrement`,
+  `TestReconcileMidPassDeclareLeavesTheDependentOwed`,
   `TestOwedPassTickDispatchesOwedWake`.
 
 ### 6. An ordinary target change (in memory)
@@ -161,26 +170,30 @@ than per registered kind, precisely because a `depends_on` edge may point at a k
 per-kind query could name. Tests: `TestClientOnlyTargetWakesDependent`,
 `TestClientOnlyTargetCreatedAfterStart`, `TestClientOnlyTargetDeletionUnwedges`.
 
-### 6b. A dependency was declared that no version claim covers (durable)
+### 6b. The watermark clear on a new edge (derived-state hygiene)
 
-The other half of case 5, and it needs no claim to be right. `EdgesAdd` **clears the
-dependent's `dependency_watermarks` row** when it creates a new `depends_on` edge, so
-case 7 finds it. An absent row already means stale; nothing new is recorded.
+A companion to case 5, no longer a coverage mechanism of its own. `EdgesAdd` **clears
+the dependent's `dependency_watermarks` row** when it creates a new `depends_on`
+edge, because a cursor recorded over a smaller dependency set cannot speak for a
+target just added — leaving it standing would misreport convergence to case 7's scan
+for the window until the stamped pass runs. An absent row already means stale;
+nothing new is recorded.
 
-Without it, a declare whose claim is exact or `0`, against a target that is not about
-to move, reaches nobody: case 5's stamp needs the target to have moved past the claim,
-case 6 needs it to move *later*, and case 7 compares that target's `resource_version`
-against a watermark recorded after it — reading converged. That is the ordinary shape
-of an edge declared **on another object's behalf**, which the cross-kind edge
-deliberately allows.
+The clear alone used to be what reached a declare against a quiet target — one the
+old conditional stamp did not fire on — and it had a strand-shaped hole: a *third party*
+declaring between a dependent's load and that dependent's own watermark write had the
+clear immediately undone by a pass that never saw the new target. Case 5's
+unconditional stamp is what closes that — recorded owed work survives the pass, where
+invalidated derived state does not — so this clear is now hygiene for the watermark
+invariant rather than anyone's only route to a wake.
+→ [ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md)
 
 - **Recorded by:** nothing — it *un*-records, inside `sqliteStore.EdgesAdd`, in the
   same statement sequence as the edge and the stamp.
-- **Found by:** case 7's scan, on the absent-row arm.
-- **Normal:** ✅ 60s (case 7's cadence). Gated on the same edge-new test as the stamp,
-  so re-asserting a dependency set costs nothing after the first declare; self-edges
-  are skipped, matching what the scan excludes.
-- **Restart:** ✅ the row is durable, and so is its absence.
+- **Found by:** case 7's scan, on the absent-row arm (until case 5's pass rewrites
+  the row).
+- **Normal / Restart:** ✅ carried by case 5's stamp; the cleared row (and its
+  absence) is durable too.
 - **Costs the declarer's own pass nothing, with one exception:** a controller declaring
   from inside its own `Reconcile` rewrites the watermark when the pass succeeds, from
   the cursor it loaded at — sound because its read of the new target happened after that
@@ -189,19 +202,12 @@ deliberately allows.
   write and the object is found stale once. Once per object ever, self-extinguishing,
   and not this mechanism's doing. Test:
   `TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
-- **Not covered — and this one is a strand, not latency:** a *third party* declaring
-  between a dependent's load and that dependent's own watermark write has the clear
-  immediately undone by a pass that never saw the new target. The dependent reads as
-  converged against it with nothing left to re-derive, so a target that never moves
-  again is never reconciled against — the same failure this case exists to close,
-  narrowed to a race window. See [`TODO.md`](../TODO.md) for the fix (stamp every new
-  edge) and what it costs.
 - **Tests:** `TestRefsAddClearsTheDependentsWatermark`,
-  `TestRefsAddClearsTheWatermarkOnAnExactClaim`,
   `TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge`,
   `TestRefsAddKeepsTheWatermarkOnAnOwnerEdge`,
   `TestRefsAddKeepsTheWatermarkOnASelfEdge`,
-  `TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge`.
+  `TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge`,
+  `TestReconcileMidPassDeclareLeavesTheDependentOwed`.
 
 ### 7. A dependency moved and nobody noticed (re-derived)
 

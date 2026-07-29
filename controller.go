@@ -30,15 +30,6 @@ import (
 // ErrNotFound.
 var ErrWrongKind = storeapi.ErrWrongKind
 
-// ErrTargetResourceVersionFuture is returned by DependenciesAdd when
-// targetResourceVersion is above the target's current ResourceVersion. Versions only
-// move forward, so such a value cannot have come from reading the target — it is
-// another object's version, or another field. The declaration is rejected rather than
-// ignored, because the guard that value drives would otherwise never fire and nothing
-// would say so. The store checks before inserting, so a rejected call writes
-// nothing. Aliased from storeapi, like ErrNotFound.
-var ErrTargetResourceVersionFuture = storeapi.ErrTargetResourceVersionFuture
-
 // Controller is the user-supplied reconcile logic for a resource kind.
 // Reconcile is called to drive an object toward its desired state; the client
 // is the status-write surface for this controller's kind. Controllers own no
@@ -56,45 +47,20 @@ type ControllerClient[Status any] interface {
 	// DependenciesAdd records that fromID depends on toID, so beehive reconciles
 	// fromID again when toID changes.
 	//
-	// targetResourceVersion is the version of toID your decision was based on: the
-	// ResourceVersion of the object you actually read, not toID's current one.
-	// Re-reading toID just to fill this in defeats the point, since a fresher version
-	// claims to have seen changes your decision did not.
+	// Every call that *creates* the edge records one owed reconcile for fromID
+	// (self-edges excluded), durably, in the same store call as the edge itself. That
+	// is what makes a declared dependency a guarantee rather than a subscription: a
+	// change to toID that landed before the declare, a declare made on
+	// another object's behalf while that object's own Reconcile is mid-flight, a
+	// crash before the wake is serviced — all of them leave the owed count standing,
+	// and the owed pass drains it at startup unconditionally. Re-asserting your edges
+	// every pass costs nothing after the first, because only the call that created
+	// the edge records anything; the cost is one reconcile per edge ever created, and
+	// a caller that deletes and re-declares its set pays once per re-create.
 	//
-	// It closes the gap between reading a target and declaring the edge. A change to
-	// toID that lands in that gap reaches nobody: the waker resolves dependents when
-	// its scan passes the change, and the edge may not exist yet, so the dependent
-	// settles at its own generation on the stale read — where ObjectsListUnsettledIDs
-	// cannot see it. So if toID has already moved past targetResourceVersion when the
-	// edge commits, fromID is recorded as owing another pass.
-	//
-	// Pass 0 for "no opinion". That is the right value when you declare the edge
-	// before reading toID, which has no gap to close: the edge is already in place, so
-	// the waker covers every later change.
-	//
-	// A targetResourceVersion above toID's current version is rejected with
-	// ErrTargetResourceVersionFuture, before anything is written, so no edge is
-	// declared — including inside a caller's Within, where returning an error unwinds
-	// nothing by itself. This catches a version read from the wrong object. It cannot
-	// catch one read from the right object at the wrong time: a stale version looks
-	// like an old read, and a freshly re-read one looks like a decision made this
-	// instant. Those remain yours to get right.
-	//
-	// The check fires at most once per edge, because it is also gated on this call
-	// being the one that created the edge. Re-asserting your edges every pass
-	// therefore costs nothing after the first, and passing a stale version — one
-	// cached across passes, say — costs one extra pass rather than a loop.
-	//
-	// The price of that bound is that this cannot repair a wake lost elsewhere. Once
-	// the edge exists, delivering toID's changes is the waker's job, and the waker can
-	// still drop one: a restart re-seeds its watermark from the store's current
-	// cursor, so changes it never scanned are not replayed (see TODO.md). A later pass
-	// re-declaring the edge would have the evidence to notice, and deliberately does
-	// not act on it — waking whenever the target has moved would loop forever for a
-	// caller whose version never advances, which is worse than the miss and invisible
-	// to the caller. Repairing lost wakes belongs to a backstop that derives staleness,
-	// not to a guard that records an intent.
-	DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
+	// Once the edge exists, delivering toID's changes is the waker's job, backstopped
+	// by the stale-dependents pass, which re-derives any wake the waker loses.
+	DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error
 	DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
 	// DependenciesList returns the objects id depends on (outgoing depends_on).
 	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
@@ -228,12 +194,14 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // is the race this method exists to close. Indivisibility inside one store call is
 // the guarantee.
 //
-// The stamp is a conjunction — the edge is new *and* the target moved — and both
-// halves are load-bearing: either alone re-fires every pass for some ordinary
-// controller, and nothing throttles that (the dispatch path has no already-settled
-// skip, and workQueue.addLocked has no rate limiter). TODO.md records the two
-// rejected one-sided guards; the interface doc covers what the conjunction gives
-// up. The edge-new half costs nothing, riding the stamp statement's own NOT EXISTS.
+// The stamp fires on every edge the call creates, gated only on the edge being
+// new — which is what stops a level-triggered controller re-asserting its set every
+// pass from re-firing, since nothing throttles a wake (the dispatch path has no
+// already-settled skip, and workQueue.addLocked has no rate limiter). It is
+// unconditional beyond that gate because only recorded owed work is sound under
+// every interleaving: increments landing mid-pass survive the load-scoped
+// decrement (see the ADR on stamping every new edge). The edge-new gate costs
+// nothing, riding the stamp statement's own NOT EXISTS.
 //
 // Nothing is scheduled here, and the store's EdgesAddResult is discarded for that
 // reason: reconcile_owed is a durable count the owed pass drains, routed by
@@ -241,12 +209,8 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // a controller may declare one on another kind's behalf. The count is the whole
 // mechanism: it is durable, so a crash between the commit and the pass loses
 // nothing.
-//
-// The store rejects a version above the target's own before it inserts (see
-// ErrTargetResourceVersionFuture), so a bad claim leaves no edge — including inside
-// a caller's Within, since nothing was written to unwind.
-func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error {
-	_, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn, targetResourceVersion)
+func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
+	_, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
 	return err
 }
 

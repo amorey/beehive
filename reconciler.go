@@ -132,8 +132,9 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// queue coalesces, so the backstop's single enqueue is already spent, and with the
 	// owed-pass tick disabled the leftover would sit until the next process start.
 	// Increments that land *during* the pass are above the observed count, so they
-	// survive the subtraction and keep the object owed — and each brought its own
-	// in-memory requeue, so nothing has to schedule the follow-up here. Skip the
+	// survive the subtraction and keep the object owed — no write schedules anything,
+	// so the follow-up costs a wait for the owed pass rather than being prompt, which
+	// is the latency the durable count is there to bound. Skip the
 	// write when nothing was owed. A failed subtraction is not fatal: the count
 	// stays up and the backstop retries it, whereas requeueing on the error would
 	// spin against a store that keeps failing.

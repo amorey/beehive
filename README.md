@@ -505,7 +505,7 @@ type ControllerClient[Status any] interface {
     ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error
     EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error
     FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
-    DependenciesAdd(ctx context.Context, fromID, toID ObjectID, targetResourceVersion int64) error
+    DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error
     DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
     EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
     // Lazy secondary lookups, for reading an object's edges during reconcile.
@@ -601,15 +601,13 @@ The check is **process-local and evaluated at call time**, since the store recor
 
 The target can be **any** kind, including one you only ever use through `Client` and never register — configuration, secrets, any reference data your app writes and your controllers read. The waker scans the whole store's write log rather than only the kinds with controllers, so such a target wakes its dependents like any other.
 
-`DependenciesAdd` takes `targetResourceVersion`: the `ResourceVersion` of the target *as you read it when deciding to depend on it*, not one fetched fresh for the call. Without it, a change to the target landing between that read and the edge's commit would reach nobody — the waker resolves dependents when its scan passes the change, and the edge doesn't exist yet. So if the target has already moved past the version you pass, beehive records that the dependent owes a pass. Pass `0` to skip the check, which is right when you declare the edge *before* reading the target.
+Every call that **creates** the edge records, durably and atomically with the edge itself, that the dependent owes a reconcile (a count on the row, `reconcile_owed`, drained by the owed pass). That one rule covers every way a declare could otherwise miss: a change to the target landing between your read and the edge's commit, a declare made on another object's behalf while that object's own reconcile is mid-flight, and a crash before the wake is serviced. Re-asserting your edges on every pass costs nothing after the first, because only the call that created the edge records anything — the cost is one reconcile per edge ever created.
 
-A version *above* the target's current one is rejected with `ErrTargetResourceVersionFuture`, since versions only move forward and it cannot have come from reading the target. Nothing is written before that check, so no edge is declared even if you call it inside your own `Within` and ignore the error.
-
-The check fires at most once per edge, because it is also gated on this call being the one that created the edge — after that, every change reaches an edge the waker can already see. So re-asserting your edges on every pass costs nothing after the first, and a stale version costs one extra reconcile rather than a loop. It survives a crash: the record is a durable count on the row (`reconcile_owed`), written with the edge, and the owed pass drains it.
+There is nothing else to pass: the call takes no version claim, because nothing conditions on one. An earlier design stamped the wake only when the target had moved past the version the caller read, which made the claim load-bearing and left one interleaving stranded; with the stamp unconditional, a claim would be dead weight in every caller's hands, so it was removed rather than kept as decoration.
 
 **A dependency wake is a guarantee, not a best effort.** The scan above is fast and lives in memory, so a crash, a restart, or a process that never ran one can drop a wake — and a dependent that has already settled is invisible to every listing of owed work, because its own generation never moved. So beehive records, on each successful reconcile of an object that has dependencies, the store-wide write cursor that pass observed; a slower pass (60s) then enqueues every dependent whose targets have moved past it. Nothing about that is bookkeeping you can lose: it compares current state, so it recovers a wake lost by any means. A failed reconcile records nothing and is therefore found again. What you get is a wake within a second in the ordinary case, and within a minute in every case.
 
-→ [ADR: caller-versioned dependency declaration](docs/adr/2026-07-27-caller-versioned-dependencies.md), for why both halves are required and how the count is kept atomic with the edge. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md), and the backstop under it is [dependency watermarks](docs/adr/2026-07-29-dependency-watermarks.md).
+→ [ADR: stamp every new dependency edge](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md), for how the count is kept atomic with the edge and why the stamp is unconditional on the claim. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md), and the backstop under it is [dependency watermarks](docs/adr/2026-07-29-dependency-watermarks.md).
 
 Read calls take `LoadOption`s (a separate type from `Option`) to eagerly fetch secondary lookups — see [Secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned):
 
