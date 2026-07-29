@@ -652,7 +652,12 @@ type Store interface {
 	// with nothing to re-queue it. Increments landing *after* that load sit above
 	// observed, so they survive the subtraction and keep the object owed. Bumps no
 	// resource_version.
-	ReconcileOwedDecrement(ctx context.Context, id ObjectID, observed int64) error
+	//
+	// Scoped to gk, like every other id-keyed mutator: another kind's id is rejected
+	// with ErrWrongKind rather than silently draining a wake that kind was owed. A
+	// row that is simply gone is not an error — a reconcile's target can be collected
+	// between its load and this write, and nothing is left to owe a pass to.
+	ReconcileOwedDecrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error
 
 	// ReconcileOwedListIDs returns the ids of objects of kind gk that are owed a
 	// dependency wake (reconcile_owed != 0). The owed pass queues these, so a wake

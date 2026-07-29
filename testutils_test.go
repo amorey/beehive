@@ -202,7 +202,7 @@ func (s *fakeStore) DependentsListStale(context.Context, []GroupKind, ObjectID, 
 func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
+func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	panic("not implemented: fakeStore.ReconcileOwedDecrement")
 }
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
@@ -610,7 +610,13 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 		return err
 	}
 	if res.ReconcileOwedStamped {
-		return store.ReconcileOwedDecrement(ctx, from, 1)
+		// The decrement is kind-scoped, and scaffolding declares edges across kinds;
+		// read from's own kind back rather than making every call site name it.
+		obj, err := store.ObjectsGetMeta(ctx, from)
+		if err != nil {
+			return err
+		}
+		return store.ReconcileOwedDecrement(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind}, from, 1)
 	}
 	return nil
 }

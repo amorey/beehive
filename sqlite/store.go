@@ -927,7 +927,7 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 }
 
 // ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs on the
-// owed-wake count. The decrement's contract (cross-kind, no resource_version bump,
+// owed-wake count. The decrement's contract (kind scope, no resource_version bump,
 // why it takes the observed count) is on storeapi.Store; the subtraction floors at
 // 0 with max() so it can never drive the count negative.
 //
@@ -943,10 +943,27 @@ func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.Ob
 	return err
 }
 
-func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
-	_, err := s.conn(ctx).ExecContext(ctx,
-		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0) WHERE id = ?`, observed, id)
-	return err
+// ReconcileOwedDecrement folds the kind into the UPDATE, so a foreign id matches no
+// row. Distinguishing the two ways that happens costs a read, so it is paid only on
+// the branch that wrote nothing — unreachable from the reconciler, which passes the
+// kind it loaded the row for a line earlier.
+func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observed int64) error {
+	res, err := s.conn(ctx).ExecContext(ctx,
+		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0)
+		 WHERE id = ? AND "group" = ? AND kind = ?`, observed, id, gk.Group, gk.Kind)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n > 0 {
+		return err
+	}
+	// No row matched: another kind's id, or one collected since the caller loaded it.
+	// Only the first is a fault — a vanished row owes no wake to anyone.
+	if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil && !errors.Is(err, storeapi.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 // DependentsListStale re-derives which dependents are owed a pass (see the

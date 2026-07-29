@@ -2687,7 +2687,7 @@ func TestReconcileOwedCount(t *testing.T) {
 
 	// A pass that observed both services both: subtracting the observed count
 	// drains the row in one go, leaving nothing for the backstop to re-enqueue.
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, a.ID, 2))
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 2))
 	assert.Zero(t, reconcileOwed(t, store, a.ID), "subtracting the observed count drains the row")
 	ids, err = store.ReconcileOwedListIDs(ctx, testGK)
 	require.NoError(t, err)
@@ -2696,12 +2696,43 @@ func TestReconcileOwedCount(t *testing.T) {
 	// An increment beyond what a pass observed survives that pass's subtraction.
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID)) // observed by the pass
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID)) // lands during the pass
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, a.ID, 1))
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "the later increment stays owed")
 
 	// Subtracting more than is owed floors at 0 rather than going negative.
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, a.ID, 5))
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 5))
 	assert.Zero(t, reconcileOwed(t, store, a.ID), "subtraction floors at 0")
+}
+
+// TestReconcileOwedDecrementIsKindScoped pins the kind boundary in the predicate
+// rather than in caller discipline: another kind's id is refused outright, and the
+// count it names is left for the pass that actually owes it.
+func TestReconcileOwedDecrementIsKindScoped(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
+
+	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
+	err := store.ReconcileOwedDecrement(ctx, otherGK, a.ID, 1)
+
+	assert.ErrorIs(t, err, beehive.ErrWrongKind)
+	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "a foreign kind drains nothing")
+}
+
+// TestReconcileOwedDecrementVanishedRowIsNotAnError pins the other half of the
+// RowsAffected == 0 split. A reconcile's target can be collected between its load
+// and this write — by the gcCollect at the end of that same pass, or by another
+// process's sweeper — and there is nothing left to owe a wake to. Reporting that
+// would put a periodic warning on a benign race.
+func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
+	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
+
+	assert.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
 }
 
 func TestReconcileOwedQueryErrors(t *testing.T) {
@@ -2712,7 +2743,7 @@ func TestReconcileOwedQueryErrors(t *testing.T) {
 	_, err := store.ReconcileOwedListIDs(ctx, testGK)
 	require.Error(t, err)
 	require.Error(t, store.ReconcileOwedIncrement(ctx, 1))
-	require.Error(t, store.ReconcileOwedDecrement(ctx, 1, 1))
+	require.Error(t, store.ReconcileOwedDecrement(ctx, testGK, 1, 1))
 }
 
 func TestObjectsUpdateSpecDBError(t *testing.T) {
@@ -2824,7 +2855,13 @@ func addEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID
 		return err
 	}
 	if res.ReconcileOwedStamped {
-		return store.ReconcileOwedDecrement(ctx, from, 1)
+		// The decrement is kind-scoped, and scaffolding declares edges across kinds;
+		// read from's own kind back rather than making every call site name it.
+		obj, err := store.ObjectsGetMeta(ctx, from)
+		if err != nil {
+			return err
+		}
+		return store.ReconcileOwedDecrement(ctx, beehive.GroupKind{Group: obj.Group, Kind: obj.Kind}, from, 1)
 	}
 	return nil
 }

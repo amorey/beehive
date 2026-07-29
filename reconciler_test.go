@@ -1313,7 +1313,7 @@ func (s *owedBadSpecStore) ObjectsGetForReconcile(ctx context.Context, id Object
 	return reconcileLoadOf(s.ObjectsGet(ctx, id))
 }
 
-func (s *owedBadSpecStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
+func (s *owedBadSpecStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	s.decremented = true
 	return nil
 }
@@ -1762,7 +1762,7 @@ type failDecrementReconcileOwedStore struct {
 	Store
 }
 
-func (s *failDecrementReconcileOwedStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
+func (s *failDecrementReconcileOwedStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	return errBoom
 }
 
