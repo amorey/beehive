@@ -138,8 +138,9 @@ unaffected and still governs `EdgesAdd`: stamp-then-insert is chosen because the
 opposite leaves an edge with no wake, which nothing re-derives. Savepoints make the
 failure atomic; they do not make the ordering arbitrary.
 
-**Cost, measured.** `BenchmarkWithinNestedMutators` (one outer `Within` enclosing
-eight self-wrapping creates — the shape `gcCollect` and the owed pass run on):
+**Cost, measured.** One outer `Within` enclosing eight self-wrapping `ObjectsCreate`
+calls — the shape `gcCollect` and the owed pass run on, and the worst case for this
+change, since the savepoints are the largest share of the work they will ever be:
 
 | | ns/op | B/op | allocs/op |
 |---|---|---|---|
@@ -147,9 +148,14 @@ eight self-wrapping creates — the shape `gcCollect` and the owed pass run on):
 | after | 785,600 | 44,978 | 1,266 |
 
 **+7.5% wall clock, +121 allocations** — about 15 per nested frame across the two
-extra statements. Take the ratio, not the absolutes: the same two commits measured
-~450k and ~480k ns/op on a quieter machine, so only a back-to-back pair on one host
-means anything. `modernc.org/sqlite` is a pure-Go translation with no statement cache
+extra statements.
+
+To re-measure: write the benchmark against `OpenMemory` with no helpers from
+`store_test.go`, check out the base commit into a worktree, drop the same file in, and
+run both **back-to-back on one host**. Take the ratio and throw the absolutes away —
+the same two commits measured ~450k/~480k ns/op early in a session and ~730k/~785k
+later on the same machine. A benchmark file left in the tree does not help here: CI
+runs no `-bench`, and one absolute number without its pair means nothing. `modernc.org/sqlite` is a pure-Go translation with no statement cache
 by default, so each `SAVEPOINT`/`RELEASE` pays a fresh prepare-and-step; that, not the
 savepoint itself, is the cost. Statements are built with `strconv.AppendInt`
 into a stack array rather than `fmt`, which keeps it to one allocation each. The
