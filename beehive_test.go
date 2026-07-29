@@ -66,6 +66,72 @@ func TestSweepEventRetention(t *testing.T) {
 	})
 }
 
+// freePagesStore records the drain calls the sweeper makes, and can fail them.
+type freePagesStore struct {
+	Store
+	called chan int
+	err    error
+}
+
+func (s *freePagesStore) FreePagesRelease(_ context.Context, maxPages int) (int, error) {
+	select {
+	case s.called <- maxPages:
+	default:
+	}
+	if s.err != nil {
+		return 0, s.err
+	}
+	return maxPages, nil
+}
+
+// freePagesSweep is the third thing the GC sweeper does, and the only one that is
+// optional: releasing free pages is a backend capability, not part of Store, so the
+// sweep has to work whether or not the store has it.
+func TestSweepFreePages(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("drains a store that implements the capability", func(t *testing.T) {
+		store := &freePagesStore{Store: &fakeStore{}, called: make(chan int, 4)}
+		bh, err := New(store)
+		require.NoError(t, err)
+
+		bh.freePagesSweep(ctx)
+
+		assert.Equal(t, freePagesPerSweep, recv(t, store.called),
+			"the sweeper should pass its own cap, not a store-chosen one")
+	})
+
+	t.Run("a store without the capability is skipped", func(t *testing.T) {
+		bh, err := New(&fakeStore{})
+		require.NoError(t, err)
+		bh.freePagesSweep(ctx) // must not panic: fakeStore has no FreePagesRelease
+	})
+
+	t.Run("a failed drain is logged, not fatal", func(t *testing.T) {
+		store := &freePagesStore{Store: &fakeStore{}, called: make(chan int, 4), err: errBoom}
+		bh, err := New(store)
+		require.NoError(t, err)
+		bh.freePagesSweep(ctx) // warn branch; the next tick retries
+		assert.Equal(t, freePagesPerSweep, recv(t, store.called))
+	})
+}
+
+// The GC sweeper's three steps run together on every tick, so a store that grows a
+// freelist through the first two gets it drained by the third without a cadence of
+// its own.
+func TestGCSweeperDrainsFreePages(t *testing.T) {
+	store := &freePagesStore{Store: &fakeStore{}, called: make(chan int, 8)}
+	bh, err := New(store, WithGCInterval(time.Millisecond))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go bh.gcSweeperRun(ctx)
+
+	recv(t, store.called) // startup pass
+	recv(t, store.called) // a periodic tick
+}
+
 func TestNewAppliesDefaults(t *testing.T) {
 	bh, err := New(&fakeStore{})
 	require.NoError(t, err)

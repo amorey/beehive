@@ -4815,3 +4815,113 @@ func TestObjectWritesMaxVersionFallsWhenTheNewestRowGoes(t *testing.T) {
 
 	assert.Equal(t, first.ResourceVersion, cursorNow(t, store))
 }
+
+// ---------------------------------------------------------------------------
+// FreePagesRelease
+// ---------------------------------------------------------------------------
+
+// pageCounts reads the two pragmas the drain is judged by.
+func pageCounts(t *testing.T, store *sqliteStore) (pages, free int) {
+	t.Helper()
+	require.NoError(t, store.db.QueryRow(`PRAGMA page_count`).Scan(&pages))
+	require.NoError(t, store.db.QueryRow(`PRAGMA freelist_count`).Scan(&free))
+	return pages, free
+}
+
+// churnStore grows the database with fat spec blobs and then deletes every row,
+// leaving a freelist well past the drain floor — the state a long-lived store
+// reaches through ordinary object churn plus event retention.
+func churnStore(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	ctx := context.Background()
+	spec := make([]byte, 4096)
+	for i := range spec {
+		spec[i] = 'x'
+	}
+	blob := append(append([]byte(`{"v":"`), spec...), []byte(`"}`)...)
+	for i := 0; i < 600; i++ {
+		_, err := store.ObjectsCreate(ctx, &beehive.RawObject{
+			Group: testGK.Group, Kind: testGK.Kind, Spec: blob,
+		})
+		require.NoError(t, err)
+	}
+	_, err := store.db.ExecContext(ctx, `DELETE FROM objects`)
+	require.NoError(t, err)
+
+	pages, free := pageCounts(t, store)
+	require.Greater(t, free, freePagesFloor, "test setup should leave a freelist past the floor")
+	require.Greater(t, free, pages/freePagesFloorDivisor, "test setup should leave a freelist past the fraction gate")
+}
+
+// A freelist past the gate is drained, and never by more than the cap. The
+// assertion is deliberately "at most the cap", not "exactly": the pragma promises
+// up to N pages. It still pins the bug that matters — PRAGMA incremental_vacuum
+// frees one page per step, so an implementation that goes through Query and closes
+// the rows without draining them releases exactly 1.
+func TestFreePagesReleaseDrainsPastTheFloor(t *testing.T) {
+	store := newRawStore(t)
+	churnStore(t, store)
+	before, freeBefore := pageCounts(t, store)
+
+	released, err := store.FreePagesRelease(context.Background(), 50)
+	require.NoError(t, err)
+
+	after, freeAfter := pageCounts(t, store)
+	assert.Greater(t, released, 1, "one page released means the pragma was stepped once, not Exec'd")
+	assert.LessOrEqual(t, released, 50)
+	assert.Equal(t, freeBefore-freeAfter, released, "released should be the drop in the freelist")
+	assert.Equal(t, before-after, released, "released pages should leave the file")
+}
+
+// Below either half of the gate the drain does nothing at all: free pages are what
+// the next insert would have reused, so releasing them just to re-grow the file is
+// work traded for nothing. A fresh store is the small-freelist case.
+func TestFreePagesReleaseSkipsASmallFreelist(t *testing.T) {
+	store := newRawStore(t)
+	before, _ := pageCounts(t, store)
+
+	released, err := store.FreePagesRelease(context.Background(), 1000)
+	require.NoError(t, err)
+
+	after, _ := pageCounts(t, store)
+	assert.Zero(t, released)
+	assert.Equal(t, before, after)
+}
+
+// The gate is hysteresis, not a one-shot: repeated ticks walk a churned freelist
+// down until it falls back under the floor, and then stop. Without the stop the
+// sweeper would fight page reuse on every tick forever.
+func TestFreePagesReleaseStopsOnceUnderTheFloor(t *testing.T) {
+	store := newRawStore(t)
+	churnStore(t, store)
+	ctx := context.Background()
+
+	// Generous bound: each pass takes up to 200 pages off a freelist a few
+	// thousand long, so a converging drain is done well inside this.
+	var last int
+	for i := 0; i < 100; i++ {
+		n, err := store.FreePagesRelease(ctx, 200)
+		require.NoError(t, err)
+		if n == 0 {
+			last = i
+			break
+		}
+		require.Less(t, i, 99, "drain never fell back under the floor")
+	}
+	assert.Greater(t, last, 0, "the churned store should have taken at least one pass")
+
+	_, free := pageCounts(t, store)
+	pages, _ := pageCounts(t, store)
+	assert.True(t, free <= freePagesFloor || free <= pages/freePagesFloorDivisor,
+		"drain should stop with the freelist back under the gate, got %d free of %d pages", free, pages)
+}
+
+// A dead pool surfaces as an error rather than a silent zero — the sweeper logs it
+// and retries on the next tick.
+func TestFreePagesReleaseErrorsOnAClosedStore(t *testing.T) {
+	store := newRawStore(t)
+	require.NoError(t, store.Close())
+
+	_, err := store.FreePagesRelease(context.Background(), 100)
+	assert.Error(t, err)
+}

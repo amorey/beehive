@@ -39,9 +39,13 @@ func Open(path string) (*sqliteStore, error) {
 
 // OpenMemory opens a Beehive SQLite database in memory.
 // Intended for testing; data is lost when the store is closed.
+//
+// auto_vacuum matches OpenPool so tests run the production on-disk format — it is
+// the one pragma that cannot be changed after the first table exists, so a test
+// database on a different mode would silently not exercise FreePagesRelease.
 func OpenMemory() (*sqliteStore, error) {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
-	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
+	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return open(db)

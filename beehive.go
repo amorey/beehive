@@ -37,6 +37,15 @@ const (
 	defaultFullPassInterval time.Duration = 0
 	defaultStartupFullPass                = false
 	defaultGCInterval                     = 30 * time.Second
+	// How many free pages the GC sweeper releases per tick, for a store that
+	// implements FreePagesReleaser. Draining costs about 3.7µs a page, so 1000 is
+	// ~3.7ms of held write lock once per GC interval — negligible beside the sweep
+	// it runs after — and reclaims ~4MB per 30s tick, which is the rate that
+	// matters: a cap of 100 gives back 400KB a tick and would take the better part
+	// of a day on a gigabyte of freed space, slower than a churning store can
+	// produce it. Not an option, because there is no measurement a caller could
+	// tune it against that the sweeper does not already have.
+	freePagesPerSweep = 1000
 	// The dependency-wake scan is the cheapest of the drivers — one indexed range
 	// query that returns nothing in a quiet system — so it runs an order of
 	// magnitude more often than the passes that scale with the object count.
@@ -219,6 +228,7 @@ func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 	runDriver(ctx, bh.gcInterval, func(ctx context.Context) bool {
 		bh.deletionPendingSweep(ctx)
 		bh.eventRetentionSweep(ctx)
+		bh.freePagesSweep(ctx)
 		return true
 	})
 }
@@ -232,6 +242,30 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 	}
 	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
+	}
+}
+
+// freePagesSweep hands space freed by the two sweeps above it back to the operating
+// system, for a store that can (see FreePagesReleaser) — collected rows and trimmed
+// event runs are exactly what leaves reusable space behind, so this runs where that
+// space is produced rather than on a cadence of its own.
+//
+// It is best-effort in the same way the sweeps are: a failure is logged and retried
+// on the next tick, because nothing is incorrect while the space is unreclaimed. The
+// store decides how much is worth releasing and may release none; the cap here only
+// bounds how long one tick can hold the write lock.
+func (bh *Beehive) freePagesSweep(ctx context.Context) {
+	releaser, ok := bh.store.(FreePagesReleaser)
+	if !ok {
+		return
+	}
+	released, err := releaser.FreePagesRelease(ctx, freePagesPerSweep)
+	if err != nil {
+		bh.log().Warn("free-page release failed; retry next sweep", "err", err)
+		return
+	}
+	if released > 0 {
+		bh.log().Debug("released free pages", "pages", released)
 	}
 }
 

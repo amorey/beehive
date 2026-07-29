@@ -299,7 +299,8 @@ func WithFullPassInterval(d time.Duration) Option {
 
 // WithGCInterval sets how often the global GC sweeper runs: it collects
 // deletion-pending objects (of every kind, including ones with no registered
-// controller) and applies event-log retention.
+// controller), applies event-log retention, and then releases the space those two
+// steps freed, for a store that implements FreePagesReleaser.
 //
 // It is separate from WithFullPassInterval on purpose. Removing dead rows and
 // re-dispatching live ones are different jobs with different costs, and a single

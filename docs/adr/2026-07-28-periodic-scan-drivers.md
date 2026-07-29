@@ -27,7 +27,7 @@ notification.
 | --- | --- | --- | --- |
 | Owed pass | unsettled specs, `reconcile_owed` | `withOwedPassInterval` (per-kind, unexported) | 30s |
 | Full pass | every object of the kind | `WithFullPassInterval` (per-kind) | 0 (off) |
-| GC sweeper | `deletion_requested_at`, plus event retention | `WithGCInterval` (global) | 30s |
+| GC sweeper | `deletion_requested_at`, event retention, then free pages | `WithGCInterval` (global) | 30s |
 | Dependency waker | `resource_version` above a scan watermark | `withDependencyWakeInterval` (global, unexported) | 1s |
 | Stale dependents | targets above each dependent's watermark | `withStaleDependentsInterval` (global, unexported) | 60s |
 | Client watch | current state, diffed against last reported | `withWatchPollInterval` (global, unexported) | 1s |

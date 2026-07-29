@@ -38,18 +38,38 @@ import (
 
 // OpenPool opens a modernc-sqlite connection pool at path with standard PRAGMAs
 // baked into the DSN — WAL journal, 5s busy_timeout, synchronous=NORMAL,
-// foreign_keys on, and immediate txlock so writes grab the lock up front.
-// maxConns caps the pool: pass 1 for a writer pool (writes serialize at the
-// pool instead of fighting at the SQLite layer), or a larger value for a WAL
-// reader pool. Callers run Apply against the returned pool to migrate it.
+// foreign_keys on, auto_vacuum=INCREMENTAL, and immediate txlock so writes grab
+// the lock up front. maxConns caps the pool: pass 1 for a writer pool (writes
+// serialize at the pool instead of fighting at the SQLite layer), or a larger
+// value for a WAL reader pool. Callers run Apply against the returned pool to
+// migrate it.
+//
+// These are Beehive's pragmas, not a neutral set: this is an opinionated opener,
+// and auto_vacuum in particular decides the on-disk format for every consumer of
+// this package. INCREMENTAL costs about one pointer-map page per 200 (~0.5% file
+// growth) and nothing measurable per commit; in exchange a database whose row
+// count churns can be made to give its pages back, which auto_vacuum=NONE can
+// never do without a full VACUUM rewrite. A consumer that never drains the
+// freelist pays only the 0.5%, and can still drain or VACUUM later without a
+// format change — the reverse is not true, which is why the default leans this way.
 func OpenPool(path string, maxConns int) *sql.DB {
 	// _pragma values are URL-encoded; modernc parses them and applies on each
 	// new connection.
+	//
+	// auto_vacuum MUST be set here rather than in a migration. SQLite writes the
+	// mode into the file header when the first table is created, and ignores the
+	// pragma both on a non-empty database and inside a transaction — and Apply
+	// creates schema_migrations before it runs migration 0001, each migration in
+	// its own transaction. So a `PRAGMA auto_vacuum` in a .sql file is a silent
+	// no-op twice over. On the DSN, modernc applies it at connection open, while
+	// the database is still empty. On an existing NONE database it is likewise a
+	// silent no-op, so adding it cannot disturb a file already written.
 	dsn := "file:" + path +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(on)" +
+		"&_pragma=auto_vacuum(incremental)" +
 		"&_txlock=immediate"
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", dsn)

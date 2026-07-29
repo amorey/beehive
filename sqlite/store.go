@@ -46,6 +46,84 @@ func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
 
+// The drain floor. A freelist is only worth releasing once it is past *both* an
+// absolute size and a share of the file: free pages are exactly what the next
+// inserts would have reused for free, so draining a small one means moving pages,
+// writing them to the WAL and re-writing pointer maps, only to re-grow the file on
+// the next write — all on the one write connection. The absolute floor keeps a
+// small or quiet database from being churned at all; the fraction keeps a large
+// steady-state one from being drained forever just because 1MB is a rounding error
+// in it. Together they are hysteresis: a churned file is walked down over
+// successive ticks until it falls back under the gate, and then left alone.
+const (
+	freePagesFloor        = 256 // pages, ~1MB at the default 4KB page size
+	freePagesFloorDivisor = 8   // ...and at least 1/8 of the file
+)
+
+// FreePagesRelease hands up to maxPages of the freelist back to the operating
+// system with PRAGMA incremental_vacuum, and reports how many pages left the file.
+// It is the drain half of auto_vacuum=INCREMENTAL (set in the DSN by OpenPool and
+// OpenMemory); the GC sweeper calls it, since that is where the free pages are
+// produced. It releases nothing, without error, when the freelist is under the
+// floor above, or on a database that predates the pragma and is therefore still
+// auto_vacuum=NONE — there the pragma is a documented no-op.
+//
+// The count is advisory. It is a difference of two reads taken around the drain,
+// so on a pool wider than one connection a concurrent writer can skew it; it is
+// logged, never acted on. All three statements share one *sql.Conn so the pool at
+// least cannot scatter them across connections.
+//
+// The pragma frees ONE PAGE PER STEP, which makes the transport load-bearing: it
+// must be Exec'd. Run through Query and closed without draining the rows, it
+// releases exactly one page and returns no error — a drain that looks alive and
+// reclaims 4KB per sweep.
+func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, error) {
+	if maxPages <= 0 {
+		return 0, nil
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("free pages: acquire conn: %w", err)
+	}
+	defer conn.Close()
+
+	pages, free, err := pageCounters(ctx, conn)
+	if err != nil {
+		return 0, err
+	}
+	if free <= freePagesFloor || free <= pages/freePagesFloorDivisor {
+		return 0, nil
+	}
+
+	// Exec, not Query — see above.
+	if _, err := conn.ExecContext(ctx, `PRAGMA incremental_vacuum(`+strconv.Itoa(maxPages)+`)`); err != nil {
+		return 0, fmt.Errorf("free pages: incremental_vacuum: %w", err)
+	}
+
+	_, freeAfter, err := pageCounters(ctx, conn)
+	if err != nil {
+		return 0, err
+	}
+	released := free - freeAfter
+	if released < 0 {
+		// Another writer freed more pages than the drain took. Nothing is wrong;
+		// the count just can't be reported as negative.
+		return 0, nil
+	}
+	return released, nil
+}
+
+// pageCounters reads page_count and freelist_count off one connection.
+func pageCounters(ctx context.Context, conn *sql.Conn) (pages, free int, err error) {
+	if err := conn.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pages); err != nil {
+		return 0, 0, fmt.Errorf("free pages: read page_count: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&free); err != nil {
+		return 0, 0, fmt.Errorf("free pages: read freelist_count: %w", err)
+	}
+	return pages, free, nil
+}
+
 // txKey carries the in-flight transaction frame through the context so that Store
 // calls made with the ctx passed to Within join it.
 type txKey struct{}

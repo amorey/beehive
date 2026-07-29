@@ -178,6 +178,25 @@ func TestOpenPool(t *testing.T) {
 	require.NoError(t, db.Ping())
 }
 
+// TestOpenPoolSetsAutoVacuum pins the one pragma that cannot be changed later:
+// auto_vacuum is written to the file header when the first table is created, and
+// switching it afterwards costs a full VACUUM rewrite. Applying migrations first is
+// the point — the mode has to survive the CREATE TABLEs, not just the open.
+func TestOpenPoolSetsAutoVacuum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db := OpenPool(path, 1)
+	t.Cleanup(func() { db.Close() })
+
+	fsys := fstest.MapFS{"m/0001_init.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE a(id INTEGER PRIMARY KEY)`)}}
+	_, err := Apply(context.Background(), db, fsys, "m")
+	require.NoError(t, err)
+
+	var mode int
+	require.NoError(t, db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode))
+	// 2 = INCREMENTAL. 0 (NONE) means the pragma never reached an empty database.
+	require.Equal(t, 2, mode)
+}
+
 func TestLoadMigrationsReadDirError(t *testing.T) {
 	// An FS that has no "migrations" directory.
 	fsys := fstest.MapFS{}
