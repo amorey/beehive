@@ -78,6 +78,16 @@ const testTimeout = 2 * time.Second
 // its own reads.
 const fastTick = 2 * time.Millisecond
 
+// staleDependentsTick paces the stale-dependents backstop in tests, and is
+// deliberately slower than fastTick. That pass is the one driver whose purpose is a
+// slow cadence — it re-derives what the fast paths missed — so running it at every
+// other driver's rate makes every integration test pay for its three-join query
+// hundreds of times a second, on the single connection all of them share, to
+// observe a backstop it is not testing. At ten ticks a test that does exercise it
+// still has a hundred-fold margin inside testTimeout, and production's ratio (60s
+// against the waker's 1s) is far wider than this.
+const staleDependentsTick = 10 * fastTick
+
 // fast bundles the tick intervals an integration test needs, plus whatever else
 // the caller passes. Kept as one bundle so a test reads as "run the drivers
 // fast" rather than as five numbers each test picked for itself; a test that
@@ -88,7 +98,7 @@ func fast(opts ...Option) []Option {
 		withOwedPassInterval(fastTick),
 		WithGCInterval(fastTick),
 		withDependencyWakeInterval(fastTick),
-		withStaleDependentsInterval(fastTick),
+		withStaleDependentsInterval(staleDependentsTick),
 		withWatchPollInterval(fastTick),
 	}, opts...)
 }

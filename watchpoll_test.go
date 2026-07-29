@@ -806,26 +806,27 @@ func TestWatchOnACancelledContextDoesNotSubscribe(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
-// The snapshot's own changes are sends like any other, so a subscriber that goes
-// away before reading them must not strand the goroutine holding them. The poll
-// interval is an hour here, so the delivery being abandoned can only be the
-// snapshot's — no tick will ever produce another.
-func TestWatchAbandonsTheSnapshotSendWhenTheSubscriberGoesAway(t *testing.T) {
+// TestPollFailedSeparatesShutdownFromFailure pins the two answers a failed read
+// gets, directly rather than through a stream. Reaching them from a live watch
+// means cancelling a context while a read is in flight, which is a race the test
+// would sometimes lose — and a coverage gate turns a lost race into a red build
+// with no defect behind it.
+//
+// The distinction itself is the point: a store error is a fault worth reporting
+// and worth one more tick, while a cancelled context is this stream shutting down
+// and neither. Warning there would put a line in the log on every clean
+// unsubscribe.
+func TestPollFailedSeparatesShutdownFromFailure(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	c := &clientImpl[cSpec, cStatus]{bh: &Beehive{logger: logger}, gk: clientTestGK}
+
 	ctx, cancel := context.WithCancel(context.Background())
-
-	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-
-	// Nobody reads ch, so the goroutine parks in the send holding the Added the
-	// snapshot found.
-	ch, err := client.ObjectsWatchList(ctx)
-	require.NoError(t, err)
 	cancel()
+	assert.False(t, c.pollFailed(ctx, "watch", errBoom), "a cancelled read ends the loop")
+	assert.Empty(t, buf.String(), "shutdown is not a fault to report")
 
-	waitClosed(t, closedWhenDrained(ch), "the stream to close on cancellation")
+	assert.True(t, c.pollFailed(context.Background(), "watch", errBoom),
+		"a store error costs the tick, not the stream")
+	assert.Contains(t, buf.String(), "watch poll failed")
+	assert.Contains(t, buf.String(), errBoom.Error())
 }

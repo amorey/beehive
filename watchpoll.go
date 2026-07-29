@@ -216,24 +216,27 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	out := make(chan ObjectChange[Spec, Status])
 	go func() {
 		defer close(out)
-		// What the snapshot found, delivered first: the sends could not happen on the
-		// caller's goroutine, since a send blocks until the subscriber reads and it
-		// cannot read until this call has returned.
-		for _, ch := range initial {
-			if !sendOrDone(ctx, out, ch) {
-				return
-			}
-		}
+		// The snapshot's changes are what the driver's eager first step delivers, so
+		// that step spends itself handing over a read that has already happened rather
+		// than repeating it, and polling begins on the tick after. Sending them here
+		// rather than above is not a choice: a send blocks until the subscriber reads,
+		// and it cannot read until objectStream has returned.
+		pending, delivered := initial, false
 		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			changes, err := c.poll(ctx, list, live, mig, seen, &cursor)
-			if err != nil {
-				return c.pollFailed(ctx, "watch", err)
+			if delivered {
+				var err error
+				pending, err = c.poll(ctx, list, live, mig, seen, &cursor)
+				if err != nil {
+					return c.pollFailed(ctx, "watch", err)
+				}
 			}
-			for _, ch := range changes {
+			delivered = true
+			for _, ch := range pending {
 				if !sendOrDone(ctx, out, ch) {
 					return false
 				}
 			}
+			pending = nil // the snapshot's objects are not held past their delivery
 			return true
 		})
 	}()
