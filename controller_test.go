@@ -353,7 +353,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	to, err := client.Create(ctx, cSpec{Val: "to"})
 	require.NoError(t, err)
 
-	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID, to.ResourceVersion))
+	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID))
 	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectRef{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
@@ -372,9 +372,6 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 //
 // The waker's own cycle test cannot serve here — it drives edges through a fake,
 // so a declare-time check is invisible to it.
-//
-// A zero targetResourceVersion is "no opinion", which keeps this about acceptance
-// of the edge and out of the raced-declare guard's way.
 func TestAddDependencyAcceptsCycle(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -390,12 +387,12 @@ func TestAddDependencyAcceptsCycle(t *testing.T) {
 	b, err := client.Create(ctx, tSpec{})
 	require.NoError(t, err)
 
-	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, b.ID, 0))
-	require.NoError(t, cc.DependenciesAdd(ctx, b.ID, a.ID, 0), "a cycle-closing edge is accepted today")
-	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, a.ID, 0), "and so is a self-edge")
+	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, b.ID))
+	require.NoError(t, cc.DependenciesAdd(ctx, b.ID, a.ID), "a cycle-closing edge is accepted today")
+	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, a.ID), "and so is a self-edge")
 }
 
-// declareFixture is the shared setup for the targetResourceVersion tests: a
+// declareFixture is the shared setup for the dependency-declare tests: a
 // dependent, a target, and a control plane that is deliberately NOT started.
 //
 // Not started because the thing under test is now durable rather than in-flight.
@@ -499,67 +496,48 @@ func (f *declareFixture) requireNotOwed(t *testing.T) {
 	assert.Empty(t, f.owed(t), "no wake was owed")
 }
 
-// TestAddDependencyWakesWhenTargetMovedSinceRead pins the fix for the
-// read-then-declare race: a target that moved past the version the caller read
-// requeues the dependent, because the change landed while no edge existed to
-// carry it. The declaration goes through the target kind's ControllerClient (see
-// declareFixture), so this also pins that the requeue routes by fromID's own
-// kind rather than the declarer's.
-func TestAddDependencyWakesWhenTargetMovedSinceRead(t *testing.T) {
-	f := newDeclareFixture(t)
-	asRead := f.moveTarget(t)
-	require.NoError(t, f.cc.DependenciesAdd(context.Background(), f.dep.ID, f.target.ID, asRead))
-	f.requireOwed(t)
-}
-
-// TestAddDependencyWakesOnceWhenTargetUnmoved pins that a declare no version claim
-// covers still reaches the dependent, durably: an unmoved target is exactly the
-// case the waker can never see (nothing changes later) and the stale scan could
-// read as converged, so the edge-creating call itself records the one owed pass.
-// It is also the anti-spin case: a level-triggered controller re-asserts its edges
-// every pass, and nothing throttles a self-sustaining requeue, so only the call
-// that created the edge may stamp — the count staying at 1 across the re-asserts
-// is the bound.
-func TestAddDependencyWakesOnceWhenTargetUnmoved(t *testing.T) {
+// TestAddDependencyWakesOncePerEdge pins the declare-time guarantee and its
+// bound together. The guarantee: the call that creates the edge records one owed
+// reconcile, durably, so a declare reaches its dependent whatever the target was
+// doing — including a change that landed between the caller's read and the
+// declare, which no scan could carry because the edge did not exist yet. The
+// declaration goes through the target kind's ControllerClient (see
+// declareFixture), so this also pins that the wake routes by fromID's own kind
+// rather than the declarer's. The bound: only the edge-creating call stamps, so a
+// level-triggered controller re-asserting its set every pass — and nothing
+// throttles a self-sustaining requeue — adds nothing after the first, even after
+// the target moves again.
+func TestAddDependencyWakesOncePerEdge(t *testing.T) {
 	f := newDeclareFixture(t)
 	ctx := context.Background()
-	// Re-assert the same edge repeatedly with a current version, as a controller
-	// converging on an unchanging target does.
+	// The target moved after the caller's read and before the declare: the case a
+	// write-log scan structurally cannot see.
+	f.moveTarget(t)
+
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	f.requireOwed(t)
+	require.EqualValues(t, 1, f.owedCount(t))
+
+	// Every later pass re-asserts the same edge, as a converging controller does.
+	// The count is what makes this exact: a re-fire would be invisible in the
+	// listing (already there from the first) but shows up here immediately.
 	for range 3 {
-		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
 	}
-	f.requireOwed(t)
-	assert.EqualValues(t, 1, f.owedCount(t), "only the declare that created the edge stamps")
-}
+	require.EqualValues(t, 1, f.owedCount(t), "the edge is no longer new, so no later declare stamps again")
 
-// TestAddDependencyRejectsFutureResourceVersion pins the one wrong value the call
-// can actually detect. Versions come from one global cursor, so any other object's
-// is a plausible-looking int64 — but the target's own only moves forward, so a
-// version above it cannot have been read from the target. Left to stand it would
-// disable the guard silently and permanently (the comparison can never fire), so
-// it is rejected, and the edge rolls back with the transaction rather than
-// persisting with an inert guard.
-func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
-	f := newDeclareFixture(t)
-	ctx := context.Background()
-
-	err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1)
-	require.ErrorIs(t, err, ErrTargetResourceVersionFuture)
-
-	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "a rejected declaration leaves no edge")
-	f.requireNotOwed(t)
-
-	// The target's own current version is the boundary, and is accepted.
-	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+	// Nor does the target moving make a re-declare stamp: once the edge exists,
+	// delivering changes is the waker's and the stale pass's job.
+	f.moveTarget(t)
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	assert.EqualValues(t, 1, f.owedCount(t), "one wake per edge created, not per declare")
 }
 
 // TestAddDependencyStampRidesRefsAdd pins that the durable stamp is not a second
 // store call sequenced after the edge. Were it one, a caller nested in its own
 // Within could handle this method's error and commit the edge with no wake — a
-// dependent stranded on a stale read, the very race the version claim closes —
-// because a nested Within is a bare fn(ctx) that unwinds nothing.
+// stranded dependent, the very thing the stamp exists to prevent — because a
+// nested Within is a bare fn(ctx) that unwinds nothing.
 //
 // That the stamp *cannot* be a second call is now structural: the Store interface
 // carries no standalone increment, so nothing on this path could issue one. What
@@ -581,12 +559,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	target, err := client.Create(ctx, tSpec{})
 	require.NoError(t, err)
 
-	stale := target.ResourceVersion
-	_, err = real.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
-	require.NoError(t, err)
-
-	// Conjunction fires: new edge, target moved past stale.
-	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID, stale))
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
 	refs, err := real.EdgesListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
@@ -597,86 +570,15 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
 }
 
-// TestAddDependencyRejectsFutureResourceVersionNested is the rejection's harder
-// case: nested in a caller's Within, whose error the caller swallows. A nested
-// Within is a bare fn(ctx) with no transaction of its own, so returning the error
-// unwinds nothing — only the caller propagating it can roll anything back. The
-// edge must therefore never be written in the first place.
-func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
-	f := newDeclareFixture(t)
-	ctx := context.Background()
-
-	err := f.cc.Within(ctx, func(ctx context.Context) error {
-		if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1); err != nil {
-			return nil // the caller logs and carries on; the outer tx still commits
-		}
-		return nil
-	})
-	require.NoError(t, err)
-
-	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "a rejected declaration must leave no edge, committed or not")
-	// The stamp is written inside EdgesAdd with the edge, so "no edge" and "no
-	// stamp" have to hold together — this is the half a caller who swallows the
-	// error could otherwise commit on its own.
-	f.requireNotOwed(t)
-}
-
-// TestAddDependencyStaleResourceVersionWakesAtMostOnce pins the wake's
-// once-per-edge bound against the caller who gets it wrong. A version that never
-// advances — cached across passes, or read once and reused — compares as "moved"
-// forever, so gating on that alone would re-fire every pass, and nothing throttles
-// the result. The edge-new half of the conjunction is what stops it: the second
-// declaration inserts nothing, so it wakes nothing, however stale the version.
-func TestAddDependencyStaleResourceVersionWakesAtMostOnce(t *testing.T) {
-	f := newDeclareFixture(t)
-	ctx := context.Background()
-	stale := f.moveTarget(t)
-
-	// First declaration: the edge is new and the target moved, so this is the
-	// requeue the guard exists for.
-	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, stale))
-	f.requireOwed(t)
-
-	require.EqualValues(t, 1, f.owedCount(t))
-
-	// Every later pass re-asserts the same edge with the same stale version. The
-	// count is what makes this exact: a re-fire would be invisible in the listing
-	// (already there from the first) but shows up here immediately.
-	for range 3 {
-		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, stale))
-	}
-	assert.EqualValues(t, 1, f.owedCount(t), "the edge is no longer new, so no later pass stamps again")
-}
-
-// TestAddDependencyZeroResourceVersionWakesOnce pins the sentinel: 0 is "no
-// opinion", the correct value when the edge is declared before the target is
-// read. The stamp no longer depends on the claim at all — a new edge wakes once
-// whatever was passed — so 0 differs from a real version only at the future-claim
-// rejection, and repeating the declare adds nothing, which is what keeps the zero
-// value spin-free.
-func TestAddDependencyZeroResourceVersionWakesOnce(t *testing.T) {
-	f := newDeclareFixture(t)
-	f.moveTarget(t)
-	ctx := context.Background()
-	for range 3 {
-		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, 0))
-	}
-	f.requireOwed(t)
-	assert.EqualValues(t, 1, f.owedCount(t), "one wake per edge created, not per declare")
-}
-
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:
 // a declaration rolled back by the controller's enclosing transaction never
 // happened, so there is no edge to have missed a change and nothing to requeue.
 func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	f := newDeclareFixture(t)
 	ctx := context.Background()
-	asRead := f.moveTarget(t)
 
 	err := f.cc.Within(ctx, func(ctx context.Context) error {
-		if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, asRead); err != nil {
+		if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID); err != nil {
 			return err
 		}
 		return errBoom
@@ -779,7 +681,7 @@ type failEdgesAddStore struct {
 	fakeStore
 }
 
-func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.EdgesAddResult, error) {
+func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	return storeapi.EdgesAddResult{}, errBoom
 }
 
@@ -787,7 +689,7 @@ func TestControllerClientAddDependencyStoreError(t *testing.T) {
 	bh, err := New(&failEdgesAddStore{})
 	require.NoError(t, err)
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.DependenciesAdd(context.Background(), 1, 2, 0)
+	err = cc.DependenciesAdd(context.Background(), 1, 2)
 	require.ErrorIs(t, err, errBoom)
 }
 

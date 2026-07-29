@@ -375,10 +375,10 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte
 		return nil, err
 	}
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it
-	// via EdgesListIncoming(owner, RelationOwnedBy). No version claim and no wake
-	// stamp: an owner edge carries no read this call could be racing.
+	// via EdgesListIncoming(owner, RelationOwnedBy). No wake stamp: only
+	// depends_on edges record one, and ownership owes the child no reconcile.
 	if co.owner != nil {
-		if _, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
+		if _, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy); err != nil {
 			return nil, err
 		}
 	}

@@ -2236,14 +2236,14 @@ func countEdges(t *testing.T, store *sqliteStore, from, to beehive.ObjectID, rel
 	return n
 }
 
-// addEdge declares an edge for test scaffolding: it discards the EdgesAddResult,
-// passes no version claim (0), and drains the owed-wake stamp every new depends_on
-// edge records — scaffolding wants the edge to exist, not the reconcile it buys —
-// keeping the common require.NoError(t, addEdge(...)) shape a one-liner with no
-// side effects on the owed listings. Tests that assert on the result, the stamp,
-// or the version guard call store.EdgesAdd directly.
+// addEdge declares an edge for test scaffolding: it discards the EdgesAddResult
+// and drains the owed-wake stamp every new depends_on edge records — scaffolding
+// wants the edge to exist, not the reconcile it buys — keeping the common
+// require.NoError(t, addEdge(...)) shape a one-liner with no side effects on the
+// owed listings. Tests that assert on the result or the stamp call
+// store.EdgesAdd directly.
 func addEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID, relation beehive.Relation) error {
-	res, err := store.EdgesAdd(ctx, from, to, relation, 0)
+	res, err := store.EdgesAdd(ctx, from, to, relation)
 	if err != nil {
 		return err
 	}
@@ -2291,47 +2291,26 @@ func TestRefsAddNonexistentEndpoint(t *testing.T) {
 // TestRefsAddReportsEndpoints pins the one thing the endpoint check reports back:
 // the source's GroupKind. The edge is cross-kind, so a caller routing a wake to
 // fromID cannot assume its own kind, and it must come from the same round-trip as
-// the insert. The target's resource_version is read on this path too, but is
-// consumed inside EdgesAdd rather than reported — TestEdgesAddStampsReconcileOwed
-// covers it, by observing the stamp it decides.
+// the insert.
 func TestRefsAddReportsEndpoints(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
 	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "fromID's kind")
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "this call created the edge")
 
-	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
 	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "re-declare reports it too")
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge already existed; the insert was a no-op")
 }
 
-// TestRefsAddRejectsFutureTargetVersion pins that the version claim is
-// checked before the insert, not after: a rejected call must leave no edge on its
-// own, since its caller may be sharing a transaction it fully intends to commit.
-func TestRefsAddRejectsFutureTargetVersion(t *testing.T) {
-	store := newRawStore(t)
-	ctx := context.Background()
-	a := newRefObject(t, store)
-	b := newRefObject(t, store)
-
-	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion+1)
-	assert.ErrorIs(t, err, beehive.ErrTargetResourceVersionFuture)
-	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"), "a rejected claim writes nothing")
-
-	// The target's own current version is the boundary, and is accepted.
-	_, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", b.ResourceVersion)
-	require.NoError(t, err)
-	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"))
-}
-
-// moveTarget writes to b so its resource_version advances past what a caller read,
-// which is the "target moved" half of the wake conjunction.
+// moveTarget writes to the object so its resource_version advances, for tests
+// that need a target to have changed since an earlier read.
 func moveTarget(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
 	t.Helper()
 	_, err := store.ConditionsSet(context.Background(), testGK,
@@ -2340,48 +2319,27 @@ func moveTarget(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
 }
 
 // TestEdgesAddStampsReconcileOwed covers the stamp's gate: every depends_on edge
-// the call creates records one owed wake on fromID, whatever the claim — the claim
-// gates only the future-version rejection — while an owner edge and a self-edge
-// record nothing. Unconditional-on-the-claim is the property that closes the
-// mid-pass declare strand (a stamp survives the load-scoped decrement where the
-// watermark clear does not), so the zero-claim and current-claim arms are the ones
-// that must stamp.
+// the call creates records one owed wake on fromID, while an owner edge and a
+// self-edge record nothing. Unconditional is the property that closes the mid-pass
+// declare strand — a stamp survives the load-scoped decrement where the watermark
+// clear does not — so the plain-declare arm is the one that must stamp.
 func TestEdgesAddStampsReconcileOwed(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
-	stale := b.ResourceVersion
-	moveTarget(t, store, b.ID)
 
-	// A zero claim — an edge declared before reading the target — still buys the
-	// one pass that reads it.
-	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	// A new depends_on edge buys the one pass that reads the target, on fromID and
+	// only fromID.
+	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
-	assert.True(t, res.ReconcileOwedStamped, "a new edge stamps with no claim")
-	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID))
-
-	// A claim the target has not moved past: the caller's read is current, and the
-	// stamp still lands — this is the arm the watermark clear alone left to a race.
-	c := newRefObject(t, store)
-	current, err := store.ObjectsGet(ctx, b.ID)
-	require.NoError(t, err)
-	res, err = store.EdgesAdd(ctx, c.ID, b.ID, "depends_on", current.ResourceVersion)
-	require.NoError(t, err)
-	assert.True(t, res.ReconcileOwedStamped, "a new edge stamps on an exact claim")
-	assert.Equal(t, int64(1), reconcileOwed(t, store, c.ID))
-
-	// A stale claim: the declare-race case, on fromID and only fromID.
-	e := newRefObject(t, store)
-	res, err = store.EdgesAdd(ctx, e.ID, b.ID, "depends_on", stale)
-	require.NoError(t, err)
-	assert.True(t, res.ReconcileOwedStamped)
-	assert.Equal(t, int64(1), reconcileOwed(t, store, e.ID), "the stamp is on the dependent, not the target")
+	assert.True(t, res.ReconcileOwedStamped, "a new depends_on edge stamps")
+	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "the stamp is on the dependent, not the target")
 	assert.Zero(t, reconcileOwed(t, store, b.ID))
 
 	// An owner edge is not a dependency: no wake is owed for it.
 	o := newRefObject(t, store)
-	res, err = store.EdgesAdd(ctx, o.ID, b.ID, "owned_by", 0)
+	res, err = store.EdgesAdd(ctx, o.ID, b.ID, "owned_by")
 	require.NoError(t, err)
 	assert.False(t, res.ReconcileOwedStamped, "owned_by stamps nothing")
 	assert.Zero(t, reconcileOwed(t, store, o.ID))
@@ -2389,51 +2347,45 @@ func TestEdgesAddStampsReconcileOwed(t *testing.T) {
 	// A self-edge stamps nothing: an object's own pass always reads its current
 	// self, so there is no wake to deliver — matching every scan, which skips it.
 	s := newRefObject(t, store)
-	res, err = store.EdgesAdd(ctx, s.ID, s.ID, "depends_on", 0)
+	res, err = store.EdgesAdd(ctx, s.ID, s.ID, "depends_on")
 	require.NoError(t, err)
 	assert.False(t, res.ReconcileOwedStamped, "a self-edge stamps nothing")
 	assert.Zero(t, reconcileOwed(t, store, s.ID))
 }
 
-// TestRefsAddStampsOnlyNewEdge pins the edge-new half against the statement that
+// TestRefsAddStampsOnlyNewEdge pins the edge-new gate against the statement that
 // carries it, the stamp's own NOT EXISTS. Re-declaring an existing edge must not
-// stamp, however far the target has moved — otherwise a controller that clears and
-// re-declares its dependency set re-fires a wake every pass, unthrottled.
+// stamp — otherwise a controller that re-asserts its dependency set re-fires a
+// wake every pass, unthrottled.
 func TestRefsAddStampsOnlyNewEdge(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	stale := b.ResourceVersion
-	moveTarget(t, store, b.ID)
-	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale)
+	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
 	require.True(t, res.ReconcileOwedStamped)
 
-	// Re-declare against an even staler claim, with the target moved again.
-	moveTarget(t, store, b.ID)
-	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale)
+	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
 	assert.False(t, res.ReconcileOwedStamped, "the edge was already there, so the stamp is suppressed")
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "still the one wake owed")
 }
 
 // TestRefsAddStampFailureLeavesNoEdge is the ordering guarantee itself. The stamp
-// is a write, so it must land on the same side of the insert as the version
-// rejection: a nested Within is a bare fn(ctx) with no transaction of its own, so
-// a caller that handles EdgesAdd's error — here by swallowing it and committing the
-// ambient transaction anyway — unwinds nothing. Were the stamp sequenced after the
-// insert, that caller would commit an edge with no wake, stranding the dependent
-// on a stale read where ObjectsListUnsettledIDs cannot see it. Running last, the insert
-// simply never happens.
+// is a write, so it must land *before* the insert: a nested Within is a bare
+// fn(ctx) with no transaction of its own, so a caller that handles EdgesAdd's
+// error — here by swallowing it and committing the ambient transaction anyway —
+// unwinds nothing. Were the stamp sequenced after the insert, that caller would
+// commit an edge with no wake, stranding the dependent on a stale read where
+// ObjectsListUnsettledIDs cannot see it. Running last, the insert simply never
+// happens.
 func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
-	stale := b.ResourceVersion
-	moveTarget(t, store, b.ID)
 	// The stamp is the only UPDATE on objects EdgesAdd issues, so blocking those
 	// fails it while leaving the endpoint read and the edges insert alone. RAISE(ABORT)
 	// undoes the statement, not the transaction, so the outer transaction below is
@@ -2442,7 +2394,7 @@ func TestRefsAddStampFailureLeavesNoEdge(t *testing.T) {
 	blockObjectUpdates(t, store)
 
 	err := store.Within(ctx, func(ctx context.Context) error {
-		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
+		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on"); err != nil {
 			return nil // the caller logs and carries on; the outer tx still commits
 		}
 		return assert.AnError // EdgesAdd must not have succeeded
@@ -2471,12 +2423,10 @@ func TestRefsAddEdgeFailureLeavesStamp(t *testing.T) {
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
-	stale := b.ResourceVersion
-	moveTarget(t, store, b.ID)
 	blockEdgeInserts(t, store)
 
 	err := store.Within(ctx, func(ctx context.Context) error {
-		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", stale); err != nil {
+		if _, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on"); err != nil {
 			return nil // the caller logs and carries on; the outer tx still commits
 		}
 		return assert.AnError // EdgesAdd must not have succeeded
@@ -2648,7 +2598,7 @@ func TestRefsAddEndpointReadDBError(t *testing.T) {
 	b := newRefObject(t, store)
 	dropObjects(t, store)
 
-	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, beehive.ErrNotFound, "a dropped table is not a missing endpoint")
 }
@@ -2664,7 +2614,7 @@ func TestRefsAddInsertDBError(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE edges`)
 	require.NoError(t, err)
 
-	_, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on", 0)
+	_, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.Error(t, err)
 }
 
@@ -3679,7 +3629,7 @@ func TestObjectsDeleteRefusesAReferencedRow(t *testing.T) {
 		Group: testGK.Group, Kind: testGK.Kind, Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
-	_, err = store.EdgesAdd(ctx, dependent.ID, target.ID, beehive.RelationDependsOn, 0)
+	_, err = store.EdgesAdd(ctx, dependent.ID, target.ID, beehive.RelationDependsOn)
 	require.NoError(t, err)
 
 	err = store.ObjectsDelete(ctx, target.ID)
@@ -3893,13 +3843,11 @@ func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
 }
 
 // A *new* depends_on edge invalidates the dependent's watermark, which the
-// declare drops. Without that, this dependency reaches the dependent by no route
-// at all: the wake stamp needs the target to have moved past the caller's claim,
-// the waker needs it to move later still, and the stale scan compares the target's
-// resource_version against a watermark that already sits above it — so a target
-// that has simply been sitting there is reported converged. That is the ordinary
-// shape of an edge declared on another object's behalf, which the cross-kind edge
-// deliberately allows.
+// declare drops: a cursor recorded over a smaller dependency set cannot speak for
+// a target just added — one whose resource_version may sit below it, where the
+// stale scan would read converged. The wake stamp is what guarantees the
+// dependent a pass; the clear keeps the derived state honest until that pass
+// rewrites it.
 func TestRefsAddClearsTheDependentsWatermark(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3908,8 +3856,7 @@ func TestRefsAddClearsTheDependentsWatermark(t *testing.T) {
 	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store), "the dependent has converged")
 
-	// A third party declares the edge: no version claim, because it did not read
-	// the target on the dependent's behalf.
+	// A third party declares the edge on the dependent's behalf.
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
 
 	_, _, ok := readWatermark(t, store, dep.ID)
@@ -3918,26 +3865,10 @@ func TestRefsAddClearsTheDependentsWatermark(t *testing.T) {
 		"so the next stale-dependents pass reconciles against the new target")
 }
 
-// An exact version claim is the case the wake stamp deliberately does not fire on
-// — the caller read the target at the version it still holds — so before the
-// watermark was cleared here, a truthful declare was the one that reached nobody.
-func TestRefsAddClearsTheWatermarkOnAnExactClaim(t *testing.T) {
-	store := newRawStore(t)
-	ctx := context.Background()
-	target := newRefObject(t, store)
-	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
-
-	_, err := store.EdgesAdd(ctx, dep.ID, target.ID, beehive.RelationDependsOn, target.ResourceVersion)
-	require.NoError(t, err)
-
-	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
-}
-
 // Gated on the same edge-new test as the wake stamp, so a controller that
 // re-asserts its dependency set every pass pays for the first declare and nothing
-// after it. Without the gate this would re-stale the dependent on every pass, which
-// is the loop the stamp's conjunction exists to avoid.
+// after it. Without the gate this would re-stale the dependent on every pass,
+// which is the loop the edge-new gate exists to avoid.
 func TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()

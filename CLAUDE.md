@@ -147,9 +147,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   survives every interleaving — an increment landing mid-pass sits above the count
   that pass observed at load, so the decrement cannot consume it. The edge-new gate
   is what bounds it: re-asserting a dependency set every pass stamps nothing after
-  the first. `DependenciesAdd`'s `targetResourceVersion` remains as validation only —
-  a claim above the target's current version is rejected
-  (`ErrTargetResourceVersionFuture`) before anything is written.
+  the first. There is no version claim — the parameter the old conditional stamp
+  read was removed once nothing conditioned on it.
   → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)
 - **Secondary lookups (owner, dependencies, dependents, owned) are read on request**,
   never folded into the `SELECT` that carries the blobs. Eager `LoadOption`s and lazy

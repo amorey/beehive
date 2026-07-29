@@ -63,14 +63,6 @@ var ErrObservedGenerationFuture = errors.New("beehive: observed generation excee
 // already-converted data instead of refusing to decode it.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
 
-// ErrTargetResourceVersionFuture is returned by EdgesAdd when the caller's claimed
-// version of the target is above the target's current one. Versions only move
-// forward, so such a value cannot have come from reading the target — it is another
-// object's version, or another field. It is checked before the insert, so a rejected
-// call writes nothing. Same argument as ErrObservedGenerationFuture: a caller can
-// only report what it could have seen.
-var ErrTargetResourceVersionFuture = errors.New("beehive: target resource version is ahead of the target")
-
 // ChangeType classifies a Change.
 type ChangeType string
 
@@ -479,27 +471,21 @@ type Store interface {
 	// idempotent, and both endpoints must exist or it returns ErrNotFound. The edge is
 	// not part of the object, so it bumps no version.
 	//
-	// targetResourceVersion is the caller's claimed version of toID — the version its
-	// decision to depend on toID was based on — or 0 for no claim. A claim above
-	// toID's current version is rejected with ErrTargetResourceVersionFuture *before*
-	// the insert, so nothing is written. The rejection cannot rely on the caller
-	// unwinding a transaction that may hold other writes it means to keep.
-	//
-	// Independently of the claim, every **new depends_on** edge this call creates (self-edges excluded)
+	// Every **new depends_on** edge this call creates (self-edges excluded)
 	// increments fromID's reconcile_owed — the durable record that a wake is owed —
 	// and reports it as EdgesAddResult.ReconcileOwedStamped. The stamp is
-	// unconditional on the claim because it is the only mechanism sound under every
+	// unconditional because it is the only mechanism sound under every
 	// interleaving: an increment landing while fromID's own reconcile is in flight
 	// sits above the count that pass observed at load, so it survives the decrement
 	// and keeps the object owed — where invalidating derived state (the watermark
 	// clear below) is undone by that same pass. The edge-new gate bounds the cost at
 	// one extra pass per edge ever created; a caller that deletes and re-declares its
 	// set every pass pays per re-create, which is the trade recorded in the ADR.
-	// That write must land on the same side of the insert as the rejection, for the
-	// same reason: as a separate call after EdgesAdd returned, a caller sharing an
-	// ambient transaction could handle its error and commit the edge with no wake —
-	// a stranded dependent. So the endpoint check, the stamp and the insert are one
-	// atomic unit, and an implementation must not split them.
+	// The stamp must land *before* the insert: issued as a separate call after
+	// EdgesAdd returned, a caller sharing an ambient transaction could handle its
+	// error and commit the edge with no wake — a stranded dependent. So the endpoint
+	// check, the stamp and the insert are one atomic unit, and an implementation
+	// must not split them.
 	//
 	// The count holds durable, owed *work*, and nothing else writes to it. A second
 	// kind of durable marker — undecodable rows, say — gets its own column and its own
@@ -524,7 +510,7 @@ type Store interface {
 	// re-declaring an edge raises it again. Reclaiming those wants a cross-kind sweeper
 	// (see TODO.md), not a gate here: refusing to stamp would lose the wake outright
 	// for a kind that gains a controller later.
-	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetResourceVersion int64) (EdgesAddResult, error)
+	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 
 	// EdgesDelete removes the (fromID, toID, relation) edge; removing one that isn't
 	// there does nothing. Like EdgesAdd it bumps no version.

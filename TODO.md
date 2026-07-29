@@ -389,10 +389,10 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   `DependenciesAdd` shows the local way out. A stamp issued as a second store call
   after `EdgesAdd` would let a caller that swallowed the stamp's error commit the edge
-  with no stamp — exactly the stranded dependent the version claim exists to prevent.
+  with no stamp — exactly the stranded dependent the stamp exists to prevent.
   The answer was ordering: fold the stamp into `EdgesAdd` ahead of the insert, so no
-  write can fail after the edge exists. `ErrTargetResourceVersionFuture` uses the same
-  trick. It works only because there are two writes and one can be moved, so it does
+  write can fail after the edge exists. It works only because there are two writes
+  and one can be moved, so it does
   not generalize: reorder anything whose second write depends on the first and there is
   nowhere to put it.
 

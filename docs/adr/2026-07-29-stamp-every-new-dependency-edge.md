@@ -29,7 +29,7 @@ re-derives it concurrently; only recorded owed work can.
 ## Decision
 
 `EdgesAdd` increments `fromID`'s `objects.reconcile_owed` for **every `depends_on`
-edge the call creates**, unconditionally on the version claim. Self-edges are
+edge the call creates**, unconditionally. Self-edges are
 excluded, as every scan excludes them: an object's own pass always reads its
 current self, so a self-wake has nothing to deliver. Owner edges stamp nothing —
 an `owned_by` edge is not a dependency.
@@ -49,13 +49,19 @@ its set every pass stamps once per re-create; that churn shape was the argument 
 the conjunction, and it now costs what it costs rather than being subsidised by a
 correctness hole.
 
-The `targetResourceVersion` parameter remains as validation only. A claim above the
-target's current version is rejected with `ErrTargetResourceVersionFuture` *before*
-anything is written — versions only move forward, so such a value cannot have come
-from reading the target, and it usually means a version read from the wrong object.
-The check stays deliberately partial: a stale claim looks like an old read and a
-freshly re-read one looks like a decision made this instant, so those remain the
-caller's to get right. Pass `0` for "no opinion".
+The `targetResourceVersion` parameter is removed outright, from
+`ControllerClient.DependenciesAdd` and `Store.EdgesAdd`, along with
+`ErrTargetResourceVersionFuture`. Once the stamp stopped conditioning on it, the
+claim's only remaining job was a pre-write sanity check — rejecting a version
+above the target's current one as "read from the wrong object". That rejection
+was load-bearing under the conditional stamp, where an impossible claim silently
+and permanently disabled the wake guard; with the stamp unconditional, a garbage
+claim can disable nothing, and the check degrades to a probabilistic bug detector
+(it fires only when the wrong version happens to exceed the target's). An API
+that asks every caller to carefully thread a value with no functional effect
+misleads more than that weak signal is worth, so the parameter went with the
+condition. The trade accepted: a caller wiring versions from the wrong object now
+gets no error at all — it just converges anyway.
 
 The watermark clear on a new edge stays, demoted from coverage to hygiene: a cursor
 recorded over a smaller dependency set cannot speak for a target just added, and
@@ -106,7 +112,7 @@ tests and future non-edge producers.
 
 - The mid-pass third-party declare is closed: pinned by
   `TestReconcileMidPassDeclareLeavesTheDependentOwed`, which stages the exact
-  interleaving (exact claim, quiet target, declare inside the dependent's pass) and
+  interleaving (quiet target, declare inside the dependent's pass) and
   asserts the derived state is blind while the count survives.
 - Every declared dependency now costs exactly one reconcile of the dependent per
   edge created, including declares whose read was current. That pass reads the
@@ -114,8 +120,10 @@ tests and future non-edge producers.
   this design errs in throughout.
 - `EdgesAddResult.ReconcileOwedStamped` now reports "this call created a
   depends_on edge (non-self)" rather than the old conjunction.
-- The anti-spin tripwires moved: `TestAddDependencyWakesOnceWhenTargetUnmoved` and
-  `TestAddDependencyZeroResourceVersionWakesOnce` pin the once-per-edge bound where
-  their predecessors pinned no-stamp;
-  `TestAddDependencyStaleResourceVersionWakesAtMostOnce` and
-  `TestRefsAddStampsOnlyNewEdge` are unchanged.
+- The anti-spin tripwires consolidated: `TestAddDependencyWakesOncePerEdge` and
+  `TestRefsAddStampsOnlyNewEdge` pin the once-per-edge bound where their
+  predecessors pinned the per-claim conditions.
+- With the claim gone, `DependenciesAdd(ctx, fromID, toID)` and
+  `EdgesAdd(ctx, fromID, toID, relation)` are the whole declare surface; the
+  version-guard tests (`TestAddDependencyRejectsFutureResourceVersion` and kin)
+  went with the error they pinned.

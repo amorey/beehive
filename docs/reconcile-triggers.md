@@ -104,15 +104,14 @@ re-deriving from state whatever the other two lost.
 
 Every `depends_on` edge `EdgesAdd` **creates** (self-edges excluded) increments the
 dependent's `reconcile_owed` — in the same statement sequence as the edge insert, so
-the two cannot come apart. The stamp is unconditional on the caller's version claim,
+the two cannot come apart. The stamp is unconditional,
 because recorded owed work is the only mechanism sound under every interleaving: an
 increment landing while the dependent's own pass is in flight sits above the count
 that pass observed at load, so the load-scoped decrement cannot consume it. That is
-what covers the declare-race (a target that moved past the caller's read), the
-declare no claim covers (case 6b's shape), and the mid-pass third-party declare that
-used to be a strand — with one reconcile per edge ever created as the price, bounded
-by the edge-new gate. The claim itself remains as validation: a version above the
-target's current one is rejected before anything is written.
+what covers the declare-race (a target that moved between the caller's read and the
+declare), the quiet-target declare (case 6b's shape), and the mid-pass third-party
+declare that used to be a strand — with one reconcile per edge ever created as the
+price, bounded by the edge-new gate.
 → [ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md)
 
 - **Recorded by:** `sqliteStore.EdgesAdd`, via `ControllerClient.DependenciesAdd`.
@@ -124,9 +123,7 @@ target's current one is rejected before anything is written.
   commit and the dispatch loses nothing. This is the case `TestDependencyRequeueLostAcrossRestart`
   pins, deliberately under `WithStartupFullPass(false)` so the full pass cannot heal it
   for unrelated reasons.
-- **Tests:** `TestAddDependencyWakesWhenTargetMovedSinceRead`,
-  `TestAddDependencyWakesOnceWhenTargetUnmoved`,
-  `TestAddDependencyZeroResourceVersionWakesOnce`, `TestAddDependencyStampRidesRefsAdd`,
+- **Tests:** `TestAddDependencyWakesOncePerEdge`, `TestAddDependencyStampRidesRefsAdd`,
   `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
   `TestRefsAddStampFailureLeavesNoEdge`, `TestRefsAddEdgeFailureLeavesStamp`,
   `TestAddDependencyNoWakeOnRollback`, `TestDependencyRequeueRaceOnDeclare`,
@@ -182,8 +179,8 @@ target just added — leaving it standing would misreport convergence to case 7'
 for the window until the stamped pass runs. An absent row already means stale;
 nothing new is recorded.
 
-The clear alone used to be what reached a declare whose claim is exact or `0` against
-a target not about to move, and it had a strand-shaped hole: a *third party*
+The clear alone used to be what reached a declare against a quiet target — one the
+old conditional stamp did not fire on — and it had a strand-shaped hole: a *third party*
 declaring between a dependent's load and that dependent's own watermark write had the
 clear immediately undone by a pass that never saw the new target. Case 5's
 unconditional stamp is what closes that — recorded owed work survives the pass, where
