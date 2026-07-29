@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,82 @@ type txState struct {
 	mu      sync.Mutex
 	hooks   []func()
 	flushed bool
+
+	// savepoints counts the savepoints this transaction has opened, ever. It names
+	// them; it is not a stack height. Monotonic on purpose: a depth-indexed name is
+	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
+	// recent match — correct, but it leaves the next reader proving it.
+	savepoints int64
+}
+
+// savepointStmt builds "<verb> bh_sp_<n>". The name is interpolated rather than
+// bound because SQLite accepts no parameter where a savepoint name goes; n is an
+// int64 this package owns, so there is nothing to escape. AppendInt over a stack
+// array keeps this off fmt, which matters because modernc.org/sqlite compiles each
+// statement fresh and these are the most trivial statements we issue.
+func savepointStmt(verb string, n int64) string {
+	var buf [40]byte
+	b := append(buf[:0], verb...)
+	b = append(b, " bh_sp_"...)
+	b = strconv.AppendInt(b, n, 10)
+	return string(b)
+}
+
+// pushSavepoint reserves the next savepoint name and the hook watermark to unwind
+// to, both under mu since a Within fn may fan store calls across goroutines.
+func (st *txState) pushSavepoint() (name int64, mark int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.savepoints++
+	return st.savepoints, len(st.hooks)
+}
+
+// truncateHooks drops every hook queued since mark, so an unwind takes the frame's
+// deferred side effects with its writes — otherwise a WithOnCreate registered inside
+// a rolled-back frame still fires at the outermost commit, for a row that is gone.
+//
+// flushed needs no consideration here: takeHooks sets it only after the outermost
+// commit, and a nested frame can only be in flight before that, so the list is
+// provably still open.
+func (st *txState) truncateHooks(mark int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if mark <= len(st.hooks) {
+		st.hooks = st.hooks[:mark]
+	}
+}
+
+// nested runs fn inside a SAVEPOINT on the ambient transaction, so an error fn
+// returns unwinds fn's writes and its queued hooks whatever the outer caller then
+// does with that error — including swallowing it. The outermost transaction is
+// still the only thing that commits, and a savepoint adds no fsync, so durability
+// is unchanged.
+//
+// Nothing here recovers, and nothing balances the stack on a panic: a panic
+// unwinding through this skips the RELEASE, and the outermost Within's deferred
+// tx.Rollback discards the whole transaction, savepoint stack included. A recover
+// here would turn a panic into a half-committed transaction.
+func (st *txState) nested(ctx context.Context, fn func(ctx context.Context) error) error {
+	name, mark := st.pushSavepoint()
+	if _, err := st.tx.ExecContext(ctx, savepointStmt("SAVEPOINT", name)); err != nil {
+		return err
+	}
+	if ferr := fn(ctx); ferr != nil {
+		st.truncateHooks(mark)
+		// ROLLBACK TO rewinds to the savepoint but leaves it on the stack; the
+		// RELEASE is what pops it.
+		if _, err := st.tx.ExecContext(ctx, savepointStmt("ROLLBACK TO", name)); err != nil {
+			return errors.Join(ferr, err)
+		}
+		if _, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", name)); err != nil {
+			return errors.Join(ferr, err)
+		}
+		return ferr
+	}
+	if _, err := st.tx.ExecContext(ctx, savepointStmt("RELEASE", name)); err != nil {
+		return err
+	}
+	return nil
 }
 
 // addHook queues fn, reporting whether it took ownership. A false return means the
@@ -132,9 +209,14 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // AfterCommit hooks are the one thing deferred to the commit, and they run only
 // on a clean one. A nested Within joins the outer transaction's queue, so a hook
 // registered deep inside a caller's Within still waits for the outermost commit.
+//
+// A nested Within is a real rollback boundary: it runs fn inside a SAVEPOINT, so an
+// error fn returns unwinds fn's own writes and its own queued hooks even if the
+// outer caller swallows that error. Without it, any multi-write composition would be
+// atomic only by the grace of its callers.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
-	if _, ok := txFrom(ctx); ok {
-		return fn(ctx) // nested: joins the outer tx and its hook queue
+	if st, ok := txFrom(ctx); ok {
+		return st.nested(ctx, fn) // nested: a savepoint on the outer tx and its hook queue
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
