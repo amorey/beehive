@@ -2016,6 +2016,38 @@ func TestWithinFailedUnwindPoisonsTheTransaction(t *testing.T) {
 	assert.False(t, committed(t, store, "after"))
 }
 
+// TestWithinOnAClosedTransactionOpensAFreshOne covers the ctx AfterCommit
+// deliberately keeps alive: the contract supports a hook passing back the
+// transaction ctx it captured rather than the detached one it was handed, and that
+// ctx still carries a txState whose *sql.Tx is committed.
+//
+// It must be driven from inside the hook. Doing it after the outer Within returns
+// would exercise only the deferred close and would pass even if closed were set too
+// late — and the hook-drain window is precisely the window the contract promises.
+func TestWithinOnAClosedTransactionOpensAFreshOne(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	var nestedErr, readErr error
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		createIn(t, store, txCtx, "seed")
+		store.AfterCommit(txCtx, func(context.Context) {
+			nestedErr = store.Within(txCtx, func(freshCtx context.Context) error {
+				createIn(t, store, freshCtx, "from-hook")
+				return nil
+			})
+			// conn has to agree with Within, or the same ctx takes a fresh
+			// transaction one way and a dead one the other.
+			_, readErr = store.ObjectsGetBySlug(txCtx, testGK, "seed")
+		})
+		return nil
+	}))
+
+	assert.NoError(t, nestedErr, "a Within on a closed transaction ctx must open a fresh one")
+	assert.True(t, committed(t, store, "from-hook"), "and the write it carries must land")
+	assert.NoError(t, readErr, "a bare read on that ctx must fall back to the pool")
+}
+
 func TestObjectsListUnsettledIDs(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

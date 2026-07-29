@@ -68,6 +68,13 @@ type txState struct {
 	hooks   []func()
 	flushed bool
 
+	// closed latches once the transaction is over, by commit or by rollback. A ctx
+	// carrying this txState outlives the transaction — AfterCommit's contract lets a
+	// hook pass back the tx ctx it captured — so both Within and conn consult it and
+	// degrade together, treating the ctx as carrying no transaction rather than a
+	// dead one. flushed is no substitute: a rolled-back transaction never sets it.
+	closed bool
+
 	// savepoints counts the savepoints this transaction has opened, ever. It names
 	// them; it is not a stack height. Monotonic on purpose: a depth-indexed name is
 	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
@@ -183,17 +190,50 @@ func (st *txState) nested(ctx context.Context, fn func(ctx context.Context) erro
 	return nil
 }
 
-// addHook queues fn, reporting whether it took ownership. A false return means the
-// commit has already run its hooks, so the caller must run fn itself rather than
-// queue it where nothing will look again.
-func (st *txState) addHook(fn func()) bool {
+// hookDisposition is what addHook decided to do with a hook. The two non-queue
+// outcomes are genuinely different and must not be collapsed: one transaction
+// committed and one did not.
+type hookDisposition int
+
+const (
+	hookQueued  hookDisposition = iota // waits for the outermost commit
+	hookRunNow                         // that commit already happened; "after" it is now
+	hookDiscard                        // the transaction rolled back; the hook must never run
+)
+
+// addHook queues fn and reports what became of it. Queueing where nothing will look
+// again is a silent drop, which is what this return exists to prevent.
+func (st *txState) addHook(fn func()) hookDisposition {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.flushed {
-		return false
+	switch {
+	case st.flushed:
+		// The commit ran and drained the queue, so run it now. takeHooks sets flushed
+		// before any hook executes, which is what makes a hook registered from inside
+		// a hook land here rather than in the discard arm below.
+		return hookRunNow
+	case st.closed:
+		// Closed without ever flushing: the transaction rolled back. Discarding is the
+		// point, not a leak — running it would fire a WithOnCreate for a row that never
+		// landed, which is the one guarantee AfterCommit exists to provide.
+		return hookDiscard
 	}
 	st.hooks = append(st.hooks, fn)
-	return true
+	return hookQueued
+}
+
+// close latches the transaction closed, by either outcome. Idempotent, so the
+// commit path can call it eagerly and the deferred call still covers the rest.
+func (st *txState) close() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.closed = true
+}
+
+func (st *txState) isClosed() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.closed
 }
 
 // takeHooks drains the queue and latches it closed.
@@ -219,9 +259,12 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// conn returns the ambient transaction if ctx carries one, else the pool.
+// conn returns the ambient transaction if ctx carries a live one, else the pool. A
+// closed txState degrades to the pool for the same reason Within opens a fresh
+// transaction on one: the ctx outlives its transaction, and half of it behaving as
+// "the transaction is over" would be worse than neither half doing so.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
-	if st, ok := txFrom(ctx); ok {
+	if st, ok := txFrom(ctx); ok && !st.isClosed() {
 		return st.tx
 	}
 	return s.db
@@ -253,7 +296,7 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // outer caller swallows that error. Without it, any multi-write composition would be
 // atomic only by the grace of its callers.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
-	if st, ok := txFrom(ctx); ok {
+	if st, ok := txFrom(ctx); ok && !st.isClosed() {
 		return st.nested(ctx, fn) // nested: a savepoint on the outer tx and its hook queue
 	}
 
@@ -262,6 +305,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		return err
 	}
 	st := &txState{tx: tx}
+	defer st.close() // covers the rollback and early-return paths
 	ctx = context.WithValue(ctx, txKey{}, st)
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
 	if err := fn(ctx); err != nil {
@@ -276,6 +320,10 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Before draining, not in the deferred close: the hooks below run inside this
+	// function, so a close deferred to its return would still read false for the
+	// whole window in which a hook can hand its captured tx ctx back to the store.
+	st.close()
 	// After the commit and outside any lock: a hook is caller code and may write to
 	// the store, which would re-enter Within.
 	for _, hook := range st.takeHooks() {
@@ -301,10 +349,12 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 	// A hook that writes gets a fresh transaction, which is the only thing it could
 	// have meant. Everything else on the ctx is inherited.
 	hookCtx := context.WithValue(ctx, txKey{}, nil)
-	if st.addHook(func() { fn(hookCtx) }) {
-		return
+	switch st.addHook(func() { fn(hookCtx) }) {
+	case hookRunNow:
+		fn(hookCtx)
+	case hookDiscard:
+		// Deliberately nothing: a rolled-back transaction never runs its hooks.
 	}
-	fn(hookCtx)
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.
