@@ -187,12 +187,13 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // time).
 //
 // It is one store call, not a composition. Both writes — the edge and the durable
-// wake stamp — live inside EdgesAdd, and they are there rather than sequenced here
-// precisely because a nested Within unwinds nothing: a stamp issued as a second
-// call after EdgesAdd returned would leave a caller who handles this method's error
-// free to commit the edge without it, stranding a dependent on a stale read, which
-// is the race this method exists to close. Indivisibility inside one store call is
-// the guarantee.
+// wake stamp — live inside EdgesAdd rather than being sequenced here, so the pair is
+// indivisible no matter what any caller does with the error. A nested Within is a
+// savepoint boundary now, so a second call sequenced here would in fact unwind with
+// the first; the reason to keep them in one store call is that the guarantee then
+// rests on the store, not on every caller's Within being a real boundary. The failure
+// it forecloses is a stranded dependent: an edge committed with no wake, on a stale
+// read nothing re-derives.
 //
 // The stamp fires on every edge the call creates, gated only on the edge being
 // new — which is what stops a level-triggered controller re-asserting its set every
