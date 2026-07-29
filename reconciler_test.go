@@ -2773,6 +2773,45 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 	assert.Empty(t, h.stale(t), "the pass that declared the edge also observed the target")
 }
 
+// The one case that does cost a pass: an object whose *first* depends_on edge is
+// declared mid-reconcile. HasDependencies was sampled false at load, so the pass
+// skips DependencyWatermarksSet entirely and leaves no row — and an absent row means
+// stale. It is the over-reconcile direction, self-extinguishing after one pass, and
+// bounded at once per object ever; the alternative is issuing the write on every
+// successful reconcile of every kind, which is the write-lock acquisition
+// HasDependencies exists to avoid.
+func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *testing.T) {
+	ctx := context.Background()
+	s := newClientTestStore(t)
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	dep, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+	target, err := s.ObjectsCreate(ctx, &RawObject{Kind: clientTestGK.Kind, Spec: specJSON})
+	require.NoError(t, err)
+	tc, inner := newSyncController(s)
+	stale := func() []ObjectID {
+		refs, err := s.DependentsListStale(ctx, []GroupKind{clientTestGK}, 0, 100)
+		require.NoError(t, err)
+		return objectRefIDs(refs)
+	}
+
+	inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, cc.DependenciesAdd(ctx, dep.ID, target.ID, 0)
+	}
+	_, err = tc.reconcile(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, stale(), "no watermark was written, so one more pass is owed")
+
+	// And it settles on that pass, which now loads with the edge in place.
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+	_, err = tc.reconcile(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.Empty(t, stale(), "self-extinguishing: once per object, never repeated")
+}
+
 // watermarkProbeStore records every dependency-watermark write, so a test can
 // assert on the call rather than on the row. The point of the skip is the write
 // lock not taken — on a pool of one connection an INSERT that writes no rows still

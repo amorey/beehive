@@ -300,35 +300,59 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 }
 
 // resolveCreate folds the create-time options and then applies the one validation
-// that needs the control plane rather than the option values alone: a finalizer is
-// only meaningful on a kind that has a controller to clear it. It runs before any
-// store work, like the package-level resolveCreate it wraps, so a caller mistake
-// never takes the store's write lock.
-//
-// WithFinalizers on a client-only kind is unclearable, not merely useless.
-// FinalizersDelete lives on ControllerClient and folds the caller's own GroupKind
-// into the store mutator, so no other kind's controller can reach the row either —
-// it gets ErrWrongKind for trying. gcCollect returns early while any finalizer
-// remains, so the row stays deletion-pending forever: re-listed by every GC sweep,
-// making no progress on any of them, and its owned_by edge RESTRICT-blocks its
-// owner's delete permanently. That is exactly the strand the global sweeper exists
-// to prevent for client-only kinds — the sweeper reaches the row, it just has
-// nothing it is allowed to do with it.
-//
-// The registration read is gated on the option actually being used, so the ordinary
-// create path never takes bh.mu: this is a caller mistake to reject, not a race to
-// close, and the registration set is frozen after Start anyway.
+// that needs the control plane rather than the option values alone. It wraps the
+// package-level resolveCreate, and runs before any store work for the same reason
+// that one does — so a caller mistake never takes the store's write lock.
 func (c *clientImpl[Spec, Status]) resolveCreate(opts []Option) (*createOptions, error) {
 	co, err := resolveCreate(opts)
 	if err != nil {
 		return nil, err
 	}
-	if len(co.finalizers) > 0 && !c.bh.isRegistered(c.gk) {
-		return nil, fmt.Errorf("%w: WithFinalizers needs a registered controller for %s/%s to clear them; "+
-			"a finalizer on a client-only kind can never be removed, and the row would stay deletion-pending forever",
-			ErrInvalidOption, c.gk.Group, c.gk.Kind)
+	if err := c.checkFinalizersClearable(co); err != nil {
+		return nil, err
 	}
 	return co, nil
+}
+
+// checkFinalizersClearable rejects WithFinalizers on a kind this process has no
+// controller for.
+//
+// Such a finalizer is unclearable, not merely useless. FinalizersDelete lives on
+// ControllerClient and folds the caller's own GroupKind into the store mutator, so no
+// other kind's controller can reach the row either — it gets ErrWrongKind for trying.
+// gcCollect returns early while any finalizer remains, so the row stays
+// deletion-pending forever: re-listed by every GC sweep, making no progress on any of
+// them, and its owned_by edge RESTRICT-blocks its owner's delete permanently. That is
+// exactly the strand the global sweeper exists to prevent for client-only kinds — the
+// sweeper reaches the row, it just has nothing it is allowed to do with it.
+//
+// **The check is process-local and evaluated at call time**, and both halves are
+// limits rather than guarantees. bh.isRegistered answers for *this* Beehive, so a
+// create issued from a process that does not register the kind is refused even when
+// another process over the same store does register it; and a create issued before
+// this process's own Register is refused for the same reason. Neither is checkable in
+// the store, which tracks no registrations — the same reason EdgesAdd's wake stamp
+// deliberately does not gate on registration. The asymmetry is deliberate: gating
+// there would *lose* a wake silently, where refusing here is loud and the caller can
+// reorder or register.
+//
+// It is gated on the option actually being used, so an ordinary create never takes
+// bh.mu.
+//
+// **It fires on GetOrCreate's found branch too**, where no row is created and the
+// option would have been ignored. That is deliberate, and it follows the eager
+// validation rule GetOrCreate's own doc sets out: deferring to the insert would make
+// the same call succeed or fail depending on whether the row happens to exist. This
+// check is the worst case for that, because the strand it prevents only happens on a
+// create — a caller who deferred would see it pass wherever the row already exists
+// and strand the first time it doesn't.
+func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) error {
+	if len(co.finalizers) == 0 || c.bh.isRegistered(c.gk) {
+		return nil
+	}
+	return fmt.Errorf("%w: WithFinalizers needs a controller registered for %s/%s in this process to clear them; "+
+		"a finalizer no controller here can remove would leave the row deletion-pending forever",
+		ErrInvalidOption, c.gk.Group, c.gk.Kind)
 }
 
 // insertObject inserts one new row of this client's kind and wires its owner

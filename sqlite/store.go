@@ -1627,9 +1627,12 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		// match DependentsListStale, which excludes them: clearing for one would drop a
 		// watermark no scan will ever re-derive from that edge.
 		//
-		// It costs the declarer's own pass nothing: a controller that declares its edge
-		// mid-reconcile rewrites the watermark when the pass succeeds, from the cursor
-		// it loaded at.
+		// A controller declaring its edge mid-reconcile mostly pays nothing for this:
+		// that pass rewrites the watermark when it succeeds, from the cursor it loaded
+		// at. The exception is its object's *first* depends_on edge, where the
+		// reconciler's own HasDependencies flag — sampled at load, before the edge
+		// existed — skips the rewrite, so the object is found stale once. That is
+		// bounded at once per object ever and is the over-reconcile direction.
 		if relation == storeapi.RelationDependsOn && fromID != toID {
 			if _, err := s.conn(ctx).ExecContext(ctx, `
 				DELETE FROM dependency_watermarks

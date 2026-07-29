@@ -181,13 +181,21 @@ deliberately allows.
   so re-asserting a dependency set costs nothing after the first declare; self-edges
   are skipped, matching what the scan excludes.
 - **Restart:** ✅ the row is durable, and so is its absence.
-- **Costs the declarer's own pass nothing:** a controller declaring from inside its own
-  `Reconcile` rewrites the watermark when the pass succeeds, from the cursor it loaded
-  at — sound because its read of the new target happened after that load.
-- **Not covered:** a *third party* declaring between a dependent's load and that
-  dependent's own watermark write has the clear immediately undone by a pass that never
-  saw the new target. It converges when the target next moves. See
-  [`TODO.md`](../TODO.md) for the fix (stamp every new edge) and what it costs.
+- **Costs the declarer's own pass nothing, with one exception:** a controller declaring
+  from inside its own `Reconcile` rewrites the watermark when the pass succeeds, from
+  the cursor it loaded at — sound because its read of the new target happened after that
+  load. The exception is the object's *first* `depends_on` edge, where
+  `ReconcileLoad.HasDependencies` was sampled before it existed, so the pass skips the
+  write and the object is found stale once. Once per object ever, self-extinguishing,
+  and not this mechanism's doing. Test:
+  `TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
+- **Not covered — and this one is a strand, not latency:** a *third party* declaring
+  between a dependent's load and that dependent's own watermark write has the clear
+  immediately undone by a pass that never saw the new target. The dependent reads as
+  converged against it with nothing left to re-derive, so a target that never moves
+  again is never reconciled against — the same failure this case exists to close,
+  narrowed to a race window. See [`TODO.md`](../TODO.md) for the fix (stamp every new
+  edge) and what it costs.
 - **Tests:** `TestRefsAddClearsTheDependentsWatermark`,
   `TestRefsAddClearsTheWatermarkOnAnExactClaim`,
   `TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge`,

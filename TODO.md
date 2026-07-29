@@ -161,8 +161,13 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   ADR](docs/adr/2026-07-29-dependency-watermarks.md)). What survives is one
   interleaving: a *third party* declaring between a dependent's `ObjectsGetForReconcile`
   and that dependent's own watermark write has the clear undone by a pass that never
-  saw the new target. The dependent then reads as converged until the target next
-  moves.
+  saw the new target.
+
+  **It is a strand, not latency.** The dependent reads as converged against that target
+  with nothing left to re-derive it, so a target that never moves again is never
+  reconciled against — the quiet-target case the clear exists to fix, narrowed to a
+  race window. That is a genuine hole in "a wake lost by any means costs latency rather
+  than permanent divergence", and the only one left in it.
 
   Reaching it takes a cross-object declare — a controller declaring an edge on another
   kind's behalf, which the cross-kind edge deliberately allows — landing inside the

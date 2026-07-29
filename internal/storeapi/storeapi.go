@@ -517,16 +517,22 @@ type Store interface {
 	//
 	// Gated on the same edge-new test as the stamp, so re-asserting a dependency set
 	// every pass costs nothing after the first, and skipped for a self-edge, which
-	// DependentsListStale excludes anyway. It costs a controller that declares from
-	// inside its own Reconcile nothing either: that pass writes the watermark again
-	// when it succeeds, from the cursor it loaded at.
+	// DependentsListStale excludes anyway. A controller declaring from inside its own
+	// Reconcile mostly pays nothing either: that pass writes the watermark again when
+	// it succeeds, from the cursor it loaded at. The exception is an object's *first*
+	// depends_on edge — ReconcileLoad.HasDependencies was sampled before it existed,
+	// so the pass skips the write and the object is found stale once. Bounded at once
+	// per object ever, and in the over-reconcile direction.
 	//
-	// It leaves one window: an edge declared by *another* writer between a
-	// dependent's load and its own watermark write is cleared and then immediately
-	// re-recorded by that pass, which never saw the new target. The dependent
-	// converges when the target next moves. Closing it needs the declare to record
-	// owed work rather than to invalidate derived state — a stamp on every new edge,
-	// which costs one extra pass per edge ever created (see TODO.md).
+	// It leaves one window, and it is a strand rather than latency: an edge declared
+	// by *another* writer between a dependent's load and its own watermark write is
+	// cleared and then immediately re-recorded by that pass, which never saw the new
+	// target. The dependent then reads as converged against that target with nothing
+	// left to re-derive it, so a target that never moves again is never reconciled
+	// against — the same failure class this clear closes, narrowed to a race window.
+	// Closing it needs the declare to record owed work rather than to invalidate
+	// derived state: a stamp on every new edge, which is sound under every
+	// interleaving and costs one extra pass per edge ever created (see TODO.md).
 	//
 	// The stamp does not depend on fromID's kind having a controller. The store cannot
 	// know which kinds do, and gating would cost the caller a pre-read of fromID's kind

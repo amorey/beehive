@@ -130,22 +130,38 @@ against a quiet target.
 
 The cost is nothing in the ordinary case. Re-asserting a dependency set costs
 nothing after the first declare, because of the edge-new gate. A controller
-declaring from inside its own `Reconcile` costs nothing either: that pass rewrites
-the watermark when it succeeds, from the cursor it loaded at — which is sound for
-exactly the reason above, since the controller's read of the new target happened
-after the load. Self-edges are skipped, matching `DependentsListStale`, which
-excludes them.
+declaring from inside its own `Reconcile` mostly pays nothing either: that pass
+rewrites the watermark when it succeeds, from the cursor it loaded at — which is
+sound for exactly the reason above, since the controller's read of the new target
+happened after the load. Self-edges are skipped, matching `DependentsListStale`,
+which excludes them.
 
-**The residual window.** A *third party* declaring between a dependent's load and
-its own watermark write has its clear immediately undone by that pass, which never
-saw the new target; the dependent converges when the target next moves. Closing it
-means recording owed work rather than invalidating derived state — stamping
-`reconcile_owed` on every new edge, dropping the target-moved half of the
+One case does cost a pass, and it is not this change's doing: an object's **first**
+`depends_on` edge. `ReconcileLoad.HasDependencies` is sampled at load, before that
+edge existed, so the reconciler skips `DependencyWatermarksSet` and leaves no row —
+and an absent row means stale. The object is reconciled once more and settles. It is
+bounded at once per object ever, self-extinguishing, and in the over-reconcile
+direction; the alternative is issuing the gated write on every successful reconcile
+of every kind, which is precisely the write-lock acquisition `HasDependencies` exists
+to avoid. Pinned by
+`TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass`.
+
+**The residual window, and it is a strand.** A *third party* declaring between a
+dependent's load and its own watermark write has its clear immediately undone by that
+pass, which never saw the new target. The dependent then reads as converged against
+that target with nothing left to re-derive it — so if the target never moves again,
+which is exactly the quiet-target case this clear exists to fix, the dependent never
+reconciles against it at all. Calling that "latency until the target moves" would be
+wrong: it is the same failure class the clear closes, narrowed to a race window.
+
+Closing it means recording owed work rather than invalidating derived state —
+stamping `reconcile_owed` on every new edge, dropping the target-moved half of the
 conjunction. That is sound under every interleaving, because the decrement subtracts
 only the count observed at load, and it costs one extra pass per edge ever created.
-It is in `TODO.md` rather than here because the extra pass is a real cost against a
-window that needs a cross-object declare concurrent with the dependent's own
-reconcile.
+It is in `TODO.md` rather than done here because it partly reverses the
+caller-versioned ADR and buys that per-edge pass, and because reaching the window
+needs a cross-object declare landing inside a single `Reconcile` call — not because
+the consequence is mild.
 
 ### A side table, not a column on `objects`
 

@@ -321,6 +321,24 @@ func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 	assert.False(t, created)
 }
 
+// It fires on the found branch too, where no row is created and the option would
+// have been ignored. That is the eager-validation rule GetOrCreate documents:
+// deferring to the insert would make the same call pass wherever the row already
+// exists and strand the first time it does not.
+func TestClientGetOrCreateRejectsFinalizersOnTheFoundBranch(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, err = client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
+	require.NoError(t, err, "the row exists, so the create branch is not reached")
+
+	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"}, WithFinalizers("cleanup"))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.False(t, created)
+}
+
 // The check is gated on the option being used, so an ordinary create on a
 // client-only kind stays legal — client-only kinds are a supported shape, and only
 // the finalizer makes one uncollectable.
