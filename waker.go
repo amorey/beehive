@@ -85,14 +85,18 @@ const wakeScanPagesPerTick = 16
 // gives up resuming from it and jumps straight to the write log's current max, the
 // way an uninitialized waker always has. It is a version-count estimate, not an
 // exact row count — the event log draws from the same counter, and deletes remove
-// rows the scan would have skipped — which is fine for a threshold. The jump is
-// not a compromise: every dependent it skips is still found by the
-// stale-dependents pass, which needs no cursor, so this trades "the first tick
-// pages through the whole gap" for "these dependents converge within one
-// stale-dependents interval instead of one wake-interval tick" — the same trade
-// wakeScanPagesPerTick makes tick by tick, taken all at once for a gap large
-// enough that draining it a page at a time would take many minutes.
-const wakeSeedBacklogCap = 100_000
+// rows the scan would have skipped — which is fine for a threshold. Sized at
+// roughly wakeScanPagesPerTick*wakeScanPageCap*250: at the per-tick page budget,
+// draining a gap this size takes on the order of 250 ticks — several minutes at
+// the wake interval — of continuous full-budget scans, competing with the
+// reconcile loops and the startup owed pass on the same connection the whole
+// time. The jump is not a compromise: every dependent it skips is still found by
+// the stale-dependents pass, which needs no cursor, so this trades that stretch
+// of contention for "these dependents converge within one stale-dependents
+// interval instead of one wake-interval tick" — the same trade
+// wakeScanPagesPerTick makes tick by tick, taken all at once once the gap is
+// this large.
+const wakeSeedBacklogCap = wakeScanPagesPerTick * wakeScanPageCap * 250
 
 // run drives the waker for the life of the control plane. A non-positive interval
 // turns it off, which is a supported choice: the reconcile_owed stamp still covers
@@ -147,29 +151,43 @@ func (dw *waker) seed(ctx context.Context) bool {
 				"err", err)
 			return false
 		}
-		// min(stored, max). A stored cursor above max is not evidence of a swapped
-		// or truncated database: max is a max over live rows, so deleting the
-		// highest-versioned object legitimately lowers it below a cursor the
-		// waker really did process. Clamping down costs nothing — the first scan
-		// asks for everything above max, which is empty by definition — where
-		// trusting a stored cursor past max would skip live writes between them.
-		if ok && stored < max {
-			if gap := max - stored; gap > wakeSeedBacklogCap {
-				// Resuming here would page through the gap for many ticks before
-				// catching up, on the same connection the reconcile loops and the
-				// startup owed pass need. Jumping to max instead costs nothing more
-				// than the ordinary clamp above does — the stale-dependents pass finds
-				// every dependent in the skipped range regardless of cursor.
-				dw.bh.log().WarnContext(ctx, "dependency waker's persisted cursor is too far behind the write log to resume from; seeding at the current cursor instead and leaving the gap to the stale-dependents pass",
-					"stored", stored, "max", max, "gap", gap)
-			} else {
-				watermark = stored
-			}
+		var jumped bool
+		watermark, jumped = resumeWatermark(stored, ok, max)
+		if jumped {
+			// Resuming here would page through the gap for many ticks before
+			// catching up, on the same connection the reconcile loops and the
+			// startup owed pass need. Jumping to max instead costs nothing more
+			// than the ordinary clamp does — the stale-dependents pass finds
+			// every dependent in the skipped range regardless of cursor.
+			dw.bh.log().WarnContext(ctx, "dependency waker's persisted cursor is too far behind the write log to resume from; seeding at the current cursor instead and leaving the gap to the stale-dependents pass",
+				"stored", stored, "max", max, "gap", max-stored)
 		}
 	}
 
 	dw.watermark, dw.persisted, dw.seeded = watermark, watermark, true
 	return true
+}
+
+// resumeWatermark decides where seed resumes scanning from, given the write
+// log's current max and what the store has persisted, if anything. It is a
+// pure function of those three values, kept separate from seed's I/O and
+// error handling so the clamp and backlog-jump policy is directly testable.
+//
+// No stored cursor (ok is false) or one at or past max resumes at max — the
+// ordinary case, and the one every pre-existing seed behaved as. A stored
+// cursor below max resumes from it, unless it is far enough behind that
+// draining the gap a page at a time would take many ticks on a connection the
+// reconcile loops also need; past wakeSeedBacklogCap, jumped reports that the
+// gap was skipped rather than drained, so the caller can log it — every
+// dependent in a skipped gap is still found by the stale-dependents pass.
+func resumeWatermark(stored int64, ok bool, max int64) (watermark int64, jumped bool) {
+	if !ok || stored >= max {
+		return max, false
+	}
+	if gap := max - stored; gap > wakeSeedBacklogCap {
+		return max, true
+	}
+	return stored, false
 }
 
 // scan runs one pass: everything above the watermark, a page at a time. The cursor

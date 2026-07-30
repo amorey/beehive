@@ -516,3 +516,53 @@ func TestWakerJumpsAnOversizedBacklog(t *testing.T) {
 	assert.Equal(t, []int64{max}, store.cursors(), "the scan asks for everything above the max")
 	assert.Zero(t, store.read, "which is empty by definition, same as an ordinary clamp")
 }
+
+// resumeWatermark's four cases, exercised directly rather than through seed and
+// a store double: no stored cursor, a stored cursor at or past max, one below
+// max within range, and one far enough behind to jump.
+func TestResumeWatermark(t *testing.T) {
+	cases := []struct {
+		name          string
+		stored        int64
+		ok            bool
+		max           int64
+		wantWatermark int64
+		wantJumped    bool
+	}{
+		{"no stored cursor", 0, false, 500, 500, false},
+		{"stored cursor at max", 500, true, 500, 500, false},
+		{"stored cursor past max: clamp", 600, true, 500, 500, false},
+		{"stored cursor within range: resume", 400, true, 500, 400, false},
+		{"stored cursor too far behind: jump", 0, true, wakeSeedBacklogCap + 1, wakeSeedBacklogCap + 1, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			watermark, jumped := resumeWatermark(c.stored, c.ok, c.max)
+			assert.Equal(t, c.wantWatermark, watermark)
+			assert.Equal(t, c.wantJumped, jumped)
+		})
+	}
+}
+
+// A failed persist write is logged and leaves dw.persisted at its old value, so
+// the next tick's guard (watermark > persisted) still holds and the write is
+// retried — even on a tick that finds nothing new to scan, since it is
+// persisted's staleness against watermark that drives the retry, not fresh
+// pages.
+func TestWakerRetriesPersistOnAFailedWrite(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	dw.seeded = true
+
+	dw.scan(context.Background())
+	assert.EqualValues(t, 3, dw.watermark, "the in-memory watermark still advances; only the durable write failed")
+	assert.Empty(t, store.setCalls, "the failed write leaves no record of succeeding")
+	assert.Zero(t, dw.persisted, "so persisted stays at its old baseline")
+	assert.NotEmpty(t, buf.String(), "the failure is logged")
+
+	store.setErr = nil
+	dw.scan(context.Background()) // no rows above watermark=3, but persisted still lags it
+	assert.Equal(t, []int64{3}, store.setCalls, "the next tick retries the write even though this scan found nothing new")
+}
