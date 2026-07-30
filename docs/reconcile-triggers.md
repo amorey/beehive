@@ -155,7 +155,7 @@ price, bounded by the edge-new gate.
   → [ADR](adr/2026-07-30-durable-waker-cursor.md)
 - **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheWriteLogMax`,
   `TestWakerSeedsFromMaxWithoutAStoredCursor`, `TestWakerSeedsFromTheStoredCursor`,
-  `TestWakerClampsAStoredCursorAboveTheMark`, `TestWakerJumpsAnOversizedBacklog`,
+  `TestWakerClampsAStoredCursorAboveTheMark`, `TestWakerResumesAnEnormousBacklog`,
   `TestWakerStopsAtThePageBudget`, `TestWakerResumesFromTheStoredCursor`,
   `TestWakerRetriesSeedOnTheNextTick`, `TestWakerRetriesSeedOnAFailedCursorRead`,
   `TestWakerPersistsOnceWhenTheCursorMoves`, `TestWakerSkipsTheWriteWhenQuiet`,

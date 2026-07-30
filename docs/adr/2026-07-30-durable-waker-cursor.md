@@ -75,24 +75,32 @@ therefore not evidence of a swapped or truncated database. Clamping down costs
 nothing: the first scan then asks for everything above `max`, which is empty by
 definition, so it degrades to exactly the pre-existing seed-from-max behaviour.
 
-### Two bounds close the cost this adds
+### A per-tick page budget bounds the cost this adds
 
 Seeding from `max` always made the first scan free by construction. A stored
 cursor does not: resuming after a long gap means the first tick has real work to
 do, on the single connection the reconcile loops and the startup owed pass also
-need. Two constants bound that:
+need. `wakeScanPagesPerTick` caps how many pages one tick reads (16, so 4096
+changes); the remainder is not lost, since the in-memory watermark carries it to
+the next tick and the persisted cursor carries it across restarts.
 
-- `wakeScanPagesPerTick` caps how many pages one tick reads (16, so 4096
-  changes). The remainder is not lost — the cursor persists at whatever the tick
-  reached, and the next tick resumes there.
-- `wakeSeedBacklogCap` makes `seed` give up resuming a cursor that is too far
-  behind `max` and jump straight to `max` instead, logging the gap. This is not
-  a compromise: every dependent in the skipped range is still found by the
-  stale-dependents pass, which needs no cursor, so the trade is "the first tick
-  pages through the whole gap" for "these dependents converge within one
-  stale-dependents interval instead of one wake-interval tick" — the same trade
-  the per-tick budget makes one tick at a time, taken all at once for a gap large
-  enough that draining it a page at a time would take many minutes.
+**There is deliberately no second bound on how far behind a cursor may be before
+`seed` abandons it.** An earlier revision had one, keyed on `max - stored`, and
+it was wrong in a way no tuning fixes: that distance is in `resource_version`
+units, and `EventsAdd` draws from the same sequence without writing anything
+this scan reads. A store logging events at any rate inflates the gap by an
+unbounded factor against the object rows actually behind it, so the threshold
+fires on backlogs that were a few ticks of work and throws away a cursor that
+would have drained fine. Nor does the case that motivated it survive scrutiny: a
+cursor cannot have come from a *different*, larger database, because it lives in
+the database it describes.
+
+What remains is the genuine one — a restart after enough real downtime that
+draining costs minutes of full-budget ticks. That is bounded per tick, and the
+work is real rather than wasted, so it is a latency question rather than a
+safety one. If it is ever observed to matter, the fix is to measure paging work
+actually done rather than to guess from a version distance; `TODO.md` carries
+the shape.
 
 ### Persisted, not committed with the wakes
 

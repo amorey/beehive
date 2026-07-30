@@ -103,18 +103,14 @@ const wakeScanPageCap = 256
 // extends that across restarts.
 const wakeScanPagesPerTick = 16
 
-// wakeSeedBacklogCap bounds how far behind a persisted cursor may be before seed
-// gives up resuming from it and jumps straight to the write log's current mark,
-// the way an uninitialized waker always has. It is a version-count estimate, not
-// an exact row count — the event log draws from the same counter, and deletes
-// remove rows the scan would have skipped — which is fine for a threshold.
-//
-// The multiplier is the point of the expression: at the per-tick page budget, a
-// gap this size takes ~250 consecutive full-budget ticks to drain, several
-// minutes of competing with the reconcile loops for the one connection. Past
-// that, skipping it and letting the stale-dependents pass cover the range is the
-// better trade — the same one wakeScanPagesPerTick makes tick by tick.
-const wakeSeedBacklogCap = wakeScanPagesPerTick * wakeScanPageCap * 250
+// There is deliberately no cap on how far behind a stored cursor may be before
+// seed gives up on it. A version distance cannot say how much work resuming
+// costs: EventsAdd draws from the same sequence without producing anything this
+// scan reads, so a store with heavy event traffic inflates the gap by an
+// unbounded factor and would have a perfectly drainable cursor thrown away.
+// What does bound the cost is wakeScanPagesPerTick, per tick, whatever the gap
+// turns out to hold. See TODO.md for the measured version, if a drain long
+// enough to matter is ever observed.
 
 // run drives the waker for the life of the control plane. A non-positive interval
 // turns it off, which is a supported choice: the reconcile_owed stamp still covers
@@ -176,18 +172,12 @@ func (dw *waker) seed(ctx context.Context) bool {
 		}
 	}
 
-	watermark, jumped := resumeWatermark(stored, ok, mark)
-	if jumped {
-		dw.bh.log().WarnContext(ctx, "dependency waker's persisted cursor is too far behind the write log to resume from; seeding at the current cursor instead and leaving the gap to the stale-dependents pass",
-			"stored", stored, "max", mark, "gap", mark-stored)
-	}
+	watermark := resumeWatermark(stored, ok, mark)
 
-	// persisted is what the row holds, not where the scan resumed — the two come
-	// apart in both directions. A clamp leaves the row *above* the watermark, and
-	// tracking the watermark there would pay a round trip every tick for a write
-	// DriverCursorsSet's own WHERE discards. A jump leaves it *below*, and
-	// tracking the watermark there would suppress the one write worth making,
-	// leaving the abandoned cursor to be re-read and re-jumped on every restart.
+	// persisted is what the row holds, not where the scan resumed: a clamp
+	// leaves the row *above* the watermark, and tracking the watermark there
+	// would pay a round trip every tick for a write DriverCursorsSet's own
+	// WHERE discards, until the watermark climbed past it.
 	persisted := noStoredCursor
 	if ok {
 		persisted = stored
@@ -209,21 +199,17 @@ func (dw *waker) seed(ctx context.Context) bool {
 // resumeWatermark decides where seed resumes scanning from, given the write
 // log's high-water mark and what the store has persisted, if anything. It is a
 // pure function of those three values, kept separate from seed's I/O and error
-// handling so the clamp and backlog-jump policy is directly testable.
+// handling so the clamp is directly testable.
 //
-// jumped reports that a stored cursor was abandoned rather than resumed from,
-// which is the only case worth logging: the gap it skips is left to the
-// stale-dependents pass.
-func resumeWatermark(stored int64, ok bool, mark int64) (watermark int64, jumped bool) {
+// min, not stored: a cursor above the mark is not evidence of a swapped or
+// truncated database — the mark steps back whenever the highest-versioned row
+// is deleted, and a stored cursor could not come from another database anyway,
+// since it lives in the one it describes.
+func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 	if !ok {
-		return mark, false
+		return mark
 	}
-	if mark-stored > wakeSeedBacklogCap {
-		return mark, true
-	}
-	// min, not stored: a cursor above the mark is not a swapped database, since
-	// the mark steps back whenever the highest-versioned row is deleted.
-	return min(stored, mark), false
+	return min(stored, mark)
 }
 
 // scan runs one pass: everything above the watermark, a page at a time. The cursor

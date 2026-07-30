@@ -109,9 +109,8 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   **The race is now much narrower.** Once the waker has persisted a cursor, `seed`
   resumes from it rather than from `ObjectWritesMaxVersion`, and a write racing
   `Start`'s return lands *above* that stored cursor — scanned on the next tick, not
-  skipped. What still reopens the original window is any seed that falls back to
-  `max`: a store with no `DriverCursorer`, the first start of a fresh one, and a
-  stored cursor far enough behind that `wakeSeedBacklogCap` abandons it.
+  skipped. What still reopens the original window is a seed that falls back to
+  `max`: a store with no `DriverCursorer`, or the first start of a fresh one.
 
   Either way that change is never read by any scan — and a settled dependent D of T is
   invisible to every owed-work listing, since D's own generation never moved and
@@ -138,6 +137,35 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   seed that fails, on either read, must leave the waker unseeded and scanning nothing,
   so a synchronous seed in `Start` must fall back to that path rather than returning an
   error.
+
+- **A waker resuming a very stale cursor can scan at full budget for minutes, and
+  nothing decides that draining is no longer worth it** — known, not fixed, and
+  deliberately unbounded rather than bounded by a guess. After a long enough
+  downtime, `seed` resumes a cursor far behind the write log and every tick reads
+  its full `wakeScanPagesPerTick` budget until it catches up: 32 queries a second
+  on the one connection the reconcile loops share, potentially for minutes.
+
+  **The obvious bound is the one that was removed, and it must not come back in that
+  form.** Capping `max - stored` at seed reads a `resource_version` distance, but
+  `EventsAdd` draws from that same sequence without writing anything the scan reads,
+  so the distance overstates the real backlog by an unbounded factor. A store logging
+  events at any rate would abandon cursors that were a few ticks of work. (The other
+  motivation for it — a database file swapped for a larger one — does not exist: a
+  stored cursor lives in the database it describes.)
+
+  **A measured bound would work.** Count consecutive ticks that exhausted the page
+  budget, and past some number of them stop draining and jump to a fresh
+  `ObjectWritesMaxVersion`. That counts paging actually done, in the right unit and
+  immune to event traffic. The natural threshold is one `staleDependentsInterval`
+  of draining, because past that point the backstop has already swept every dependent
+  the drain is still working toward, so the remaining wakes deliver nothing.
+
+  Deferred because the cost is latency rather than divergence, the drain is doing
+  real work rather than wasting it, and no deployment has been observed where it
+  matters — the threshold above is reasoning, not measurement. Revisit if a restart
+  after a long outage is seen to starve the reconcile loops. Tripwire:
+  `TestWakerResumesAnEnormousBacklog` pins that a far-behind cursor is resumed today,
+  which is exactly what such a bound would change.
 
 - **A `RequeueAfter` chain does not survive a restart** — known, not fixed. The
   dependency-wake half is closed: staleness is re-derived from

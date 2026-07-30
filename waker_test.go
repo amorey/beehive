@@ -556,56 +556,46 @@ func TestWakerStopsAtThePageBudget(t *testing.T) {
 	assert.EqualValues(t, total, dw.watermark, "the next tick resumes at the budget, not from the start")
 }
 
-// A stored cursor far enough behind the write log's max that draining it a page
-// at a time would take many minutes is not worth resuming from at all: seed
-// jumps straight to the max, the way an uninitialized waker always has, and logs
-// so the gap is visible. Every dependent in the skipped range is still found by
-// the stale-dependents pass, which needs no cursor.
-func TestWakerJumpsAnOversizedBacklog(t *testing.T) {
-	logger, buf := captureLogger(slog.LevelWarn)
-	const max = wakeSeedBacklogCap + 1000
+// However far behind a stored cursor is, seed resumes from it: the distance is
+// in resource_version units, which EventsAdd inflates without adding anything
+// this scan would read, so no threshold over it could say whether the gap is
+// worth draining. wakeScanPagesPerTick is what bounds the cost instead, per
+// tick, whatever the gap holds.
+func TestWakerResumesAnEnormousBacklog(t *testing.T) {
+	const mark = 50_000_000
 	store := &cursorStore{
-		replayStore: replayStore{seed: max},
+		replayStore: replayStore{seed: mark, rows: changedAt(10)},
 		stored:      map[string]int64{cursorNameWaker: 0},
 	}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	dw.bh.logger = logger
 
-	dw.seed(context.Background())
-	require.True(t, dw.seeded)
-	assert.EqualValues(t, max, dw.watermark, "the stored cursor is too far behind to resume from")
-	assert.NotEmpty(t, buf.String(), "the skipped gap is logged, unlike an ordinary clamp")
+	require.True(t, dw.seed(context.Background()))
+	assert.Zero(t, dw.watermark, "the cursor is resumed, however far behind the mark it sits")
 
 	dw.scan(context.Background())
-	assert.Equal(t, []int64{max}, store.cursors(), "the scan asks for everything above the max")
-	assert.Zero(t, store.read, "which is empty by definition, same as an ordinary clamp")
-	assert.Equal(t, []int64{max}, store.setCalls,
-		"the jump is recorded, so a restart re-reads the new cursor rather than re-jumping the same gap")
+	assert.Equal(t, []int64{0}, store.cursors(), "so the scan starts where the last run stopped")
+	assert.Equal(t, 1, store.read, "and the change above it is found rather than skipped")
 }
 
-// resumeWatermark's four cases, exercised directly rather than through seed and
-// a store double: no stored cursor, a stored cursor at or past max, one below
-// max within range, and one far enough behind to jump.
+// resumeWatermark's cases, exercised directly rather than through seed and a
+// store double: no stored cursor, one at or past the mark, and one below it.
 func TestResumeWatermark(t *testing.T) {
 	cases := []struct {
-		name          string
-		stored        int64
-		ok            bool
-		max           int64
-		wantWatermark int64
-		wantJumped    bool
+		name   string
+		stored int64
+		ok     bool
+		mark   int64
+		want   int64
 	}{
-		{"no stored cursor", 0, false, 500, 500, false},
-		{"stored cursor at max", 500, true, 500, 500, false},
-		{"stored cursor past max: clamp", 600, true, 500, 500, false},
-		{"stored cursor within range: resume", 400, true, 500, 400, false},
-		{"stored cursor too far behind: jump", 0, true, wakeSeedBacklogCap + 1, wakeSeedBacklogCap + 1, true},
+		{"no stored cursor", 0, false, 500, 500},
+		{"stored cursor at the mark", 500, true, 500, 500},
+		{"stored cursor past the mark: clamp", 600, true, 500, 500},
+		{"stored cursor below the mark: resume", 400, true, 500, 400},
+		{"stored cursor far below the mark: still resume", 1, true, 50_000_000, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			watermark, jumped := resumeWatermark(c.stored, c.ok, c.max)
-			assert.Equal(t, c.wantWatermark, watermark)
-			assert.Equal(t, c.wantJumped, jumped)
+			assert.Equal(t, c.want, resumeWatermark(c.stored, c.ok, c.mark))
 		})
 	}
 }
