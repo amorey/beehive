@@ -384,6 +384,41 @@ func replayRows(count int) []ObjectWrite {
 	return rows
 }
 
+// cursorStore layers storeapi.DriverCursorer on top of replayStore, so a waker
+// test can script what a durable store already has stored for the waker's
+// cursor name and observe what it writes. A plain *replayStore does not
+// implement DriverCursorer at all — that is what exercises the no-capability
+// fallback — so this is a distinct type rather than a field toggle.
+type cursorStore struct {
+	replayStore
+	stored   map[string]int64 // what DriverCursorsGet reports; nil means nothing stored
+	getErr   error
+	setErr   error
+	setCalls []int64 // cursor values passed to DriverCursorsSet, in call order
+}
+
+func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
+	if s.getErr != nil {
+		return 0, false, s.getErr
+	}
+	v, ok := s.stored[name]
+	return v, ok, nil
+}
+
+func (s *cursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+	if s.setErr != nil {
+		return s.setErr
+	}
+	s.setCalls = append(s.setCalls, cursor)
+	if s.stored == nil {
+		s.stored = map[string]int64{}
+	}
+	if cursor > s.stored[name] {
+		s.stored[name] = cursor
+	}
+	return nil
+}
+
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.
 // Tests that need a ControllerClient obtain it from Register's return value.

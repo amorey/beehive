@@ -45,8 +45,10 @@ func TestStartWithNoControllersSkipsWaker(t *testing.T) {
 // wakerOver builds a waker over a scripted write log, plus reconcilers for the
 // given kinds so a wake has somewhere to land. The Beehive is assembled by hand
 // rather than through New: these tests drive seed and scan directly, so nothing
-// should be running concurrently with the assertions.
-func wakerOver(store *replayStore, kinds ...GroupKind) (*waker, map[GroupKind]*reconciler) {
+// should be running concurrently with the assertions. It mirrors New's own
+// type-assertion, so a store double opts into the durable-cursor path exactly by
+// implementing DriverCursorer — nothing here has to say which.
+func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	order := make([]*reconciler, 0, len(kinds))
 	for _, gk := range kinds {
@@ -55,7 +57,8 @@ func wakerOver(store *replayStore, kinds ...GroupKind) (*waker, map[GroupKind]*r
 		order = append(order, r)
 	}
 	bh := &Beehive{store: store, reconcilers: rs, order: order}
-	bh.waker = &waker{bh: bh}
+	cursors, _ := store.(DriverCursorer)
+	bh.waker = &waker{bh: bh, cursors: cursors}
 	return bh.waker, rs
 }
 
@@ -64,7 +67,11 @@ func wakerOver(store *replayStore, kinds ...GroupKind) (*waker, map[GroupKind]*r
 // paying an edges lookup per page — the whole-world pass this design exists to
 // avoid — to wake dependents for changes that happened before the process began,
 // which the startup pass already covers.
-func TestWakerSeedsFromTheStoreCursor(t *testing.T) {
+//
+// *replayStore alone implements no DriverCursorer, so this is also the
+// no-capability fallback: it pins that a store which cannot persist a cursor
+// seeds exactly as it always did.
+func TestWakerSeedsFromTheWriteLogMax(t *testing.T) {
 	store := &replayStore{seed: 500, rows: replayRows(3)}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 
@@ -76,9 +83,63 @@ func TestWakerSeedsFromTheStoreCursor(t *testing.T) {
 	assert.Equal(t, []int64{500}, store.cursors(), "the first scan starts at the seed, not at zero")
 }
 
+// A store that implements DriverCursorer but has never persisted a cursor for
+// this waker seeds the same way a store with no capability at all does: there is
+// nothing stored to prefer over the write log's max.
+func TestWakerSeedsFromMaxWithoutAStoredCursor(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{seed: 500, rows: replayRows(3)}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+
+	dw.seed(context.Background())
+	require.True(t, dw.seeded)
+	assert.EqualValues(t, 500, dw.watermark, "no stored cursor: fall back to the write log's max")
+}
+
+// A restart resumes from the stored cursor rather than the write log's max, which
+// is the entire point: the interval the process was down for is still scanned.
+func TestWakerSeedsFromTheStoredCursor(t *testing.T) {
+	store := &cursorStore{
+		replayStore: replayStore{seed: 500, rows: replayRows(3)},
+		stored:      map[string]int64{cursorNameWaker: 200},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+
+	dw.seed(context.Background())
+	require.True(t, dw.seeded)
+	assert.EqualValues(t, 200, dw.watermark, "the stored cursor precedes the write log's max, so it wins")
+
+	dw.scan(context.Background())
+	assert.Equal(t, []int64{200}, store.cursors(), "the first scan resumes at the stored cursor")
+}
+
+// ObjectWritesMaxVersion is a max over live rows, so deleting the
+// highest-versioned object legitimately lowers it below a cursor the waker
+// really did process. A stored cursor above the mark is therefore not evidence
+// of a swapped or truncated database, and clamping to the mark rather than
+// resetting to zero is what makes replaying that case free: the next listing
+// asks for everything above the mark, which is empty by definition.
+func TestWakerClampsAStoredCursorAboveTheMark(t *testing.T) {
+	store := &cursorStore{
+		replayStore: replayStore{seed: 90, rows: replayRows(3)},
+		stored:      map[string]int64{cursorNameWaker: 100},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+
+	dw.seed(context.Background())
+	require.True(t, dw.seeded)
+	assert.EqualValues(t, 90, dw.watermark, "the mark clamps a stored cursor that overshoots it")
+
+	dw.scan(context.Background())
+	assert.Equal(t, []int64{90}, store.cursors(), "the scan asks for everything above the mark")
+	assert.Zero(t, store.read, "which is empty by definition, so nothing is walked")
+	assert.Zero(t, store.calls.Load(), "and no edges lookup is paid for")
+}
+
 // A seed that fails leaves the waker unseeded, and the next tick seeds instead of
 // scanning. Scanning would be the harmful choice: an unseeded watermark is zero,
-// so it would replay the whole table on the strength of a transient error.
+// so it would replay the whole table on the strength of a transient error. This
+// covers both reads seed makes: the write log's max and, when the store persists
+// one, the stored cursor.
 func TestWakerRetriesSeedOnTheNextTick(t *testing.T) {
 	store := &replayStore{seed: 500, seedErr: errBoom}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
@@ -92,6 +153,23 @@ func TestWakerRetriesSeedOnTheNextTick(t *testing.T) {
 
 	store.seedErr = nil
 	dw.scan(ctx)
+	require.True(t, dw.seeded)
+	assert.EqualValues(t, 500, dw.watermark)
+}
+
+// The same retry contract, for a failure reading the stored cursor rather than
+// the write log's max: nothing here can tell whether the stored value would have
+// mattered, so the safe answer is to try both reads again next tick.
+func TestWakerRetriesSeedOnAFailedCursorRead(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{seed: 500}, getErr: errBoom}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	ctx := context.Background()
+
+	dw.seed(ctx)
+	require.False(t, dw.seeded)
+
+	store.getErr = nil
+	dw.seed(ctx)
 	require.True(t, dw.seeded)
 	assert.EqualValues(t, 500, dw.watermark)
 }

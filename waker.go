@@ -37,11 +37,25 @@ import "context"
 type waker struct {
 	bh *Beehive
 
+	// cursors persists the watermark across restarts when the store supports it
+	// (see DriverCursorer). Nil leaves the waker on watermark alone, which is the
+	// in-memory-only behaviour that shipped before this field existed: every
+	// restart reseeds from ObjectWritesMaxVersion rather than resuming.
+	cursors DriverCursorer
+
 	// watermark is the highest resource_version this waker has processed. The cursor
 	// is store-wide, always increasing and never reused, so "everything above this"
 	// is exactly what changed since the last scan — however long ago that was, which
 	// is what lets a tick do the job of a stream.
 	watermark int64
+
+	// persisted is the watermark value last written through cursors. It seeds to
+	// the same value as watermark, never to zero: DriverCursorsSet already
+	// suppresses a write that does not advance its stored cursor, but only once
+	// that write reaches the store — without this, a clamped seed (stored above
+	// the write log's max) would pay a round trip every tick for a write the
+	// store then discards.
+	persisted int64
 
 	// seeded says the watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero. Seeding at startup keeps
@@ -49,6 +63,10 @@ type waker struct {
 	// this false so the next tick tries again.
 	seeded bool
 }
+
+// cursorNameWaker is this waker's key in driver_cursors. The table is shared
+// across drivers by name, though this is the only one today.
+const cursorNameWaker = "dependency_waker"
 
 // wakeScanPageCap bounds one scan page. The query itself is an indexed range scan
 // and cheap; the cost is round trips, since each page also runs an edges lookup that
@@ -74,17 +92,20 @@ func (dw *waker) run(ctx context.Context) {
 
 // seed takes the object write log's current high-water mark as the starting
 // watermark, so the first scan reports changes from startup rather than all
-// history. It reports whether it got
-// one. On failure the waker stays unseeded and the next tick tries again, taking the
-// cursor as of *then* — so a change committed in between is below the watermark and is
-// never scanned. The reconciler's startup pass covers that only for an object the
-// store records as owed; a settled dependent stranded in the window is found by the
-// stale-dependents pass instead, which is why this is now a latency gap rather than a
-// hole (the startup seed race in TODO.md is the same shape). Retrying is still right:
-// an unseeded watermark is zero, and scanning from there would replay every object
+// history — unless the store remembers a cursor from a previous run, in which
+// case that is where this scan resumes, so the interval the process was down
+// for is not skipped. It reports whether it got one. On failure the waker stays
+// unseeded and the next tick tries again, taking the cursor as of *then* — so a
+// change committed in between is below the watermark and is never scanned. The
+// reconciler's startup pass covers that only for an object the store records as
+// owed; a settled dependent stranded in the window is found by the
+// stale-dependents pass instead, which is why this is now a latency gap rather
+// than a hole (the startup seed race in TODO.md is the same shape, narrowed to a
+// fresh database with no cursor of its own yet). Retrying is still right: an
+// unseeded watermark is zero, and scanning from there would replay every object
 // ever written on the strength of a transient error.
 func (dw *waker) seed(ctx context.Context) bool {
-	cursor, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
+	max, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false // shutdown, not a loss
@@ -93,7 +114,30 @@ func (dw *waker) seed(ctx context.Context) bool {
 			"err", err)
 		return false
 	}
-	dw.watermark, dw.seeded = cursor, true
+
+	watermark := max
+	if dw.cursors != nil {
+		stored, ok, err := dw.cursors.DriverCursorsGet(ctx, cursorNameWaker)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next tick",
+				"err", err)
+			return false
+		}
+		// min(stored, max). A stored cursor above max is not evidence of a swapped
+		// or truncated database: max is a max over live rows, so deleting the
+		// highest-versioned object legitimately lowers it below a cursor the
+		// waker really did process. Clamping down costs nothing — the first scan
+		// asks for everything above max, which is empty by definition — where
+		// trusting a stored cursor past max would skip live writes between them.
+		if ok && stored < max {
+			watermark = stored
+		}
+	}
+
+	dw.watermark, dw.persisted, dw.seeded = watermark, watermark, true
 	return true
 }
 
