@@ -164,12 +164,12 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
 	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug: uniqueSlug(),
+		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
 	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug: uniqueSlug(),
+		Name: uniqueName(),
 		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
@@ -196,12 +196,12 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug: uniqueSlug(),
+		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
 	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug: uniqueSlug(),
+		Name: uniqueName(),
 		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
@@ -288,13 +288,13 @@ func TestClientCreate(t *testing.T) {
 	assert.Equal(t, int64(1), obj.Generation)
 	assert.Nil(t, obj.Status)
 	assert.Equal(t, "hello", obj.Spec.Val)
-	assert.Equal(t, "hello-1", obj.Slug, "the slug is required, so a created row always has one")
+	assert.Equal(t, "hello-1", obj.Name, "the name is required, so a created row always has one")
 }
 
-// The slug's UNIQUE constraint is unchanged by the move to a positional
-// argument — it was reachable only through WithSlug before, so it needs a test
+// The name's UNIQUE constraint is unchanged by the move to a positional
+// argument — it was reachable only through WithName before, so it needs a test
 // at the new signature.
-func TestClientCreateRejectsTakenSlug(t *testing.T) {
+func TestClientCreateRejectsTakenName(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -303,37 +303,37 @@ func TestClientCreateRejectsTakenSlug(t *testing.T) {
 
 	_, err = client.Create(ctx, "taken", cSpec{Val: "second"})
 
-	require.ErrorIs(t, err, ErrSlugTaken,
-		"a slug already held fails rather than returning the existing row, and says so matchably")
+	require.ErrorIs(t, err, ErrNameTaken,
+		"a name already held fails rather than returning the existing row, and says so matchably")
 }
 
-// A tombstone keeps the name reserved: the slug is not free until GC clears
-// finalizers and removes the row. Callers retrying on ErrSlugTaken need that to be
+// A tombstone keeps the name reserved: the name is not free until GC clears
+// finalizers and removes the row. Callers retrying on ErrNameTaken need that to be
 // the same error, or a delete-then-recreate looks like a different failure.
-func TestClientCreateReportsSlugTakenByATombstone(t *testing.T) {
+func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	// The finalizer keeps the tombstone around after Delete, so the slug is still
+	// The finalizer keeps the tombstone around after Delete, so the name is still
 	// held when Create runs.
 	mustCreate(t, ctx, client, "doomed", cSpec{Val: "first"}, WithFinalizers("test/hold"))
 	require.NoError(t, client.Delete(ctx, "doomed"))
 
 	_, err = client.Create(ctx, "doomed", cSpec{Val: "second"})
 
-	require.ErrorIs(t, err, ErrSlugTaken, "a deletion-pending row still holds its slug")
+	require.ErrorIs(t, err, ErrNameTaken, "a deletion-pending row still holds its name")
 }
 
-// The empty slug is the one footgun making the slug required creates rather than
-// inherits. Before, "no name" was spelled by passing no WithSlug; now every write
-// names something, and a slug read from unset configuration is "" — which under
-// the old contract was an ordinary slug, so every such caller would silently share
+// The empty name is the one footgun making the name required creates rather than
+// inherits. Before, "no name" was spelled by passing no WithName; now every write
+// names something, and a name read from unset configuration is "" — which under
+// the old contract was an ordinary name, so every such caller would silently share
 // one row. Rejecting it is a deliberate, narrow exception to "beehive does not
-// validate slugs".
-func TestClientRejectsEmptySlug(t *testing.T) {
+// validate names".
+func TestClientRejectsEmptyName(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -341,54 +341,54 @@ func TestClientRejectsEmptySlug(t *testing.T) {
 
 	t.Run("Create", func(t *testing.T) {
 		_, err := client.Create(ctx, "", cSpec{Val: "a"})
-		require.ErrorIs(t, err, ErrInvalidSlug)
+		require.ErrorIs(t, err, ErrInvalidName)
 	})
 	t.Run("GetOrCreate", func(t *testing.T) {
 		_, created, err := client.GetOrCreate(ctx, "", cSpec{Val: "a"})
-		require.ErrorIs(t, err, ErrInvalidSlug)
+		require.ErrorIs(t, err, ErrInvalidName)
 		assert.False(t, created)
 	})
 	t.Run("Update", func(t *testing.T) {
 		_, err := client.Update(ctx, "", cSpec{Val: "a"})
-		require.ErrorIs(t, err, ErrInvalidSlug)
+		require.ErrorIs(t, err, ErrInvalidName)
 	})
 	t.Run("Get", func(t *testing.T) {
 		// Not ErrNotFound: that would send the caller hunting for a missing row
 		// when what is missing is a config value.
 		_, err := client.Get(ctx, "")
-		require.ErrorIs(t, err, ErrInvalidSlug)
+		require.ErrorIs(t, err, ErrInvalidName)
 	})
 	t.Run("Delete", func(t *testing.T) {
 		// Delete folds absence to nil, so a silent nil here would be the worst
 		// possible answer — indistinguishable from a successful no-op.
-		require.ErrorIs(t, client.Delete(ctx, ""), ErrInvalidSlug)
+		require.ErrorIs(t, client.Delete(ctx, ""), ErrInvalidName)
 	})
 }
 
 // Rejection is caller-input validation, so it must not depend on store state:
 // the same call has to fail whether or not a row happens to exist, or the bug
 // stays hidden until a cold start or a GC sweep removes the row.
-func TestClientRejectsEmptySlugBeforeAnyStoreWork(t *testing.T) {
+func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	// An unmarshalable spec would also fail this call — assert the slug is checked
+	// An unmarshalable spec would also fail this call — assert the name is checked
 	// first, so the caller hears about the argument they actually got wrong.
 	bad := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, err = bad.Create(ctx, "", errMarshaler{})
-	require.ErrorIs(t, err, ErrInvalidSlug)
+	require.ErrorIs(t, err, ErrInvalidName)
 
 	after, err := client.List(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, after, "a rejected create writes nothing")
 }
 
-// The slug is the API's key and the id is the store's key, so the bare CRUD verbs
-// take the slug and the ByID siblings take the id. This pins both halves at once,
+// The name is the API's key and the id is the store's key, so the bare CRUD verbs
+// take the name and the ByID siblings take the id. This pins both halves at once,
 // because the interesting property is that they address different things.
-func TestClientCRUDIsSlugKeyedWithByIDSiblings(t *testing.T) {
+func TestClientCRUDIsNameKeyedWithByIDSiblings(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -396,22 +396,22 @@ func TestClientCRUDIsSlugKeyedWithByIDSiblings(t *testing.T) {
 
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "a"})
 
-	bySlug, err := client.Get(ctx, "prod")
+	byName, err := client.Get(ctx, "prod")
 	require.NoError(t, err)
 	byID, err := client.GetByID(ctx, created.ID)
 	require.NoError(t, err)
-	assert.Equal(t, created.ID, bySlug.ID)
+	assert.Equal(t, created.ID, byName.ID)
 	assert.Equal(t, created.ID, byID.ID)
 
-	// Absence splits the same way it always has: a slug folds to nil (idempotent),
+	// Absence splits the same way it always has: a name folds to nil (idempotent),
 	// an id reports ErrNotFound.
-	require.NoError(t, client.Delete(ctx, "no-such-slug"))
+	require.NoError(t, client.Delete(ctx, "no-such-name"))
 	require.ErrorIs(t, client.DeleteByID(ctx, 99999), ErrNotFound)
 
 	require.NoError(t, client.Delete(ctx, "prod"))
 	got, err := client.GetByID(ctx, created.ID)
 	require.NoError(t, err)
-	assert.NotNil(t, got.DeletionRequestedAt, "the slug-keyed delete marked the row")
+	assert.NotNil(t, got.DeletionRequestedAt, "the name-keyed delete marked the row")
 }
 
 // A finalizer on a kind with no controller is unclearable, not merely useless:
@@ -439,7 +439,7 @@ func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 
 // GetOrCreate takes the same options, so it makes the same check — on the branch
 // that would actually insert and on the one that would not, since resolving
-// happens before the slug lookup.
+// happens before the name lookup.
 func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -495,17 +495,17 @@ func TestClientCreateWithOptions(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// An owner must exist before a child can ref it.
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 
 	child, err := client.Create(ctx, "child-1", cSpec{Val: "child"},
 		WithFinalizers("cleanup-a", "cleanup-b"),
 		WithOwner(owner.ID))
 	require.NoError(t, err)
 
-	assert.Equal(t, "child-1", child.Slug)
+	assert.Equal(t, "child-1", child.Name)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, child.Finalizers)
 
-	// Slug is persisted and looked up via Get.
+	// Name is persisted and looked up via Get.
 	got, err := client.Get(ctx, "child-1")
 	require.NoError(t, err)
 	assert.Equal(t, child.ID, got.ID)
@@ -540,7 +540,7 @@ func TestClientGetByID(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	got, err := client.GetByID(ctx, created.ID)
 	require.NoError(t, err)
@@ -549,7 +549,7 @@ func TestClientGetByID(t *testing.T) {
 	assert.Nil(t, got.Status)
 }
 
-func TestClientGetAbsentSlug(t *testing.T) {
+func TestClientGetAbsentName(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -565,8 +565,8 @@ func TestClientList(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
 	list, err := client.List(ctx)
 	require.NoError(t, err)
@@ -581,7 +581,7 @@ func TestClientUpdateByID(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "v1"})
+	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
 
 	updated, err := client.UpdateByID(ctx, created.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
@@ -600,7 +600,7 @@ func TestClientGetOrCreateCreates(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, created)
 	assert.NotZero(t, obj.ID)
-	assert.Equal(t, "w1", obj.Slug)
+	assert.Equal(t, "w1", obj.Name)
 	assert.Equal(t, int64(1), obj.Generation)
 	assert.Equal(t, "a", obj.Spec.Val)
 
@@ -634,7 +634,7 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	// The finalizer keeps the tombstone around after Delete, so the slug is still
+	// The finalizer keeps the tombstone around after Delete, so the name is still
 	// held by a deletion-pending row when GetOrCreate runs.
 	orig := mustCreate(t, ctx, client, "w1", cSpec{Val: "a"}, WithFinalizers("test/hold"))
 	require.NoError(t, client.DeleteByID(ctx, orig.ID))
@@ -685,7 +685,7 @@ func (badDecodeSpec) MarshalJSON() ([]byte, error) { return []byte(`"not-an-obje
 // TestClientGetOrCreateRollsBackOnDecodeError pins validate-before-commit: the new
 // row is decoded inside the Within, so bytes that don't round-trip roll the insert
 // back instead of committing a poison row. The call returns (nil, false, err) —
-// created=false because nothing landed — and the slug is left free, so a retry does
+// created=false because nothing landed — and the name is left free, so a retry does
 // not hit a spurious UNIQUE on a phantom row.
 func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
@@ -700,9 +700,9 @@ func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 	assert.Nil(t, obj)
 	assert.False(t, created, "a rolled-back create must report created=false")
 
-	// Nothing committed: the slug is still absent, so a second attempt takes the
+	// Nothing committed: the name is still absent, so a second attempt takes the
 	// create branch again (not the found branch) and likewise rolls back.
-	_, err = store.ObjectsGetBySlug(ctx, gk, "w1")
+	_, err = store.ObjectsGetByName(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 	_, created, err = client.GetOrCreate(ctx, "w1", badDecodeSpec{Val: "b"})
 	require.Error(t, err)
@@ -730,7 +730,7 @@ func TestClientCreateRollsBackOnDecodeError(t *testing.T) {
 	assert.Nil(t, obj)
 	assert.Empty(t, queuedIDs(r.work), "a rolled-back create must not wake the reconciler")
 
-	_, err = store.ObjectsGetBySlug(ctx, gk, "w1")
+	_, err = store.ObjectsGetByName(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 }
 
@@ -765,7 +765,7 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	require.True(t, ok)
 	client := NewClient[conditionalBadSpec, cStatus](bh, gk)
 
-	orig := mustCreate(t, ctx, client, uniqueSlug(), conditionalBadSpec{Val: "good"})
+	orig := mustCreate(t, ctx, client, uniqueName(), conditionalBadSpec{Val: "good"})
 	drainQueue(r.work)
 	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
@@ -970,7 +970,7 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"}, WithFinalizers("test/hold"))
+		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithFinalizers("test/hold"))
 
 		cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 		err = cc.Within(ctx, func(ctx context.Context) error {
@@ -1001,7 +1001,7 @@ func TestClientGetOrCreateWithOwner(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 
 	child, created, err := client.GetOrCreate(ctx, "child-1", cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
@@ -1044,7 +1044,7 @@ func TestClientGetOrCreateMarshalError(t *testing.T) {
 
 func TestClientGetOrCreateStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&slugErrorStore{})
+	bh, err := New(&nameErrorStore{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1133,7 +1133,7 @@ func TestClientDeleteByID(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created := mustCreate(t, ctx, client, uniqueSlug(), cSpec{})
+	created := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 
 	err = client.DeleteByID(ctx, created.ID)
 	require.NoError(t, err)
@@ -1213,7 +1213,7 @@ func TestClientDeleteAlreadyDeleting(t *testing.T) {
 
 // the sweeper's registered-kind branch: the object must be handed to its controller
 // to clear finalizers, the one part of Delete's tail Delete still runs itself
-// now that the store resolves and marks in one statement. A slug that matches no
+// now that the store resolves and marks in one statement. A name that matches no
 // row must wake nobody.
 func TestClientDeleteMarksForCollection(t *testing.T) {
 	ctx := context.Background()
@@ -1235,10 +1235,10 @@ func TestClientDeleteMarksForCollection(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, "absent"))
 	pending, err = store.DeletionRequestsList(ctx)
 	require.NoError(t, err)
-	assert.Len(t, pending, 1, "an unresolved slug marks nothing")
+	assert.Len(t, pending, 1, "an unresolved name marks nothing")
 }
 
-// A slug is per-kind, so another kind's row holding the same slug is invisible:
+// A name is per-kind, so another kind's row holding the same name is invisible:
 // Delete reports success (nothing of this kind to delete) and leaves it be.
 func TestClientDeleteKindScoped(t *testing.T) {
 	ctx := context.Background()
@@ -1259,7 +1259,7 @@ func TestClientDeleteKindScoped(t *testing.T) {
 
 func TestClientDeleteStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&requestDeletionBySlugErrorStore{})
+	bh, err := New(&requestDeletionByNameErrorStore{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1278,7 +1278,7 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 
-	w := mustCreate(t, ctx, widgets, uniqueSlug(), cSpec{Val: "v1"})
+	w := mustCreate(t, ctx, widgets, uniqueName(), cSpec{Val: "v1"})
 
 	// The Gadget client must not see or mutate the Widget by its id.
 	_, err = gadgets.GetByID(ctx, w.ID)
@@ -1332,33 +1332,33 @@ func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind,
 	return nil, errBoom
 }
 
-// slugErrorStore returns a non-NotFound error from ObjectsGetBySlug, driving
+// nameErrorStore returns a non-NotFound error from ObjectsGetByName, driving
 // GetOrCreate's read-error branch.
-type slugErrorStore struct {
+type nameErrorStore struct {
 	fakeStore
 }
 
-func (s *slugErrorStore) ObjectsGetBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *nameErrorStore) ObjectsGetByName(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, errBoom
 }
 
-// requestDeletionBySlugErrorStore fails the slug-keyed deletion request.
-type requestDeletionBySlugErrorStore struct {
+// requestDeletionByNameErrorStore fails the name-keyed deletion request.
+type requestDeletionByNameErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionBySlugErrorStore) DeletionRequestsCreateBySlug(_ context.Context, _ GroupKind, _ string) (bool, error) {
+func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (bool, error) {
 	return false, errBoom
 }
 
 // getOrCreateBadJSONStore drives GetOrCreate's rawToTyped error path: the
-// slug is absent (NotFound) so the create branch runs, and ObjectsCreate returns
+// name is absent (NotFound) so the create branch runs, and ObjectsCreate returns
 // undecodable spec bytes.
 type getOrCreateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *getOrCreateBadJSONStore) ObjectsGetBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *getOrCreateBadJSONStore) ObjectsGetByName(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, ErrNotFound
 }
 
@@ -1367,7 +1367,7 @@ func (s *getOrCreateBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, 
 }
 
 // createErrorStore drives the create branch's write-error path: it borrows
-// getOrCreateBadJSONStore's absent-slug lookup so the insert runs, but fails
+// getOrCreateBadJSONStore's absent-name lookup so the insert runs, but fails
 // the insert instead of returning an undecodable row.
 type createErrorStore struct {
 	getOrCreateBadJSONStore
@@ -1505,7 +1505,7 @@ func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	evt := recv(t, ch)
 	assert.Equal(t, Added, evt.Type)
@@ -1524,7 +1524,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "v1"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
 	// Drain the Added event from Create.
 	recv(t, ch)
 
@@ -1547,7 +1547,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 	// Drain the Added event from Create.
 	recv(t, ch)
 
@@ -1568,7 +1568,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 	recv(t, ch) // drain Added
 
 	require.NoError(t, client.DeleteByID(ctx, obj.ID))
@@ -1588,7 +1588,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	// And on the stream: a fresh object gives the poller something it *must* report,
 	// so anything the idempotent delete emitted has to show up at or before that
 	// frame. Reading until the Added arrives therefore sees every stray there is.
-	other := mustCreate(t, ctx, client, uniqueSlug(), cSpec{})
+	other := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 	evt := recv(t, ch)
 	require.Equal(t, other.ID, evt.Object.ID, "unexpected event on idempotent delete: %v", evt.Type)
 	assert.Equal(t, Added, evt.Type)
@@ -1600,8 +1600,8 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	obj1 := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	obj2 := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	obj1 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	obj2 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
 	ch, err := client.ObjectsWatch(ctx, obj1.ID)
 	require.NoError(t, err)
@@ -1672,7 +1672,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 		_ = stop(stopCtx)
 	}()
 
-	obj := mustCreate(t, ctx, client2, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client2, uniqueName(), cSpec{Val: "x"})
 
 	// Subscribe after create: the snapshot emits Added(obj) first, then we
 	// expect Modified from UpdateStatus.
@@ -1699,8 +1699,8 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -1722,7 +1722,7 @@ func TestWatchInitialSnapshot(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -1777,8 +1777,8 @@ func TestClientGetOwner(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
-	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	got, ok, err := client.OwnersGet(ctx, child.ID)
 	require.NoError(t, err)
@@ -1812,7 +1812,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, addEdge(ctx, store, a.ID, a.ID, RelationDependsOn))
 
 	dependents, err := client.DependentsList(ctx, a.ID)
@@ -1833,9 +1833,9 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
-	c := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "c"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
+	c := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "c"})
 
 	// a depends on b and c.
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
@@ -1863,9 +1863,9 @@ func TestClientListOwned(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
-	c1 := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "c1"}, WithOwner(owner.ID))
-	c2 := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "c2"}, WithOwner(owner.ID))
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	c1 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "c1"}, WithOwner(owner.ID))
+	c2 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "c2"}, WithOwner(owner.ID))
 
 	owned, err := client.OwnedList(ctx, owner.ID)
 	require.NoError(t, err)
@@ -1894,10 +1894,10 @@ func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus],
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 
-	owner := mustCreate(t, ctx, owners, uniqueSlug(), cSpec{Val: "owner"})
-	w1 := mustCreate(t, ctx, widgets, uniqueSlug(), cSpec{Val: "w1"}, WithOwner(owner.ID))
-	w2 := mustCreate(t, ctx, widgets, uniqueSlug(), cSpec{Val: "w2"}, WithOwner(owner.ID))
-	mustCreate(t, ctx, gadgets, uniqueSlug(), cSpec{Val: "g1"}, WithOwner(owner.ID))
+	owner := mustCreate(t, ctx, owners, uniqueName(), cSpec{Val: "owner"})
+	w1 := mustCreate(t, ctx, widgets, uniqueName(), cSpec{Val: "w1"}, WithOwner(owner.ID))
+	w2 := mustCreate(t, ctx, widgets, uniqueName(), cSpec{Val: "w2"}, WithOwner(owner.ID))
+	mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "g1"}, WithOwner(owner.ID))
 
 	return ctx, owners, widgets, owner.ID, []*Object[cSpec, cStatus]{w1, w2}
 }
@@ -1950,7 +1950,7 @@ func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
 	ctx, owners, widgets, _, _ := ownedObjectsFixture(t)
 
 	// A second owner, so the fixture's children don't crowd the assertion.
-	owner := mustCreate(t, ctx, owners, uniqueSlug(), cSpec{Val: "owner2"})
+	owner := mustCreate(t, ctx, owners, uniqueName(), cSpec{Val: "owner2"})
 	// The finalizer holds the row after Delete, leaving it deletion-pending.
 	child, err := widgets.Create(ctx, "w1", cSpec{Val: "w1"},
 		WithOwner(owner.ID), WithFinalizers("test/hold"))
@@ -2050,8 +2050,8 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
-	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	// Without the selector the owner is not loaded — accessing it errors.
 	plain, err := client.GetByID(ctx, child.ID)
@@ -2068,10 +2068,10 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	assert.Equal(t, owner.ID, ref.ID)
 
 	// Get honours selectors too.
-	mustCreate(t, ctx, client, "s1", cSpec{Val: "slugged"}, WithOwner(owner.ID))
-	bySlug, err := client.Get(ctx, "s1", LoadOwner())
+	mustCreate(t, ctx, client, "s1", cSpec{Val: "named"}, WithOwner(owner.ID))
+	byName, err := client.Get(ctx, "s1", LoadOwner())
 	require.NoError(t, err)
-	ref, ok, err = bySlug.Owner()
+	ref, ok, err = byName.Owner()
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, owner.ID, ref.ID)
@@ -2102,7 +2102,7 @@ func TestClientListWithLoadOwnerBatches(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 	const n = 5
 	for i := 0; i < n; i++ {
 		mustCreate(t, ctx, client, fmt.Sprintf("child-%d", i), cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
@@ -2131,7 +2131,7 @@ func TestClientLoadsOwned(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 	const n = 3
 	var childIDs []ObjectID
 	for i := 0; i < n; i++ {
@@ -2180,8 +2180,8 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn)) // a depends on b
 
 	got, err := client.GetByID(ctx, a.ID, LoadDependencies(), LoadDependents())
@@ -2207,8 +2207,8 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
 
 	objs, err := client.List(ctx, LoadDependencies(), LoadDependents())
@@ -2292,7 +2292,7 @@ func TestClientLazyRefsMissingIDReadsEmpty(t *testing.T) {
 	assert.Empty(t, owned)
 }
 
-// getBadJSONStore returns an undecodable spec from the scoped and slug-keyed
+// getBadJSONStore returns an undecodable spec from the scoped and name-keyed
 // reads, driving the decode-error branch of Client.Get / Client.GetByID.
 type getBadJSONStore struct {
 	fakeStore
@@ -2302,7 +2302,7 @@ type getBadJSONStore struct {
 func (s *getBadJSONStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
 	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
 }
-func (s *getBadJSONStore) ObjectsGetBySlug(context.Context, GroupKind, string) (*RawObject, error) {
+func (s *getBadJSONStore) ObjectsGetByName(context.Context, GroupKind, string) (*RawObject, error) {
 	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
 }
 
@@ -2339,7 +2339,7 @@ func TestClientRequeueNoController(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	err = client.Requeue(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
@@ -2366,7 +2366,7 @@ func TestClientRequeue(t *testing.T) {
 			require.NoError(t, err)
 
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
-			obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 			r := bh.reconcilers[clientTestGK]
 			// Drain the enqueue Create produced, and seed a backoff entry so the
@@ -2416,7 +2416,7 @@ func TestClientGetScheduleScheduled(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	// Drain the create-time enqueue so only the future schedule remains.
 	r := bh.reconcilers[clientTestGK]
@@ -2439,7 +2439,7 @@ func TestClientGetScheduleUnscheduled(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
@@ -2458,7 +2458,7 @@ func TestClientGetScheduleNoController(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	s, err := client.SchedulesGet(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2477,7 +2477,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	// Drain the create-time enqueue and schedule a future requeue before watching.
 	r := bh.reconcilers[clientTestGK]
@@ -2504,7 +2504,7 @@ func TestClientWatchScheduleLive(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
@@ -2545,7 +2545,7 @@ func TestClientWatchScheduleNoController(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	_, err = client.SchedulesWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
@@ -2576,7 +2576,7 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	_, err = client.EventsList(ctx, obj.ID)
 	assert.ErrorIs(t, err, errBoom)
@@ -2596,7 +2596,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	got, err := client.EventsList(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2615,7 +2615,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	cluster := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "prod"})
+	cluster := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "prod"})
 
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
@@ -2678,7 +2678,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
@@ -2704,8 +2704,8 @@ func TestClientListLoadsEvents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
-	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	_, err = store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
 	_, err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
@@ -2732,7 +2732,7 @@ func TestClientListEvents(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	rec := func(cat, typ, reason string) {
 		_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
@@ -2763,7 +2763,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
@@ -2789,7 +2789,7 @@ func TestClientWatchEvents(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2842,20 +2842,20 @@ func TestEventFromRaw(t *testing.T) {
 	assert.Equal(t, last, e.LastAt)
 }
 
-// Update joins the slug-keyed family: leaving it out would split the CRUD set,
+// Update joins the name-keyed family: leaving it out would split the CRUD set,
 // letting a caller create, read and delete by name but forcing an id to write.
-func TestClientUpdateIsSlugKeyedWithByIDSibling(t *testing.T) {
+func TestClientUpdateIsNameKeyedWithByIDSibling(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
 
-	bySlug, err := client.Update(ctx, "prod", cSpec{Val: "v2"})
+	byName, err := client.Update(ctx, "prod", cSpec{Val: "v2"})
 	require.NoError(t, err)
-	assert.Equal(t, created.ID, bySlug.ID)
-	assert.Equal(t, "v2", bySlug.Spec.Val)
-	assert.Equal(t, int64(2), bySlug.Generation, "a real spec change bumps generation")
+	assert.Equal(t, created.ID, byName.ID)
+	assert.Equal(t, "v2", byName.Spec.Val)
+	assert.Equal(t, int64(2), byName.Generation, "a real spec change bumps generation")
 
 	byID, err := client.UpdateByID(ctx, created.ID, cSpec{Val: "v3"})
 	require.NoError(t, err)
@@ -2864,17 +2864,17 @@ func TestClientUpdateIsSlugKeyedWithByIDSibling(t *testing.T) {
 
 // Unlike Delete, a missing row is not "already in the desired state" — there is
 // nothing to write the spec onto — so Update reports absence both ways.
-func TestClientUpdateAbsentSlugIsNotFound(t *testing.T) {
+func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.Update(ctx, "no-such-slug", cSpec{Val: "v1"})
+	_, err = client.Update(ctx, "no-such-name", cSpec{Val: "v1"})
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// A slug is unique only within a GroupKind, so the slug-keyed update must fold
+// A name is unique only within a GroupKind, so the name-keyed update must fold
 // the kind into its own lookup rather than trusting the caller's.
 func TestClientUpdateIsKindScoped(t *testing.T) {
 	ctx := context.Background()
@@ -2886,7 +2886,7 @@ func TestClientUpdateIsKindScoped(t *testing.T) {
 	w := mustCreate(t, ctx, widgets, "shared", cSpec{Val: "widget"})
 
 	_, err = gadgets.Update(ctx, "shared", cSpec{Val: "gadget"})
-	require.ErrorIs(t, err, ErrNotFound, "another kind's row holding the same slug is not this client's to write")
+	require.ErrorIs(t, err, ErrNotFound, "another kind's row holding the same name is not this client's to write")
 
 	unchanged, err := widgets.GetByID(ctx, w.ID)
 	require.NoError(t, err)
@@ -2895,16 +2895,16 @@ func TestClientUpdateIsKindScoped(t *testing.T) {
 
 // The ABA contract, both directions. This is the executable form of the promise
 // the README used to make — "everything after the create takes an ObjectID, so a
-// delete and recreate under the same slug can't make you act on the wrong row" —
-// which the slug-keyed CRUD surface retires. What replaces it is a split, and a
+// delete and recreate under the same name can't make you act on the wrong row" —
+// which the name-keyed CRUD surface retires. What replaces it is a split, and a
 // split is only real if both halves are pinned:
 //
-//	a slug-keyed call acts on whatever holds that slug NOW, or reports absence;
+//	a name-keyed call acts on whatever holds that name NOW, or reports absence;
 //	an id-keyed call acts on that ONE incarnation, or returns ErrNotFound.
 //
 // Without this test the contract is prose, and a resolve-then-write regression in
 // either mutator would pass everything else in the suite.
-func TestClientSlugKeyedWritesFollowTheSlugAcrossARecreate(t *testing.T) {
+func TestClientNameKeyedWritesFollowTheNameAcrossARecreate(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -2913,20 +2913,20 @@ func TestClientSlugKeyedWritesFollowTheSlugAcrossARecreate(t *testing.T) {
 	first := mustCreate(t, ctx, client, "prod", cSpec{Val: "first"})
 
 	// Retire the first incarnation completely. Until GC collects it the tombstone
-	// still holds the slug's UNIQUE constraint, so the recreate below could not
+	// still holds the name's UNIQUE constraint, so the recreate below could not
 	// even happen — which is what makes this window narrow in practice.
 	require.NoError(t, client.Delete(ctx, "prod"))
 	collected, err := bh.gcCollect(ctx, first.ID)
 	require.NoError(t, err)
-	require.True(t, collected, "the row must be physically gone before the slug is free")
+	require.True(t, collected, "the row must be physically gone before the name is free")
 
 	second := mustCreate(t, ctx, client, "prod", cSpec{Val: "second"})
 	require.NotEqual(t, first.ID, second.ID, "AUTOINCREMENT never reuses an id")
 
-	// The slug follows the name to the live incarnation.
+	// The name follows the name to the live incarnation.
 	updated, err := client.Update(ctx, "prod", cSpec{Val: "third"})
 	require.NoError(t, err)
-	assert.Equal(t, second.ID, updated.ID, "the slug-keyed write landed on whatever holds the slug now")
+	assert.Equal(t, second.ID, updated.ID, "the name-keyed write landed on whatever holds the name now")
 
 	// The id still means the incarnation it always meant, which no longer exists.
 	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "resurrect"})
@@ -2935,36 +2935,36 @@ func TestClientSlugKeyedWritesFollowTheSlugAcrossARecreate(t *testing.T) {
 	_, err = client.GetByID(ctx, first.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 
-	// The delete pair splits the same way: the slug deletes the live row, the dead
+	// The delete pair splits the same way: the name deletes the live row, the dead
 	// id reports absence rather than silently succeeding.
 	require.ErrorIs(t, client.DeleteByID(ctx, first.ID), ErrNotFound)
 	require.NoError(t, client.Delete(ctx, "prod"))
 	live, err := client.GetByID(ctx, second.ID)
 	require.NoError(t, err)
-	assert.NotNil(t, live.DeletionRequestedAt, "the slug-keyed delete marked the live incarnation")
+	assert.NotNil(t, live.DeletionRequestedAt, "the name-keyed delete marked the live incarnation")
 }
 
-// resolveProbeStore records whether anything asked it to resolve a slug to a row.
-// A slug-keyed write must not be composed as "look the slug up, then write by the
+// resolveProbeStore records whether anything asked it to resolve a name to a row.
+// A name-keyed write must not be composed as "look the name up, then write by the
 // id it returned": those are two store calls with no transaction across them, so a
-// concurrent collect could retire the row and hand its slug to a replacement in
+// concurrent collect could retire the row and hand its name to a replacement in
 // between, landing the write on an incarnation the caller never named.
 type resolveProbeStore struct {
 	Store
 	resolved atomic.Bool
 }
 
-func (s *resolveProbeStore) ObjectsGetBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error) {
+func (s *resolveProbeStore) ObjectsGetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
 	s.resolved.Store(true)
-	return s.Store.ObjectsGetBySlug(ctx, gk, slug)
+	return s.Store.ObjectsGetByName(ctx, gk, name)
 }
 
 // The single-threaded ABA test above cannot catch a resolve-then-write Update:
 // with no concurrent collect to interleave, composing the two calls lands on the
-// same row and every assertion passes. So pin the shape directly — the slug goes
-// to the store's own slug-keyed mutator, which resolves and writes inside one
+// same row and every assertion passes. So pin the shape directly — the name goes
+// to the store's own name-keyed mutator, which resolves and writes inside one
 // transaction.
-func TestClientUpdateDoesNotResolveTheSlugSeparately(t *testing.T) {
+func TestClientUpdateDoesNotResolveTheNameSeparately(t *testing.T) {
 	ctx := context.Background()
 	probe := &resolveProbeStore{Store: newClientTestStore(t)}
 	bh, err := New(probe)
@@ -2977,15 +2977,15 @@ func TestClientUpdateDoesNotResolveTheSlugSeparately(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.False(t, probe.resolved.Load(),
-		"Update resolved the slug through a separate store read; it must go through ObjectsUpdateSpecBySlug, which resolves and writes in one transaction")
+		"Update resolved the name through a separate store read; it must go through ObjectsUpdateSpecByName, which resolves and writes in one transaction")
 }
 
-// The generate-and-retry loop GenerateSlug's doc recommends, exercised against a
+// The generate-and-retry loop GenerateName's doc recommends, exercised against a
 // real collision. Forced rather than waited for: a genuine UUIDv7 collision is
 // ~10^-15, so the only way this loop is ever executed is a stubbed generator — which
 // is also the failure it exists to insure against, since generation degenerating is
 // far likelier than luck running out.
-func TestGenerateSlugRetryLoopSurvivesACollision(t *testing.T) {
+func TestGenerateNameRetryLoopSurvivesACollision(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -3006,7 +3006,7 @@ func TestGenerateSlugRetryLoopSurvivesACollision(t *testing.T) {
 	var last *Object[cSpec, cStatus]
 	for range len(names) {
 		obj, err := client.Create(ctx, next(), cSpec{Val: "v"})
-		if errors.Is(err, ErrSlugTaken) {
+		if errors.Is(err, ErrNameTaken) {
 			continue
 		}
 		require.NoError(t, err)
@@ -3019,73 +3019,73 @@ func TestGenerateSlugRetryLoopSurvivesACollision(t *testing.T) {
 	all, err := client.List(ctx)
 	require.NoError(t, err)
 	assert.Len(t, all, 2)
-	assert.Equal(t, "cache-unique", last.Slug)
+	assert.Equal(t, "cache-unique", last.Name)
 }
 
 // The README/godoc example, compiled so it cannot drift into not building.
-func TestGenerateSlugDocExampleCompiles(t *testing.T) {
+func TestGenerateNameDocExampleCompiles(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	obj, err := client.Create(ctx, GenerateSlug("cache"), cSpec{Val: "v"})
+	obj, err := client.Create(ctx, GenerateName("cache"), cSpec{Val: "v"})
 	require.NoError(t, err)
-	assert.True(t, strings.HasPrefix(obj.Slug, "cache-"))
+	assert.True(t, strings.HasPrefix(obj.Name, "cache-"))
 }
 
-// GenerateSlug is for callers with no natural name. It is deliberately explicit —
-// nothing generates a slug for you — because a name the caller never chose is one
-// nobody can look up, which is the NULL slug in a costume.
-func TestGenerateSlugKeepsThePrefixAndIsUnique(t *testing.T) {
+// GenerateName is for callers with no natural name. It is deliberately explicit —
+// nothing generates a name for you — because a name the caller never chose is one
+// nobody can look up, which is the NULL name in a costume.
+func TestGenerateNameKeepsThePrefixAndIsUnique(t *testing.T) {
 	const n = 10_000
 	seen := make(map[string]struct{}, n)
 	for range n {
-		slug := GenerateSlug("cache")
-		require.True(t, strings.HasPrefix(slug, "cache-"), "the prefix is the caller's, kept verbatim: %q", slug)
-		require.Len(t, slug, len("cache-")+36, "a UUIDv7 suffix is 36 characters")
-		_, dup := seen[slug]
-		require.False(t, dup, "generated a slug twice: %q", slug)
-		seen[slug] = struct{}{}
+		name := GenerateName("cache")
+		require.True(t, strings.HasPrefix(name, "cache-"), "the prefix is the caller's, kept verbatim: %q", name)
+		require.Len(t, name, len("cache-")+36, "a UUIDv7 suffix is 36 characters")
+		_, dup := seen[name]
+		require.False(t, dup, "generated a name twice: %q", name)
+		seen[name] = struct{}{}
 	}
 }
 
-// UUIDv7 leads with a 48-bit millisecond timestamp, so slugs sharing a prefix sort
+// UUIDv7 leads with a 48-bit millisecond timestamp, so names sharing a prefix sort
 // lexicographically by creation time. google/uuid's NewV7 also carries a monotonic
 // 12-bit sub-millisecond counter, which makes that ordering strict within a process
 // rather than merely likely — two calls in the same millisecond still order.
-func TestGenerateSlugSortsByCreationTime(t *testing.T) {
+func TestGenerateNameSortsByCreationTime(t *testing.T) {
 	var prev string
 	for range 1000 {
-		slug := GenerateSlug("cache")
+		name := GenerateName("cache")
 		if prev != "" {
-			require.Greater(t, slug, prev, "each slug must sort after the one before it")
+			require.Greater(t, name, prev, "each name must sort after the one before it")
 		}
-		prev = slug
+		prev = name
 	}
 }
 
-// The empty prefix is allowed: the result is still a valid, non-empty slug, so
-// there is nothing for ErrInvalidSlug to catch. A caller who wants no prefix should
+// The empty prefix is allowed: the result is still a valid, non-empty name, so
+// there is nothing for ErrInvalidName to catch. A caller who wants no prefix should
 // not have to invent one.
-func TestGenerateSlugAcceptsAnEmptyPrefix(t *testing.T) {
-	slug := GenerateSlug("")
-	assert.NotEmpty(t, slug)
-	assert.NoError(t, checkSlug(slug))
+func TestGenerateNameAcceptsAnEmptyPrefix(t *testing.T) {
+	name := GenerateName("")
+	assert.NotEmpty(t, name)
+	assert.NoError(t, checkName(name))
 }
 
-// GenerateSlug's error branch is unreachable in production — io.ReadFull of 16
+// GenerateName's error branch is unreachable in production — io.ReadFull of 16
 // bytes from a 16-byte reader cannot come up short — but the branch has to stay,
-// because the value behind a swallowed error is uuid.Nil, and every slug collapsing
-// to one constant would surface as ErrSlugTaken on every create after the first. So
+// because the value behind a swallowed error is uuid.Nil, and every name collapsing
+// to one constant would surface as ErrNameTaken on every create after the first. So
 // pin that it panics rather than returning that constant.
-func TestGenerateSlugPanicsRatherThanReturningTheNilUUID(t *testing.T) {
+func TestGenerateNamePanicsRatherThanReturningTheNilUUID(t *testing.T) {
 	orig := newUUIDv7
 	t.Cleanup(func() { newUUIDv7 = orig })
 	newUUIDv7 = func(io.Reader) (uuid.UUID, error) { return uuid.Nil, errBoom }
 
 	assert.PanicsWithValue(t,
 		"beehive: unreachable: UUIDv7 from a 16-byte reader: "+errBoom.Error(),
-		func() { GenerateSlug("cache") },
-		"a swallowed error would make every slug identical")
+		func() { GenerateName("cache") },
+		"a swallowed error would make every name identical")
 }

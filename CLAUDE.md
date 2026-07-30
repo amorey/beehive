@@ -108,29 +108,29 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on its
   own. Mutators self-wrap in `Within` and scope id-keyed writes to the caller's
   `GroupKind`, returning `ErrWrongKind` otherwise. Use `ControllerClient.Within` when
-  several writes must land together. The slug-keyed create/delete writes (`Create`,
-  `GetOrCreate`, `Delete`) differ only in what they do when the slug is taken, and
-  **none of them writes to a row it found** — there is no slug-keyed upsert, so
+  several writes must land together. The name-keyed create/delete writes (`Create`,
+  `GetOrCreate`, `Delete`) differ only in what they do when the name is taken, and
+  **none of them writes to a row it found** — there is no name-keyed upsert, so
   changing an existing object is always `Update`. **No write schedules anything**: a spec write bumps the
   generation that the owed pass lists, a delete sets the `deletion_requested_at` that the
   sweeper lists. `Store.AfterCommit` exists for one thing, the `WithOnCreate` hook.
-  → [ADR](docs/adr/2026-07-27-slug-keyed-writes.md)
-- **The slug is the `Client` API's key; the id is the store's key.** The bare CRUD
-  verbs take a slug; `GetByID`/`UpdateByID`/`DeleteByID` take an id. A slug-keyed
-  call acts on whatever holds the slug *now*, or reports absence; an id-keyed call
+  → [ADR](docs/adr/2026-07-27-name-keyed-writes.md)
+- **The name is the `Client` API's key; the id is the store's key.** The bare CRUD
+  verbs take a name; `GetByID`/`UpdateByID`/`DeleteByID` take an id. A name-keyed
+  call acts on whatever holds the name *now*, or reports absence; an id-keyed call
   acts on that one incarnation, or returns `ErrNotFound` — so **read-modify-write
   goes through `UpdateByID`**. Nothing below `Client` is re-keyed: every foreign key
   stays `INTEGER REFERENCES objects(id)`, because `AUTOINCREMENT` ids are never
-  reused and slugs are reusable by design. The slug is required (`NOT NULL` in
+  reused and names are reusable by design. The name is required (`NOT NULL` in
   `0001_init.sql`), immutable and opaque, with one exception — `""` is rejected with
-  `ErrInvalidSlug`, since it is what unset configuration reads as rather than a name
+  `ErrInvalidName`, since it is what unset configuration reads as rather than a name
   anyone chose — enforced in the store (the sentinel lives in `storeapi`), not just
-  the client, because `Store` is a public extension point. A taken slug is
-  `ErrSlugTaken`, tombstones included; `GenerateSlug(prefix)` builds one from a
+  the client, because `Store` is a public extension point. A taken name is
+  `ErrNameTaken`, tombstones included; `GenerateName(prefix)` builds one from a
   UUIDv7 for callers with no natural name, explicitly and never implicitly, and
-  callers bound-retry on that sentinel rather than trusting the odds. The store keeps its `…BySlug` suffixes: there the id really is the
-  key and the slug methods really are the qualified variant.
-  → [ADR](docs/adr/2026-07-30-slug-primary-key.md)
+  callers bound-retry on that sentinel rather than trusting the odds. The store keeps its `…ByName` suffixes: there the id really is the
+  key and the name methods really are the qualified variant.
+  → [ADR](docs/adr/2026-07-30-name-primary-key.md)
 - **A store write takes only what it honours and returns only what a caller reads.**
   `ObjectsCreate` takes an `ObjectsCreateInput`, not the read-shaped `RawObject`
   whose `Status` field it used to drop in silence. And a mutator returns a row only

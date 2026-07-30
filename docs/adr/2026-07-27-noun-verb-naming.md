@@ -92,10 +92,10 @@ Five judgment calls worth recording, since each has a defensible other answer:
   objection here; `ReconcileOwed*` (`objects.reconcile_owed`) is the same shape.
   `Pending` then drops out of the list method, since a request is only ever cleared by
   the delete itself — and out of `ReconcileOwedListIDs` for the same reason, the family
-  name already saying the row owes something. The cascade breaks the `By…` qualifier pattern (`BySlug`, `ByRelation`,
+  name already saying the row owes something. The cascade breaks the `By…` qualifier pattern (`ByName`, `ByRelation`,
   `ByIncomingEdge`, all naming the key you pass) and reads
   `DeletionRequestsCreateFromOwner`: `By` also means *agency* in English, and unlike a
-  slug an owner is animate, so `CreateByOwner` invites the wrong reading — the owner
+  name an owner is animate, so `CreateByOwner` invites the wrong reading — the owner
   is what is being deleted, not the actor. `From` keeps the sense of "derived from an
   owner id" and answers the question `CreateOwned` leaves open, whether the owner
   itself gets a request. It does not.

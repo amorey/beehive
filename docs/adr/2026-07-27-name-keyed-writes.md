@@ -1,14 +1,14 @@
-# Slug-keyed writes differ only in conflict policy
+# Name-keyed writes differ only in conflict policy
 
 - **Status:** Accepted — implemented in `client.go`, `sqlite/store.go`.
 - **Date:** 2026-07-27 (recorded retroactively)
 
-> **Superseded in part.** The slug is now the `Client` API's key for all of CRUD, so
-> `DeleteBySlug` is spelled `Delete` and `Update` has a slug form of its own. The
-> slug is also required, which retired `WithSlug` and `ErrConflictingOption` — so the
-> `WithSlug` paragraph below is void, not merely renamed. Everything else here, the
+> **Superseded in part.** The name is now the `Client` API's key for all of CRUD, so
+> `DeleteByName` is spelled `Delete` and `Update` has a name form of its own. The
+> name is also required, which retired `WithName` and `ErrConflictingOption` — so the
+> `WithName` paragraph below is void, not merely renamed. Everything else here, the
 > transaction-boundary reasoning above all, is unchanged and is what the newer
-> decision builds on. → [ADR](2026-07-30-slug-primary-key.md)
+> decision builds on. → [ADR](2026-07-30-name-primary-key.md)
 
 ## Reconcile is not transactional
 
@@ -30,54 +30,54 @@ ctx's `txKey`. The store runs on a single connection (`SetMaxOpenConns(1)`,
 it is open. That is why atomicity is opt-in per composition rather than held across a
 whole reconcile.
 
-## The slug-keyed writes differ only in their conflict policy
+## The name-keyed writes differ only in their conflict policy
 
 `Create` errors, `GetOrCreate` returns the row untouched (`created=false`).
 
 `GetOrCreate` wraps its read-and-write in one `store.Within` —
-that transaction, not the caller, is what makes the slug race safe (`Create`
+that transaction, not the caller, is what makes the name race safe (`Create`
 doesn't read at all; its loser just takes the `UNIQUE` error).
 
 They share `insertObject` for the created-row shape (spec-version stamp,
 finalizers, owner ref); a new column or stamp is a one-site change there.
 
-### There is no slug-keyed upsert
+### There is no name-keyed upsert
 
 A third policy — update the row to the new spec — shipped as `CreateOrUpdate` and was
 removed on 2026-07-30. Nothing replaces it. What is left is a sharper rule than the
-spectrum it sat in the middle of: **no slug-keyed write ever writes to a row it
+spectrum it sat in the middle of: **no name-keyed write ever writes to a row it
 found.** Both surviving policies are decisions about *creating*, and mutation is
 `Update`, keyed by id.
 
 That is worth stating as a rule rather than an absence, because `CreateOrUpdate`'s
-found branch was the one place the slug-keyed family could resurrect a
-deletion-pending row — it updated whatever the slug named, tombstone included, which
+found branch was the one place the name-keyed family could resurrect a
+deletion-pending row — it updated whatever the name named, tombstone included, which
 sits badly beside `GetOrCreate`'s deliberate refusal to do exactly that a few lines
 away. A caller that genuinely wants ensure-then-set still composes `GetOrCreate` with
 `Update` inside its own `Within`, which costs one extra statement on the create path
 and makes the tombstone question the caller's to answer rather than one this API
 answered for them by accident.
 
-~~`GetOrCreate` rejects `WithSlug` with `ErrConflictingOption` rather than ignoring
-it.~~ **Void**: the slug is now positional on every slug-keyed write, so there is no
-option left to contradict it. `WithSlug` and `ErrConflictingOption` are both deleted.
+~~`GetOrCreate` rejects `WithName` with `ErrConflictingOption` rather than ignoring
+it.~~ **Void**: the name is now positional on every name-keyed write, so there is no
+option left to contradict it. `WithName` and `ErrConflictingOption` are both deleted.
 
 `GetOrCreate`'s found branch does no write at all, which is the point. A
 deletion-pending row comes back with its tombstone intact rather than being
-resurrected by a spec update, and it still holds the slug's `UNIQUE` constraint, so
+resurrected by a spec update, and it still holds the name's `UNIQUE` constraint, so
 waiting for GC is the caller's only way forward.
 
-### `DeleteBySlug` is `GetOrCreate`'s remove-side partner
+### `DeleteByName` is `GetOrCreate`'s remove-side partner
 
-It is the one slug-keyed write that needs no client-side `Within`: the store
-resolves and marks in a single statement via `DeletionRequestsCreateBySlug`, which folds
-the slug into the `UPDATE`'s `WHERE` exactly as `DeletionRequestsCreate` folds in the
+It is the one name-keyed write that needs no client-side `Within`: the store
+resolves and marks in a single statement via `DeletionRequestsCreateByName`, which folds
+the name into the `UPDATE`'s `WHERE` exactly as `DeletionRequestsCreate` folds in the
 kind.
 
 That is why `markForDeletion` takes the caller's **whole row predicate** rather than
 an id plus an extra clause. One statement template, with the key supplied per caller:
 `id = ?` plus the kind scope for `DeletionRequestsCreate`, a bare `id = ?` for the
-`DeletionRequestsCreateFromOwner` cascade, and the group/kind/slug triple for the slug
+`DeletionRequestsCreateFromOwner` cascade, and the group/kind/name triple for the name
 path. Keying it a new way is a change at the call site, not a second copy of the
 statement.
 
@@ -88,8 +88,8 @@ and the reread is what tells them apart. It also supplies the current row that t
 no-op path returns. That reread is the only part that differs between the two entry
 points.
 
-Its `ErrNotFound` is therefore unambiguous — nothing of this kind holds the slug —
-and the client folds it to `nil`, the one place a slug delete departs from
+Its `ErrNotFound` is therefore unambiguous — nothing of this kind holds the name —
+and the client folds it to `nil`, the one place a name delete departs from
 `Delete`, which reports a missing id. Beyond the mark it runs nothing at all: the
 `deletion_requested_at` it wrote is what puts the row in the GC sweeper's listing.
 

@@ -646,7 +646,7 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 }
 
 // objectColumns is the canonical select list; scanObject reads them in order.
-const objectColumns = `id, "group", kind, slug, spec, status,
+const objectColumns = `id, "group", kind, name, spec, status,
 	schema_version_spec, schema_version_status,
 	generation, observed_generation, observed_at, resource_version,
 	deletion_requested_at, reconcile_owed, finalizers, created_at, updated_at`
@@ -701,10 +701,10 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	// backstop for writes that bypass this store entirely (a migration, a foreign
 	// writer), but a driver's constraint error carries no sentinel a caller can match
 	// on, and its text is the driver's to change. The contract on ObjectsCreateInput
-	// promises ErrInvalidSlug, so this is where that promise is kept — before the
+	// promises ErrInvalidName, so this is where that promise is kept — before the
 	// version draw, so a refused create burns no resource_version.
-	if in.Slug == "" {
-		return nil, fmt.Errorf("%w: pass the name the object should be addressable by", storeapi.ErrInvalidSlug)
+	if in.Name == "" {
+		return nil, fmt.Errorf("%w: pass the name the object should be addressable by", storeapi.ErrInvalidName)
 	}
 	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
@@ -718,34 +718,34 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	// in the same statement, so there's no follow-up read.
 	row := c.QueryRowContext(ctx, `
 		INSERT INTO objects
-			("group", kind, slug, spec, status, schema_version_spec,
+			("group", kind, name, spec, status, schema_version_spec,
 			 generation, resource_version, finalizers, created_at, updated_at)
 		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
 		RETURNING `+objectColumns,
-		gk.Group, gk.Kind, in.Slug, jsonText(in.Spec), in.SpecVersion,
+		gk.Group, gk.Kind, in.Name, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
 	// scanObject, not scanWritten: a condition references an object id, and this id
 	// did not exist until the statement above. So the row provably has none, and
 	// nil Conditions is what assembling them would have produced anyway.
 	obj, err := scanObject(row)
 	if err != nil {
-		return nil, asSlugTaken(err)
+		return nil, asNameTaken(err)
 	}
 	return obj, nil
 }
 
-// asSlugTaken translates the UNIQUE violation on ("group", kind, slug) into the
+// asNameTaken translates the UNIQUE violation on ("group", kind, name) into the
 // storeapi sentinel, leaving every other error alone.
 //
-// The slug is the only uniqueness constraint a caller can hit on a create — the id
+// The name is the only uniqueness constraint a caller can hit on a create — the id
 // is AUTOINCREMENT and everything else on the row is unconstrained — so the code
 // alone identifies it, with no need to parse which index the driver named. Callers
-// generating slugs retry on this and on nothing else, which is exactly why it cannot
+// generating names retry on this and on nothing else, which is exactly why it cannot
 // stay a driver error: the text is modernc's to reword.
-func asSlugTaken(err error) error {
+func asNameTaken(err error) error {
 	var serr *sqlite.Error
 	if errors.As(err, &serr) && serr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
-		return fmt.Errorf("%w: %w", storeapi.ErrSlugTaken, err)
+		return fmt.Errorf("%w: %w", storeapi.ErrNameTaken, err)
 	}
 	return err
 }
@@ -847,18 +847,18 @@ func (s *sqliteStore) ObjectsGetMeta(ctx context.Context, id storeapi.ObjectID) 
 	return s.getObjectRow(ctx, id)
 }
 
-// getObjectRowBySlug is getObjectRow keyed by slug within gk: the bare row, no
-// conditions assembled. The slug-keyed sibling of getObjectRowScoped — no
+// getObjectRowByName is getObjectRow keyed by name within gk: the bare row, no
+// conditions assembled. The name-keyed sibling of getObjectRowScoped — no
 // ErrWrongKind, since the kind is in the WHERE rather than checked after the read.
-func (s *sqliteStore) getObjectRowBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) getObjectRowByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
-		gk.Group, gk.Kind, slug)
+		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
+		gk.Group, gk.Kind, name)
 	return scanObject(row)
 }
 
-func (s *sqliteStore) ObjectsGetBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, error) {
-	obj, err := s.getObjectRowBySlug(ctx, gk, slug)
+func (s *sqliteStore) ObjectsGetByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
+	obj, err := s.getObjectRowByName(ctx, gk, name)
 	if err != nil {
 		return nil, err
 	}
@@ -1281,13 +1281,13 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 	})
 }
 
-// ObjectsUpdateSpecBySlug replaces the spec of whatever holds slug within gk.
+// ObjectsUpdateSpecByName replaces the spec of whatever holds name within gk.
 //
-// No ErrWrongKind: the kind is in the WHERE, so a slug this kind does not hold is
-// absent rather than foreign — as with DeletionRequestsCreateBySlug.
-func (s *sqliteStore) ObjectsUpdateSpecBySlug(ctx context.Context, gk storeapi.GroupKind, slug string, spec []byte, specVersion int) (*storeapi.RawObject, error) {
+// No ErrWrongKind: the kind is in the WHERE, so a name this kind does not hold is
+// absent rather than foreign — as with DeletionRequestsCreateByName.
+func (s *sqliteStore) ObjectsUpdateSpecByName(ctx context.Context, gk storeapi.GroupKind, name string, spec []byte, specVersion int) (*storeapi.RawObject, error) {
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
-		return s.getObjectRowBySlug(ctx, gk, slug)
+		return s.getObjectRowByName(ctx, gk, name)
 	})
 }
 
@@ -1914,7 +1914,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 // `IS NULL` guard makes a repeat a no-op, so retries don't churn the watch
 // cursor. where is the caller's whole
 // row predicate, keying and scope together — `id = ?` plus a kind scope, or the
-// group/kind/slug triple — so a new keying is a call-site change rather than a
+// group/kind/name triple — so a new keying is a call-site change rather than a
 // second copy of this statement. It is parenthesized before the guard is appended,
 // so a disjunctive key can't bind loosely enough to escape the IS NULL and re-stamp
 // an already-deleting row. Like edgesByIDs' column names it is a compile-time
@@ -1934,7 +1934,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 // path is a pure read. The two statements are in the caller's transaction, on one
 // connection, so no other writer can draw the same value in between; and the
 // subquery is safe against a multi-row match only because there is never one —
-// every `where` here keys on a unique column (id, or group/kind/slug).
+// every `where` here keys on a unique column (id, or group/kind/name).
 func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (bool, error) {
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
@@ -1960,20 +1960,20 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	return true, nil
 }
 
-// probeDeletionBySlug is probeObjectScoped keyed by slug. Existence is the whole
-// question here: slugs are unique per kind, so a slug this kind does not hold is
+// probeDeletionByName is probeObjectScoped keyed by name. Existence is the whole
+// question here: names are unique per kind, so a name this kind does not hold is
 // absent rather than foreign, and there is no ErrWrongKind to distinguish.
 //
-// The saving over getObjectRowBySlug is Go-side, not page-side: UNIQUE ("group",
-// kind, slug) does not cover deletion_requested_at, so the index seek is still
+// The saving over getObjectRowByName is Go-side, not page-side: UNIQUE ("group",
+// kind, name) does not cover deletion_requested_at, so the index seek is still
 // followed by a row fetch either way. What it avoids is copying the spec and status
 // blobs into Go and unmarshalling the finalizers — one allocation instead of
 // scanObject's handful, on a path that discards everything but a bool.
-func (s *sqliteStore) probeDeletionBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
+func (s *sqliteStore) probeDeletionByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
 	var deletionAt sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT deletion_requested_at FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
-		gk.Group, gk.Kind, slug).Scan(&deletionAt)
+		`SELECT deletion_requested_at FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
+		gk.Group, gk.Kind, name).Scan(&deletionAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, storeapi.ErrNotFound
 	}
@@ -2029,15 +2029,15 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
-// DeletionRequestsCreateBySlug marks the gk row holding slug. The slug rides in the
+// DeletionRequestsCreateByName marks the gk row holding name. The name rides in the
 // UPDATE's own WHERE the way the kind does for DeletionRequestsCreate, so the resolve and
 // the mark are one statement: atomic, and a round trip cheaper than the alternative
-// of wrapping a ObjectsGetBySlug + DeletionRequestsCreate pair in a Within — which matters
+// of wrapping a ObjectsGetByName + DeletionRequestsCreate pair in a Within — which matters
 // on a store that runs every caller through one connection.
-func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
+func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) (bool, error) { return s.probeDeletionBySlug(ctx, gk, slug) },
-		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
+		func(ctx context.Context) (bool, error) { return s.probeDeletionByName(ctx, gk, name) },
+		`"group" = ? AND kind = ? AND name = ?`, gk.Group, gk.Kind, name)
 }
 
 // DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children. One indexed
@@ -2488,7 +2488,7 @@ func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 		updatedAt   int64
 	)
 	dest := []any{
-		&obj.ID, &obj.Group, &obj.Kind, &obj.Slug, &obj.Spec, &status,
+		&obj.ID, &obj.Group, &obj.Kind, &obj.Name, &obj.Spec, &status,
 		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
 		&deletionAt, &obj.ReconcileOwed, &finalizers, &createdAt, &updatedAt,

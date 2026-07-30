@@ -10,7 +10,7 @@
 returns, and it was also the shape every write spoke in — on both sides of the call.
 
 **On the way in.** `ObjectsCreate` took a `*RawObject`. The `INSERT` bound six of its
-eighteen fields — group, kind, slug, spec, `schema_version_spec`, finalizers — and
+eighteen fields — group, kind, name, spec, `schema_version_spec`, finalizers — and
 ignored the rest. Some of the twelve are defensible: `ID`, `ResourceVersion`,
 `CreatedAt` and `UpdatedAt` are store-assigned, `Generation` starts at 1 and
 `ReconcileOwed` at 0. `Status` was the sharp one. Seeding a status on create is a
@@ -37,7 +37,7 @@ kind-scoping of `ReconcileOwedDecrement`, which had been waiting on the same tab
 **A write takes a shape built for writing.** `ObjectsCreate(ctx, gk, ObjectsCreateInput)`
 replaces the `*RawObject` parameter. The `GroupKind` moves out to its own argument,
 matching every other kind-scoped call in the interface, and `ObjectsCreateInput`
-carries exactly the four remaining fields the `INSERT` binds: `Finalizers`, `Slug`,
+carries exactly the four remaining fields the `INSERT` binds: `Finalizers`, `Name`,
 `Spec`, `SpecVersion`. Seeding a status is now a compile error rather than a silent
 discard.
 
@@ -46,7 +46,7 @@ discard.
 `GetOrCreate` hand it to the user, who has no other way to see
 the store-assigned id, version and timestamps. Every other mutator returns `error`,
 plus a `bool` where whether the write landed is not otherwise derivable
-(`DeletionRequestsCreate`, `DeletionRequestsCreateBySlug`). The `RETURNING`
+(`DeletionRequestsCreate`, `DeletionRequestsCreateByName`). The `RETURNING`
 clauses behind them are gone: `bumpObject`, the finalizer rewrite, both status
 writes and `markForDeletion` now `Exec`. Each had already read its row under a kind
 scope inside the same transaction, so `RETURNING` was never what proved the row

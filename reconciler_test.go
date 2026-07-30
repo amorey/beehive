@@ -258,8 +258,8 @@ func TestDependencyRequeue(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
-	target := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
-	dep := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
 	// Drain the two creation-driven reconciles so the channel is quiet before we
 	// trigger the dependency path.
@@ -384,8 +384,8 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 
 	// Create before Start so the ids are set before any reconcile can dispatch;
 	// the startup pass then drives both objects.
-	target := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
-	dep := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 	ctrl.targetID, ctrl.depID = target.ID, dep.ID
 	store.targetID = target.ID
 
@@ -461,8 +461,8 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// Create before Start: the waker's watch is events-only, so pre-Start creates
 	// emit nothing into it and the only lookup the probe can see is the one the
 	// test triggers below.
-	target := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
-	dep := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 	ctrl.targetID, ctrl.depID = target.ID, dep.ID
 	store.targetID = target.ID
 
@@ -555,8 +555,8 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	client1 := NewClient[tSpec, tStatus](bh1, gk)
 	ctrl1.client = client1
 
-	target := mustCreate(t, ctx, client1, uniqueSlug(), tSpec{})
-	dep := mustCreate(t, ctx, client1, uniqueSlug(), tSpec{})
+	target := mustCreate(t, ctx, client1, uniqueName(), tSpec{})
+	dep := mustCreate(t, ctx, client1, uniqueName(), tSpec{})
 	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
 
 	stop1, err := bh1.Start(ctx)
@@ -632,7 +632,7 @@ func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, gk)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)
@@ -727,7 +727,7 @@ func TestSelfDrivenRecovery(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 
 	raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{
-		Slug: uniqueSlug(),
+		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1336,7 +1336,7 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 // TestTypedControllerReconcileRawToTypedErrorCollectsDeleting pins the GC leg of
 // the quarantine: a deletion-pending, finalizer-free row that can't decode is
 // still collected here (collect needs only the id), so it doesn't strand holding
-// its slug and owned_by edge waiting for a controller that can never decode it.
+// its name and owned_by edge waiting for a controller that can never decode it.
 func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -1346,7 +1346,7 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 
 	// Inject an undecodable row directly (a valid create can always decode), then
 	// request its deletion so the reconcile sees a deletion-pending poison row.
-	raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte("not-json")})
+	raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte("not-json")})
 	require.NoError(t, err)
 	_, err = store.DeletionRequestsCreate(ctx, gk, raw.ID)
 	require.NoError(t, err)
@@ -1480,7 +1480,7 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	raw, err := s.ObjectsCreate(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
 	tc := &typedController[tSpec, tStatus]{
@@ -1511,7 +1511,7 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	raw, err := s.ObjectsCreate(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	_, err = s.DeletionRequestsCreate(ctx, GroupKind{Kind: "Widget"}, raw.ID)
 	require.NoError(t, err)
@@ -1540,7 +1540,7 @@ func TestTypedControllerReconcile(t *testing.T) {
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
-	raw, err := s.ObjectsCreate(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
 	bh := &Beehive{store: s}
@@ -1593,7 +1593,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	raw, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
 	bh := &Beehive{store: s}
@@ -1661,7 +1661,7 @@ func reconcileOwedHarness(t *testing.T, wrap func(Store) Store) (*typedControlle
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	raw, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	raw, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
 	tc, inner := newSyncController(wrapStore(s, wrap))
@@ -1792,7 +1792,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	raw, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug:       uniqueSlug(),
+		Name:       uniqueName(),
 		Spec:       specJSON,
 		Finalizers: []string{"f"},
 	})
@@ -1904,7 +1904,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
@@ -1933,7 +1933,7 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "v1"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
 
 	// Wait for the first reconcile before updating, so the update is genuinely a
 	// distinct reconcile of generation 2 rather than being coalesced with the
@@ -1970,7 +1970,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	// The finalizer keeps the row alive until the controller observes the deletion;
 	// see deletionTrackingFinalizer.
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
@@ -2003,7 +2003,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	ctrl.signal.wait(t, "reconcile wrote status before erroring")
 
@@ -2043,7 +2043,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
@@ -2085,7 +2085,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	ctrl.signal.wait(t, "reconcile set condition before erroring")
 
@@ -2103,7 +2103,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	// Insert an object before beehive starts (simulating a previous process run).
 	specJSON, err := json.Marshal(cSpec{Val: "pre-existing"})
 	require.NoError(t, err)
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
 	bh, err := New(store, WithFullPassInterval(0))
@@ -2238,7 +2238,7 @@ func TestOwedPassTickDispatchesOwedWork(t *testing.T) {
 
 	// An object a prior process left unconverged: written straight through the
 	// store, so observed_generation is NULL and nothing has dispatched it.
-	raw, err := real.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
+	raw, err := real.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 
 	select {
@@ -2263,7 +2263,7 @@ func TestOwedPassTickDispatchesOwedWake(t *testing.T) {
 	// be what dispatches it.
 	var id ObjectID
 	real, reconciled := newOwedPassHarness(t, gk, func(s wakeStampingStore) {
-		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
+		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
 		err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
@@ -2306,7 +2306,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 	// anything and no owed-pass listing will ever return them.
 	settle := func() ObjectID {
 		t.Helper()
-		raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
+		raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
 		err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
@@ -2389,7 +2389,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 	t.Cleanup(func() { store.Close() })
 	seed(store, gk)
 
-	sentinel, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
+	sentinel, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	// Settled, so no startup pass of its own can reach it: the only thing that ever
 	// dispatches it is the explicit requeue below.
@@ -2434,7 +2434,7 @@ func TestStartupAlwaysDrainsOwedWork(t *testing.T) {
 	var unsettled ObjectID
 	got := newStartupHarness(t, func(s Store, gk GroupKind) {
 		// Unconverged: observed_generation NULL, as a crash mid-reconcile leaves it.
-		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
+		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
 		unsettled = raw.ID
 	}, WithStartupFullPass(false))
@@ -2450,7 +2450,7 @@ func TestStartupFullPassReconcilesSettled(t *testing.T) {
 	ctx := context.Background()
 	var settled ObjectID
 	seed := func(s Store, gk GroupKind) {
-		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
+		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
 		err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
@@ -2600,7 +2600,7 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	defer stop()
 
 	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	dep := mustCreate(t, ctx, depClient, uniqueSlug(), tSpec{})
+	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
 	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnlyGK), "target-a", tSpec{})
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
@@ -2623,7 +2623,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	defer stop()
 
 	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	dep := mustCreate(t, ctx, depClient, uniqueSlug(), tSpec{})
+	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 
 	// The kind's first object is born after Start, so nothing observable at
@@ -2653,9 +2653,9 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	widget := GroupKind{Kind: "Widget"}
 	depClient := NewClient[tSpec, tStatus](bh, widget)
-	dep := mustCreate(t, ctx, depClient, uniqueSlug(), tSpec{})
+	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
 	targetClient := NewClient[tSpec, tStatus](bh, clientOnlyGK)
-	target := mustCreate(t, ctx, targetClient, uniqueSlug(), tSpec{})
+	target := mustCreate(t, ctx, targetClient, uniqueName(), tSpec{})
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
@@ -2694,9 +2694,9 @@ func newWatermarkHarness(t *testing.T, wrap func(Store) Store) *watermarkHarness
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	target, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	target, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
-	dep, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	dep, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, s, dep.ID, target.ID, RelationDependsOn))
 
@@ -2758,7 +2758,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	second, err := h.store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	second, err := h.store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	h.inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, cc.DependenciesAdd(ctx, h.dep, second.ID)
@@ -2793,7 +2793,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 	// version — the shape that makes the rewritten watermark read as converged.
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	quiet, err := h.store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	quiet, err := h.store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
 	// The third party declares from outside the pass's client, mid-flight. The
@@ -2830,9 +2830,9 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 	s := newClientTestStore(t)
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
-	dep, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	dep, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
-	target, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Slug: uniqueSlug(), Spec: specJSON})
+	target, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	tc, inner := newSyncController(s)
 	stale := func() []ObjectID {
@@ -3011,8 +3011,8 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	client1 := NewClient[tSpec, tStatus](bh1, gk)
 	ctrl1.client = client1
 
-	target := mustCreate(t, ctx, client1, uniqueSlug(), tSpec{})
-	dep := mustCreate(t, ctx, client1, uniqueSlug(), tSpec{})
+	target := mustCreate(t, ctx, client1, uniqueName(), tSpec{})
+	dep := mustCreate(t, ctx, client1, uniqueName(), tSpec{})
 	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
 	// Declared before the change. The declare stamps one owed pass, but the
 	// startup reconcile below services and drains it — so by the time the target

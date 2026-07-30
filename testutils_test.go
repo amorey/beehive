@@ -117,12 +117,12 @@ func mustCreate[Spec, Status any](
 	t *testing.T,
 	ctx context.Context,
 	c Client[Spec, Status],
-	slug string,
+	name string,
 	spec Spec,
 	opts ...Option,
 ) *Object[Spec, Status] {
 	t.Helper()
-	obj, err := c.Create(ctx, slug, spec, opts...)
+	obj, err := c.Create(ctx, name, spec, opts...)
 	require.NoError(t, err)
 	return obj
 }
@@ -201,8 +201,8 @@ func (s *fakeStore) ObjectsGetForReconcile(context.Context, ObjectID) (storeapi.
 func (s *fakeStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsGetMeta")
 }
-func (s *fakeStore) ObjectsGetBySlug(context.Context, GroupKind, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGetBySlug")
+func (s *fakeStore) ObjectsGetByName(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.ObjectsGetByName")
 }
 func (s *fakeStore) ObjectsList(context.Context, GroupKind) ([]*RawObject, error) {
 	return nil, nil
@@ -233,8 +233,8 @@ func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []by
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }
 
-func (s *fakeStore) ObjectsUpdateSpecBySlug(context.Context, GroupKind, string, []byte, int) (*RawObject, error) {
-	panic("not implemented: ObjectsUpdateSpecBySlug")
+func (s *fakeStore) ObjectsUpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, error) {
+	panic("not implemented: ObjectsUpdateSpecByName")
 }
 func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
 	panic("not implemented: fakeStore.UpdateStatus")
@@ -245,8 +245,8 @@ func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, strin
 func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (bool, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreate")
 }
-func (s *fakeStore) DeletionRequestsCreateBySlug(context.Context, GroupKind, string) (bool, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreateBySlug")
+func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (bool, error) {
+	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
 }
 func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
 	panic("not implemented: fakeStore.ConditionsSet")
@@ -873,12 +873,12 @@ func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectI
 	return err
 }
 
-// uniqueSlug returns a slug no other test row holds, for the tests that seed rows
-// through the store directly rather than through Client.Create. Slugs are required
+// uniqueName returns a name no other test row holds, for the tests that seed rows
+// through the store directly rather than through Client.Create. Names are required
 // and unique per kind, but these tests assert on versions, edges and watermarks —
 // never on the name — so naming each row by hand would be noise.
-func uniqueSlug() string {
-	return fmt.Sprintf("test-obj-%d", slugSeq.Add(1))
+func uniqueName() string {
+	return fmt.Sprintf("test-obj-%d", nameSeq.Add(1))
 }
 
-var slugSeq atomic.Int64
+var nameSeq atomic.Int64
