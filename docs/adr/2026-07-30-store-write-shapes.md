@@ -42,8 +42,8 @@ carries exactly the four remaining fields the `INSERT` binds: `Finalizers`, `Slu
 discard.
 
 **A write returns what its caller reads, and nothing more.** `ObjectsCreate` and
-`ObjectsUpdateSpec` keep returning the row, because `Client.Create`, `Update`,
-`CreateOrUpdate` and `GetOrCreate` hand it to the user, who has no other way to see
+`ObjectsUpdateSpec` keep returning the row, because `Client.Create`, `Update` and
+`GetOrCreate` hand it to the user, who has no other way to see
 the store-assigned id, version and timestamps. Every other mutator returns `error`,
 plus a `bool` where whether the write landed is not otherwise derivable
 (`DeletionRequestsCreate`, `DeletionRequestsCreateBySlug`). The `RETURNING`

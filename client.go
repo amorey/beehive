@@ -41,7 +41,6 @@ type ObjectChange[Spec, Status any] struct {
 // creating, reading, updating, deleting, and watching objects.
 type Client[Spec, Status any] interface {
 	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
 	// Delete soft-deletes the object by setting DeletionRequestedAt. That mark is the
 	// whole signal: it puts the row in the GC sweeper's listing, so the next sweep
 	// hands it to the controller to clear finalizers, and physical removal follows
@@ -81,13 +80,16 @@ type Client[Spec, Status any] interface {
 	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
 	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
 	// GetOrCreate returns the object with the given slug, creating it from spec if
-	// absent. Unlike CreateOrUpdate it NEVER mutates an existing row: a slug held by
-	// a live OR deletion-pending row is returned as-is with created=false, so the
-	// caller can inspect DeletionRequestedAt and decide whether to wait for GC and
-	// retry — a tombstone still holds the slug's UNIQUE constraint, so no replacement
-	// can be created until GC clears it. The read-or-create is atomic (a single
-	// store.Within transaction), so concurrent reconciles can't both create — one
-	// wins, the other observes it with created=false.
+	// absent. It NEVER mutates an existing row: a slug held by a live OR
+	// deletion-pending row is returned as-is with created=false, so the caller can
+	// inspect DeletionRequestedAt and decide whether to wait for GC and retry — a
+	// tombstone still holds the slug's UNIQUE constraint, so no replacement can be
+	// created until GC clears it. The read-or-create is atomic (a single store.Within
+	// transaction), so concurrent reconciles can't both create — one wins, the other
+	// observes it with created=false.
+	//
+	// There is no slug-keyed upsert: to change an existing row, follow this with
+	// Update. Nothing in the slug-keyed family writes to a row it found.
 	//
 	// On create the new object is unsettled and so owed its first reconcile, as with
 	// Create; returning an existing row writes nothing and owes nothing.
@@ -361,7 +363,7 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // the insert and its ref must commit together, or a crash between them leaves an
 // ownerless child the GC path would never collect. The slug rides on co, which
 // each caller has already populated from its single source (WithSlug for Create,
-// the positional argument for CreateOrUpdate/GetOrCreate).
+// the positional argument for GetOrCreate).
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
 	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
 		Slug:        co.slug,
@@ -397,51 +399,10 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, co *create
 	}
 }
 
-// CreateOrUpdate idempotently reconciles the object named by slug to spec: it
-// updates the existing object carrying that slug, or creates one with that slug
-// if none exists. Wrapping the read-then-write in Within makes the upsert atomic,
-// so concurrent callers can't both insert the same slug — the second sees the
-// first's row and updates instead. Re-applying the same spec is a no-op (ObjectsUpdateSpec
-// suppresses the generation bump on equal bytes).
-//
-// It drives the store mutators directly rather than composing Create/Update so
-// one call produces at most one row change, and so the create branch stays
-// distinguishable from the update branch for WithOnCreate's sake.
-func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error) {
-	b, err := json.Marshal(spec)
-	if err != nil {
-		return nil, err
-	}
-	var obj *Object[Spec, Status]
-	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
-		var raw *RawObject
-		switch {
-		case err == nil:
-			raw, _, err = c.bh.store.ObjectsUpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
-		case errors.Is(err, ErrNotFound):
-			// No opts on this surface, so the row carries no finalizers and no owner.
-			raw, err = c.insertObject(ctx, b, &createOptions{slug: &slug})
-		}
-		// A non-NotFound read error falls through both cases with raw unset; err
-		// still carries it. Both write branches reassign err.
-		if err != nil {
-			return err
-		}
-		obj, err = c.decode(raw)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return obj, nil
-}
-
-// GetOrCreate returns the row holding slug, creating it only when absent. It is
-// the create-if-absent sibling of CreateOrUpdate: the found branch does no write
-// at all, so a deletion-pending row comes back with its tombstone intact rather
-// than being spuriously bumped back to life. See the Client interface for the
-// full contract.
+// GetOrCreate returns the row holding slug, creating it only when absent. The found
+// branch does no write at all, so a deletion-pending row comes back with its
+// tombstone intact rather than being spuriously bumped back to life. See the Client
+// interface for the full contract.
 func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
 	b, err := json.Marshal(spec)
 	if err != nil {

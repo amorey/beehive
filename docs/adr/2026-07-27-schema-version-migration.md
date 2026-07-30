@@ -36,7 +36,7 @@ ever has to rewrite the whole row.
 
 ### Stamp on write
 
-Lazily. `Create`, `CreateOrUpdate` and `Update` stamp `SchemaVersionSpec()`, through
+Lazily. `Create`, `GetOrCreate` and `Update` stamp `SchemaVersionSpec()`, through
 `migratorSpecVersion`, which is 0 when there is no migrator.
 `ControllerClient.UpdateStatus` stamps `SchemaVersionStatus()` — note that this is the
 separate status-write surface, which is easy to miss. The condition and finalizer

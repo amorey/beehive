@@ -74,7 +74,7 @@ argument is shared:
   (pins that the drain happens even under `WithStartupFullPass(false)`),
   `TestEnqueueUnsettledEnqueuesReturnedIDs`, `TestObjectsListUnsettledIDs`.
 
-1. **Create** — `Create` / `CreateOrUpdate` / `GetOrCreate` insert with `generation=1`
+1. **Create** — `Create` / `GetOrCreate` insert with `generation=1`
    and `observed_generation` NULL (`sqliteStore.objectsCreate`). Tests:
    `TestIntegrationCreateTriggersReconcile`, `TestClientGetOrCreateOwesAPassOnlyOnCreate`,
    `TestClientWritesAreOwedOnlyAfterOuterCommit`.

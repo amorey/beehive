@@ -104,9 +104,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on its
   own. Mutators self-wrap in `Within` and scope id-keyed writes to the caller's
   `GroupKind`, returning `ErrWrongKind` otherwise. Use `ControllerClient.Within` when
-  several writes must land together. The slug-keyed writes (`Create`,
-  `CreateOrUpdate`, `GetOrCreate`, `DeleteBySlug`) differ only in what they do when
-  the slug is taken. **No write schedules anything**: a spec write bumps the
+  several writes must land together. The slug-keyed writes (`Create`, `GetOrCreate`,
+  `DeleteBySlug`) differ only in what they do when the slug is taken, and **none of
+  them writes to a row it found** — there is no slug-keyed upsert, so changing an
+  existing object is always `Update`, keyed by id. **No write schedules anything**: a spec write bumps the
   generation that the owed pass lists, a delete sets the `deletion_requested_at` that the
   sweeper lists. `Store.AfterCommit` exists for one thing, the `WithOnCreate` hook.
   → [ADR](docs/adr/2026-07-27-slug-keyed-writes.md)
