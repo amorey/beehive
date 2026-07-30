@@ -271,6 +271,53 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   that declares many edges from client-only kinds, where the index entries would
   actually be measurable.
 
+- **`EventsAdd` still takes the read shape, so the write-shapes rule has one
+  exception** — known, not fixed. The
+  [write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md) says a write takes
+  only what it honours, and `ObjectsCreate` was narrowed to `ObjectsCreateInput` for
+  exactly that reason. `EventsAdd(ctx, gk, id, ev Event)` still takes `Event`, the
+  read shape, and reads five of its eleven fields — `Category`, `Type`, `Reason`,
+  `Message`, `Detail`. The store assigns the rest, and its godoc says so *in prose*,
+  which is the silent-drop shape the create path was just fixed for, on the same
+  interface.
+
+  It is milder than `ObjectsCreate`'s was: the dropped fields are `ID`, `ObjectID`,
+  `Count`, `FirstAt`, `LastAt` and `ResourceVersion`, all obviously store-assigned,
+  where `Status` on a create was a plausible thing to seed. So there is no trap here
+  today, only an inconsistency.
+
+  The fix is an `EventsAddInput` beside `ObjectsCreateInput`, same shape, same reason.
+  Deferred because it is a third break of an externally implementable `Store` for a
+  case with no reachable defect, and the ADR's own argument is that the break cost is
+  paid per break rather than per method — so this wants to ride along with the next
+  one that has to happen anyway, not to be its own. Revisit then, or sooner if a
+  field is ever added to `Event` that a caller might reasonably try to set.
+
+- **The remaining write paths read whole rows to answer narrow questions** — known,
+  not fixed, and the tail of the write-shapes pass. That pass stopped assembling
+  *conditions* on the writes that report nothing, and gave the deletion probes and
+  `ReconcileOwedDecrement`'s fault probe a metadata-only read (`checkObjectScoped`).
+  It did not touch the pre-read on the writes that still need one:
+  `ObjectsUpdateStatus` selects all 17 columns (including the `spec` blob, the
+  largest, and it unmarshals `finalizers`) to read six of them; `FinalizersDelete`
+  needs three; `ConditionsSet` and `ConditionsDelete` read a full row purely as a
+  kind gate.
+
+  Two further folds are available on top of narrower `SELECT`s. `ConditionsSet` runs
+  its kind gate and `getCondition` as separate statements against the same key, which
+  one `LEFT JOIN` from `objects` to `conditions` collapses — worth naming because
+  `ConditionsSet` is the hottest write in the system, nested inside the reconcile
+  transaction. And `deletionRequestsCreateFromOwner` calls `markForDeletion` per
+  child, so an N-child cascade draws N versions where one `value + N` draw would do.
+
+  Deferred as a family rather than piecemeal: each is a new hand-written `SELECT`
+  list or join that has to stay in step with `objectColumns` and `scanObject`, which
+  is a maintenance cost the write-shapes pass deliberately did not take on while it
+  was changing signatures. None of it changes a contract, so none of it needs a
+  break. Revisit as one pass, with the narrow reads and the folds measured together —
+  and note the seq-draw-before-match half of this overlaps the `DeleteBySlug` item
+  above, which should be settled at the same time.
+
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.
   Explore a `WithSchemaVersion(n)` option that lets a kind declare its schema

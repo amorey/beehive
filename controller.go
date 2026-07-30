@@ -132,8 +132,9 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err != nil {
 		return err
 	}
-	// The store's UpdateStatus emits the Modified event into its transaction's
-	// collector, so it's published only after the write commits.
+	// Nothing is published here: the write bumps resource_version, and a watch poll
+	// finds it once the transaction commits (see watchpoll.go). There is no
+	// in-process event collector for a mutator to emit into.
 	return c.bh.store.ObjectsUpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
 }
 

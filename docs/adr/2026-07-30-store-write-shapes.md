@@ -55,9 +55,12 @@ existed.
 `markForDeletion` reports `RowsAffected() > 0` where it used to lean on
 `RETURNING`'s `ErrNotFound`. That signal was always ambiguous — guard, scope, or
 missing row — and `requestDeletion`'s second read is what disambiguates it. That read
-is now a probe returning only an error, which is where the deletion path's saving
-comes from: the already-pending branch, the steady state for an idempotent
-controller, no longer decodes a row or queries conditions to answer.
+is now a probe returning only an error, and it reads `"group"`/`kind` rather than the
+whole row (`checkObjectScoped`), which is where the deletion path's saving comes
+from: the already-pending branch, the steady state for an idempotent controller,
+answers from metadata alone — no blob fetch, no finalizer unmarshal, no conditions
+query. A probe built on the read-path row readers would have kept the conditions
+saving and thrown the rest away.
 
 **`ObjectsUpdateSpec` loses its `changed` bool**, which is where the two halves of the
 rule pull against each other. It passes the derivability test — the returned row has
@@ -98,5 +101,13 @@ lines away. The contract was the thing to change, not the branch.
 
 The interface is now asymmetric — two mutators return a row and five do not — which
 is a thing to remember. `Store`'s doc comment states the rule and the reason, so the
-answer is one place, and the line falls where the callers put it rather than
-somewhere chosen for tidiness.
+answer is one place. State it as the invariant rather than as two facts: **a mutator
+returns a row iff a public `Client` write returns that object to the user.** That
+makes the next mutator's shape decidable instead of a judgement call, and it is why
+the line falls where the callers put it rather than somewhere chosen for tidiness.
+
+One consequence worth naming: `ObjectsCreate` returns a row but does *not* assemble
+conditions for it, because a condition references an object id and the id was minted
+by the `INSERT` that returned the row — so the row provably has none, and `nil` is
+what assembling would have produced. `scanWritten` is therefore reached from
+`ObjectsUpdateSpec` only.

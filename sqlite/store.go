@@ -636,9 +636,11 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	return rv, err
 }
 
-// scanWritten scans a mutator's RETURNING row and assembles its conditions.
-// Mutators share it, so the returned object carries the full conditions set
-// regardless of which column the write touched, matching Get/List.
+// scanWritten scans a mutator's RETURNING row and assembles its conditions, so the
+// returned object carries the full conditions set regardless of which column the
+// write touched, matching Get/List. Only ObjectsUpdateSpec needs it: it is the one
+// mutator that both returns a row and can be writing a row that already has
+// conditions (ObjectsCreate's cannot — see objectsCreate).
 func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.RawObject, error) {
 	obj, err := scanObject(sc)
 	if err != nil {
@@ -687,7 +689,33 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 		RETURNING `+objectColumns,
 		gk.Group, gk.Kind, in.Slug, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
-	return s.scanWritten(ctx, row)
+	// scanObject, not scanWritten: a condition references an object id, and this id
+	// did not exist until the statement above. So the row provably has none, and
+	// nil Conditions is what assembling them would have produced anyway.
+	return scanObject(row)
+}
+
+// checkObjectScoped answers "does id exist, and is it gk's?" and nothing else. It
+// reads two TEXT columns rather than the whole row, so unlike getObjectRowScoped it
+// touches neither blob and unmarshals no finalizers — which matters because every
+// caller is a write path that throws the row away: a kind gate, or the branch that
+// has to tell a foreign id from a collected one. Same errors as a scoped read,
+// ErrNotFound and ErrWrongKind, so callers read identically.
+func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
+	var group, kind string
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT "group", kind FROM objects WHERE id = ?`, id).Scan(&group, &kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeapi.ErrNotFound // bare, like scanObject's
+	}
+	if err != nil {
+		return err
+	}
+	if group != gk.Group || kind != gk.Kind {
+		return fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
+			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
+	}
+	return nil
 }
 
 // getObjectRow reads the objects row without assembling conditions. Internal
@@ -960,7 +988,7 @@ func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.Gr
 	}
 	// No row matched: another kind's id, or one collected since the caller loaded it.
 	// Only the first is a fault — a vanished row owes no wake to anyone.
-	if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil && !errors.Is(err, storeapi.ErrNotFound) {
+	if err := s.checkObjectScoped(ctx, gk, id); err != nil && !errors.Is(err, storeapi.ErrNotFound) {
 		return err
 	}
 	return nil
@@ -1207,8 +1235,8 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 		// carry different values (a converter reading v1's absent field as a default
 		// the v2 shape spells explicitly). Suppressing that as a no-op would change
 		// what every later read decodes while bumping no resource_version and emitting
-		// nothing, so no watcher learns and the client
-		// skips the controller wake. When the shapes disagree we can't compare, so we
+		// nothing, so no watcher learns and the client skips the controller wake.
+		// When the shapes disagree we can't compare, so we
 		// fall through and write it as the real change it may be — generation bump
 		// included. That is the point, not a side effect: bumping resource_version
 		// while leaving generation would re-stamp a row that stays settled
@@ -1785,9 +1813,9 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 	})
 }
 
-// markForDeletion stamps the deletion clock of the row named by key and emits a
-// Modified, once: the `IS NULL` guard makes a repeat a no-op (changed=false,
-// ErrNotFound) so retries don't churn the watch cursor. where is the caller's whole
+// markForDeletion stamps the deletion clock of the row named by key, once: the
+// `IS NULL` guard makes a repeat a no-op, so retries don't churn the watch
+// cursor. where is the caller's whole
 // row predicate, keying and scope together — `id = ?` plus a kind scope, or the
 // group/kind/slug triple — so a new keying is a call-site change rather than a
 // second copy of this statement. It is parenthesized before the guard is appended,
@@ -1824,8 +1852,10 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 // requestDeletion is the mark-or-probe protocol behind both deletion entry points.
 // A zero-row mark is ambiguous — already deleting, out of scope, or gone — so probe
 // resolves it on the caller's own key: it succeeds for the idempotent already-pending
-// case and reports ErrWrongKind or ErrNotFound otherwise. It reads no conditions,
-// which is the whole reason this pair no longer returns a row. Within keeps the
+// case and reports ErrWrongKind or ErrNotFound otherwise. It reads neither blob nor
+// conditions — answering from metadata alone is the whole reason this pair no longer
+// returns a row, and the already-pending branch is the steady state for a controller
+// that idempotently deletes a child. Within keeps the
 // rv-bump and the write atomic whether or not a caller wrapped this: the mutators
 // self-wrap, and nested they join the caller's transaction — e.g. the GC cascade.
 func (s *sqliteStore) requestDeletion(
@@ -1835,27 +1865,20 @@ func (s *sqliteStore) requestDeletion(
 ) (bool, error) {
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
-		ch, err := s.markForDeletion(ctx, where, whereArgs...)
-		if err != nil {
+		var err error
+		if changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
 			return err
 		}
-		if !ch {
-			return probe(ctx)
-		}
-		changed = true
-		return nil
+		return probe(ctx)
 	})
 	return changed, err
 }
 
 // DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
-// foreign id matches no row and the re-read reports ErrWrongKind.
+// foreign id matches no row and the probe reports ErrWrongKind.
 func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) error {
-			_, err := s.getObjectRowScoped(ctx, gk, id)
-			return err
-		},
+		func(ctx context.Context) error { return s.checkObjectScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
@@ -1866,8 +1889,17 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 // on a store that runs every caller through one connection.
 func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
 	return s.requestDeletion(ctx,
+		// Existence is the whole question here: slugs are unique per kind, so a slug
+		// this kind does not hold is absent rather than foreign, and there is no
+		// ErrWrongKind to distinguish.
 		func(ctx context.Context) error {
-			_, err := s.getObjectRowBySlug(ctx, gk, slug)
+			var one int
+			err := s.conn(ctx).QueryRowContext(ctx,
+				`SELECT 1 FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
+				gk.Group, gk.Kind, slug).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				return storeapi.ErrNotFound
+			}
 			return err
 		},
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)

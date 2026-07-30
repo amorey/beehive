@@ -20,8 +20,9 @@ import "github.com/amorey/beehive/internal/storeapi"
 // non-generic and deals only in raw rows: the generic-to-non-generic boundary
 // lives one layer up, in the typedController adapter.
 //
-// Mutators return the freshly written row so callers see the store-assigned
-// id, resource_version, and timestamps without a re-read.
+// ObjectsCreate and ObjectsUpdateSpec return the row they wrote, so a caller can
+// hand the store-assigned id, resource_version and timestamps straight to the user.
+// Every other mutator returns only an error — see the contract on storeapi.Store.
 type Store = storeapi.Store
 
 // FreePagesReleaser is an optional capability a Store may implement to hand space

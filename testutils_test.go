@@ -598,8 +598,7 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 	return Result{}, nil
 }
 
-// addEdge declares an edge for test scaffolding: it discards the endpoint metadata
-// EdgesAdd reports, drains the owed-wake stamp
+// addEdge declares an edge for test scaffolding: it drains the owed-wake stamp
 // every new depends_on edge now records — scaffolding wants the edge to exist, not
 // the reconcile it buys — so the common require.NoError(t, addEdge(...)) shape
 // stays a one-liner with no side effects on the owed listings. Tests that assert
@@ -610,13 +609,10 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 		return err
 	}
 	if res.ReconcileOwedStamped {
-		// The decrement is kind-scoped, and scaffolding declares edges across kinds;
-		// read from's own kind back rather than making every call site name it.
-		obj, err := store.ObjectsGetMeta(ctx, from)
-		if err != nil {
-			return err
-		}
-		return store.ReconcileOwedDecrement(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind}, from, 1)
+		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
+		// the source's own kind is needed here — and res.From already carries it,
+		// projected from the endpoint check EdgesAdd had to do anyway.
+		return store.ReconcileOwedDecrement(ctx, res.From, from, 1)
 	}
 	return nil
 }

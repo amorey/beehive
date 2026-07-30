@@ -289,19 +289,24 @@ func (r ObjectRef) GroupKind() GroupKind {
 // parameters and deals only in raw rows; the generic boundary is one layer up, in the
 // typedController adapter.
 //
-// Two mutators return the row they wrote — ObjectsCreate and ObjectsUpdateSpec —
-// because their callers hand it back to the user, who could not otherwise see the
-// store-assigned id, resource_version and timestamps without reading again. Where
-// they do return a row a nil error guarantees it is non-nil, so callers dereference
-// it without checking; an implementation that returns (nil, nil) is broken, not a
-// case to handle. That holds on ObjectsUpdateSpec's content no-op too, where the row
-// is unchanged but still returned.
+// **A mutator returns a row exactly where a public Client write returns that object
+// to the user**, which today is ObjectsCreate and ObjectsUpdateSpec and nothing else.
+// Their callers could not otherwise show the store-assigned id, resource_version and
+// timestamps without reading again. Apply that rule to a new mutator rather than
+// copying whichever neighbour it resembles.
+//
+// Where a mutator does return a row, a nil error guarantees it is non-nil, so callers
+// dereference it without checking; an implementation that returns (nil, nil) is
+// broken, not a case to handle. That holds on ObjectsUpdateSpec's content no-op too,
+// where the row is unchanged but still returned.
 //
 // Every other mutator returns only an error, plus a bool where whether the write
-// landed is not otherwise derivable. Returning a row nobody reads is not free here:
-// a row is assembled with its conditions attached, so it costs an indexed query per
-// write, and offering it invites a caller to trust a shape the store would rather
-// narrow. Callers that want the post-write row read it back.
+// landed is not otherwise derivable *and a caller reads it*. Returning a row nobody
+// reads is not free here: assembling one attaches its conditions, so it costs an
+// indexed query per write, and offering it invites a caller to trust a shape the
+// store would rather narrow. Callers that want the post-write row read it back.
+// Writes that report no row should answer from metadata alone — no blob, no
+// conditions — since that is the saving, not the signature.
 type Store interface {
 	io.Closer
 
@@ -530,10 +535,8 @@ type Store interface {
 	// schema version are in a different shape, so comparing them says nothing about
 	// whether the value changed, and such a write takes the normal path.
 	//
-	// Which of the two happened is not reported. It is not derivable from the returned
-	// row either, since that carries no before-state — a caller who needs to know
-	// compares Generation against one it read first. Nothing in this repo does, and a
-	// bool nobody reads is a bool an implementation has to get right for no one.
+	// Which of the two happened is not reported: a caller who needs to know compares
+	// Generation against one it read first.
 	//
 	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id with
 	// ErrNotFound.
