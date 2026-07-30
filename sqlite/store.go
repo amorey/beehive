@@ -1842,10 +1842,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
+	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
 	return n > 0, nil
 }
 

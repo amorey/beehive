@@ -2750,6 +2750,29 @@ func TestDeletionRequestsCreateDBError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The mark's own UPDATE is a separate failure from the version draw ahead of it: the
+// draw writes resource_version_seq, so a trigger scoped to objects lets it through
+// and fails only the statement under test.
+func TestDeletionRequestsCreateMarkError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	blockObjectUpdates(t, store)
+
+	_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.Error(t, err)
+}
+
+// checkObjectScoped resolves a zero-row mark or decrement, so it only ever runs
+// after a statement that already succeeded — no fault-injection path reaches it with
+// a broken connection. Called directly, which is what whitebox tests are for.
+func TestCheckObjectScopedDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	require.Error(t, store.checkObjectScoped(context.Background(), testGK, 1))
+}
+
 // Neither branch of a deletion mark decodes the row's blobs — not the UPDATE that
 // stamps it (the old RETURNING clause did) and not the probe that resolves a
 // zero-row mark (which reads "group"/kind only). An undecodable finalizers column is
@@ -3565,8 +3588,16 @@ func TestOnlyUpdateSpecCanFailAssemblingConditions(t *testing.T) {
 	_, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err, "nor does a deletion mark")
 
-	_, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{}`), 0)
-	require.Error(t, err)
+	// Both of ObjectsUpdateSpec's branches assemble conditions, by two different
+	// routes, so both fail here. A changed spec writes and scans the row back
+	// (scanWritten); an identical one returns the row it read (attachConditions
+	// directly). newConditionObject's spec is `{}`, so the order matters: the
+	// changed write has to come first for the second call to be the no-op.
+	_, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
+	require.Error(t, err, "the write path assembles through scanWritten")
+
+	_, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
+	require.Error(t, err, "the content no-op assembles onto the row it read")
 }
 
 func TestDeleteObjectCascadesConditions(t *testing.T) {
