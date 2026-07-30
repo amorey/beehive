@@ -4705,6 +4705,22 @@ func TestDriverCursorsSetSuppressesTheWriteWhenTheCursorDoesNotAdvance(t *testin
 	assert.Greater(t, updatedAt, sentinel, "an advancing cursor carries the timestamp with it")
 }
 
+// Zero is a legitimate cursor — it is what an empty write log reports — so the
+// upsert has to create the row for it rather than read it as nothing worth
+// storing. The monotone guard applies only where a row already exists, which is
+// what makes the waker's seed write land on a fresh store.
+func TestDriverCursorsSetStoresAZeroCursor(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 0))
+
+	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	require.NoError(t, err)
+	require.True(t, ok, "a zero cursor still creates the row")
+	assert.Zero(t, cursor)
+}
+
 // Two names are two rows: a second driver's cursor must not collide with or
 // clamp against the first's.
 func TestDriverCursorsSetKeysByName(t *testing.T) {

@@ -50,9 +50,10 @@ type waker struct {
 	watermark int64
 
 	// persisted is what the stored row holds: the value last written through
-	// cursors, or what seed read there. DriverCursorsSet already refuses a write
-	// that would not advance the row, but only after paying the round trip —
-	// comparing against this is what keeps a tick from making the call at all.
+	// cursors, or what seed read there, and noStoredCursor when there is no row.
+	// DriverCursorsSet already refuses a write that would not advance the row,
+	// but only after paying the round trip — comparing against this is what
+	// keeps a tick from making the call at all.
 	persisted int64
 
 	// seeded says the watermark holds a real cursor. "watermark != 0" cannot say
@@ -65,6 +66,12 @@ type waker struct {
 // cursorNameWaker is this waker's key in driver_cursors. The table is shared
 // across drivers by name, though this is the only one today.
 const cursorNameWaker = "dependency_waker"
+
+// noStoredCursor marks waker.persisted as "no row yet", which no real cursor
+// value can say: zero is a legitimate position, the one an empty write log
+// reports. It is below every cursor, so the first persist writes whatever the
+// seed settled on and creates the row.
+const noStoredCursor = int64(-1)
 
 // wakeScanPageCap bounds one scan page. The query itself is an indexed range scan
 // and cheap; the cost is round trips, since each page also runs an edges lookup that
@@ -114,16 +121,19 @@ func (dw *waker) run(ctx context.Context) {
 // watermark, so the first scan reports changes from startup rather than all
 // history — unless the store remembers a cursor from a previous run, in which
 // case that is where this scan resumes, so the interval the process was down
-// for is not skipped. It reports whether it got one. On failure the waker stays
-// unseeded and the next tick tries again, taking the cursor as of *then* — so a
-// change committed in between is below the watermark and is never scanned. The
-// reconciler's startup pass covers that only for an object the store records as
-// owed; a settled dependent stranded in the window is found by the
-// stale-dependents pass instead, which is why this is now a latency gap rather
-// than a hole (the startup seed race in TODO.md is the same shape, narrowed to a
-// fresh database with no cursor of its own yet). Retrying is still right: an
-// unseeded watermark is zero, and scanning from there would replay every object
-// ever written on the strength of a transient error.
+// for is not skipped. It reports whether it got one, and records the point it
+// settled on before returning, so that a run which never sees a write still
+// leaves its successor somewhere to resume from.
+//
+// On failure the waker stays unseeded and the next tick tries again, taking the
+// cursor as of *then* — so a change committed in between is below the watermark
+// and is never scanned. The reconciler's startup pass covers that only for an
+// object the store records as owed; a settled dependent stranded in the window
+// is found by the stale-dependents pass instead, which is why this is a latency
+// gap rather than a hole (the startup seed race in TODO.md is the same shape).
+// Retrying is still right: an unseeded watermark is zero, and scanning from
+// there would replay every object ever written on the strength of a transient
+// error.
 func (dw *waker) seed(ctx context.Context) bool {
 	mark, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
 	if err != nil {
@@ -162,14 +172,21 @@ func (dw *waker) seed(ctx context.Context) bool {
 	// DriverCursorsSet's own WHERE discards. A jump leaves it *below*, and
 	// tracking the watermark there would suppress the one write worth making,
 	// leaving the abandoned cursor to be re-read and re-jumped on every restart.
-	// With no row at all there is nothing to beat, so the mark stands in and the
-	// first real advance is what creates the row.
-	persisted := mark
+	persisted := noStoredCursor
 	if ok {
 		persisted = stored
 	}
 
 	dw.watermark, dw.persisted, dw.seeded = watermark, persisted, true
+
+	// Record the seed point now rather than waiting for a change to scan. An
+	// absent row is what makes the next start seed from the mark as of *then*,
+	// so a process that seeds and stops without seeing a single write would
+	// otherwise leave its successor to skip everything committed in between —
+	// this cursor's whole purpose, defeated for the entire first run of a fresh
+	// store. persist is a no-op whenever the row already covers the watermark,
+	// so this costs a write only when there is genuinely nothing stored.
+	dw.persist(ctx)
 	return true
 }
 

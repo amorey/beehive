@@ -95,6 +95,45 @@ func TestWakerSeedsFromMaxWithoutAStoredCursor(t *testing.T) {
 	assert.EqualValues(t, 500, dw.watermark, "no stored cursor: fall back to the write log's max")
 }
 
+// A run that seeds and then stops without a single change to scan must still
+// leave the seed point behind. Without the row, its successor seeds from the
+// mark as of *its* start, which sits above anything committed in between — so
+// the change that landed while nothing was running is never scanned, which is
+// precisely the gap this cursor exists to close, reopened for the whole first
+// run of a fresh store.
+func TestWakerPersistsTheSeedBeforeSeeingAnyWrite(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+	store := &cursorStore{replayStore: replayStore{seed: 10}}
+	store.deps = map[ObjectID][]ObjectRef{1: {{ID: 7, Kind: "Widget"}}}
+
+	first, _ := wakerOver(store, widget)
+	require.True(t, first.seed(context.Background()))
+	require.Equal(t, []int64{10}, store.setCalls, "the seed point is durable before any change arrives")
+
+	// Target 1 changes with no waker running to see it.
+	store.rows, store.seed = changedAt(20), 20
+
+	second, rs := wakerOver(store, widget)
+	require.True(t, second.seed(context.Background()))
+	require.EqualValues(t, 10, second.watermark, "the restart resumes at the stored seed, not the new mark")
+
+	second.scan(context.Background())
+	assert.Equal(t, []ObjectID{7}, queuedIDs(rs[widget].work),
+		"the dependent of a change made while nothing was running is woken on the first scan back")
+}
+
+// Zero is a position, not an absence: it is what an empty write log reports, and
+// a run that seeds there and stops is the same story as the test above. The row
+// has to be created for it, which is why persisted starts at noStoredCursor
+// rather than at zero.
+func TestWakerPersistsAZeroSeed(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{seed: 0}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+
+	require.True(t, dw.seed(context.Background()))
+	assert.Equal(t, []int64{0}, store.setCalls, "an empty store still records where it started")
+}
+
 // A restart resumes from the stored cursor rather than the write log's max, which
 // is the entire point: the interval the process was down for is still scanned.
 func TestWakerSeedsFromTheStoredCursor(t *testing.T) {
@@ -479,7 +518,8 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 	store.seed = 20
 	first.scan(context.Background())
 	require.Equal(t, []ObjectID{8}, queuedIDs(rsFirst[widget].work))
-	require.Equal(t, []int64{20}, store.setCalls, "the first process persists its cursor before it goes away")
+	require.Equal(t, []int64{10, 20}, store.setCalls,
+		"the seed point first, then the progress the scan made, both before the process goes away")
 
 	// The process is gone; a second write lands while nothing is running to see it.
 	store.rows = append(store.rows, ObjectWrite{ID: 3, ResourceVersion: 30})

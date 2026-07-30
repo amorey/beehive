@@ -110,11 +110,24 @@ committing the cursor inside every woken dependent's reconcile would couple a
 store-wide driver cursor to per-object work and buy nothing the backstop does
 not already provide.
 
-`persisted`, the last value actually written, seeds from the same value as
-`watermark` at seed time, never from zero — a clamped seed (stored cursor above
-`max`) would otherwise make every quiet tick issue a write the store's own
-upsert just discards, paying a round trip for nothing on a connection every
-driver shares.
+`persisted` tracks what the *row* holds, which is not the same as where the scan
+resumed — and the difference runs both ways. A clamp leaves the row above the
+watermark, so tracking the watermark would make every tick issue a write the
+store's own upsert discards, a round trip apiece on a connection every driver
+shares. A jump leaves the row below it, so tracking the watermark would suppress
+the one write worth making and leave the abandoned cursor to be re-read and
+re-jumped on every restart.
+
+**`seed` writes the point it settled on, before any scanning.** An absent row is
+what makes the next start seed from the mark as of *then*, so a run that seeds
+and stops without ever seeing a write would otherwise leave its successor to skip
+everything committed in between — this cursor's whole purpose, defeated for the
+entire first run of a fresh store. That write includes a cursor of zero, which is
+a real position (an empty write log) rather than an absence, so `persisted`
+starts at a `noStoredCursor` sentinel below every valid cursor rather than at
+zero. Once the row exists the write is suppressed on both sides — `persisted`
+short-circuits it in Go, and the upsert's `WHERE` would discard it anyway — so
+this costs one write per fresh store, not one per start.
 
 ## Consequences
 
