@@ -125,7 +125,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `0001_init.sql`), immutable and opaque, with one exception — `""` is rejected with
   `ErrInvalidSlug`, since it is what unset configuration reads as rather than a name
   anyone chose — enforced in the store (the sentinel lives in `storeapi`), not just
-  the client, because `Store` is a public extension point. The store keeps its `…BySlug` suffixes: there the id really is the
+  the client, because `Store` is a public extension point. A taken slug is
+  `ErrSlugTaken`, tombstones included; `GenerateSlug(prefix)` builds one from a
+  UUIDv7 for callers with no natural name, explicitly and never implicitly, and
+  callers bound-retry on that sentinel rather than trusting the odds. The store keeps its `…BySlug` suffixes: there the id really is the
   key and the slug methods really are the qualified variant.
   → [ADR](docs/adr/2026-07-30-slug-primary-key.md)
 - **A store write takes only what it honours and returns only what a caller reads.**

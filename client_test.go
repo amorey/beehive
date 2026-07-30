@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2971,4 +2972,98 @@ func TestClientUpdateDoesNotResolveTheSlugSeparately(t *testing.T) {
 
 	assert.False(t, probe.resolved.Load(),
 		"Update resolved the slug through a separate store read; it must go through ObjectsUpdateSpecBySlug, which resolves and writes in one transaction")
+}
+
+// The generate-and-retry loop GenerateSlug's doc recommends, exercised against a
+// real collision. Forced rather than waited for: a genuine UUIDv7 collision is
+// ~10^-15, so the only way this loop is ever executed is a stubbed generator — which
+// is also the failure it exists to insure against, since generation degenerating is
+// far likelier than luck running out.
+func TestGenerateSlugRetryLoopSurvivesACollision(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// Something already holds the name the generator is about to produce.
+	mustCreate(t, ctx, client, "cache-fixed", cSpec{Val: "incumbent"})
+
+	// A generator that hands out that taken name twice before recovering.
+	names := []string{"cache-fixed", "cache-fixed", "cache-unique"}
+	var i int
+	next := func() string {
+		s := names[i]
+		i++
+		return s
+	}
+
+	var last *Object[cSpec, cStatus]
+	for range len(names) {
+		obj, err := client.Create(ctx, next(), cSpec{Val: "v"})
+		if errors.Is(err, ErrSlugTaken) {
+			continue
+		}
+		require.NoError(t, err)
+		last = obj
+		break
+	}
+	require.NotNil(t, last, "the loop must recover once the generator stops repeating")
+
+	// Two rows, not three: the collided create landed nothing.
+	all, err := client.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, all, 2)
+	assert.Equal(t, "cache-unique", last.Slug)
+}
+
+// The README/godoc example, compiled so it cannot drift into not building.
+func TestGenerateSlugDocExampleCompiles(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	obj, err := client.Create(ctx, GenerateSlug("cache"), cSpec{Val: "v"})
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(obj.Slug, "cache-"))
+}
+
+// GenerateSlug is for callers with no natural name. It is deliberately explicit —
+// nothing generates a slug for you — because a name the caller never chose is one
+// nobody can look up, which is the NULL slug in a costume.
+func TestGenerateSlugKeepsThePrefixAndIsUnique(t *testing.T) {
+	const n = 10_000
+	seen := make(map[string]struct{}, n)
+	for range n {
+		slug := GenerateSlug("cache")
+		require.True(t, strings.HasPrefix(slug, "cache-"), "the prefix is the caller's, kept verbatim: %q", slug)
+		require.Len(t, slug, len("cache-")+36, "a UUIDv7 suffix is 36 characters")
+		_, dup := seen[slug]
+		require.False(t, dup, "generated a slug twice: %q", slug)
+		seen[slug] = struct{}{}
+	}
+}
+
+// UUIDv7 leads with a 48-bit millisecond timestamp, so slugs sharing a prefix sort
+// lexicographically by creation time. google/uuid's NewV7 also carries a monotonic
+// 12-bit sub-millisecond counter, which makes that ordering strict within a process
+// rather than merely likely — two calls in the same millisecond still order.
+func TestGenerateSlugSortsByCreationTime(t *testing.T) {
+	var prev string
+	for range 1000 {
+		slug := GenerateSlug("cache")
+		if prev != "" {
+			require.Greater(t, slug, prev, "each slug must sort after the one before it")
+		}
+		prev = slug
+	}
+}
+
+// The empty prefix is allowed: the result is still a valid, non-empty slug, so
+// there is nothing for ErrInvalidSlug to catch. A caller who wants no prefix should
+// not have to invent one.
+func TestGenerateSlugAcceptsAnEmptyPrefix(t *testing.T) {
+	slug := GenerateSlug("")
+	assert.NotEmpty(t, slug)
+	assert.NoError(t, checkSlug(slug))
 }

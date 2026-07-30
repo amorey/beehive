@@ -629,9 +629,15 @@ exception.
 
 ## Open questions
 
-2. **Callers with no natural name.** Removing `WithSlug` removes the ability to create
+2. ~~**Callers with no natural name.**~~ **Decided:** `GenerateSlug(prefix string)
+   string`, UUIDv7 via `google/uuid` (already in the module graph as an
+   indirect dependency of `modernc.org/sqlite`), paired with a new `ErrSlugTaken` so
+   the caller can bound-retry. A plain function passed positionally rather than an
+   option: an option would give the slug two sources again, and would be silently
+   destructive on `GetOrCreate`, whose lookup could never match a suffixed name.
+   Original text: Removing `WithSlug` removes the ability to create
    an unnamed object, which some callers legitimately want. *Recommendation:* an
-   exported helper the caller invokes explicitly (`beehive.GeneratedSlug()`, ULID or
+   exported helper the caller invokes explicitly (`beehive.GenerateSlug()`, ULID or
    `kind-<ulid>`), never implicit generation — an auto-slug that the caller did not
    choose is a name nobody can look up, which is the current NULL in a costume.
 3. **Should `ObjectsWatch` / `Requeue` / `SchedulesGet` / `SchedulesWatch` take
@@ -679,7 +685,7 @@ would have dropped the generation handshake's no-op skip), Change 4's cost model
 probe (the sequence `UPDATE` it claimed to remove was already gone; `getObjectRowBySlug`
 would have read two JSON blobs to check one flag), and Change 4's test observable.
 
-Remaining open questions — 2 (a `GeneratedSlug()` helper), 3 (slugs on
+Remaining open questions — 2 (a `GenerateSlug()` helper), 3 (slugs on
 `ObjectsWatch`/`Requeue`/`Schedules*`) and 5 (the slug→id memo) — are all deferrals
 with standing recommendations. None gates commit 1; revisit after the CRUD flip has
 usage.

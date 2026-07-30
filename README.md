@@ -363,9 +363,32 @@ client.Update(ctx, "prod-cluster", ClusterSpec{...})
 ```
 
 The slug is required and immutable — there is no `UpdateSlug`, and a rename is
-delete+recreate. If it is already taken, `Create` fails on the
-`UNIQUE ("group", kind, slug)` constraint; use `GetOrCreate` when "already there"
-is an acceptable outcome.
+delete+recreate. If it is already taken, `Create` returns `ErrSlugTaken`; use
+`GetOrCreate` when "already there" is an acceptable outcome. A deletion-pending row
+still holds its name, so a tombstone reports `ErrSlugTaken` too, until GC clears the
+finalizers and removes it.
+
+For objects with no natural name, `beehive.GenerateSlug(prefix)` returns the prefix
+joined to a fresh UUIDv7 — time-ordered, so slugs sharing a prefix sort by creation.
+Nothing generates a slug implicitly: a name the caller never chose is a name nobody
+can look up, which is the nullable slug this API retired. Passing it positionally
+keeps the value in your hands, where you can log it or write it into a sibling's spec
+before the create:
+
+```go
+// "cache-018f3a5c-8b2e-7c3d-a4f5-6b7c8d9e0f10"
+obj, err := client.Create(ctx, beehive.GenerateSlug("cache"), spec)
+```
+
+It returns a bare `string`, with no error to handle: the random bytes come from
+`crypto/rand.Read`, which is documented never to return an error — it crashes the
+program if the OS entropy source fails, which is the right answer for an unusable
+source and not something a slug helper could improve on.
+
+It is collision-resistant, not collision-proof, and nothing but the store can settle
+that atomically — a lookup before the create would be a TOCTOU race. So a caller
+generating names should bound-retry on `ErrSlugTaken` and no other error. Reaching
+the bound means generation is broken, not that you were unlucky.
 
 **Which key you use decides what a call acts on**, and the two answers differ
 exactly when a slug has been reused:

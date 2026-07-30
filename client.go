@@ -15,18 +15,74 @@
 package beehive
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/google/uuid"
 )
 
 // ErrNoController is returned by Requeue when the client's kind has no
 // registered controller: there is no reconcile loop to schedule against. A
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
+
+// GenerateSlug returns prefix joined to a fresh UUIDv7, for callers whose objects
+// have no natural name. It is a plain function rather than something Create does for
+// you: a name the caller never chose is a name nobody can look up, which is the
+// nullable slug this API just retired, wearing a hat. Passing it positionally keeps
+// the slug's single source and puts the value in the caller's hands, where it can be
+// logged or written into a sibling's spec before the create.
+//
+//	obj, err := client.Create(ctx, beehive.GenerateSlug("cache"), spec)
+//
+// UUIDv7 leads with a 48-bit millisecond timestamp, so slugs sharing a prefix sort
+// lexicographically by creation time. NewV7 also carries a monotonic sub-millisecond
+// counter, which makes two slugs generated in the same process distinct by
+// construction rather than by luck; only cross-process creates inside the same
+// ~256ns window rest on the 62 random bits, and those collide at around 10^-15 for a
+// hundred such creates.
+//
+// Negligible is not impossible, though, and the store is the only thing that can
+// settle it atomically — a lookup before the create would be a TOCTOU race. So treat
+// this as collision-resistant, not collision-proof: Create reports ErrSlugTaken, and
+// a caller generating names should bound-retry on exactly that. Reaching the bound
+// means generation is broken, not that you were unlucky.
+//
+//	for range 3 {
+//		obj, err := client.Create(ctx, beehive.GenerateSlug("cache"), spec)
+//		if !errors.Is(err, beehive.ErrSlugTaken) {
+//			return obj, err
+//		}
+//	}
+func GenerateSlug(prefix string) string {
+	// Drawn here rather than left to uuid.NewV7, so that no error is reachable and
+	// the signature can say so. Two mutable globals sit on that path — uuid's own
+	// rander (uuid.SetRand) and crypto/rand.Reader — and a read through either can
+	// fail. crypto/rand.Read is the one primitive documented never to return an
+	// error: it crashes the program instead if the OS source fails, which is the
+	// right answer for an unusable entropy source and not something a slug helper
+	// could improve on.
+	var b [16]byte
+	rand.Read(b[:])
+
+	// Routed through uuid rather than laying the bits out here: makeV7 stamps the
+	// version and variant nibbles and the monotonic sub-millisecond counter, and that
+	// counter is what makes two slugs from one process distinct by construction. The
+	// error is unreachable — NewRandomFromReader does one io.ReadFull of 16 bytes,
+	// and this reader holds exactly 16 — but it is checked rather than dropped,
+	// because the value behind a dropped error would be uuid.Nil, and every slug
+	// collapsing to one constant is a far worse failure than a panic naming its cause.
+	id, err := uuid.NewV7FromReader(bytes.NewReader(b[:]))
+	if err != nil {
+		panic("beehive: unreachable: UUIDv7 from a 16-byte reader: " + err.Error())
+	}
+	return prefix + "-" + id.String()
+}
 
 // checkSlug runs before any store work: deferring it would make the same call
 // succeed or fail depending on whether a row happens to exist, hiding the bug until
