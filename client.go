@@ -403,7 +403,7 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // absence, and a required argument should not be able to.
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, slug string, spec []byte, co *createOptions) (*RawObject, error) {
 	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
-		Slug:        &slug,
+		Slug:        slug,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
 		Finalizers:  co.finalizers,

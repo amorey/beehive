@@ -34,7 +34,7 @@ func TestSweepEventRetention(t *testing.T) {
 	ctx := context.Background()
 
 	gk := GroupKind{Kind: "Widget"}
-	obj, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Spec: []byte(`{}`)})
+	obj, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Slug: uniqueSlug(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	for _, r := range []string{"R1", "R2", "R3", "R4"} {
 		_, err := store.EventsAdd(ctx, gk, obj.ID, RawEvent{Category: "c", Type: "Normal", Reason: r})

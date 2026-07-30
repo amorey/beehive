@@ -160,10 +160,12 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
 	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
 	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
@@ -190,10 +192,12 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
 	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
@@ -281,7 +285,7 @@ func TestClientCreate(t *testing.T) {
 	assert.Nil(t, obj.Status)
 	assert.Equal(t, "hello", obj.Spec.Val)
 	require.NotNil(t, obj.Slug, "the slug is required, so a created row always has one")
-	assert.Equal(t, "hello-1", *obj.Slug)
+	assert.Equal(t, "hello-1", obj.Slug)
 }
 
 // The slug being positional is what makes it required: there is no longer a
@@ -458,7 +462,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, child.Slug)
-	assert.Equal(t, "child-1", *child.Slug)
+	assert.Equal(t, "child-1", child.Slug)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, child.Finalizers)
 
 	// Slug is persisted and looked up via GetBySlug.
@@ -557,7 +561,7 @@ func TestClientGetOrCreateCreates(t *testing.T) {
 	assert.True(t, created)
 	assert.NotZero(t, obj.ID)
 	require.NotNil(t, obj.Slug)
-	assert.Equal(t, "w1", *obj.Slug)
+	assert.Equal(t, "w1", obj.Slug)
 	assert.Equal(t, int64(1), obj.Generation)
 	assert.Equal(t, "a", obj.Spec.Val)
 
@@ -1068,7 +1072,7 @@ func TestClientGetBySlugFound(t *testing.T) {
 	specJSON, err := json.Marshal(cSpec{Val: "hello"})
 	require.NoError(t, err)
 	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug: new("myobj"),
+		Slug: "myobj",
 		Spec: specJSON,
 	})
 	require.NoError(t, err)

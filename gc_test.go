@@ -421,6 +421,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// store before any control plane runs. (Written through the store directly, so
 	// no reconcile has touched it.)
 	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -742,6 +743,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
 	raw, err := real.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)

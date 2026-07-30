@@ -157,8 +157,8 @@ func main() {
 	fmt.Printf("created Cluster %d (endpoint=%s, finalizers=%v)\n", cluster.ID, cluster.Spec.Endpoint, cluster.Finalizers)
 	exitOnErr(clusterClient.Requeue(ctx, cluster.ID))
 
-	for range numCaches {
-		cache, err := cacheClient.Create(ctx, ClusterCacheSpec{ClusterID: cluster.ID},
+	for i := range numCaches {
+		cache, err := cacheClient.Create(ctx, fmt.Sprintf("cache-%d", i), ClusterCacheSpec{ClusterID: cluster.ID},
 			beehive.WithOwner(cluster.ID), beehive.WithFinalizers(cacheFlushFinalizer))
 		exitOnErr(err)
 		fmt.Printf("created ClusterCache %d owned by Cluster %d (finalizers=%v)\n", cache.ID, cluster.ID, cache.Finalizers)

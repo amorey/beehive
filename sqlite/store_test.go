@@ -18,6 +18,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -490,12 +492,31 @@ func TestSweepEventsExecErrors(t *testing.T) {
 	})
 }
 
+// The slug is required, and the schema is what says so. No Go path can express a
+// NULL slug any more — ObjectsCreateInput.Slug is a string — so this reaches past
+// the store to the column itself. That is the point: without it the NOT NULL reads
+// as redundant with the Go type and invites removal, when in fact it is the only
+// thing standing between a foreign writer (or a hand-run migration) and a row no
+// slug-keyed call can ever address.
+func TestObjectsSlugIsNotNullable(t *testing.T) {
+	store := newTestStore(t)
+	db := store.(*sqliteStore).db
+
+	_, err := db.ExecContext(context.Background(),
+		`INSERT INTO objects ("group", kind, slug, spec, generation, resource_version, created_at, updated_at)
+		 VALUES (?, ?, NULL, ?, 1, 1, 0, 0)`,
+		testGK.Group, testGK.Kind, `{}`)
+
+	require.Error(t, err, "the column rejects NULL")
+	assert.Contains(t, err.Error(), "NOT NULL")
+}
+
 func TestObjectsCreateAssignsIdentity(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("world"),
+		Slug: "world",
 		Spec: []byte(`{"name":"world"}`),
 	})
 	require.NoError(t, err)
@@ -508,8 +529,7 @@ func TestObjectsCreateAssignsIdentity(t *testing.T) {
 	assert.Empty(t, obj.Finalizers)
 	assert.False(t, obj.CreatedAt.IsZero())
 	assert.Equal(t, obj.CreatedAt, obj.UpdatedAt)
-	require.NotNil(t, obj.Slug)
-	assert.Equal(t, "world", *obj.Slug)
+	assert.Equal(t, "world", obj.Slug)
 	// The kind comes from the positional gk, not from a field of the input.
 	assert.Equal(t, testGK.Group, obj.Group)
 	assert.Equal(t, testGK.Kind, obj.Kind)
@@ -521,7 +541,7 @@ func TestObjectsCreatePersistsFinalizers(t *testing.T) {
 
 	want := []string{"kstack.sh/cluster", "kstack.sh/dns"}
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug:       new("guarded"),
+		Slug:       "guarded",
 		Spec:       []byte(`{}`),
 		Finalizers: want,
 	})
@@ -539,7 +559,7 @@ func TestGetByIdAndSlug(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("world"),
+		Slug: "world",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -570,7 +590,7 @@ func TestDuplicateSlugRejected(t *testing.T) {
 
 	mk := func() error {
 		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-			Slug: new("dup"),
+			Slug: "dup",
 			Spec: []byte(`{}`),
 		})
 		return err
@@ -579,29 +599,12 @@ func TestDuplicateSlugRejected(t *testing.T) {
 	assert.Error(t, mk(), "second create with same slug should violate UNIQUE")
 }
 
-func TestUnnamedObjectsCoexist(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	mk := func() *beehive.RawObject {
-		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-			// Slug nil
-			Spec: []byte(`{}`),
-		})
-		require.NoError(t, err)
-		assert.Nil(t, obj.Slug)
-		return obj
-	}
-	// SQLite treats NULL != NULL, so multiple unnamed objects are allowed.
-	a, b := mk(), mk()
-	assert.NotEqual(t, a.ID, b.ID)
-}
-
 func TestObjectsUpdateSpecBumpsGeneration(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{"v":1}`),
 	})
 	require.NoError(t, err)
@@ -622,6 +625,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{"v":1}`),
 	})
 	require.NoError(t, err)
@@ -678,7 +682,7 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 
 	// ObjectsCreate persists the caller-set spec version; status stays 0 (nil at create).
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug:        new("v"),
+		Slug:        "v",
 		Spec:        []byte(`{}`),
 		SpecVersion: 3,
 	})
@@ -978,6 +982,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:        uniqueSlug(),
 		Spec:        []byte(`{"v":1}`),
 		SpecVersion: 1,
 	})
@@ -1023,6 +1028,7 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:        uniqueSlug(),
 		Spec:        []byte(`{"v":1}`),
 		SpecVersion: 1,
 	})
@@ -1058,6 +1064,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:        uniqueSlug(),
 		Spec:        []byte(`{"v":3}`),
 		SpecVersion: 3,
 	})
@@ -1097,6 +1104,7 @@ func TestNoOpWriteStampsUpwardWhileConverging(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:        uniqueSlug(),
 		Spec:        []byte(`{}`),
 		SpecVersion: 3,
 	})
@@ -1128,6 +1136,7 @@ func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:        uniqueSlug(),
 		Spec:        []byte(`{"v":3}`),
 		SpecVersion: 3,
 	})
@@ -1164,6 +1173,7 @@ func TestContentWriteWithNoMigratorKeepsSchemaVersion(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:        uniqueSlug(),
 		Spec:        []byte(`{"v":3}`),
 		SpecVersion: 3,
 	})
@@ -1188,13 +1198,14 @@ func TestListObjects(t *testing.T) {
 
 	for _, n := range []string{"a", "b", "c"} {
 		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-			Slug: new(n),
+			Slug: n,
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
 	}
 	// A different kind must not leak into the list.
 	_, err := store.ObjectsCreate(ctx, beehive.GroupKind{Group: "", Kind: "Other"}, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1205,8 +1216,7 @@ func TestListObjects(t *testing.T) {
 
 	var names []string
 	for _, o := range list {
-		require.NotNil(t, o.Slug)
-		names = append(names, *o.Slug)
+		names = append(names, o.Slug)
 	}
 	assert.Equal(t, []string{"a", "b", "c"}, names, "ordered by id")
 }
@@ -1216,12 +1226,12 @@ func TestResourceVersionIsMonotonic(t *testing.T) {
 	ctx := context.Background()
 
 	a, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("a"),
+		Slug: "a",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	b, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("b"),
+		Slug: "b",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1238,12 +1248,12 @@ func TestResourceVersionNotReusedAfterDelete(t *testing.T) {
 	ctx := context.Background()
 
 	a, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("a"),
+		Slug: "a",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	b, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("b"),
+		Slug: "b",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1430,6 +1440,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:       uniqueSlug(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"a", "b"},
 	})
@@ -1459,6 +1470,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:       uniqueSlug(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"a"},
 	})
@@ -1727,7 +1739,7 @@ func TestDeletionRequestsCreateBySlugIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new("w1"),
+		Slug: "w1",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1759,7 +1771,7 @@ func TestDeletionRequestsCreateBySlugIsKindScoped(t *testing.T) {
 	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
 
 	other, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
-		Slug: new("shared"),
+		Slug: "shared",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -1796,7 +1808,7 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	var committedID beehive.ObjectID
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
 		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-			Slug: new("committed"),
+			Slug: "committed",
 			Spec: []byte(`{}`),
 		})
 		if err != nil {
@@ -1812,7 +1824,7 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	sentinel := errors.New("boom")
 	err = store.Within(ctx, func(ctx context.Context) error {
 		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-			Slug: new("rolledback"),
+			Slug: "rolledback",
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
@@ -1838,7 +1850,7 @@ func TestAfterCommit(t *testing.T) {
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
 		return store.Within(ctx, func(ctx context.Context) error {
 			obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-				Slug: new("hooked"),
+				Slug: "hooked",
 				Spec: []byte(`{}`),
 			})
 			require.NoError(t, err)
@@ -1899,7 +1911,7 @@ func TestAfterCommit(t *testing.T) {
 func createIn(t *testing.T, store beehive.Store, ctx context.Context, slug string) {
 	t.Helper()
 	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-		Slug: new(slug),
+		Slug: slug,
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -2041,7 +2053,7 @@ func TestWithinFailedUnwindPoisonsTheTransaction(t *testing.T) {
 		// Swallowed, as a careless caller would. Further nested work must be refused
 		// rather than accumulate on a transaction in unknown state.
 		_, refused = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-			Slug: new("after"),
+			Slug: "after",
 			Spec: []byte(`{}`),
 		})
 		return nil
@@ -2345,7 +2357,7 @@ func TestWithinRefusesToCommitWhileANestedFrameIsOpen(t *testing.T) {
 			// goroutine.
 			_ = store.Within(txCtx, func(nested context.Context) error {
 				_, _ = store.ObjectsCreate(nested, testGK, beehive.ObjectsCreateInput{
-					Slug: new("orphan"),
+					Slug: "orphan",
 					Spec: []byte(`{}`),
 				})
 				close(entered)
@@ -2423,7 +2435,7 @@ func TestWithinRefusesAContextFromAnUnwoundFrame(t *testing.T) {
 		// height again, which is all admission used to look at.
 		return store.Within(txCtx, func(context.Context) error {
 			_, createErr := store.ObjectsCreate(captured, testGK, beehive.ObjectsCreateInput{
-				Slug: new("revived"),
+				Slug: "revived",
 				Spec: []byte(`{}`),
 			})
 			assert.ErrorIs(t, createErr, beehive.ErrStaleTxContext)
@@ -2495,6 +2507,7 @@ func TestObjectsListUnsettledIDs(t *testing.T) {
 
 	// different kind — must NOT appear
 	_, err = store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -2527,7 +2540,7 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	err := store.Within(ctx, func(ctx context.Context) error {
 		if err := store.Within(ctx, func(ctx context.Context) error {
 			_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
-				Slug: new("nested"),
+				Slug: "nested",
 				Spec: []byte(`{}`),
 			})
 			return err
@@ -2618,9 +2631,9 @@ func insertBadFinalizersRow(t *testing.T, store *sqliteStore, gk beehive.GroupKi
 	t.Helper()
 	ctx := context.Background()
 	res, err := store.db.ExecContext(ctx, `
-		INSERT INTO objects ("group", kind, spec, finalizers, generation, resource_version, created_at, updated_at)
-		VALUES (?, ?, '{}', 'not-valid-json', 1, 999999, 0, 0)`,
-		gk.Group, gk.Kind)
+		INSERT INTO objects ("group", kind, slug, spec, finalizers, generation, resource_version, created_at, updated_at)
+		VALUES (?, ?, ?, '{}', 'not-valid-json', 1, 999999, 0, 0)`,
+		gk.Group, gk.Kind, uniqueSlug())
 	require.NoError(t, err)
 	id, err := res.LastInsertId()
 	require.NoError(t, err)
@@ -2640,6 +2653,7 @@ func TestObjectsCreateDBError(t *testing.T) {
 	store.db.Close()
 
 	_, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.Error(t, err)
@@ -2918,6 +2932,7 @@ func TestWithinNestedCommitError(t *testing.T) {
 func newRefObject(t *testing.T, store beehive.Store) *beehive.RawObject {
 	t.Helper()
 	obj, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -3344,6 +3359,7 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 	c2 := newRefObject(t, store)
 	c1 := newRefObject(t, store)
 	foreign, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -3438,7 +3454,7 @@ func TestRefsListIncomingDBError(t *testing.T) {
 func newConditionObject(t *testing.T, store beehive.Store, name string) *beehive.RawObject {
 	t.Helper()
 	obj, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
-		Slug: new(name),
+		Slug: name,
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -4071,6 +4087,7 @@ func TestDeleteFinalizerResourceVersionError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug:       uniqueSlug(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"f"},
 	})
@@ -4189,6 +4206,7 @@ func TestDeletionRequestsList(t *testing.T) {
 	// the sweeper's whole reason to exist is the kinds no controller watches.
 	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
 	other, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -4234,6 +4252,7 @@ func TestObjectWritesListSince(t *testing.T) {
 
 	mk := func(gk beehive.GroupKind) *beehive.RawObject {
 		o, err := store.ObjectsCreate(ctx, gk, beehive.ObjectsCreateInput{
+			Slug: uniqueSlug(),
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
@@ -4309,6 +4328,7 @@ func TestResourceVersionMonotonicInCommitOrder(t *testing.T) {
 	var prev int64
 	for range 20 {
 		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			Slug: uniqueSlug(),
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
@@ -4353,7 +4373,8 @@ func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
 	store := newRawStore(t)
 	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
 	require.NoError(t, err)
-	_, err = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{Spec: []byte(`{}`)})
+	_, err = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(), Spec: []byte(`{}`)})
 	require.Error(t, err)
 }
 
@@ -4904,6 +4925,7 @@ func TestDependentsListStaleFiltersByKind(t *testing.T) {
 	other := beehive.GroupKind{Kind: "Gadget"}
 	target := newRefObject(t, store)
 	dep, err := store.ObjectsCreate(ctx, other, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -4925,6 +4947,7 @@ func TestDependentsListStaleFindsDependentsOfUnregisteredTargets(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	target, err := store.ObjectsCreate(ctx, beehive.GroupKind{Group: "", Kind: "Gadget"}, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -5119,6 +5142,7 @@ func churnStore(t *testing.T, store *sqliteStore) {
 	blob := append(append([]byte(`{"v":"`), spec...), []byte(`"}`)...)
 	for i := 0; i < 600; i++ {
 		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			Slug: uniqueSlug(),
 			Spec: blob,
 		})
 		require.NoError(t, err)
@@ -5313,3 +5337,13 @@ func TestFreePagesReleaseClampsAGrowingFreelist(t *testing.T) {
 	assert.Zero(t, released)
 	assert.True(t, c.execCalled)
 }
+
+// uniqueSlug returns a slug no other test row holds. Slugs are required and
+// unique per kind, but the great majority of store tests only need a row to
+// exist — they assert on versions, edges or sweeps, never on the name. Naming
+// each one by hand would be noise, and reusing a literal collides on UNIQUE.
+func uniqueSlug() string {
+	return fmt.Sprintf("test-obj-%d", slugSeq.Add(1))
+}
+
+var slugSeq atomic.Int64

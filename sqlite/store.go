@@ -2373,7 +2373,6 @@ type scanner interface {
 func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 	var (
 		obj         storeapi.RawObject
-		slug        sql.NullString
 		status      []byte
 		observedGen sql.NullInt64
 		observedAt  sql.NullInt64
@@ -2383,7 +2382,7 @@ func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 		updatedAt   int64
 	)
 	dest := []any{
-		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
+		&obj.ID, &obj.Group, &obj.Kind, &obj.Slug, &obj.Spec, &status,
 		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
 		&deletionAt, &obj.ReconcileOwed, &finalizers, &createdAt, &updatedAt,
@@ -2396,9 +2395,6 @@ func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 		return nil, err
 	}
 
-	if slug.Valid {
-		obj.Slug = &slug.String
-	}
 	obj.Status = status // nil for a NULL column; bytes once a status is written
 	if observedGen.Valid {
 		obj.ObservedGeneration = &observedGen.Int64

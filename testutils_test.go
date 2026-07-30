@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -867,3 +868,13 @@ func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectI
 	probeSignal(s.watermarkSet)
 	return err
 }
+
+// uniqueSlug returns a slug no other test row holds, for the tests that seed rows
+// through the store directly rather than through Client.Create. Slugs are required
+// and unique per kind, but these tests assert on versions, edges and watermarks —
+// never on the name — so naming each row by hand would be noise.
+func uniqueSlug() string {
+	return fmt.Sprintf("test-obj-%d", slugSeq.Add(1))
+}
+
+var slugSeq atomic.Int64

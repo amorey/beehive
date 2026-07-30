@@ -175,10 +175,12 @@ type EventQuery struct {
 // objects table. The reconciler and client decode Spec/Status into typed
 // Object[Spec, Status] values; the Store never inspects them.
 type RawObject struct {
-	ID     ObjectID
-	Group  string
-	Kind   string
-	Slug   *string
+	ID    ObjectID
+	Group string
+	Kind  string
+	// Slug is the object's name, unique within its GroupKind. Required, so never
+	// empty on a row the store returns.
+	Slug   string
 	Spec   []byte // JSON, user-owned
 	Status []byte // JSON, controller-owned; nil until first status write
 	// SpecVersion and StatusVersion are the per-column schema versions: the
@@ -244,8 +246,11 @@ const (
 // compiler refuse what the store would otherwise drop.
 type ObjectsCreateInput struct {
 	Finalizers []string
-	// Slug is nil for an unnamed object; the uniqueness constraint is per kind.
-	Slug *string
+	// Slug is the object's name and is required: the uniqueness constraint is per
+	// kind, and the column is NOT NULL. A value type rather than a pointer because
+	// there is no unnamed object to represent — see ErrInvalidSlug for the empty
+	// string, which the client rejects before it reaches here.
+	Slug string
 	Spec []byte
 	// SpecVersion is the migrator schema version Spec was written at, stamped onto
 	// the row like any other write. Status has no counterpart here: a new row has no

@@ -143,7 +143,7 @@ type Object[Spec, Status any] struct {
 	ID                  ObjectID
 	Group               string
 	Kind                string
-	Slug                *string
+	Slug                string
 	Spec                Spec
 	Status              *Status
 	Generation          int64      // bumped on every Spec write not provably a no-op (see ObjectsUpdateSpec)
