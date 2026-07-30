@@ -196,8 +196,8 @@ type RawObject struct {
 	// objects.reconcile_owed column); 0 means none. The reconciler reads it to decide
 	// what to subtract after a successful pass. Like ResourceVersion it is
 	// store-owned: reported on reads, moved only by ReconcileOwedIncrement and
-	// ReconcileOwedDecrement, and ignored on a RawObject handed to ObjectsCreate,
-	// since a new object owes nothing.
+	// ReconcileOwedDecrement. A new object owes nothing, which is why
+	// ObjectsCreateInput has no counterpart field.
 	ReconcileOwed int64
 	Finalizers    []string
 	Conditions    []Condition // assembled on reads; nil when the object has none
@@ -235,6 +235,24 @@ const (
 	RelationDependsOn Relation = "depends_on"
 )
 
+// ObjectsCreateInput is everything ObjectsCreate accepts from its caller. It is
+// deliberately not RawObject: that is the read shape, mirroring a whole row, and
+// passing it here offered a caller eighteen fields of which the INSERT bound six —
+// a seeded Status being the sharp case, discarded with no error. The rest of a new
+// row is store-assigned (ID, ResourceVersion, the timestamps) or fixed (Generation
+// starts at 1, ReconcileOwed at 0, Status NULL), so a narrow input lets the
+// compiler refuse what the store would otherwise drop.
+type ObjectsCreateInput struct {
+	Finalizers []string
+	// Slug is nil for an unnamed object; the uniqueness constraint is per kind.
+	Slug *string
+	Spec []byte
+	// SpecVersion is the migrator schema version Spec was written at, stamped onto
+	// the row like any other write. Status has no counterpart here: a new row has no
+	// status to version.
+	SpecVersion int
+}
+
 // EdgesAddResult is what a caller needs in order to follow up on an edge it
 // declared. All of it falls out of work EdgesAdd already does, so none of it costs an
 // extra query.
@@ -271,12 +289,24 @@ func (r ObjectRef) GroupKind() GroupKind {
 // parameters and deals only in raw rows; the generic boundary is one layer up, in the
 // typedController adapter.
 //
-// Mutators return the row they just wrote, so callers see the store-assigned id,
-// resource_version and timestamps without reading again. A nil error therefore
-// guarantees a non-nil object, and callers dereference it without checking. That
-// includes the idempotent no-op paths, where the row is unchanged but still returned
-// — DeletionRequestsCreate and DeletionRequestsCreateBySlug with changed=false. An
-// implementation that returns (nil, nil) is broken, not a case to handle.
+// **A mutator returns a row exactly where a public Client write returns that object
+// to the user**, which today is ObjectsCreate and ObjectsUpdateSpec and nothing else.
+// Their callers could not otherwise show the store-assigned id, resource_version and
+// timestamps without reading again. Apply that rule to a new mutator rather than
+// copying whichever neighbour it resembles.
+//
+// Where a mutator does return a row, a nil error guarantees it is non-nil, so callers
+// dereference it without checking; an implementation that returns (nil, nil) is
+// broken, not a case to handle. That holds on ObjectsUpdateSpec's content no-op too,
+// where the row is unchanged but still returned.
+//
+// Every other mutator returns only an error, plus a bool where whether the write
+// landed is not otherwise derivable *and a caller reads it*. Returning a row nobody
+// reads is not free here: assembling one attaches its conditions, so it costs an
+// indexed query per write, and offering it invites a caller to trust a shape the
+// store would rather narrow. Callers that want the post-write row read it back.
+// Writes that report no row should answer from metadata alone — no blob, no
+// conditions — since that is the saving, not the signature.
 type Store interface {
 	io.Closer
 
@@ -366,23 +396,24 @@ type Store interface {
 
 	// ConditionsDelete removes the condition of type condType from id. Removing an
 	// existing condition bumps ResourceVersion; deleting one that isn't there does
-	// nothing. Returns the object with its conditions assembled. Scoped to gk: another
-	// kind's id is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) (*RawObject, error)
+	// nothing. Scoped to gk: another kind's id is rejected with ErrWrongKind, a
+	// missing id with ErrNotFound. It returns no row: see the note above Store.
+	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
 
 	// ConditionsSet inserts or updates the condition keyed by (id, cond.Type). A real
 	// change bumps the object's ResourceVersion; an identical write does nothing.
-	// Returns the object with its conditions assembled. Scoped to gk: another kind's id
-	// is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) (*RawObject, error)
+	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id is
+	// rejected with ErrNotFound. It returns no row: see the note above Store, and
+	// read the conditions back with ObjectsGet if you need them.
+	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
 
 	// DeletionRequestsCreate requests an object's deletion by setting
 	// DeletionRequestedAt. The row stays until its finalizers clear, so this creates
 	// the request, never the deletion itself — ObjectsDelete does that. changed is true
 	// only when this call set the flag; repeat calls do nothing and return false.
 	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id with
-	// ErrNotFound.
-	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
+	// ErrNotFound. It returns no row: see the note above Store.
+	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (changed bool, err error)
 
 	// DeletionRequestsCreateBySlug is DeletionRequestsCreate keyed by slug within gk.
 	// The slug goes into the write's own WHERE clause, so resolving and marking are one
@@ -392,8 +423,9 @@ type Store interface {
 	// Everything else matches DeletionRequestsCreate: changed is true only when this
 	// call set the flag, a repeat does nothing, and ErrNotFound means no object of gk
 	// holds the slug. There is no ErrWrongKind here, because slugs are unique per kind,
-	// so another kind's slug is simply not found.
-	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
+	// so another kind's slug is simply not found. It returns no row either; a caller
+	// that needs the marked object's id resolves the slug itself.
+	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (changed bool, err error)
 
 	// DeletionRequestsCreateFromOwner is the GC cascade as one command: it requests
 	// deletion of every object owned by ownerID and returns them all. It writes only to
@@ -439,15 +471,15 @@ type Store interface {
 	EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
 
 	// FinalizersDelete removes finalizer from id's finalizer list. Removing one that is
-	// there bumps ResourceVersion; removing one that isn't does nothing. Returns the
-	// object with its conditions assembled, or ErrNotFound if the row is gone. Scoped
-	// to gk: another kind's id is rejected with ErrWrongKind.
-	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (*RawObject, error)
+	// there bumps ResourceVersion; removing one that isn't does nothing. ErrNotFound if
+	// the row is gone. Scoped to gk: another kind's id is rejected with ErrWrongKind.
+	// It returns no row: see the note above Store.
+	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) error
 
-	// ObjectsCreate inserts a new object. The store assigns ID and
-	// ResourceVersion and sets Generation to 1; the caller supplies the rest
-	// (Group, Kind, Slug, Spec, Finalizers).
-	ObjectsCreate(ctx context.Context, obj *RawObject) (*RawObject, error)
+	// ObjectsCreate inserts a new object of kind gk. The store assigns ID and
+	// ResourceVersion and sets Generation to 1; ObjectsCreateInput carries
+	// everything else create accepts, and nothing it doesn't.
+	ObjectsCreate(ctx context.Context, gk GroupKind, in ObjectsCreateInput) (*RawObject, error)
 
 	// ObjectsDelete removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.
@@ -503,10 +535,12 @@ type Store interface {
 	// schema version are in a different shape, so comparing them says nothing about
 	// whether the value changed, and such a write takes the normal path.
 	//
-	// changed says which happened: true for a real write, false for the no-op. Scoped
-	// to gk: another kind's id is rejected with ErrWrongKind, a missing id with
+	// Which of the two happened is not reported: a caller who needs to know compares
+	// Generation against one it read first.
+	//
+	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id with
 	// ErrNotFound.
-	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
 
 	// ObjectsUpdateStatus replaces an object's status, records the generation the
 	// controller observed, and stamps statusVersion (the migrator schema version
@@ -543,7 +577,9 @@ type Store interface {
 	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
 	// id with ErrNotFound. An observedGeneration greater than the row's current
 	// generation is rejected with ErrObservedGenerationFuture, no-op or not.
-	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
+	//
+	// It returns no row: see the note above Store on which mutators do.
+	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
 
 	// EdgesAdd inserts a directed (fromID -> toID) edge with the given relation. It is
 	// idempotent, and both endpoints must exist or it returns ErrNotFound. The edge is
@@ -652,7 +688,12 @@ type Store interface {
 	// with nothing to re-queue it. Increments landing *after* that load sit above
 	// observed, so they survive the subtraction and keep the object owed. Bumps no
 	// resource_version.
-	ReconcileOwedDecrement(ctx context.Context, id ObjectID, observed int64) error
+	//
+	// Scoped to gk, like every other id-keyed mutator: another kind's id is rejected
+	// with ErrWrongKind rather than silently draining a wake that kind was owed. A
+	// row that is simply gone is not an error — a reconcile's target can be collected
+	// between its load and this write, and nothing is left to owe a pass to.
+	ReconcileOwedDecrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error
 
 	// ReconcileOwedListIDs returns the ids of objects of kind gk that are owed a
 	// dependency wake (reconcile_owed != 0). The owed pass queues these, so a wake

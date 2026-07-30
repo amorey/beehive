@@ -65,29 +65,35 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   tripwires: they add distinct ids once each, and a first add stays immediately
   dispatchable under any sane throttle.
 
-- **`DeleteBySlug` on an absent slug costs a write transaction** — known, not fixed.
-  `DeletionRequestsCreateBySlug` opens `Within` (so `BEGIN IMMEDIATE`) and its first act
-  inside is `nextResourceVersion`, an `UPDATE` on the sequence — both before
-  anything is known to match. A slug no row holds therefore costs a write
-  transaction, a sequence write, the zero-row `UPDATE`, the re-read, and a
+- **`DeleteBySlug` on an absent slug still opens a write transaction** — known, not
+  fixed, though it now costs much less than it did. `DeletionRequestsCreateBySlug`
+  opens `Within`, so `BEGIN IMMEDIATE`, before anything is known to match. A slug no
+  row holds costs that transaction, the zero-row `UPDATE`, the existence probe and a
   rollback, where the pre-mutator client code cost a single lock-free `SELECT`.
-  The rollback means no cursor value is burned, but the journal/page work happens.
 
     That absent path is the steady state of what this method is for. A controller that
   idempotently removes a child re-runs the call every reconcile, so it keeps hitting
   the absent path long after the one call that actually deleted something.
 
-  The fix is a lock-free `getObjectRowBySlug` before `Within`, short-circuiting both
-  idempotent outcomes — no such slug, and a row already deletion-pending — and falling
-  through to the atomic mark otherwise. That makes absent 1 statement, no-op 2, and the
-  happy path 4, one more than today.
+  **Two thirds of the original cost is gone.** The probe reads `"group"`/`kind` rather
+  than the whole row (`checkObjectScoped`), and `markForDeletion` draws the version
+  lazily — the `UPDATE` reads `value + 1` inline and the counter is advanced only once
+  a row was stamped — so neither the absent path nor the already-pending path writes
+  the sequence any more. What is left is the `BEGIN IMMEDIATE` and the journal work,
+  not the extra statements. See
+  [the write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md).
+
+  The remaining fix is a lock-free `getObjectRowBySlug` before `Within`,
+  short-circuiting both idempotent outcomes — no such slug, and a row already
+  deletion-pending — and falling through to the atomic mark otherwise.
 
   Deferred because it brings back a read-then-write shape as a fast path, and because
   its no-op branch would answer outside a transaction where the id-keyed sibling
-  answers inside one. That divergence needs more thought than the saving currently
-  justifies. Revisit if a profile shows absent-path deletes are hot, or if
-  `DeletionRequestsCreate` gets the same treatment — its absent path has always had
-  this shape, so the probe would belong in `requestDeletion` for both.
+  answers inside one. That divergence needs more thought than the saving now
+  justifies — and it justifies less than it used to, since the statements it would
+  have saved are the ones already removed. Revisit if a profile shows absent-path
+  deletes are hot, or if `DeletionRequestsCreate` gets the same treatment, in which
+  case the fast path belongs in `requestDeletion` for both.
 
 - **The waker's startup seed race costs latency, not convergence** — known, no longer
   a correctness hole. `Start` launches the waker with `bh.wg.Go` and returns; `seed`
@@ -268,67 +274,58 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   that declares many edges from client-only kinds, where the index entries would
   actually be measurable.
 
-- **`ReconcileOwedDecrement` is not kind-scoped** — known, not fixed. Its UPDATE is keyed
-  `WHERE id = ?` with no group/kind in the predicate, so it will decrement any row in
-  `objects` whose id it is handed, of any kind. Every other id-keyed mutator in the
-  store is scoped to a `GroupKind` and rejects a foreign id with `ErrWrongKind` —
-  either in the `WHERE` or via the scoped re-read — and this is the sole exception.
+- **`EventsAdd` still takes the read shape, so the write-shapes rule has one
+  exception** — known, not fixed. The
+  [write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md) says a write takes
+  only what it honours, and `ObjectsCreate` was narrowed to `ObjectsCreateInput` for
+  exactly that reason. `EventsAdd(ctx, gk, id, ev Event)` still takes `Event`, the
+  read shape, and reads five of its eleven fields — `Category`, `Type`, `Reason`,
+  `Message`, `Detail`. The store assigns the rest, and its godoc says so *in prose*,
+  which is the silent-drop shape the create path was just fixed for, on the same
+  interface.
 
-    It is safe today for one narrow reason: the reconciler is the only caller, and it
-  passes the id of a row it loaded a line earlier for its own kind, with the count read
-  off that same row. Nothing reaches it with another kind's id, and the `max(…, 0)`
-  floor means even a mistaken call could not corrupt the count — it would only clear a
-  wake another kind was owed.
+  It is milder than `ObjectsCreate`'s was: the dropped fields are `ID`, `ObjectID`,
+  `Count`, `FirstAt`, `LastAt` and `ResourceVersion`, all obviously store-assigned,
+  where `Status` on a create was a plausible thing to seed. So there is no trap here
+  today, only an inconsistency.
 
-  So this invariant rests on caller discipline where the rest of the store has
-  structure. The fix is small in itself — add `AND "group" = ? AND kind = ?` and thread
-  a `GroupKind` through — but it changes a `storeapi.Store` signature and wants a test
-  pinning the rejection, which is more than the two-line diff it looks like. Deferred
-  because there is no reachable defect here, only an invariant to move from convention
-  into the schema. Revisit when a second caller appears: the cross-kind sweeper above
-  would be one, and it would deliberately reach for rows of kinds it does not own —
-  exactly the case scoping exists to catch.
+  The fix is an `EventsAddInput` beside `ObjectsCreateInput`, same shape, same reason.
+  Deferred because it is a third break of an externally implementable `Store` for a
+  case with no reachable defect, and the ADR's own argument is that the break cost is
+  paid per break rather than per method — so this wants to ride along with the next
+  one that has to happen anyway, not to be its own. Revisit then, or sooner if a
+  field is ever added to `Event` that a caller might reasonably try to set.
 
-- **`ObjectsCreate` takes a `RawObject` and silently drops most of it** — known, not
-  fixed, and the input-side twin of the item below. `RawObject` mirrors a whole row and
-  is shaped for reads, but it is also `ObjectsCreate`'s parameter. The INSERT binds six
-  of its fields — group, kind, slug, spec, schema_version_spec, finalizers — and
-  ignores the other twelve. A caller that sets any of those gets a row without it and
-  no error.
+- **Two writes still read the whole row to answer a narrow question** — known, not
+  fixed, and the tail of the write-shapes pass. Every write that reports *no* row now
+  answers from metadata alone: the deletion probes, `ReconcileOwedDecrement`'s fault
+  probe and both condition mutators' kind gates go through `checkObjectScoped`. What
+  is left is the pre-read on the two writes that genuinely need row *content*, and
+  those read more of it than they use — `ObjectsUpdateStatus` selects all 17 columns
+  (including `spec`, the largest, and it unmarshals `finalizers`) to read six;
+  `FinalizersDelete` needs three.
 
-  Some of the twelve are defensible: `ID`, `ResourceVersion`, `CreatedAt` and
-  `UpdatedAt` are store-assigned, and `Generation` starts at 1. `Status` is the sharp
-  one, because seeding a status on create is a reasonable thing to try and it is
-  discarded silently. Nothing at the call site says which is which — the struct offers
-  eighteen fields and honours six.
+  One fold remains available on top of narrower `SELECT`s: `ConditionsSet` runs its
+  kind gate and `getCondition` as separate statements against the same key, which one
+  `LEFT JOIN` from `objects` to `conditions` collapses. Worth naming because
+  `ConditionsSet` is the hottest write in the system, nested inside the reconcile
+  transaction — though the gate is now two columns, so the fold saves a round trip
+  rather than a blob read.
 
-  The fix is to stop using the read shape for the write: a `CreateObjectInput`, or
-  functional options, carrying only the six fields create accepts, so the compiler
-  rejects the rest instead of the store dropping them. Deferred because `RawObject` is
-  an exported alias, so narrowing the parameter breaks an externally implementable
-  `Store`, and it should be done together with the return-shape item below rather than
-  as a second separate break.
+  Deferred as a family rather than piecemeal: each is a new hand-written `SELECT` list
+  or join that has to stay in step with `objectColumns` and `scanObject`, which is a
+  maintenance cost the write-shapes pass deliberately did not take on while it was
+  changing signatures. None of it changes a contract, so none of it needs a break.
 
-- **Mutators build a `RawObject` no caller reads** — known, not fixed. This is the
-  general form of the point the `DeleteBySlug` item makes about one method. Every
-  mutator returns a full `*RawObject` with conditions attached, because `scanWritten`
-  calls `attachConditions` on the write path. On the branches whose row nobody reads —
-  `ObjectsUpdateSpec`'s content no-op, `UpdateStatus`'s settled no-op,
-  `requestDeletion`'s already-pending re-read — that conditions query builds a value
-  the only caller throws away: `controllerClientImpl.UpdateStatus` drops it, and the
-  delete path reads only `obj.ID`. Where the client returns the object to the user, in
-  `Create`, `Update` and `CreateOrUpdate`, the work is needed.
-
-  Skipping `attachConditions` per branch was rejected: it would make one method's
-  return shape depend on which branch it took, and differ from its sibling a few lines
-  away. The contract is the thing to change. The options are narrowing what the `Store`
-  godoc promises about a returned row, adding mutator variants that return nothing or
-  just an id and version, or making the discard explicit at the `storeapi` boundary so
-  the store can skip the work.
-
-  Deferred because `type Store = storeapi.Store` is an alias, so any of those breaks an
-  externally implementable interface, and the saving is one indexed query per
-  discarding write. Revisit when the next `Store` break is on the table anyway.
+  **Not in this family any more**, both settled: the condition gates (now
+  `checkObjectScoped`) and the version drawn before a deletion mark knew it would
+  stamp one (now drawn lazily, so a guard-blocked mark writes no counter page —
+  pinned by `TestDeletionMarkDrawsAVersionOnlyWhenItStamps`). The one place a version
+  draw per row survives is `deletionRequestsCreateFromOwner`, which calls
+  `markForDeletion` per child, so an N-child cascade draws N versions where one
+  `value + N` draw would do. It only pays on children not already deleting — the
+  cascade skips the rest before calling — so the steady-state re-cascade is unaffected
+  and this is the first-pass cost of a large subtree only.
 
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.

@@ -20,8 +20,9 @@ import "github.com/amorey/beehive/internal/storeapi"
 // non-generic and deals only in raw rows: the generic-to-non-generic boundary
 // lives one layer up, in the typedController adapter.
 //
-// Mutators return the freshly written row so callers see the store-assigned
-// id, resource_version, and timestamps without a re-read.
+// ObjectsCreate and ObjectsUpdateSpec return the row they wrote, so a caller can
+// hand the store-assigned id, resource_version and timestamps straight to the user.
+// Every other mutator returns only an error — see the contract on storeapi.Store.
 type Store = storeapi.Store
 
 // FreePagesReleaser is an optional capability a Store may implement to hand space
@@ -36,6 +37,11 @@ type FreePagesReleaser = storeapi.FreePagesReleaser
 // objects table. The reconciler and client decode Spec/Status into typed
 // Object[Spec, Status] values; the Store never inspects them.
 type RawObject = storeapi.RawObject
+
+// ObjectsCreateInput is the narrow write shape ObjectsCreate accepts — only the
+// fields a create honours, so the compiler refuses the rest rather than the store
+// dropping them.
+type ObjectsCreateInput = storeapi.ObjectsCreateInput
 
 // RawEvent is the untyped event-log row below the generic boundary — one
 // aggregated run. The client decodes it into the public Event.

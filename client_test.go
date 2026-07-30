@@ -159,12 +159,12 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
-	_, err = store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
+	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
 
@@ -189,12 +189,12 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
-	_, err = store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
+	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
 
@@ -466,88 +466,6 @@ func TestClientUpdate(t *testing.T) {
 	assert.Equal(t, "v2", updated.Spec.Val)
 }
 
-func TestClientCreateOrUpdateCreates(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.NoError(t, err)
-	assert.NotZero(t, obj.ID)
-	require.NotNil(t, obj.Slug)
-	assert.Equal(t, "w1", *obj.Slug)
-	assert.Equal(t, int64(1), obj.Generation)
-	assert.Equal(t, "a", obj.Spec.Val)
-
-	got, err := client.GetBySlug(ctx, "w1")
-	require.NoError(t, err)
-	assert.Equal(t, obj.ID, got.ID)
-}
-
-func TestClientCreateOrUpdateUpdates(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.NoError(t, err)
-
-	updated, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "b"})
-	require.NoError(t, err)
-	assert.Equal(t, created.ID, updated.ID)
-	assert.Equal(t, int64(2), updated.Generation)
-	assert.Equal(t, "b", updated.Spec.Val)
-}
-
-func TestClientCreateOrUpdateIdempotent(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	first, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), first.Generation)
-
-	// Re-applying the same spec is a no-op: no generation bump.
-	second, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.NoError(t, err)
-	assert.Equal(t, first.ID, second.ID)
-	assert.Equal(t, int64(1), second.Generation)
-}
-
-func TestClientCreateOrUpdateMarshalError(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-
-	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
-	_, err = client.CreateOrUpdate(ctx, "w1", errMarshaler{})
-	require.Error(t, err)
-}
-
-func TestClientCreateOrUpdateStoreError(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(&slugErrorStore{})
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.ErrorIs(t, err, errBoom)
-}
-
-func TestClientCreateOrUpdateRawToTypedError(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(&createOrUpdateBadJSONStore{})
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.Error(t, err)
-}
-
 func TestClientGetOrCreateCreates(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
@@ -625,7 +543,7 @@ func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a new object is owed its first pass")
 
 	// Settle it, so the found branch below starts from "nothing owed".
-	_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+	err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
 	require.NoError(t, err)
 	require.Empty(t, unsettledIDs(t, store), "precondition: settled")
 
@@ -740,35 +658,6 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	assert.Equal(t, orig.Generation, got.Generation, "no generation bump on a rolled-back update")
 }
 
-// TestClientCreateOrUpdateRollsBackOnDecodeError pins validate-before-commit on both
-// of CreateOrUpdate's branches: an undecodable update keeps the prior good spec, and
-// an undecodable create leaves the slug free (no committed poison row).
-func TestClientCreateOrUpdateRollsBackOnDecodeError(t *testing.T) {
-	ctx := context.Background()
-	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
-	gk := GroupKind{Kind: "CondBad"}
-	client := NewClient[conditionalBadSpec, cStatus](bh, gk)
-
-	// Update branch: an existing good row, updated to an undecodable spec, rolls back.
-	orig, err := client.CreateOrUpdate(ctx, "w1", conditionalBadSpec{Val: "good"})
-	require.NoError(t, err)
-	_, err = client.CreateOrUpdate(ctx, "w1", conditionalBadSpec{Val: "bad", Bad: true})
-	require.Error(t, err)
-	got, err := client.GetBySlug(ctx, "w1")
-	require.NoError(t, err, "the prior good spec must still decode")
-	assert.Equal(t, "good", got.Spec.Val, "the update must have rolled back")
-	assert.Equal(t, orig.Generation, got.Generation, "no generation bump on a rolled-back update")
-
-	// Create branch: an absent slug written with an undecodable spec rolls back,
-	// leaving the slug free for a later good create.
-	_, err = client.CreateOrUpdate(ctx, "w2", conditionalBadSpec{Val: "bad", Bad: true})
-	require.Error(t, err)
-	_, err = store.ObjectsGetBySlug(ctx, gk, "w2")
-	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
-}
-
 // TestClientWithOnCreateFiresOnlyOnCreate pins WithOnCreate to the create branch:
 // Create always runs it, GetOrCreate runs it when it inserts but not when it
 // returns an existing row.
@@ -867,10 +756,6 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 			_, err := c.Create(ctx, cSpec{Val: "b"})
 			return err
 		}},
-		{"CreateOrUpdate", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
-			_, err := c.CreateOrUpdate(ctx, "new", cSpec{Val: "b"})
-			return err
-		}},
 		{"GetOrCreate", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
 			_, _, err := c.GetOrCreate(ctx, "new", cSpec{Val: "b"})
 			return err
@@ -896,7 +781,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 				seeded, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("seed"))
 				require.NoError(t, err)
 				// Settle the seed so its own unconverged spec doesn't mask the write's.
-				_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
+				err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
 				require.NoError(t, err)
 				require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
@@ -927,46 +812,29 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 // listing reports it. It also closes a spin: a controller that idempotently
 // re-applies its own kind's spec each pass would otherwise re-owe itself forever.
 func TestClientNoOpUpdateOwesNothing(t *testing.T) {
-	writes := []struct {
-		name  string
-		write func(ctx context.Context, c Client[cSpec, cStatus], id ObjectID) error
-	}{
-		{"Update", func(ctx context.Context, c Client[cSpec, cStatus], id ObjectID) error {
-			_, err := c.Update(ctx, id, cSpec{Val: "a"})
-			return err
-		}},
-		{"CreateOrUpdate", func(ctx context.Context, c Client[cSpec, cStatus], _ ObjectID) error {
-			_, err := c.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-			return err
-		}},
-	}
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
 
-	for _, w := range writes {
-		t.Run(w.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := newClientTestStore(t)
-			bh, err := New(store)
-			require.NoError(t, err)
-			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-			require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
+	require.NoError(t, err)
+	// Settle it, so anything the write below owes is its own.
+	err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+	require.NoError(t, err)
+	require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
-			client := NewClient[cSpec, cStatus](bh, clientTestGK)
-			obj, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
-			require.NoError(t, err)
-			// Settle it, so anything the writes below owe is theirs.
-			_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
-			require.NoError(t, err)
-			require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.Empty(t, unsettledIDs(t, store), "re-applying the identical spec leaves it settled")
 
-			require.NoError(t, w.write(ctx, client, obj.ID))
-			assert.Empty(t, unsettledIDs(t, store), "re-applying the identical spec leaves it settled")
-
-			// A real change still unsettles it, so the suppression is scoped to the no-op.
-			_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
-			require.NoError(t, err)
-			assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a real spec change is owed a pass")
-		})
-	}
+	// A real change still unsettles it, so the suppression is scoped to the no-op.
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a real spec change is owed a pass")
 }
 
 // TestClientDeleteAdvancesGCOnlyAfterOuterCommit covers Delete, whose follow-up is
@@ -1114,7 +982,7 @@ func TestClientGetOrCreateCreateError(t *testing.T) {
 
 func TestClientGetOrCreateRawToTypedError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&createOrUpdateBadJSONStore{})
+	bh, err := New(&getOrCreateBadJSONStore{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1145,9 +1013,9 @@ func TestClientGetBySlugFound(t *testing.T) {
 	// Create a named object via the store directly (client.Create uses nil slug).
 	specJSON, err := json.Marshal(cSpec{Val: "hello"})
 	require.NoError(t, err)
-	raw, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind,
-		Slug: new("myobj"), Spec: specJSON,
+	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: new("myobj"),
+		Spec: specJSON,
 	})
 	require.NoError(t, err)
 
@@ -1365,7 +1233,7 @@ type createBadJSONStore struct {
 	fakeStore
 }
 
-func (s *createBadJSONStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -1374,7 +1242,7 @@ type errorObjectsCreateStore struct {
 	fakeStore
 }
 
-func (s *errorObjectsCreateStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *errorObjectsCreateStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1383,8 +1251,8 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
-	return &RawObject{ID: 1, Spec: []byte("not-json")}, true, nil
+func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
+	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
 // errorUpdateSpecStore returns an error from ObjectsUpdateSpec.
@@ -1392,12 +1260,12 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
-	return nil, false, errBoom
+func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
+	return nil, errBoom
 }
 
 // slugErrorStore returns a non-NotFound error from ObjectsGetBySlug, driving
-// CreateOrUpdate's default (read-error) branch.
+// GetOrCreate's read-error branch.
 type slugErrorStore struct {
 	fakeStore
 }
@@ -1411,33 +1279,33 @@ type requestDeletionBySlugErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionBySlugErrorStore) DeletionRequestsCreateBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
-	return nil, false, errBoom
+func (s *requestDeletionBySlugErrorStore) DeletionRequestsCreateBySlug(_ context.Context, _ GroupKind, _ string) (bool, error) {
+	return false, errBoom
 }
 
-// createOrUpdateBadJSONStore drives CreateOrUpdate's rawToTyped error path: the
+// getOrCreateBadJSONStore drives GetOrCreate's rawToTyped error path: the
 // slug is absent (NotFound) so the create branch runs, and ObjectsCreate returns
 // undecodable spec bytes.
-type createOrUpdateBadJSONStore struct {
+type getOrCreateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *createOrUpdateBadJSONStore) ObjectsGetBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *getOrCreateBadJSONStore) ObjectsGetBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, ErrNotFound
 }
 
-func (s *createOrUpdateBadJSONStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *getOrCreateBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
 // createErrorStore drives the create branch's write-error path: it borrows
-// createOrUpdateBadJSONStore's absent-slug lookup so the insert runs, but fails
+// getOrCreateBadJSONStore's absent-slug lookup so the insert runs, but fails
 // the insert instead of returning an undecodable row.
 type createErrorStore struct {
-	createOrUpdateBadJSONStore
+	getOrCreateBadJSONStore
 }
 
-func (s *createErrorStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createErrorStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return nil, errBoom
 }
 

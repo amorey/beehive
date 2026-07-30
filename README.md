@@ -309,7 +309,6 @@ type ObjectChange[Spec, Status any] struct {
 
 type Client[Spec, Status any] interface {
     Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-    CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
     GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
     Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
     Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
@@ -356,17 +355,19 @@ client.Update(ctx, obj.ID, ClusterSpec{...})
 
 **A slug is an opaque key and beehive does not validate it** — no character rules, no length limit, no normalization. So the empty string is an ordinary slug: a real value under the unique constraint, and distinct from `NULL`. `GetOrCreate(ctx, "", spec)` creates *the* empty-slug object of that kind, and the next caller passing `""` gets that same row back with `created=false`, exactly as two callers passing `"prod"` would. That is the contract, not a collision bug, but it has a sharp edge: a slug read from configuration is `""` when the field is unset, which quietly points every such caller at one shared object. Validate slugs that come from outside your code, and when you mean "no name" pass no `WithSlug` at all rather than `""`.
 
-The three slug-keyed writes differ **only in what they do when the slug is taken**, and that holds under concurrency. `CreateOrUpdate` and `GetOrCreate` do their read and write in one transaction, so two callers racing on a slug never both insert — the loser sees the winner's row and updates or returns it. `Create` does no lookup at all, so the loser of that race fails on `UNIQUE`, just as it would against a row that was already there:
+The two slug-keyed creates differ **only in what they do when the slug is taken**, and that holds under concurrency. `GetOrCreate` does its read and write in one transaction, so two callers racing on a slug never both insert — the loser sees the winner's row and returns it. `Create` does no lookup at all, so the loser of that race fails on `UNIQUE`, just as it would against a row that was already there:
 
-| Slug already held by    | `Create`         | `CreateOrUpdate`     | `GetOrCreate`                         |
-| ----------------------- | ---------------- | -------------------- | ------------------------------------- |
-| nothing                 | creates          | creates              | creates, `created=true`               |
-| a live row              | fails (`UNIQUE`) | updates it to `spec` | returns it untouched, `created=false` |
-| a deletion-pending row  | fails (`UNIQUE`) | updates it to `spec` | returns it untouched, `created=false` |
+| Slug already held by    | `Create`         | `GetOrCreate`                         |
+| ----------------------- | ---------------- | ------------------------------------- |
+| nothing                 | creates          | creates, `created=true`               |
+| a live row              | fails (`UNIQUE`) | returns it untouched, `created=false` |
+| a deletion-pending row  | fails (`UNIQUE`) | returns it untouched, `created=false` |
 
-Where the table says `CreateOrUpdate` "updates it", re-applying the spec the row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever. `Update` behaves the same way.
+**There is no slug-keyed upsert.** Neither create branch ever writes to a row it found, so changing an existing object is always `Update`, keyed by id. A caller that wants ensure-then-set composes `GetOrCreate` with `Update` inside its own `Within` — and should think about the deletion-pending row before it does, since `GetOrCreate` hands that back like any other and the `Update` would write a spec onto an object being torn down.
 
-Every write **validates before it commits.** `Create`, `CreateOrUpdate`, `GetOrCreate` and `Update` decode the written row back into `Spec`/`Status` *inside* the transaction. A spec that marshals but does not round-trip — usually a `MarshalJSON`/`UnmarshalJSON` pair that disagree — rolls the write back instead of committing a row this process cannot read. **So an error from a write means nothing was committed:** no unreadable row, nothing added to a driver's listing, no `UNIQUE` left behind for the retry to trip on, and for `Update`/`CreateOrUpdate` the previous spec is still there. `GetOrCreate` returns `created=false` in that case, since nothing was created. The cost is that the write holds the store's single writer across the decode (`json.Marshal` still runs before the transaction opens). This only guards the write path — a row can still become unreadable later, say after a schema downgrade, which the read path handles by quarantining it (see [Migrator](#migrator)).
+Re-applying the spec a row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever.
+
+Every write **validates before it commits.** `Create`, `GetOrCreate` and `Update` decode the written row back into `Spec`/`Status` *inside* the transaction. A spec that marshals but does not round-trip — usually a `MarshalJSON`/`UnmarshalJSON` pair that disagree — rolls the write back instead of committing a row this process cannot read. **So an error from a write means nothing was committed:** no unreadable row, nothing added to a driver's listing, no `UNIQUE` left behind for the retry to trip on, and for `Update` the previous spec is still there. `GetOrCreate` returns `created=false` in that case, since nothing was created. The cost is that the write holds the store's single writer across the decode (`json.Marshal` still runs before the transaction opens). This only guards the write path — a row can still become unreadable later, say after a schema downgrade, which the read path handles by quarantining it (see [Migrator](#migrator)).
 
 Use `GetOrCreate` when a controller has to make sure a child exists **without ever changing it**. The alternative is open-coding `GetBySlug` → `Create` → `GetBySlug` again on conflict, where the fallback path tends to drift out of step with the primary one. Its found branch writes nothing, so a deletion-pending row comes back as it is, with `DeletionRequestedAt` set, rather than being resurrected by a spec update:
 

@@ -25,15 +25,31 @@ whole reconcile.
 
 ## The slug-keyed writes differ only in their conflict policy
 
-`Create` errors, `CreateOrUpdate` updates the row to the new spec, `GetOrCreate`
-returns it untouched (`created=false`).
+`Create` errors, `GetOrCreate` returns the row untouched (`created=false`).
 
-`CreateOrUpdate` / `GetOrCreate` wrap their read-and-write in one `store.Within` —
+`GetOrCreate` wraps its read-and-write in one `store.Within` —
 that transaction, not the caller, is what makes the slug race safe (`Create`
 doesn't read at all; its loser just takes the `UNIQUE` error).
 
 They share `insertObject` for the created-row shape (spec-version stamp,
 finalizers, owner ref); a new column or stamp is a one-site change there.
+
+### There is no slug-keyed upsert
+
+A third policy — update the row to the new spec — shipped as `CreateOrUpdate` and was
+removed on 2026-07-30. Nothing replaces it. What is left is a sharper rule than the
+spectrum it sat in the middle of: **no slug-keyed write ever writes to a row it
+found.** Both surviving policies are decisions about *creating*, and mutation is
+`Update`, keyed by id.
+
+That is worth stating as a rule rather than an absence, because `CreateOrUpdate`'s
+found branch was the one place the slug-keyed family could resurrect a
+deletion-pending row — it updated whatever the slug named, tombstone included, which
+sits badly beside `GetOrCreate`'s deliberate refusal to do exactly that a few lines
+away. A caller that genuinely wants ensure-then-set still composes `GetOrCreate` with
+`Update` inside its own `Within`, which costs one extra statement on the create path
+and makes the tombstone question the caller's to answer rather than one this API
+answered for them by accident.
 
 `GetOrCreate` rejects `WithSlug` with `ErrConflictingOption` rather than ignoring it.
 This is the deliberate exception to "an option ignores targets it doesn't recognize":

@@ -432,8 +432,8 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// Simulate a crash mid-delete: a deletion-pending row is already in the durable
 	// store before any control plane runs. (Written through the store directly, so
 	// no reconcile has touched it.)
-	raw, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
+	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	// Settle it first, so the GC sweeper's startup pass really is the *only* path
@@ -441,9 +441,9 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// which the startup resumption of owed work would pick up as unsettled — the row
 	// would then be removed for two reasons and this test would stop pinning either
 	// one. Deletion does not bump generation, so the row stays settled below.
-	_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
+	err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, _, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
+	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	// A fresh Beehive with no spec-startup pass and the full pass disabled: the GC
@@ -763,8 +763,8 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	real := newClientTestStore(t)
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
-	raw, err := real.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
+	raw, err := real.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -782,7 +782,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		t.Fatal("sweeper never ran its startup pass")
 	}
 
-	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
+	_, err = real.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -849,7 +849,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	// Mark it deletion-pending through the store, so nothing the client's own Delete does
 	// wake isn't what drives this either.
-	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
+	_, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)
 
 	waitForDeletions(t, w, obj.ID)

@@ -139,7 +139,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// stays up and the backstop retries it, whereas requeueing on the error would
 	// spin against a store that keeps failing.
 	if reconcileErr == nil && raw.ReconcileOwed != 0 {
-		if err := t.bh.store.ReconcileOwedDecrement(ctx, id, raw.ReconcileOwed); err != nil {
+		if err := t.bh.store.ReconcileOwedDecrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
 		}
 	}

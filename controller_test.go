@@ -456,7 +456,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 // of it predates the change.
 func (f *declareFixture) moveTarget(t *testing.T) {
 	t.Helper()
-	_, err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
+	err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 }
@@ -709,8 +709,8 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) (*RawObject, error) {
-	return nil, errBoom
+func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
+	return errBoom
 }
 
 // errStatusMarshaler is a Status type whose JSON marshaling always fails.

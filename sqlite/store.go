@@ -636,9 +636,11 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	return rv, err
 }
 
-// scanWritten scans a mutator's RETURNING row and assembles its conditions.
-// Mutators share it, so the returned object carries the full conditions set
-// regardless of which column the write touched, matching Get/List.
+// scanWritten scans a mutator's RETURNING row and assembles its conditions, so the
+// returned object carries the full conditions set regardless of which column the
+// write touched, matching Get/List. Only ObjectsUpdateSpec needs it: it is the one
+// mutator that both returns a row and can be writing a row that already has
+// conditions (ObjectsCreate's cannot — see objectsCreate).
 func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.RawObject, error) {
 	obj, err := scanObject(sc)
 	if err != nil {
@@ -650,7 +652,7 @@ func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.Ra
 	return obj, nil
 }
 
-func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
 	// Self-wrapping keeps the version draw and the insert atomic: a create is two
 	// statements (nextResourceVersion, then INSERT ... RETURNING), and a scan of the
 	// write log orders rows by the version they were stamped with. Store is public,
@@ -659,7 +661,7 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject
 	var created *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		created, err = s.objectsCreate(ctx, obj)
+		created, err = s.objectsCreate(ctx, gk, in)
 		return err
 	})
 	if err != nil {
@@ -668,8 +670,8 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject
 	return created, nil
 }
 
-func (s *sqliteStore) objectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
-	finalizers := marshalFinalizers(obj.Finalizers)
+func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
+	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -685,9 +687,35 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, obj *storeapi.RawObject
 			 generation, resource_version, finalizers, created_at, updated_at)
 		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
 		RETURNING `+objectColumns,
-		obj.Group, obj.Kind, obj.Slug, jsonText(obj.Spec), obj.SpecVersion,
+		gk.Group, gk.Kind, in.Slug, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
-	return s.scanWritten(ctx, row)
+	// scanObject, not scanWritten: a condition references an object id, and this id
+	// did not exist until the statement above. So the row provably has none, and
+	// nil Conditions is what assembling them would have produced anyway.
+	return scanObject(row)
+}
+
+// checkObjectScoped answers "does id exist, and is it gk's?" and nothing else. It
+// reads two TEXT columns rather than the whole row, so unlike getObjectRowScoped it
+// touches neither blob and unmarshals no finalizers — which matters because every
+// caller is a write path that throws the row away: a kind gate, or the branch that
+// has to tell a foreign id from a collected one. Same errors as a scoped read,
+// ErrNotFound and ErrWrongKind, so callers read identically.
+func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
+	var group, kind string
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT "group", kind FROM objects WHERE id = ?`, id).Scan(&group, &kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeapi.ErrNotFound // bare, like scanObject's
+	}
+	if err != nil {
+		return err
+	}
+	if group != gk.Group || kind != gk.Kind {
+		return fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
+			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
+	}
+	return nil
 }
 
 // getObjectRow reads the objects row without assembling conditions. Internal
@@ -927,7 +955,7 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 }
 
 // ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs on the
-// owed-wake count. The decrement's contract (cross-kind, no resource_version bump,
+// owed-wake count. The decrement's contract (kind scope, no resource_version bump,
 // why it takes the observed count) is on storeapi.Store; the subtraction floors at
 // 0 with max() so it can never drive the count negative.
 //
@@ -943,10 +971,27 @@ func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.Ob
 	return err
 }
 
-func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, id storeapi.ObjectID, observed int64) error {
-	_, err := s.conn(ctx).ExecContext(ctx,
-		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0) WHERE id = ?`, observed, id)
-	return err
+// ReconcileOwedDecrement folds the kind into the UPDATE, so a foreign id matches no
+// row. Distinguishing the two ways that happens costs a read, so it is paid only on
+// the branch that wrote nothing — unreachable from the reconciler, which passes the
+// kind it loaded the row for a line earlier.
+func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observed int64) error {
+	res, err := s.conn(ctx).ExecContext(ctx,
+		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0)
+		 WHERE id = ? AND "group" = ? AND kind = ?`, observed, id, gk.Group, gk.Kind)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n > 0 {
+		return err
+	}
+	// No row matched: another kind's id, or one collected since the caller loaded it.
+	// Only the first is a fault — a vanished row owes no wake to anyone.
+	if err := s.checkObjectScoped(ctx, gk, id); err != nil && !errors.Is(err, storeapi.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 // DependentsListStale re-derives which dependents are owed a pass (see the
@@ -1161,11 +1206,10 @@ func stampVersion(stored, incoming int) (int, error) {
 	}
 }
 
-func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
 	var result *storeapi.RawObject
-	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
@@ -1190,9 +1234,9 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 		// newer version hands us bytes in a *different shape* — equal bytes there can
 		// carry different values (a converter reading v1's absent field as a default
 		// the v2 shape spells explicitly). Suppressing that as a no-op would change
-		// what every later read decodes while reporting changed=false, bumping no
-		// resource_version and emitting nothing, so no watcher learns and the client
-		// skips the controller wake. When the shapes disagree we can't compare, so we
+		// what every later read decodes while bumping no resource_version and emitting
+		// nothing, so no watcher learns and the client skips the controller wake.
+		// When the shapes disagree we can't compare, so we
 		// fall through and write it as the real change it may be — generation bump
 		// included. That is the point, not a side effect: bumping resource_version
 		// while leaving generation would re-stamp a row that stays settled
@@ -1221,10 +1265,9 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 			RETURNING `+objectColumns,
 			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanWritten(ctx, row)
-		changed = err == nil
 		return err
 	})
-	return result, changed, err
+	return result, err
 }
 
 // ObjectsUpdateStatus skips the status write when the incoming bytes equal the stored
@@ -1250,11 +1293,10 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 // written in a different shape aren't comparable, so a caller at a newer version
 // takes the content path even when the bytes look identical. Identical status at
 // the same version, with the generation already recorded, writes nothing at all.
-func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
-	var result *storeapi.RawObject
+func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
 		// while doubling as the no-op compare's load — no separate kind check.
@@ -1300,8 +1342,7 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			// nothing to heal, which is what makes suppressing it free here.
 			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
 			if settled {
-				result, err = s.attachConditions(ctx, obj)
-				return err
+				return nil
 			}
 			// The handshake advanced: the object settled at a generation it hadn't
 			// settled at before. That's watch-visible even with identical bytes.
@@ -1313,13 +1354,13 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			if err != nil {
 				return err
 			}
-			row := c.QueryRowContext(ctx, `
+			// No RETURNING: the caller gets no row, and the scoped read above already
+			// proved this id exists inside this transaction.
+			_, err = c.ExecContext(ctx, `
 				UPDATE objects
 				SET observed_generation = ?, observed_at = ?, resource_version = ?
-				WHERE id = ?
-				RETURNING `+objectColumns,
+				WHERE id = ?`,
 				observedGeneration, toMillis(time.Now().UTC()), rv, id)
-			result, err = s.scanWritten(ctx, row)
 			return err
 		}
 		rv, err := nextResourceVersion(ctx, c)
@@ -1338,17 +1379,14 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 		// generation guard both came from the scoped read above, in this same
 		// transaction, and group/kind are write-once at insert. Keep the read if you
 		// move this statement.
-		row := c.QueryRowContext(ctx, `
+		_, err = c.ExecContext(ctx, `
 			UPDATE objects
 			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
 			    resource_version = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+objectColumns,
+			WHERE id = ?`,
 			jsonText(status), stamp, observedGeneration, now, rv, now, id)
-		result, err = s.scanWritten(ctx, row)
 		return err
 	})
-	return result, err
 }
 
 // conditionColumns is the canonical select list for a condition row; scanCondition
@@ -1445,20 +1483,20 @@ func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, co
 	return &cond, nil
 }
 
-// bumpObject advances id's resource_version and returns the assembled object. The
-// condition mutators share it: a condition lives in its own table, so the version
-// bump — which is what makes the change visible to a scan of the write log — can't
-// be folded into the semantic write and is a separate UPDATE.
-func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+// bumpObject advances id's resource_version. The condition mutators share it: a
+// condition lives in its own table, so the version bump — which is what makes the
+// change visible to a scan of the write log — can't be folded into the semantic
+// write and is a separate UPDATE. No RETURNING: neither mutator reports a row, and
+// each has already read this one under its kind scope in this same transaction.
+func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) error {
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	row := c.QueryRowContext(ctx, `
+	_, err = c.ExecContext(ctx, `
 		UPDATE objects SET resource_version = ?, updated_at = ?
-		WHERE id = ?
-		RETURNING `+objectColumns, rv, toMillis(time.Now().UTC()), id)
-	return s.scanWritten(ctx, row)
+		WHERE id = ?`, rv, toMillis(time.Now().UTC()), id)
+	return err
 }
 
 // conditionUnchanged reports whether an existing condition already matches the
@@ -1482,19 +1520,19 @@ func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want stor
 		existing.Liveness == want.Liveness
 }
 
-func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) error {
 	// Within keeps the condition write and the object's version bump atomic: it
 	// opens a transaction when called standalone and joins the caller's when
 	// nested (the reconcile path), so a crash between the two statements can't
 	// leave a changed condition with an unbumped resource_version.
-	var result *storeapi.RawObject
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read confirms the object exists and belongs to gk first: yields a
-		// clean ErrNotFound/ErrWrongKind rather than a foreign-key violation or a
-		// cross-kind write from the conditions insert.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// Metadata-only gate: confirms the object exists and belongs to gk first,
+		// yielding a clean ErrNotFound/ErrWrongKind rather than a foreign-key
+		// violation or a cross-kind write from the conditions insert. Nothing here
+		// reports a row, so nothing here reads one — a full read would also make a
+		// corrupt finalizers blob fail a condition write that never touches it.
+		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		// No-op suppression: an identical condition leaves resource_version where it is,
@@ -1504,8 +1542,7 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 			return err
 		}
 		if s.conditionUnchanged(existing, cond) {
-			result, err = s.attachConditions(ctx, obj)
-			return err
+			return nil
 		}
 		now := toMillis(time.Now().UTC())
 		if _, err := c.ExecContext(ctx, `
@@ -1527,22 +1564,18 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// A condition change bumps the object's resource_version, which is what a watch
 		// poll and the dependency waker both look at.
-		result, err = s.bumpObject(ctx, c, id)
-		return err
+		return s.bumpObject(ctx, c, id)
 	})
-	return result, err
 }
 
-func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {
 	// Within keeps the delete and the version bump atomic (see ConditionsSet).
-	var result *storeapi.RawObject
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary up front (symmetric with
-		// ConditionsSet); the conditions table carries no group/kind to fold into
-		// the DELETE, so the gate is the object read.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// Same metadata-only gate as ConditionsSet: the conditions table carries no
+		// group/kind to fold into the DELETE, so the kind boundary is a separate read
+		// — of two columns, not of the row.
+		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		res, err := c.ExecContext(ctx,
@@ -1552,16 +1585,12 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 		}
 		n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
 		// Absent condition: nothing changed, so don't bump resource_version — a watch
-		// poll would otherwise report a spurious diff. Return the object we already
-		// read, with its conditions assembled.
+		// poll would otherwise report a spurious diff.
 		if n == 0 {
-			result, err = s.attachConditions(ctx, obj)
-			return err
+			return nil
 		}
-		result, err = s.bumpObject(ctx, c, id)
-		return err
+		return s.bumpObject(ctx, c, id)
 	})
-	return result, err
 }
 
 // eventColumns is the canonical select list for an event row; scanEvent reads
@@ -1754,12 +1783,11 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge tim
 	return int(total), err
 }
 
-func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) error {
 	// Within keeps the read-modify-write of the finalizer list atomic: it opens a
 	// transaction standalone and joins the caller's on the reconcile path, so a
 	// concurrent writer can't slip between the load and the rewrite.
-	var result *storeapi.RawObject
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary while loading the finalizer list.
 		obj, err := s.getObjectRowScoped(ctx, gk, id)
@@ -1770,93 +1798,102 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		// Absent finalizer: nothing changed, so don't bump resource_version — a watch
 		// poll would otherwise report a spurious diff (mirrors ConditionsDelete).
 		if !removed {
-			result, err = s.attachConditions(ctx, obj)
-			return err
+			return nil
 		}
 		rv, err := nextResourceVersion(ctx, c)
 		if err != nil {
 			return err
 		}
-		row := c.QueryRowContext(ctx, `
+		// No RETURNING: the caller gets no row, and the scoped read above already
+		// proved this id exists inside this transaction.
+		_, err = c.ExecContext(ctx, `
 			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+objectColumns,
+			WHERE id = ?`,
 			jsonText(marshalFinalizers(remaining)), rv, toMillis(time.Now().UTC()), id)
-		result, err = s.scanWritten(ctx, row)
 		return err
 	})
-	return result, err
 }
 
-// markForDeletion stamps the deletion clock of the row named by key and emits a
-// Modified, once: the `IS NULL` guard makes a repeat a no-op (changed=false,
-// ErrNotFound) so retries don't churn the watch cursor. where is the caller's whole
+// markForDeletion stamps the deletion clock of the row named by key, once: the
+// `IS NULL` guard makes a repeat a no-op, so retries don't churn the watch
+// cursor. where is the caller's whole
 // row predicate, keying and scope together — `id = ?` plus a kind scope, or the
 // group/kind/slug triple — so a new keying is a call-site change rather than a
 // second copy of this statement. It is parenthesized before the guard is appended,
 // so a disjunctive key can't bind loosely enough to escape the IS NULL and re-stamp
 // an already-deleting row. Like edgesByIDs' column names it is a compile-time
-// fragment, never user input; only whereArgs carry values. The row persists
-// (deletion is async via finalizers), so the emitted object still carries its
-// conditions, matching Get/List. Runs on the ambient connection — callers wrap it
-// in Within to make rv-bump/write/emit atomic.
-func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (*storeapi.RawObject, bool, error) {
+// fragment, never user input; only whereArgs carry values. Runs on the ambient
+// connection — callers wrap it in Within to make the rv bump and the write atomic.
+//
+// It reports only whether it stamped a row. RowsAffected == 0 is the same signal
+// RETURNING's ErrNotFound used to carry, and just as ambiguous: guard, scope or
+// missing. requestDeletion's probe is what tells them apart.
+//
+// **The version is drawn lazily, which is why this doesn't call
+// nextResourceVersion.** That helper is an UPDATE on resource_version_seq, so
+// calling it first would make every repeat delete — the steady state for a
+// controller that idempotently removes a child — commit a counter write and its
+// fsync to stamp nothing. Instead the UPDATE reads `value + 1` inline and the
+// counter is advanced only once a row was actually stamped, so the guard-blocked
+// path is a pure read. The two statements are in the caller's transaction, on one
+// connection, so no other writer can draw the same value in between; and the
+// subquery is safe against a multi-row match only because there is never one —
+// every `where` here keys on a unique column (id, or group/kind/slug).
+func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (bool, error) {
 	c := s.conn(ctx)
-	rv, err := nextResourceVersion(ctx, c)
-	if err != nil {
-		return nil, false, err
-	}
 	now := toMillis(time.Now().UTC())
-	args := append([]any{now, rv, now}, whereArgs...)
-	row := c.QueryRowContext(ctx, `
+	args := append([]any{now, now}, whereArgs...)
+	res, err := c.ExecContext(ctx, `
 		UPDATE objects
-		SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
-		WHERE (`+where+`) AND deletion_requested_at IS NULL
-		RETURNING `+objectColumns, args...)
-	obj, err := s.scanWritten(ctx, row)
+		SET deletion_requested_at = ?,
+		    resource_version = (SELECT value + 1 FROM resource_version_seq WHERE id = 1),
+		    updated_at = ?
+		WHERE (`+where+`) AND deletion_requested_at IS NULL`, args...)
 	if err != nil {
-		return nil, false, err // ErrNotFound = no transition (guard/where/missing)
+		return false, err
 	}
-	return obj, true, nil
+	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
+	if n == 0 {
+		return false, nil
+	}
+	// Commit the value the row above just took. Must match it exactly, which it does:
+	// same transaction, same single connection, nothing between the two statements.
+	if _, err := nextResourceVersion(ctx, c); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-// requestDeletion is the mark-or-reread protocol behind both deletion entry points.
-// markForDeletion's ErrNotFound is ambiguous — already deleting, out of scope, or
-// gone — so reread resolves it on the caller's own key and supplies the current row
-// for the no-op case. Within keeps the rv-bump and the write atomic whether or not
-// a caller wrapped this: the mutators self-wrap, and nested they join the caller's
-// transaction — e.g. the GC cascade.
+// requestDeletion is the mark-or-probe protocol behind both deletion entry points.
+// A zero-row mark is ambiguous — already deleting, out of scope, or gone — so probe
+// resolves it on the caller's own key: it succeeds for the idempotent already-pending
+// case and reports ErrWrongKind or ErrNotFound otherwise. It reads neither blob nor
+// conditions — answering from metadata alone is the whole reason this pair no longer
+// returns a row, and the already-pending branch is the steady state for a controller
+// that idempotently deletes a child. Within keeps the
+// rv-bump and the write atomic whether or not a caller wrapped this: the mutators
+// self-wrap, and nested they join the caller's transaction — e.g. the GC cascade.
 func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
-	reread func(context.Context) (*storeapi.RawObject, error),
+	probe func(context.Context) error,
 	where string, whereArgs ...any,
-) (*storeapi.RawObject, bool, error) {
-	var result *storeapi.RawObject
+) (bool, error) {
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
-		obj, ch, err := s.markForDeletion(ctx, where, whereArgs...)
-		if errors.Is(err, storeapi.ErrNotFound) {
-			cur, rerr := reread(ctx)
-			if rerr != nil {
-				return rerr
-			}
-			result, err = s.attachConditions(ctx, cur)
+		var err error
+		if changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
 			return err
 		}
-		if err != nil {
-			return err
-		}
-		result, changed = obj, ch
-		return nil
+		return probe(ctx)
 	})
-	return result, changed, err
+	return changed, err
 }
 
 // DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
-// foreign id matches no row and the re-read reports ErrWrongKind.
-func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
+// foreign id matches no row and the probe reports ErrWrongKind.
+func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowScoped(ctx, gk, id) },
+		func(ctx context.Context) error { return s.checkObjectScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
@@ -1865,9 +1902,21 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 // the mark are one statement: atomic, and a round trip cheaper than the alternative
 // of wrapping a ObjectsGetBySlug + DeletionRequestsCreate pair in a Within — which matters
 // on a store that runs every caller through one connection.
-func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowBySlug(ctx, gk, slug) },
+		// Existence is the whole question here: slugs are unique per kind, so a slug
+		// this kind does not hold is absent rather than foreign, and there is no
+		// ErrWrongKind to distinguish.
+		func(ctx context.Context) error {
+			var one int
+			err := s.conn(ctx).QueryRowContext(ctx,
+				`SELECT 1 FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
+				gk.Group, gk.Kind, slug).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				return storeapi.ErrNotFound
+			}
+			return err
+		},
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
@@ -1930,9 +1979,9 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 			continue // already deletion-pending: nothing to stamp
 		}
 		// A race could have set the flag since the SELECT; markForDeletion's guard
-		// then returns ErrNotFound — benign here.
-		if _, _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil &&
-			!errors.Is(err, storeapi.ErrNotFound) {
+		// then stamps nothing and reports changed=false — benign here, which is why
+		// only the error matters.
+		if _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
 			return nil, err
 		}
 	}

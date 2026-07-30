@@ -104,12 +104,22 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on its
   own. Mutators self-wrap in `Within` and scope id-keyed writes to the caller's
   `GroupKind`, returning `ErrWrongKind` otherwise. Use `ControllerClient.Within` when
-  several writes must land together. The slug-keyed writes (`Create`,
-  `CreateOrUpdate`, `GetOrCreate`, `DeleteBySlug`) differ only in what they do when
-  the slug is taken. **No write schedules anything**: a spec write bumps the
+  several writes must land together. The slug-keyed writes (`Create`, `GetOrCreate`,
+  `DeleteBySlug`) differ only in what they do when the slug is taken, and **none of
+  them writes to a row it found** — there is no slug-keyed upsert, so changing an
+  existing object is always `Update`, keyed by id. **No write schedules anything**: a spec write bumps the
   generation that the owed pass lists, a delete sets the `deletion_requested_at` that the
   sweeper lists. `Store.AfterCommit` exists for one thing, the `WithOnCreate` hook.
   → [ADR](docs/adr/2026-07-27-slug-keyed-writes.md)
+- **A store write takes only what it honours and returns only what a caller reads.**
+  `ObjectsCreate` takes an `ObjectsCreateInput`, not the read-shaped `RawObject`
+  whose `Status` field it used to drop in silence. And a mutator returns a row only
+  where a public `Client` write hands that row to the user, which is `ObjectsCreate`
+  and `ObjectsUpdateSpec` alone; the rest return `error`, plus a `bool` that someone
+  actually reads. So no write pays a conditions query for a value nobody looks at,
+  and the writes that report nothing answer from metadata alone. Tests read a
+  post-write row back with `ObjectsGet`.
+  → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
 - **A nested `Within` is a real rollback boundary.** It runs on a `SAVEPOINT`, so an
   error unwinds that frame's writes and its queued `AfterCommit` hooks even if the
   outer caller swallows it; only the outermost transaction commits. Depth rides on the

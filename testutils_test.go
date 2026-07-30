@@ -165,7 +165,7 @@ func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) 
 // AfterCommit runs inline: the fake never opens a transaction, so there is no
 // commit to wait for.
 func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
-func (s *fakeStore) ObjectsCreate(context.Context, *RawObject) (*RawObject, error) {
+func (s *fakeStore) ObjectsCreate(context.Context, GroupKind, ObjectsCreateInput) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsCreate")
 }
 func (s *fakeStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
@@ -202,28 +202,28 @@ func (s *fakeStore) DependentsListStale(context.Context, []GroupKind, ObjectID, 
 func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ReconcileOwedDecrement(context.Context, ObjectID, int64) error {
+func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	panic("not implemented: fakeStore.ReconcileOwedDecrement")
 }
-func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
+func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }
-func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) (*RawObject, error) {
+func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
-func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
+func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) error {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
-func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (*RawObject, bool, error) {
+func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (bool, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreate")
 }
-func (s *fakeStore) DeletionRequestsCreateBySlug(context.Context, GroupKind, string) (*RawObject, bool, error) {
+func (s *fakeStore) DeletionRequestsCreateBySlug(context.Context, GroupKind, string) (bool, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateBySlug")
 }
-func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
+func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
 	panic("not implemented: fakeStore.ConditionsSet")
 }
-func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
+func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) error {
 	panic("not implemented: fakeStore.ConditionsDelete")
 }
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
@@ -598,8 +598,7 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 	return Result{}, nil
 }
 
-// addEdge declares an edge for test scaffolding: it discards the endpoint metadata
-// EdgesAdd reports, drains the owed-wake stamp
+// addEdge declares an edge for test scaffolding: it drains the owed-wake stamp
 // every new depends_on edge now records — scaffolding wants the edge to exist, not
 // the reconcile it buys — so the common require.NoError(t, addEdge(...)) shape
 // stays a one-liner with no side effects on the owed listings. Tests that assert
@@ -610,7 +609,10 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 		return err
 	}
 	if res.ReconcileOwedStamped {
-		return store.ReconcileOwedDecrement(ctx, from, 1)
+		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
+		// the source's own kind is needed here — and res.From already carries it,
+		// projected from the endpoint check EdgesAdd had to do anyway.
+		return store.ReconcileOwedDecrement(ctx, res.From, from, 1)
 	}
 	return nil
 }
