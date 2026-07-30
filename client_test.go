@@ -315,6 +315,60 @@ func TestClientCreateRejectsTakenSlug(t *testing.T) {
 	require.Error(t, err, "a slug already held fails on UNIQUE rather than returning the existing row")
 }
 
+// The empty slug is the one footgun making the slug required creates rather than
+// inherits. Before, "no name" was spelled by passing no WithSlug; now every write
+// names something, and a slug read from unset configuration is "" — which under
+// the old contract was an ordinary slug, so every such caller would silently share
+// one row. Rejecting it is a deliberate, narrow exception to "beehive does not
+// validate slugs".
+func TestClientRejectsEmptySlug(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	t.Run("Create", func(t *testing.T) {
+		_, err := client.Create(ctx, "", cSpec{Val: "a"})
+		require.ErrorIs(t, err, ErrInvalidSlug)
+	})
+	t.Run("GetOrCreate", func(t *testing.T) {
+		_, created, err := client.GetOrCreate(ctx, "", cSpec{Val: "a"})
+		require.ErrorIs(t, err, ErrInvalidSlug)
+		assert.False(t, created)
+	})
+	t.Run("GetBySlug", func(t *testing.T) {
+		// Not ErrNotFound: that would send the caller hunting for a missing row
+		// when what is missing is a config value.
+		_, err := client.GetBySlug(ctx, "")
+		require.ErrorIs(t, err, ErrInvalidSlug)
+	})
+	t.Run("DeleteBySlug", func(t *testing.T) {
+		// Delete folds absence to nil, so a silent nil here would be the worst
+		// possible answer — indistinguishable from a successful no-op.
+		require.ErrorIs(t, client.DeleteBySlug(ctx, ""), ErrInvalidSlug)
+	})
+}
+
+// Rejection is caller-input validation, so it must not depend on store state:
+// the same call has to fail whether or not a row happens to exist, or the bug
+// stays hidden until a cold start or a GC sweep removes the row.
+func TestClientRejectsEmptySlugBeforeAnyStoreWork(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// An unmarshalable spec would also fail this call — assert the slug is checked
+	// first, so the caller hears about the argument they actually got wrong.
+	bad := NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, err = bad.Create(ctx, "", errMarshaler{})
+	require.ErrorIs(t, err, ErrInvalidSlug)
+
+	after, err := client.List(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, after, "a rejected create writes nothing")
+}
+
 // A finalizer on a kind with no controller is unclearable, not merely useless:
 // FinalizersDelete is a ControllerClient method folded to the caller's own kind, so
 // nothing in the process can remove it, gcCollect returns early while it stands,

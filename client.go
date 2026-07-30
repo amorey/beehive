@@ -28,6 +28,32 @@ import (
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
+// ErrInvalidSlug reports the empty string passed where a slug is required.
+//
+// It is the one rule beehive enforces on a slug, which is otherwise opaque — no
+// character set, no length limit, no normalization. The exception exists because
+// the empty slug is not a name a caller chooses: it is what an unset
+// configuration field reads as, and under an unvalidated contract every caller
+// whose config was unset would silently converge on one shared row. Every other
+// malformed slug at least addresses the row its author meant.
+//
+// Returned by the slug-keyed writes and by the slug-keyed reads alike. A read
+// answers with this rather than ErrNotFound so the caller looks at the argument
+// they passed instead of at a row that was never going to be there.
+var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
+
+// checkSlug rejects the empty slug. Callers run it before any store work — this
+// is caller-input validation, and deferring it would make the same call succeed
+// or fail depending on whether a row happens to exist, hiding the bug until GC or
+// a cold start removed it (the same reasoning as GetOrCreate's eager spec and
+// option validation).
+func checkSlug(slug string) error {
+	if slug == "" {
+		return fmt.Errorf("%w: pass the name the object should be addressable by", ErrInvalidSlug)
+	}
+	return nil
+}
+
 // ObjectChange reports a change to a watched object: what happened (Type) and
 // the object it happened to. On a Deleted change Object carries the row's final
 // state. It is delivered by value — a type tag plus one pointer — so a consumer
@@ -271,6 +297,9 @@ func (c *clientImpl[Spec, Status]) decode(raw *RawObject) (*Object[Spec, Status]
 }
 
 func (c *clientImpl[Spec, Status]) Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
+	if err := checkSlug(slug); err != nil {
+		return nil, err
+	}
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
@@ -412,6 +441,9 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, co *create
 // tombstone intact rather than being spuriously bumped back to life. See the Client
 // interface for the full contract.
 func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+	if err := checkSlug(slug); err != nil {
+		return nil, false, err
+	}
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, false, err
@@ -541,6 +573,9 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 }
 
 func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
+	if err := checkSlug(slug); err != nil {
+		return nil, err
+	}
 	raw, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
 	if err != nil {
 		return nil, err
@@ -830,6 +865,9 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 // DeleteBySlug is Delete keyed by a name rather than a handle; the store resolves
 // and marks in one statement. See the Client interface for the full contract.
 func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string) error {
+	if err := checkSlug(slug); err != nil {
+		return err
+	}
 	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
 	// The one place a slug delete departs from Delete, which reports a missing id.
