@@ -857,7 +857,7 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// idempotent retry leaves it untouched, so no watch poll reports a spurious
 	// diff. It folds this client's kind into the write, so a foreign id can't be
 	// deleted through this client; hideWrongKind keeps that foreign id invisible.
-	_, _, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	_, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
@@ -875,7 +875,7 @@ func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string
 	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
 	// The one place a slug delete departs from Delete, which reports a missing id.
-	if _, _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug); err != nil {
+	if _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}

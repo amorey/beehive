@@ -1808,67 +1808,69 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 // second copy of this statement. It is parenthesized before the guard is appended,
 // so a disjunctive key can't bind loosely enough to escape the IS NULL and re-stamp
 // an already-deleting row. Like edgesByIDs' column names it is a compile-time
-// fragment, never user input; only whereArgs carry values. The row persists
-// (deletion is async via finalizers), so the emitted object still carries its
-// conditions, matching Get/List. Runs on the ambient connection — callers wrap it
-// in Within to make rv-bump/write/emit atomic.
-func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (*storeapi.RawObject, bool, error) {
+// fragment, never user input; only whereArgs carry values. Runs on the ambient
+// connection — callers wrap it in Within to make the rv bump and the write atomic.
+//
+// It reports only whether it stamped a row. RowsAffected == 0 is the same signal
+// RETURNING's ErrNotFound used to carry, and just as ambiguous: guard, scope or
+// missing. requestDeletion's probe is what tells them apart.
+func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (bool, error) {
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
-		return nil, false, err
+		return false, err
 	}
 	now := toMillis(time.Now().UTC())
 	args := append([]any{now, rv, now}, whereArgs...)
-	row := c.QueryRowContext(ctx, `
+	res, err := c.ExecContext(ctx, `
 		UPDATE objects
 		SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
-		WHERE (`+where+`) AND deletion_requested_at IS NULL
-		RETURNING `+objectColumns, args...)
-	obj, err := s.scanWritten(ctx, row)
+		WHERE (`+where+`) AND deletion_requested_at IS NULL`, args...)
 	if err != nil {
-		return nil, false, err // ErrNotFound = no transition (guard/where/missing)
+		return false, err
 	}
-	return obj, true, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
-// requestDeletion is the mark-or-reread protocol behind both deletion entry points.
-// markForDeletion's ErrNotFound is ambiguous — already deleting, out of scope, or
-// gone — so reread resolves it on the caller's own key and supplies the current row
-// for the no-op case. Within keeps the rv-bump and the write atomic whether or not
-// a caller wrapped this: the mutators self-wrap, and nested they join the caller's
-// transaction — e.g. the GC cascade.
+// requestDeletion is the mark-or-probe protocol behind both deletion entry points.
+// A zero-row mark is ambiguous — already deleting, out of scope, or gone — so probe
+// resolves it on the caller's own key: it succeeds for the idempotent already-pending
+// case and reports ErrWrongKind or ErrNotFound otherwise. It reads no conditions,
+// which is the whole reason this pair no longer returns a row. Within keeps the
+// rv-bump and the write atomic whether or not a caller wrapped this: the mutators
+// self-wrap, and nested they join the caller's transaction — e.g. the GC cascade.
 func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
-	reread func(context.Context) (*storeapi.RawObject, error),
+	probe func(context.Context) error,
 	where string, whereArgs ...any,
-) (*storeapi.RawObject, bool, error) {
-	var result *storeapi.RawObject
+) (bool, error) {
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
-		obj, ch, err := s.markForDeletion(ctx, where, whereArgs...)
-		if errors.Is(err, storeapi.ErrNotFound) {
-			cur, rerr := reread(ctx)
-			if rerr != nil {
-				return rerr
-			}
-			result, err = s.attachConditions(ctx, cur)
-			return err
-		}
+		ch, err := s.markForDeletion(ctx, where, whereArgs...)
 		if err != nil {
 			return err
 		}
-		result, changed = obj, ch
+		if !ch {
+			return probe(ctx)
+		}
+		changed = true
 		return nil
 	})
-	return result, changed, err
+	return changed, err
 }
 
 // DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
 // foreign id matches no row and the re-read reports ErrWrongKind.
-func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowScoped(ctx, gk, id) },
+		func(ctx context.Context) error {
+			_, err := s.getObjectRowScoped(ctx, gk, id)
+			return err
+		},
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
@@ -1877,9 +1879,12 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 // the mark are one statement: atomic, and a round trip cheaper than the alternative
 // of wrapping a ObjectsGetBySlug + DeletionRequestsCreate pair in a Within — which matters
 // on a store that runs every caller through one connection.
-func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) (*storeapi.RawObject, error) { return s.getObjectRowBySlug(ctx, gk, slug) },
+		func(ctx context.Context) error {
+			_, err := s.getObjectRowBySlug(ctx, gk, slug)
+			return err
+		},
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
@@ -1942,9 +1947,9 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 			continue // already deletion-pending: nothing to stamp
 		}
 		// A race could have set the flag since the SELECT; markForDeletion's guard
-		// then returns ErrNotFound — benign here.
-		if _, _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil &&
-			!errors.Is(err, storeapi.ErrNotFound) {
+		// then stamps nothing and reports changed=false — benign here, which is why
+		// only the error matters.
+		if _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
 			return nil, err
 		}
 	}

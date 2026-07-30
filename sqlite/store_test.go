@@ -1336,17 +1336,21 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	first, changed, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	changed, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
 	require.NoError(t, err)
 	assert.True(t, changed, "first call is a real change")
+	first, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, err)
 	assert.Greater(t, first.ResourceVersion, created.ResourceVersion,
 		"the first request is a real change and bumps the cursor")
 
 	// A repeat request changes no deletion state, so it must be a no-op: same
 	// resource_version, same updated_at, no spurious watch/CAS churn.
-	second, changed, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	changed, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
 	require.NoError(t, err)
 	assert.False(t, changed, "repeat call is an idempotent no-op")
+	second, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
 		"an idempotent repeat must not bump resource_version")
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
@@ -1630,7 +1634,7 @@ func TestDeleteFinalizingDependsOnRefs(t *testing.T) {
 	// The target and the finalizing dependent and the owned child are deleting;
 	// the live dependent is not.
 	for _, id := range []beehive.ObjectID{target.ID, deletingDep.ID, owned.ID} {
-		_, _, err := store.DeletionRequestsCreate(ctx, testGK, id)
+		_, err := store.DeletionRequestsCreate(ctx, testGK, id)
 		require.NoError(t, err)
 	}
 
@@ -1679,7 +1683,7 @@ func TestHasIncomingRefsIgnoresFinalizingDependent(t *testing.T) {
 	assert.True(t, has)
 
 	// Once the dependent is itself finalizing, its claim is void — it's going away.
-	_, _, err = store.DeletionRequestsCreate(ctx, testGK, dep.ID)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, dep.ID)
 	require.NoError(t, err)
 	has, err = store.EdgesHasIncoming(ctx, target.ID)
 	require.NoError(t, err)
@@ -1689,7 +1693,7 @@ func TestHasIncomingRefsIgnoresFinalizingDependent(t *testing.T) {
 	// for it to be physically removed.
 	child := newRefObject(t, store)
 	require.NoError(t, addEdge(ctx, store, child.ID, target.ID, beehive.RelationOwnedBy))
-	_, _, err = store.DeletionRequestsCreate(ctx, testGK, child.ID)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, child.ID)
 	require.NoError(t, err)
 	has, err = store.EdgesHasIncoming(ctx, target.ID)
 	require.NoError(t, err)
@@ -1711,13 +1715,13 @@ func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 			return err
 		},
 		"DeletionRequestsCreate": func() error {
-			_, _, err := store.DeletionRequestsCreate(ctx, testGK, missing)
+			_, err := store.DeletionRequestsCreate(ctx, testGK, missing)
 			return err
 		},
 		// Keyed by a slug no row holds, so here ErrNotFound carries its full meaning:
 		// nothing of this kind is named that.
 		"DeletionRequestsCreateBySlug": func() error {
-			_, _, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "never-created")
+			_, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "never-created")
 			return err
 		},
 	}
@@ -1737,20 +1741,24 @@ func TestDeletionRequestsCreateIsIdempotent(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	first, _, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	require.NoError(t, err)
+	first, err := store.ObjectsGet(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, first.DeletionRequestedAt)
 
-	second, _, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	require.NoError(t, err)
+	second, err := store.ObjectsGet(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, second.DeletionRequestedAt)
 	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,
 		"deletion timestamp is stamped once and not moved by requeues")
 }
 
-// The first call marks and resolves the slug to its row; the repeat is the no-op,
-// returning the row so the caller can still advance GC but stamping nothing — same
-// timestamp, same resource_version, so no watch churn.
+// The first call marks the row the slug names; the repeat reports changed=false and
+// stamps nothing — same timestamp, same resource_version, so no watch churn. Neither
+// hands back a row: the caller resolves the slug itself if it needs the id.
 func TestDeletionRequestsCreateBySlugIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1761,15 +1769,19 @@ func TestDeletionRequestsCreateBySlugIsIdempotent(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	first, changed, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "w1")
+	changed, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.True(t, changed, "this call set the flag")
+	first, err := store.ObjectsGetBySlug(ctx, testGK, "w1")
+	require.NoError(t, err)
 	require.Equal(t, created.ID, first.ID, "the slug resolved to its row")
 	require.NotNil(t, first.DeletionRequestedAt)
 
-	second, changed, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "w1")
+	changed, err = store.DeletionRequestsCreateBySlug(ctx, testGK, "w1")
 	require.NoError(t, err)
 	assert.False(t, changed, "the repeat changed nothing")
+	second, err := store.ObjectsGetBySlug(ctx, testGK, "w1")
+	require.NoError(t, err)
 	require.NotNil(t, second.DeletionRequestedAt)
 	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,
 		"the deletion timestamp is stamped once")
@@ -1790,7 +1802,7 @@ func TestDeletionRequestsCreateBySlugIsKindScoped(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, _, err = store.DeletionRequestsCreateBySlug(ctx, testGK, "shared")
+	_, err = store.DeletionRequestsCreateBySlug(ctx, testGK, "shared")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 	assert.NotErrorIs(t, err, beehive.ErrWrongKind)
 
@@ -2832,21 +2844,30 @@ func TestDeletionRequestsCreateDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, _, err := store.DeletionRequestsCreate(context.Background(), testGK, 1)
+	_, err := store.DeletionRequestsCreate(context.Background(), testGK, 1)
 	require.Error(t, err)
 }
 
-func TestDeletionRequestsCreateScanError(t *testing.T) {
+// A mark that stamps a row scans nothing back, so an undecodable column on that
+// row cannot fail it. The old RETURNING clause could: this pins that the write is
+// now blind to the blobs it doesn't touch. The probe path still scans, so the same
+// row *does* fail the already-pending branch, which the second half covers.
+func TestDeletionRequestsCreateDoesNotScanTheRowItMarks(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	// Insert a row with bad finalizers JSON and no deletion_requested_at.
-	// DeletionRequestsCreate will UPDATE it (WHERE deletion_requested_at IS NULL matches),
-	// the RETURNING clause gives us the row, and scanObject fails on bad finalizers.
+	// A row with bad finalizers JSON and no deletion_requested_at, so the guard
+	// matches and the UPDATE stamps it.
 	id := insertBadFinalizersRow(t, store, testGK)
 
-	_, _, err := store.DeletionRequestsCreate(ctx, testGK, id)
-	require.Error(t, err)
+	changed, err := store.DeletionRequestsCreate(ctx, testGK, id)
+	require.NoError(t, err, "the mark binds no blob column and reads none back")
+	assert.True(t, changed)
+
+	// The repeat takes the probe, which loads the row to tell already-pending from
+	// out-of-scope — and that load is where the bad finalizers surface.
+	_, err = store.DeletionRequestsCreate(ctx, testGK, id)
+	require.Error(t, err, "the already-pending probe still decodes the row")
 }
 
 func TestDeleteObjectDBError(t *testing.T) {
@@ -3578,10 +3599,10 @@ func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
 	probe.expectNone()
 }
 
-// TestNonConditionWritesPreserveConditions verifies that mutators which don't
-// touch conditions still return — and emit — the object with its existing
-// conditions assembled, matching Get/List. Otherwise an Update result or a
-// Modified watch event after a status/spec change would show Conditions == nil.
+// TestNonConditionWritesPreserveConditions verifies that mutators which don't touch
+// conditions leave them intact, and that ObjectsUpdateSpec — the one that still
+// returns a row — returns them assembled, matching Get/List. Otherwise an Update
+// result after a spec change would show Conditions == nil.
 func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3606,17 +3627,19 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	probe.expectWrite()
 
 	// DeletionRequestsCreate (the row persists; conditions still exist).
-	del, _, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err)
-	require.NotNil(t, findCondition(del.Conditions, "Ready"), "DeletionRequestsCreate result carries conditions")
+	del, err := store.ObjectsGet(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, findCondition(del.Conditions, "Ready"), "a deletion mark must not disturb conditions")
 	probe.expectWrite()
 }
 
 // TestNonConditionWriteAssemblyError drops the conditions table so the
-// post-write condition assembly fails, covering that error branch in the shared
-// scanWritten (ObjectsUpdateSpec) and in DeletionRequestsCreate. UpdateStatus is
-// deliberately absent: it returns no row, so it never assembles conditions and has
-// no such branch left to cover — it succeeds here, which the assertion below pins.
+// post-write condition assembly fails, covering that error branch in scanWritten.
+// ObjectsUpdateSpec is the only mutator left that reaches it — the writes that no
+// longer return a row assemble nothing, so a missing conditions table cannot fail
+// them, which is what the two require.NoErrors here pin.
 func TestNonConditionWriteAssemblyError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -3627,9 +3650,10 @@ func TestNonConditionWriteAssemblyError(t *testing.T) {
 
 	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0),
 		"a status write does not read conditions, so a missing table cannot fail it")
+	_, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.NoError(t, err, "nor does a deletion mark")
+
 	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{}`), 0)
-	require.Error(t, err)
-	_, _, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.Error(t, err)
 }
 
@@ -4028,7 +4052,7 @@ func TestDeletionRequestsCreateResourceVersionError(t *testing.T) {
 	obj := newRefObject(t, store)
 	dropSeq(t, store)
 
-	_, _, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.Error(t, err)
 }
 
@@ -4118,7 +4142,7 @@ func TestDeletionRequestsList(t *testing.T) {
 	_ = newRefObject(t, store) // not deletion-pending
 
 	for _, id := range []beehive.ObjectID{a.ID, b.ID} {
-		_, _, err := store.DeletionRequestsCreate(ctx, testGK, id)
+		_, err := store.DeletionRequestsCreate(ctx, testGK, id)
 		require.NoError(t, err)
 	}
 
@@ -4130,7 +4154,7 @@ func TestDeletionRequestsList(t *testing.T) {
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
-	_, _, err = store.DeletionRequestsCreate(ctx, otherGK, other.ID)
+	_, err = store.DeletionRequestsCreate(ctx, otherGK, other.ID)
 	require.NoError(t, err)
 
 	rows, err := store.DeletionRequestsList(ctx)

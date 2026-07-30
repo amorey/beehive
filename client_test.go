@@ -1411,8 +1411,8 @@ type requestDeletionBySlugErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionBySlugErrorStore) DeletionRequestsCreateBySlug(_ context.Context, _ GroupKind, _ string) (*RawObject, bool, error) {
-	return nil, false, errBoom
+func (s *requestDeletionBySlugErrorStore) DeletionRequestsCreateBySlug(_ context.Context, _ GroupKind, _ string) (bool, error) {
+	return false, errBoom
 }
 
 // createOrUpdateBadJSONStore drives CreateOrUpdate's rawToTyped error path: the

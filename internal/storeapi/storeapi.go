@@ -406,8 +406,8 @@ type Store interface {
 	// the request, never the deletion itself — ObjectsDelete does that. changed is true
 	// only when this call set the flag; repeat calls do nothing and return false.
 	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id with
-	// ErrNotFound.
-	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (obj *RawObject, changed bool, err error)
+	// ErrNotFound. It returns no row: see the note above Store.
+	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (changed bool, err error)
 
 	// DeletionRequestsCreateBySlug is DeletionRequestsCreate keyed by slug within gk.
 	// The slug goes into the write's own WHERE clause, so resolving and marking are one
@@ -417,8 +417,9 @@ type Store interface {
 	// Everything else matches DeletionRequestsCreate: changed is true only when this
 	// call set the flag, a repeat does nothing, and ErrNotFound means no object of gk
 	// holds the slug. There is no ErrWrongKind here, because slugs are unique per kind,
-	// so another kind's slug is simply not found.
-	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (obj *RawObject, changed bool, err error)
+	// so another kind's slug is simply not found. It returns no row either; a caller
+	// that needs the marked object's id resolves the slug itself.
+	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (changed bool, err error)
 
 	// DeletionRequestsCreateFromOwner is the GC cascade as one command: it requests
 	// deletion of every object owned by ownerID and returns them all. It writes only to

@@ -443,7 +443,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// one. Deletion does not bump generation, so the row stays settled below.
 	err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, _, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
+	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	// A fresh Beehive with no spec-startup pass and the full pass disabled: the GC
@@ -782,7 +782,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		t.Fatal("sweeper never ran its startup pass")
 	}
 
-	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
+	_, err = real.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -849,7 +849,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	// Mark it deletion-pending through the store, so nothing the client's own Delete does
 	// wake isn't what drives this either.
-	_, _, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
+	_, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)
 
 	waitForDeletions(t, w, obj.ID)
