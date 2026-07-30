@@ -4705,6 +4705,18 @@ func TestDriverCursorsSetSuppressesTheWriteWhenTheCursorDoesNotAdvance(t *testin
 	assert.Greater(t, updatedAt, sentinel, "an advancing cursor carries the timestamp with it")
 }
 
+// A read that fails for any reason other than "no such row" is an error, not an
+// absence: reporting ok=false would tell the waker to seed from the write log's
+// max, silently discarding a cursor that is still there.
+func TestDriverCursorsGetDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, ok, err := store.DriverCursorsGet(context.Background(), "dependency_waker")
+	require.Error(t, err)
+	assert.False(t, ok, "a failed read reports no cursor, but as an error rather than an absence")
+}
+
 // Zero is a legitimate cursor — it is what an empty write log reports — so the
 // upsert has to create the row for it rather than read it as nothing worth
 // storing. The monotone guard applies only where a row already exists, which is

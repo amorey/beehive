@@ -238,6 +238,23 @@ func TestWakerRetriesSeedOnAFailedCursorRead(t *testing.T) {
 	assert.EqualValues(t, 500, dw.watermark)
 }
 
+// A cursor read that fails because stop cancelled the ctx is shutdown, not an
+// outage — the same treatment the write-log read beside it already gets, and the
+// rest of the waker gives a cancelled ctx.
+func TestWakerCursorReadFailureDuringShutdownIsQuiet(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{replayStore: replayStore{seed: 500}, getErr: errBoom}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.False(t, dw.seed(ctx), "a cancelled read still leaves the waker unseeded")
+	assert.False(t, dw.seeded)
+	assert.Empty(t, buf.String(), "shutdown is not an outage to report")
+}
+
 // The scan's whole job: every row above the watermark has its dependents
 // requeued, each on its own kind's reconciler.
 func TestWakerScanWakesDependentsByTheirOwnKind(t *testing.T) {
@@ -599,6 +616,19 @@ func TestResumeWatermark(t *testing.T) {
 			assert.Equal(t, c.want, resumeWatermark(c.stored, c.ok, c.mark))
 		})
 	}
+}
+
+// The retry ladder, straight rather than through 60-odd scan ticks: immediate
+// after the first failure, doubling, then flat at the cap — including for a
+// streak long enough that the shift itself would overflow if it were taken.
+func TestWakePersistRetrySkips(t *testing.T) {
+	assert.Equal(t, 0, wakePersistRetrySkips(1), "the first retry is immediate")
+	assert.Equal(t, 1, wakePersistRetrySkips(2))
+	assert.Equal(t, 3, wakePersistRetrySkips(3))
+	assert.Equal(t, 31, wakePersistRetrySkips(6))
+	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(7), "the ladder reaches the cap")
+	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(8), "and stays there")
+	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(1000), "however long the streak runs")
 }
 
 // A failed persist write is logged and leaves dw.persisted at its old value, so
