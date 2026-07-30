@@ -1251,8 +1251,8 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
-	return &RawObject{ID: 1, Spec: []byte("not-json")}, true, nil
+func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
+	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
 // errorUpdateSpecStore returns an error from ObjectsUpdateSpec.
@@ -1260,8 +1260,8 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
-	return nil, false, errBoom
+func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
+	return nil, errBoom
 }
 
 // slugErrorStore returns a non-NotFound error from ObjectsGetBySlug, driving

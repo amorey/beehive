@@ -59,6 +59,22 @@ is now a probe returning only an error, which is where the deletion path's savin
 comes from: the already-pending branch, the steady state for an idempotent
 controller, no longer decodes a row or queries conditions to answer.
 
+**`ObjectsUpdateSpec` loses its `changed` bool**, which is where the two halves of the
+rule pull against each other. It passes the derivability test — the returned row has
+no before-state, so a caller genuinely cannot reconstruct "was this a no-op" from it —
+and fails the one that matters, which is that nobody reads it. Both call sites spelled
+it `_`. It survived the first draft of this sweep on the strength of a hypothetical
+caller: `CreateOrUpdate`, the one place a follow-up might plausibly have been skipped
+on a no-op. `CreateOrUpdate` is deleted in the same change, and with it the only
+candidate. What is left is `Client.Update`, which discards it.
+
+So the rule is "what a caller reads", not "what a caller could not otherwise compute";
+the second is a reason to *keep* a value someone reads, not a reason to ship one nobody
+does. The suppression behaviour is unchanged and still pinned — by generation and
+`resource_version` in `TestObjectsUpdateSpecIdenticalSpecIsNoOp` and by
+`TestClientNoOpUpdateOwesNothing` at the client layer, which are what the bool was
+being cross-checked against anyway.
+
 ## Consequences
 
 `attachConditions` is reached from one write path, `scanWritten`, and `scanWritten`

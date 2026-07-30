@@ -116,7 +116,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `Status` field it used to drop in silence. And only `ObjectsCreate` and
   `ObjectsUpdateSpec` return a row — the two whose callers hand it to the user;
   the rest return `error`, plus a `bool` where "did it land" isn't otherwise
-  derivable. So no write assembles conditions for a value nobody reads, and
+  derivable *and someone reads it* — `ObjectsUpdateSpec` dropped its `changed` when
+  the last caller that might have did. So no write assembles conditions for a value nobody reads, and
   `scanWritten`/`attachConditions` are reached from two mutators instead of seven.
   Tests read a post-write row back with `ObjectsGet`.
   → [ADR](docs/adr/2026-07-30-store-write-shapes.md)

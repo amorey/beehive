@@ -1178,11 +1178,10 @@ func stampVersion(stored, incoming int) (int, error) {
 	}
 }
 
-func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
+func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
 	var result *storeapi.RawObject
-	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
@@ -1207,8 +1206,8 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 		// newer version hands us bytes in a *different shape* — equal bytes there can
 		// carry different values (a converter reading v1's absent field as a default
 		// the v2 shape spells explicitly). Suppressing that as a no-op would change
-		// what every later read decodes while reporting changed=false, bumping no
-		// resource_version and emitting nothing, so no watcher learns and the client
+		// what every later read decodes while bumping no resource_version and emitting
+		// nothing, so no watcher learns and the client
 		// skips the controller wake. When the shapes disagree we can't compare, so we
 		// fall through and write it as the real change it may be — generation bump
 		// included. That is the point, not a side effect: bumping resource_version
@@ -1238,10 +1237,9 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 			RETURNING `+objectColumns,
 			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), id)
 		result, err = s.scanWritten(ctx, row)
-		changed = err == nil
 		return err
 	})
-	return result, changed, err
+	return result, err
 }
 
 // ObjectsUpdateStatus skips the status write when the incoming bytes equal the stored

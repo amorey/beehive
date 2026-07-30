@@ -530,10 +530,14 @@ type Store interface {
 	// schema version are in a different shape, so comparing them says nothing about
 	// whether the value changed, and such a write takes the normal path.
 	//
-	// changed says which happened: true for a real write, false for the no-op. Scoped
-	// to gk: another kind's id is rejected with ErrWrongKind, a missing id with
+	// Which of the two happened is not reported. It is not derivable from the returned
+	// row either, since that carries no before-state — a caller who needs to know
+	// compares Generation against one it read first. Nothing in this repo does, and a
+	// bool nobody reads is a bool an implementation has to get right for no one.
+	//
+	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id with
 	// ErrNotFound.
-	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
 
 	// ObjectsUpdateStatus replaces an object's status, records the generation the
 	// controller observed, and stamps statusVersion (the migrator schema version

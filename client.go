@@ -488,7 +488,7 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
 		// rejected at the store (no separate read-then-write to keep atomic);
 		// hideWrongKind keeps that foreign id invisible to this single-kind client.
-		raw, _, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		raw, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		if err = c.hideWrongKind(err); err != nil {
 			return err
 		}

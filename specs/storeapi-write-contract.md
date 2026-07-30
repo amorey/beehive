@@ -49,8 +49,9 @@ once here.
 The TODO describes the return-shape waste as per-branch ("the branches whose row
 nobody reads"). It is broader than that: for six of the seven mutators the caller
 discards the row on **every** branch. `ObjectsUpdateSpec` is the sole exception and
-keeps its full return, including on its content no-op, because `Client.Update`
-hands that object back to the user.
+keeps its row, including on its content no-op, because `Client.Update` hands that
+object back to the user. Its `changed` bool goes the other way: no caller reads it,
+so it leaves with the rest (see the write-shapes ADR).
 
 ## Change 1 — `ObjectsCreateInput`
 
