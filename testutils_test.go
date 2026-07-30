@@ -103,6 +103,28 @@ func fast(opts ...Option) []Option {
 	}, opts...)
 }
 
+// mustCreate creates one object and fails the test if the create errors — the
+// shape of the great majority of test creates, which only want a row to exist
+// before they assert on something else.
+//
+// It exists so that a change to Create's signature is a change to one function
+// rather than to every test that needed a row. Tests that assert *on the create
+// itself* (a UNIQUE conflict, an option error, a marshal failure) call Create
+// directly and should keep doing so: the error is their subject, and this helper
+// would swallow it.
+func mustCreate[Spec, Status any](
+	t *testing.T,
+	ctx context.Context,
+	c Client[Spec, Status],
+	spec Spec,
+	opts ...Option,
+) *Object[Spec, Status] {
+	t.Helper()
+	obj, err := c.Create(ctx, spec, opts...)
+	require.NoError(t, err)
+	return obj
+}
+
 // captureLogger returns a logger that records everything at or above level into
 // the returned buffer, for tests asserting that a code path announces itself.
 func captureLogger(level slog.Level) (*slog.Logger, *bytes.Buffer) {

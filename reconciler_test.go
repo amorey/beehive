@@ -258,10 +258,8 @@ func TestDependencyRequeue(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
-	target, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	dep, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client, tSpec{})
+	dep := mustCreate(t, ctx, client, tSpec{})
 
 	// Drain the two creation-driven reconciles so the channel is quiet before we
 	// trigger the dependency path.
@@ -386,10 +384,8 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 
 	// Create before Start so the ids are set before any reconcile can dispatch;
 	// the startup pass then drives both objects.
-	target, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	dep, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client, tSpec{})
+	dep := mustCreate(t, ctx, client, tSpec{})
 	ctrl.targetID, ctrl.depID = target.ID, dep.ID
 	store.targetID = target.ID
 
@@ -465,10 +461,8 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// Create before Start: the waker's watch is events-only, so pre-Start creates
 	// emit nothing into it and the only lookup the probe can see is the one the
 	// test triggers below.
-	target, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	dep, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client, tSpec{})
+	dep := mustCreate(t, ctx, client, tSpec{})
 	ctrl.targetID, ctrl.depID = target.ID, dep.ID
 	store.targetID = target.ID
 
@@ -561,10 +555,8 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	client1 := NewClient[tSpec, tStatus](bh1, gk)
 	ctrl1.client = client1
 
-	target, err := client1.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	dep, err := client1.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client1, tSpec{})
+	dep := mustCreate(t, ctx, client1, tSpec{})
 	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
 
 	stop1, err := bh1.Start(ctx)
@@ -640,8 +632,7 @@ func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, gk)
-	obj, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "a"})
 	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)
@@ -1911,8 +1902,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
@@ -1941,8 +1931,7 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "v1"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "v1"})
 
 	// Wait for the first reconcile before updating, so the update is genuinely a
 	// distinct reconcile of generation 2 rather than being coalesced with the
@@ -1979,8 +1968,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	// The finalizer keeps the row alive until the controller observes the deletion;
 	// see deletionTrackingFinalizer.
-	obj, err := client.Create(ctx, cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
@@ -2013,8 +2001,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	ctrl.signal.wait(t, "reconcile wrote status before erroring")
 
@@ -2054,8 +2041,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
@@ -2097,8 +2083,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	ctrl.signal.wait(t, "reconcile set condition before erroring")
 
@@ -2613,8 +2598,7 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	defer stop()
 
 	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	dep, err := depClient.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	dep := mustCreate(t, ctx, depClient, tSpec{})
 	target, err := NewClient[tSpec, tStatus](bh, clientOnlyGK).Create(ctx, tSpec{})
 	require.NoError(t, err)
 	settleFirstPass(t, depClient, reconciled, dep.ID)
@@ -2638,8 +2622,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	defer stop()
 
 	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	dep, err := depClient.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	dep := mustCreate(t, ctx, depClient, tSpec{})
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 
 	// The kind's first object is born after Start, so nothing observable at
@@ -2670,11 +2653,9 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	widget := GroupKind{Kind: "Widget"}
 	depClient := NewClient[tSpec, tStatus](bh, widget)
-	dep, err := depClient.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	dep := mustCreate(t, ctx, depClient, tSpec{})
 	targetClient := NewClient[tSpec, tStatus](bh, clientOnlyGK)
-	target, err := targetClient.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, targetClient, tSpec{})
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
@@ -2685,7 +2666,7 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
 	require.NoError(t, store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn))
-	_, err = bh.gcCollect(ctx, target.ID)
+	_, err := bh.gcCollect(ctx, target.ID)
 	require.NoError(t, err)
 	_, err = store.ObjectsGet(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")
@@ -3030,10 +3011,8 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	client1 := NewClient[tSpec, tStatus](bh1, gk)
 	ctrl1.client = client1
 
-	target, err := client1.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	dep, err := client1.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client1, tSpec{})
+	dep := mustCreate(t, ctx, client1, tSpec{})
 	ctrl1.targetID, ctrl1.depID = target.ID, dep.ID
 	// Declared before the change. The declare stamps one owed pass, but the
 	// startup reconcile below services and drains it — so by the time the target

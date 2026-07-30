@@ -742,10 +742,8 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	target, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	dep, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	dep := mustCreate(t, ctx, client, cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, probe.Store, dep.ID, target.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)

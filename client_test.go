@@ -273,8 +273,7 @@ func TestClientCreate(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 	assert.NotZero(t, obj.ID)
 	assert.Equal(t, clientTestGK.Group, obj.Group)
 	assert.Equal(t, clientTestGK.Kind, obj.Kind)
@@ -364,8 +363,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// An owner must exist before a child can ref it.
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
 
 	child, err := client.Create(ctx, cSpec{Val: "child"},
 		WithSlug("child-1"),
@@ -412,8 +410,7 @@ func TestClientGet(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	created := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	got, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
@@ -438,10 +435,8 @@ func TestClientList(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, cSpec{Val: "b"})
 
 	list, err := client.List(ctx)
 	require.NoError(t, err)
@@ -456,8 +451,7 @@ func TestClientUpdate(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created, err := client.Create(ctx, cSpec{Val: "v1"})
-	require.NoError(t, err)
+	created := mustCreate(t, ctx, client, cSpec{Val: "v1"})
 
 	updated, err := client.Update(ctx, created.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
@@ -513,8 +507,7 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	// The finalizer keeps the tombstone around after Delete, so the slug is still
 	// held by a deletion-pending row when GetOrCreate runs.
-	orig, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"), WithFinalizers("test/hold"))
-	require.NoError(t, err)
+	orig := mustCreate(t, ctx, client, cSpec{Val: "a"}, WithSlug("w1"), WithFinalizers("test/hold"))
 	require.NoError(t, client.Delete(ctx, orig.ID))
 
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
@@ -643,8 +636,7 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	require.True(t, ok)
 	client := NewClient[conditionalBadSpec, cStatus](bh, gk)
 
-	orig, err := client.Create(ctx, conditionalBadSpec{Val: "good"})
-	require.NoError(t, err)
+	orig := mustCreate(t, ctx, client, conditionalBadSpec{Val: "good"})
 	drainQueue(r.work)
 	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
@@ -670,8 +662,7 @@ func TestClientWithOnCreateFiresOnlyOnCreate(t *testing.T) {
 	var calls int
 	onCreate := WithOnCreate(func(context.Context) { calls++ })
 
-	_, err = client.Create(ctx, cSpec{Val: "a"}, WithSlug("c1"), onCreate)
-	require.NoError(t, err)
+	mustCreate(t, ctx, client, cSpec{Val: "a"}, WithSlug("c1"), onCreate)
 	assert.Equal(t, 1, calls, "Create must run onCreate")
 
 	_, created, err := client.GetOrCreate(ctx, "g1", cSpec{Val: "a"}, onCreate)
@@ -778,8 +769,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 				require.NoError(t, err)
 
 				client := NewClient[cSpec, cStatus](bh, clientTestGK)
-				seeded, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("seed"))
-				require.NoError(t, err)
+				seeded := mustCreate(t, ctx, client, cSpec{Val: "a"}, WithSlug("seed"))
 				// Settle the seed so its own unconverged spec doesn't mask the write's.
 				err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
 				require.NoError(t, err)
@@ -820,8 +810,7 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "a"}, WithSlug("w1"))
 	// Settle it, so anything the write below owes is its own.
 	err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
 	require.NoError(t, err)
@@ -852,8 +841,7 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("test/hold"))
-		require.NoError(t, err)
+		obj := mustCreate(t, ctx, client, cSpec{Val: "a"}, WithFinalizers("test/hold"))
 
 		cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 		err = cc.Within(ctx, func(ctx context.Context) error {
@@ -884,8 +872,7 @@ func TestClientGetOrCreateWithOwner(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
 
 	child, created, err := client.GetOrCreate(ctx, "child-1", cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, err)
@@ -1058,8 +1045,7 @@ func TestClientDelete(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created, err := client.Create(ctx, cSpec{})
-	require.NoError(t, err)
+	created := mustCreate(t, ctx, client, cSpec{})
 
 	err = client.Delete(ctx, created.ID)
 	require.NoError(t, err)
@@ -1078,8 +1064,7 @@ func TestClientDeleteBySlugDeletes(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, cSpec{}, WithSlug("w1"))
-	require.NoError(t, err)
+	mustCreate(t, ctx, client, cSpec{}, WithSlug("w1"))
 
 	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
 
@@ -1105,8 +1090,7 @@ func TestClientDeleteBySlugIdempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, cSpec{}, WithSlug("w1"))
-	require.NoError(t, err)
+	mustCreate(t, ctx, client, cSpec{}, WithSlug("w1"))
 
 	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
 	assert.NoError(t, client.DeleteBySlug(ctx, "w1"))
@@ -1121,8 +1105,7 @@ func TestClientDeleteBySlugAlreadyDeleting(t *testing.T) {
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	pending, err := client.GetBySlug(ctx, "w1")
@@ -1153,8 +1136,7 @@ func TestClientDeleteBySlugMarksForCollection(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{}, WithSlug("w1"), WithFinalizers("test/hold"))
 
 	require.NoError(t, client.DeleteBySlug(ctx, "w1"))
 	pending, err := store.DeletionRequestsList(ctx)
@@ -1178,8 +1160,7 @@ func TestClientDeleteBySlugKindScoped(t *testing.T) {
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 
-	w, err := widgets.Create(ctx, cSpec{Val: "v1"}, WithSlug("shared"))
-	require.NoError(t, err)
+	w := mustCreate(t, ctx, widgets, cSpec{Val: "v1"}, WithSlug("shared"))
 
 	require.NoError(t, gadgets.DeleteBySlug(ctx, "shared"))
 
@@ -1209,8 +1190,7 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 
-	w, err := widgets.Create(ctx, cSpec{Val: "v1"})
-	require.NoError(t, err)
+	w := mustCreate(t, ctx, widgets, cSpec{Val: "v1"})
 
 	// The Gadget client must not see or mutate the Widget by its id.
 	_, err = gadgets.Get(ctx, w.ID)
@@ -1437,8 +1417,7 @@ func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	evt := recv(t, ch)
 	assert.Equal(t, Added, evt.Type)
@@ -1457,8 +1436,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj, err := client.Create(ctx, cSpec{Val: "v1"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "v1"})
 	// Drain the Added event from Create.
 	recv(t, ch)
 
@@ -1481,8 +1459,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj, err := client.Create(ctx, cSpec{})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{})
 	// Drain the Added event from Create.
 	recv(t, ch)
 
@@ -1503,8 +1480,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	obj, err := client.Create(ctx, cSpec{})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{})
 	recv(t, ch) // drain Added
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -1524,8 +1500,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	// And on the stream: a fresh object gives the poller something it *must* report,
 	// so anything the idempotent delete emitted has to show up at or before that
 	// frame. Reading until the Added arrives therefore sees every stray there is.
-	other, err := client.Create(ctx, cSpec{})
-	require.NoError(t, err)
+	other := mustCreate(t, ctx, client, cSpec{})
 	evt := recv(t, ch)
 	require.Equal(t, other.ID, evt.Object.ID, "unexpected event on idempotent delete: %v", evt.Type)
 	assert.Equal(t, Added, evt.Type)
@@ -1537,10 +1512,8 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	obj1, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	obj2, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	obj1 := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	obj2 := mustCreate(t, ctx, client, cSpec{Val: "b"})
 
 	ch, err := client.ObjectsWatch(ctx, obj1.ID)
 	require.NoError(t, err)
@@ -1611,8 +1584,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 		_ = stop(stopCtx)
 	}()
 
-	obj, err := client2.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client2, cSpec{Val: "x"})
 
 	// Subscribe after create: the snapshot emits Added(obj) first, then we
 	// expect Modified from UpdateStatus.
@@ -1639,10 +1611,8 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, cSpec{Val: "b"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -1664,8 +1634,7 @@ func TestWatchInitialSnapshot(t *testing.T) {
 	ctx := context.Background()
 	_, client := watchTestBH(t)
 
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "hello"})
 
 	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -1720,10 +1689,8 @@ func TestClientGetOwner(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	got, ok, err := client.OwnersGet(ctx, child.ID)
 	require.NoError(t, err)
@@ -1757,8 +1724,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
 	require.NoError(t, addEdge(ctx, store, a.ID, a.ID, RelationDependsOn))
 
 	dependents, err := client.DependentsList(ctx, a.ID)
@@ -1779,12 +1745,9 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
-	c, err := client.Create(ctx, cSpec{Val: "c"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, cSpec{Val: "b"})
+	c := mustCreate(t, ctx, client, cSpec{Val: "c"})
 
 	// a depends on b and c.
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
@@ -1812,12 +1775,9 @@ func TestClientListOwned(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	c1, err := client.Create(ctx, cSpec{Val: "c1"}, WithOwner(owner.ID))
-	require.NoError(t, err)
-	c2, err := client.Create(ctx, cSpec{Val: "c2"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
+	c1 := mustCreate(t, ctx, client, cSpec{Val: "c1"}, WithOwner(owner.ID))
+	c2 := mustCreate(t, ctx, client, cSpec{Val: "c2"}, WithOwner(owner.ID))
 
 	owned, err := client.OwnedList(ctx, owner.ID)
 	require.NoError(t, err)
@@ -1846,14 +1806,10 @@ func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus],
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 
-	owner, err := owners.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	w1, err := widgets.Create(ctx, cSpec{Val: "w1"}, WithOwner(owner.ID))
-	require.NoError(t, err)
-	w2, err := widgets.Create(ctx, cSpec{Val: "w2"}, WithOwner(owner.ID))
-	require.NoError(t, err)
-	_, err = gadgets.Create(ctx, cSpec{Val: "g1"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, owners, cSpec{Val: "owner"})
+	w1 := mustCreate(t, ctx, widgets, cSpec{Val: "w1"}, WithOwner(owner.ID))
+	w2 := mustCreate(t, ctx, widgets, cSpec{Val: "w2"}, WithOwner(owner.ID))
+	mustCreate(t, ctx, gadgets, cSpec{Val: "g1"}, WithOwner(owner.ID))
 
 	return ctx, owners, widgets, owner.ID, []*Object[cSpec, cStatus]{w1, w2}
 }
@@ -1906,8 +1862,7 @@ func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
 	ctx, owners, widgets, _, _ := ownedObjectsFixture(t)
 
 	// A second owner, so the fixture's children don't crowd the assertion.
-	owner, err := owners.Create(ctx, cSpec{Val: "owner2"})
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, owners, cSpec{Val: "owner2"})
 	// The finalizer holds the row after Delete, leaving it deletion-pending.
 	child, err := widgets.Create(ctx, cSpec{Val: "w1"},
 		WithOwner(owner.ID), WithFinalizers("test/hold"))
@@ -2007,10 +1962,8 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	// Without the selector the owner is not loaded — accessing it errors.
 	plain, err := client.Get(ctx, child.ID)
@@ -2027,8 +1980,7 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	assert.Equal(t, owner.ID, ref.ID)
 
 	// GetBySlug honours selectors too.
-	_, err = client.Create(ctx, cSpec{Val: "slugged"}, WithSlug("s1"), WithOwner(owner.ID))
-	require.NoError(t, err)
+	mustCreate(t, ctx, client, cSpec{Val: "slugged"}, WithSlug("s1"), WithOwner(owner.ID))
 	bySlug, err := client.GetBySlug(ctx, "s1", LoadOwner())
 	require.NoError(t, err)
 	ref, ok, err = bySlug.Owner()
@@ -2062,12 +2014,10 @@ func TestClientListWithLoadOwnerBatches(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
 	const n = 5
 	for i := 0; i < n; i++ {
-		_, err := client.Create(ctx, cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
-		require.NoError(t, err)
+		mustCreate(t, ctx, client, cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
 	}
 
 	objs, err := client.List(ctx, LoadOwner())
@@ -2093,13 +2043,11 @@ func TestClientLoadsOwned(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, cSpec{Val: "owner"})
 	const n = 3
 	var childIDs []ObjectID
 	for i := 0; i < n; i++ {
-		c, err := client.Create(ctx, cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
-		require.NoError(t, err)
+		c := mustCreate(t, ctx, client, cSpec{Val: fmt.Sprintf("child-%d", i)}, WithOwner(owner.ID))
 		childIDs = append(childIDs, c.ID)
 	}
 
@@ -2144,10 +2092,8 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn)) // a depends on b
 
 	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
@@ -2173,10 +2119,8 @@ func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
 
 	objs, err := client.List(ctx, LoadDependencies(), LoadDependents())
@@ -2223,8 +2167,7 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	obj, err := client.Create(ctx, cSpec{Val: "x"}, WithSlug("x1"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"}, WithSlug("x1"))
 
 	loads := []LoadOption{LoadOwner(), LoadDependencies(), LoadDependents(), LoadOwned()}
 	// Single-object path: each relation's store error surfaces through Get/GetBySlug.
@@ -2308,8 +2251,7 @@ func TestClientRequeueNoController(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	err = client.Requeue(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
@@ -2336,8 +2278,7 @@ func TestClientRequeue(t *testing.T) {
 			require.NoError(t, err)
 
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
-			obj, err := client.Create(ctx, cSpec{Val: "x"})
-			require.NoError(t, err)
+			obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 			r := bh.reconcilers[clientTestGK]
 			// Drain the enqueue Create produced, and seed a backoff entry so the
@@ -2387,8 +2328,7 @@ func TestClientGetScheduleScheduled(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	// Drain the create-time enqueue so only the future schedule remains.
 	r := bh.reconcilers[clientTestGK]
@@ -2411,8 +2351,7 @@ func TestClientGetScheduleUnscheduled(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
@@ -2431,8 +2370,7 @@ func TestClientGetScheduleNoController(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	s, err := client.SchedulesGet(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2451,8 +2389,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	// Drain the create-time enqueue and schedule a future requeue before watching.
 	r := bh.reconcilers[clientTestGK]
@@ -2479,8 +2416,7 @@ func TestClientWatchScheduleLive(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
@@ -2521,8 +2457,7 @@ func TestClientWatchScheduleNoController(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	_, err = client.SchedulesWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
@@ -2553,8 +2488,7 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	_, err = client.EventsList(ctx, obj.ID)
 	assert.ErrorIs(t, err, errBoom)
@@ -2574,8 +2508,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	got, err := client.EventsList(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2594,8 +2527,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	cluster, err := client.Create(ctx, cSpec{Val: "prod"})
-	require.NoError(t, err)
+	cluster := mustCreate(t, ctx, client, cSpec{Val: "prod"})
 
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
@@ -2658,8 +2590,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
@@ -2685,10 +2616,8 @@ func TestClientListLoadsEvents(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, cSpec{Val: "b"})
 	_, err = store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
 	_, err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
@@ -2715,8 +2644,7 @@ func TestClientListEvents(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	rec := func(cat, typ, reason string) {
 		_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
@@ -2747,8 +2675,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	bh, err := New(store)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
@@ -2774,8 +2701,7 @@ func TestClientWatchEvents(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, cSpec{Val: "x"})
 
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
