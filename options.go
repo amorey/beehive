@@ -148,7 +148,7 @@ func resolveEvents(opts []EventOption) storeapi.EventQuery {
 
 // createOptions collects the per-object settings the create-time options apply.
 // Client.Create builds one, runs the options against it, and folds the result
-// into the new row (slug/finalizers) and its owner ref.
+// into the new row (name/finalizers) and its owner ref.
 type createOptions struct {
 	finalizers []string
 	owner      *ObjectID

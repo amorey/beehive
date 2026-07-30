@@ -31,57 +31,57 @@ import (
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// GenerateSlug returns prefix joined to a fresh UUIDv7, for callers whose objects
+// GenerateName returns prefix joined to a fresh UUIDv7, for callers whose objects
 // have no natural name. It is a plain function rather than something Create does for
 // you: a name the caller never chose is a name nobody can look up, which is the
-// nullable slug this API just retired, wearing a hat. Passing it positionally keeps
-// the slug's single source and puts the value in the caller's hands, where it can be
+// nullable name this API just retired, wearing a hat. Passing it positionally keeps
+// the name's single source and puts the value in the caller's hands, where it can be
 // logged or written into a sibling's spec before the create.
 //
-//	obj, err := client.Create(ctx, beehive.GenerateSlug("cache"), spec)
+//	obj, err := client.Create(ctx, beehive.GenerateName("cache"), spec)
 //
-// UUIDv7 leads with a 48-bit millisecond timestamp, so slugs sharing a prefix sort
+// UUIDv7 leads with a 48-bit millisecond timestamp, so names sharing a prefix sort
 // lexicographically by creation time. NewV7 also carries a monotonic sub-millisecond
-// counter, which makes two slugs generated in the same process distinct by
+// counter, which makes two names generated in the same process distinct by
 // construction rather than by luck; only cross-process creates inside the same
 // ~256ns window rest on the 62 random bits, and those collide at around 10^-15 for a
 // hundred such creates.
 //
 // Negligible is not impossible, though, and the store is the only thing that can
 // settle it atomically — a lookup before the create would be a TOCTOU race. So treat
-// this as collision-resistant, not collision-proof: Create reports ErrSlugTaken, and
+// this as collision-resistant, not collision-proof: Create reports ErrNameTaken, and
 // a caller generating names should bound-retry on exactly that. Reaching the bound
 // means generation is broken, not that you were unlucky.
 //
 //	for range 3 {
-//		obj, err := client.Create(ctx, beehive.GenerateSlug("cache"), spec)
-//		if !errors.Is(err, beehive.ErrSlugTaken) {
+//		obj, err := client.Create(ctx, beehive.GenerateName("cache"), spec)
+//		if !errors.Is(err, beehive.ErrNameTaken) {
 //			return obj, err
 //		}
 //	}
 //
-// newUUIDv7 is a seam for the one branch of GenerateSlug production cannot reach.
+// newUUIDv7 is a seam for the one branch of GenerateName production cannot reach.
 // The panic it guards is worth keeping — see below — and a guard no test can enter
 // is a guard that rots, so the indirection buys the assertion that it still fires.
 var newUUIDv7 = uuid.NewV7FromReader
 
-func GenerateSlug(prefix string) string {
+func GenerateName(prefix string) string {
 	// Drawn here rather than left to uuid.NewV7, so that no error is reachable and
 	// the signature can say so. Two mutable globals sit on that path — uuid's own
 	// rander (uuid.SetRand) and crypto/rand.Reader — and a read through either can
 	// fail. crypto/rand.Read is the one primitive documented never to return an
 	// error: it crashes the program instead if the OS source fails, which is the
-	// right answer for an unusable entropy source and not something a slug helper
+	// right answer for an unusable entropy source and not something a name helper
 	// could improve on.
 	var b [16]byte
 	rand.Read(b[:])
 
 	// Routed through uuid rather than laying the bits out here: makeV7 stamps the
 	// version and variant nibbles and the monotonic sub-millisecond counter, and that
-	// counter is what makes two slugs from one process distinct by construction. The
+	// counter is what makes two names from one process distinct by construction. The
 	// error is unreachable — NewRandomFromReader does one io.ReadFull of 16 bytes,
 	// and this reader holds exactly 16 — but it is checked rather than dropped,
-	// because the value behind a dropped error would be uuid.Nil, and every slug
+	// because the value behind a dropped error would be uuid.Nil, and every name
 	// collapsing to one constant is a far worse failure than a panic naming its cause.
 	id, err := newUUIDv7(bytes.NewReader(b[:]))
 	if err != nil {
@@ -90,14 +90,14 @@ func GenerateSlug(prefix string) string {
 	return prefix + "-" + id.String()
 }
 
-// checkSlug runs before any store work: deferring it would make the same call
+// checkName runs before any store work: deferring it would make the same call
 // succeed or fail depending on whether a row happens to exist, hiding the bug until
 // GC or a cold start removed it (as with GetOrCreate's eager spec validation). The
-// store refuses "" as well (ErrInvalidSlug lives there) — this is the courtesy that
+// store refuses "" as well (ErrInvalidName lives there) — this is the courtesy that
 // keeps the reads from answering ErrNotFound for what is really a bad argument.
-func checkSlug(slug string) error {
-	if slug == "" {
-		return fmt.Errorf("%w: pass the name the object should be addressable by", ErrInvalidSlug)
+func checkName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: pass the name the object should be addressable by", ErrInvalidName)
 	}
 	return nil
 }
@@ -114,32 +114,32 @@ type ObjectChange[Spec, Status any] struct {
 // Client is the user-facing API for a single resource kind: the surface for
 // creating, reading, updating, deleting, and watching objects.
 type Client[Spec, Status any] interface {
-	// Create inserts a new object under slug, which is required and immutable:
-	// it is the name every later slug-keyed call addresses the row by. A slug
+	// Create inserts a new object under name, which is required and immutable:
+	// it is the name every later name-keyed call addresses the row by. A name
 	// already held by a live or deletion-pending row fails on the store's UNIQUE
 	// constraint — Create never writes to a row it found, so use GetOrCreate when
 	// "already there" is an acceptable outcome.
 	//
-	// The slug is positional rather than an option because it is required, and an
+	// The name is positional rather than an option because it is required, and an
 	// options bag can express an absence a required argument should not have.
 	//
 	// The new object is unsettled and so owed its first reconcile; nothing is
 	// scheduled, since the owed pass lists exactly that.
-	Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	// Delete soft-deletes whatever holds slug now, by setting DeletionRequestedAt.
+	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+	// Delete soft-deletes whatever holds name now, by setting DeletionRequestedAt.
 	// That mark is the whole signal: it puts the row in the GC sweeper's listing, so
 	// the next sweep hands it to the controller to clear finalizers, and physical
 	// removal follows once they clear.
 	//
-	// It is idempotent: a slug no row holds returns nil (already gone), and a row
+	// It is idempotent: a name no row holds returns nil (already gone), and a row
 	// already deletion-pending is a no-op returning nil. Kind-scoped like Get — a
-	// slug is per-kind, so this only ever targets this client's kind, and another
-	// kind's row holding the same slug is simply not found.
+	// name is per-kind, so this only ever targets this client's kind, and another
+	// kind's row holding the same name is simply not found.
 	//
 	// The delete-if-present partner to GetOrCreate's create-if-absent, so an
 	// ensure/remove pair is one call on each side. Use DeleteByID when you mean the
 	// one incarnation you read a moment ago rather than whatever holds the name now.
-	Delete(ctx context.Context, slug string) error
+	Delete(ctx context.Context, name string) error
 	// DeleteByID is Delete keyed by incarnation: it acts on that one row, or returns
 	// ErrNotFound. It does not fold absence to nil, because an id naming no object
 	// is not "already in the desired state" — it is a row that was collected out from
@@ -165,25 +165,25 @@ type Client[Spec, Status any] interface {
 	// client's kind, and polls on a fixed interval — so a run extended several
 	// times within one interval is delivered once, carrying its latest state.
 	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
-	// Get loads whatever holds slug now, or returns ErrNotFound. Kind-scoped: a
-	// slug is unique only within a GroupKind, so another kind's row holding the same
-	// slug is not found rather than returned.
-	Get(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+	// Get loads whatever holds name now, or returns ErrNotFound. Kind-scoped: a
+	// name is unique only within a GroupKind, so another kind's row holding the same
+	// name is not found rather than returned.
+	Get(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
 	// GetByID is Get keyed by incarnation. Use it to finish work on a row already in
 	// hand — notably the read half of a read-modify-write, whose write half is
 	// UpdateByID.
 	GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
-	// GetOrCreate returns the object with the given slug, creating it from spec if
-	// absent. It NEVER mutates an existing row: a slug held by a live OR
+	// GetOrCreate returns the object with the given name, creating it from spec if
+	// absent. It NEVER mutates an existing row: a name held by a live OR
 	// deletion-pending row is returned as-is with created=false, so the caller can
 	// inspect DeletionRequestedAt and decide whether to wait for GC and retry — a
-	// tombstone still holds the slug's UNIQUE constraint, so no replacement can be
+	// tombstone still holds the name's UNIQUE constraint, so no replacement can be
 	// created until GC clears it. The read-or-create is atomic (a single store.Within
 	// transaction), so concurrent reconciles can't both create — one wins, the other
 	// observes it with created=false.
 	//
-	// There is no slug-keyed upsert: to change an existing row, follow this with
-	// Update. Nothing in the slug-keyed family writes to a row it found.
+	// There is no name-keyed upsert: to change an existing row, follow this with
+	// Update. Nothing in the name-keyed family writes to a row it found.
 	//
 	// On create the new object is unsettled and so owed its first reconcile, as with
 	// Create; returning an existing row writes nothing and owes nothing.
@@ -214,7 +214,7 @@ type Client[Spec, Status any] interface {
 	// row that already has a different owner would produce a two-owner object, and
 	// picking a winner is caller policy.
 	//
-	// spec and opts are nonetheless validated up front, before the slug is read, so
+	// spec and opts are nonetheless validated up front, before the name is read, so
 	// an unmarshalable spec or an erroring option fails the call even when the row
 	// already exists and neither would have been used. Both are caller bugs, and
 	// validating them eagerly keeps the error independent of store state: deferring
@@ -222,7 +222,7 @@ type Client[Spec, Status any] interface {
 	// to exist, hiding the bug until GC or a cold start removed it. It also keeps
 	// json.Marshal out of the transaction, which on a single-connection store would
 	// hold the write lock across arbitrary user MarshalJSON code.
-	GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
+	GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
 	// ObjectsWatch streams changes to one object, ObjectsWatchList to every object
 	// of this client's kind: the current state as Added, then Added/Modified/Deleted
@@ -332,7 +332,7 @@ type Client[Spec, Status any] interface {
 	// returns ErrNoController rather than hang on a stream that can never emit; id need
 	// not exist — an unscheduled id streams the zero Schedule until scheduled.
 	SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error)
-	// Update replaces the spec of whatever holds slug now, or returns ErrNotFound.
+	// Update replaces the spec of whatever holds name now, or returns ErrNotFound.
 	// Unlike Delete it does not fold absence to nil: a missing row is not "already
 	// in the desired state", because there is nothing to write the spec onto.
 	//
@@ -344,7 +344,7 @@ type Client[Spec, Status any] interface {
 	// and a collect plus a fresh create in between would land the write on a
 	// different incarnation. The object Get returned carries ID, so the fix is
 	// always to hand.
-	Update(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
+	Update(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
 	// UpdateByID is Update keyed by incarnation: it writes that one row, or returns
 	// ErrNotFound. This is the write half of a read-modify-write.
 	UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
@@ -368,8 +368,8 @@ func (c *clientImpl[Spec, Status]) decode(raw *RawObject) (*Object[Spec, Status]
 	return rawToTyped[Spec, Status](raw, c.bh.migratorFor(c.gk))
 }
 
-func (c *clientImpl[Spec, Status]) Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
-	if err := checkSlug(slug); err != nil {
+func (c *clientImpl[Spec, Status]) Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
 		return nil, err
 	}
 	b, err := json.Marshal(spec)
@@ -385,7 +385,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, slug string, spec
 	// Within keeps the insert and its owner ref atomic, so a crash between them
 	// can't leave an ownerless child the GC path would never collect.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err := c.insertObject(ctx, slug, b, co)
+		raw, err := c.insertObject(ctx, name, b, co)
 		if err != nil {
 			return err
 		}
@@ -470,12 +470,12 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // edge. Every create path shares it, so the row shape, the spec-version stamp,
 // and the owner-ref policy live in one place. Callers run it inside a Within:
 // the insert and its ref must commit together, or a crash between them leaves an
-// ownerless child the GC path would never collect. The slug is a parameter rather
+// ownerless child the GC path would never collect. The name is a parameter rather
 // than a field on co because it is required: an options bag can express its
 // absence, and a required argument should not be able to.
-func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, slug string, spec []byte, co *createOptions) (*RawObject, error) {
+func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string, spec []byte, co *createOptions) (*RawObject, error) {
 	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
-		Slug:        slug,
+		Name:        name,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
 		Finalizers:  co.finalizers,
@@ -508,12 +508,12 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, co *create
 	}
 }
 
-// GetOrCreate returns the row holding slug, creating it only when absent. The found
+// GetOrCreate returns the row holding name, creating it only when absent. The found
 // branch does no write at all, so a deletion-pending row comes back with its
 // tombstone intact rather than being spuriously bumped back to life. See the Client
 // interface for the full contract.
-func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
-	if err := checkSlug(slug); err != nil {
+func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+	if err := checkName(name); err != nil {
 		return nil, false, err
 	}
 	b, err := json.Marshal(spec)
@@ -528,9 +528,9 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	var created bool
 	// One Within around the read and the insert is what removes the caller's
 	// TOCTOU: the loser of a concurrent create observes the winner's row instead
-	// of failing on the slug's UNIQUE constraint.
+	// of failing on the name's UNIQUE constraint.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
+		existing, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
 		if err == nil {
 			// Found: return the existing row as-is (live or deletion-pending; never
 			// mutated). A pre-existing poison row is not ours to roll back, so its
@@ -541,7 +541,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
-		raw, err := c.insertObject(ctx, slug, b, co)
+		raw, err := c.insertObject(ctx, name, b, co)
 		if err != nil {
 			return err
 		}
@@ -574,12 +574,12 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	return obj, created, nil
 }
 
-func (c *clientImpl[Spec, Status]) Update(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error) {
-	if err := checkSlug(slug); err != nil {
+func (c *clientImpl[Spec, Status]) Update(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
 		return nil, err
 	}
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, error) {
-		return c.bh.store.ObjectsUpdateSpecBySlug(ctx, c.gk, slug, b, version)
+		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
 	})
 }
 
@@ -668,11 +668,11 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	return err
 }
 
-func (c *clientImpl[Spec, Status]) Get(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
-	if err := checkSlug(slug); err != nil {
+func (c *clientImpl[Spec, Status]) Get(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
 		return nil, err
 	}
-	raw, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
+	raw, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
 	if err != nil {
 		return nil, err
 	}
@@ -960,14 +960,14 @@ func (c *clientImpl[Spec, Status]) DeleteByID(ctx context.Context, id ObjectID) 
 
 // Delete is DeleteByID keyed by a name rather than a handle; the store resolves
 // and marks in one statement. See the Client interface for the full contract.
-func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, slug string) error {
-	if err := checkSlug(slug); err != nil {
+func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, name string) error {
+	if err := checkName(name); err != nil {
 		return err
 	}
-	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
+	// ErrNotFound is unambiguous here — nothing of this kind holds the name, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
-	// The one place a slug delete departs from DeleteByID, which reports a missing id.
-	if _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug); err != nil {
+	// The one place a name delete departs from DeleteByID, which reports a missing id.
+	if _, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
@@ -1092,7 +1092,7 @@ func rawToTyped[Spec, Status any](raw *RawObject, m Migrator) (*Object[Spec, Sta
 		ID:                  raw.ID,
 		Group:               raw.Group,
 		Kind:                raw.Kind,
-		Slug:                raw.Slug,
+		Name:                raw.Name,
 		Spec:                spec,
 		Generation:          raw.Generation,
 		ObservedGeneration:  raw.ObservedGeneration,

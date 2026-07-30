@@ -39,7 +39,7 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"}, WithFinalizers("a", "b"))
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("a", "b"))
 
 	require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "a"))
 	got, err := client.GetByID(ctx, obj.ID)
@@ -65,7 +65,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 		// Spec write (Create) stamped the spec version; status untouched (still 0).
 		raw, err := store.ObjectsGet(ctx, obj.ID)
@@ -90,7 +90,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
 		raw, err := store.ObjectsGet(ctx, obj.ID)
@@ -114,7 +114,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 
 	// Create an object and update its status via the ControllerClient.
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	err = cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"})
 	require.NoError(t, err)
@@ -143,7 +143,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
 	ch, err := client.ObjectsWatchList(ctx)
@@ -190,7 +190,7 @@ func TestControllerClientWithin(t *testing.T) {
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	// Rollback: an error from fn discards every write it made.
 	sentinel := errors.New("boom")
@@ -228,7 +228,7 @@ func TestControllerClientAddEvent(t *testing.T) {
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{
 		Category: "connection", Type: EventWarning, Reason: "ProbeFailed",
@@ -267,7 +267,7 @@ func TestControllerClientAddEventWrongKind(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	other := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Other"}}
 	err = other.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
@@ -283,7 +283,7 @@ func TestControllerClientAddEventWithinRollback(t *testing.T) {
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "x"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	sentinel := errors.New("boom")
 	err = cc.Within(ctx, func(ctx context.Context) error {
@@ -312,7 +312,7 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "hello"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	require.NoError(t, cc.ConditionsSet(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue}))
 	got, err := client.GetByID(ctx, obj.ID)
@@ -338,8 +338,8 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	from := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "from"})
-	to := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "to"})
+	from := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "from"})
+	to := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "to"})
 
 	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID))
 	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
@@ -370,8 +370,8 @@ func TestAddDependencyAcceptsCycle(t *testing.T) {
 	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
-	a := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
-	b := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
+	a := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	b := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
 	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, b.ID))
 	require.NoError(t, cc.DependenciesAdd(ctx, b.ID, a.ID), "a cycle-closing edge is accepted today")
@@ -534,8 +534,8 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
-	dep := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
-	target := mustCreate(t, ctx, client, uniqueSlug(), tSpec{})
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
@@ -582,8 +582,8 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
-	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	has, err := cc.EdgesHasIncoming(ctx, owner.ID)
 	require.NoError(t, err)
@@ -619,7 +619,7 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	// Give the Gadget a finalizer so the FinalizersDelete attempt has a target to
 	// (fail to) remove.
 	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
-	gadget := mustCreate(t, ctx, gadgets, uniqueSlug(), cSpec{Val: "v1"}, WithFinalizers("f"))
+	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
 
 	require.ErrorIs(t, cc.UpdateStatus(ctx, gadget.ID, 1, cStatus{Val: "hijacked"}), ErrWrongKind)
 	require.ErrorIs(t, cc.ConditionsSet(ctx, gadget.ID, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
@@ -740,8 +740,8 @@ func TestControllerClientReadEdges(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
-	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, RelationDependsOn))
 
 	ref, ok, err := cc.OwnersGet(ctx, child.ID)

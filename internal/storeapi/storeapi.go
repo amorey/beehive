@@ -40,18 +40,18 @@ type EventID = int64
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = errors.New("beehive: object not found")
 
-// ErrInvalidSlug is returned by a write whose slug is the empty string — the one
-// rule the store enforces on a slug, which is otherwise opaque. "" is not a name
+// ErrInvalidName is returned by a write whose name is the empty string — the one
+// rule the store enforces on a name, which is otherwise opaque. "" is not a name
 // anyone chooses; it is what an unset configuration field reads as, so admitting it
 // would converge every caller whose config was unset on one shared row, which no
-// slug-keyed call could then address unambiguously.
+// name-keyed call could then address unambiguously.
 //
 // It lives here rather than above the store because Store is a public extension
 // point: a client-side check is a courtesy to the caller, but the row is what has to
 // be refused, so the guarantee has to be the store's.
-var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
+var ErrInvalidName = errors.New("beehive: name must not be empty")
 
-// ErrSlugTaken is returned by a create whose slug is already held within the same
+// ErrNameTaken is returned by a create whose name is already held within the same
 // GroupKind — by a live row or by a deletion-pending one, since a tombstone keeps
 // the name reserved until GC clears it.
 //
@@ -60,7 +60,7 @@ var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
 // without a sentinel the only signal is a backend-specific error whose text belongs
 // to the driver. An implementation MUST report it rather than passing its
 // constraint violation through raw.
-var ErrSlugTaken = errors.New("beehive: slug is already in use for this kind")
+var ErrNameTaken = errors.New("beehive: name is already in use for this kind")
 
 // ErrWrongKind is returned by an id-keyed mutator whose target id belongs to a
 // different kind than the gk passed in. The store folds the caller's kind into every
@@ -200,9 +200,9 @@ type RawObject struct {
 	ID    ObjectID
 	Group string
 	Kind  string
-	// Slug is the object's name, unique within its GroupKind. Required, so never
+	// Name is the object's name, unique within its GroupKind. Required, so never
 	// empty on a row the store returns.
-	Slug   string
+	Name   string
 	Spec   []byte // JSON, user-owned
 	Status []byte // JSON, controller-owned; nil until first status write
 	// SpecVersion and StatusVersion are the per-column schema versions: the
@@ -268,16 +268,16 @@ const (
 // compiler refuse what the store would otherwise drop.
 type ObjectsCreateInput struct {
 	Finalizers []string
-	// Slug is the object's name, and is required. A value type rather than a pointer
+	// Name is the object's name, and is required. A value type rather than a pointer
 	// because there is no unnamed object to represent.
 	//
-	// An implementation MUST reject the empty string with ErrInvalidSlug, and MUST
+	// An implementation MUST reject the empty string with ErrInvalidName, and MUST
 	// enforce uniqueness within gk. Client rejects "" up front too, but that is a
 	// courtesy to the caller, not the guarantee: a row admitted under "" is one no
-	// slug-keyed call can ever address again, so the store is where it has to be
+	// name-keyed call can ever address again, so the store is where it has to be
 	// refused. Report it as the sentinel, not as whatever a schema constraint
 	// happens to raise — a caller cannot match on a driver's error text.
-	Slug string
+	Name string
 	Spec []byte
 	// SpecVersion is the migrator schema version Spec was written at, stamped onto
 	// the row like any other write. Status has no counterpart here: a new row has no
@@ -447,17 +447,17 @@ type Store interface {
 	// ErrNotFound. It returns no row: see the note above Store.
 	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (changed bool, err error)
 
-	// DeletionRequestsCreateBySlug is DeletionRequestsCreate keyed by slug within gk.
-	// The slug goes into the write's own WHERE clause, so resolving and marking are one
+	// DeletionRequestsCreateByName is DeletionRequestsCreate keyed by name within gk.
+	// The name goes into the write's own WHERE clause, so resolving and marking are one
 	// statement rather than a lookup and a write wrapped in a transaction. Both are
 	// race-free; this one saves a round trip, which a single-connection store notices.
 	//
 	// Everything else matches DeletionRequestsCreate: changed is true only when this
 	// call set the flag, a repeat does nothing, and ErrNotFound means no object of gk
-	// holds the slug. There is no ErrWrongKind here, because slugs are unique per kind,
-	// so another kind's slug is simply not found. It returns no row either; a caller
-	// that needs the marked object's id resolves the slug itself.
-	DeletionRequestsCreateBySlug(ctx context.Context, gk GroupKind, slug string) (changed bool, err error)
+	// holds the name. There is no ErrWrongKind here, because names are unique per kind,
+	// so another kind's name is simply not found. It returns no row either; a caller
+	// that needs the marked object's id resolves the name itself.
+	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (changed bool, err error)
 
 	// DeletionRequestsCreateFromOwner is the GC cascade as one command: it requests
 	// deletion of every object owned by ownerID and returns them all. It writes only to
@@ -520,9 +520,9 @@ type Store interface {
 	// ObjectsGet loads an object by id, or returns ErrNotFound.
 	ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error)
 
-	// ObjectsGetBySlug loads the object with the given slug within gk, or returns
+	// ObjectsGetByName loads the object with the given name within gk, or returns
 	// ErrNotFound.
-	ObjectsGetBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error)
+	ObjectsGetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
 
 	// ObjectsGetForReconcile is the reconcile loop's opening read: the object (with
 	// its conditions, as ObjectsGet returns it), the store-wide write cursor as of the
@@ -574,17 +574,17 @@ type Store interface {
 	// ErrNotFound.
 	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
 
-	// ObjectsUpdateSpecBySlug is ObjectsUpdateSpec keyed by slug within gk: it
-	// writes whatever holds the slug now, or returns ErrNotFound. A slug this kind
+	// ObjectsUpdateSpecByName is ObjectsUpdateSpec keyed by name within gk: it
+	// writes whatever holds the name now, or returns ErrNotFound. A name this kind
 	// does not hold is absent rather than foreign, so there is no ErrWrongKind — as
-	// with DeletionRequestsCreateBySlug.
+	// with DeletionRequestsCreateByName.
 	//
 	// Everything else matches ObjectsUpdateSpec, the content no-op included. An
 	// implementation MUST resolve and write within one transaction: the no-op skip
 	// needs the stored bytes to compare against, so a resolve-then-write split
-	// across two calls would let a concurrent collect hand the slug to a
+	// across two calls would let a concurrent collect hand the name to a
 	// replacement in between.
-	ObjectsUpdateSpecBySlug(ctx context.Context, gk GroupKind, slug string, spec []byte, specVersion int) (*RawObject, error)
+	ObjectsUpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (*RawObject, error)
 
 	// ObjectsUpdateStatus replaces an object's status, records the generation the
 	// controller observed, and stamps statusVersion (the migrator schema version

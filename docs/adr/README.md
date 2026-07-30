@@ -1,6 +1,6 @@
 # Architecture decision records
 
-One file per decision, named `YYYY-MM-DD-slug.md`, opening with:
+One file per decision, named `YYYY-MM-DD-name.md`, opening with:
 
 ```markdown
 # <the decision, as a sentence>
@@ -29,8 +29,8 @@ directory of archaeology.
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)
-- [The slug is the Client API's key; the id is the store's key](2026-07-30-slug-primary-key.md)
-- [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)
+- [The name is the Client API's key; the id is the store's key](2026-07-30-name-primary-key.md)
+- [Name-keyed writes](2026-07-27-name-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
 - [Every new depends_on edge stamps a durable owed reconcile](2026-07-29-stamp-every-new-dependency-edge.md)

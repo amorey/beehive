@@ -20,15 +20,15 @@ CREATE TABLE objects (
 
     -- The object's name, and the key the Client API addresses it by. Required, and
     -- immutable — a rename is delete+recreate, which is why edges key on id instead
-    -- (a reused slug would otherwise let a recreate re-adopt the old incarnation's).
+    -- (a reused name would otherwise let a recreate re-adopt the old incarnation's).
     -- Unique within (group, kind). NOT NULL is what makes that constraint total:
-    -- SQLite NULL != NULL, so a nullable slug lets any number of rows go unnamed and
-    -- unreachable through every slug-keyed call. The CHECK closes the same hole from
+    -- SQLite NULL != NULL, so a nullable name lets any number of rows go unnamed and
+    -- unreachable through every name-keyed call. The CHECK closes the same hole from
     -- the other side: '' is what unset configuration reads as, so a row admitted
     -- under it is one every such caller would collide on. The client rejects '' with
-    -- ErrInvalidSlug, but Store is a public extension point — this makes the
+    -- ErrInvalidName, but Store is a public extension point — this makes the
     -- invariant true of the column rather than true of one caller.
-    slug TEXT NOT NULL CHECK (slug <> ''),
+    name TEXT NOT NULL CHECK (name <> ''),
 
     spec   TEXT NOT NULL, -- JSON, user-owned,        HARD / desired state
     status TEXT,          -- JSON, controller-owned,  SOFT / observed state (nullable)
@@ -79,7 +79,7 @@ CREATE TABLE objects (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
 
-    UNIQUE ("group", kind, slug)
+    UNIQUE ("group", kind, name)
 ) STRICT;
 
 CREATE INDEX idx_objects_kind ON objects("group", kind);    -- list / resync a kind

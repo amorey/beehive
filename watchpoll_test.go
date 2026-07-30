@@ -57,7 +57,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -90,7 +90,7 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -122,7 +122,7 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "gone"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "gone"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -333,7 +333,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -366,7 +366,7 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -412,7 +412,7 @@ func TestWatchAbandonsASendWhenTheSubscriberGoesAway(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store, _, client, _ := watchFixture(t)
 
-	mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -432,7 +432,7 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store, _, client, _ := watchFixture(t)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -458,7 +458,7 @@ func TestWatchDoesNotTombstoneARowItCouldNeverDecode(t *testing.T) {
 
 	store, _, client, _ := watchFixture(t)
 	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-		Slug: uniqueSlug(),
+		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
@@ -471,7 +471,7 @@ func TestWatchDoesNotTombstoneARowItCouldNeverDecode(t *testing.T) {
 
 	// A good object created after the removal is the barrier: it can only arrive
 	// after the poll that dropped the poison row from the stream's own bookkeeping.
-	good := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "good"})
+	good := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "good"})
 
 	ev := recv(t, ch)
 	assert.Equal(t, Added, ev.Type, "the poison row's removal produced no tombstone")
@@ -486,7 +486,7 @@ func TestEventsWatchWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	defer cancel()
 
 	store, _, client, cc := watchFixture(t)
-	first := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	// The id the store will assign next: no row holds it yet, so the kind check
 	// finds nothing on every tick.
@@ -495,7 +495,7 @@ func TestEventsWatchWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.metaRead, 2), "polls while the id is unassigned")
 
-	later := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
+	later := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	require.Equal(t, next, later.ID, "the store assigns ids in order")
 	require.NoError(t, cc.EventsAdd(ctx, later.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
 
@@ -537,7 +537,7 @@ func TestEventsWatchSurvivesReadFailures(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	store.metaErr.Store(true) // the kind check fails first
 	ch, err := client.EventsWatch(ctx, obj.ID)
@@ -562,7 +562,7 @@ func TestEventsWatchEmitsOnlyWhatChanged(t *testing.T) {
 	defer cancel()
 
 	store, _, client, cc := watchFixture(t)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	ch, err := client.EventsWatch(ctx, obj.ID)
@@ -583,7 +583,7 @@ func TestEventsWatchAbandonsASendOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store, _, client, cc := watchFixture(t)
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	ch, err := client.EventsWatch(ctx, obj.ID)
@@ -608,7 +608,7 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 	defer cancel()
 
 	store, _, client, cc := watchFixture(t)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -648,8 +648,8 @@ func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
 	// and no reconcile loop can collect the row out from under the ordering.
 	store, bh, client, _ := watchFixture(t)
 	store.listIDsErr.Store(true)
-	watched := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "watched"})
-	newer := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "newer"})
+	watched := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "watched"})
+	newer := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "newer"})
 
 	ch, err := client.ObjectsWatch(ctx, watched.ID)
 	require.NoError(t, err)
@@ -691,7 +691,7 @@ func TestWatchSingleObjectSurvivesALivenessProbeFailure(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
 
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 	require.Equal(t, Added, recv(t, ch).Type)
@@ -729,7 +729,7 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	t.Run("list watch", func(t *testing.T) {
 		ch, err := client.ObjectsWatchList(ctx)
@@ -758,7 +758,7 @@ func TestWatchReportsAFailedFirstRead(t *testing.T) {
 	defer cancel()
 
 	store, _, client, _ := watchFixture(t)
-	mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	store.listErr.Store(true)
 	ch, err := client.ObjectsWatchList(ctx)
