@@ -1284,6 +1284,51 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
+// seqValue reads the global write cursor's counter directly. Tests use it to tell
+// "this write consumed a version" from "the row's version did not move", which the
+// object row alone cannot distinguish: a drawn-but-unused value leaves no trace on it.
+func seqValue(t *testing.T, store *sqliteStore) int64 {
+	t.Helper()
+	var v int64
+	require.NoError(t, store.db.QueryRowContext(context.Background(),
+		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&v))
+	return v
+}
+
+// A mark stamps the row with exactly the version it then commits to the counter, and
+// a mark blocked by the IS NULL guard draws nothing at all. The second half is the
+// point: the version is drawn lazily, so the already-pending path — the steady state
+// for a controller that idempotently deletes a child — writes no counter page and
+// leaves no gap in the cursor.
+func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	before := seqValue(t, store)
+	changed, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	marked, err := store.ObjectsGet(ctx, obj.ID)
+	require.NoError(t, err)
+	after := seqValue(t, store)
+	assert.Equal(t, before+1, after, "a stamped mark consumes exactly one version")
+	assert.Equal(t, after, marked.ResourceVersion,
+		"the row carries the value the counter committed, not one beside it")
+
+	// The repeat is blocked by the guard, so nothing is drawn and no gap appears.
+	changed, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.NoError(t, err)
+	require.False(t, changed)
+	assert.Equal(t, after, seqValue(t, store), "a guard-blocked mark draws no version")
+
+	// Same for a mark that matches no row at all, via the other keying.
+	_, err = store.DeletionRequestsCreateBySlug(ctx, testGK, "no-such-slug")
+	require.ErrorIs(t, err, beehive.ErrNotFound)
+	assert.Equal(t, after, seqValue(t, store), "a mark that matches nothing draws none either")
+}
+
 // ObjectsGetMeta returns the same row as ObjectsGet but skips assembling
 // conditions, which the metadata-only GC and edge callers never read.
 func TestGetObjectMetaSkipsConditions(t *testing.T) {
@@ -2763,6 +2808,44 @@ func TestDeletionRequestsCreateMarkError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The condition mutators gate on kind, which is metadata, so they must not decode
+// the row to do it. A corrupt finalizers blob is the probe: it fails every full-row
+// read in the store, and neither of these writes touches finalizers. Sibling of
+// TestDeletionRequestsCreateReadsNoBlobOnEitherBranch — same rule, same class of
+// write, and before the gate was narrowed these two disagreed about it.
+func TestConditionWritesReadNoBlobToGateOnKind(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	id := insertBadFinalizersRow(t, store, testGK)
+
+	require.NoError(t, store.ConditionsSet(ctx, testGK, id,
+		storeapi.Condition{Type: "Ready", Status: "True"}))
+	require.NoError(t, store.ConditionsDelete(ctx, testGK, id, "Ready"))
+
+	// The gate still reports scope and existence, which is all it reads for.
+	assert.ErrorIs(t, store.ConditionsSet(ctx, beehive.GroupKind{Kind: "Other"}, id,
+		storeapi.Condition{Type: "Ready", Status: "True"}), beehive.ErrWrongKind)
+	assert.ErrorIs(t, store.ConditionsDelete(ctx, testGK, 999999, "Ready"), beehive.ErrNotFound)
+}
+
+// The counter bump is the one statement in a deletion mark that runs after the row
+// was already stamped, so it is a distinct failure from the mark itself. Blocking it
+// must roll the whole thing back rather than leaving a row stamped with a version the
+// cursor never committed.
+func TestDeletionRequestsCreateVersionDrawError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	blockResourceVersionDraws(t, store)
+
+	_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.Error(t, err)
+
+	reloaded, err := store.ObjectsGet(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reloaded.DeletionRequestedAt, "the mark rolled back with the draw")
+}
+
 // checkObjectScoped resolves a zero-row mark or decrement, so it only ever runs
 // after a statement that already succeeded — no fault-injection path reaches it with
 // a broken connection. Called directly, which is what whitebox tests are for.
@@ -3883,6 +3966,18 @@ func blockObjectUpdates(t *testing.T, store *sqliteStore) {
 	t.Helper()
 	_, err := store.db.ExecContext(context.Background(), `
 		CREATE TRIGGER block_object_updates BEFORE UPDATE ON objects
+		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	require.NoError(t, err)
+}
+
+// blockResourceVersionDraws makes advancing the write cursor abort while leaving
+// reads of it alone — a BEFORE UPDATE trigger does not fire for the `SELECT value + 1`
+// subquery. That isolates the lazy draw markForDeletion runs *after* stamping a row,
+// which no whole-connection failure can reach.
+func blockResourceVersionDraws(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `
+		CREATE TRIGGER block_rv_draws BEFORE UPDATE ON resource_version_seq
 		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
 	require.NoError(t, err)
 }

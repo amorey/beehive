@@ -62,6 +62,21 @@ answers from metadata alone — no blob fetch, no finalizer unmarshal, no condit
 query. A probe built on the read-path row readers would have kept the conditions
 saving and thrown the rest away.
 
+`checkObjectScoped` is the general form of that, not a one-off for the deletion pair:
+**a write that reports no row reads no row.** Both condition mutators gate on kind
+through it too, which is what stops a corrupt `finalizers` blob from failing a
+condition write that never touches finalizers — the inconsistency that gave the rule
+away, since `DeletionRequestsCreate` already tolerated such a row.
+
+The same rule applied to the version draw. `markForDeletion` used to call
+`nextResourceVersion` — an `UPDATE` on `resource_version_seq` — *before* the `IS NULL`
+guard decided whether anything would be stamped, so a repeat delete committed a
+counter write and its fsync to stamp nothing. It now reads `value + 1` inline in the
+`UPDATE` and advances the counter only once a row was stamped, making the
+already-pending path a pure read. That is safe because the two statements sit in the
+caller's transaction on a single connection, and because every `where` this helper
+takes keys on a unique column, so the subquery can never hand one value to two rows.
+
 **`ObjectsUpdateSpec` loses its `changed` bool**, which is where the two halves of the
 rule pull against each other. It passes the derivability test — the returned row has
 no before-state, so a caller genuinely cannot reconstruct "was this a no-op" from it —

@@ -1527,11 +1527,12 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 	// leave a changed condition with an unbumped resource_version.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read confirms the object exists and belongs to gk first: yields a
-		// clean ErrNotFound/ErrWrongKind rather than a foreign-key violation or a
-		// cross-kind write from the conditions insert. Its row is not reported, only
-		// used as that gate.
-		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
+		// Metadata-only gate: confirms the object exists and belongs to gk first,
+		// yielding a clean ErrNotFound/ErrWrongKind rather than a foreign-key
+		// violation or a cross-kind write from the conditions insert. Nothing here
+		// reports a row, so nothing here reads one — a full read would also make a
+		// corrupt finalizers blob fail a condition write that never touches it.
+		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		// No-op suppression: an identical condition leaves resource_version where it is,
@@ -1571,10 +1572,10 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 	// Within keeps the delete and the version bump atomic (see ConditionsSet).
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary up front (symmetric with
-		// ConditionsSet); the conditions table carries no group/kind to fold into
-		// the DELETE, so the gate is the object read.
-		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
+		// Same metadata-only gate as ConditionsSet: the conditions table carries no
+		// group/kind to fold into the DELETE, so the kind boundary is a separate read
+		// — of two columns, not of the row.
+		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		res, err := c.ExecContext(ctx,
@@ -1827,23 +1828,40 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 // It reports only whether it stamped a row. RowsAffected == 0 is the same signal
 // RETURNING's ErrNotFound used to carry, and just as ambiguous: guard, scope or
 // missing. requestDeletion's probe is what tells them apart.
+//
+// **The version is drawn lazily, which is why this doesn't call
+// nextResourceVersion.** That helper is an UPDATE on resource_version_seq, so
+// calling it first would make every repeat delete — the steady state for a
+// controller that idempotently removes a child — commit a counter write and its
+// fsync to stamp nothing. Instead the UPDATE reads `value + 1` inline and the
+// counter is advanced only once a row was actually stamped, so the guard-blocked
+// path is a pure read. The two statements are in the caller's transaction, on one
+// connection, so no other writer can draw the same value in between; and the
+// subquery is safe against a multi-row match only because there is never one —
+// every `where` here keys on a unique column (id, or group/kind/slug).
 func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (bool, error) {
 	c := s.conn(ctx)
-	rv, err := nextResourceVersion(ctx, c)
-	if err != nil {
-		return false, err
-	}
 	now := toMillis(time.Now().UTC())
-	args := append([]any{now, rv, now}, whereArgs...)
+	args := append([]any{now, now}, whereArgs...)
 	res, err := c.ExecContext(ctx, `
 		UPDATE objects
-		SET deletion_requested_at = ?, resource_version = ?, updated_at = ?
+		SET deletion_requested_at = ?,
+		    resource_version = (SELECT value + 1 FROM resource_version_seq WHERE id = 1),
+		    updated_at = ?
 		WHERE (`+where+`) AND deletion_requested_at IS NULL`, args...)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
-	return n > 0, nil
+	if n == 0 {
+		return false, nil
+	}
+	// Commit the value the row above just took. Must match it exactly, which it does:
+	// same transaction, same single connection, nothing between the two statements.
+	if _, err := nextResourceVersion(ctx, c); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // requestDeletion is the mark-or-probe protocol behind both deletion entry points.
