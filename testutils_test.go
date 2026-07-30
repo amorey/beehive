@@ -211,7 +211,7 @@ func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []by
 func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
-func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
+func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) error {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
 func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (bool, error) {
@@ -220,10 +220,10 @@ func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID)
 func (s *fakeStore) DeletionRequestsCreateBySlug(context.Context, GroupKind, string) (bool, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateBySlug")
 }
-func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) (*RawObject, error) {
+func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
 	panic("not implemented: fakeStore.ConditionsSet")
 }
-func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) (*RawObject, error) {
+func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) error {
 	panic("not implemented: fakeStore.ConditionsDelete")
 }
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {

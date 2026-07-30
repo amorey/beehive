@@ -278,7 +278,7 @@ func TestDependencyRequeue(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
-	_, err = store.ConditionsSet(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = store.ConditionsSet(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	// Wait for the dependent specifically rather than for "the next reconcile":
@@ -404,7 +404,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	// dependents — with no edge yet, that lookup comes back empty and the change
 	// is now permanently unclaimed. Only then let the declaration commit.
 	store.resetLooked()
-	_, err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	store.waitLooked(t)
 	close(proceed)
@@ -490,7 +490,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// makes the window deterministic: with no edge yet it comes back empty, so the
 	// change is already unclaimed by the time DependenciesAdd commits.
 	store.resetLooked()
-	_, err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	store.waitLooked(t)
 	// target is the application's read of the target, taken before the change
@@ -583,7 +583,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// already unclaimed when the edge appears — the out-of-band race. The
 	// ControllerClient outlives the control plane (it holds the store, not the
 	// loops), so the declaration commits normally with no running queue to reach.
-	_, err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
@@ -2620,7 +2620,7 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
-	_, err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	awaitReconcile(t, reconciled, dep.ID,
@@ -2648,7 +2648,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
-	_, err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	awaitReconcile(t, reconciled, dep.ID,
@@ -3052,7 +3052,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	require.NoError(t, stop1(ctx))
 
 	// --- the crash window: the target changes with nobody running ---
-	_, err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	// --- second process over the same store ---

@@ -1457,20 +1457,20 @@ func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, co
 	return &cond, nil
 }
 
-// bumpObject advances id's resource_version and returns the assembled object. The
-// condition mutators share it: a condition lives in its own table, so the version
-// bump — which is what makes the change visible to a scan of the write log — can't
-// be folded into the semantic write and is a separate UPDATE.
-func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+// bumpObject advances id's resource_version. The condition mutators share it: a
+// condition lives in its own table, so the version bump — which is what makes the
+// change visible to a scan of the write log — can't be folded into the semantic
+// write and is a separate UPDATE. No RETURNING: neither mutator reports a row, and
+// each has already read this one under its kind scope in this same transaction.
+func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) error {
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	row := c.QueryRowContext(ctx, `
+	_, err = c.ExecContext(ctx, `
 		UPDATE objects SET resource_version = ?, updated_at = ?
-		WHERE id = ?
-		RETURNING `+objectColumns, rv, toMillis(time.Now().UTC()), id)
-	return s.scanWritten(ctx, row)
+		WHERE id = ?`, rv, toMillis(time.Now().UTC()), id)
+	return err
 }
 
 // conditionUnchanged reports whether an existing condition already matches the
@@ -1494,19 +1494,18 @@ func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want stor
 		existing.Liveness == want.Liveness
 }
 
-func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) error {
 	// Within keeps the condition write and the object's version bump atomic: it
 	// opens a transaction when called standalone and joins the caller's when
 	// nested (the reconcile path), so a crash between the two statements can't
 	// leave a changed condition with an unbumped resource_version.
-	var result *storeapi.RawObject
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read confirms the object exists and belongs to gk first: yields a
 		// clean ErrNotFound/ErrWrongKind rather than a foreign-key violation or a
-		// cross-kind write from the conditions insert.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// cross-kind write from the conditions insert. Its row is not reported, only
+		// used as that gate.
+		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		// No-op suppression: an identical condition leaves resource_version where it is,
@@ -1516,8 +1515,7 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 			return err
 		}
 		if s.conditionUnchanged(existing, cond) {
-			result, err = s.attachConditions(ctx, obj)
-			return err
+			return nil
 		}
 		now := toMillis(time.Now().UTC())
 		if _, err := c.ExecContext(ctx, `
@@ -1539,22 +1537,18 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// A condition change bumps the object's resource_version, which is what a watch
 		// poll and the dependency waker both look at.
-		result, err = s.bumpObject(ctx, c, id)
-		return err
+		return s.bumpObject(ctx, c, id)
 	})
-	return result, err
 }
 
-func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {
 	// Within keeps the delete and the version bump atomic (see ConditionsSet).
-	var result *storeapi.RawObject
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary up front (symmetric with
 		// ConditionsSet); the conditions table carries no group/kind to fold into
 		// the DELETE, so the gate is the object read.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		res, err := c.ExecContext(ctx,
@@ -1564,16 +1558,12 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 		}
 		n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
 		// Absent condition: nothing changed, so don't bump resource_version — a watch
-		// poll would otherwise report a spurious diff. Return the object we already
-		// read, with its conditions assembled.
+		// poll would otherwise report a spurious diff.
 		if n == 0 {
-			result, err = s.attachConditions(ctx, obj)
-			return err
+			return nil
 		}
-		result, err = s.bumpObject(ctx, c, id)
-		return err
+		return s.bumpObject(ctx, c, id)
 	})
-	return result, err
 }
 
 // eventColumns is the canonical select list for an event row; scanEvent reads
@@ -1766,12 +1756,11 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge tim
 	return int(total), err
 }
 
-func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (*storeapi.RawObject, error) {
+func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) error {
 	// Within keeps the read-modify-write of the finalizer list atomic: it opens a
 	// transaction standalone and joins the caller's on the reconcile path, so a
 	// concurrent writer can't slip between the load and the rewrite.
-	var result *storeapi.RawObject
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary while loading the finalizer list.
 		obj, err := s.getObjectRowScoped(ctx, gk, id)
@@ -1782,22 +1771,20 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		// Absent finalizer: nothing changed, so don't bump resource_version — a watch
 		// poll would otherwise report a spurious diff (mirrors ConditionsDelete).
 		if !removed {
-			result, err = s.attachConditions(ctx, obj)
-			return err
+			return nil
 		}
 		rv, err := nextResourceVersion(ctx, c)
 		if err != nil {
 			return err
 		}
-		row := c.QueryRowContext(ctx, `
+		// No RETURNING: the caller gets no row, and the scoped read above already
+		// proved this id exists inside this transaction.
+		_, err = c.ExecContext(ctx, `
 			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+objectColumns,
+			WHERE id = ?`,
 			jsonText(marshalFinalizers(remaining)), rv, toMillis(time.Now().UTC()), id)
-		result, err = s.scanWritten(ctx, row)
 		return err
 	})
-	return result, err
 }
 
 // markForDeletion stamps the deletion clock of the row named by key and emits a

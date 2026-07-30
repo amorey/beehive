@@ -391,15 +391,16 @@ type Store interface {
 
 	// ConditionsDelete removes the condition of type condType from id. Removing an
 	// existing condition bumps ResourceVersion; deleting one that isn't there does
-	// nothing. Returns the object with its conditions assembled. Scoped to gk: another
-	// kind's id is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) (*RawObject, error)
+	// nothing. Scoped to gk: another kind's id is rejected with ErrWrongKind, a
+	// missing id with ErrNotFound. It returns no row: see the note above Store.
+	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
 
 	// ConditionsSet inserts or updates the condition keyed by (id, cond.Type). A real
 	// change bumps the object's ResourceVersion; an identical write does nothing.
-	// Returns the object with its conditions assembled. Scoped to gk: another kind's id
-	// is rejected with ErrWrongKind, a missing id with ErrNotFound.
-	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) (*RawObject, error)
+	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id is
+	// rejected with ErrNotFound. It returns no row: see the note above Store, and
+	// read the conditions back with ObjectsGet if you need them.
+	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
 
 	// DeletionRequestsCreate requests an object's deletion by setting
 	// DeletionRequestedAt. The row stays until its finalizers clear, so this creates
@@ -465,10 +466,10 @@ type Store interface {
 	EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
 
 	// FinalizersDelete removes finalizer from id's finalizer list. Removing one that is
-	// there bumps ResourceVersion; removing one that isn't does nothing. Returns the
-	// object with its conditions assembled, or ErrNotFound if the row is gone. Scoped
-	// to gk: another kind's id is rejected with ErrWrongKind.
-	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (*RawObject, error)
+	// there bumps ResourceVersion; removing one that isn't does nothing. ErrNotFound if
+	// the row is gone. Scoped to gk: another kind's id is rejected with ErrWrongKind.
+	// It returns no row: see the note above Store.
+	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) error
 
 	// ObjectsCreate inserts a new object of kind gk. The store assigns ID and
 	// ResourceVersion and sets Generation to 1; ObjectsCreateInput carries

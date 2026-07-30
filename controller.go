@@ -138,19 +138,17 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 }
 
 func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error {
-	_, err := c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
+	return c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
 		Reason:   condition.Reason,
 		Message:  condition.Message,
 		Liveness: condition.Liveness,
 	})
-	return err
 }
 
 func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error {
-	_, err := c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType)
-	return err
+	return c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType)
 }
 
 // EventsAdd marshals the event's optional Detail — typed in, opaque out, like
@@ -177,8 +175,7 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 }
 
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
-	_, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
-	return err
+	return c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
 }
 
 // DependenciesAdd implements the contract documented on ControllerClient. The
