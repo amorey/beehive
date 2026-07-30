@@ -94,7 +94,7 @@ func main() {
 	watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
-	obj, err := client.Create(ctx, GreetingSpec{Name: "world"})
+	obj, err := client.Create(ctx, "world", GreetingSpec{Name: "world"})
 	exitOnErr(err)
 
 	fmt.Printf("created Greeting id=%d name=%v\n", obj.ID, obj.Spec.Name)

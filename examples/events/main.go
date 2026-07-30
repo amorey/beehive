@@ -90,7 +90,7 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 
-	cluster, err := client.Create(ctx, ClusterSpec{Endpoint: "10.0.0.1:443"})
+	cluster, err := client.Create(ctx, "primary", ClusterSpec{Endpoint: "10.0.0.1:443"})
 	exitOnErr(err)
 	fmt.Printf("created Cluster id=%d endpoint=%s\n\n", cluster.ID, cluster.Spec.Endpoint)
 

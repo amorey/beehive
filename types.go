@@ -97,6 +97,17 @@ const (
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
+// ErrInvalidSlug is returned by the slug-keyed calls when the slug is the empty
+// string. The client rejects it before any store work; the store rejects it too,
+// since Store is a public extension point and a "" row is one no slug-keyed call
+// could address.
+var ErrInvalidSlug = storeapi.ErrInvalidSlug
+
+// ErrSlugTaken is returned by Create when the slug is already held, by a live row
+// or by a deletion-pending one. GetOrCreate returns the existing row instead; this
+// is Create's answer, and what a caller generating slugs retries on.
+var ErrSlugTaken = storeapi.ErrSlugTaken
+
 // ErrStaleTxContext is returned by a nested Within whose ctx is not the transaction's
 // live innermost frame — another goroutine's frame, an enclosing frame used while
 // deeper ones are open, or a frame that already unwound. Deep nesting on one goroutine
@@ -143,7 +154,7 @@ type Object[Spec, Status any] struct {
 	ID                  ObjectID
 	Group               string
 	Kind                string
-	Slug                *string
+	Slug                string
 	Spec                Spec
 	Status              *Status
 	Generation          int64      // bumped on every Spec write not provably a no-op (see ObjectsUpdateSpec)

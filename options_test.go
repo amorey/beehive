@@ -248,18 +248,15 @@ func TestWithLogLevelDispatch(t *testing.T) {
 // inert on anything else (so they're harmless if passed to New/Register).
 func TestCreateOptionsDispatch(t *testing.T) {
 	co := &createOptions{}
-	require.NoError(t, WithSlug("widget")(co))
 	require.NoError(t, WithFinalizers("a", "b")(co))
 	require.NoError(t, WithOwner(42)(co))
 
-	require.NotNil(t, co.slug)
-	assert.Equal(t, "widget", *co.slug)
 	assert.Equal(t, []string{"a", "b"}, co.finalizers)
 	require.NotNil(t, co.owner)
 	assert.Equal(t, ObjectID(42), *co.owner)
 
 	// A target the options don't recognize is silently ignored.
-	for _, o := range []Option{WithSlug("x"), WithFinalizers("a"), WithOwner(7)} {
+	for _, o := range []Option{WithFinalizers("a"), WithOwner(7)} {
 		require.NoError(t, o(&Beehive{}))
 	}
 }

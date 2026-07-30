@@ -3,6 +3,13 @@
 - **Status:** Accepted — implemented in `client.go`, `sqlite/store.go`.
 - **Date:** 2026-07-27 (recorded retroactively)
 
+> **Superseded in part.** The slug is now the `Client` API's key for all of CRUD, so
+> `DeleteBySlug` is spelled `Delete` and `Update` has a slug form of its own. The
+> slug is also required, which retired `WithSlug` and `ErrConflictingOption` — so the
+> `WithSlug` paragraph below is void, not merely renamed. Everything else here, the
+> transaction-boundary reasoning above all, is unchanged and is what the newer
+> decision builds on. → [ADR](2026-07-30-slug-primary-key.md)
+
 ## Reconcile is not transactional
 
 `typedController.reconcile` loads the object and calls `Reconcile` with no enclosing
@@ -51,10 +58,9 @@ away. A caller that genuinely wants ensure-then-set still composes `GetOrCreate`
 and makes the tombstone question the caller's to answer rather than one this API
 answered for them by accident.
 
-`GetOrCreate` rejects `WithSlug` with `ErrConflictingOption` rather than ignoring it.
-This is the deliberate exception to "an option ignores targets it doesn't recognize":
-here the target *does* recognize it, and ignoring it would discard a value the caller
-believes took effect.
+~~`GetOrCreate` rejects `WithSlug` with `ErrConflictingOption` rather than ignoring
+it.~~ **Void**: the slug is now positional on every slug-keyed write, so there is no
+option left to contradict it. `WithSlug` and `ErrConflictingOption` are both deleted.
 
 `GetOrCreate`'s found branch does no write at all, which is the point. A
 deletion-pending row comes back with its tombstone intact rather than being

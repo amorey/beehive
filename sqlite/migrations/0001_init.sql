@@ -18,10 +18,17 @@ CREATE TABLE objects (
     "group" TEXT NOT NULL,
     kind    TEXT NOT NULL,
 
-    -- NULL for internally-generated objects; set for user-named objects (e.g. kubeconfig entries).
-    -- Immutable — a rename is delete+recreate.
-    -- Unique within (group, kind); SQLite NULL != NULL so multiple NULL slugs are allowed.
-    slug TEXT,
+    -- The object's name, and the key the Client API addresses it by. Required, and
+    -- immutable — a rename is delete+recreate, which is why edges key on id instead
+    -- (a reused slug would otherwise let a recreate re-adopt the old incarnation's).
+    -- Unique within (group, kind). NOT NULL is what makes that constraint total:
+    -- SQLite NULL != NULL, so a nullable slug lets any number of rows go unnamed and
+    -- unreachable through every slug-keyed call. The CHECK closes the same hole from
+    -- the other side: '' is what unset configuration reads as, so a row admitted
+    -- under it is one every such caller would collide on. The client rejects '' with
+    -- ErrInvalidSlug, but Store is a public extension point — this makes the
+    -- invariant true of the column rather than true of one caller.
+    slug TEXT NOT NULL CHECK (slug <> ''),
 
     spec   TEXT NOT NULL, -- JSON, user-owned,        HARD / desired state
     status TEXT,          -- JSON, controller-owned,  SOFT / observed state (nullable)

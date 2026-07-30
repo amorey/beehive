@@ -29,21 +29,16 @@ import (
 // targets it understands and ignores the rest.
 type Option func(target any) error
 
-// ErrConflictingOption reports an option that contradicts an argument the call
-// already carries — passing WithSlug to a method that takes the slug positionally,
-// for instance. It is distinct from an option being *inapplicable*: an option
-// aimed at a target it doesn't understand is ignored by design (see Option), while
-// a contradiction is a caller mistake whose effect would otherwise be invisible.
-var ErrConflictingOption = errors.New("beehive: option conflicts with an explicit argument")
-
 // ErrInvalidOption reports an option carrying a value that has no meaning — a
-// non-positive GC interval, for instance. Unlike ErrConflictingOption it is about
-// the argument alone, so it is returned regardless of the target the option lands
-// on: a value that means nothing at one call site means nothing at any of them.
+// non-positive GC interval, for instance. It is about the argument alone, so it
+// is returned regardless of the target the option lands on: a value that means
+// nothing at one call site means nothing at any of them. This is distinct from an
+// option being *inapplicable*: an option aimed at a target it doesn't understand
+// is ignored by design (see Option).
 var ErrInvalidOption = errors.New("beehive: option value is invalid")
 
 // LoadOption selects a secondary lookup to fetch alongside an object on a read.
-// It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
+// It is distinct from Option: it applies only to read call sites (Get/GetByID/
 // List), composing into a LoadSet. Lazy fetching is the alternative — omit the
 // selector and call Client.OwnersGet/DependenciesList when the data is needed.
 type LoadOption func(*LoadSet)
@@ -155,7 +150,6 @@ func resolveEvents(opts []EventOption) storeapi.EventQuery {
 // Client.Create builds one, runs the options against it, and folds the result
 // into the new row (slug/finalizers) and its owner ref.
 type createOptions struct {
-	slug       *string
 	finalizers []string
 	owner      *ObjectID
 	onCreate   func(context.Context)
@@ -173,16 +167,6 @@ func resolveCreate(opts []Option) (*createOptions, error) {
 		}
 	}
 	return co, nil
-}
-
-// WithSlug sets the object's unique slug, looked up later via GetBySlug.
-func WithSlug(slug string) Option {
-	return func(target any) error {
-		if t, ok := target.(*createOptions); ok {
-			t.slug = &slug
-		}
-		return nil
-	}
 }
 
 // WithFinalizers attaches finalizers that must be cleared before an object is

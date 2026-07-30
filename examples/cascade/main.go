@@ -151,14 +151,14 @@ func main() {
 
 	// A Cluster guarded by a connection finalizer, owning two caches that each
 	// guard a cache-flush finalizer.
-	cluster, err := clusterClient.Create(ctx, ClusterSpec{Endpoint: "db.example:5432"},
+	cluster, err := clusterClient.Create(ctx, "primary", ClusterSpec{Endpoint: "db.example:5432"},
 		beehive.WithFinalizers(connectionFinalizer))
 	exitOnErr(err)
 	fmt.Printf("created Cluster %d (endpoint=%s, finalizers=%v)\n", cluster.ID, cluster.Spec.Endpoint, cluster.Finalizers)
 	exitOnErr(clusterClient.Requeue(ctx, cluster.ID))
 
-	for range numCaches {
-		cache, err := cacheClient.Create(ctx, ClusterCacheSpec{ClusterID: cluster.ID},
+	for i := range numCaches {
+		cache, err := cacheClient.Create(ctx, fmt.Sprintf("cache-%d", i), ClusterCacheSpec{ClusterID: cluster.ID},
 			beehive.WithOwner(cluster.ID), beehive.WithFinalizers(cacheFlushFinalizer))
 		exitOnErr(err)
 		fmt.Printf("created ClusterCache %d owned by Cluster %d (finalizers=%v)\n", cache.ID, cluster.ID, cache.Finalizers)
@@ -200,7 +200,7 @@ func watchCascade(
 		}
 		deleted = true
 		fmt.Printf("\nall ready; deleting Cluster %d — watch the cascade:\n", clusterID)
-		exitOnErr(clusterClient.Delete(ctx, clusterID))
+		exitOnErr(clusterClient.DeleteByID(ctx, clusterID))
 	}
 
 	timeout := time.After(30 * time.Second)

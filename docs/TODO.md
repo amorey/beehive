@@ -65,36 +65,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   tripwires: they add distinct ids once each, and a first add stays immediately
   dispatchable under any sane throttle.
 
-- **`DeleteBySlug` on an absent slug still opens a write transaction** — known, not
-  fixed, though it now costs much less than it did. `DeletionRequestsCreateBySlug`
-  opens `Within`, so `BEGIN IMMEDIATE`, before anything is known to match. A slug no
-  row holds costs that transaction, the zero-row `UPDATE`, the existence probe and a
-  rollback, where the pre-mutator client code cost a single lock-free `SELECT`.
-
-    That absent path is the steady state of what this method is for. A controller that
-  idempotently removes a child re-runs the call every reconcile, so it keeps hitting
-  the absent path long after the one call that actually deleted something.
-
-  **Two thirds of the original cost is gone.** The probe reads `"group"`/`kind` rather
-  than the whole row (`checkObjectScoped`), and `markForDeletion` draws the version
-  lazily — the `UPDATE` reads `value + 1` inline and the counter is advanced only once
-  a row was stamped — so neither the absent path nor the already-pending path writes
-  the sequence any more. What is left is the `BEGIN IMMEDIATE` and the journal work,
-  not the extra statements. See
-  [the write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md).
-
-  The remaining fix is a lock-free `getObjectRowBySlug` before `Within`,
-  short-circuiting both idempotent outcomes — no such slug, and a row already
-  deletion-pending — and falling through to the atomic mark otherwise.
-
-  Deferred because it brings back a read-then-write shape as a fast path, and because
-  its no-op branch would answer outside a transaction where the id-keyed sibling
-  answers inside one. That divergence needs more thought than the saving now
-  justifies — and it justifies less than it used to, since the statements it would
-  have saved are the ones already removed. Revisit if a profile shows absent-path
-  deletes are hot, or if `DeletionRequestsCreate` gets the same treatment, in which
-  case the fast path belongs in `requestDeletion` for both.
-
 - **The waker's startup seed race costs latency, not convergence** — known, no longer
   a correctness hole, and narrower than it was since the waker started persisting its
   cursor (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)). `Start` launches

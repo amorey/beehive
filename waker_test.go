@@ -742,10 +742,8 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	target, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	dep, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	dep := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, probe.Store, dep.ID, target.ID, RelationDependsOn))
 
 	stop, err := bh.Start(ctx)
@@ -758,7 +756,7 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 	waitClosed(t, probe.watermarkSet, "the dependent's watermark write")
 	drainProbe(reconciled)
 
-	_, err = client.Update(ctx, target.ID, cSpec{Val: "moved"})
+	_, err = client.UpdateByID(ctx, target.ID, cSpec{Val: "moved"})
 	require.NoError(t, err)
 
 	awaitMatch(t, reconciled, func(id ObjectID) bool { return id == dep.ID },

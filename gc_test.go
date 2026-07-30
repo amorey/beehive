@@ -45,7 +45,7 @@ func (c *depDroppingController) Reconcile(ctx context.Context, cc ControllerClie
 	if obj.ID != depID {
 		return Result{}, nil // only the dependent acts
 	}
-	target, err := reader.Get(ctx, targetID)
+	target, err := reader.GetByID(ctx, targetID)
 	if errors.Is(err, ErrNotFound) {
 		return Result{}, nil // target already gone
 	}
@@ -218,14 +218,13 @@ func TestCollectIgnoresLiveObject(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
 
-	obj, err := client.Create(ctx, cSpec{Val: "alive"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "alive"})
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.False(t, gone, "live object not collected")
 
-	_, err = client.Get(ctx, obj.ID) // not deletion-pending: untouched
+	_, err = client.GetByID(ctx, obj.ID) // not deletion-pending: untouched
 	require.NoError(t, err)
 }
 
@@ -233,15 +232,14 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
 
-	obj, err := client.Create(ctx, cSpec{Val: "doomed"})
-	require.NoError(t, err)
-	require.NoError(t, client.Delete(ctx, obj.ID))
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "doomed"})
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, gone, "unfinalized object collected")
 
-	_, err = client.Get(ctx, obj.ID) // no finalizers, no edges: physically gone
+	_, err = client.GetByID(ctx, obj.ID) // no finalizers, no edges: physically gone
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -260,16 +258,15 @@ func TestCollectDeletesSelfDependentObject(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
 
-	obj, err := client.Create(ctx, cSpec{Val: "self"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "self"})
 	require.NoError(t, addEdge(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
-	require.NoError(t, client.Delete(ctx, obj.ID))
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, gone, "a self-dependency must not hold its own object open")
 
-	_, err = client.Get(ctx, obj.ID)
+	_, err = client.GetByID(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -278,15 +275,14 @@ func TestCollectKeepsFinalizedObject(t *testing.T) {
 	bh, client := gcFixture(t)
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
-	obj, err := client.Create(ctx, cSpec{Val: "guarded"}, WithFinalizers("f"))
-	require.NoError(t, err)
-	require.NoError(t, client.Delete(ctx, obj.ID))
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "guarded"}, WithFinalizers("f"))
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.False(t, gone, "object with a finalizer is not collected")
 
-	got, err := client.Get(ctx, obj.ID) // finalizer still set: lingers
+	got, err := client.GetByID(ctx, obj.ID) // finalizer still set: lingers
 	require.NoError(t, err)
 	assert.Equal(t, []string{"f"}, got.Finalizers)
 }
@@ -295,22 +291,20 @@ func TestCollectCascadesAndBlocksOnChild(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
-	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, client.DeleteByID(ctx, owner.ID))
 	gone, err := bh.gcCollect(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.False(t, gone, "owner blocked by child ref")
 
 	// The owner lingers while the child still references it (RESTRICT).
-	_, err = client.Get(ctx, owner.ID)
+	_, err = client.GetByID(ctx, owner.ID)
 	require.NoError(t, err)
 
 	// The cascade requested the child's deletion.
-	gotChild, err := client.Get(ctx, child.ID)
+	gotChild, err := client.GetByID(ctx, child.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, gotChild.DeletionRequestedAt, "child deletion requested by cascade")
 }
@@ -319,27 +313,25 @@ func TestCollectDeletesOwnerAfterChildGone(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
 
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
-	require.NoError(t, client.Delete(ctx, owner.ID))
-	require.NoError(t, client.Delete(ctx, child.ID))
+	require.NoError(t, client.DeleteByID(ctx, owner.ID))
+	require.NoError(t, client.DeleteByID(ctx, child.ID))
 
 	// Collect the child first: no finalizers, so it's removed and its owned_by
 	// edge cascades away, freeing the owner.
 	gone, err := bh.gcCollect(ctx, child.ID)
 	require.NoError(t, err)
 	assert.True(t, gone)
-	_, err = client.Get(ctx, child.ID)
+	_, err = client.GetByID(ctx, child.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 
 	// Now the owner has no referrers and is collectable.
 	gone, err = bh.gcCollect(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.True(t, gone)
-	_, err = client.Get(ctx, owner.ID)
+	_, err = client.GetByID(ctx, owner.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -347,17 +339,16 @@ func TestCollectBreaksSelfDependency(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
 
-	obj, err := client.Create(ctx, cSpec{Val: "self"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "self"})
 	// A controller accidentally recorded a self-dependency.
 	require.NoError(t, addEdge(ctx, bh.store, obj.ID, obj.ID, RelationDependsOn))
-	require.NoError(t, client.Delete(ctx, obj.ID))
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
 
 	gone, err := bh.gcCollect(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.True(t, gone, "a self-dependency must not block collection")
 
-	_, err = client.Get(ctx, obj.ID)
+	_, err = client.GetByID(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -372,10 +363,8 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	a, err := client.Create(ctx, cSpec{Val: "a"})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, cSpec{Val: "b"})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "b"})
 	// A and B depend on each other: neither can be collected until the cycle breaks.
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn))
 	require.NoError(t, addEdge(ctx, store, b.ID, a.ID, RelationDependsOn))
@@ -389,8 +378,8 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	require.NoError(t, err)
 	defer stop(ctx)
 
-	require.NoError(t, client.Delete(ctx, a.ID))
-	require.NoError(t, client.Delete(ctx, b.ID))
+	require.NoError(t, client.DeleteByID(ctx, a.ID))
+	require.NoError(t, client.DeleteByID(ctx, b.ID))
 	waitForDeletions(t, w, a.ID, b.ID)
 }
 
@@ -405,8 +394,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	obj, err := client.Create(ctx, cSpec{Val: "self"}, WithFinalizers("gate"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "self"}, WithFinalizers("gate"))
 	// A finalizing dependent that points at obj — modeled as a self-dependency, so
 	// the referrer is itself deletion-pending the instant obj is deleted. Without
 	// the fix, the gate sees this edge, never clears the finalizer, and GC stalls.
@@ -421,7 +409,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	require.NoError(t, err)
 	defer stop(ctx)
 
-	require.NoError(t, client.Delete(ctx, obj.ID))
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
 	waitForDeletions(t, w, obj.ID)
 }
 
@@ -433,6 +421,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// store before any control plane runs. (Written through the store directly, so
 	// no reconcile has touched it.)
 	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -472,7 +461,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 
 	waitForDeletions(t, w, raw.ID)
 
-	_, err = client.Get(ctx, raw.ID)
+	_, err = client.GetByID(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -491,8 +480,7 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "doomed"}, WithFinalizers("f"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "doomed"}, WithFinalizers("f"))
 
 	// Subscribe before deleting: the watch reads current state before returning, so
 	// the object is in its snapshot and the Deleted below cannot be missed.
@@ -501,10 +489,10 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	w, err := client.ObjectsWatch(wctx, obj.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, client.Delete(ctx, obj.ID))
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
 	waitForDeletions(t, w, obj.ID)
 
-	_, err = client.Get(ctx, obj.ID)
+	_, err = client.GetByID(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -524,17 +512,15 @@ func TestIntegrationGCCascadeWithFullPassDisabled(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
-	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, client.DeleteByID(ctx, owner.ID))
 	waitForDeletions(t, w, owner.ID, child.ID)
 }
 
@@ -553,10 +539,8 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -564,12 +548,12 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	require.NoError(t, err)
 
 	// Deleting only the owner must cascade to the child and remove both.
-	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, client.DeleteByID(ctx, owner.ID))
 	waitForDeletions(t, w, owner.ID, child.ID)
 
-	_, err = client.Get(ctx, owner.ID)
+	_, err = client.GetByID(ctx, owner.ID)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = client.Get(ctx, child.ID)
+	_, err = client.GetByID(ctx, child.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -596,10 +580,8 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	childGK := GroupKind{Group: "", Kind: "ClientOnlyChild"}
 	children := NewClient[cSpec, cStatus](bh, childGK)
 
-	owner, err := owners.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := children.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, owners, uniqueSlug(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, children, uniqueSlug(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	// The client rejects watches on unregistered kinds, so watch only the owner.
 	// Its deletion is itself proof the sweeper collected the child: the owner
@@ -610,12 +592,12 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	wOwner, err := owners.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
-	require.NoError(t, owners.Delete(ctx, owner.ID))
+	require.NoError(t, owners.DeleteByID(ctx, owner.ID))
 	waitForDeletions(t, wOwner, owner.ID)
 
-	_, err = owners.Get(ctx, owner.ID)
+	_, err = owners.GetByID(ctx, owner.ID)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = children.Get(ctx, child.ID)
+	_, err = children.GetByID(ctx, child.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -637,17 +619,16 @@ func TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete(t *testing.T) {
 
 	// No controller registered for this kind: it is entirely client-only.
 	client := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnly"})
-	obj, err := client.Create(ctx, cSpec{Val: "doomed"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "doomed"})
 
-	require.NoError(t, client.Delete(ctx, obj.ID))
-	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, client.DeleteByID(ctx, obj.ID))
+	got, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err, "the delete marks the row; collecting it is the sweeper's job")
 	require.NotNil(t, got.DeletionRequestedAt, "the row must be deletion-pending for the sweep to find it")
 
 	bh.deletionPendingSweep(ctx)
 
-	_, err = client.Get(ctx, obj.ID)
+	_, err = client.GetByID(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -713,10 +694,8 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	target, err := client.Create(ctx, cSpec{Val: "target"})
-	require.NoError(t, err)
-	dep, err := client.Create(ctx, cSpec{Val: "dependent"})
-	require.NoError(t, err)
+	target := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "target"})
+	dep := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "dependent"})
 
 	// dep depends_on target (not owned: the dependent survives the target).
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
@@ -738,11 +717,11 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 
 	// Deleting the target wakes the dependent (depends_on waker); the dependent
 	// drops the edge, which must then wake the target so GC removes it.
-	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.DeleteByID(ctx, target.ID))
 	waitForDeletions(t, w, target.ID)
 
 	// The dependent is untouched.
-	_, err = client.Get(ctx, dep.ID)
+	_, err = client.GetByID(ctx, dep.ID)
 	require.NoError(t, err)
 }
 
@@ -764,6 +743,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
 	raw, err := real.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: uniqueSlug(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -821,8 +801,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "a"}, WithFinalizers("gate"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueSlug(), cSpec{Val: "a"}, WithFinalizers("gate"))
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()

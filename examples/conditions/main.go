@@ -167,7 +167,7 @@ func main() {
 	watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
-	obj, err := client.Create(ctx, ServerSpec{Replicas: 3})
+	obj, err := client.Create(ctx, "web", ServerSpec{Replicas: 3})
 	exitOnErr(err)
 
 	fmt.Printf("created Server id=%d replicas=%d\n", obj.ID, obj.Spec.Replicas)

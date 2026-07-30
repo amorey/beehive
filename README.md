@@ -239,7 +239,7 @@ type Object[Spec, Status any] struct {
     ID                  ObjectID
     Group               string
     Kind                string
-    Slug                *string  // nil when created without WithSlug; never auto-generated
+    Slug                string   // required and immutable; the key the Client API addresses the row by
     Spec                Spec
     Status              *Status
     Generation          int64
@@ -308,14 +308,18 @@ type ObjectChange[Spec, Status any] struct {
 }
 
 type Client[Spec, Status any] interface {
-    Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+    // Slug-keyed: acts on whatever holds the slug now.
+    Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
     GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
-    Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
-    Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
-    GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+    Update(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
+    Get(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+    Delete(ctx context.Context, slug string) error // idempotent: absent or already-deleting is a nil no-op
     List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
-    Delete(ctx context.Context, id ObjectID) error
-    DeleteBySlug(ctx context.Context, slug string) error // idempotent: absent or already-deleting is a nil no-op
+
+    // Id-keyed: acts on one incarnation, or returns ErrNotFound.
+    UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+    GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+    DeleteByID(ctx context.Context, id ObjectID) error
     ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
     ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 
@@ -345,15 +349,75 @@ func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 
 #### Writes
 
-`Create` leaves the slug unset unless you pass `beehive.WithSlug`. It stays `nil`, stored as SQL `NULL`, and nothing is generated for you. NULL slugs never collide (`NULL != NULL` in SQLite), so a kind can hold any number of slugless objects; you reach them by `ObjectID` and `List`, just not by name. If you do pass a slug and it is taken, `Create` fails on the `UNIQUE ("group", kind, slug)` constraint. Everything after the create takes an `ObjectID`, so a delete and recreate under the same slug can't make you act on the wrong row. Finalizers and other metadata are options:
+**The slug is the API's key; the id is the store's key.** Every object is named at
+creation, and the name is what the ordinary CRUD surface addresses it by, so a
+caller who names things never has to hold an `ObjectID` to get work done. The id
+keeps every job it does inside the store — incarnation identity, foreign-key
+target, work-queue key, scan ordering — and stays reachable through the `…ByID`
+siblings. Finalizers and other metadata are options:
 
 ```go
 client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
-obj, _ := client.Create(ctx, ClusterSpec{...}, beehive.WithSlug("prod-cluster"), beehive.WithFinalizers("kstack.sh/cluster"))
-client.Update(ctx, obj.ID, ClusterSpec{...})
+obj, _ := client.Create(ctx, "prod-cluster", ClusterSpec{...}, beehive.WithFinalizers("kstack.sh/cluster"))
+client.Update(ctx, "prod-cluster", ClusterSpec{...})
 ```
 
-**A slug is an opaque key and beehive does not validate it** — no character rules, no length limit, no normalization. So the empty string is an ordinary slug: a real value under the unique constraint, and distinct from `NULL`. `GetOrCreate(ctx, "", spec)` creates *the* empty-slug object of that kind, and the next caller passing `""` gets that same row back with `created=false`, exactly as two callers passing `"prod"` would. That is the contract, not a collision bug, but it has a sharp edge: a slug read from configuration is `""` when the field is unset, which quietly points every such caller at one shared object. Validate slugs that come from outside your code, and when you mean "no name" pass no `WithSlug` at all rather than `""`.
+The slug is required and immutable — there is no `UpdateSlug`, and a rename is
+delete+recreate. If it is already taken, `Create` returns `ErrSlugTaken`; use
+`GetOrCreate` when "already there" is an acceptable outcome. A deletion-pending row
+still holds its name, so a tombstone reports `ErrSlugTaken` too, until GC clears the
+finalizers and removes it.
+
+For objects with no natural name, `beehive.GenerateSlug(prefix)` returns the prefix
+joined to a fresh UUIDv7 — time-ordered, so slugs sharing a prefix sort by creation.
+Nothing generates a slug implicitly: a name the caller never chose is a name nobody
+can look up, which is the nullable slug this API retired. Passing it positionally
+keeps the value in your hands, where you can log it or write it into a sibling's spec
+before the create:
+
+```go
+// "cache-018f3a5c-8b2e-7c3d-a4f5-6b7c8d9e0f10"
+obj, err := client.Create(ctx, beehive.GenerateSlug("cache"), spec)
+```
+
+It returns a bare `string`, with no error to handle: the random bytes come from
+`crypto/rand.Read`, which is documented never to return an error — it crashes the
+program if the OS entropy source fails, which is the right answer for an unusable
+source and not something a slug helper could improve on.
+
+It is collision-resistant, not collision-proof, and nothing but the store can settle
+that atomically — a lookup before the create would be a TOCTOU race. So a caller
+generating names should bound-retry on `ErrSlugTaken` and no other error. Reaching
+the bound means generation is broken, not that you were unlucky.
+
+**Which key you use decides what a call acts on**, and the two answers differ
+exactly when a slug has been reused:
+
+> A **slug-keyed** call acts on whatever holds that slug *now*, or reports absence.
+> An **id-keyed** call acts on that one incarnation, or returns `ErrNotFound`.
+
+That split is the level-triggered principle applied to the API surface, not a
+compromise. "Ensure this child exists" / "remove this child" is a statement about a
+*name*, and should re-evaluate against current state on every reconcile — which is
+what a slug-keyed call does. "Finish what I read a moment ago" is a statement about
+an *incarnation*, and that is what an id is for.
+
+So **read-modify-write goes through `UpdateByID`**. `Get(ctx, "prod")` → mutate →
+`Update(ctx, "prod", spec)` names the row twice, and a GC collect plus a fresh
+create in between would land the write on a different incarnation. The object `Get`
+returned carries `ID`, so the fix is always to hand:
+
+```go
+obj, _ := client.Get(ctx, "prod-cluster")
+obj.Spec.Replicas++
+client.UpdateByID(ctx, obj.ID, obj.Spec)   // this incarnation, or ErrNotFound
+```
+
+The window is narrower than it looks — a tombstone holds the slug's `UNIQUE`
+constraint until GC clears finalizers, so opening it takes a full collect *plus* a
+new create — but it is real, and `UpdateByID` closes it with no extra surface.
+
+**A slug is an opaque key and beehive does not validate it** — no character rules, no length limit, no normalization — with exactly one exception: **the empty string is rejected with `ErrInvalidSlug`**, by the writes and the reads alike. `""` is not a name anyone chooses; it is what an unset configuration field reads as, and treating it as an ordinary slug would quietly point every caller whose config was unset at one shared row. Every other malformed slug at least addresses the row its author meant. Validate slugs that come from outside your code; beehive only catches the one case where the mistake is invisible. The store enforces it too, not just the client — `Store` is a public extension point, and a row admitted under `""` is one no slug-keyed call could address again.
 
 The two slug-keyed creates differ **only in what they do when the slug is taken**, and that holds under concurrency. `GetOrCreate` does its read and write in one transaction, so two callers racing on a slug never both insert — the loser sees the winner's row and returns it. `Create` does no lookup at all, so the loser of that race fails on `UNIQUE`, just as it would against a row that was already there:
 
@@ -363,13 +427,13 @@ The two slug-keyed creates differ **only in what they do when the slug is taken*
 | a live row              | fails (`UNIQUE`) | returns it untouched, `created=false` |
 | a deletion-pending row  | fails (`UNIQUE`) | returns it untouched, `created=false` |
 
-**There is no slug-keyed upsert.** Neither create branch ever writes to a row it found, so changing an existing object is always `Update`, keyed by id. A caller that wants ensure-then-set composes `GetOrCreate` with `Update` inside its own `Within` — and should think about the deletion-pending row before it does, since `GetOrCreate` hands that back like any other and the `Update` would write a spec onto an object being torn down.
+**There is no slug-keyed upsert.** Neither create branch ever writes to a row it found, so changing an existing object is always `Update`. A caller that wants ensure-then-set composes `GetOrCreate` with `Update` inside its own `Within` — and should think about the deletion-pending row before it does, since `GetOrCreate` hands that back like any other and the `Update` would write a spec onto an object being torn down.
 
 Re-applying the spec a row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever.
 
 Every write **validates before it commits.** `Create`, `GetOrCreate` and `Update` decode the written row back into `Spec`/`Status` *inside* the transaction. A spec that marshals but does not round-trip — usually a `MarshalJSON`/`UnmarshalJSON` pair that disagree — rolls the write back instead of committing a row this process cannot read. **So an error from a write means nothing was committed:** no unreadable row, nothing added to a driver's listing, no `UNIQUE` left behind for the retry to trip on, and for `Update` the previous spec is still there. `GetOrCreate` returns `created=false` in that case, since nothing was created. The cost is that the write holds the store's single writer across the decode (`json.Marshal` still runs before the transaction opens). This only guards the write path — a row can still become unreadable later, say after a schema downgrade, which the read path handles by quarantining it (see [Migrator](#migrator)).
 
-Use `GetOrCreate` when a controller has to make sure a child exists **without ever changing it**. The alternative is open-coding `GetBySlug` → `Create` → `GetBySlug` again on conflict, where the fallback path tends to drift out of step with the primary one. Its found branch writes nothing, so a deletion-pending row comes back as it is, with `DeletionRequestedAt` set, rather than being resurrected by a spec update:
+Use `GetOrCreate` when a controller has to make sure a child exists **without ever changing it**. The alternative is open-coding `Get` → `Create` → `Get` again on conflict, where the fallback path tends to drift out of step with the primary one. Its found branch writes nothing, so a deletion-pending row comes back as it is, with `DeletionRequestedAt` set, rather than being resurrected by a spec update:
 
 The example uses two surfaces, and they are not interchangeable. `GetOrCreate` is on
 `Client` — here the child kind's client, built with `NewClient` and held by the
@@ -415,21 +479,23 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
 
 `created` is returned synchronously, so inside an enclosing `ControllerClient.Within` a `created=true` is provisional until that transaction commits. For a side effect that must run only if the row really lands, use `WithOnCreate` (below), which waits for the outermost commit.
 
-The options apply **only when the call creates the row** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). `WithSlug` is rejected with `ErrConflictingOption`, because the slug is already a positional argument here — the option could only contradict it, and dropping it silently would file the row under one slug while you looked for it under another. (Options that simply don't apply are still ignored, as everywhere else; this one is a caller mistake.)
+The options apply **only when the call creates the row** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). Options that don't apply are ignored, as everywhere else.
 
-That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `OwnersGet`, or `Get(ctx, id, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
+That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `OwnersGet`, or `Get(ctx, slug, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
 
-`DeleteBySlug` is the other half of the pair: `GetOrCreate` creates if absent, `DeleteBySlug` deletes if present. Both are idempotent and both understand tombstones, so a controller that ensures a slug-keyed child on one branch and removes it on another writes one call for each. It replaces the usual open-coding of `GetBySlug`, treating `ErrNotFound` as success, treating `DeletionRequestedAt` as a no-op, then `Delete`:
+`Delete` is the other half of the pair: `GetOrCreate` creates if absent, `Delete` deletes if present. Both are idempotent and both understand tombstones, so a controller that ensures a slug-keyed child on one branch and removes it on another writes one call for each. It replaces the usual open-coding of `Get`, treating `ErrNotFound` as success, treating `DeletionRequestedAt` as a no-op, then deleting:
 
-| Slug held by           | `DeleteBySlug`                                              |
+| Slug held by           | `Delete`                                                     |
 | ---------------------- | ----------------------------------------------------------- |
 | nothing                | `nil` — already gone                                         |
 | a live row             | soft-deletes it (sets `DeletionRequestedAt`), advances GC    |
 | a deletion-pending row | no-op — no write at all — advances GC; `nil`                 |
 
-Like `Delete`, it marks the object and hands it to the controller to clear its finalizers. The row is removed once they clear, and only then is the slug free again. It is scoped to the kind, like `GetBySlug`: another kind's row holding the same slug is simply not found, which is reported as success rather than as a wrong-kind error.
+It marks the object and hands it to the controller to clear its finalizers. The row is removed once they clear, and only then is the slug free again. It is scoped to the kind, like `Get`: another kind's row holding the same slug is simply not found, which is reported as success rather than as a wrong-kind error. `DeleteByID` is the incarnation-keyed sibling, and reports `ErrNotFound` where this folds absence to `nil`.
 
-Looking the slug up is **atomic with the delete** — the slug goes into the store's `WHERE` clause rather than being resolved first and deleted after, so no concurrent collection can retire the row and hand its slug to a replacement in between. A `nil` return means "no object of this kind holds this slug", not "the row I resolved is gone". What it cannot promise, and no implementation could, is that the slug is still free when the call returns: a concurrent `GetOrCreate` may take it the instant the delete commits. As always, the next reconcile works from current state.
+Both idempotent outcomes — no such row, and a row already deletion-pending — are answered by a lock-free probe **without opening a write transaction**. That is the steady state of the call: a controller that removes a child re-runs it every reconcile, and exactly one of those calls ever deletes anything, so taking the store's single write lock to discover there is nothing to do was the whole cost.
+
+Looking the slug up is **atomic with the delete** — the slug goes into the store's `WHERE` clause rather than being resolved first and deleted after, so no concurrent collection can retire the row and hand its slug to a replacement in between. The probe above does not change that: it is advisory, and the fall-through still runs the atomic mark, whose `deletion_requested_at IS NULL` guard re-checks everything. A `nil` return means "no object of this kind holds this slug", not "the row I resolved is gone". What it cannot promise, and no implementation could, is that the slug is still free when the call returns: a concurrent `GetOrCreate` may take it the instant the delete commits. As always, the next reconcile works from current state.
 
 → [ADR: slug-keyed writes](docs/adr/2026-07-27-slug-keyed-writes.md), for the transaction boundaries.
 
@@ -566,7 +632,7 @@ Conversion is lazy and per column: a blob is re-stamped when it is next written,
 A blob that fails to convert, fails to unmarshal, or came from a newer build is a decode failure, and each read path handles it in the way that fails safest:
 
 - `List` and the watches skip the bad row, log it and carry on. A watch remembers its version, so it warns once per change rather than once per poll.
-- `Get`/`GetBySlug` return the error.
+- `Get`/`GetByID` return the error.
 - **The reconcile loop quarantines the row.** It cannot reconcile what it cannot decode, and the bytes will not change until someone rewrites the spec, so it logs and treats the pass as a successful no-op rather than retrying the same bytes forever under backoff. A deletion-pending row is still collected, since GC needs only the id. The owed pass re-queues the unsettled row every tick, so the warning repeats at that interval — deliberately, so a bad row stays visible instead of logging once and going quiet.
 
 A kind with no migrator is untouched; its columns stay `0`. Only registered kinds can have a migrator, so client-only kinds cannot.
@@ -578,7 +644,6 @@ A kind with no migrator is untouched; its columns stay `0`. Only registered kind
 ```go
 type Option interface{ apply(any) }
 
-func WithSlug(slug string) Option                  // set a human-readable slug; fails if already exists
 func WithFinalizers(f ...string) Option            // declare finalizers before the object is visible to controllers; registered kinds only
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)

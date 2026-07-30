@@ -24,9 +24,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Compile-time proof that this store satisfies the contracts beehive resolves
@@ -45,6 +48,14 @@ var (
 
 type sqliteStore struct {
 	db *sql.DB
+
+	// txCount counts transactions begun — incremented at the sole BeginTx below, so
+	// a nested Within (which joins on a savepoint) does not add to it. Test-only
+	// observability, and the only way to assert that a fast path answered without
+	// taking the write lock: the statements such a path avoids are all invisible
+	// from outside, and BEGIN IMMEDIATE is the cost that actually matters on a store
+	// that runs every caller through one connection.
+	txCount atomic.Int64
 
 	// processStart stamps when this store opened. Liveness conditions written by a
 	// prior process (updated_at older than this) read as Unknown ("verifying")
@@ -568,6 +579,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		return fr.st.nested(ctx, fr.depth, fr.id, fn)
 	}
 
+	s.txCount.Add(1)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -685,6 +697,15 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 }
 
 func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
+	// Refused here rather than left to the column's CHECK. The constraint is the
+	// backstop for writes that bypass this store entirely (a migration, a foreign
+	// writer), but a driver's constraint error carries no sentinel a caller can match
+	// on, and its text is the driver's to change. The contract on ObjectsCreateInput
+	// promises ErrInvalidSlug, so this is where that promise is kept — before the
+	// version draw, so a refused create burns no resource_version.
+	if in.Slug == "" {
+		return nil, fmt.Errorf("%w: pass the name the object should be addressable by", storeapi.ErrInvalidSlug)
+	}
 	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
@@ -706,30 +727,61 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	// scanObject, not scanWritten: a condition references an object id, and this id
 	// did not exist until the statement above. So the row provably has none, and
 	// nil Conditions is what assembling them would have produced anyway.
-	return scanObject(row)
+	obj, err := scanObject(row)
+	if err != nil {
+		return nil, asSlugTaken(err)
+	}
+	return obj, nil
 }
 
-// checkObjectScoped answers "does id exist, and is it gk's?" and nothing else. It
-// reads two TEXT columns rather than the whole row, so unlike getObjectRowScoped it
-// touches neither blob and unmarshals no finalizers — which matters because every
-// caller is a write path that throws the row away: a kind gate, or the branch that
-// has to tell a foreign id from a collected one. Same errors as a scoped read,
-// ErrNotFound and ErrWrongKind, so callers read identically.
-func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
+// asSlugTaken translates the UNIQUE violation on ("group", kind, slug) into the
+// storeapi sentinel, leaving every other error alone.
+//
+// The slug is the only uniqueness constraint a caller can hit on a create — the id
+// is AUTOINCREMENT and everything else on the row is unconstrained — so the code
+// alone identifies it, with no need to parse which index the driver named. Callers
+// generating slugs retry on this and on nothing else, which is exactly why it cannot
+// stay a driver error: the text is modernc's to reword.
+func asSlugTaken(err error) error {
+	var serr *sqlite.Error
+	if errors.As(err, &serr) && serr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+		return fmt.Errorf("%w: %w", storeapi.ErrSlugTaken, err)
+	}
+	return err
+}
+
+// probeObjectScoped answers "does id exist, is it gk's, and is it already
+// deletion-pending?" and nothing else. It reads three columns rather than the whole
+// row, so unlike getObjectRowScoped it touches neither blob and unmarshals no
+// finalizers — which matters because every caller is a write path that throws the
+// row away: a kind gate, or the branch that has to tell a foreign id from a
+// collected one. Same errors as a scoped read, ErrNotFound and ErrWrongKind, so
+// callers read identically.
+func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (deletionPending bool, err error) {
 	var group, kind string
-	err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT "group", kind FROM objects WHERE id = ?`, id).Scan(&group, &kind)
+	var deletionAt sql.NullInt64
+	err = s.conn(ctx).QueryRowContext(ctx,
+		`SELECT "group", kind, deletion_requested_at FROM objects WHERE id = ?`, id).
+		Scan(&group, &kind, &deletionAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return storeapi.ErrNotFound // bare, like scanObject's
+		return false, storeapi.ErrNotFound // bare, like scanObject's
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if group != gk.Group || kind != gk.Kind {
-		return fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
+		return false, fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
 			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
 	}
-	return nil
+	return deletionAt.Valid, nil
+}
+
+// checkObjectScoped is probeObjectScoped for the callers that only need the gate.
+// The deletion state rides along on the same row read, so asking for less would
+// cost the same.
+func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
+	_, err := s.probeObjectScoped(ctx, gk, id)
+	return err
 }
 
 // getObjectRow reads the objects row without assembling conditions. Internal
@@ -1220,15 +1272,45 @@ func stampVersion(stored, incoming int) (int, error) {
 	}
 }
 
+// ObjectsUpdateSpec replaces id's spec within gk. See updateSpec for the shape.
 func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
-	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
-	// between the no-op check and the update.
+	// The scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
+	// while doubling as the no-op compare's load — no separate kind check.
+	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
+		return s.getObjectRowScoped(ctx, gk, id)
+	})
+}
+
+// ObjectsUpdateSpecBySlug replaces the spec of whatever holds slug within gk.
+//
+// No ErrWrongKind: the kind is in the WHERE, so a slug this kind does not hold is
+// absent rather than foreign — as with DeletionRequestsCreateBySlug.
+func (s *sqliteStore) ObjectsUpdateSpecBySlug(ctx context.Context, gk storeapi.GroupKind, slug string, spec []byte, specVersion int) (*storeapi.RawObject, error) {
+	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
+		return s.getObjectRowBySlug(ctx, gk, slug)
+	})
+}
+
+// updateSpec is the read-compare-write body both spec mutators share, differing only
+// in how they resolve the row.
+//
+// The read is not optional, which is why neither mutator keys its UPDATE on the
+// caller's key directly: the no-op skip below compares stored bytes and schema
+// version against the incoming ones, and a bare UPDATE has nothing to compare
+// against. Atomicity comes from Within rather than from statement count — the store
+// runs every caller through one connection under BEGIN IMMEDIATE, so a read and a
+// write in one transaction are as indivisible as one statement, which is also what
+// makes keying the UPDATE on the resolved id safe.
+func (s *sqliteStore) updateSpec(
+	ctx context.Context,
+	spec []byte,
+	specVersion int,
+	resolve func(context.Context) (*storeapi.RawObject, error),
+) (*storeapi.RawObject, error) {
 	var result *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
-		// while doubling as the no-op compare's load — no separate kind check.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
+		obj, err := resolve(ctx)
 		if err != nil {
 			return err
 		}
@@ -1268,16 +1350,16 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 			return err
 		}
 		// A real spec change bumps generation so the convergence handshake notices.
-		// Keyed on id alone: the kind boundary came from the scoped read above, in
-		// this same transaction, and group/kind are write-once at insert. Keep the
-		// read if you move this statement.
+		// Keyed on id alone: the kind boundary came from the resolve above, in this
+		// same transaction, and group/kind are write-once at insert. Keep the read if
+		// you move this statement.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
 			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), id)
+			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), obj.ID)
 		result, err = s.scanWritten(ctx, row)
 		return err
 	})
@@ -1878,27 +1960,63 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	return true, nil
 }
 
-// requestDeletion is the mark-or-probe protocol behind both deletion entry points.
-// A zero-row mark is ambiguous — already deleting, out of scope, or gone — so probe
-// resolves it on the caller's own key: it succeeds for the idempotent already-pending
-// case and reports ErrWrongKind or ErrNotFound otherwise. It reads neither blob nor
-// conditions — answering from metadata alone is the whole reason this pair no longer
-// returns a row, and the already-pending branch is the steady state for a controller
-// that idempotently deletes a child. Within keeps the
-// rv-bump and the write atomic whether or not a caller wrapped this: the mutators
-// self-wrap, and nested they join the caller's transaction — e.g. the GC cascade.
+// probeDeletionBySlug is probeObjectScoped keyed by slug. Existence is the whole
+// question here: slugs are unique per kind, so a slug this kind does not hold is
+// absent rather than foreign, and there is no ErrWrongKind to distinguish.
+//
+// The saving over getObjectRowBySlug is Go-side, not page-side: UNIQUE ("group",
+// kind, slug) does not cover deletion_requested_at, so the index seek is still
+// followed by a row fetch either way. What it avoids is copying the spec and status
+// blobs into Go and unmarshalling the finalizers — one allocation instead of
+// scanObject's handful, on a path that discards everything but a bool.
+func (s *sqliteStore) probeDeletionBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
+	var deletionAt sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT deletion_requested_at FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
+		gk.Group, gk.Kind, slug).Scan(&deletionAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, storeapi.ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return deletionAt.Valid, nil
+}
+
+// requestDeletion is the probe-then-mark protocol behind both deletion entry points.
+//
+// The probe runs first and lock-free, so both idempotent outcomes — no such row, and
+// a row already deletion-pending — answer without BEGIN IMMEDIATE. That is the whole
+// point: absence and already-pending are the *steady state* here, since a controller
+// that idempotently removes a child re-runs the delete every reconcile and exactly
+// one of those calls ever deletes anything.
+//
+// The probe is advisory and cannot be wrong: the fall-through still runs the atomic
+// mark, whose "deletion_requested_at IS NULL" guard re-checks everything, and a row
+// that appears or vanishes in between yields the same answer either way. A zero-row
+// mark after a probe that said "live" means the row moved, so the probe runs again
+// inside the transaction to resolve which — the branch that tells a foreign id from
+// a collected one.
+//
+// Within keeps the rv-bump and the write atomic whether or not a caller wrapped
+// this: the mutators self-wrap, and nested they join the caller's transaction — e.g.
+// the GC cascade.
 func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
-	probe func(context.Context) error,
+	probe func(context.Context) (pending bool, err error),
 	where string, whereArgs ...any,
 ) (bool, error) {
+	if pending, err := probe(ctx); err != nil || pending {
+		return false, err
+	}
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
 		if changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
 			return err
 		}
-		return probe(ctx)
+		_, err = probe(ctx)
+		return err
 	})
 	return changed, err
 }
@@ -1907,7 +2025,7 @@ func (s *sqliteStore) requestDeletion(
 // foreign id matches no row and the probe reports ErrWrongKind.
 func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) error { return s.checkObjectScoped(ctx, gk, id) },
+		func(ctx context.Context) (bool, error) { return s.probeObjectScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
@@ -1918,19 +2036,7 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 // on a store that runs every caller through one connection.
 func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
 	return s.requestDeletion(ctx,
-		// Existence is the whole question here: slugs are unique per kind, so a slug
-		// this kind does not hold is absent rather than foreign, and there is no
-		// ErrWrongKind to distinguish.
-		func(ctx context.Context) error {
-			var one int
-			err := s.conn(ctx).QueryRowContext(ctx,
-				`SELECT 1 FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
-				gk.Group, gk.Kind, slug).Scan(&one)
-			if errors.Is(err, sql.ErrNoRows) {
-				return storeapi.ErrNotFound
-			}
-			return err
-		},
+		func(ctx context.Context) (bool, error) { return s.probeDeletionBySlug(ctx, gk, slug) },
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
@@ -2373,7 +2479,6 @@ type scanner interface {
 func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 	var (
 		obj         storeapi.RawObject
-		slug        sql.NullString
 		status      []byte
 		observedGen sql.NullInt64
 		observedAt  sql.NullInt64
@@ -2383,7 +2488,7 @@ func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 		updatedAt   int64
 	)
 	dest := []any{
-		&obj.ID, &obj.Group, &obj.Kind, &slug, &obj.Spec, &status,
+		&obj.ID, &obj.Group, &obj.Kind, &obj.Slug, &obj.Spec, &status,
 		&obj.SpecVersion, &obj.StatusVersion,
 		&obj.Generation, &observedGen, &observedAt, &obj.ResourceVersion,
 		&deletionAt, &obj.ReconcileOwed, &finalizers, &createdAt, &updatedAt,
@@ -2396,9 +2501,6 @@ func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 		return nil, err
 	}
 
-	if slug.Valid {
-		obj.Slug = &slug.String
-	}
 	obj.Status = status // nil for a NULL column; bytes once a status is written
 	if observedGen.Valid {
 		obj.ObservedGeneration = &observedGen.Int64

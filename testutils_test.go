@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -101,6 +102,29 @@ func fast(opts ...Option) []Option {
 		withStaleDependentsInterval(staleDependentsTick),
 		withWatchPollInterval(fastTick),
 	}, opts...)
+}
+
+// mustCreate creates one object and fails the test if the create errors — the
+// shape of the great majority of test creates, which only want a row to exist
+// before they assert on something else.
+//
+// It exists so that a change to Create's signature is a change to one function
+// rather than to every test that needed a row. Tests that assert *on the create
+// itself* (a UNIQUE conflict, an option error, a marshal failure) call Create
+// directly and should keep doing so: the error is their subject, and this helper
+// would swallow it.
+func mustCreate[Spec, Status any](
+	t *testing.T,
+	ctx context.Context,
+	c Client[Spec, Status],
+	slug string,
+	spec Spec,
+	opts ...Option,
+) *Object[Spec, Status] {
+	t.Helper()
+	obj, err := c.Create(ctx, slug, spec, opts...)
+	require.NoError(t, err)
+	return obj
 }
 
 // captureLogger returns a logger that records everything at or above level into
@@ -207,6 +231,10 @@ func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID,
 }
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
+}
+
+func (s *fakeStore) ObjectsUpdateSpecBySlug(context.Context, GroupKind, string, []byte, int) (*RawObject, error) {
+	panic("not implemented: ObjectsUpdateSpecBySlug")
 }
 func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
 	panic("not implemented: fakeStore.UpdateStatus")
@@ -844,3 +872,13 @@ func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectI
 	probeSignal(s.watermarkSet)
 	return err
 }
+
+// uniqueSlug returns a slug no other test row holds, for the tests that seed rows
+// through the store directly rather than through Client.Create. Slugs are required
+// and unique per kind, but these tests assert on versions, edges and watermarks —
+// never on the name — so naming each row by hand would be noise.
+func uniqueSlug() string {
+	return fmt.Sprintf("test-obj-%d", slugSeq.Add(1))
+}
+
+var slugSeq atomic.Int64
