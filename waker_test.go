@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -630,4 +631,36 @@ func TestWakerRetriesPersistOnAFailedWrite(t *testing.T) {
 	store.setErr = nil
 	dw.scan(context.Background()) // no rows above watermark=3, but persisted still lags it
 	assert.Equal(t, []int64{3}, store.setCalls, "the next tick retries the write even though this scan found nothing new")
+}
+
+// A write that fails forever — a read-only or full database — must not become a
+// doomed round trip and a warning every second. Holding persisted is what makes
+// the retry happen at all, so nothing here stops retrying; the streak is what
+// paces it, and what keeps the log to one line about one cause.
+func TestWakerBacksOffAFailingPersist(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	dw.seeded = true
+
+	const ticks = 30
+	for range ticks {
+		dw.scan(context.Background())
+	}
+
+	assert.Equal(t, 1, strings.Count(buf.String(), "persisting the dependency waker's cursor failed"),
+		"one warning for the streak, not one per tick")
+	assert.Less(t, store.setAttempts, ticks/2,
+		"and the retries back off rather than paying a round trip every tick")
+	assert.Positive(t, store.setAttempts, "without giving up on the write entirely")
+
+	// Recovery closes the streak, so a later failure is a fresh warning rather
+	// than silence inherited from this one.
+	store.setErr = nil
+	for range ticks {
+		dw.scan(context.Background())
+	}
+	assert.Equal(t, []int64{3}, store.setCalls, "the write lands once the store accepts it again")
+	assert.Zero(t, dw.persistFailures, "and the streak is closed")
 }

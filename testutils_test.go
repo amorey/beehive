@@ -398,10 +398,16 @@ func replayRows(count int) []ObjectWrite {
 // fallback — so this is a distinct type rather than a field toggle.
 type cursorStore struct {
 	replayStore
-	stored   map[string]int64 // what DriverCursorsGet reports; nil means nothing stored
-	getErr   error
-	setErr   error
-	setCalls []int64 // cursor values passed to DriverCursorsSet, in call order
+	stored map[string]int64 // what DriverCursorsGet reports; nil means nothing stored
+	getErr error
+	setErr error
+
+	// setCalls holds the cursor values DriverCursorsSet *stored*, in order, and
+	// setAttempts counts every call including the ones setErr failed — which is
+	// what a test asserting on retry backoff has to count, since a failed write
+	// stores nothing but still costs the round trip.
+	setCalls    []int64
+	setAttempts int
 }
 
 func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
@@ -413,6 +419,7 @@ func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, b
 }
 
 func (s *cursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+	s.setAttempts++
 	if s.setErr != nil {
 		return s.setErr
 	}

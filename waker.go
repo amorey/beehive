@@ -56,6 +56,15 @@ type waker struct {
 	// keeps a tick from making the call at all.
 	persisted int64
 
+	// persistFailures counts the current streak of failed cursor writes, and
+	// persistSkips how many persists are still to be sat out before the next
+	// attempt. A failure holds persisted where it was, so watermark stays above
+	// it and every later tick would otherwise retry — fine for the transient
+	// case, a doomed write plus a warning every second for a database that is
+	// read-only or full. Both reset on the first success.
+	persistFailures int
+	persistSkips    int
+
 	// seeded says the watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero. Seeding at startup keeps
 	// the first scan from replaying every object ever written; a failed seed leaves
@@ -72,6 +81,13 @@ const cursorNameWaker = "dependency_waker"
 // reports. It is below every cursor, so the first persist writes whatever the
 // seed settled on and creates the row.
 const noStoredCursor = int64(-1)
+
+// wakePersistRetryCap bounds the backoff between retries of a failing cursor
+// write, in persists sat out — a minute at the default wake interval. The
+// cursor is an optimisation, so a stalled write costs latency after a restart
+// and nothing else; there is no reason to keep hammering a database that is
+// refusing writes, and no reason to give up on it either.
+const wakePersistRetryCap = 60
 
 // wakeScanPageCap bounds one scan page. The query itself is an indexed range scan
 // and cheap; the cost is round trips, since each page also runs an edges lookup that
@@ -276,18 +292,52 @@ func (dw *waker) scan(ctx context.Context) {
 // shutdown rather than a loss.
 //
 // A failed write leaves dw.persisted alone, so the next tick compares against
-// the same baseline and retries. The watermark itself is never rolled back: the
-// wakes are already queued, and re-queueing is the cheap direction.
+// the same baseline and retries — then backs off, and reports only the first
+// failure of a streak, since a database that is read-only or full fails every
+// tick and neither the write nor the warning would be telling anyone anything
+// new. The watermark itself is never rolled back: the wakes are already queued,
+// and re-queueing is the cheap direction.
 func (dw *waker) persist(ctx context.Context) {
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return
 	}
+	if dw.persistSkips > 0 {
+		dw.persistSkips--
+		return
+	}
 	if err := dw.cursors.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
-		dw.bh.log().WarnContext(ctx, "persisting the dependency waker's cursor failed; the next tick retries it, and a restart before then re-scans from the last cursor that was persisted",
+		dw.persistFailures++
+		dw.persistSkips = wakePersistRetrySkips(dw.persistFailures)
+		// Only the first of a streak is a warning. The rest say the same thing
+		// about the same cause, and at this cadence they would bury everything
+		// else in the log; the streak length rides on the recovery message.
+		if dw.persistFailures > 1 {
+			dw.bh.log().DebugContext(ctx, "persisting the dependency waker's cursor failed again",
+				"watermark", dw.watermark, "failures", dw.persistFailures, "err", err)
+			return
+		}
+		dw.bh.log().WarnContext(ctx, "persisting the dependency waker's cursor failed; retries continue with backoff, and a restart before one lands re-scans from the last cursor that was persisted",
 			"watermark", dw.watermark, "err", err)
 		return
 	}
+	if dw.persistFailures > 0 {
+		dw.bh.log().InfoContext(ctx, "dependency waker's cursor is being persisted again",
+			"watermark", dw.watermark, "failures", dw.persistFailures)
+		dw.persistFailures, dw.persistSkips = 0, 0
+	}
 	dw.persisted = dw.watermark
+}
+
+// wakePersistRetrySkips is how many persists to sit out after failures
+// consecutive failures: none after the first, then doubling to a cap. The first
+// retry stays immediate because a transient error is the common case and one
+// round trip is cheap. The doubling is for the failure that is not going away,
+// where a write per tick buys nothing on a connection every driver shares.
+func wakePersistRetrySkips(failures int) int {
+	if failures >= 8 { // 1<<7 - 1 is already past the cap
+		return wakePersistRetryCap
+	}
+	return min(1<<(failures-1)-1, wakePersistRetryCap)
 }
 
 // dependentsWake queues every object that depends_on one of the page's targets, each
