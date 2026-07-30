@@ -24,7 +24,7 @@ import (
 	"embed"
 	"time"
 
-	"github.com/amorey/beehive/sqlitemigrate"
+	"github.com/amorey/beehive/internal/sqlitemigrate"
 	_ "modernc.org/sqlite"
 )
 

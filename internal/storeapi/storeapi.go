@@ -622,7 +622,7 @@ type Store interface {
 	// nothing scans it either, since ReconcileOwedListIDs is per-kind — so the count
 	// goes unread, though it is still a lasting column value and index entry, and
 	// re-declaring an edge raises it again. Reclaiming those wants a cross-kind sweeper
-	// (see TODO.md), not a gate here: refusing to stamp would lose the wake outright
+	// (see docs/TODO.md), not a gate here: refusing to stamp would lose the wake outright
 	// for a kind that gains a controller later.
 	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 

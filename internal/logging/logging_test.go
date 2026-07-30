@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package beehive
+package logging
 
 import (
 	"bytes"
@@ -27,18 +27,18 @@ import (
 
 func TestResolveLoggerNilDisables(t *testing.T) {
 	// A nil logger resolves to the shared discard logger: never nil, never emits.
-	got := resolveLogger(nil, nil)
+	got := Resolve(nil, nil)
 	require.NotNil(t, got)
-	assert.Same(t, discardLogger, got)
+	assert.Same(t, Discard, got)
 
 	// A level on a disabled logger is still a no-op (discard ignores everything).
-	assert.Same(t, discardLogger, resolveLogger(nil, slog.LevelDebug))
+	assert.Same(t, Discard, Resolve(nil, slog.LevelDebug))
 }
 
 func TestResolveLoggerNoLevelPassesThrough(t *testing.T) {
 	l := slog.New(slog.DiscardHandler)
 	// Without a level override the logger is returned unwrapped.
-	assert.Same(t, l, resolveLogger(l, nil))
+	assert.Same(t, l, Resolve(l, nil))
 }
 
 func TestResolveLoggerLevelFilters(t *testing.T) {
@@ -46,7 +46,7 @@ func TestResolveLoggerLevelFilters(t *testing.T) {
 	// Underlying handler at Debug so the levelHandler is the only gate.
 	base := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	log := resolveLogger(base, slog.LevelWarn)
+	log := Resolve(base, slog.LevelWarn)
 	ctx := context.Background()
 
 	assert.False(t, log.Enabled(ctx, slog.LevelInfo), "info is below the warn floor")
@@ -61,12 +61,12 @@ func TestResolveLoggerLevelFilters(t *testing.T) {
 }
 
 // The level wrapper must preserve attrs/groups attached after resolution, since
-// Register tags the resolved logger with group/kind via With.
+// beehive.Register tags the resolved logger with group/kind via With.
 func TestLevelHandlerPreservesAttrs(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	log := resolveLogger(base, slog.LevelInfo).With("kind", "Widget")
+	log := Resolve(base, slog.LevelInfo).With("kind", "Widget")
 	log.Info("hello", "id", 7)
 
 	out := buf.String()
@@ -81,7 +81,7 @@ func TestLevelHandlerPreservesGroups(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	log := resolveLogger(base, slog.LevelInfo).WithGroup("g")
+	log := Resolve(base, slog.LevelInfo).WithGroup("g")
 	log.Info("hello", "id", 7)
 
 	// The TextHandler prefixes grouped attrs with "g.", proving WithGroup reached

@@ -13,14 +13,18 @@
 // limitations under the License.
 
 // Package sqlitemigrate is a tiny, forward-only SQL migration runner for SQLite
-// databases. Each caller embeds its own numbered `*.sql` files and hands them
-// to Apply; the runner records progress in a schema_migrations table and brings
-// the DB up to the latest version.
+// databases. A caller embeds its numbered `*.sql` files and hands them to Apply;
+// the runner records progress in a schema_migrations table and brings the DB up to
+// the latest version. Beehive's sqlite store is the only caller.
 //
 // It is deliberately minimal — no down-migrations, no external dependency. Each
 // migration runs in its own transaction so a crash mid-upgrade leaves the DB at
 // the last committed version and the next start resumes from there. A DB written
 // by a newer binary is refused rather than truncated.
+//
+// It sits below the public surface because OpenPool is not a neutral opener: it
+// decides the on-disk format (see auto_vacuum there), which is a choice only
+// Beehive's storage strategy earns the right to make.
 package sqlitemigrate
 
 import (
@@ -45,11 +49,12 @@ import (
 // migrate it.
 //
 // These are Beehive's pragmas, not a neutral set: this is an opinionated opener,
-// and auto_vacuum in particular decides the on-disk format for every consumer of
-// this package. INCREMENTAL costs about one pointer-map page per 200 (~0.5% file
+// and auto_vacuum in particular decides the on-disk format of every database it
+// opens. That opinion is what keeps this package internal — nobody outside gets it
+// imposed on them. INCREMENTAL costs about one pointer-map page per 200 (~0.5% file
 // growth) and nothing measurable per commit; in exchange a database whose row
 // count churns can be made to give its pages back, which auto_vacuum=NONE can
-// never do without a full VACUUM rewrite. A consumer that never drains the
+// never do without a full VACUUM rewrite. A caller that never drains the
 // freelist pays only the 0.5%, and can still drain or VACUUM later without a
 // format change — the reverse is not true, which is why the default leans this way.
 func OpenPool(path string, maxConns int) *sql.DB {

@@ -99,7 +99,7 @@ What remains is the genuine one — a restart after enough real downtime that
 draining costs minutes of full-budget ticks. That is bounded per tick, and the
 work is real rather than wasted, so it is a latency question rather than a
 safety one. If it is ever observed to matter, the fix is to measure paging work
-actually done rather than to guess from a version distance; `TODO.md` carries
+actually done rather than to guess from a version distance; `docs/TODO.md` carries
 the shape.
 
 ### Persisted, not committed with the wakes
@@ -146,7 +146,7 @@ this costs one write per fresh store, not one per start.
 
 ## Consequences
 
-**The seed race in `TODO.md` narrows to first run only.** With a stored cursor,
+**The seed race in `docs/TODO.md` narrows to first run only.** With a stored cursor,
 writes committed between `Start` returning and the waker's seed goroutine being
 scheduled sit *above* it and are scanned on the next tick. The race survives
 only on the very first start of a fresh database, where there is nothing stored

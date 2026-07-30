@@ -1,8 +1,8 @@
 # The store runs auto_vacuum=INCREMENTAL, drained by the GC sweeper above a floor
 
-- **Status:** Accepted — implemented in `sqlitemigrate/sqlitemigrate.go`,
+- **Status:** Accepted — implemented in `internal/sqlitemigrate/sqlitemigrate.go`,
   `sqlite/sqlite.go`, `sqlite/store.go`, `internal/storeapi/storeapi.go`,
-  `store.go`, `beehive.go`.
+  `types.go`, `beehive.go`.
 - **Date:** 2026-07-29
 
 ## Context
@@ -52,12 +52,13 @@ On an existing `NONE` database the pragma is likewise a silent no-op, so adding 
 could not disturb a file already written.
 
 This makes `sqlitemigrate.OpenPool` an opinionated opener rather than a neutral one:
-it decides the on-disk format for every consumer of an exported, general-purpose
-package, and only Beehive ships a drainer. That is taken deliberately and said so in
-the package doc. A consumer that never drains pays only the 0.5% and can still drain
-or `VACUUM` later without a format change; the reverse is not true, which is what
-settles the direction of the default. A `maxConns`-style parameter for one pragma
-would be worse than the opinion.
+it decides the on-disk format of every database it opens, and only Beehive ships a
+drainer. That is taken deliberately and said so in the package doc — and it is why
+the package lives under `internal/`, so the opinion reaches no caller who did not
+choose Beehive's storage strategy along with it. A caller that never drains pays only
+the 0.5% and can still drain or `VACUUM` later without a format change; the reverse
+is not true, which is what settles the direction of the default. A `maxConns`-style
+parameter for one pragma would be worse than the opinion.
 
 ### Why the GC sweeper owns the drain
 

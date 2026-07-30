@@ -99,7 +99,7 @@ know registrations, gating would cost a per-declare pre-read (what sank an earli
 version of the guard), and it would lose the wake outright for a kind that gains a
 controller later — which now costs **one** spurious pass, since a reconcile
 subtracts the whole accrued count. A client-only dependent's count goes unread; the
-cross-kind sweeper that would reclaim it is unbuilt, in `TODO.md`.
+cross-kind sweeper that would reclaim it is unbuilt, in `docs/TODO.md`.
 
 **`reconcile_owed` is a count, not a flag.** A successful pass subtracts the count
 it loaded, floored at 0. Increments landing after the load survive; subtracting

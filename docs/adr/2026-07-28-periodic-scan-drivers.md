@@ -1,6 +1,6 @@
 # Every driver is a periodic scan of the store, on its own cadence
 
-- **Status:** Accepted — implemented in `drivers.go`, `beehive.go`, `reconciler.go`, `waker.go`, `watchpoll.go`, `gc.go`, `options.go`.
+- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `watchpoll.go`, `gc.go`, `options.go`.
 - **Date:** 2026-07-28
 
 This record is the *why*. For the case-by-case map of what each driver actually
@@ -34,9 +34,9 @@ notification.
 
 They are separate cadences because they are separate jobs with sharply different
 cost curves, and one interval governing several would mean tuning any of them moves
-the rest. All six share two loop shapes in `drivers.go`: `runDriver` (one cadence
+the rest. All six share two loop shapes in `internal/driver`: `driver.Run` (one cadence
 with an eager first pass — the GC sweeper, the waker, the stale-dependents pass,
-each watch) and `tickerChan`
+each watch) and `driver.TickerChan`
 (a nil channel for a disabled cadence, for the reconciler's select over the owed
 *and* full passes). Keeping them together is what makes "a non-positive interval
 disables this driver" one answer rather than one per driver.

@@ -12,25 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package beehive
+// Package logging resolves the user-supplied logger into the never-nil, optionally
+// level-gated *slog.Logger the rest of beehive logs through. It carries no beehive
+// types, which is why it sits below the main package rather than inside it.
+package logging
 
 import (
 	"context"
 	"log/slog"
 )
 
-// discardLogger is the resolved logger when logging is disabled (the default).
+// Discard is the resolved logger when logging is disabled (the default).
 // Using slog.DiscardHandler rather than a nil *slog.Logger lets every call site
 // log unconditionally, with no nil checks.
-var discardLogger = slog.New(slog.DiscardHandler)
+var Discard = slog.New(slog.DiscardHandler)
 
-// resolveLogger turns the user-supplied (possibly nil) logger and optional
+// Resolve turns the user-supplied (possibly nil) logger and optional
 // minimum level into a concrete, never-nil *slog.Logger. A nil logger means
 // logging is disabled. A non-nil level wraps the handler so records below it are
 // dropped, layered on top of whatever the handler itself already filters.
-func resolveLogger(l *slog.Logger, level slog.Leveler) *slog.Logger {
+func Resolve(l *slog.Logger, level slog.Leveler) *slog.Logger {
 	if l == nil {
-		return discardLogger
+		return Discard
 	}
 	if level == nil {
 		return l
@@ -39,7 +42,7 @@ func resolveLogger(l *slog.Logger, level slog.Leveler) *slog.Logger {
 }
 
 // levelHandler drops records below a minimum level before delegating to inner.
-// It exists so WithLogLevel can quiet beehive down without the caller having to
+// It exists so beehive.WithLogLevel can quiet beehive down without the caller having to
 // build a leveled handler around their own logging library.
 type levelHandler struct {
 	level slog.Leveler

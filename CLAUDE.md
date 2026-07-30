@@ -40,9 +40,9 @@ go test -run TestName ./  # single test
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.
 
 - **Nothing is pushed. Every driver is a periodic scan.** A write leaves a durable
-  trace, and a driver finds it by scanning the column that moved. `drivers.go` holds
-  the two loop shapes: `runDriver` for one cadence, `tickerChan` for a select over
-  several. Six drivers: the owed pass (unsettled specs plus `reconcile_owed`,
+  trace, and a driver finds it by scanning the column that moved. `internal/driver` holds
+  the two loop shapes: `driver.Run` for one cadence, `driver.TickerChan` for a select
+  over several. Six drivers: the owed pass (unsettled specs plus `reconcile_owed`,
   per-kind, 30s), the full pass (`WithFullPassInterval`, every object, per-kind, off
   by default), the GC sweeper (`WithGCInterval`, deletion-pending, global, **cannot
   be disabled**), the dependency waker (the write log, global, 1s), the
@@ -168,7 +168,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   nothing for a scan to find, which is what stops a controller that re-applies its
   own spec from waking itself forever.
   → [ADR](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md)
-- **Schema-version migration** (`Migrator`, `migrator.go`). A per-kind migrator
+- **Schema-version migration** (`Migrator`, in `types.go`). A per-kind migrator
   converts spec and status blobs up *on read*, at the decode boundary. Writes stamp
   lazily and never downward, and the two columns
   (`schema_version_spec`/`_status`) version independently. A blob that fails to

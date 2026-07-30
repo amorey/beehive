@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/amorey/beehive/internal/driver"
 )
 
 // This file is the client's whole watch surface. The store pushes nothing, so a
@@ -222,7 +224,7 @@ func (c *clientImpl[Spec, Status]) objectStream(
 		// rather than above is not a choice: a send blocks until the subscriber reads,
 		// and it cannot read until objectStream has returned.
 		pending, delivered := initial, false
-		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
 			if delivered {
 				var err error
 				pending, err = c.poll(ctx, list, live, mig, seen, &cursor)
@@ -371,7 +373,7 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 
 	go func() {
 		defer close(out)
-		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
 			if !scoped {
 				// Kind-scope the read: the object watches are scoped, and an unscoped log
 				// read would let a foreign id stream another kind's events through this
@@ -439,7 +441,7 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 
 	go func() {
 		defer close(out)
-		runDriver(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
 			at, _ := r.nextRequeueAt(id) // zero time when nothing is scheduled
 			cur := Schedule{NextRequeueAt: at}
 			if !first && cur == last {

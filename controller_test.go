@@ -365,7 +365,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 }
 
 // TestAddDependencyAcceptsCycle records that beehive lets a caller declare a
-// cycle. It is the tripwire for the deferred fix in TODO.md's cycle entry: the
+// cycle. It is the tripwire for the deferred fix in docs/TODO.md's cycle entry: the
 // candidate that rejects a cycle-closing edge at declare time would make one of
 // these calls start returning an error, so whoever builds it trips a test that
 // states today's answer rather than discovering it.
