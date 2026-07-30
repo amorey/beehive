@@ -821,3 +821,26 @@ type FreePagesReleaser interface {
 	// many pages were actually released. A non-positive maxPages releases nothing.
 	FreePagesRelease(ctx context.Context, maxPages int) (int, error)
 }
+
+// DriverCursorer is an optional Store capability: a backend that can persist a
+// periodic driver's scan position implements it, and a driver that has one reads
+// it at startup to resume where it stopped rather than reseeding from "now". A
+// Store that does not implement it is simply not resumed across restarts — the
+// dependency waker's original, tested behaviour — so this is deliberately NOT a
+// member of Store, for the same reason FreePagesReleaser is not: it is a latency
+// optimisation over a mechanism (the stale-dependents pass) that is already
+// guaranteed, and every implementation and test double would otherwise have to
+// answer a question only some of them need to.
+type DriverCursorer interface {
+	// DriverCursorsGet returns the cursor last persisted for name, or ok=false if
+	// none has been yet. Absence is the normal state on every fresh database, not
+	// an error — there is no ErrNotFound here because a driver cursor is not an
+	// object, and zero is a legitimate cursor value on an empty store, so it
+	// cannot double as "no cursor".
+	DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
+
+	// DriverCursorsSet persists cursor for name if it is greater than what is
+	// stored, and otherwise writes nothing — a call that does not advance the
+	// cursor must cost no write, since a driver may call this every tick.
+	DriverCursorsSet(ctx context.Context, name string, cursor int64) error
+}

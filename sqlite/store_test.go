@@ -4616,6 +4616,107 @@ func TestDependencyWatermarksSetMovesReconciledAtOnlyWithTheCursor(t *testing.T)
 	assert.Greater(t, at, sentinel, "an advancing cursor carries the timestamp with it")
 }
 
+// readDriverCursor returns the stored cursor row for name, or ok=false when no
+// row exists. It reads the table directly, mirroring readWatermark: nothing on
+// the Store surface exposes updated_at, which the suppression test needs.
+func readDriverCursor(t *testing.T, store *sqliteStore, name string) (cursor, updatedAt int64, ok bool) {
+	t.Helper()
+	err := store.db.QueryRowContext(context.Background(),
+		`SELECT cursor, updated_at FROM driver_cursors WHERE name = ?`, name).Scan(&cursor, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, false
+	}
+	require.NoError(t, err)
+	return cursor, updatedAt, true
+}
+
+// stampDriverCursorAt back-dates name's updated_at to a sentinel, so a later
+// assertion can tell a suppressed write (the sentinel survives) from one that
+// rewrote the row.
+func stampDriverCursorAt(t *testing.T, store *sqliteStore, name string, at int64) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(),
+		`UPDATE driver_cursors SET updated_at = ? WHERE name = ?`, at, name)
+	require.NoError(t, err)
+}
+
+// A driver that has never run yet finds nothing, and that is the normal state
+// on every fresh database — not an error, which is why DriverCursorsGet reports
+// it as ok=false rather than through ErrNotFound (see the spec on the ok bool).
+func TestDriverCursorsGetReportsAbsence(t *testing.T) {
+	store := newRawStore(t)
+
+	_, ok, err := store.DriverCursorsGet(context.Background(), "dependency_waker")
+	require.NoError(t, err)
+	assert.False(t, ok, "no driver has ever persisted a cursor here")
+}
+
+// The basic round trip: what Set writes, Get reads back.
+func TestDriverCursorsSetThenGetRoundTrips(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 42))
+
+	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.EqualValues(t, 42, cursor)
+}
+
+// A write arriving out of order cannot regress the cursor, the same guarantee
+// DependencyWatermarksSet gives its own cursor and for the same reason: an
+// out-of-order write must not un-scan history the stored cursor already covers.
+func TestDriverCursorsSetNeverRegresses(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 20))
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 5))
+
+	cursor, _, ok := readDriverCursor(t, store, "dependency_waker")
+	require.True(t, ok)
+	assert.EqualValues(t, 20, cursor, "a lower cursor leaves the stored value alone")
+}
+
+// updated_at is guarded by the same predicate as the cursor, so a tick that made
+// no progress dirties no page — the property the waker's idle-store cost model
+// depends on.
+func TestDriverCursorsSetSuppressesTheWriteWhenTheCursorDoesNotAdvance(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	const sentinel = int64(1)
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 10))
+	stampDriverCursorAt(t, store, "dependency_waker", sentinel)
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 10))
+	_, updatedAt, ok := readDriverCursor(t, store, "dependency_waker")
+	require.True(t, ok)
+	assert.Equal(t, sentinel, updatedAt, "re-applying the same cursor rewrites nothing")
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 11))
+	cursor, updatedAt, ok := readDriverCursor(t, store, "dependency_waker")
+	require.True(t, ok)
+	assert.EqualValues(t, 11, cursor)
+	assert.Greater(t, updatedAt, sentinel, "an advancing cursor carries the timestamp with it")
+}
+
+// Two names are two rows: a second driver's cursor must not collide with or
+// clamp against the first's.
+func TestDriverCursorsSetKeysByName(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 10))
+	require.NoError(t, store.DriverCursorsSet(ctx, "some_other_driver", 999))
+
+	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.EqualValues(t, 10, cursor, "a second driver's cursor leaves this one alone")
+}
+
 // cursorNow is the store-wide write cursor as a reconcile's load would observe
 // it — what a dependent records as its watermark.
 func cursorNow(t *testing.T, store beehive.Store) int64 {

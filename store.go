@@ -32,6 +32,12 @@ type Store = storeapi.Store
 // auto_vacuum=INCREMENTAL.
 type FreePagesReleaser = storeapi.FreePagesReleaser
 
+// DriverCursorer is an optional capability a Store may implement to persist a
+// periodic driver's scan position across restarts. The dependency waker uses it
+// when present and falls back to its in-memory-only cursor otherwise. The sqlite
+// store implements it on the driver_cursors table.
+type DriverCursorer = storeapi.DriverCursorer
+
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON bytes; everything else is Beehive-owned metadata that mirrors the
 // objects table. The reconciler and client decode Spec/Status into typed
