@@ -69,7 +69,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   `DeletionRequestsCreateBySlug` opens `Within` (so `BEGIN IMMEDIATE`) and its first act
   inside is `nextResourceVersion`, an `UPDATE` on the sequence — both before
   anything is known to match. A slug no row holds therefore costs a write
-  transaction, a sequence write, the zero-row `UPDATE`, the re-read, and a
+  transaction, a sequence write, the zero-row `UPDATE`, the existence probe, and a
   rollback, where the pre-mutator client code cost a single lock-free `SELECT`.
   The rollback means no cursor value is burned, but the journal/page work happens.
 
@@ -87,7 +87,10 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   answers inside one. That divergence needs more thought than the saving currently
   justifies. Revisit if a profile shows absent-path deletes are hot, or if
   `DeletionRequestsCreate` gets the same treatment — its absent path has always had
-  this shape, so the probe would belong in `requestDeletion` for both.
+  this shape, so the fast path would belong in `requestDeletion` for both. The write
+  shapes break already made `requestDeletion`'s second read conditions-free (see
+  [the write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md)), so what is left
+  here is the transaction, not the row assembly.
 
 - **The waker's startup seed race costs latency, not convergence** — known, no longer
   a correctness hole. `Start` launches the waker with `bh.wg.Go` and returns; `seed`
@@ -267,68 +270,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   is a judgement call worth making deliberately. Revisit if a deployment is found
   that declares many edges from client-only kinds, where the index entries would
   actually be measurable.
-
-- **`ReconcileOwedDecrement` is not kind-scoped** — known, not fixed. Its UPDATE is keyed
-  `WHERE id = ?` with no group/kind in the predicate, so it will decrement any row in
-  `objects` whose id it is handed, of any kind. Every other id-keyed mutator in the
-  store is scoped to a `GroupKind` and rejects a foreign id with `ErrWrongKind` —
-  either in the `WHERE` or via the scoped re-read — and this is the sole exception.
-
-    It is safe today for one narrow reason: the reconciler is the only caller, and it
-  passes the id of a row it loaded a line earlier for its own kind, with the count read
-  off that same row. Nothing reaches it with another kind's id, and the `max(…, 0)`
-  floor means even a mistaken call could not corrupt the count — it would only clear a
-  wake another kind was owed.
-
-  So this invariant rests on caller discipline where the rest of the store has
-  structure. The fix is small in itself — add `AND "group" = ? AND kind = ?` and thread
-  a `GroupKind` through — but it changes a `storeapi.Store` signature and wants a test
-  pinning the rejection, which is more than the two-line diff it looks like. Deferred
-  because there is no reachable defect here, only an invariant to move from convention
-  into the schema. Revisit when a second caller appears: the cross-kind sweeper above
-  would be one, and it would deliberately reach for rows of kinds it does not own —
-  exactly the case scoping exists to catch.
-
-- **`ObjectsCreate` takes a `RawObject` and silently drops most of it** — known, not
-  fixed, and the input-side twin of the item below. `RawObject` mirrors a whole row and
-  is shaped for reads, but it is also `ObjectsCreate`'s parameter. The INSERT binds six
-  of its fields — group, kind, slug, spec, schema_version_spec, finalizers — and
-  ignores the other twelve. A caller that sets any of those gets a row without it and
-  no error.
-
-  Some of the twelve are defensible: `ID`, `ResourceVersion`, `CreatedAt` and
-  `UpdatedAt` are store-assigned, and `Generation` starts at 1. `Status` is the sharp
-  one, because seeding a status on create is a reasonable thing to try and it is
-  discarded silently. Nothing at the call site says which is which — the struct offers
-  eighteen fields and honours six.
-
-  The fix is to stop using the read shape for the write: a `CreateObjectInput`, or
-  functional options, carrying only the six fields create accepts, so the compiler
-  rejects the rest instead of the store dropping them. Deferred because `RawObject` is
-  an exported alias, so narrowing the parameter breaks an externally implementable
-  `Store`, and it should be done together with the return-shape item below rather than
-  as a second separate break.
-
-- **Mutators build a `RawObject` no caller reads** — known, not fixed. This is the
-  general form of the point the `DeleteBySlug` item makes about one method. Every
-  mutator returns a full `*RawObject` with conditions attached, because `scanWritten`
-  calls `attachConditions` on the write path. On the branches whose row nobody reads —
-  `ObjectsUpdateSpec`'s content no-op, `UpdateStatus`'s settled no-op,
-  `requestDeletion`'s already-pending re-read — that conditions query builds a value
-  the only caller throws away: `controllerClientImpl.UpdateStatus` drops it, and the
-  delete path reads only `obj.ID`. Where the client returns the object to the user, in
-  `Create`, `Update` and `CreateOrUpdate`, the work is needed.
-
-  Skipping `attachConditions` per branch was rejected: it would make one method's
-  return shape depend on which branch it took, and differ from its sibling a few lines
-  away. The contract is the thing to change. The options are narrowing what the `Store`
-  godoc promises about a returned row, adding mutator variants that return nothing or
-  just an id and version, or making the discard explicit at the `storeapi` boundary so
-  the store can skip the work.
-
-  Deferred because `type Store = storeapi.Store` is an alias, so any of those breaks an
-  externally implementable interface, and the saving is one indexed query per
-  discarding write. Revisit when the next `Store` break is on the table anyway.
 
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.

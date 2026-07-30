@@ -110,6 +110,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation that the owed pass lists, a delete sets the `deletion_requested_at` that the
   sweeper lists. `Store.AfterCommit` exists for one thing, the `WithOnCreate` hook.
   → [ADR](docs/adr/2026-07-27-slug-keyed-writes.md)
+- **A store write takes only what it honours and returns only what a caller reads.**
+  `ObjectsCreate` takes an `ObjectsCreateInput`, not the read-shaped `RawObject` whose
+  `Status` field it used to drop in silence. And only `ObjectsCreate` and
+  `ObjectsUpdateSpec` return a row — the two whose callers hand it to the user;
+  the rest return `error`, plus a `bool` where "did it land" isn't otherwise
+  derivable. So no write assembles conditions for a value nobody reads, and
+  `scanWritten`/`attachConditions` are reached from two mutators instead of seven.
+  Tests read a post-write row back with `ObjectsGet`.
+  → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
 - **A nested `Within` is a real rollback boundary.** It runs on a `SAVEPOINT`, so an
   error unwinds that frame's writes and its queued `AfterCommit` hooks even if the
   outer caller swallows it; only the outermost transaction commits. Depth rides on the
