@@ -1220,15 +1220,50 @@ func stampVersion(stored, incoming int) (int, error) {
 	}
 }
 
+// ObjectsUpdateSpec replaces id's spec within gk. See updateSpec for the shape.
 func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
-	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
-	// between the no-op check and the update.
+	// The scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
+	// while doubling as the no-op compare's load — no separate kind check.
+	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
+		return s.getObjectRowScoped(ctx, gk, id)
+	})
+}
+
+// ObjectsUpdateSpecBySlug replaces the spec of the gk row holding slug.
+//
+// It resolves and writes inside one transaction rather than keying the UPDATE on
+// the slug, because this mutator *must* read the row first: the no-op skip
+// compares the stored bytes and schema version against the incoming ones, and a
+// bare UPDATE ... WHERE slug = ? has nothing to compare against. Atomicity comes
+// from Within, not from statement count — the store runs every caller through one
+// connection under BEGIN IMMEDIATE, so a read and a write in one transaction are
+// as indivisible as one statement is.
+//
+// Keying the write on the loaded id is safe for the same reason the id-keyed
+// sibling keys on id alone: the resolution happened in this transaction.
+//
+// There is no ErrWrongKind here. The kind is in the WHERE, so a slug this kind
+// does not hold is absent rather than foreign — the same reasoning as
+// DeletionRequestsCreateBySlug's probe.
+func (s *sqliteStore) ObjectsUpdateSpecBySlug(ctx context.Context, gk storeapi.GroupKind, slug string, spec []byte, specVersion int) (*storeapi.RawObject, error) {
+	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
+		return s.getObjectRowBySlug(ctx, gk, slug)
+	})
+}
+
+// updateSpec is the read-compare-write body both spec mutators share, differing
+// only in how they resolve the row. Within keeps it atomic so a concurrent writer
+// can't slip between the no-op check and the update.
+func (s *sqliteStore) updateSpec(
+	ctx context.Context,
+	spec []byte,
+	specVersion int,
+	resolve func(context.Context) (*storeapi.RawObject, error),
+) (*storeapi.RawObject, error) {
 	var result *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
-		// while doubling as the no-op compare's load — no separate kind check.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
+		obj, err := resolve(ctx)
 		if err != nil {
 			return err
 		}
@@ -1268,16 +1303,16 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 			return err
 		}
 		// A real spec change bumps generation so the convergence handshake notices.
-		// Keyed on id alone: the kind boundary came from the scoped read above, in
-		// this same transaction, and group/kind are write-once at insert. Keep the
-		// read if you move this statement.
+		// Keyed on id alone: the kind boundary came from the resolve above, in this
+		// same transaction, and group/kind are write-once at insert. Keep the read if
+		// you move this statement.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
 			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), id)
+			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), obj.ID)
 		result, err = s.scanWritten(ctx, row)
 		return err
 	})

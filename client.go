@@ -284,7 +284,22 @@ type Client[Spec, Status any] interface {
 	// returns ErrNoController rather than hang on a stream that can never emit; id need
 	// not exist — an unscheduled id streams the zero Schedule until scheduled.
 	SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error)
-	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+	// Update replaces the spec of whatever holds slug now, or returns ErrNotFound.
+	// Unlike Delete it does not fold absence to nil: a missing row is not "already
+	// in the desired state", because there is nothing to write the spec onto.
+	//
+	// A spec whose bytes match what is stored, at the same schema version, writes
+	// nothing at all — no generation bump, no resource_version — so a controller
+	// re-applying its own spec does not wake itself forever.
+	//
+	// For a read-modify-write, use UpdateByID: Get then Update names the row twice,
+	// and a collect plus a fresh create in between would land the write on a
+	// different incarnation. The object Get returned carries ID, so the fix is
+	// always to hand.
+	Update(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
+	// UpdateByID is Update keyed by incarnation: it writes that one row, or returns
+	// ErrNotFound. This is the write half of a read-modify-write.
+	UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -511,7 +526,34 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	return obj, created, nil
 }
 
-func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Update(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error) {
+	if err := checkSlug(slug); err != nil {
+		return nil, err
+	}
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, error) {
+		return c.bh.store.ObjectsUpdateSpecBySlug(ctx, c.gk, slug, b, version)
+	})
+}
+
+func (c *clientImpl[Spec, Status]) UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, error) {
+		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
+		// rejected at the store (no separate read-then-write to keep atomic);
+		// hideWrongKind keeps that foreign id invisible to this single-kind client.
+		raw, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
+		return raw, c.hideWrongKind(err)
+	})
+}
+
+// update is the body both spec writes share, differing only in how the store
+// mutator is keyed. The marshal stays outside the transaction: on a
+// single-connection store it would otherwise hold the write lock across arbitrary
+// user MarshalJSON code.
+func (c *clientImpl[Spec, Status]) update(
+	ctx context.Context,
+	spec Spec,
+	write func(ctx context.Context, b []byte, version int) (*RawObject, error),
+) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
@@ -523,11 +565,8 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	// joins.
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
-		// rejected at the store (no separate read-then-write to keep atomic);
-		// hideWrongKind keeps that foreign id invisible to this single-kind client.
-		raw, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
-		if err = c.hideWrongKind(err); err != nil {
+		raw, err := write(ctx, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		if err != nil {
 			return err
 		}
 		obj, err = c.decode(raw)

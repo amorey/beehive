@@ -232,6 +232,10 @@ func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID,
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }
+
+func (s *fakeStore) ObjectsUpdateSpecBySlug(context.Context, GroupKind, string, []byte, int) (*RawObject, error) {
+	panic("not implemented: ObjectsUpdateSpecBySlug")
+}
 func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
 	panic("not implemented: fakeStore.UpdateStatus")
 }

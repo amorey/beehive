@@ -642,7 +642,7 @@ func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 
 	// A changed spec: the write must not be suppressed as an identical-byte no-op,
 	// or nothing would wake it and the test would pass for the wrong reason.
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	assert.Equal(t, obj.ID, recv(t, reconciled), "a spec write wakes it without the self-edge")
@@ -1940,7 +1940,7 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	// create into a single pass.
 	ctrl.firstDone.wait(t, "first reconcile")
 
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
 	ctrl.secondDone.wait(t, "second reconcile after spec update")

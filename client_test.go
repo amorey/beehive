@@ -247,7 +247,7 @@ func TestClientUpdateMarshalError(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
-	_, err = client.Update(ctx, 1, errMarshaler{})
+	_, err = client.UpdateByID(ctx, 1, errMarshaler{})
 	require.Error(t, err)
 }
 
@@ -572,7 +572,7 @@ func TestClientUpdate(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, "obj-5", cSpec{Val: "v1"})
 
-	updated, err := client.Update(ctx, created.ID, cSpec{Val: "v2"})
+	updated, err := client.UpdateByID(ctx, created.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, updated.ID)
 	assert.Equal(t, int64(2), updated.Generation)
@@ -759,7 +759,7 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	drainQueue(r.work)
 	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
-	_, err = client.Update(ctx, orig.ID, conditionalBadSpec{Val: "bad", Bad: true})
+	_, err = client.UpdateByID(ctx, orig.ID, conditionalBadSpec{Val: "bad", Bad: true})
 	require.Error(t, err, "the new spec's bytes must fail to decode")
 	assert.Empty(t, queuedIDs(r.work), "a rolled-back update must not wake the reconciler")
 
@@ -871,7 +871,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 			return err
 		}},
 		{"Update", func(ctx context.Context, c Client[cSpec, cStatus], seeded ObjectID) error {
-			_, err := c.Update(ctx, seeded, cSpec{Val: "b"})
+			_, err := c.UpdateByID(ctx, seeded, cSpec{Val: "b"})
 			return err
 		}},
 	}
@@ -935,12 +935,12 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "a"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "a"})
 	require.NoError(t, err)
 	assert.Empty(t, unsettledIDs(t, store), "re-applying the identical spec leaves it settled")
 
 	// A real change still unsettles it, so the suppression is scoped to the no-op.
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a real spec change is owed a pass")
 }
@@ -1295,7 +1295,7 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	// The Gadget client must not see or mutate the Widget by its id.
 	_, err = gadgets.GetByID(ctx, w.ID)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = gadgets.Update(ctx, w.ID, cSpec{Val: "hijacked"})
+	_, err = gadgets.UpdateByID(ctx, w.ID, cSpec{Val: "hijacked"})
 	require.ErrorIs(t, err, ErrNotFound)
 	err = gadgets.DeleteByID(ctx, w.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -1429,7 +1429,7 @@ func TestClientUpdateStoreError(t *testing.T) {
 	bh, err := New(&errorUpdateSpecStore{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.Update(context.Background(), 1, tSpec{})
+	_, err = client.UpdateByID(context.Background(), 1, tSpec{})
 	require.Error(t, err)
 }
 
@@ -1437,7 +1437,7 @@ func TestClientUpdateRawToTypedError(t *testing.T) {
 	bh, err := New(&updateBadJSONStore{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.Update(context.Background(), 1, tSpec{})
+	_, err = client.UpdateByID(context.Background(), 1, tSpec{})
 	require.Error(t, err)
 }
 
@@ -1540,7 +1540,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	// Drain the Added event from Create.
 	recv(t, ch)
 
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
 	evt := recv(t, ch)
@@ -1624,11 +1624,11 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
 	// Update obj2 first — this event must not appear on ch.
-	_, err = client.Update(ctx, obj2.ID, cSpec{Val: "b2"})
+	_, err = client.UpdateByID(ctx, obj2.ID, cSpec{Val: "b2"})
 	require.NoError(t, err)
 
 	// Update obj1 — this must appear.
-	_, err = client.Update(ctx, obj1.ID, cSpec{Val: "a2"})
+	_, err = client.UpdateByID(ctx, obj1.ID, cSpec{Val: "a2"})
 	require.NoError(t, err)
 
 	evt := recv(t, ch)
@@ -2852,4 +2852,55 @@ func TestEventFromRaw(t *testing.T) {
 	assert.Equal(t, 18, e.Count)
 	assert.Equal(t, first, e.FirstAt)
 	assert.Equal(t, last, e.LastAt)
+}
+
+// Update joins the slug-keyed family: leaving it out would split the CRUD set,
+// letting a caller create, read and delete by name but forcing an id to write.
+func TestClientUpdateIsSlugKeyedWithByIDSibling(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
+
+	bySlug, err := client.Update(ctx, "prod", cSpec{Val: "v2"})
+	require.NoError(t, err)
+	assert.Equal(t, created.ID, bySlug.ID)
+	assert.Equal(t, "v2", bySlug.Spec.Val)
+	assert.Equal(t, int64(2), bySlug.Generation, "a real spec change bumps generation")
+
+	byID, err := client.UpdateByID(ctx, created.ID, cSpec{Val: "v3"})
+	require.NoError(t, err)
+	assert.Equal(t, "v3", byID.Spec.Val)
+}
+
+// Unlike Delete, a missing row is not "already in the desired state" — there is
+// nothing to write the spec onto — so Update reports absence both ways.
+func TestClientUpdateAbsentSlugIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, err = client.Update(ctx, "no-such-slug", cSpec{Val: "v1"})
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// A slug is unique only within a GroupKind, so the slug-keyed update must fold
+// the kind into its own lookup rather than trusting the caller's.
+func TestClientUpdateIsKindScoped(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
+	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
+	w := mustCreate(t, ctx, widgets, "shared", cSpec{Val: "widget"})
+
+	_, err = gadgets.Update(ctx, "shared", cSpec{Val: "gadget"})
+	require.ErrorIs(t, err, ErrNotFound, "another kind's row holding the same slug is not this client's to write")
+
+	unchanged, err := widgets.GetByID(ctx, w.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "widget", unchanged.Spec.Val)
 }

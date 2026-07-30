@@ -5347,3 +5347,48 @@ func uniqueSlug() string {
 }
 
 var slugSeq atomic.Int64
+
+// The slug-keyed spec write must carry everything the id-keyed one does. The
+// no-op skip is the part most at risk: written as a bare UPDATE ... WHERE slug =
+// ? it would have nothing to compare against and would bump generation on every
+// re-apply, which is what stops a controller re-applying its own spec from waking
+// itself forever.
+func TestObjectsUpdateSpecBySlugSkipsANoOp(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: "prod",
+		Spec: []byte(`{"v":1}`),
+	})
+	require.NoError(t, err)
+
+	same, err := store.ObjectsUpdateSpecBySlug(ctx, testGK, "prod", []byte(`{"v":1}`), 0)
+	require.NoError(t, err)
+	assert.Equal(t, created.Generation, same.Generation, "identical bytes bump no generation")
+	assert.Equal(t, created.ResourceVersion, same.ResourceVersion, "and draw no resource_version")
+
+	changed, err := store.ObjectsUpdateSpecBySlug(ctx, testGK, "prod", []byte(`{"v":2}`), 0)
+	require.NoError(t, err)
+	assert.Equal(t, created.Generation+1, changed.Generation)
+	assert.Greater(t, changed.ResourceVersion, created.ResourceVersion)
+}
+
+// The kind rides in the WHERE, so a slug this kind does not hold is absent rather
+// than foreign — there is no ErrWrongKind to tell apart, as with the slug-keyed
+// delete.
+func TestObjectsUpdateSpecBySlugIsKindScoped(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	other := beehive.GroupKind{Kind: "Other"}
+	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: "shared",
+		Spec: []byte(`{"v":1}`),
+	})
+	require.NoError(t, err)
+
+	_, err = store.ObjectsUpdateSpecBySlug(ctx, other, "shared", []byte(`{"v":2}`), 0)
+	require.ErrorIs(t, err, storeapi.ErrNotFound)
+
+	_, err = store.ObjectsUpdateSpecBySlug(ctx, testGK, "absent", []byte(`{"v":2}`), 0)
+	require.ErrorIs(t, err, storeapi.ErrNotFound)
+}

@@ -66,7 +66,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	// The next two listings fail. Only a tick that has something to list reaches
 	// them, so give it a change to find.
 	store.failures.Store(2)
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -99,7 +99,7 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 	// A real change is the barrier. Many ticks pass while the object is untouched;
 	// if any of them re-sent it, that Modified would arrive carrying the old spec
 	// and this assertion would see it instead of the new one.
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -345,7 +345,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	// come *after* the failure is armed, so the recovery below is the stream
 	// outliving a failure rather than never meeting one.
 	store.getErr.Store(true)
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	drainProbe(store.polled)
 	waitClosed(t, chanAfter(store.polled, 2), "polls while the read fails")
@@ -382,7 +382,7 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	store.listIDsErr.Store(false)
 
 	// A real change proves the stream is still live and still diffing.
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch poll failed")
@@ -664,7 +664,7 @@ func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
 
 	// Put another object's write above that mark, and let the stream take it in, so
 	// the collect below cannot move the high-water mark it compares against.
-	_, err = client.Update(ctx, newer.ID, cSpec{Val: "newest"})
+	_, err = client.UpdateByID(ctx, newer.ID, cSpec{Val: "newest"})
 	require.NoError(t, err)
 	// Wait for a *quiet* tick, not merely for ticks. The liveness probe only runs on
 	// a tick that found the high-water mark unmoved, so a token here proves the
@@ -707,7 +707,7 @@ func TestWatchSingleObjectSurvivesALivenessProbeFailure(t *testing.T) {
 	store.metaErr.Store(false)
 
 	// A real change proves the stream is still live and still diffing.
-	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch poll failed")

@@ -547,6 +547,18 @@ type Store interface {
 	// ErrNotFound.
 	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
 
+	// ObjectsUpdateSpecBySlug is ObjectsUpdateSpec keyed by slug within gk: it
+	// writes whatever holds the slug now, or returns ErrNotFound. A slug this kind
+	// does not hold is absent rather than foreign, so there is no ErrWrongKind — as
+	// with DeletionRequestsCreateBySlug.
+	//
+	// Everything else matches ObjectsUpdateSpec, the content no-op included. An
+	// implementation MUST resolve and write within one transaction: the no-op skip
+	// needs the stored bytes to compare against, so a resolve-then-write split
+	// across two calls would let a concurrent collect hand the slug to a
+	// replacement in between.
+	ObjectsUpdateSpecBySlug(ctx context.Context, gk GroupKind, slug string, spec []byte, specVersion int) (*RawObject, error)
+
 	// ObjectsUpdateStatus replaces an object's status, records the generation the
 	// controller observed, and stamps statusVersion (the migrator schema version
 	// the status bytes were written at). When the bytes differ from the stored
