@@ -99,7 +99,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   a correctness hole, and narrower than it was since the waker started persisting its
   cursor (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)). `Start` launches
   the waker with `bh.wg.Go` and returns; `seed` runs whenever the Go runtime first
-  schedules that goroutine, and `runDriver`'s eager first step is a seed that returns
+  schedules that goroutine, and `driver.Run`'s eager first step is a seed that returns
   without scanning. Nothing orders those against `Start`'s return, so a caller that
   writes target T as soon as `Start` hands back its stop func can commit T's new
   version *below* the watermark the waker then takes. A failed seed is the same hole by

@@ -125,7 +125,7 @@ the only place in the suite that would notice.
 
 SQLite cannot convert a table between rowid and `WITHOUT ROWID` in place. This
 change rode an in-place edit to `0001_init.sql`, which costs nothing:
-`sqlite/migrations/` holds exactly one file and TODO.md records that a fresh
+`sqlite/migrations/` holds exactly one file and docs/TODO.md records that a fresh
 database is the only supported upgrade path, so editing the initial migration is
 legitimate rather than rewriting applied history.
 

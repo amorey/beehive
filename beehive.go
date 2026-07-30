@@ -24,6 +24,9 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/amorey/beehive/internal/driver"
+	"github.com/amorey/beehive/internal/logging"
 )
 
 const (
@@ -112,7 +115,7 @@ type Beehive struct {
 	// so its zero value is also the correct default (see WithStartupFullPass).
 	startupFullPass bool
 	// logger and logLevel are the user-supplied logging config (nil logger =
-	// disabled). They stay raw until Start resolves them via resolveLogger; each
+	// disabled). They stay raw until Start resolves them via logging.Resolve; each
 	// reconciler inherits them as its own default (see Register).
 	logger   *slog.Logger
 	logLevel slog.Leveler
@@ -137,7 +140,7 @@ type Beehive struct {
 // that drive state directly) may run before that, so guard against nil.
 func (bh *Beehive) log() *slog.Logger {
 	if bh.logger == nil {
-		return discardLogger
+		return logging.Discard
 	}
 	return bh.logger
 }
@@ -163,7 +166,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 
 	// Resolve the control plane's own logger once: nil becomes the discard logger
 	// so the goroutines below (GC sweeper, dependency waker) log unconditionally.
-	bh.logger = resolveLogger(bh.logger, bh.logLevel)
+	bh.logger = logging.Resolve(bh.logger, bh.logLevel)
 
 	// runCtx lives for the lifetime of the control plane and drives the
 	// reconcile loops. It is cancelled by Stop.
@@ -222,10 +225,10 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 // Failures inside a sweep are logged and swallowed, which is only safe because there
 // is always a next tick: WithGCInterval rejects a non-positive interval, so a
 // transient error costs one interval of latency rather than stranding a row for the
-// life of the process. (runDriver still honours a non-positive interval by not
+// life of the process. (driver.Run still honours a non-positive interval by not
 // running, which a Beehive built field by field in a test can reach.)
 func (bh *Beehive) gcSweeperRun(ctx context.Context) {
-	runDriver(ctx, bh.gcInterval, func(ctx context.Context) bool {
+	driver.Run(ctx, bh.gcInterval, func(ctx context.Context) bool {
 		bh.deletionPendingSweep(ctx)
 		bh.eventRetentionSweep(ctx)
 		bh.freePagesSweep(ctx)
@@ -435,7 +438,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	// Resolve once now that overrides are applied, and tag every record with the
 	// kind so per-object logs need only add the id. The adapter shares the same
 	// resolved logger for its reconcile-scoped messages.
-	r.logger = resolveLogger(r.logger, r.logLevel).With("group", gk.Group, "kind", gk.Kind)
+	r.logger = logging.Resolve(r.logger, r.logLevel).With("group", gk.Group, "kind", gk.Kind)
 	adapter.logger = r.logger
 
 	// A WithMigrator option sets r.migrator; promote it to the shared registry so

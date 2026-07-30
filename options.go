@@ -474,7 +474,7 @@ func WithMigrator(m Migrator) Option {
 // durable dependency wake, a pending deletion — and startup resumes all three
 // regardless of this setting, via enqueueOwedPass and the GC sweeper's own eager
 // sweep. If some path needs this pass to converge, that path is the defect; see
-// docs/reconcile-triggers.md for the map and TODO.md for the open ones.
+// docs/reconcile-triggers.md for the map and docs/TODO.md for the open ones.
 //
 // Passed to New it sets the default for all controllers; passed to Register it
 // overrides that default for one.

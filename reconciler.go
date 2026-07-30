@@ -21,6 +21,9 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/amorey/beehive/internal/driver"
+	"github.com/amorey/beehive/internal/logging"
 )
 
 const (
@@ -51,7 +54,7 @@ type typedController[Spec, Status any] struct {
 // is built outside Register (e.g. in tests) and logger was never assigned.
 func (t *typedController[Spec, Status]) log() *slog.Logger {
 	if t.logger == nil {
-		return discardLogger
+		return logging.Discard
 	}
 	return t.logger
 }
@@ -273,11 +276,11 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 }
 
 // log returns a non-nil logger, guarding reconcilers built outside Register (e.g.
-// the minimal ones in tests): run assigns discardLogger, but the enqueue helpers
+// the minimal ones in tests): run assigns logging.Discard, but the enqueue helpers
 // are reachable without it.
 func (r *reconciler) log() *slog.Logger {
 	if r.logger == nil {
-		return discardLogger
+		return logging.Discard
 	}
 	return r.logger
 }
@@ -376,7 +379,7 @@ func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
 //
 // It runs two independent tickers, and each is disabled by a non-positive interval
-// (tickerChan yields a nil channel, which never fires). fullPassInterval <= 0 — the
+// (driver.TickerChan yields a nil channel, which never fires). fullPassInterval <= 0 — the
 // default — disables the *full* pass only; the owed-pass tick still drives periodic
 // passes over the work the store records as owed. That is the pass convergence rests
 // on, which is why it is the one whose absence the log calls out.
@@ -384,7 +387,7 @@ func (r *reconciler) run(ctx context.Context) {
 	// A reconciler built outside Register (e.g. in tests) may have no logger;
 	// fall back to discard so the log sites below stay nil-safe.
 	if r.logger == nil {
-		r.logger = discardLogger
+		r.logger = logging.Discard
 	}
 	// Always drain the work the store records as owed. An object whose spec never
 	// converged — a crash mid-reconcile, or a create that never settled — and one owed
@@ -438,11 +441,11 @@ func (r *reconciler) run(ctx context.Context) {
 		}
 	}()
 
-	fullPass, stopFullPass := tickerChan(r.fullPassInterval)
+	fullPass, stopFullPass := driver.TickerChan(r.fullPassInterval)
 	defer stopFullPass()
 	// The owed-pass tick is the cheap, frequent one: it drains only what the store
 	// records as owed, so it can run often without scaling with the object count.
-	owedPass, stopOwedPass := tickerChan(r.owedPassInterval)
+	owedPass, stopOwedPass := driver.TickerChan(r.owedPassInterval)
 	defer stopOwedPass()
 
 	for {

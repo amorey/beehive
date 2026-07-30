@@ -978,7 +978,7 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 // declare path cannot route through a separate call and no other producer exists
 // yet. It stays here as the standalone form — reachable on the concrete store, so
 // tests can seed a count without staging the whole declare race — and is where a
-// future non-edge producer (see the dependency-waker item in TODO.md) would hook in.
+// future non-edge producer (see the dependency-waker item in docs/TODO.md) would hook in.
 func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)

@@ -830,3 +830,32 @@ func TestPollFailedSeparatesShutdownFromFailure(t *testing.T) {
 	assert.Contains(t, buf.String(), "watch poll failed")
 	assert.Contains(t, buf.String(), errBoom.Error())
 }
+
+// The watch surface falls back to the default interval for a Beehive assembled
+// field by field, as tests do. New itself cannot produce one: withWatchPollInterval
+// rejects a non-positive value.
+func TestWatchPollFallsBackToTheDefault(t *testing.T) {
+	assert.Equal(t, defaultWatchPollInterval, (&Beehive{}).watchPoll(),
+		"an unset interval reads as the default rather than as disabled")
+
+	bh, err := New(&fakeStore{}, withWatchPollInterval(fastTick))
+	require.NoError(t, err)
+	assert.Equal(t, fastTick, bh.watchPoll(), "a configured interval is used as given")
+}
+
+// sendOrDone reports the send it could not make. Without it a subscriber that
+// stopped reading would wedge its own poll goroutine, which then never observes
+// the cancellation that was meant to release it.
+func TestSendOrDoneReportsACancelledSend(t *testing.T) {
+	out := make(chan int) // unbuffered, and nobody is reading
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.False(t, sendOrDone(ctx, out, 1), "a cancelled context abandons the send")
+
+	// A reader waiting is the other half: the send lands and is reported as landed.
+	got := make(chan int, 1)
+	go func() { got <- <-out }()
+	assert.True(t, sendOrDone(context.Background(), out, 7), "a send with a reader lands")
+	assert.Equal(t, 7, <-got)
+}

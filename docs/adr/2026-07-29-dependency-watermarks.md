@@ -2,7 +2,7 @@
 
 - **Status:** Accepted — implemented in `sqlite/migrations/0001_init.sql`
   (`dependency_watermarks`), `internal/storeapi/storeapi.go`, `sqlite/store.go`,
-  `reconciler.go`, `staledependents.go`, `options.go`.
+  `reconciler.go`, `waker.go`, `options.go`.
 - **Date:** 2026-07-29
 
 ## Context
@@ -164,7 +164,7 @@ cannot consume it. Pinned by `TestReconcileMidPassDeclareLeavesTheDependentOwed`
 `UPDATE` — including overflow pages — and this is the highest-frequency writer of
 the smallest value in the schema. Eight bytes would cost a multi-kilobyte row
 rewrite per pass of every dependent. The side table also leaves `RawObject`
-untouched (which `TODO.md` is already trying to shrink) and removes a genuine
+untouched (which `docs/TODO.md` is already trying to shrink) and removes a genuine
 misreading hazard: a `dependency_watermark` column beside `resource_version` reads
 as a comparable pair, like `observed_generation`/`generation`, and is not one.
 
@@ -209,7 +209,7 @@ full pass's object count.
 controllers that write on every pass keep re-staling each other here exactly as they
 do under the waker. Not a new bug class, but not neutral either: the stale pass
 cannot be disabled, so a cycle now has a second, unkillable driver sustaining it. The
-fix remains `TODO.md`'s minimum re-enqueue interval per work-queue item.
+fix remains `docs/TODO.md`'s minimum re-enqueue interval per work-queue item.
 
 **Not addressed:** `RequeueAfter` durability (a controller's private timer, not a
 fact about the object), and pushing latency below the 1s waker scan. Multiple

@@ -12,7 +12,7 @@ the system look more push-driven than it is.
 
 **Keep it in step with the code.** When you add a way for work to be owed, it belongs
 here with its recording site, its finding site, and its restart answer. Gaps are not
-listed here — they are in [`TODO.md`](../TODO.md), and linked from the case they
+listed here — they are in [`TODO.md`](TODO.md), and linked from the case they
 belong to.
 
 ## The shape of the answer
@@ -43,7 +43,7 @@ guarantees the dependent a pass whatever else is in flight.
 
 Startup runs exactly three things: `enqueueOwedPass` (`reconciler.run`, before its
 workers start), the GC sweeper's eager first sweep, and the stale-dependents pass's
-eager first step (both `runDriver`). The first two are unconditional; the third runs
+eager first step (both `driver.Run`). The first two are unconditional; the third runs
 whenever any kind is registered, which is the only case in which it could enqueue
 anything. That is the whole of what a restart guarantees.
 
@@ -54,7 +54,7 @@ outstanding, so a guarantee resting on one holds only while the sweep stays
 affordable. A full pass is a re-confirm tool for process-scoped state — see
 [section E](#e-not-triggers) — never an answer to "how does this work get found". If
 the only answer for some path is "the full pass picks it up", that path is a defect,
-and it belongs in [`TODO.md`](../TODO.md) rather than in a coverage column here.
+and it belongs in [`TODO.md`](TODO.md) rather than in a coverage column here.
 
 ---
 
@@ -273,7 +273,7 @@ All three cases share one trace and one driver:
   registered kind would make no progress forever.
 - **Normal:** ✅ GC sweeper, 30s, and `WithGCInterval` rejects a non-positive value, so
   every error path has a next tick.
-- **Restart:** ✅ `runDriver` sweeps eagerly before its first tick. Test:
+- **Restart:** ✅ `driver.Run` sweeps eagerly before its first tick. Test:
   `TestIntegrationGCResumesDanglingDeleteOnStartup`.
 - **Tests:** `TestGCSweepsOnItsOwnInterval`, `TestGCSweepDispatchesRegisteredKind`,
   `TestIntegrationGCSweepsClientOnlyKind`, `TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete`,
@@ -312,7 +312,7 @@ holds its `reconcile_owed` count, because `ReconcileOwedDecrement` runs only on 
     `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfter`, `TestWorkQueueAddAfterNewestWins`,
     `TestTypedControllerReconcileDropsRequeueWhenCollected`. A chain of these on a
     settled object is the case with no durable trace at all: it does not survive a
-    restart, and no driver brings it back. See [`TODO.md`](../TODO.md) — the open
+    restart, and no driver brings it back. See [`TODO.md`](TODO.md) — the open
     question there is whether a self-polling controller should be written this way
     rather than owning its own ticker and calling `Client.Requeue`.
 11. **Failure backoff** — `reconciler.backoffNext` → `addAfter`, doubling to
@@ -337,7 +337,7 @@ Worth stating, because each looks like one:
   that is exactly the property not to lean on: it turns an open gap into an
   intermittent one, scaled by object count, and hides it from anyone reading this
   document for what guarantees convergence. Where a gap exists it is named as a gap
-  here and tracked in [`TODO.md`](../TODO.md). Tests:
+  here and tracked in [`TODO.md`](TODO.md). Tests:
   `TestStartupEnqueuesAllNotJustUnsettled`, `TestStartupFullPassReconcilesSettled`,
   `TestStartupFullPassDisabledSkipsSettled`, `TestFullPassTickReconcilesSettled`,
   `TestDefaultConfigDoesNotFullPass`, `TestSelfDrivenRecovery`.

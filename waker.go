@@ -14,7 +14,11 @@
 
 package beehive
 
-import "context"
+import (
+	"context"
+
+	"github.com/amorey/beehive/internal/driver"
+)
 
 // waker requeues the dependents of everything that has changed. On each tick it
 // scans the store's write log from a scan watermark and wakes what it finds. There is
@@ -109,7 +113,7 @@ const wakeScanPagesPerTick = 16
 // scan reads, so a store with heavy event traffic inflates the gap by an
 // unbounded factor and would have a perfectly drainable cursor thrown away.
 // What does bound the cost is wakeScanPagesPerTick, per tick, whatever the gap
-// turns out to hold. See TODO.md for the measured version, if a drain long
+// turns out to hold. See docs/TODO.md for the measured version, if a drain long
 // enough to matter is ever observed.
 
 // run drives the waker for the life of the control plane. A non-positive interval
@@ -123,7 +127,7 @@ func (dw *waker) run(ctx context.Context) {
 	if len(dw.bh.order) == 0 {
 		return
 	}
-	runDriver(ctx, dw.bh.wakeInterval, func(ctx context.Context) bool {
+	driver.Run(ctx, dw.bh.wakeInterval, func(ctx context.Context) bool {
 		dw.scan(ctx)
 		return true
 	})
@@ -142,7 +146,7 @@ func (dw *waker) run(ctx context.Context) {
 // and is never scanned. The reconciler's startup pass covers that only for an
 // object the store records as owed; a settled dependent stranded in the window
 // is found by the stale-dependents pass instead, which is why this is a latency
-// gap rather than a hole (the startup seed race in TODO.md is the same shape).
+// gap rather than a hole (the startup seed race in docs/TODO.md is the same shape).
 // Retrying is still right: an unseeded watermark is zero, and scanning from
 // there would replay every object ever written on the strength of a transient
 // error.
@@ -386,7 +390,7 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 				// Self-edge: nothing is owed a wake here. A spec write already leaves the
 				// object unsettled, and a status or condition write came from this object's
 				// own pass, which just ran. Waking it would only re-queue it with nothing
-				// left to converge. Cycles of two or more still loop; see TODO.md.
+				// left to converge. Cycles of two or more still loop; see docs/TODO.md.
 				continue
 			}
 			enqueue(d.GroupKind(), d.ID)
@@ -394,4 +398,80 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 	}
 	dw.watermark = max(dw.watermark, high)
 	return true
+}
+
+// staleDependentsPageCap bounds one page of the stale-dependents scan. The query
+// is bounded by the depends_on edges of registered kinds and cheap; the cost is
+// round trips on the store's single connection, which every writer shares.
+const staleDependentsPageCap = 256
+
+// staleDependentsRun is the correctness backstop behind the dependency waker. The
+// waker is fast and in-memory, so a wake it loses — to a crash, to a process with
+// no controllers, to a bug — is lost for good; here the same question is asked of
+// current state instead, by comparing each dependent's durable watermark against
+// its targets' resource_version. A wake lost by *any* means, including means that
+// do not exist yet, costs latency until this pass rather than permanent divergence.
+//
+// That is why it cannot be disabled and why it is store-derived rather than
+// recorded: there is no bookkeeping to keep in sync, and re-deriving twice is
+// re-deriving once.
+func (bh *Beehive) staleDependentsRun(ctx context.Context) {
+	// With no registered controllers there is nothing to enqueue, and the kind list
+	// the scan filters on would be empty anyway — the same early return the waker makes.
+	if len(bh.order) == 0 {
+		return
+	}
+	// order is frozen after Start, so the kind list is built once rather than per pass.
+	kinds := make([]GroupKind, 0, len(bh.order))
+	for _, r := range bh.order {
+		kinds = append(kinds, r.gk)
+	}
+	driver.Run(ctx, bh.staleDependentsInterval, func(ctx context.Context) bool {
+		bh.staleDependentsSweep(ctx, kinds)
+		return true
+	})
+}
+
+// staleDependentsSweep pages the staleness listing to exhaustion and enqueues
+// each dependent under its own kind. It pages to exhaustion rather than one page
+// per tick, as the waker's scan does, so the startup step enqueues everything
+// stale rather than a slice of it — which matters most on the first start after
+// this mechanism lands, when no object has a watermark yet and the whole
+// dependency graph is stale at once. That herd is one-time and self-extinguishing:
+// each pass records a watermark.
+//
+// A failed page is logged and the sweep abandoned. The cursor is local to the
+// sweep and nothing was drained, so the next tick re-derives the same set — there
+// is no state to hold or repair.
+func (bh *Beehive) staleDependentsSweep(ctx context.Context, kinds []GroupKind) {
+	// Resolve each kind's reconciler once for the whole sweep rather than per
+	// dependent: resolving takes the mutex Register, migratorFor and stop also want,
+	// and one sweep can reach many dependents across a handful of kinds. The cache may
+	// outlive a page safely — the registration set is frozen after Start (see
+	// enqueuerForPage).
+	enqueue := bh.enqueuerForPage()
+	var after ObjectID
+	for {
+		page, err := bh.store.DependentsListStale(ctx, kinds, after, staleDependentsPageCap)
+		if err != nil {
+			if ctx.Err() != nil {
+				return // shutdown cancelled this read; not a loss of its own
+			}
+			bh.log().WarnContext(ctx, "listing stale dependents failed; the next pass re-derives them",
+				"afterID", after, "err", err)
+			return
+		}
+		if len(page) == 0 {
+			return
+		}
+		for _, d := range page {
+			enqueue(d.GroupKind(), d.ID)
+		}
+		after = page[len(page)-1].ID
+		if len(page) < staleDependentsPageCap {
+			// A short page means nothing was above it when the store answered. Anything
+			// that has gone stale since belongs to the next tick.
+			return
+		}
+	}
 }
