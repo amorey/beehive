@@ -97,6 +97,12 @@ const (
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = storeapi.ErrNotFound
 
+// ErrInvalidSlug is returned by the slug-keyed calls when the slug is the empty
+// string. The client rejects it before any store work; the store rejects it too,
+// since Store is a public extension point and a "" row is one no slug-keyed call
+// could address.
+var ErrInvalidSlug = storeapi.ErrInvalidSlug
+
 // ErrStaleTxContext is returned by a nested Within whose ctx is not the transaction's
 // live innermost frame — another goroutine's frame, an enclosing frame used while
 // deeper ones are open, or a frame that already unwound. Deep nesting on one goroutine

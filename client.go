@@ -28,18 +28,11 @@ import (
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// ErrInvalidSlug reports the empty string passed where a slug is required — the
-// one rule beehive enforces on a slug, which is otherwise opaque. "" is not a name
-// anyone chooses; it is what an unset configuration field reads as, so admitting it
-// would silently converge every caller whose config was unset on one shared row.
-//
-// The reads return it too, rather than ErrNotFound, so such a caller looks at the
-// argument they passed instead of at a row that was never going to be there.
-var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
-
 // checkSlug runs before any store work: deferring it would make the same call
 // succeed or fail depending on whether a row happens to exist, hiding the bug until
-// GC or a cold start removed it (as with GetOrCreate's eager spec validation).
+// GC or a cold start removed it (as with GetOrCreate's eager spec validation). The
+// store refuses "" as well (ErrInvalidSlug lives there) — this is the courtesy that
+// keeps the reads from answering ErrNotFound for what is really a bad argument.
 func checkSlug(slug string) error {
 	if slug == "" {
 		return fmt.Errorf("%w: pass the name the object should be addressable by", ErrInvalidSlug)

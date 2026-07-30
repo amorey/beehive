@@ -40,6 +40,17 @@ type EventID = int64
 // ErrNotFound is returned by Store reads when no object matches.
 var ErrNotFound = errors.New("beehive: object not found")
 
+// ErrInvalidSlug is returned by a write whose slug is the empty string — the one
+// rule the store enforces on a slug, which is otherwise opaque. "" is not a name
+// anyone chooses; it is what an unset configuration field reads as, so admitting it
+// would converge every caller whose config was unset on one shared row, which no
+// slug-keyed call could then address unambiguously.
+//
+// It lives here rather than above the store because Store is a public extension
+// point: a client-side check is a courtesy to the caller, but the row is what has to
+// be refused, so the guarantee has to be the store's.
+var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
+
 // ErrWrongKind is returned by an id-keyed mutator whose target id belongs to a
 // different kind than the gk passed in. The store folds the caller's kind into every
 // write, so another kind's id is rejected at the source rather than corrupting that
@@ -249,11 +260,12 @@ type ObjectsCreateInput struct {
 	// Slug is the object's name, and is required. A value type rather than a pointer
 	// because there is no unnamed object to represent.
 	//
-	// An implementation MUST reject the empty string, and MUST enforce uniqueness
-	// within gk. Client rejects "" up front with ErrInvalidSlug, but that is a
+	// An implementation MUST reject the empty string with ErrInvalidSlug, and MUST
+	// enforce uniqueness within gk. Client rejects "" up front too, but that is a
 	// courtesy to the caller, not the guarantee: a row admitted under "" is one no
 	// slug-keyed call can ever address again, so the store is where it has to be
-	// refused.
+	// refused. Report it as the sentinel, not as whatever a schema constraint
+	// happens to raise — a caller cannot match on a driver's error text.
 	Slug string
 	Spec []byte
 	// SpecVersion is the migrator schema version Spec was written at, stamped onto

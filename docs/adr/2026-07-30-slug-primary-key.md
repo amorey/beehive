@@ -124,6 +124,20 @@ too, because `ErrNotFound` would send the caller hunting for a missing row when 
 is missing is a config value, and the slug-keyed delete folds absence to `nil`, where
 a silent `nil` is indistinguishable from success.
 
+**`ErrInvalidSlug` lives in `storeapi`, and the store is what enforces it.** A
+client-side check alone would make the invariant true of one caller rather than of
+the data: `Store` is a public extension point, and a row admitted under `""` is one
+no slug-keyed call can address again. `Client` still rejects it up front — that is
+what keeps the reads from answering `ErrNotFound` for a bad argument — but the
+guarantee is the store's.
+
+`ObjectsCreate` refuses it in Go, *before* the version draw, rather than leaning on
+the column's `CHECK (slug <> '')`. A constraint violation arrives as a raw driver
+error carrying no sentinel to match on, and its text belongs to the driver; the
+contract promises `ErrInvalidSlug`, so the promise is kept where it can be. The
+`CHECK` remains as the backstop for writes that never pass through the store — a
+migration, or a foreign writer — which is the only case a Go guard cannot cover.
+
 ## Consequences
 
 - **The public API breaks for every consumer.** Taken all at once, which is why

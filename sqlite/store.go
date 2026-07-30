@@ -695,6 +695,15 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 }
 
 func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
+	// Refused here rather than left to the column's CHECK. The constraint is the
+	// backstop for writes that bypass this store entirely (a migration, a foreign
+	// writer), but a driver's constraint error carries no sentinel a caller can match
+	// on, and its text is the driver's to change. The contract on ObjectsCreateInput
+	// promises ErrInvalidSlug, so this is where that promise is kept — before the
+	// version draw, so a refused create burns no resource_version.
+	if in.Slug == "" {
+		return nil, fmt.Errorf("%w: pass the name the object should be addressable by", storeapi.ErrInvalidSlug)
+	}
 	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)

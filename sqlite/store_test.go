@@ -507,16 +507,23 @@ func TestObjectsSlugIsNotNullable(t *testing.T) {
 		 VALUES (?, ?, NULL, ?, 1, 1, 0, 0)`,
 		testGK.Group, testGK.Kind, `{}`)
 
+	// Assert the row was refused, not how the driver spells the refusal: there is no
+	// sentinel to match on for a raw INSERT that bypasses the store, and the message
+	// text belongs to the driver.
 	require.Error(t, err, "the column rejects NULL")
-	assert.Contains(t, err.Error(), "NOT NULL")
+	assertNoObjectRows(t, store)
 }
 
 // And the empty string, which is the same hole from the other side: "" is what
 // unset configuration reads as, so a row admitted under it is one every such caller
-// would collide on and no slug-keyed call could address. Client rejects it with
-// ErrInvalidSlug, but Store is a public extension point, so the column is where the
-// invariant has to hold.
-func TestObjectsSlugRejectsTheEmptyString(t *testing.T) {
+// would collide on and no slug-keyed call could address. Client rejects it too, but
+// Store is a public extension point, so the guarantee has to be the store's.
+//
+// The error must be the documented sentinel. A CHECK violation surfaces as a raw
+// driver error carrying nothing a caller can match on, so the store refuses "" in Go
+// before the INSERT and the constraint stands only as the backstop for writes that
+// bypass the store.
+func TestObjectsCreateRejectsTheEmptySlug(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
@@ -525,8 +532,32 @@ func TestObjectsSlugRejectsTheEmptyString(t *testing.T) {
 		Spec: []byte(`{}`),
 	})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "CHECK")
+	require.ErrorIs(t, err, storeapi.ErrInvalidSlug)
+	assertNoObjectRows(t, store)
+}
+
+// The CHECK is the backstop, and it has to hold against SQL the store never saw.
+// Driven raw for the same reason the NULL case is, and asserted the same way.
+func TestObjectsSlugColumnRejectsTheEmptyStringInSQL(t *testing.T) {
+	store := newTestStore(t)
+	db := store.(*sqliteStore).db
+
+	_, err := db.ExecContext(context.Background(),
+		`INSERT INTO objects ("group", kind, slug, spec, generation, resource_version, created_at, updated_at)
+		 VALUES (?, ?, '', ?, 1, 1, 0, 0)`,
+		testGK.Group, testGK.Kind, `{}`)
+
+	require.Error(t, err, "the column rejects the empty string")
+	assertNoObjectRows(t, store)
+}
+
+// assertNoObjectRows reports that nothing of testGK landed — the driver-independent
+// half of a constraint assertion, where the error text is the driver's to change.
+func assertNoObjectRows(t *testing.T, store beehive.Store) {
+	t.Helper()
+	ids, err := store.ObjectsListIDs(context.Background(), testGK)
+	require.NoError(t, err)
+	assert.Empty(t, ids, "the refused row must not have landed")
 }
 
 func TestObjectsCreateAssignsIdentity(t *testing.T) {
