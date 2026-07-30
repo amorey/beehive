@@ -5392,3 +5392,108 @@ func TestObjectsUpdateSpecBySlugIsKindScoped(t *testing.T) {
 	_, err = store.ObjectsUpdateSpecBySlug(ctx, testGK, "absent", []byte(`{"v":2}`), 0)
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 }
+
+// The idempotent delete paths must not take a write transaction. Absence is the
+// steady state of a slug-keyed delete — a controller that removes a child re-runs
+// the call every reconcile, and exactly one of those calls ever deletes anything —
+// so BEGIN IMMEDIATE on every one of them takes the store's single write lock to
+// discover there is nothing to do.
+//
+// The observable has to be the transaction itself. resource_version_seq will not
+// serve: markForDeletion already draws the version only after a row is stamped, so
+// the sequence is unmoved on both no-op paths and such an assertion passes on the
+// unfixed code. Counting transactions begun is exact, because Within's BeginTx is
+// the only one in the package and a nested Within returns before reaching it.
+func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
+	store := newTestStore(t)
+	raw := store.(*sqliteStore)
+	ctx := context.Background()
+	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: "prod",
+		Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	t.Run("absent slug", func(t *testing.T) {
+		before := raw.txCount.Load()
+		changed, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "no-such-slug")
+		require.ErrorIs(t, err, storeapi.ErrNotFound)
+		assert.False(t, changed)
+		assert.Equal(t, before, raw.txCount.Load(), "an absent slug answered from a lock-free read")
+	})
+
+	t.Run("absent id", func(t *testing.T) {
+		before := raw.txCount.Load()
+		_, err := store.DeletionRequestsCreate(ctx, testGK, 99999)
+		require.ErrorIs(t, err, storeapi.ErrNotFound)
+		assert.Equal(t, before, raw.txCount.Load())
+	})
+
+	t.Run("the delete that lands does take one", func(t *testing.T) {
+		before := raw.txCount.Load()
+		changed, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "prod")
+		require.NoError(t, err)
+		assert.True(t, changed)
+		assert.Equal(t, before+1, raw.txCount.Load())
+	})
+
+	t.Run("already pending", func(t *testing.T) {
+		before := raw.txCount.Load()
+		changed, err := store.DeletionRequestsCreateBySlug(ctx, testGK, "prod")
+		require.NoError(t, err)
+		assert.False(t, changed, "already deletion-pending is an idempotent no-op")
+		assert.Equal(t, before, raw.txCount.Load())
+
+		changed, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+		require.NoError(t, err)
+		assert.False(t, changed)
+		assert.Equal(t, before, raw.txCount.Load())
+	})
+}
+
+// The pre-probe is advisory, so the fall-through has to resolve a row that moved
+// after it. A probe that reports "live" and a mark that stamps nothing is exactly
+// that interleaving — a concurrent delete landed in between — and it must come out
+// as the idempotent no-op, not as an error.
+//
+// Driven through requestDeletion directly with a scripted probe: the branch exists
+// for a race, and scripting it is what makes the assertion deterministic rather
+// than dependent on two goroutines meeting.
+func TestRequestDeletionResolvesARowThatMovedAfterTheProbe(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	ctx := context.Background()
+
+	// live on the pre-probe, deletion-pending by the time the mark finds no row.
+	var calls int
+	probe := func(context.Context) (bool, error) {
+		calls++
+		return calls > 1, nil
+	}
+
+	changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+
+	require.NoError(t, err, "the row was collected or marked by someone else; that is success")
+	assert.False(t, changed, "this call stamped nothing")
+	assert.Equal(t, 2, calls, "the probe ran again inside the transaction to resolve the zero-row mark")
+}
+
+// And the same interleaving where the row was physically collected rather than
+// marked still surfaces as absence.
+func TestRequestDeletionReportsARowCollectedAfterTheProbe(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	ctx := context.Background()
+
+	var calls int
+	probe := func(context.Context) (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, nil // live
+		}
+		return false, storeapi.ErrNotFound // gone
+	}
+
+	changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+
+	require.ErrorIs(t, err, storeapi.ErrNotFound)
+	assert.False(t, changed)
+}

@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
@@ -45,6 +46,14 @@ var (
 
 type sqliteStore struct {
 	db *sql.DB
+
+	// txCount counts transactions begun — incremented at the sole BeginTx below, so
+	// a nested Within (which joins on a savepoint) does not add to it. Test-only
+	// observability, and the only way to assert that a fast path answered without
+	// taking the write lock: the statements such a path avoids are all invisible
+	// from outside, and BEGIN IMMEDIATE is the cost that actually matters on a store
+	// that runs every caller through one connection.
+	txCount atomic.Int64
 
 	// processStart stamps when this store opened. Liveness conditions written by a
 	// prior process (updated_at older than this) read as Unknown ("verifying")
@@ -568,6 +577,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		return fr.st.nested(ctx, fr.depth, fr.id, fn)
 	}
 
+	s.txCount.Add(1)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1913,27 +1923,90 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	return true, nil
 }
 
-// requestDeletion is the mark-or-probe protocol behind both deletion entry points.
-// A zero-row mark is ambiguous — already deleting, out of scope, or gone — so probe
-// resolves it on the caller's own key: it succeeds for the idempotent already-pending
-// case and reports ErrWrongKind or ErrNotFound otherwise. It reads neither blob nor
-// conditions — answering from metadata alone is the whole reason this pair no longer
-// returns a row, and the already-pending branch is the steady state for a controller
-// that idempotently deletes a child. Within keeps the
-// rv-bump and the write atomic whether or not a caller wrapped this: the mutators
-// self-wrap, and nested they join the caller's transaction — e.g. the GC cascade.
+// deletionProbeScoped reports whether id (within gk) is already deletion-pending,
+// and reports ErrNotFound or ErrWrongKind when it is not this client's row to
+// delete. Columns only — never getObjectRowScoped, which selects objectColumns and
+// would pull the spec and status blobs off disk to answer a question about one
+// timestamp.
+func (s *sqliteStore) deletionProbeScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
+	var group, kind string
+	var deletionAt sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT "group", kind, deletion_requested_at FROM objects WHERE id = ?`, id).
+		Scan(&group, &kind, &deletionAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, storeapi.ErrNotFound // bare, like scanObject's
+	}
+	if err != nil {
+		return false, err
+	}
+	if group != gk.Group || kind != gk.Kind {
+		return false, fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
+			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
+	}
+	return deletionAt.Valid, nil
+}
+
+// deletionProbeBySlug is deletionProbeScoped keyed by slug. Existence is the whole
+// question here: slugs are unique per kind, so a slug this kind does not hold is
+// absent rather than foreign, and there is no ErrWrongKind to distinguish. One
+// indexed probe on UNIQUE ("group", kind, slug), no row fetch.
+func (s *sqliteStore) deletionProbeBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
+	var deletionAt sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT deletion_requested_at FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
+		gk.Group, gk.Kind, slug).Scan(&deletionAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, storeapi.ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return deletionAt.Valid, nil
+}
+
+// requestDeletion is the probe-then-mark protocol behind both deletion entry points.
+//
+// The probe runs first and lock-free, before any transaction. Both idempotent
+// outcomes — no such row, and a row already deletion-pending — are answered from
+// it, so neither takes BEGIN IMMEDIATE. That matters because absence and
+// already-pending are the *steady state* of these calls: a controller that
+// idempotently removes a child re-runs the delete every reconcile, and exactly one
+// of those calls ever deletes anything. On a store that runs every caller through
+// one connection, taking the write lock to discover there is nothing to do is the
+// whole cost.
+//
+// The probe is advisory and cannot be wrong. A row that appears between probe and
+// return simply was not covered by this delete — the same race any delete has. A
+// row that vanishes in between yields the same idempotent answer. And the
+// fall-through still runs the atomic mark, whose "AND deletion_requested_at IS
+// NULL" guard re-checks everything the probe looked at.
+//
+// A zero-row mark after a probe that said "live" means the row moved in between, so
+// the probe runs again inside the transaction to resolve it — succeeding for the
+// already-pending case and reporting ErrWrongKind or ErrNotFound otherwise. It reads
+// neither blob nor conditions: answering from metadata alone is the whole reason
+// this pair no longer returns a row.
+//
+// Within keeps the rv-bump and the write atomic whether or not a caller wrapped
+// this: the mutators self-wrap, and nested they join the caller's transaction — e.g.
+// the GC cascade.
 func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
-	probe func(context.Context) error,
+	probe func(context.Context) (pending bool, err error),
 	where string, whereArgs ...any,
 ) (bool, error) {
+	if pending, err := probe(ctx); err != nil || pending {
+		return false, err
+	}
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
 		if changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
 			return err
 		}
-		return probe(ctx)
+		_, err = probe(ctx)
+		return err
 	})
 	return changed, err
 }
@@ -1942,7 +2015,7 @@ func (s *sqliteStore) requestDeletion(
 // foreign id matches no row and the probe reports ErrWrongKind.
 func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
 	return s.requestDeletion(ctx,
-		func(ctx context.Context) error { return s.checkObjectScoped(ctx, gk, id) },
+		func(ctx context.Context) (bool, error) { return s.deletionProbeScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
@@ -1953,19 +2026,7 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 // on a store that runs every caller through one connection.
 func (s *sqliteStore) DeletionRequestsCreateBySlug(ctx context.Context, gk storeapi.GroupKind, slug string) (bool, error) {
 	return s.requestDeletion(ctx,
-		// Existence is the whole question here: slugs are unique per kind, so a slug
-		// this kind does not hold is absent rather than foreign, and there is no
-		// ErrWrongKind to distinguish.
-		func(ctx context.Context) error {
-			var one int
-			err := s.conn(ctx).QueryRowContext(ctx,
-				`SELECT 1 FROM objects WHERE "group" = ? AND kind = ? AND slug = ?`,
-				gk.Group, gk.Kind, slug).Scan(&one)
-			if errors.Is(err, sql.ErrNoRows) {
-				return storeapi.ErrNotFound
-			}
-			return err
-		},
+		func(ctx context.Context) (bool, error) { return s.deletionProbeBySlug(ctx, gk, slug) },
 		`"group" = ? AND kind = ? AND slug = ?`, gk.Group, gk.Kind, slug)
 }
 
