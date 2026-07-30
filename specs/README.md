@@ -14,6 +14,6 @@ the gap it addressed is still real.
 
 ## Index
 
-- [A durable scan cursor for the dependency waker](durable-waker-cursor.md) —
-  persist the waker's `resource_version` watermark so a restart resumes where it
-  stopped instead of skipping the interval it was down for.
+Empty — nothing is currently proposed. The last entry here,
+`durable-waker-cursor.md`, landed and was folded into
+[the durable-waker-cursor ADR](../docs/adr/2026-07-30-durable-waker-cursor.md).

@@ -83,13 +83,20 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   the clear alone did not — a pass already in flight rewriting the cleared row.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The dependency waker scans from a `resource_version` watermark**
-  (`ObjectWritesListSince`, paged; seeded at startup from `ObjectWritesMaxVersion`).
-  It is store-wide rather than per-kind, because a `depends_on` edge can point at a
-  client-only kind that no per-kind query would name. Its cost is bounded by what
-  changed rather than by what exists, which is why it runs far more often than the
-  other drivers. A failed scan holds the cursor, so the next tick re-reads what is
-  still owed. It is also the only driver that can find a *settled* dependent, which
-  no owed-work listing sees.
+  (`ObjectWritesListSince`, paged). It is store-wide rather than per-kind, because a
+  `depends_on` edge can point at a client-only kind that no per-kind query would
+  name. Its cost is bounded by what changed rather than by what exists, which is why
+  it runs far more often than the other drivers. A failed scan holds the cursor, so
+  the next tick re-reads what is still owed. It is also the only driver that can
+  find a *settled* dependent, which no owed-work listing sees. The watermark is
+  persisted through the optional `DriverCursorer` capability (`driver_cursors`),
+  paged and capped at `wakeScanPagesPerTick` per tick so a resumed cursor can't
+  monopolise the connection, and abandoned for a fresh seed from
+  `ObjectWritesMaxVersion` past `wakeSeedBacklogCap` — a store with no
+  `DriverCursorer`, or a first start, seeds from that max exactly as before. This is
+  still an optimisation, never a guarantee: the stale-dependents pass below is what
+  makes a lost wake, persisted cursor or not, a latency cost rather than a strand.
+  → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md)
 - **Client watches poll and diff** (`watchpoll.go`). Each stream remembers the
   `resource_version` it last reported and emits `Added`/`Modified`/`Deleted` from the
   comparison. A quiet tick costs one high-water-mark read plus one blob-free liveness

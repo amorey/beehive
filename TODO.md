@@ -96,14 +96,22 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   case the fast path belongs in `requestDeletion` for both.
 
 - **The waker's startup seed race costs latency, not convergence** — known, no longer
-  a correctness hole. `Start` launches the waker with `bh.wg.Go` and returns; `seed`
-  runs whenever the Go runtime first schedules that goroutine, and `runDriver`'s eager
-  first step is a seed that reads `ObjectWritesMaxVersion` and returns without
-  scanning. Nothing orders those against `Start`'s return, so a caller that writes
-  target T as soon as `Start` hands back its stop func can commit T's new version
-  *below* the watermark the waker then takes. A failed seed is the same hole by another
-  route: the next tick seeds from the cursor as of *then*, so everything committed in
-  between is below the watermark and never scanned.
+  a correctness hole, and narrower than it was since the waker started persisting its
+  cursor (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)). `Start` launches
+  the waker with `bh.wg.Go` and returns; `seed` runs whenever the Go runtime first
+  schedules that goroutine, and `runDriver`'s eager first step is a seed that returns
+  without scanning. Nothing orders those against `Start`'s return, so a caller that
+  writes target T as soon as `Start` hands back its stop func can commit T's new
+  version *below* the watermark the waker then takes. A failed seed is the same hole by
+  another route: the next tick seeds from the cursor as of *then*, so everything
+  committed in between is below the watermark and never scanned.
+
+  **The race now survives only on the first start of a fresh database.** Once the
+  waker has persisted a cursor, `seed` resumes from it rather than from
+  `ObjectWritesMaxVersion`, and a write racing `Start`'s return lands *above* that
+  stored cursor — scanned on the next tick, not skipped. Only a store with no stored
+  cursor yet — no `DriverCursorer`, or nothing persisted so far — falls back to `max`
+  and reopens the original window.
 
   Either way that change is never read by any scan — and a settled dependent D of T is
   invisible to every owed-work listing, since D's own generation never moved and
@@ -115,17 +123,23 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   **The fix is still to seed synchronously in `Start`**, under `startCtx`, before the
   reconcile loops are launched: the watermark then provably precedes every write any
-  caller could make, because no caller holds the stop func yet. A few lines, no schema
-  change. Not done because it moves a store read into `Start`'s critical section, where
-  it is the first thing that can fail there for a reason unrelated to configuration —
-  and the answer to "does a failed seed abort startup" has to be no, which means
-  keeping the retry-on-next-tick path alive rather than replacing it. Worth doing on
-  latency grounds alone, but no longer urgent.
+  caller could make, because no caller holds the stop func yet. Persisting the cursor
+  makes this slightly more expensive to justify than it was, not less: a synchronous
+  seed now reads *two* rows inside `Start`'s critical section
+  (`ObjectWritesMaxVersion` and `DriverCursorsGet`) instead of one, doubling the exact
+  hesitation this item already recorded about moving a store read into that section.
+  Not done for that reason, and because the answer to "does a failed seed abort
+  startup" has to be no, which means keeping the retry-on-next-tick path alive rather
+  than replacing it. Worth doing on latency grounds alone, but no longer urgent, and
+  now bounded to a smaller case than before.
 
-  **Tripwires.** `TestWakerSeedsFromTheStoreCursor` pins that the first scan starts at
-  the seed. `TestWakerRetriesSeedOnTheNextTick` is the one that constrains the fix: a
-  seed that fails must leave the waker unseeded and scanning nothing, so a synchronous
-  seed in `Start` must fall back to that path rather than returning an error.
+  **Tripwires.** `TestWakerSeedsFromTheWriteLogMax` pins that the first scan on a store
+  with no stored cursor starts at the write log's max; `TestWakerSeedsFromTheStoredCursor`
+  pins that a store with one resumes from it instead. `TestWakerRetriesSeedOnTheNextTick`
+  and `TestWakerRetriesSeedOnAFailedCursorRead` are the ones that constrain the fix: a
+  seed that fails, on either read, must leave the waker unseeded and scanning nothing,
+  so a synchronous seed in `Start` must fall back to that path rather than returning an
+  error.
 
 - **A `RequeueAfter` chain does not survive a restart** — known, not fixed. The
   dependency-wake half is closed: staleness is re-derived from

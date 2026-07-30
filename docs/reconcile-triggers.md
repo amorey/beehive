@@ -142,17 +142,30 @@ price, bounded by the edge-new gate.
 - **Normal:** ✅ 1s scan. A failed page or a failed edges lookup holds the cursor so the
   next tick re-reads it; the self-edge is skipped; a wake arriving mid-reconcile is held
   by `workQueue`'s dirty bit and re-dispatched by `done`.
-- **Restart:** ✅ **by case 7, not by this mechanism.** `seed` re-reads the store's
-  *current* cursor, so a change made while the process was down is never scanned, and a
-  settled dependent stranded by one is invisible to every owed-work listing: its own
-  generation never moved, and nothing stamped `reconcile_owed`. This mechanism leaves no
-  durable trace, **by design** — it is an optimisation over case 7, which re-derives the
-  same wake from durable state at its own cadence. A wake lost mid-process to a failed
-  lookup or a bug is covered the same way. The cost is latency (one stale-pass interval
-  instead of one waker tick), never divergence; there is no fix owed here, and
-  `TODO.md` carries none.
-- **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheStoreCursor`,
-  `TestWakerRetriesSeedOnTheNextTick`, `TestWakerHoldsTheWatermarkOnScanFailure`,
+- **Restart:** ✅ **still primarily by case 7, but this mechanism now resumes rather
+  than always reseeding.** When the store implements `DriverCursorer`, `seed` reads
+  a cursor this waker itself persisted (`driver_cursors`, one bare write per tick,
+  never in the same transaction as a wake) and resumes there instead of at
+  `ObjectWritesMaxVersion` — so a change committed while the process was down is
+  scanned on the first tick back, not skipped. Two things still make case 7 the
+  guarantee rather than this: a store with no `DriverCursorer`, or the very first
+  start of a fresh one, seeds from the max exactly as before, and a wake this waker
+  queues but never delivers (a crash between the cursor write and dispatch) leaves
+  no durable trace of the wake itself — only of the fact that it was scanned. Either
+  way a settled dependent stranded by it is invisible to every owed-work listing:
+  its own generation never moved, and nothing stamped `reconcile_owed`. A wake lost
+  mid-process to a failed lookup or a bug is covered the same way. The cost is
+  latency (one stale-pass interval instead of one waker tick), never divergence;
+  there is no fix owed here, and `TODO.md` carries none.
+  → [ADR](adr/2026-07-30-durable-waker-cursor.md)
+- **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheWriteLogMax`,
+  `TestWakerSeedsFromMaxWithoutAStoredCursor`, `TestWakerSeedsFromTheStoredCursor`,
+  `TestWakerClampsAStoredCursorAboveTheMark`, `TestWakerJumpsAnOversizedBacklog`,
+  `TestWakerStopsAtThePageBudget`, `TestWakerResumesFromTheStoredCursor`,
+  `TestWakerRetriesSeedOnTheNextTick`, `TestWakerRetriesSeedOnAFailedCursorRead`,
+  `TestWakerPersistsOnceWhenTheCursorMoves`, `TestWakerSkipsTheWriteWhenQuiet`,
+  `TestWakerSkipsTheWriteOnShutdown`, `TestWakerPersistsProgressOnAFailedPage`,
+  `TestWakerHoldsTheWatermarkOnScanFailure`,
   `TestWakerHoldsTheWatermarkOnLookupFailure`, `TestWakerPagesTheScan`,
   `TestWakerStopsOnAShortPage`, `TestWakerResolvesEachTargetOnce`,
   `TestWakerSkipsTheSelfEdge`, `TestWakerSkipsUnregisteredKinds`,
