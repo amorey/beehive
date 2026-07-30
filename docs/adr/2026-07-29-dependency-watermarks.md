@@ -233,6 +233,10 @@ It can come back later as a pure startup optimisation, and the composition is so
 *because* the watermark is the ground truth: a checkpoint that is stale, wrong, or
 written by a buggy build costs startup latency and nothing else.
 
+**It did come back, in that narrower form**: the waker now persists its scan
+cursor and resumes from it, without any new promise about wakes actually
+delivered. → [ADR](2026-07-30-durable-waker-cursor.md)
+
 ### Rejected: `idx_edges_depends_on`
 
 The scan pages by `from_id`, and the `edges` primary key already leads on `from_id`,

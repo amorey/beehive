@@ -234,6 +234,42 @@ CREATE TABLE dependency_watermarks (
 ) STRICT;
 
 -- ============================================================
+-- driver_cursors
+-- Durable scan position for a periodic driver, keyed by driver
+-- name. One row today: the dependency waker's write-log
+-- watermark (see waker.go). Lets a driver resume where it
+-- stopped across a restart instead of reseeding from "now".
+-- ============================================================
+
+-- WITHOUT ROWID because the key is TEXT, not the INTEGER PRIMARY KEY case
+-- dependency_watermarks makes its rowid argument on: a rowid table would build a
+-- separate unique index to enforce this key and store every name twice, once in
+-- the record and once in that index. It is also not the edges rationale above —
+-- this table has payload columns outside the key. At one row today the storage
+-- class is immaterial in practice; the reason is written down so it is not read
+-- as either precedent.
+--
+-- name identifies the driver, not a kind or an object — there is nothing here
+-- for a foreign key to reference, and no ON DELETE CASCADE, because the cursor
+-- names a position in the write log rather than a row that can be collected.
+--
+-- Single-writer. A second process sharing this database would steal pages from
+-- the first's scan, since the row is shared and each process only queues its own
+-- registered kinds. Nothing in the project documents or tests two embedding
+-- processes on one file, so this is a constraint to keep true rather than a gap
+-- to close. (Open's max_open_conns=1 is not the reason — it bounds one process's
+-- pool and says nothing about a second one.)
+--
+-- updated_at is guarded by the same WHERE as cursor, so a tick that made no
+-- progress dirties no page — load-bearing at the waker's cadence, not
+-- observability: see cursor's comment.
+CREATE TABLE driver_cursors (
+    name       TEXT PRIMARY KEY,
+    cursor     INTEGER NOT NULL, -- resource_version scanned through, inclusive
+    updated_at INTEGER NOT NULL  -- millis; moves only with cursor
+) STRICT, WITHOUT ROWID;
+
+-- ============================================================
 -- events
 -- Append-only per-object log, aggregated into contiguous runs:
 -- one row per run of consecutive observations sharing

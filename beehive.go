@@ -376,7 +376,11 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),
 	}
-	bh.waker = &waker{bh: bh}
+	// Assigned once here, like FreePagesReleaser's assertion in freePagesSweep,
+	// except stored on the waker rather than asserted per tick: the waker already
+	// owns per-run state (watermark, persisted) that this belongs beside.
+	cursors, _ := s.(DriverCursorer)
+	bh.waker = &waker{bh: bh, cursors: cursors}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
 			return nil, err

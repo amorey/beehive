@@ -338,6 +338,13 @@ type replayStore struct {
 	listed  *signal       // fires on the first page request, when set
 	err     error
 	seedErr error
+
+	// failFromCall makes err apply only from the given call onward (1-indexed),
+	// so a test can script an early page succeeding before a later one fails —
+	// proving what happened before the failure is not thrown away. Zero (the
+	// default) means err, when set, applies to every call, as before this field
+	// existed.
+	failFromCall int
 }
 
 func (s *replayStore) ObjectWritesMaxVersion(context.Context) (int64, error) {
@@ -362,7 +369,7 @@ func (s *replayStore) ObjectWritesListSince(_ context.Context, afterRV int64, li
 	if s.listed != nil {
 		s.listed.fire()
 	}
-	if s.err != nil {
+	if s.err != nil && (s.failFromCall == 0 || len(s.pages) >= s.failFromCall) {
 		return nil, s.err
 	}
 	var out []ObjectWrite
@@ -382,6 +389,48 @@ func replayRows(count int) []ObjectWrite {
 		rows = append(rows, ObjectWrite{ID: ObjectID(i), ResourceVersion: int64(i)})
 	}
 	return rows
+}
+
+// cursorStore layers storeapi.DriverCursorer on top of replayStore, so a waker
+// test can script what a durable store already has stored for the waker's
+// cursor name and observe what it writes. A plain *replayStore does not
+// implement DriverCursorer at all — that is what exercises the no-capability
+// fallback — so this is a distinct type rather than a field toggle.
+type cursorStore struct {
+	replayStore
+	stored map[string]int64 // what DriverCursorsGet reports; nil means nothing stored
+	getErr error
+	setErr error
+
+	// setCalls holds the cursor values DriverCursorsSet *stored*, in order, and
+	// setAttempts counts every call including the ones setErr failed — which is
+	// what a test asserting on retry backoff has to count, since a failed write
+	// stores nothing but still costs the round trip.
+	setCalls    []int64
+	setAttempts int
+}
+
+func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
+	if s.getErr != nil {
+		return 0, false, s.getErr
+	}
+	v, ok := s.stored[name]
+	return v, ok, nil
+}
+
+func (s *cursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+	s.setAttempts++
+	if s.setErr != nil {
+		return s.setErr
+	}
+	s.setCalls = append(s.setCalls, cursor)
+	if s.stored == nil {
+		s.stored = map[string]int64{}
+	}
+	if cursor > s.stored[name] {
+		s.stored[name] = cursor
+	}
+	return nil
 }
 
 // noopController is a no-op test double for Controller, used wherever a test

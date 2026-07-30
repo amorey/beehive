@@ -29,6 +29,20 @@ import (
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
+// Compile-time proof that this store satisfies the contracts beehive resolves
+// structurally. Store is here because Open returns *sqliteStore rather than the
+// interface, so nothing else pins it. The two optional capabilities are here
+// because they are acquired by type assertion with the failure discarded: a
+// drifted signature would not fail to build, it would silently turn the feature
+// off — reverting the waker to reseed-from-max, or leaving free pages
+// undrained — with every test still green, since the beehive-side tests drive
+// their own doubles.
+var (
+	_ storeapi.Store             = (*sqliteStore)(nil)
+	_ storeapi.FreePagesReleaser = (*sqliteStore)(nil)
+	_ storeapi.DriverCursorer    = (*sqliteStore)(nil)
+)
+
 type sqliteStore struct {
 	db *sql.DB
 
@@ -2313,6 +2327,38 @@ func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID
 		return false, err
 	}
 	return exists == 1, nil
+}
+
+// DriverCursorsGet reads name's persisted cursor (see storeapi.DriverCursorer).
+// A missing row is reported as ok=false, not sql.ErrNoRows: absence is the
+// ordinary first-run state, not a fault.
+func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64, bool, error) {
+	var cursor int64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT cursor FROM driver_cursors WHERE name = ?`, name).Scan(&cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return cursor, true, nil
+}
+
+// DriverCursorsSet upserts name's persisted cursor (see storeapi.DriverCursorer).
+// The WHERE on DO UPDATE mirrors DependencyWatermarksSet: it makes the stored
+// cursor monotonic, so an out-of-order write cannot regress it, and it
+// suppresses the write outright when the cursor has not advanced — no page
+// dirtied, no WAL frame — which is what keeps a quiet store from paying a row
+// write on every driver tick.
+func (s *sqliteStore) DriverCursorsSet(ctx context.Context, name string, cursor int64) error {
+	_, err := s.conn(ctx).ExecContext(ctx, `
+		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
+		    ON CONFLICT(name) DO UPDATE
+		   SET cursor = excluded.cursor, updated_at = excluded.updated_at
+		 WHERE excluded.cursor > driver_cursors.cursor`,
+		name, cursor, toMillis(time.Now().UTC()))
+	return err
 }
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.

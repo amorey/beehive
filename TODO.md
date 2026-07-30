@@ -96,14 +96,21 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   case the fast path belongs in `requestDeletion` for both.
 
 - **The waker's startup seed race costs latency, not convergence** — known, no longer
-  a correctness hole. `Start` launches the waker with `bh.wg.Go` and returns; `seed`
-  runs whenever the Go runtime first schedules that goroutine, and `runDriver`'s eager
-  first step is a seed that reads `ObjectWritesMaxVersion` and returns without
-  scanning. Nothing orders those against `Start`'s return, so a caller that writes
-  target T as soon as `Start` hands back its stop func can commit T's new version
-  *below* the watermark the waker then takes. A failed seed is the same hole by another
-  route: the next tick seeds from the cursor as of *then*, so everything committed in
-  between is below the watermark and never scanned.
+  a correctness hole, and narrower than it was since the waker started persisting its
+  cursor (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)). `Start` launches
+  the waker with `bh.wg.Go` and returns; `seed` runs whenever the Go runtime first
+  schedules that goroutine, and `runDriver`'s eager first step is a seed that returns
+  without scanning. Nothing orders those against `Start`'s return, so a caller that
+  writes target T as soon as `Start` hands back its stop func can commit T's new
+  version *below* the watermark the waker then takes. A failed seed is the same hole by
+  another route: the next tick seeds from the cursor as of *then*, so everything
+  committed in between is below the watermark and never scanned.
+
+  **The race is now much narrower.** Once the waker has persisted a cursor, `seed`
+  resumes from it rather than from `ObjectWritesMaxVersion`, and a write racing
+  `Start`'s return lands *above* that stored cursor — scanned on the next tick, not
+  skipped. What still reopens the original window is a seed that falls back to
+  `max`: a store with no `DriverCursorer`, or the first start of a fresh one.
 
   Either way that change is never read by any scan — and a settled dependent D of T is
   invisible to every owed-work listing, since D's own generation never moved and
@@ -115,17 +122,50 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   **The fix is still to seed synchronously in `Start`**, under `startCtx`, before the
   reconcile loops are launched: the watermark then provably precedes every write any
-  caller could make, because no caller holds the stop func yet. A few lines, no schema
-  change. Not done because it moves a store read into `Start`'s critical section, where
-  it is the first thing that can fail there for a reason unrelated to configuration —
-  and the answer to "does a failed seed abort startup" has to be no, which means
+  caller could make, because no caller holds the stop func yet. Not done because a
+  synchronous seed now reads *two* rows inside `Start`'s critical section rather than
+  one, which only sharpens the hesitation recorded above about putting a store read
+  there at all (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)), and
+  because the answer to "does a failed seed abort startup" has to be no, which means
   keeping the retry-on-next-tick path alive rather than replacing it. Worth doing on
-  latency grounds alone, but no longer urgent.
+  latency grounds, but no longer urgent and now bounded to a smaller case.
 
-  **Tripwires.** `TestWakerSeedsFromTheStoreCursor` pins that the first scan starts at
-  the seed. `TestWakerRetriesSeedOnTheNextTick` is the one that constrains the fix: a
-  seed that fails must leave the waker unseeded and scanning nothing, so a synchronous
-  seed in `Start` must fall back to that path rather than returning an error.
+  **Tripwires.** `TestWakerSeedsFromTheWriteLogMax` pins that the first scan on a store
+  with no stored cursor starts at the write log's max; `TestWakerSeedsFromTheStoredCursor`
+  pins that a store with one resumes from it instead. `TestWakerRetriesSeedOnTheNextTick`
+  and `TestWakerRetriesSeedOnAFailedCursorRead` are the ones that constrain the fix: a
+  seed that fails, on either read, must leave the waker unseeded and scanning nothing,
+  so a synchronous seed in `Start` must fall back to that path rather than returning an
+  error.
+
+- **A waker resuming a very stale cursor can scan at full budget for minutes, and
+  nothing decides that draining is no longer worth it** — known, not fixed, and
+  deliberately unbounded rather than bounded by a guess. After a long enough
+  downtime, `seed` resumes a cursor far behind the write log and every tick reads
+  its full `wakeScanPagesPerTick` budget until it catches up: 32 queries a second
+  on the one connection the reconcile loops share, potentially for minutes.
+
+  **The obvious bound is the one that was removed, and it must not come back in that
+  form.** Capping `max - stored` at seed reads a `resource_version` distance, but
+  `EventsAdd` draws from that same sequence without writing anything the scan reads,
+  so the distance overstates the real backlog by an unbounded factor. A store logging
+  events at any rate would abandon cursors that were a few ticks of work. (The other
+  motivation for it — a database file swapped for a larger one — does not exist: a
+  stored cursor lives in the database it describes.)
+
+  **A measured bound would work.** Count consecutive ticks that exhausted the page
+  budget, and past some number of them stop draining and jump to a fresh
+  `ObjectWritesMaxVersion`. That counts paging actually done, in the right unit and
+  immune to event traffic. The natural threshold is one `staleDependentsInterval`
+  of draining, because past that point the backstop has already swept every dependent
+  the drain is still working toward, so the remaining wakes deliver nothing.
+
+  Deferred because the cost is latency rather than divergence, the drain is doing
+  real work rather than wasting it, and no deployment has been observed where it
+  matters — the threshold above is reasoning, not measurement. Revisit if a restart
+  after a long outage is seen to starve the reconcile loops. Tripwire:
+  `TestWakerResumesAnEnormousBacklog` pins that a far-behind cursor is resumed today,
+  which is exactly what such a bound would change.
 
 - **A `RequeueAfter` chain does not survive a restart** — known, not fixed. The
   dependency-wake half is closed: staleness is re-derived from

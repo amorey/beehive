@@ -142,17 +142,25 @@ price, bounded by the edge-new gate.
 - **Normal:** ✅ 1s scan. A failed page or a failed edges lookup holds the cursor so the
   next tick re-reads it; the self-edge is skipped; a wake arriving mid-reconcile is held
   by `workQueue`'s dirty bit and re-dispatched by `done`.
-- **Restart:** ✅ **by case 7, not by this mechanism.** `seed` re-reads the store's
-  *current* cursor, so a change made while the process was down is never scanned, and a
-  settled dependent stranded by one is invisible to every owed-work listing: its own
-  generation never moved, and nothing stamped `reconcile_owed`. This mechanism leaves no
-  durable trace, **by design** — it is an optimisation over case 7, which re-derives the
-  same wake from durable state at its own cadence. A wake lost mid-process to a failed
-  lookup or a bug is covered the same way. The cost is latency (one stale-pass interval
-  instead of one waker tick), never divergence; there is no fix owed here, and
-  `TODO.md` carries none.
-- **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheStoreCursor`,
-  `TestWakerRetriesSeedOnTheNextTick`, `TestWakerHoldsTheWatermarkOnScanFailure`,
+- **Restart:** ✅ **by case 7, though this mechanism now resumes rather than always
+  reseeding.** `seed` reads a cursor the waker persisted (`driver_cursors`) and
+  resumes there instead of at `ObjectWritesMaxVersion`, so a change committed while
+  the process was down is scanned on the first tick back. Case 7 is still the
+  guarantee, because three things bypass the cursor: a store with no
+  `DriverCursorer`, the first start of a fresh one, and a wake queued but never
+  delivered — the cursor records what was *scanned*, never what was woken. A
+  dependent stranded any of those ways is invisible to every owed-work listing, its
+  own generation never having moved. The cost is latency, never divergence; no fix
+  is owed here and `TODO.md` carries none.
+  → [ADR](adr/2026-07-30-durable-waker-cursor.md)
+- **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`, `TestWakerSeedsFromTheWriteLogMax`,
+  `TestWakerSeedsFromMaxWithoutAStoredCursor`, `TestWakerSeedsFromTheStoredCursor`,
+  `TestWakerClampsAStoredCursorAboveTheMark`, `TestWakerResumesAnEnormousBacklog`,
+  `TestWakerStopsAtThePageBudget`, `TestWakerResumesFromTheStoredCursor`,
+  `TestWakerRetriesSeedOnTheNextTick`, `TestWakerRetriesSeedOnAFailedCursorRead`,
+  `TestWakerPersistsOnceWhenTheCursorMoves`, `TestWakerSkipsTheWriteWhenQuiet`,
+  `TestWakerSkipsTheWriteOnShutdown`, `TestWakerPersistsProgressOnAFailedPage`,
+  `TestWakerHoldsTheWatermarkOnScanFailure`,
   `TestWakerHoldsTheWatermarkOnLookupFailure`, `TestWakerPagesTheScan`,
   `TestWakerStopsOnAShortPage`, `TestWakerResolvesEachTargetOnce`,
   `TestWakerSkipsTheSelfEdge`, `TestWakerSkipsUnregisteredKinds`,

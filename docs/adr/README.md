@@ -27,6 +27,7 @@ directory of archaeology.
 - [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
+- [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)
 - [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
