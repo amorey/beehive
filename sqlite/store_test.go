@@ -645,7 +645,35 @@ func TestDuplicateSlugRejected(t *testing.T) {
 		return err
 	}
 	require.NoError(t, mk())
-	assert.Error(t, mk(), "second create with same slug should violate UNIQUE")
+
+	// The sentinel, not a raw driver error. A caller that generates slugs has to be
+	// able to tell "that name is taken, try another" from "the disk is full", and the
+	// UNIQUE violation arrives as a modernc *sqlite.Error whose text is the driver's
+	// to change.
+	require.ErrorIs(t, mk(), storeapi.ErrSlugTaken,
+		"second create with same slug should report the sentinel")
+}
+
+// A create that fails on the slug must leave nothing behind — the caller's retry
+// depends on it, and self-wrapping already rolls the whole statement pair back.
+func TestDuplicateSlugCreateLandsNothing(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	first, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: "dup",
+		Spec: []byte(`{"v":1}`),
+	})
+	require.NoError(t, err)
+
+	_, err = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: "dup",
+		Spec: []byte(`{"v":2}`),
+	})
+	require.ErrorIs(t, err, storeapi.ErrSlugTaken)
+
+	ids, err := store.ObjectsListIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, []storeapi.ObjectID{first.ID}, ids, "the losing create left no row")
 }
 
 func TestObjectsUpdateSpecBumpsGeneration(t *testing.T) {

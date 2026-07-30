@@ -51,6 +51,17 @@ var ErrNotFound = errors.New("beehive: object not found")
 // be refused, so the guarantee has to be the store's.
 var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
 
+// ErrSlugTaken is returned by a create whose slug is already held within the same
+// GroupKind — by a live row or by a deletion-pending one, since a tombstone keeps
+// the name reserved until GC clears it.
+//
+// It exists so a caller can tell "pick another name" from every other reason a write
+// fails. That distinction is the whole basis of a generate-and-retry loop, and
+// without a sentinel the only signal is a backend-specific error whose text belongs
+// to the driver. An implementation MUST report it rather than passing its
+// constraint violation through raw.
+var ErrSlugTaken = errors.New("beehive: slug is already in use for this kind")
+
 // ErrWrongKind is returned by an id-keyed mutator whose target id belongs to a
 // different kind than the gk passed in. The store folds the caller's kind into every
 // write, so another kind's id is rejected at the source rather than corrupting that

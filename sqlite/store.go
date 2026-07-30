@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Compile-time proof that this store satisfies the contracts beehive resolves
@@ -725,7 +727,27 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	// scanObject, not scanWritten: a condition references an object id, and this id
 	// did not exist until the statement above. So the row provably has none, and
 	// nil Conditions is what assembling them would have produced anyway.
-	return scanObject(row)
+	obj, err := scanObject(row)
+	if err != nil {
+		return nil, asSlugTaken(err)
+	}
+	return obj, nil
+}
+
+// asSlugTaken translates the UNIQUE violation on ("group", kind, slug) into the
+// storeapi sentinel, leaving every other error alone.
+//
+// The slug is the only uniqueness constraint a caller can hit on a create — the id
+// is AUTOINCREMENT and everything else on the row is unconstrained — so the code
+// alone identifies it, with no need to parse which index the driver named. Callers
+// generating slugs retry on this and on nothing else, which is exactly why it cannot
+// stay a driver error: the text is modernc's to reword.
+func asSlugTaken(err error) error {
+	var serr *sqlite.Error
+	if errors.As(err, &serr) && serr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+		return fmt.Errorf("%w: %w", storeapi.ErrSlugTaken, err)
+	}
+	return err
 }
 
 // probeObjectScoped answers "does id exist, is it gk's, and is it already

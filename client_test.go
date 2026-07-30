@@ -300,7 +300,28 @@ func TestClientCreateRejectsTakenSlug(t *testing.T) {
 
 	_, err = client.Create(ctx, "taken", cSpec{Val: "second"})
 
-	require.Error(t, err, "a slug already held fails on UNIQUE rather than returning the existing row")
+	require.ErrorIs(t, err, ErrSlugTaken,
+		"a slug already held fails rather than returning the existing row, and says so matchably")
+}
+
+// A tombstone keeps the name reserved: the slug is not free until GC clears
+// finalizers and removes the row. Callers retrying on ErrSlugTaken need that to be
+// the same error, or a delete-then-recreate looks like a different failure.
+func TestClientCreateReportsSlugTakenByATombstone(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	// The finalizer keeps the tombstone around after Delete, so the slug is still
+	// held when Create runs.
+	mustCreate(t, ctx, client, "doomed", cSpec{Val: "first"}, WithFinalizers("test/hold"))
+	require.NoError(t, client.Delete(ctx, "doomed"))
+
+	_, err = client.Create(ctx, "doomed", cSpec{Val: "second"})
+
+	require.ErrorIs(t, err, ErrSlugTaken, "a deletion-pending row still holds its slug")
 }
 
 // The empty slug is the one footgun making the slug required creates rather than
