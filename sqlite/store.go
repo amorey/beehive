@@ -1267,11 +1267,10 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 // written in a different shape aren't comparable, so a caller at a newer version
 // takes the content path even when the bytes look identical. Identical status at
 // the same version, with the generation already recorded, writes nothing at all.
-func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) (*storeapi.RawObject, error) {
-	var result *storeapi.RawObject
+func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
 	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
 	// between the no-op check and the update.
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
 		// while doubling as the no-op compare's load — no separate kind check.
@@ -1317,8 +1316,7 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			// nothing to heal, which is what makes suppressing it free here.
 			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
 			if settled {
-				result, err = s.attachConditions(ctx, obj)
-				return err
+				return nil
 			}
 			// The handshake advanced: the object settled at a generation it hadn't
 			// settled at before. That's watch-visible even with identical bytes.
@@ -1330,13 +1328,13 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			if err != nil {
 				return err
 			}
-			row := c.QueryRowContext(ctx, `
+			// No RETURNING: the caller gets no row, and the scoped read above already
+			// proved this id exists inside this transaction.
+			_, err = c.ExecContext(ctx, `
 				UPDATE objects
 				SET observed_generation = ?, observed_at = ?, resource_version = ?
-				WHERE id = ?
-				RETURNING `+objectColumns,
+				WHERE id = ?`,
 				observedGeneration, toMillis(time.Now().UTC()), rv, id)
-			result, err = s.scanWritten(ctx, row)
 			return err
 		}
 		rv, err := nextResourceVersion(ctx, c)
@@ -1355,17 +1353,14 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 		// generation guard both came from the scoped read above, in this same
 		// transaction, and group/kind are write-once at insert. Keep the read if you
 		// move this statement.
-		row := c.QueryRowContext(ctx, `
+		_, err = c.ExecContext(ctx, `
 			UPDATE objects
 			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
 			    resource_version = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+objectColumns,
+			WHERE id = ?`,
 			jsonText(status), stamp, observedGeneration, now, rv, now, id)
-		result, err = s.scanWritten(ctx, row)
 		return err
 	})
-	return result, err
 }
 
 // conditionColumns is the canonical select list for a condition row; scanCondition

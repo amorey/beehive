@@ -289,12 +289,19 @@ func (r ObjectRef) GroupKind() GroupKind {
 // parameters and deals only in raw rows; the generic boundary is one layer up, in the
 // typedController adapter.
 //
-// Mutators return the row they just wrote, so callers see the store-assigned id,
-// resource_version and timestamps without reading again. A nil error therefore
-// guarantees a non-nil object, and callers dereference it without checking. That
-// includes the idempotent no-op paths, where the row is unchanged but still returned
-// — DeletionRequestsCreate and DeletionRequestsCreateBySlug with changed=false. An
-// implementation that returns (nil, nil) is broken, not a case to handle.
+// Two mutators return the row they wrote — ObjectsCreate and ObjectsUpdateSpec —
+// because their callers hand it back to the user, who could not otherwise see the
+// store-assigned id, resource_version and timestamps without reading again. Where
+// they do return a row a nil error guarantees it is non-nil, so callers dereference
+// it without checking; an implementation that returns (nil, nil) is broken, not a
+// case to handle. That holds on ObjectsUpdateSpec's content no-op too, where the row
+// is unchanged but still returned.
+//
+// Every other mutator returns only an error, plus a bool where whether the write
+// landed is not otherwise derivable. Returning a row nobody reads is not free here:
+// a row is assembled with its conditions attached, so it costs an indexed query per
+// write, and offering it invites a caller to trust a shape the store would rather
+// narrow. Callers that want the post-write row read it back.
 type Store interface {
 	io.Closer
 
@@ -561,7 +568,9 @@ type Store interface {
 	// Scoped to gk: an id of another kind is rejected with ErrWrongKind, a missing
 	// id with ErrNotFound. An observedGeneration greater than the row's current
 	// generation is rejected with ErrObservedGenerationFuture, no-op or not.
-	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) (*RawObject, error)
+	//
+	// It returns no row: see the note above Store on which mutators do.
+	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
 
 	// EdgesAdd inserts a directed (fromID -> toID) edge with the given relation. It is
 	// idempotent, and both endpoints must exist or it returns ErrNotFound. The edge is

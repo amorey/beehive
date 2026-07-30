@@ -625,7 +625,7 @@ func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a new object is owed its first pass")
 
 	// Settle it, so the found branch below starts from "nothing owed".
-	_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+	err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
 	require.NoError(t, err)
 	require.Empty(t, unsettledIDs(t, store), "precondition: settled")
 
@@ -896,7 +896,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 				seeded, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("seed"))
 				require.NoError(t, err)
 				// Settle the seed so its own unconverged spec doesn't mask the write's.
-				_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
+				err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
 				require.NoError(t, err)
 				require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
@@ -954,7 +954,7 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 			obj, err := client.Create(ctx, cSpec{Val: "a"}, WithSlug("w1"))
 			require.NoError(t, err)
 			// Settle it, so anything the writes below owe is theirs.
-			_, err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+			err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
 			require.NoError(t, err)
 			require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 

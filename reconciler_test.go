@@ -2278,7 +2278,7 @@ func TestOwedPassTickDispatchesOwedWake(t *testing.T) {
 	real, reconciled := newOwedPassHarness(t, gk, func(s wakeStampingStore) {
 		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		_, err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
 		id = raw.ID
 	})
@@ -2321,7 +2321,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 		t.Helper()
 		raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		_, err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		err = store.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
 		return raw.ID
 	}
@@ -2406,7 +2406,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 	require.NoError(t, err)
 	// Settled, so no startup pass of its own can reach it: the only thing that ever
 	// dispatches it is the explicit requeue below.
-	_, err = store.ObjectsUpdateStatus(ctx, gk, sentinel.ID, sentinel.Generation, []byte(`{}`), 0)
+	err = store.ObjectsUpdateStatus(ctx, gk, sentinel.ID, sentinel.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 
 	reconciled := make(chan ObjectID, 8)
@@ -2465,7 +2465,7 @@ func TestStartupFullPassReconcilesSettled(t *testing.T) {
 	seed := func(s Store, gk GroupKind) {
 		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		_, err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
 		require.NoError(t, err)
 		settled = raw.ID
 	}
