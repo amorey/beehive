@@ -119,12 +119,19 @@ store-wide driver cursor to per-object work and buy nothing the backstop does
 not already provide.
 
 `persisted` tracks what the *row* holds, which is not the same as where the scan
-resumed — and the difference runs both ways. A clamp leaves the row above the
-watermark, so tracking the watermark would make every tick issue a write the
-store's own upsert discards, a round trip apiece on a connection every driver
-shares. A jump leaves the row below it, so tracking the watermark would suppress
-the one write worth making and leave the abandoned cursor to be re-read and
-re-jumped on every restart.
+resumed: a clamp leaves the row above the watermark, so tracking the watermark
+instead would make every tick issue a write the store's own upsert discards, a
+round trip apiece on a connection every driver shares, until the watermark
+climbed past it.
+
+A failed write holds `persisted` where it is, which is what makes the next tick
+retry — and, left there, what would make *every* tick retry, since the watermark
+stays above it for good on a database that is read-only or full. So the retries
+double to a one-minute cap and only the first failure of a streak warns, with
+the streak length reported on recovery. The first retry stays immediate: a
+transient error is the common case and one round trip is cheap. Nothing gives up
+on the write, because nothing has to — a stalled cursor costs latency after a
+restart and nothing else.
 
 **`seed` writes the point it settled on, before any scanning.** An absent row is
 what makes the next start seed from the mark as of *then*, so a run that seeds
