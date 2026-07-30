@@ -29,6 +29,20 @@ import (
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
+// Compile-time proof that this store satisfies the contracts beehive resolves
+// structurally. Store is here because Open returns *sqliteStore rather than the
+// interface, so nothing else pins it. The two optional capabilities are here
+// because they are acquired by type assertion with the failure discarded: a
+// drifted signature would not fail to build, it would silently turn the feature
+// off — reverting the waker to reseed-from-max, or leaving free pages
+// undrained — with every test still green, since the beehive-side tests drive
+// their own doubles.
+var (
+	_ storeapi.Store             = (*sqliteStore)(nil)
+	_ storeapi.FreePagesReleaser = (*sqliteStore)(nil)
+	_ storeapi.DriverCursorer    = (*sqliteStore)(nil)
+)
+
 type sqliteStore struct {
 	db *sql.DB
 

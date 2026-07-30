@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -653,4 +654,27 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 	}
 	assert.Equal(t, []int64{3}, store.setCalls, "the write lands once the store accepts it again")
 	assert.Zero(t, dw.persistFailures, "and the streak is closed")
+}
+
+// Every waker test above drives a double, so all of them would stay green if the
+// real store stopped satisfying DriverCursorer — New's type assertion discards
+// its failure, leaving cursors nil and the waker silently back on
+// reseed-from-max. The static assertions in sqlite/store.go are the primary
+// guard; this pins the other half, that New actually hands the capability to the
+// waker rather than dropping it somewhere in between.
+func TestNewGivesTheWakerTheStoresCursorCapability(t *testing.T) {
+	store, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+
+	bh, err := New(store)
+	require.NoError(t, err)
+	require.NotNil(t, bh.waker.cursors, "the sqlite store persists cursors, so the waker must have them")
+
+	// And the wiring carries all the way through a real seed and back.
+	require.True(t, bh.waker.seed(context.Background()))
+	cursor, ok, err := store.DriverCursorsGet(context.Background(), cursorNameWaker)
+	require.NoError(t, err)
+	require.True(t, ok, "the seed point reached the database")
+	assert.Equal(t, bh.waker.watermark, cursor)
 }
