@@ -22,7 +22,7 @@ assembled it through `scanWritten`, which calls `attachConditions`. So each writ
 paid an indexed query on the `conditions` table to build a value that, for six of the
 seven mutators, no caller ever read: `controllerClientImpl` discarded the row from
 `UpdateStatus`, `ConditionsSet`, `ConditionsDelete` and `FinalizersDelete`, and
-`clientImpl.Delete`/`DeleteBySlug` discarded it from both deletion entry points. The
+`clientImpl.Delete`/`DeleteByID` discarded it from both deletion entry points. The
 waste was worst exactly where the least happened — the content no-op branches, which
 did no write at all and still assembled a row to report it.
 

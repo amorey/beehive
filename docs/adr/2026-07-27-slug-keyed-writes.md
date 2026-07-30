@@ -3,6 +3,11 @@
 - **Status:** Accepted — implemented in `client.go`, `sqlite/store.go`.
 - **Date:** 2026-07-27 (recorded retroactively)
 
+> **Superseded in part**: the slug is now the `Client` API's key for all of CRUD, and
+> `DeleteBySlug` is spelled `Delete`. The transaction-boundary reasoning below is
+> unchanged and is what the newer decision builds on.
+> → [ADR](2026-07-30-slug-primary-key.md)
+
 ## Reconcile is not transactional
 
 `typedController.reconcile` loads the object and calls `Reconcile` with no enclosing

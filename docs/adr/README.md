@@ -29,6 +29,7 @@ directory of archaeology.
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)
+- [The slug is the Client API's key; the id is the store's key](2026-07-30-slug-primary-key.md)
 - [Slug-keyed writes](2026-07-27-slug-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)

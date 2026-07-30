@@ -1,7 +1,9 @@
 # The slug as the `Client` API's primary key
 
-- **Status:** Accepted — ready to implement. All four gating decisions are settled
-  (see Decisions and Readiness); nothing is blocked.
+- **Status:** Implemented. The decision record is
+  [`docs/adr/2026-07-30-slug-primary-key.md`](adr/2026-07-30-slug-primary-key.md);
+  this file is kept as the working spec it was built from, including the
+  re-verification notes and the three corrections made along the way.
 - **Date:** 2026-07-30 (re-verified against `bd77d7d`)
 - **Replaces:** one deferred `docs/TODO.md` item (`DeleteBySlug` on an absent slug
   still opens a write transaction, `docs/TODO.md:68-95`).
