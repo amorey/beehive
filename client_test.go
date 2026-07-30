@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2903,4 +2904,91 @@ func TestClientUpdateIsKindScoped(t *testing.T) {
 	unchanged, err := widgets.GetByID(ctx, w.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "widget", unchanged.Spec.Val)
+}
+
+// The ABA contract, both directions. This is the executable form of the promise
+// the README used to make — "everything after the create takes an ObjectID, so a
+// delete and recreate under the same slug can't make you act on the wrong row" —
+// which the slug-keyed CRUD surface retires. What replaces it is a split, and a
+// split is only real if both halves are pinned:
+//
+//	a slug-keyed call acts on whatever holds that slug NOW, or reports absence;
+//	an id-keyed call acts on that ONE incarnation, or returns ErrNotFound.
+//
+// Without this test the contract is prose, and a resolve-then-write regression in
+// either mutator would pass everything else in the suite.
+func TestClientSlugKeyedWritesFollowTheSlugAcrossARecreate(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	first := mustCreate(t, ctx, client, "prod", cSpec{Val: "first"})
+
+	// Retire the first incarnation completely. Until GC collects it the tombstone
+	// still holds the slug's UNIQUE constraint, so the recreate below could not
+	// even happen — which is what makes this window narrow in practice.
+	require.NoError(t, client.Delete(ctx, "prod"))
+	collected, err := bh.gcCollect(ctx, first.ID)
+	require.NoError(t, err)
+	require.True(t, collected, "the row must be physically gone before the slug is free")
+
+	second := mustCreate(t, ctx, client, "prod", cSpec{Val: "second"})
+	require.NotEqual(t, first.ID, second.ID, "AUTOINCREMENT never reuses an id")
+
+	// The slug follows the name to the live incarnation.
+	updated, err := client.Update(ctx, "prod", cSpec{Val: "third"})
+	require.NoError(t, err)
+	assert.Equal(t, second.ID, updated.ID, "the slug-keyed write landed on whatever holds the slug now")
+
+	// The id still means the incarnation it always meant, which no longer exists.
+	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "resurrect"})
+	require.ErrorIs(t, err, ErrNotFound, "the id-keyed write refuses to act on a collected row")
+
+	_, err = client.GetByID(ctx, first.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	// The delete pair splits the same way: the slug deletes the live row, the dead
+	// id reports absence rather than silently succeeding.
+	require.ErrorIs(t, client.DeleteByID(ctx, first.ID), ErrNotFound)
+	require.NoError(t, client.Delete(ctx, "prod"))
+	live, err := client.GetByID(ctx, second.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, live.DeletionRequestedAt, "the slug-keyed delete marked the live incarnation")
+}
+
+// resolveProbeStore records whether anything asked it to resolve a slug to a row.
+// A slug-keyed write must not be composed as "look the slug up, then write by the
+// id it returned": those are two store calls with no transaction across them, so a
+// concurrent collect could retire the row and hand its slug to a replacement in
+// between, landing the write on an incarnation the caller never named.
+type resolveProbeStore struct {
+	Store
+	resolved atomic.Bool
+}
+
+func (s *resolveProbeStore) ObjectsGetBySlug(ctx context.Context, gk GroupKind, slug string) (*RawObject, error) {
+	s.resolved.Store(true)
+	return s.Store.ObjectsGetBySlug(ctx, gk, slug)
+}
+
+// The single-threaded ABA test above cannot catch a resolve-then-write Update:
+// with no concurrent collect to interleave, composing the two calls lands on the
+// same row and every assertion passes. So pin the shape directly — the slug goes
+// to the store's own slug-keyed mutator, which resolves and writes inside one
+// transaction.
+func TestClientUpdateDoesNotResolveTheSlugSeparately(t *testing.T) {
+	ctx := context.Background()
+	probe := &resolveProbeStore{Store: newClientTestStore(t)}
+	bh, err := New(probe)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
+	probe.resolved.Store(false)
+
+	_, err = client.Update(ctx, "prod", cSpec{Val: "v2"})
+	require.NoError(t, err)
+
+	assert.False(t, probe.resolved.Load(),
+		"Update resolved the slug through a separate store read; it must go through ObjectsUpdateSpecBySlug, which resolves and writes in one transaction")
 }
