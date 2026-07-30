@@ -471,3 +471,48 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 	assert.Equal(t, []ObjectID{9}, queuedIDs(rsSecond[widget].work),
 		"the dependent of the write made while the process was down is woken on the first scan back")
 }
+
+// One tick reads at most wakeScanPagesPerTick pages, so a long backlog cannot
+// monopolise the single connection the reconcile loops need too. The remainder
+// is not lost: the cursor persists at whatever this tick reached, and the next
+// tick resumes there rather than re-reading it.
+func TestWakerStopsAtThePageBudget(t *testing.T) {
+	total := wakeScanPagesPerTick*wakeScanPageCap + 5
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(total)}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.seeded = true
+
+	dw.scan(context.Background())
+	assert.Len(t, store.pages, wakeScanPagesPerTick, "the tick stops at the page budget")
+	assert.EqualValues(t, wakeScanPagesPerTick*wakeScanPageCap, dw.watermark)
+	assert.Equal(t, []int64{wakeScanPagesPerTick * wakeScanPageCap}, store.setCalls,
+		"progress within the budget is still persisted")
+
+	dw.scan(context.Background())
+	assert.EqualValues(t, total, dw.watermark, "the next tick resumes at the budget, not from the start")
+}
+
+// A stored cursor far enough behind the write log's max that draining it a page
+// at a time would take many minutes is not worth resuming from at all: seed
+// jumps straight to the max, the way an uninitialized waker always has, and logs
+// so the gap is visible. Every dependent in the skipped range is still found by
+// the stale-dependents pass, which needs no cursor.
+func TestWakerJumpsAnOversizedBacklog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	const max = wakeSeedBacklogCap + 1000
+	store := &cursorStore{
+		replayStore: replayStore{seed: max},
+		stored:      map[string]int64{cursorNameWaker: 0},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	dw.seed(context.Background())
+	require.True(t, dw.seeded)
+	assert.EqualValues(t, max, dw.watermark, "the stored cursor is too far behind to resume from")
+	assert.NotEmpty(t, buf.String(), "the skipped gap is logged, unlike an ordinary clamp")
+
+	dw.scan(context.Background())
+	assert.Equal(t, []int64{max}, store.cursors(), "the scan asks for everything above the max")
+	assert.Zero(t, store.read, "which is empty by definition, same as an ordinary clamp")
+}

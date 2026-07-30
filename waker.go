@@ -73,6 +73,27 @@ const cursorNameWaker = "dependency_waker"
 // queues behind every writer on the store's single connection.
 const wakeScanPageCap = 256
 
+// wakeScanPagesPerTick bounds how many pages one tick of scan reads: 4096 changes
+// at wakeScanPageCap. Without it, resuming from a persisted cursor after a long
+// gap would page to exhaustion in one tick, monopolising the single connection the
+// reconcile loops and the startup owed pass are also trying to use. The remainder
+// is not lost — the cursor persists at whatever this tick reached, so the next
+// tick picks up where this one stopped rather than re-reading it.
+const wakeScanPagesPerTick = 16
+
+// wakeSeedBacklogCap bounds how far behind a persisted cursor may be before seed
+// gives up resuming from it and jumps straight to the write log's current max, the
+// way an uninitialized waker always has. It is a version-count estimate, not an
+// exact row count — the event log draws from the same counter, and deletes remove
+// rows the scan would have skipped — which is fine for a threshold. The jump is
+// not a compromise: every dependent it skips is still found by the
+// stale-dependents pass, which needs no cursor, so this trades "the first tick
+// pages through the whole gap" for "these dependents converge within one
+// stale-dependents interval instead of one wake-interval tick" — the same trade
+// wakeScanPagesPerTick makes tick by tick, taken all at once for a gap large
+// enough that draining it a page at a time would take many minutes.
+const wakeSeedBacklogCap = 100_000
+
 // run drives the waker for the life of the control plane. A non-positive interval
 // turns it off, which is a supported choice: the reconcile_owed stamp still covers
 // every newly declared dependency, and a later change to a settled dependency is
@@ -133,7 +154,17 @@ func (dw *waker) seed(ctx context.Context) bool {
 		// asks for everything above max, which is empty by definition — where
 		// trusting a stored cursor past max would skip live writes between them.
 		if ok && stored < max {
-			watermark = stored
+			if gap := max - stored; gap > wakeSeedBacklogCap {
+				// Resuming here would page through the gap for many ticks before
+				// catching up, on the same connection the reconcile loops and the
+				// startup owed pass need. Jumping to max instead costs nothing more
+				// than the ordinary clamp above does — the stale-dependents pass finds
+				// every dependent in the skipped range regardless of cursor.
+				dw.bh.log().WarnContext(ctx, "dependency waker's persisted cursor is too far behind the write log to resume from; seeding at the current cursor instead and leaving the gap to the stale-dependents pass",
+					"stored", stored, "max", max, "gap", gap)
+			} else {
+				watermark = stored
+			}
 		}
 	}
 
@@ -166,7 +197,11 @@ func (dw *waker) scan(ctx context.Context) {
 	// specifically: it persists whatever earlier pages already advanced the
 	// watermark to, rather than losing that progress along with the failure.
 	defer dw.persist(ctx)
-	for {
+	// Bounded rather than to exhaustion: a backlog longer than the budget is not
+	// dropped, only deferred. The watermark this tick reached is what persist
+	// above saves, so the next tick's ObjectWritesListSince picks up exactly
+	// there instead of re-reading what this one already walked.
+	for pages := 0; pages < wakeScanPagesPerTick; pages++ {
 		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
