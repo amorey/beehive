@@ -135,6 +135,29 @@ func TestWakerClampsAStoredCursorAboveTheMark(t *testing.T) {
 	assert.Zero(t, store.calls.Load(), "and no edges lookup is paid for")
 }
 
+// A clamp leaves the row above the watermark, and persisted has to track the
+// row rather than the watermark or every tick between the two pays a round trip
+// for a write DriverCursorsSet's own WHERE discards. Only once the watermark
+// climbs past what the row already holds is there anything worth writing.
+func TestWakerWritesNothingUntilItPassesAClampedRow(t *testing.T) {
+	store := &cursorStore{
+		replayStore: replayStore{seed: 90, rows: changedAt(95)},
+		stored:      map[string]int64{cursorNameWaker: 100},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	require.True(t, dw.seed(context.Background()))
+	require.EqualValues(t, 90, dw.watermark)
+
+	dw.scan(context.Background())
+	require.EqualValues(t, 95, dw.watermark, "the scan advanced past the mark but not past the row")
+	assert.Empty(t, store.setCalls, "the row already holds 100, so the store is not asked to store 95")
+
+	store.rows = changedAt(95, 105)
+	dw.scan(context.Background())
+	require.EqualValues(t, 105, dw.watermark)
+	assert.Equal(t, []int64{105}, store.setCalls, "past the row, the write is worth making")
+}
+
 // A seed that fails leaves the waker unseeded, and the next tick seeds instead of
 // scanning. Scanning would be the harmful choice: an unseeded watermark is zero,
 // so it would replay the whole table on the strength of a transient error. This
@@ -515,6 +538,8 @@ func TestWakerJumpsAnOversizedBacklog(t *testing.T) {
 	dw.scan(context.Background())
 	assert.Equal(t, []int64{max}, store.cursors(), "the scan asks for everything above the max")
 	assert.Zero(t, store.read, "which is empty by definition, same as an ordinary clamp")
+	assert.Equal(t, []int64{max}, store.setCalls,
+		"the jump is recorded, so a restart re-reads the new cursor rather than re-jumping the same gap")
 }
 
 // resumeWatermark's four cases, exercised directly rather than through seed and

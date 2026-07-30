@@ -14,6 +14,4 @@ the gap it addressed is still real.
 
 ## Index
 
-Empty — nothing is currently proposed. The last entry here,
-`durable-waker-cursor.md`, landed and was folded into
-[the durable-waker-cursor ADR](../docs/adr/2026-07-30-durable-waker-cursor.md).
+Empty — nothing is proposed right now.

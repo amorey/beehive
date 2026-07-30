@@ -4674,7 +4674,10 @@ func TestDriverCursorsSetNeverRegresses(t *testing.T) {
 	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 20))
 	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 5))
 
-	cursor, _, ok := readDriverCursor(t, store, "dependency_waker")
+	// The public getter, not readDriverCursor: unlike the watermark table, the
+	// Store surface exposes exactly what this asserts on.
+	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	require.NoError(t, err)
 	require.True(t, ok)
 	assert.EqualValues(t, 20, cursor, "a lower cursor leaves the stored value alone")
 }

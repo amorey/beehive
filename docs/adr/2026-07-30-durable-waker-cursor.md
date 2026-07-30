@@ -60,11 +60,10 @@ than the `INTEGER PRIMARY KEY`-aliases-the-rowid case `dependency_watermarks`
 makes its own rowid argument on. `DriverCursorsSet` is the same monotone,
 self-suppressing upsert as `DependencyWatermarksSet`: a lower cursor is refused,
 and a cursor that hasn't advanced dirties no page — load-bearing at a 1s tick
-rate on a store that may otherwise be idle. Single-writer by construction and
-documented as such in the migration comment: nothing in this project supports
-two embedding processes sharing one file today (`Open` sets
-`SetMaxOpenConns(1)`), so a shared cursor row is a constraint to keep true, not a
-gap to close.
+rate on a store that may otherwise be idle. Single-writer, and documented as
+such in the migration comment: nothing in this project documents or tests two
+embedding processes sharing one file, so a shared cursor row is a constraint to
+keep true rather than a gap to close.
 
 ### Seed clamps rather than trusts or resets
 

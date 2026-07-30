@@ -88,14 +88,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   name. Its cost is bounded by what changed rather than by what exists, which is why
   it runs far more often than the other drivers. A failed scan holds the cursor, so
   the next tick re-reads what is still owed. It is also the only driver that can
-  find a *settled* dependent, which no owed-work listing sees. The watermark is
-  persisted through the optional `DriverCursorer` capability (`driver_cursors`),
-  paged and capped at `wakeScanPagesPerTick` per tick so a resumed cursor can't
-  monopolise the connection, and abandoned for a fresh seed from
-  `ObjectWritesMaxVersion` past `wakeSeedBacklogCap` — a store with no
-  `DriverCursorer`, or a first start, seeds from that max exactly as before. This is
-  still an optimisation, never a guarantee: the stale-dependents pass below is what
-  makes a lost wake, persisted cursor or not, a latency cost rather than a strand.
+  find a *settled* dependent, which no owed-work listing sees. The watermark
+  persists through the optional `DriverCursorer` capability (`driver_cursors`), so
+  a restart resumes rather than reseeding from `ObjectWritesMaxVersion` — still an
+  optimisation, never a guarantee, since the stale-dependents pass is what makes a
+  lost wake a latency cost either way.
   → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md)
 - **Client watches poll and diff** (`watchpoll.go`). Each stream remembers the
   `resource_version` it last reported and emits `Added`/`Modified`/`Deleted` from the

@@ -49,12 +49,10 @@ type waker struct {
 	// is what lets a tick do the job of a stream.
 	watermark int64
 
-	// persisted is the watermark value last written through cursors. It seeds to
-	// the same value as watermark, never to zero: DriverCursorsSet already
-	// suppresses a write that does not advance its stored cursor, but only once
-	// that write reaches the store — without this, a clamped seed (stored above
-	// the write log's max) would pay a round trip every tick for a write the
-	// store then discards.
+	// persisted is what the stored row holds: the value last written through
+	// cursors, or what seed read there. DriverCursorsSet already refuses a write
+	// that would not advance the row, but only after paying the round trip —
+	// comparing against this is what keeps a tick from making the call at all.
 	persisted int64
 
 	// seeded says the watermark holds a real cursor. "watermark != 0" cannot say
@@ -77,25 +75,22 @@ const wakeScanPageCap = 256
 // at wakeScanPageCap. Without it, resuming from a persisted cursor after a long
 // gap would page to exhaustion in one tick, monopolising the single connection the
 // reconcile loops and the startup owed pass are also trying to use. The remainder
-// is not lost — the cursor persists at whatever this tick reached, so the next
-// tick picks up where this one stopped rather than re-reading it.
+// is not lost, and not dependent on the cursor being persisted either: the
+// in-memory watermark already carries it to the next tick, and persisting only
+// extends that across restarts.
 const wakeScanPagesPerTick = 16
 
 // wakeSeedBacklogCap bounds how far behind a persisted cursor may be before seed
-// gives up resuming from it and jumps straight to the write log's current max, the
-// way an uninitialized waker always has. It is a version-count estimate, not an
-// exact row count — the event log draws from the same counter, and deletes remove
-// rows the scan would have skipped — which is fine for a threshold. Sized at
-// roughly wakeScanPagesPerTick*wakeScanPageCap*250: at the per-tick page budget,
-// draining a gap this size takes on the order of 250 ticks — several minutes at
-// the wake interval — of continuous full-budget scans, competing with the
-// reconcile loops and the startup owed pass on the same connection the whole
-// time. The jump is not a compromise: every dependent it skips is still found by
-// the stale-dependents pass, which needs no cursor, so this trades that stretch
-// of contention for "these dependents converge within one stale-dependents
-// interval instead of one wake-interval tick" — the same trade
-// wakeScanPagesPerTick makes tick by tick, taken all at once once the gap is
-// this large.
+// gives up resuming from it and jumps straight to the write log's current mark,
+// the way an uninitialized waker always has. It is a version-count estimate, not
+// an exact row count — the event log draws from the same counter, and deletes
+// remove rows the scan would have skipped — which is fine for a threshold.
+//
+// The multiplier is the point of the expression: at the per-tick page budget, a
+// gap this size takes ~250 consecutive full-budget ticks to drain, several
+// minutes of competing with the reconcile loops for the one connection. Past
+// that, skipping it and letting the stale-dependents pass cover the range is the
+// better trade — the same one wakeScanPagesPerTick makes tick by tick.
 const wakeSeedBacklogCap = wakeScanPagesPerTick * wakeScanPageCap * 250
 
 // run drives the waker for the life of the control plane. A non-positive interval
@@ -130,7 +125,7 @@ func (dw *waker) run(ctx context.Context) {
 // unseeded watermark is zero, and scanning from there would replay every object
 // ever written on the strength of a transient error.
 func (dw *waker) seed(ctx context.Context) bool {
-	max, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
+	mark, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false // shutdown, not a loss
@@ -140,10 +135,12 @@ func (dw *waker) seed(ctx context.Context) bool {
 		return false
 	}
 
-	watermark := max
+	// A store with no DriverCursorer leaves these zero, which resumeWatermark
+	// reads as "nothing stored" — the same answer as an unwritten row.
+	var stored int64
+	var ok bool
 	if dw.cursors != nil {
-		stored, ok, err := dw.cursors.DriverCursorsGet(ctx, cursorNameWaker)
-		if err != nil {
+		if stored, ok, err = dw.cursors.DriverCursorsGet(ctx, cursorNameWaker); err != nil {
 			if ctx.Err() != nil {
 				return false
 			}
@@ -151,43 +148,49 @@ func (dw *waker) seed(ctx context.Context) bool {
 				"err", err)
 			return false
 		}
-		var jumped bool
-		watermark, jumped = resumeWatermark(stored, ok, max)
-		if jumped {
-			// Resuming here would page through the gap for many ticks before
-			// catching up, on the same connection the reconcile loops and the
-			// startup owed pass need. Jumping to max instead costs nothing more
-			// than the ordinary clamp does — the stale-dependents pass finds
-			// every dependent in the skipped range regardless of cursor.
-			dw.bh.log().WarnContext(ctx, "dependency waker's persisted cursor is too far behind the write log to resume from; seeding at the current cursor instead and leaving the gap to the stale-dependents pass",
-				"stored", stored, "max", max, "gap", max-stored)
-		}
 	}
 
-	dw.watermark, dw.persisted, dw.seeded = watermark, watermark, true
+	watermark, jumped := resumeWatermark(stored, ok, mark)
+	if jumped {
+		dw.bh.log().WarnContext(ctx, "dependency waker's persisted cursor is too far behind the write log to resume from; seeding at the current cursor instead and leaving the gap to the stale-dependents pass",
+			"stored", stored, "max", mark, "gap", mark-stored)
+	}
+
+	// persisted is what the row holds, not where the scan resumed — the two come
+	// apart in both directions. A clamp leaves the row *above* the watermark, and
+	// tracking the watermark there would pay a round trip every tick for a write
+	// DriverCursorsSet's own WHERE discards. A jump leaves it *below*, and
+	// tracking the watermark there would suppress the one write worth making,
+	// leaving the abandoned cursor to be re-read and re-jumped on every restart.
+	// With no row at all there is nothing to beat, so the mark stands in and the
+	// first real advance is what creates the row.
+	persisted := mark
+	if ok {
+		persisted = stored
+	}
+
+	dw.watermark, dw.persisted, dw.seeded = watermark, persisted, true
 	return true
 }
 
 // resumeWatermark decides where seed resumes scanning from, given the write
-// log's current max and what the store has persisted, if anything. It is a
-// pure function of those three values, kept separate from seed's I/O and
-// error handling so the clamp and backlog-jump policy is directly testable.
+// log's high-water mark and what the store has persisted, if anything. It is a
+// pure function of those three values, kept separate from seed's I/O and error
+// handling so the clamp and backlog-jump policy is directly testable.
 //
-// No stored cursor (ok is false) or one at or past max resumes at max — the
-// ordinary case, and the one every pre-existing seed behaved as. A stored
-// cursor below max resumes from it, unless it is far enough behind that
-// draining the gap a page at a time would take many ticks on a connection the
-// reconcile loops also need; past wakeSeedBacklogCap, jumped reports that the
-// gap was skipped rather than drained, so the caller can log it — every
-// dependent in a skipped gap is still found by the stale-dependents pass.
-func resumeWatermark(stored int64, ok bool, max int64) (watermark int64, jumped bool) {
-	if !ok || stored >= max {
-		return max, false
+// jumped reports that a stored cursor was abandoned rather than resumed from,
+// which is the only case worth logging: the gap it skips is left to the
+// stale-dependents pass.
+func resumeWatermark(stored int64, ok bool, mark int64) (watermark int64, jumped bool) {
+	if !ok {
+		return mark, false
 	}
-	if gap := max - stored; gap > wakeSeedBacklogCap {
-		return max, true
+	if mark-stored > wakeSeedBacklogCap {
+		return mark, true
 	}
-	return stored, false
+	// min, not stored: a cursor above the mark is not a swapped database, since
+	// the mark steps back whenever the highest-versioned row is deleted.
+	return min(stored, mark), false
 }
 
 // scan runs one pass: everything above the watermark, a page at a time. The cursor
@@ -215,10 +218,8 @@ func (dw *waker) scan(ctx context.Context) {
 	// specifically: it persists whatever earlier pages already advanced the
 	// watermark to, rather than losing that progress along with the failure.
 	defer dw.persist(ctx)
-	// Bounded rather than to exhaustion: a backlog longer than the budget is not
-	// dropped, only deferred. The watermark this tick reached is what persist
-	// above saves, so the next tick's ObjectWritesListSince picks up exactly
-	// there instead of re-reading what this one already walked.
+	// Bounded rather than to exhaustion; dw.watermark is what carries the
+	// remainder to the next tick. See wakeScanPagesPerTick.
 	for pages := 0; pages < wakeScanPagesPerTick; pages++ {
 		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
@@ -246,10 +247,10 @@ func (dw *waker) scan(ctx context.Context) {
 
 // persist writes the watermark through cursors when it has advanced since the
 // last successful write, so a future seed can resume here instead of at
-// whatever ObjectWritesMaxVersion reports then. It is a bare statement outside
-// any transaction: the watermark may end up ahead of what the wakes it produced
-// actually survive to do, and that is an accepted, bounded exposure covered by
-// the stale-dependents pass — see the design doc this shipped with.
+// whatever ObjectWritesMaxVersion reports then. It is deliberately a bare
+// statement outside any transaction, which lets the cursor run ahead of wakes
+// the process then loses — an accepted exposure, argued in
+// docs/adr/2026-07-30-durable-waker-cursor.md.
 //
 // ctx.Err() is checked directly rather than left to the write to discover,
 // because stop cancels this same ctx: without the check, every shutdown that
@@ -257,11 +258,9 @@ func (dw *waker) scan(ctx context.Context) {
 // reason of its own, where the rest of the waker treats that cancellation as
 // shutdown rather than a loss.
 //
-// A failed write is logged and dw.persisted is left alone, so the next tick's
-// watermark (which only ever advances) is compared against the same baseline
-// and retries the write rather than silently giving up on it. The in-memory
-// watermark itself is never rolled back: the wakes for those pages are already
-// queued, and re-queueing them is the cheap direction.
+// A failed write leaves dw.persisted alone, so the next tick compares against
+// the same baseline and retries. The watermark itself is never rolled back: the
+// wakes are already queued, and re-queueing is the cheap direction.
 func (dw *waker) persist(ctx context.Context) {
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return

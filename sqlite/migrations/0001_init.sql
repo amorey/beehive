@@ -255,9 +255,10 @@ CREATE TABLE dependency_watermarks (
 --
 -- Single-writer. A second process sharing this database would steal pages from
 -- the first's scan, since the row is shared and each process only queues its own
--- registered kinds. Nothing in this project supports two embedding processes on
--- one file today (Open sets max_open_conns=1), so this is not a gap to close,
--- only a constraint to keep true.
+-- registered kinds. Nothing in the project documents or tests two embedding
+-- processes on one file, so this is a constraint to keep true rather than a gap
+-- to close. (Open's max_open_conns=1 is not the reason — it bounds one process's
+-- pool and says nothing about a second one.)
 --
 -- updated_at is guarded by the same WHERE as cursor, so a tick that made no
 -- progress dirties no page — load-bearing at the waker's cadence, not

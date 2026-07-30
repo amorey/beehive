@@ -106,12 +106,12 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   another route: the next tick seeds from the cursor as of *then*, so everything
   committed in between is below the watermark and never scanned.
 
-  **The race now survives only on the first start of a fresh database.** Once the
-  waker has persisted a cursor, `seed` resumes from it rather than from
-  `ObjectWritesMaxVersion`, and a write racing `Start`'s return lands *above* that
-  stored cursor — scanned on the next tick, not skipped. Only a store with no stored
-  cursor yet — no `DriverCursorer`, or nothing persisted so far — falls back to `max`
-  and reopens the original window.
+  **The race is now much narrower.** Once the waker has persisted a cursor, `seed`
+  resumes from it rather than from `ObjectWritesMaxVersion`, and a write racing
+  `Start`'s return lands *above* that stored cursor — scanned on the next tick, not
+  skipped. What still reopens the original window is any seed that falls back to
+  `max`: a store with no `DriverCursorer`, the first start of a fresh one, and a
+  stored cursor far enough behind that `wakeSeedBacklogCap` abandons it.
 
   Either way that change is never read by any scan — and a settled dependent D of T is
   invisible to every owed-work listing, since D's own generation never moved and
@@ -123,15 +123,13 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   **The fix is still to seed synchronously in `Start`**, under `startCtx`, before the
   reconcile loops are launched: the watermark then provably precedes every write any
-  caller could make, because no caller holds the stop func yet. Persisting the cursor
-  makes this slightly more expensive to justify than it was, not less: a synchronous
-  seed now reads *two* rows inside `Start`'s critical section
-  (`ObjectWritesMaxVersion` and `DriverCursorsGet`) instead of one, doubling the exact
-  hesitation this item already recorded about moving a store read into that section.
-  Not done for that reason, and because the answer to "does a failed seed abort
-  startup" has to be no, which means keeping the retry-on-next-tick path alive rather
-  than replacing it. Worth doing on latency grounds alone, but no longer urgent, and
-  now bounded to a smaller case than before.
+  caller could make, because no caller holds the stop func yet. Not done because a
+  synchronous seed now reads *two* rows inside `Start`'s critical section rather than
+  one, which only sharpens the hesitation recorded above about putting a store read
+  there at all (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)), and
+  because the answer to "does a failed seed abort startup" has to be no, which means
+  keeping the retry-on-next-tick path alive rather than replacing it. Worth doing on
+  latency grounds, but no longer urgent and now bounded to a smaller case.
 
   **Tripwires.** `TestWakerSeedsFromTheWriteLogMax` pins that the first scan on a store
   with no stored cursor starts at the write log's max; `TestWakerSeedsFromTheStoredCursor`
