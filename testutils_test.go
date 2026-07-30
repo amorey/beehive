@@ -338,6 +338,13 @@ type replayStore struct {
 	listed  *signal       // fires on the first page request, when set
 	err     error
 	seedErr error
+
+	// failFromCall makes err apply only from the given call onward (1-indexed),
+	// so a test can script an early page succeeding before a later one fails —
+	// proving what happened before the failure is not thrown away. Zero (the
+	// default) means err, when set, applies to every call, as before this field
+	// existed.
+	failFromCall int
 }
 
 func (s *replayStore) ObjectWritesMaxVersion(context.Context) (int64, error) {
@@ -362,7 +369,7 @@ func (s *replayStore) ObjectWritesListSince(_ context.Context, afterRV int64, li
 	if s.listed != nil {
 		s.listed.fire()
 	}
-	if s.err != nil {
+	if s.err != nil && (s.failFromCall == 0 || len(s.pages) >= s.failFromCall) {
 		return nil, s.err
 	}
 	var out []ObjectWrite

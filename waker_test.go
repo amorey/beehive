@@ -376,3 +376,98 @@ func TestWakerDisabledByNonPositiveInterval(t *testing.T) {
 
 	assert.Empty(t, store.pages, "a disabled waker never scans")
 }
+
+// A scan that advances the watermark persists it once, at the value the scan
+// reached — not per page, and not the watermark it started from.
+func TestWakerPersistsOnceWhenTheCursorMoves(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.seeded = true
+
+	dw.scan(context.Background())
+
+	assert.Equal(t, []int64{3}, store.setCalls, "persisted once, at the watermark the scan reached")
+	assert.EqualValues(t, 3, dw.persisted)
+}
+
+// A tick that finds nothing above the watermark writes nothing. The guard is on
+// the in-memory watermark rather than a hopeful call the store's own upsert
+// would just discard, so a quiet store costs this driver no round trip at all.
+func TestWakerSkipsTheWriteWhenQuiet(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.seeded, dw.watermark, dw.persisted = true, 3, 3
+
+	dw.scan(context.Background())
+
+	assert.Empty(t, store.setCalls, "nothing above the watermark, so nothing to persist")
+}
+
+// stop cancels the waker's ctx. A scan that reached ctx cancellation must not
+// persist or report anything on the way out — the rest of the waker already
+// treats a cancelled ctx as shutdown rather than a loss, and this has to match
+// it rather than log a warning on every clean stop that overlapped a scan.
+func TestWakerSkipsTheWriteOnShutdown(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	dw.seeded = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dw.scan(ctx)
+
+	assert.Empty(t, store.setCalls, "a scan caught by shutdown persists nothing")
+	assert.Empty(t, buf.String(), "and logs nothing: shutdown is not an outage")
+}
+
+// The defer that persists the cursor is what makes a mid-scan failure keep the
+// pages that already succeeded: an end-of-loop write would never run on this
+// path at all, since every exit from the paging loop is a return.
+func TestWakerPersistsProgressOnAFailedPage(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{
+		rows: replayRows(wakeScanPageCap + 5), err: errBoom, failFromCall: 2,
+	}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.seeded = true
+
+	dw.scan(context.Background())
+
+	require.EqualValues(t, wakeScanPageCap, dw.watermark, "the first page succeeded before the second failed")
+	assert.Equal(t, []int64{wakeScanPageCap}, store.setCalls, "and that progress is what gets persisted")
+}
+
+// The whole point, proven end to end: a dependent whose target changed while
+// the process was down is still woken on the very first scan back, because the
+// new process resumes from the stored cursor rather than reseeding at the
+// write log's current max — which would place the watermark past that change
+// and never scan it at all.
+func TestWakerResumesFromTheStoredCursor(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+	store := &cursorStore{replayStore: replayStore{seed: 10, rows: changedAt(10)}}
+	store.deps = map[ObjectID][]ObjectRef{1: {{ID: 7, Kind: "Widget"}}}
+
+	first, rsFirst := wakerOver(store, widget)
+	require.True(t, first.seed(context.Background()))
+	// A write lands while the first process is up; its scan finds and persists it.
+	store.rows = append(store.rows, ObjectWrite{ID: 2, ResourceVersion: 20})
+	store.deps[2] = []ObjectRef{{ID: 8, Kind: "Widget"}}
+	store.seed = 20
+	first.scan(context.Background())
+	require.Equal(t, []ObjectID{8}, queuedIDs(rsFirst[widget].work))
+	require.Equal(t, []int64{20}, store.setCalls, "the first process persists its cursor before it goes away")
+
+	// The process is gone; a second write lands while nothing is running to see it.
+	store.rows = append(store.rows, ObjectWrite{ID: 3, ResourceVersion: 30})
+	store.deps[3] = []ObjectRef{{ID: 9, Kind: "Widget"}}
+	store.seed = 30
+
+	second, rsSecond := wakerOver(store, widget)
+	require.True(t, second.seed(context.Background()))
+	assert.EqualValues(t, 20, second.watermark, "seeded from the stored cursor, not the write log's new max")
+
+	second.scan(context.Background())
+	assert.Equal(t, []ObjectID{9}, queuedIDs(rsSecond[widget].work),
+		"the dependent of the write made while the process was down is woken on the first scan back")
+}

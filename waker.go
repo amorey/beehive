@@ -159,6 +159,13 @@ func (dw *waker) scan(ctx context.Context) {
 		dw.seed(ctx)
 		return
 	}
+	// A defer, not a write after the loop: every exit below is a return — the
+	// error path, the empty page, a failed dependentsWake, and the short page
+	// that is the overwhelmingly common one — so an end-of-loop write would be
+	// unreachable code. The defer also does the right thing on the error path
+	// specifically: it persists whatever earlier pages already advanced the
+	// watermark to, rather than losing that progress along with the failure.
+	defer dw.persist(ctx)
 	for {
 		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
@@ -182,6 +189,36 @@ func (dw *waker) scan(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// persist writes the watermark through cursors when it has advanced since the
+// last successful write, so a future seed can resume here instead of at
+// whatever ObjectWritesMaxVersion reports then. It is a bare statement outside
+// any transaction: the watermark may end up ahead of what the wakes it produced
+// actually survive to do, and that is an accepted, bounded exposure covered by
+// the stale-dependents pass — see the design doc this shipped with.
+//
+// ctx.Err() is checked directly rather than left to the write to discover,
+// because stop cancels this same ctx: without the check, every shutdown that
+// catches a scan mid-page would log a warning for a write that failed for no
+// reason of its own, where the rest of the waker treats that cancellation as
+// shutdown rather than a loss.
+//
+// A failed write is logged and dw.persisted is left alone, so the next tick's
+// watermark (which only ever advances) is compared against the same baseline
+// and retries the write rather than silently giving up on it. The in-memory
+// watermark itself is never rolled back: the wakes for those pages are already
+// queued, and re-queueing them is the cheap direction.
+func (dw *waker) persist(ctx context.Context) {
+	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
+		return
+	}
+	if err := dw.cursors.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
+		dw.bh.log().WarnContext(ctx, "persisting the dependency waker's cursor failed; the next tick retries it, and a restart before then re-scans from the last cursor that was persisted",
+			"watermark", dw.watermark, "err", err)
+		return
+	}
+	dw.persisted = dw.watermark
 }
 
 // dependentsWake queues every object that depends_on one of the page's targets, each
