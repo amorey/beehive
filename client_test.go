@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -345,6 +347,10 @@ func TestClientRejectsEmptySlug(t *testing.T) {
 		_, created, err := client.GetOrCreate(ctx, "", cSpec{Val: "a"})
 		require.ErrorIs(t, err, ErrInvalidSlug)
 		assert.False(t, created)
+	})
+	t.Run("Update", func(t *testing.T) {
+		_, err := client.Update(ctx, "", cSpec{Val: "a"})
+		require.ErrorIs(t, err, ErrInvalidSlug)
 	})
 	t.Run("Get", func(t *testing.T) {
 		// Not ErrNotFound: that would send the caller hunting for a missing row
@@ -3066,4 +3072,20 @@ func TestGenerateSlugAcceptsAnEmptyPrefix(t *testing.T) {
 	slug := GenerateSlug("")
 	assert.NotEmpty(t, slug)
 	assert.NoError(t, checkSlug(slug))
+}
+
+// GenerateSlug's error branch is unreachable in production — io.ReadFull of 16
+// bytes from a 16-byte reader cannot come up short — but the branch has to stay,
+// because the value behind a swallowed error is uuid.Nil, and every slug collapsing
+// to one constant would surface as ErrSlugTaken on every create after the first. So
+// pin that it panics rather than returning that constant.
+func TestGenerateSlugPanicsRatherThanReturningTheNilUUID(t *testing.T) {
+	orig := newUUIDv7
+	t.Cleanup(func() { newUUIDv7 = orig })
+	newUUIDv7 = func(io.Reader) (uuid.UUID, error) { return uuid.Nil, errBoom }
+
+	assert.PanicsWithValue(t,
+		"beehive: unreachable: UUIDv7 from a 16-byte reader: "+errBoom.Error(),
+		func() { GenerateSlug("cache") },
+		"a swallowed error would make every slug identical")
 }

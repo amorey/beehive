@@ -5574,3 +5574,34 @@ func TestRequestDeletionReportsARowCollectedAfterTheProbe(t *testing.T) {
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 	assert.False(t, changed)
 }
+
+// asSlugTaken translates only the UNIQUE violation; every other failure has to pass
+// through untouched, or a caller's retry-on-ErrSlugTaken loop would spin on a
+// permanent error. Driven with the table gone, so the INSERT fails with a different
+// SQLite code.
+func TestObjectsCreateLeavesANonUniqueErrorAlone(t *testing.T) {
+	store := newRawStore(t)
+	dropObjects(t, store)
+
+	_, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
+		Slug: uniqueSlug(),
+		Spec: []byte(`{}`),
+	})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, storeapi.ErrSlugTaken, "a missing table is not a taken slug")
+}
+
+// probeDeletionBySlug's read failure is distinct from its no-rows branch: absent is
+// idempotent success, but a broken read must surface, or a delete would report
+// "already gone" for a store it could not question.
+func TestDeletionRequestsCreateBySlugSurfacesAProbeReadError(t *testing.T) {
+	store := newRawStore(t)
+	dropObjects(t, store)
+
+	changed, err := store.DeletionRequestsCreateBySlug(context.Background(), testGK, "whatever")
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "a broken read is not an absent row")
+	assert.False(t, changed)
+}

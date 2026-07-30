@@ -59,6 +59,12 @@ var ErrNoController = errors.New("beehive: no controller registered for kind")
 //			return obj, err
 //		}
 //	}
+//
+// newUUIDv7 is a seam for the one branch of GenerateSlug production cannot reach.
+// The panic it guards is worth keeping — see below — and a guard no test can enter
+// is a guard that rots, so the indirection buys the assertion that it still fires.
+var newUUIDv7 = uuid.NewV7FromReader
+
 func GenerateSlug(prefix string) string {
 	// Drawn here rather than left to uuid.NewV7, so that no error is reachable and
 	// the signature can say so. Two mutable globals sit on that path — uuid's own
@@ -77,7 +83,7 @@ func GenerateSlug(prefix string) string {
 	// and this reader holds exactly 16 — but it is checked rather than dropped,
 	// because the value behind a dropped error would be uuid.Nil, and every slug
 	// collapsing to one constant is a far worse failure than a panic naming its cause.
-	id, err := uuid.NewV7FromReader(bytes.NewReader(b[:]))
+	id, err := newUUIDv7(bytes.NewReader(b[:]))
 	if err != nil {
 		panic("beehive: unreachable: UUIDv7 from a 16-byte reader: " + err.Error())
 	}
