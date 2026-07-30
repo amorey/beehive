@@ -511,6 +511,24 @@ func TestObjectsSlugIsNotNullable(t *testing.T) {
 	assert.Contains(t, err.Error(), "NOT NULL")
 }
 
+// And the empty string, which is the same hole from the other side: "" is what
+// unset configuration reads as, so a row admitted under it is one every such caller
+// would collide on and no slug-keyed call could address. Client rejects it with
+// ErrInvalidSlug, but Store is a public extension point, so the column is where the
+// invariant has to hold.
+func TestObjectsSlugRejectsTheEmptyString(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Slug: "",
+		Spec: []byte(`{}`),
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CHECK")
+}
+
 func TestObjectsCreateAssignsIdentity(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

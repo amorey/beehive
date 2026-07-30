@@ -246,10 +246,14 @@ const (
 // compiler refuse what the store would otherwise drop.
 type ObjectsCreateInput struct {
 	Finalizers []string
-	// Slug is the object's name and is required: the uniqueness constraint is per
-	// kind, and the column is NOT NULL. A value type rather than a pointer because
-	// there is no unnamed object to represent — see ErrInvalidSlug for the empty
-	// string, which the client rejects before it reaches here.
+	// Slug is the object's name, and is required. A value type rather than a pointer
+	// because there is no unnamed object to represent.
+	//
+	// An implementation MUST reject the empty string, and MUST enforce uniqueness
+	// within gk. Client rejects "" up front with ErrInvalidSlug, but that is a
+	// courtesy to the caller, not the guarantee: a row admitted under "" is one no
+	// slug-keyed call can ever address again, so the store is where it has to be
+	// refused.
 	Slug string
 	Spec []byte
 	// SpecVersion is the migrator schema version Spec was written at, stamped onto

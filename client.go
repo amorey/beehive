@@ -28,25 +28,18 @@ import (
 // client-only kind is read/write but never reconciled.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// ErrInvalidSlug reports the empty string passed where a slug is required.
+// ErrInvalidSlug reports the empty string passed where a slug is required — the
+// one rule beehive enforces on a slug, which is otherwise opaque. "" is not a name
+// anyone chooses; it is what an unset configuration field reads as, so admitting it
+// would silently converge every caller whose config was unset on one shared row.
 //
-// It is the one rule beehive enforces on a slug, which is otherwise opaque — no
-// character set, no length limit, no normalization. The exception exists because
-// the empty slug is not a name a caller chooses: it is what an unset
-// configuration field reads as, and under an unvalidated contract every caller
-// whose config was unset would silently converge on one shared row. Every other
-// malformed slug at least addresses the row its author meant.
-//
-// Returned by the slug-keyed writes and by the slug-keyed reads alike. A read
-// answers with this rather than ErrNotFound so the caller looks at the argument
-// they passed instead of at a row that was never going to be there.
+// The reads return it too, rather than ErrNotFound, so such a caller looks at the
+// argument they passed instead of at a row that was never going to be there.
 var ErrInvalidSlug = errors.New("beehive: slug must not be empty")
 
-// checkSlug rejects the empty slug. Callers run it before any store work — this
-// is caller-input validation, and deferring it would make the same call succeed
-// or fail depending on whether a row happens to exist, hiding the bug until GC or
-// a cold start removed it (the same reasoning as GetOrCreate's eager spec and
-// option validation).
+// checkSlug runs before any store work: deferring it would make the same call
+// succeed or fail depending on whether a row happens to exist, hiding the bug until
+// GC or a cold start removed it (as with GetOrCreate's eager spec validation).
 func checkSlug(slug string) error {
 	if slug == "" {
 		return fmt.Errorf("%w: pass the name the object should be addressable by", ErrInvalidSlug)
@@ -910,7 +903,7 @@ func (c *clientImpl[Spec, Status]) DeleteByID(ctx context.Context, id ObjectID) 
 	return nil
 }
 
-// Delete is Delete keyed by a name rather than a handle; the store resolves
+// Delete is DeleteByID keyed by a name rather than a handle; the store resolves
 // and marks in one statement. See the Client interface for the full contract.
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, slug string) error {
 	if err := checkSlug(slug); err != nil {
@@ -918,14 +911,14 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, slug string) erro
 	}
 	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
 	// kind's included — so it is idempotent success rather than a failure to report.
-	// The one place a slug delete departs from Delete, which reports a missing id.
+	// The one place a slug delete departs from DeleteByID, which reports a missing id.
 	if _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
 		return err
 	}
-	// Nothing scheduled, as in Delete: the mark is what the GC sweeper lists.
+	// Nothing scheduled, as in DeleteByID: the mark is what the GC sweeper lists.
 	return nil
 }
 
