@@ -466,8 +466,8 @@ func TestWatchDoesNotTombstoneARowItCouldNeverDecode(t *testing.T) {
 	defer cancel()
 
 	store, _, client, _ := watchFixture(t)
-	poison, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
 

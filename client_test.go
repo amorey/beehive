@@ -159,12 +159,12 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
-	_, err = store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
+	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
 
@@ -189,12 +189,12 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
-	_, err = store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`not json`),
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{"Val":"good"}`),
+	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{"Val":"good"}`),
 	})
 	require.NoError(t, err)
 
@@ -1145,9 +1145,9 @@ func TestClientGetBySlugFound(t *testing.T) {
 	// Create a named object via the store directly (client.Create uses nil slug).
 	specJSON, err := json.Marshal(cSpec{Val: "hello"})
 	require.NoError(t, err)
-	raw, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind,
-		Slug: new("myobj"), Spec: specJSON,
+	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Slug: new("myobj"),
+		Spec: specJSON,
 	})
 	require.NoError(t, err)
 
@@ -1365,7 +1365,7 @@ type createBadJSONStore struct {
 	fakeStore
 }
 
-func (s *createBadJSONStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -1374,7 +1374,7 @@ type errorObjectsCreateStore struct {
 	fakeStore
 }
 
-func (s *errorObjectsCreateStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *errorObjectsCreateStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1426,7 +1426,7 @@ func (s *createOrUpdateBadJSONStore) ObjectsGetBySlug(_ context.Context, _ Group
 	return nil, ErrNotFound
 }
 
-func (s *createOrUpdateBadJSONStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createOrUpdateBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -1437,7 +1437,7 @@ type createErrorStore struct {
 	createOrUpdateBadJSONStore
 }
 
-func (s *createErrorStore) ObjectsCreate(_ context.Context, _ *RawObject) (*RawObject, error) {
+func (s *createErrorStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return nil, errBoom
 }
 

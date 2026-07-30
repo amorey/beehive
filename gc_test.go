@@ -432,8 +432,8 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// Simulate a crash mid-delete: a deletion-pending row is already in the durable
 	// store before any control plane runs. (Written through the store directly, so
 	// no reconcile has touched it.)
-	raw, err := store.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
+	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	// Settle it first, so the GC sweeper's startup pass really is the *only* path
@@ -763,8 +763,8 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	real := newClientTestStore(t)
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
-	raw, err := real.ObjectsCreate(ctx, &RawObject{
-		Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: []byte(`{}`),
+	raw, err := real.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 

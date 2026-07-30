@@ -37,6 +37,11 @@ type FreePagesReleaser = storeapi.FreePagesReleaser
 // Object[Spec, Status] values; the Store never inspects them.
 type RawObject = storeapi.RawObject
 
+// ObjectsCreateInput is the narrow write shape ObjectsCreate accepts — only the
+// fields a create honours, so the compiler refuses the rest rather than the store
+// dropping them.
+type ObjectsCreateInput = storeapi.ObjectsCreateInput
+
 // RawEvent is the untyped event-log row below the generic boundary — one
 // aggregated run. The client decodes it into the public Event.
 type RawEvent = storeapi.Event

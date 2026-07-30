@@ -650,7 +650,7 @@ func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.Ra
 	return obj, nil
 }
 
-func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
 	// Self-wrapping keeps the version draw and the insert atomic: a create is two
 	// statements (nextResourceVersion, then INSERT ... RETURNING), and a scan of the
 	// write log orders rows by the version they were stamped with. Store is public,
@@ -659,7 +659,7 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject
 	var created *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		created, err = s.objectsCreate(ctx, obj)
+		created, err = s.objectsCreate(ctx, gk, in)
 		return err
 	})
 	if err != nil {
@@ -668,8 +668,8 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, obj *storeapi.RawObject
 	return created, nil
 }
 
-func (s *sqliteStore) objectsCreate(ctx context.Context, obj *storeapi.RawObject) (*storeapi.RawObject, error) {
-	finalizers := marshalFinalizers(obj.Finalizers)
+func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
+	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -685,7 +685,7 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, obj *storeapi.RawObject
 			 generation, resource_version, finalizers, created_at, updated_at)
 		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
 		RETURNING `+objectColumns,
-		obj.Group, obj.Kind, obj.Slug, jsonText(obj.Spec), obj.SpecVersion,
+		gk.Group, gk.Kind, in.Slug, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
 	return s.scanWritten(ctx, row)
 }

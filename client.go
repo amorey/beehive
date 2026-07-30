@@ -363,9 +363,7 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // each caller has already populated from its single source (WithSlug for Create,
 // the positional argument for CreateOrUpdate/GetOrCreate).
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
-	raw, err := c.bh.store.ObjectsCreate(ctx, &RawObject{
-		Group:       c.gk.Group,
-		Kind:        c.gk.Kind,
+	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
 		Slug:        co.slug,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),

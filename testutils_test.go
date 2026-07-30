@@ -165,7 +165,7 @@ func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) 
 // AfterCommit runs inline: the fake never opens a transaction, so there is no
 // commit to wait for.
 func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
-func (s *fakeStore) ObjectsCreate(context.Context, *RawObject) (*RawObject, error) {
+func (s *fakeStore) ObjectsCreate(context.Context, GroupKind, ObjectsCreateInput) (*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsCreate")
 }
 func (s *fakeStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {

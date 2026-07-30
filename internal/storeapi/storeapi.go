@@ -196,8 +196,8 @@ type RawObject struct {
 	// objects.reconcile_owed column); 0 means none. The reconciler reads it to decide
 	// what to subtract after a successful pass. Like ResourceVersion it is
 	// store-owned: reported on reads, moved only by ReconcileOwedIncrement and
-	// ReconcileOwedDecrement, and ignored on a RawObject handed to ObjectsCreate,
-	// since a new object owes nothing.
+	// ReconcileOwedDecrement. A new object owes nothing, which is why
+	// ObjectsCreateInput has no counterpart field.
 	ReconcileOwed int64
 	Finalizers    []string
 	Conditions    []Condition // assembled on reads; nil when the object has none
@@ -234,6 +234,24 @@ const (
 	// RelationDependsOn: a change to the target requeues the dependent.
 	RelationDependsOn Relation = "depends_on"
 )
+
+// ObjectsCreateInput is everything ObjectsCreate accepts from its caller. It is
+// deliberately not RawObject: that is the read shape, mirroring a whole row, and
+// passing it here offered a caller eighteen fields of which the INSERT bound six —
+// a seeded Status being the sharp case, discarded with no error. The rest of a new
+// row is store-assigned (ID, ResourceVersion, the timestamps) or fixed (Generation
+// starts at 1, ReconcileOwed at 0, Status NULL), so a narrow input lets the
+// compiler refuse what the store would otherwise drop.
+type ObjectsCreateInput struct {
+	Finalizers []string
+	// Slug is nil for an unnamed object; the uniqueness constraint is per kind.
+	Slug *string
+	Spec []byte
+	// SpecVersion is the migrator schema version Spec was written at, stamped onto
+	// the row like any other write. Status has no counterpart here: a new row has no
+	// status to version.
+	SpecVersion int
+}
 
 // EdgesAddResult is what a caller needs in order to follow up on an edge it
 // declared. All of it falls out of work EdgesAdd already does, so none of it costs an
@@ -444,10 +462,10 @@ type Store interface {
 	// to gk: another kind's id is rejected with ErrWrongKind.
 	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (*RawObject, error)
 
-	// ObjectsCreate inserts a new object. The store assigns ID and
-	// ResourceVersion and sets Generation to 1; the caller supplies the rest
-	// (Group, Kind, Slug, Spec, Finalizers).
-	ObjectsCreate(ctx context.Context, obj *RawObject) (*RawObject, error)
+	// ObjectsCreate inserts a new object of kind gk. The store assigns ID and
+	// ResourceVersion and sets Generation to 1; ObjectsCreateInput carries
+	// everything else create accepts, and nothing it doesn't.
+	ObjectsCreate(ctx context.Context, gk GroupKind, in ObjectsCreateInput) (*RawObject, error)
 
 	// ObjectsDelete removes the row outright. Callers must ensure finalizers are
 	// empty first; this is the physical delete the GC path performs.
