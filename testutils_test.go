@@ -116,11 +116,12 @@ func mustCreate[Spec, Status any](
 	t *testing.T,
 	ctx context.Context,
 	c Client[Spec, Status],
+	slug string,
 	spec Spec,
 	opts ...Option,
 ) *Object[Spec, Status] {
 	t.Helper()
-	obj, err := c.Create(ctx, spec, opts...)
+	obj, err := c.Create(ctx, slug, spec, opts...)
 	require.NoError(t, err)
 	return obj
 }

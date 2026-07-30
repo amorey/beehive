@@ -40,7 +40,18 @@ type ObjectChange[Spec, Status any] struct {
 // Client is the user-facing API for a single resource kind: the surface for
 // creating, reading, updating, deleting, and watching objects.
 type Client[Spec, Status any] interface {
-	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+	// Create inserts a new object under slug, which is required and immutable:
+	// it is the name every later slug-keyed call addresses the row by. A slug
+	// already held by a live or deletion-pending row fails on the store's UNIQUE
+	// constraint — Create never writes to a row it found, so use GetOrCreate when
+	// "already there" is an acceptable outcome.
+	//
+	// The slug is positional rather than an option because it is required, and an
+	// options bag can express an absence a required argument should not have.
+	//
+	// The new object is unsettled and so owed its first reconcile; nothing is
+	// scheduled, since the owed pass lists exactly that.
+	Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
 	// Delete soft-deletes the object by setting DeletionRequestedAt. That mark is the
 	// whole signal: it puts the row in the GC sweeper's listing, so the next sweep
 	// hands it to the controller to clear finalizers, and physical removal follows
@@ -95,9 +106,6 @@ type Client[Spec, Status any] interface {
 	// Create; returning an existing row writes nothing and owes nothing.
 	//
 	// opts apply only on the create branch (WithOwner, WithFinalizers, WithOnCreate).
-	// WithSlug is rejected with ErrConflictingOption rather than ignored: the slug is
-	// positional here, so the option can only contradict it, and silently dropping it
-	// would surface much later as an ErrNotFound on the slug the caller meant to use.
 	//
 	// The returned created bool is synchronous, so inside a caller's
 	// ControllerClient.Within it is set before the enclosing transaction commits: a
@@ -262,7 +270,7 @@ func (c *clientImpl[Spec, Status]) decode(raw *RawObject) (*Object[Spec, Status]
 	return rawToTyped[Spec, Status](raw, c.bh.migratorFor(c.gk))
 }
 
-func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
@@ -276,7 +284,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	// Within keeps the insert and its owner ref atomic, so a crash between them
 	// can't leave an ownerless child the GC path would never collect.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err := c.insertObject(ctx, b, co)
+		raw, err := c.insertObject(ctx, slug, b, co)
 		if err != nil {
 			return err
 		}
@@ -361,12 +369,12 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // edge. Every create path shares it, so the row shape, the spec-version stamp,
 // and the owner-ref policy live in one place. Callers run it inside a Within:
 // the insert and its ref must commit together, or a crash between them leaves an
-// ownerless child the GC path would never collect. The slug rides on co, which
-// each caller has already populated from its single source (WithSlug for Create,
-// the positional argument for GetOrCreate).
-func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
+// ownerless child the GC path would never collect. The slug is a parameter rather
+// than a field on co because it is required: an options bag can express its
+// absence, and a required argument should not be able to.
+func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, slug string, spec []byte, co *createOptions) (*RawObject, error) {
 	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
-		Slug:        co.slug,
+		Slug:        &slug,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
 		Finalizers:  co.finalizers,
@@ -412,14 +420,6 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 	if err != nil {
 		return nil, false, err
 	}
-	// The slug is positional here, so WithSlug can only contradict it. Reject rather
-	// than silently drop it: the ignored option would otherwise surface much later,
-	// as an ErrNotFound on a slug the caller believed it had asked for.
-	if co.slug != nil {
-		return nil, false, fmt.Errorf("%w: GetOrCreate takes the slug positionally; WithSlug(%q) conflicts with %q",
-			ErrConflictingOption, *co.slug, slug)
-	}
-
 	var obj *Object[Spec, Status]
 	var created bool
 	// One Within around the read and the insert is what removes the caller's
@@ -437,10 +437,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string,
 		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
-		// co.slug is nil here — WithSlug was rejected up front — so the positional
-		// slug is the row's only name.
-		co.slug = &slug
-		raw, err := c.insertObject(ctx, b, co)
+		raw, err := c.insertObject(ctx, slug, b, co)
 		if err != nil {
 			return err
 		}

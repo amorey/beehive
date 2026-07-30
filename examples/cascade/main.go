@@ -151,7 +151,7 @@ func main() {
 
 	// A Cluster guarded by a connection finalizer, owning two caches that each
 	// guard a cache-flush finalizer.
-	cluster, err := clusterClient.Create(ctx, ClusterSpec{Endpoint: "db.example:5432"},
+	cluster, err := clusterClient.Create(ctx, "primary", ClusterSpec{Endpoint: "db.example:5432"},
 		beehive.WithFinalizers(connectionFinalizer))
 	exitOnErr(err)
 	fmt.Printf("created Cluster %d (endpoint=%s, finalizers=%v)\n", cluster.ID, cluster.Spec.Endpoint, cluster.Finalizers)
