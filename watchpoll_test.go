@@ -659,7 +659,7 @@ func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
 	require.Equal(t, Added, recv(t, ch).Type)
 
 	// The deletion mark is an ordinary write, so it arrives as a Modified.
-	require.NoError(t, client.Delete(ctx, watched.ID))
+	require.NoError(t, client.DeleteByID(ctx, watched.ID))
 	require.Equal(t, Modified, recv(t, ch).Type)
 
 	// Put another object's write above that mark, and let the stream take it in, so

@@ -42,7 +42,7 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	obj := mustCreate(t, ctx, client, "obj-1", cSpec{Val: "hello"}, WithFinalizers("a", "b"))
 
 	require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "a"))
-	got, err := client.Get(ctx, obj.ID)
+	got, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
 }
@@ -120,7 +120,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	// Status must now be visible through the client.
-	got, err := client.Get(ctx, obj.ID)
+	got, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "done", got.Status.Val)
@@ -160,10 +160,10 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	// no-op write that leaves it alone is one the poller cannot see, whenever it
 	// happens to look. The channel assertion below is the second half: a stray
 	// frame for this write would have to arrive before the real change's.
-	before, err := client.Get(ctx, obj.ID)
+	before, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
-	after, err := client.Get(ctx, obj.ID)
+	after, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, before.ResourceVersion, after.ResourceVersion,
 		"an unchanged status bumped resource_version, which is what the watch emits on")
@@ -201,7 +201,7 @@ func TestControllerClientWithin(t *testing.T) {
 		return sentinel
 	})
 	require.ErrorIs(t, err, sentinel)
-	got, err := client.Get(ctx, obj.ID)
+	got, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, got.Status, "writes inside a Within that errored must roll back")
 
@@ -212,7 +212,7 @@ func TestControllerClientWithin(t *testing.T) {
 		}
 		return cc.ConditionsSet(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
 	}))
-	got, err = client.Get(ctx, obj.ID)
+	got, err = client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "committed", got.Status.Val)
@@ -315,12 +315,12 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	obj := mustCreate(t, ctx, client, "obj-10", cSpec{Val: "hello"})
 
 	require.NoError(t, cc.ConditionsSet(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue}))
-	got, err := client.Get(ctx, obj.ID)
+	got, err := client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(got.Conditions, "Ready"))
 
 	require.NoError(t, cc.ConditionsDelete(ctx, obj.ID, "Ready"))
-	got, err = client.Get(ctx, obj.ID)
+	got, err = client.GetByID(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "condition removed via ControllerClient")
 }
@@ -630,7 +630,7 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	require.ErrorIs(t, cc.FinalizersDelete(ctx, gadget.ID, "f"), ErrWrongKind)
 
 	// The Gadget is untouched: no status, no conditions, finalizer intact.
-	got, err := gadgets.Get(ctx, gadget.ID)
+	got, err := gadgets.GetByID(ctx, gadget.ID)
 	require.NoError(t, err)
 	assert.Nil(t, got.Status, "foreign status write rejected")
 	assert.Empty(t, got.Conditions, "foreign condition write rejected")

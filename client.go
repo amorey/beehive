@@ -78,22 +78,25 @@ type Client[Spec, Status any] interface {
 	// The new object is unsettled and so owed its first reconcile; nothing is
 	// scheduled, since the owed pass lists exactly that.
 	Create(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	// Delete soft-deletes the object by setting DeletionRequestedAt. That mark is the
-	// whole signal: it puts the row in the GC sweeper's listing, so the next sweep
-	// hands it to the controller to clear finalizers, and physical removal follows
-	// once they clear. An id naming no object of this kind is ErrNotFound — contrast
-	// DeleteBySlug, which folds absence to nil.
-	Delete(ctx context.Context, id ObjectID) error
-	// DeleteBySlug requests deletion of the object with the given slug. It is
-	// idempotent: a slug that matches no object returns nil (already gone), and a
-	// row already deletion-pending is a no-op returning nil (as Delete is on a
-	// repeated call). Kind-scoped like GetBySlug — a slug is per-kind, so this only
-	// ever targets this client's kind. Deletion itself is Delete's semantics: the
-	// soft-delete mark, collected on a later sweep.
+	// Delete soft-deletes whatever holds slug now, by setting DeletionRequestedAt.
+	// That mark is the whole signal: it puts the row in the GC sweeper's listing, so
+	// the next sweep hands it to the controller to clear finalizers, and physical
+	// removal follows once they clear.
+	//
+	// It is idempotent: a slug no row holds returns nil (already gone), and a row
+	// already deletion-pending is a no-op returning nil. Kind-scoped like Get — a
+	// slug is per-kind, so this only ever targets this client's kind, and another
+	// kind's row holding the same slug is simply not found.
 	//
 	// The delete-if-present partner to GetOrCreate's create-if-absent, so an
-	// ensure/remove pair is one call on each side.
-	DeleteBySlug(ctx context.Context, slug string) error
+	// ensure/remove pair is one call on each side. Use DeleteByID when you mean the
+	// one incarnation you read a moment ago rather than whatever holds the name now.
+	Delete(ctx context.Context, slug string) error
+	// DeleteByID is Delete keyed by incarnation: it acts on that one row, or returns
+	// ErrNotFound. It does not fold absence to nil, because an id naming no object
+	// is not "already in the desired state" — it is a row that was collected out from
+	// under the caller, which is exactly what such a caller wants to hear about.
+	DeleteByID(ctx context.Context, id ObjectID) error
 	// DependenciesList returns the objects id depends on (its outgoing depends_on
 	// edges). The lazy counterpart to LoadDependencies().
 	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
@@ -114,8 +117,14 @@ type Client[Spec, Status any] interface {
 	// client's kind, and polls on a fixed interval — so a run extended several
 	// times within one interval is delivered once, carrying its latest state.
 	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
-	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
-	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+	// Get loads whatever holds slug now, or returns ErrNotFound. Kind-scoped: a
+	// slug is unique only within a GroupKind, so another kind's row holding the same
+	// slug is not found rather than returned.
+	Get(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
+	// GetByID is Get keyed by incarnation. Use it to finish work on a row already in
+	// hand — notably the read half of a read-modify-write, whose write half is
+	// UpdateByID.
+	GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
 	// GetOrCreate returns the object with the given slug, creating it from spec if
 	// absent. It NEVER mutates an existing row: a slug held by a live OR
 	// deletion-pending row is returned as-is with created=false, so the caller can
@@ -530,7 +539,7 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	return obj, nil
 }
 
-func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error) {
 	raw, err := c.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
@@ -572,7 +581,7 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	return err
 }
 
-func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Get(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
 	if err := checkSlug(slug); err != nil {
 		return nil, err
 	}
@@ -845,7 +854,7 @@ func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID
 	return Schedule{NextRequeueAt: at}, nil
 }
 
-func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
+func (c *clientImpl[Spec, Status]) DeleteByID(ctx context.Context, id ObjectID) error {
 	// DeletionRequestsCreate bumps resource_version only on a real state change — an
 	// idempotent retry leaves it untouched, so no watch poll reports a spurious
 	// diff. It folds this client's kind into the write, so a foreign id can't be
@@ -862,9 +871,9 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	return nil
 }
 
-// DeleteBySlug is Delete keyed by a name rather than a handle; the store resolves
+// Delete is Delete keyed by a name rather than a handle; the store resolves
 // and marks in one statement. See the Client interface for the full contract.
-func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string) error {
+func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, slug string) error {
 	if err := checkSlug(slug); err != nil {
 		return err
 	}
