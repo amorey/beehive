@@ -1102,10 +1102,9 @@ func TestClientGetByIDNotFound(t *testing.T) {
 }
 
 func TestClientWatchNonExistentID(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	parent, client := watchTestClient(t)
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-
-	_, client := watchTestBH(t)
 
 	// Watch a non-existent ID: the snapshot loader returns (nil, nil) via the
 	// ErrNotFound path, yielding an empty snapshot and an open channel.
@@ -1484,23 +1483,33 @@ func assertChanClosed[T any](t *testing.T, ch <-chan T) {
 	}
 }
 
-// watchTestBH builds a Beehive with a real SQLite store and a registered
-// controller for clientTestGK. No Start is needed for client-side event tests.
-func watchTestBH(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
+// watchTestClient builds a Beehive with a real SQLite store and a registered
+// controller for clientTestGK. No Start is needed for client-side watch tests.
+//
+// It returns the context those watches must run on, cancelled when the test
+// ends. Cancelling is the *only* thing that stops a stream: a store closed under
+// a poll is a read failure, which the poller logs and retries on the next tick.
+// A stream left on context.Background() therefore outlives its test and keeps
+// polling a closed store every fastTick for the rest of the binary — eight of
+// them accumulated here once, and the drag starved a later test's failsafe on a
+// single-proc race build.
+func watchTestClient(t *testing.T) (context.Context, Client[cSpec, cStatus]) {
 	t.Helper()
 	bh, err := New(newClientTestStore(t), fast()...)
 	require.NoError(t, err)
 	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	return bh, client
+	// Registered after the store's own close, so it runs before it: the streams
+	// are cancelled first, and none of them sees the closed store at all.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return ctx, NewClient[cSpec, cStatus](bh, clientTestGK)
 }
 
 // TestWatchListReceivesAddedOnCreate verifies that WatchList delivers a
 // Added when an object is created.
 func TestWatchListReceivesAddedOnCreate(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -1516,8 +1525,7 @@ func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 // TestWatchListReceivesModifiedOnUpdate verifies that WatchList delivers a
 // Modified when an object's spec is updated.
 func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	// Subscribe before creating so the snapshot is empty and the first event is
 	// the Modified from the Update, not an Added from the snapshot.
@@ -1541,8 +1549,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 // Modified (not Deleted) when deletion is requested, because the
 // object still exists in the store with DeletionRequestedAt set.
 func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -1562,8 +1569,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 // TestWatchListNoEventOnIdempotentDelete verifies that a second Delete call for
 // an already-pending-deletion object emits no additional watch event.
 func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -1597,8 +1603,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 // TestWatchReceivesOnlyMatchingID verifies that Watch(id) filters out events
 // for other objects.
 func TestWatchReceivesOnlyMatchingID(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	obj1 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	obj2 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
@@ -1627,8 +1632,8 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 // TestWatchListClosesOnCtxCancel verifies that the watch channel is closed when
 // the context is cancelled.
 func TestWatchListClosesOnCtxCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	_, client := watchTestBH(t)
+	parent, client := watchTestClient(t)
+	ctx, cancel := context.WithCancel(parent)
 
 	ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
@@ -1639,10 +1644,10 @@ func TestWatchListClosesOnCtxCancel(t *testing.T) {
 
 // TestWatchClosesOnCtxCancel verifies that Watch(id) channel closes on ctx cancel.
 func TestWatchClosesOnCtxCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	_, client := watchTestBH(t)
+	parent, client := watchTestClient(t)
+	ctx, cancel := context.WithCancel(parent)
 
-	obj, err := client.Create(context.Background(), "decoded", cSpec{})
+	obj, err := client.Create(parent, "decoded", cSpec{})
 	require.NoError(t, err)
 
 	ch, err := client.ObjectsWatch(ctx, obj.ID)
@@ -1655,9 +1660,13 @@ func TestWatchClosesOnCtxCancel(t *testing.T) {
 // TestWatchReceivesModifiedOnStatusUpdate verifies that WatchList delivers a
 // Modified when the controller calls UpdateStatus.
 func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
-	ctx := context.Background()
+	// Cancelled at the end of the test: the watch below runs on it, and a stream
+	// left on an uncancellable context polls on past the test (see watchTestClient).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// watchTestBH already registered one; we need a fresh beehive for this test.
+	// A fresh beehive rather than watchTestClient's, since this test needs the
+	// ControllerClient that registration returns.
 	bh2, err := New(newClientTestStore(t), fast()...)
 	require.NoError(t, err)
 	cc, err := Register(bh2, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -1696,8 +1705,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 // TestWatchListInitialSnapshot verifies that WatchList emits Added events for
 // objects that already exist in the store at subscription time.
 func TestWatchListInitialSnapshot(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
@@ -1719,8 +1727,7 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 // TestWatchInitialSnapshot verifies that Watch(id) emits an Added event for an
 // object that already exists in the store at subscription time.
 func TestWatchInitialSnapshot(t *testing.T) {
-	ctx := context.Background()
-	_, client := watchTestBH(t)
+	ctx, client := watchTestClient(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 

@@ -21,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"runtime/pprof"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,6 +34,88 @@ import (
 	"github.com/amorey/gochan/oneshot"
 	"github.com/stretchr/testify/require"
 )
+
+// TestMain runs the package's tests and then fails the binary if any beehive
+// goroutine outlived them.
+//
+// The leak it catches is silent by construction. A watch stream ends only when
+// its context is cancelled — a failed read costs one tick and the poller retries
+// — so a stream started on an uncancellable context keeps polling its store
+// every fastTick for the rest of the run, and every test that follows pays for
+// it. The test that leaked still passes; what fails is some later test's
+// failsafe, on a loaded machine, once in a while. This turns that into a
+// deterministic failure in the run that caused it.
+//
+// It reports only on a run that otherwise passed. A failing test has its own
+// message, and one that failed part-way through is entitled to leave goroutines
+// behind — the leak report on top of it would be noise pointing at a cause it
+// does not have.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		if stacks := lingeringGoroutines(); stacks != "" {
+			fmt.Fprintf(os.Stderr, "\ngoroutines outlived the tests that started them:\n\n%s\n"+
+				"A watch stream is the usual source: see watchTestClient.\n", stacks)
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
+// leakSettleAttempts and leakSettleWait bound how long lingeringGoroutines waits
+// for a goroutine that is already on its way out. Cancellation is asynchronous:
+// a stream cancelled in a t.Cleanup is unblocked, not gone, and the profile can
+// still show it. A real leak is never gone, so the wait costs a passing run at
+// most one nap and a failing one nothing it did not deserve.
+const (
+	leakSettleAttempts = 20
+	leakSettleWait     = 10 * time.Millisecond
+)
+
+// lingeringGoroutines returns the stacks of every goroutine still running
+// beehive code, or "" when there are none.
+//
+// The retry is the one deliberate exception to "synchronize on signals, never on
+// sleeps": the goroutines under observation are leaked ones, so by definition
+// nobody holds a signal to wait on and there is nothing to select over. Polling
+// the profile is the only reading available.
+func lingeringGoroutines() string {
+	for attempt := range leakSettleAttempts {
+		if attempt > 0 {
+			time.Sleep(leakSettleWait)
+		}
+		var buf bytes.Buffer
+		// 1: one record per distinct stack, carrying a count — so N copies of a
+		// leaked poller report as one stack rather than N pages of the same frames.
+		if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
+			return "" // no profile is not evidence of a leak
+		}
+		ours := beehiveStacks(buf.String())
+		if ours == "" {
+			return ""
+		}
+		if attempt == leakSettleAttempts-1 {
+			return ours
+		}
+	}
+	return ""
+}
+
+// beehiveStacks keeps the records of a goroutine profile that name this module,
+// which is what makes the report actionable and what keeps it quiet about
+// runtime and database/sql goroutines nobody here can end. The goroutine doing
+// the looking names the module too, so it is excluded by the frame it is
+// standing in.
+func beehiveStacks(profile string) string {
+	var ours []string
+	for _, record := range strings.Split(profile, "\n\n") {
+		if strings.Contains(record, "github.com/amorey/beehive") &&
+			!strings.Contains(record, "beehive.lingeringGoroutines") {
+			ours = append(ours, strings.TrimSpace(record))
+		}
+	}
+	return strings.Join(ours, "\n\n")
+}
 
 // errBoom is a sentinel error shared by tests that exercise error-propagation
 // paths (option failures, store failures, controller reconcile errors).
@@ -66,7 +151,15 @@ func (m *fakeMigrator) ConvertStatus(from int, raw json.RawMessage) (json.RawMes
 
 // testTimeout is a failsafe only: a select that waits this long has hung, so we
 // fail rather than block forever. Tests never rely on it to pace anything.
-const testTimeout = 2 * time.Second
+//
+// Generous on purpose, and paid only by a run that was going to fail anyway. CI
+// runs the suite under -race at GOMAXPROCS=1, where every driver in every live
+// beehive competes for the one processor with the test goroutine — so the gap
+// between "a tick took longer than usual" and "this has hung" is orders of
+// magnitude wider there than on a developer's machine. A failsafe tight enough
+// to be reached by mere load reports the hang that never happened, which is the
+// one thing it must not do.
+const testTimeout = 10 * time.Second
 
 // fastTick is the cadence every integration test runs its drivers at. Nothing is
 // pushed — a reconcile after a write, a collect after a delete and a dependency wake

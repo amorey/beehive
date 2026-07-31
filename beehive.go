@@ -358,8 +358,11 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	}
 
 	// Client watch streams poll the store directly and are not counted in wg, so
-	// stop does not terminate them: one ends when its own context is cancelled or
-	// the store is closed under it.
+	// stop does not terminate them: one ends when its own context is cancelled,
+	// and nothing else ends it. Closing the store under a stream does not — a
+	// failed read costs one tick and the poller retries on the next one, which is
+	// what keeps a transient store failure from killing a live subscriber. A
+	// subscriber that outlives its context therefore polls forever.
 	bh.log().Info("control plane stopped")
 	return drainErr
 }
