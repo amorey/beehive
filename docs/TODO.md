@@ -4,31 +4,6 @@ Deferred work, and why. An item belongs here when it is a real defect or gap we
 chose not to fix yet — not a wishlist. Each one says what would make it worth doing,
 so the next reader can tell "we decided against this" from "nobody thought of it".
 
-- **`idx_events_rv` has no query** — known, not fixed. Its comment reads
-  "Watch ordering (mirrors `idx_objects_rv`)", but nothing orders or
-  filters on `events.resource_version`. `EventsList` sorts by
-  `last_at DESC, id DESC`; `EventsSweep` deletes by rank within
-  `(object_id, category)` and by `last_at`; `EventsWatch` compares versions
-  per row from a listing it already has. The index appears to have been
-  speculative from the start.
-
-  `EventsMaxVersion`, the watch's gate read, does not use it either: that
-  read needs `object_id` leading, so it goes through
-  `idx_events_object_cat` — which does not carry `resource_version`, so
-  `EXPLAIN QUERY PLAN` shows one table-btree lookup per run, and the column
-  is declared after `detail`, so a run whose detail spilled is walked past
-  an overflow chain to reach it. It is still far below the listing it
-  replaced, and it is the read that would most like a
-  `(object_id, resource_version)` index: that would make the quiet tick a
-  true index-only max. Same schema-change question from the other side —
-  one index to add, one to drop.
-
-  Deferred only on the migration question: the project keeps one migration
-  file, so dropping an index means either editing `0001_init.sql` in place,
-  which breaks an existing database, or adding `0002` through
-  `internal/sqlitemigrate`. Decide that once; several other deferred items
-  here also want a schema change.
-
 - **Do not remove `EventsAdd`'s return value, even though the write-shapes
   rule says to** — a deliberate exception, recorded so nobody applies the
   rule mechanically. `Store.EventsAdd` returns a run that no caller reads

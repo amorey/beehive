@@ -34,6 +34,7 @@ directory of archaeology.
 - [Name-keyed writes](2026-07-27-name-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
+- [The schema is amended in place until release](2026-07-31-amend-the-schema-in-place-until-release.md)
 - [Every new depends_on edge stamps a durable owed reconcile](2026-07-29-stamp-every-new-dependency-edge.md)
 - [A nested Within is a rollback boundary (SAVEPOINT)](2026-07-29-nested-within-savepoints.md)
 - [Secondary lookups (owner/dependencies/dependents/owned)](2026-07-27-secondary-lookups.md)

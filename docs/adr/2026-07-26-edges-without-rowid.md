@@ -124,12 +124,13 @@ the only place in the suite that would notice.
 ### Applying it to an existing database is not a one-liner
 
 SQLite cannot convert a table between rowid and `WITHOUT ROWID` in place. This
-change rode an in-place edit to `0001_init.sql`, which costs nothing:
-`sqlite/migrations/` holds exactly one file and docs/TODO.md records that a fresh
-database is the only supported upgrade path, so editing the initial migration is
-legitimate rather than rewriting applied history.
+change rode an in-place edit to `0001_init.sql`, which costs nothing: nothing is
+deployed, so `sqlite/migrations/` holds exactly one file and a fresh database is the
+only supported upgrade path. Editing the initial migration is legitimate rather than
+rewriting applied history — the policy, and the release that expires it, are recorded
+in [the amend-in-place ADR](2026-07-31-amend-the-schema-in-place-until-release.md).
 
-Should that policy change, converting an existing store means a
+Once that expires, converting an existing store means a
 create-copy-drop-rename of the whole `edges` table — and `0001_init.sql`'s preamble
 declares `PRAGMA foreign_keys = ON` as a store contract, with `edges` sitting
 between two FK edges, so the rebuild must run under `PRAGMA foreign_keys = OFF`

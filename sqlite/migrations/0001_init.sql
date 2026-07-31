@@ -312,8 +312,15 @@ CREATE TABLE events (
 -- newest-first panel query (ORDER BY last_at DESC).
 CREATE INDEX idx_events_object_cat ON events(object_id, category, last_at DESC);
 
--- Watch ordering (mirrors idx_objects_rv).
-CREATE INDEX idx_events_rv ON events(resource_version);
+-- EventsMaxVersion, the gate EventsWatch reads on every quiet tick: the equality
+-- prefix selects the object's runs and the maximum sits at the tail of that range,
+-- so the read is answered from this index and never touches the table. That is the
+-- whole reason it exists — no query orders or filters on resource_version alone,
+-- which is why there is no bare index on the column (idx_objects_rv has no mirror
+-- here). Without the second column the read falls back to idx_events_object_cat:
+-- one table-btree lookup for each run, past an overflow chain for any run whose
+-- detail spilled, since resource_version is declared last.
+CREATE INDEX idx_events_object_rv ON events(object_id, resource_version);
 
 -- ============================================================
 -- resource_version_seq
