@@ -1840,6 +1840,26 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 	return scanEvents(rows)
 }
 
+// EventsMaxVersion reads the high-water mark of id's event log. The
+// (object_id, ...) prefix of idx_events_object_cat selects the object's runs, so
+// the read is bounded by that object's log rather than by the table, and NULL (no
+// runs at all, an unknown id included) reads as 0. It is what EventsWatch reads on a
+// quiet tick instead of the listing.
+//
+// It is not free: resource_version is not in that index, so the plan is one
+// table-btree lookup per run, and the column is declared last — after detail — so a
+// run whose detail spilled to an overflow page is walked past to reach it. It costs
+// what the listing costs minus the decode, the sort and the returned rows. A
+// covering (object_id, resource_version) index is what would make it a true scalar
+// read, and that is a schema change docs/TODO.md holds open together with dropping
+// the unused idx_events_rv.
+func (s *sqliteStore) EventsMaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
+	var rv sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT MAX(resource_version) FROM events WHERE object_id = ?`, id).Scan(&rv)
+	return rv.Int64, err
+}
+
 func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	return s.latestEventRun(ctx, id, category)
 }

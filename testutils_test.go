@@ -266,6 +266,9 @@ func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, RawEvent) (*
 func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
 	panic("not implemented: fakeStore.EventsList")
 }
+func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
+	panic("not implemented: fakeStore.EventsMaxVersion")
+}
 func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	panic("not implemented: fakeStore.EventsGetLatest")
 }

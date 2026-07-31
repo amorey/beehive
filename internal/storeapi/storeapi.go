@@ -495,6 +495,22 @@ type Store interface {
 	// only — not kind-scoped, like the ref-list reads.
 	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
 
+	// EventsMaxVersion returns the highest ResourceVersion over id's event runs, and
+	// 0 when the object has no runs (an unknown id included). It is the per-object
+	// high-water mark of the event log, for a watch that reads the scalar on every
+	// tick and pays for EventsList only when it moves. Reads by object id only, like
+	// EventsList.
+	//
+	// It spans every category and ignores every other EventQuery filter, so a
+	// filtered watch sees it move for a run it will not be shown: that costs one
+	// listing that reports nothing, never a missed run.
+	//
+	// It is a maximum over the runs that are there rather than a counter, so it is
+	// not monotonic — retention deleting the newest run lowers it. A consumer
+	// therefore compares for *inequality*: a mark that moved either way means read
+	// again.
+	EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error)
+
 	// EventsSweep trims the event log to the retention bounds and returns how many runs
 	// it deleted. perObject > 0 caps each (object, category) timeline to its newest
 	// perObject runs, per timeline so a flapping one can't evict a quiet one. maxAge > 0

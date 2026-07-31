@@ -358,6 +358,12 @@ func (c *clientImpl[Spec, Status]) deletedSince(
 // the same convergence the object watches give. There are no tombstones, because an
 // append-only log means a run only appears or grows. A run that both appears and is
 // trimmed by retention inside one interval is never seen.
+//
+// A quiet tick skips the listing, the way the object watches skip theirs: it reads
+// EventsMaxVersion — one scalar over this object's log — and lists only when that
+// moved. There is no liveness half here, because there is nothing this watch could
+// do with a disappearance: it reports no tombstones, so a run trimmed by retention
+// is not an event, and a version that has not moved means there is nothing to send.
 func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
@@ -365,6 +371,10 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 	q := resolveEvents(opts)
 	out := make(chan Event)
 	seen := make(map[EventID]int64)
+	// The log's high-water mark as of the last listing. Zero before the first one,
+	// and an object with no runs reads as 0 too, so a log that is still empty never
+	// pays for a listing at all — there is nothing in it to report.
+	var cursor int64
 	// scoped and foreign latch the kind check below, in both directions. An object's
 	// group and kind are fixed at insert and its id is never reused, so once the id
 	// resolves the answer cannot change while the stream runs — checking it once keeps
@@ -399,16 +409,34 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 				}
 				scoped = true
 			}
+			at, err := c.bh.store.EventsMaxVersion(ctx, id)
+			if err != nil {
+				return c.pollFailed(ctx, "event watch", err, "id", id)
+			}
+			if at == cursor {
+				// The log has not moved, so no run was added or extended and there is
+				// nothing this watch reports. Unlike the object watches there is no
+				// second read to make: a run that vanished is retention, not a change.
+				return true
+			}
 			runs, err := c.bh.store.EventsList(ctx, id, q)
 			if err != nil {
 				return c.pollFailed(ctx, "event watch", err, "id", id)
 			}
-			// Rebuilt per tick rather than added to, so the map is bounded by what the
-			// query returns instead of by every run the stream has ever seen: retention
-			// physically deletes runs, and their ids would otherwise be held for the
-			// life of the stream. A run that leaves the window and comes back must have
-			// been extended to get there, so its version moved and it is owed a
-			// delivery anyway.
+			// Only advanced past a listing that succeeded, so a failed one is retried
+			// on the next tick rather than skipped.
+			cursor = at
+			// Rebuilt per listing rather than added to, so the map is bounded by what
+			// the query returns instead of by every run the stream has ever seen:
+			// retention physically deletes runs, and their ids would otherwise be held
+			// for the life of the stream. A run that leaves the window and comes back
+			// must have been extended to get there, so its version moved and it is owed
+			// a delivery anyway.
+			//
+			// The gate above means a quiet tick does not rebuild, so a run trimmed
+			// while the log is quiet keeps its id here until the next real event. That
+			// is bounded by the runs this stream has seen, and the next event clears
+			// it — trading a quiet tick's listing for it is the point.
 			next := make(map[EventID]int64, len(runs))
 			// EventsList is newest-first; deliver oldest-first so the timeline builds
 			// in order, as a reader of an append-only log expects.

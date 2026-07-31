@@ -104,6 +104,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ObjectWritesMaxVersion` is the maximum over live `objects` rows rather than the
   `resource_version_seq` counter, because the event log draws from that counter too —
   a mark taken from it would move for writes no consumer of this pair can be shown.
+  **`EventsWatch` is gated the same way, on `EventsMaxVersion(ctx, id)`** — the
+  highest `resource_version` over that one object's runs — but with no liveness half:
+  the log reports no tombstones, so a run that vanished is retention rather than a
+  change, and a mark that has not moved means there is nothing to send. The mark spans
+  every category, so a filtered watch can pay a listing that reports nothing; it can
+  never miss a run. A quiet tick does not rebuild the stream's `seen` map, so a
+  trimmed run's id lingers there until the next real event — bounded, memory only,
+  and noted where the rebuild happens.
 - **`Spec`/`Status` separation is structural.** The user-facing `Client` has no
   status-write path. Only `Controller`/`ControllerClient` does.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on its
