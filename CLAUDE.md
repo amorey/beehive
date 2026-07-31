@@ -135,10 +135,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ObjectsCreate` takes an `ObjectsCreateInput`, not the read-shaped `RawObject`
   whose `Status` field it used to drop in silence. And a mutator returns a row only
   where a public `Client` write hands that row to the user, which is `ObjectsCreate`
-  and the two `ObjectsUpdateSpec*` mutators alone; the rest return `error`, plus a `bool` that someone
+  and the two `ObjectsUpdateSpec*` mutators; the rest return `error`, plus a `bool` that someone
   actually reads. So no write pays a conditions query for a value nobody looks at,
   and the writes that report nothing answer from metadata alone. Tests read a
-  post-write row back with `ObjectsGet`.
+  post-write row back with `ObjectsGet`. `EventsAdd` is the one exception: it returns
+  an `*Event` no caller reads, so it meets the shape but not the reason — kept
+  deliberately, see `docs/TODO.md`.
   → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
 - **A nested `Within` is a real rollback boundary.** It runs on a `SAVEPOINT`, so an
   error unwinds that frame's writes and its queued `AfterCommit` hooks even if the

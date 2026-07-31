@@ -133,7 +133,7 @@ concurrency until a workload shows the stall.
 
 ### Client watches poll and diff
 
-`ObjectsWatch`, `ObjectsWatchList`, `EventsWatch` and `SchedulesWatch` each hold the
+The two object watches — `ObjectsWatch` and `ObjectsWatchList` — hold the
 `resource_version` of what they last reported and emit the difference: absent then
 present is `Added`, a moved version is `Modified`, present then absent is `Deleted`.
 
@@ -144,6 +144,16 @@ scalar read plus one blob-free id listing, and the blob-bearing listing is paid 
 when the cursor moved or the id set shrank. A list watch does retain the decoded
 body of each object it has reported, for the tombstone a later delete needs; that is
 its memory cost.
+
+The other two watches share the interval and nothing else, so read the paragraph
+above as being about the object watches alone. `EventsWatch` also compares
+`resource_version`, but per run rather than per object, and it has **no cursor gate**:
+every tick runs the full `EventsList` for its object, blobs included. It emits no
+`Deleted` either, because an append-only log has no tombstone — a run only appears or
+grows, and retention removes runs silently. `SchedulesWatch` is further out still: it
+holds a `Schedule` rather than a version, reads memory rather than the store, and
+emits the gauge itself rather than a change. So of the four, only two are gated, and
+`EventsWatch` has the most expensive quiet tick in the watch surface.
 
 ## GC is the one cadence that cannot be disabled
 
