@@ -143,8 +143,14 @@ CREATE TABLE conditions (
     PRIMARY KEY (object_id, type)
 ) STRICT;
 
--- Fetch all conditions for an object (status assembly, cascade delete).
-CREATE INDEX idx_conditions_object ON conditions(object_id);
+-- No index beyond the primary key. Every read is keyed on object_id — the whole
+-- set for one object (status assembly), one type (ConditionsGet/Delete), or a
+-- batch of ids — and PRIMARY KEY (object_id, type) on a rowid table already
+-- builds sqlite_autoindex_conditions_1 over exactly that prefix. A separate
+-- conditions(object_id) index is a strict prefix of it: the planner never chose
+-- it for any statement in store.go, including the ON DELETE CASCADE probe, which
+-- reads the autoindex as COVERING either way. It cost a b-tree write on every
+-- condition upsert to serve nothing.
 
 -- ============================================================
 -- edges
@@ -308,9 +314,38 @@ CREATE TABLE events (
     resource_version INTEGER NOT NULL
 ) STRICT;
 
--- Serves both the append-time "latest run for (object, category)" probe and the
--- newest-first panel query (ORDER BY last_at DESC).
-CREATE INDEX idx_events_object_cat ON events(object_id, category, last_at DESC);
+-- The newest-first read order: EventsList's panel query and EventsSweep's ring
+-- window (ROW_NUMBER OVER (PARTITION BY object_id, category ORDER BY last_at
+-- DESC, id DESC)) both sort by it. id closes the tiebreak, and carrying it is
+-- what makes the order total rather than nearly so: stopping at last_at leaves
+-- SQLite to sort the last term, which for a *limited* EventsList means sorting
+-- the whole timeline to find the first page. It is one more column in a key that
+-- already exists, and id (the rowid) rides in every entry regardless.
+--
+-- This index does NOT serve the append-time "latest run" probe. See
+-- idx_events_latest below for why they cannot be the same key.
+CREATE INDEX idx_events_object_cat
+    ON events(object_id, category, last_at DESC, id DESC);
+
+-- The append-time probe: EventsAdd reads the newest run of (object, category) to
+-- decide extend-vs-append, and "newest" there means the greatest id — append
+-- order, not clock order. That is a different sort from the one above, not a
+-- prefix of it, so one key cannot answer both.
+--
+-- Without this index the probe rides idx_events_object_cat, which orders by
+-- last_at: SQLite sorts the object's whole timeline to find one row, and because
+-- type/reason are in neither key it fetches every run from the table to do it,
+-- past an overflow chain for any run whose detail spilled. That cost is linear in
+-- the timeline's depth, it is paid once per event, and event retention is off by
+-- default (WithEventRetention), so the depth it scales with is unbounded.
+-- Measured on the 0001 schema, modernc, one timeline of 5000 runs: EventsAdd
+-- 1491µs -> 125µs, and flat in depth rather than linear.
+--
+-- Its write cost lands only on the rarer branch. All three key columns are
+-- immutable, and EventsAdd's extend path writes count/last_at/message/detail/
+-- resource_version — none of them here — so an extended run does not touch this
+-- index at all. Only opening a new run inserts an entry.
+CREATE INDEX idx_events_latest ON events(object_id, category, id DESC);
 
 -- EventsMaxVersion, the gate EventsWatch reads on every quiet tick: the equality
 -- prefix selects the object's runs and the maximum sits at the tail of that range,
