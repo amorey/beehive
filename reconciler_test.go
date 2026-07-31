@@ -368,7 +368,15 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 		// land its change to the target inside the window. Later passes declare
 		// straight through, as a level-triggered controller re-asserting its edges.
 		if readDone.fire() {
-			<-proceed
+			// ctx.Done is the abort half, not decoration: the test closes proceed only
+			// on the path where it got what it was waiting for, so a failed wait would
+			// otherwise park this worker forever and the deferred stop — which waits on
+			// an unbounded context — would hang the binary until the panic timeout,
+			// burying the failure it was meant to report.
+			select {
+			case <-proceed:
+			case <-ctx.Done():
+			}
 		}
 		// The version the read above reflects — not a fresh one, which would claim
 		// to have seen changes this pass did not.
