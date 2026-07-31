@@ -401,7 +401,7 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, name string, spec
 		if err != nil {
 			return err
 		}
-		c.signalCreated(ctx, co)
+		c.signalCreated(ctx, raw, co)
 		return nil
 	})
 	if err != nil {
@@ -495,17 +495,63 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string
 }
 
 // signalCreated registers what a freshly inserted row owes after the commit: the
-// caller's WithOnCreate hook, if there is one. It goes through AfterCommit, so it
-// fires after the outermost commit and never on a rollback. Create and GetOrCreate
-// share it, keeping the create-side-effect wiring in one place next to insertObject.
-//
-// A create schedules no reconcile. An object whose spec nothing has observed is
-// unsettled, which is exactly what the owed pass lists, and the row is the record
-// — so a rollback leaves nothing behind, for free.
-func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, co *createOptions) {
+// caller's WithOnCreate hook, if there is one, and the row's first reconcile. Both
+// go through AfterCommit, so they fire after the outermost commit and never on a
+// rollback. Create and GetOrCreate share it, keeping the create-side-effect wiring
+// in one place next to insertObject.
+func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawObject, co *createOptions) {
 	if co.onCreate != nil {
 		c.bh.store.AfterCommit(ctx, co.onCreate)
 	}
+	// A create always changes the object: there was nothing before it.
+	c.signalSpecWritten(ctx, raw.ID)
+}
+
+// signalSpecWritten enqueues id's own reconcile once the write that changed its
+// spec commits. It is what makes a spec write prompt rather than a wait for the
+// owed pass, which used to be the only thing that listed it.
+//
+// **The caller passes only writes that actually changed the object.** That gate is
+// the whole of the design, and the obvious alternatives are both wrong.
+//
+// Gating on "the caller called Update" would enqueue a byte-identical write. The
+// store skips such a write entirely — no generation bump, no resource_version — and
+// that skip is what stops a controller re-applying its own spec from waking itself
+// forever. An enqueue would rebuild that loop without a scan being involved at all,
+// and worse than the scan version: requeueNow cancels the backoff alarm and marks an
+// in-flight id dirty, so work.done redispatches it immediately. A controller that
+// re-applies its spec and then fails would retry at full speed forever, never
+// reaching its backoff ladder.
+//
+// Gating on the row being unsettled has the same defect by a longer route. A failing
+// reconcile leaves the object unsettled, so every no-op write it makes would pass
+// that gate. "Unsettled" is what the object *owes*; "changed" is what this write
+// *did*, and only the second is a reason to schedule anything.
+//
+// A create always changes the object, so it always enqueues.
+//
+// **The signal is read as the write leaves it, not as the transaction commits.** A
+// caller that updates the spec and then reports that generation through UpdateStatus
+// in the same outer Within commits a settled row and still enqueues it. That is a
+// duplicate rather than a defect — the object is dispatched once more, reconciles
+// against current state and settles — and it is the direction this design errs in
+// throughout. Checking the committed row instead would cost a store read on every
+// spec write and would not even be exact, since after the commit a read returns
+// current state, which a concurrent write may have moved either way. Pinned by
+// TestSpecThenStatusInOneTransactionStillEnqueues.
+//
+// The reconciler is resolved inside the hook, not here: this runs inside the
+// caller's transaction, and bh.mu is a lock Register and stop also want. A
+// client-only kind resolves to nothing and the hook is a no-op. The enqueue does
+// not clear the backoff ladder, matching Client.Requeue's default — WithResetBackoff
+// is the explicit way to ask for that, and a new spec is not evidence that a past
+// failure will not repeat.
+func (c *clientImpl[Spec, Status]) signalSpecWritten(ctx context.Context, id ObjectID) {
+	c.bh.store.AfterCommit(ctx, func(context.Context) {
+		if r, ok := c.bh.reconcilerFor(c.gk); ok {
+			r.requeueNow(id)
+		}
+	})
 }
 
 // GetOrCreate returns the row holding name, creating it only when absent. The found
@@ -559,7 +605,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 		// an existing object is a pure read and must not nudge the reconciler or run
 		// create-conditional side effects (which is also why they aren't gated on the
 		// returned created bool — see below).
-		c.signalCreated(ctx, co)
+		c.signalCreated(ctx, raw, co)
 		return nil
 	})
 	if err != nil {
@@ -578,18 +624,18 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, name string, spec
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
-	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, error) {
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
 		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
 	})
 }
 
 func (c *clientImpl[Spec, Status]) UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
-	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, error) {
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
 		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
 		// rejected at the store (no separate read-then-write to keep atomic);
 		// hideWrongKind keeps that foreign id invisible to this single-kind client.
-		raw, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
-		return raw, c.hideWrongKind(err)
+		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
+		return raw, changed, c.hideWrongKind(err)
 	})
 }
 
@@ -600,7 +646,7 @@ func (c *clientImpl[Spec, Status]) UpdateByID(ctx context.Context, id ObjectID, 
 func (c *clientImpl[Spec, Status]) update(
 	ctx context.Context,
 	spec Spec,
-	write func(ctx context.Context, b []byte, version int) (*RawObject, error),
+	write func(ctx context.Context, b []byte, version int) (*RawObject, bool, error),
 ) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
@@ -613,12 +659,17 @@ func (c *clientImpl[Spec, Status]) update(
 	// joins.
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err := write(ctx, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		raw, changed, err := write(ctx, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
 		if err != nil {
 			return err
 		}
-		obj, err = c.decode(raw)
-		return err
+		if obj, err = c.decode(raw); err != nil {
+			return err
+		}
+		if changed {
+			c.signalSpecWritten(ctx, raw.ID)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

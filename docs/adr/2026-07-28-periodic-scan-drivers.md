@@ -226,18 +226,30 @@ that reason — the pass that covered it was never entitled to. It is now carrie
 the stale-dependents pass, whose cost is bounded by the dependency graph rather than
 by the object count, which is what makes it eligible to be depended on.
 
-## Writes schedule nothing
+## Writes record what they owe, and only a spec write also starts it
 
-No client write registers a reconcile, and no delete registers a collect. A spec
-write bumps the generation, which is what puts the object in the owed-pass listing; a
-delete sets `deletion_requested_at`, which is what puts it in the sweeper's. The
-signal and the durable record are the same write, so a rolled-back transaction
-leaves nothing behind for free.
+A write's durable record is what puts the object in a driver's listing. A spec write
+bumps the generation, which is what the owed pass lists; a delete sets
+`deletion_requested_at`, which is what the sweeper lists. The signal and the durable
+record are the same write, so a rolled-back transaction leaves nothing behind for
+free. That is the invariant, and it is unchanged.
 
-`Store.AfterCommit` is a plain post-commit callback queue with exactly one user:
-`WithOnCreate`, a caller-facing guarantee that a create-conditional side effect never
-fires for a row a rollback discarded. Beehive's own machinery registers nothing
-there.
+**One write also starts the work it recorded.** A spec write that leaves the row
+unsettled enqueues that row through `Store.AfterCommit`, so a `Create` or `Update` no
+longer waits up to an owed-pass interval to be seen. The listing still runs and still
+finds the same objects, so the enqueue is an optimisation over it rather than a
+replacement — a lost enqueue costs latency, never convergence. The gate is the store
+reporting that the write *changed* the object, which is what keeps a byte-identical
+update from waking a controller that re-applies its own spec. See
+[the spec-write-enqueue ADR](2026-07-31-a-spec-write-enqueues-its-own-object.md).
+
+**A delete still schedules nothing.** Nothing registers a collect; the sweeper's
+cadence is the whole of that path.
+
+`Store.AfterCommit` therefore has two users: `WithOnCreate`, a caller-facing
+guarantee that a create-conditional side effect never fires for a row a rollback
+discarded, and the spec-write enqueue above. Both want the same property — fire on a
+real commit, and never on a rollback.
 
 ## Consequences
 

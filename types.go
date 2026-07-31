@@ -39,9 +39,11 @@ type ObjectRef = storeapi.ObjectRef
 // non-generic and deals only in raw rows: the generic-to-non-generic boundary
 // lives one layer up, in the typedController adapter.
 //
-// ObjectsCreate and ObjectsUpdateSpec return the row they wrote, so a caller can
-// hand the store-assigned id, resource_version and timestamps straight to the user.
-// Every other mutator returns only an error — see the contract on storeapi.Store.
+// ObjectsCreate and the two ObjectsUpdateSpec* mutators return the row they wrote,
+// so a caller can hand the store-assigned id, resource_version and timestamps
+// straight to the user; the spec mutators also report whether they wrote at all,
+// which is what lets a caller act on a real change without a read of its own. Every
+// other mutator returns only an error — see the contract on storeapi.Store.
 type Store = storeapi.Store
 
 // FreePagesReleaser is an optional capability a Store may implement to hand space

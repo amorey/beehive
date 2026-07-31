@@ -1319,8 +1319,8 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
-	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
+func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+	return &RawObject{ID: 1, Spec: []byte("not-json")}, true, nil
 }
 
 // errorUpdateSpecStore returns an error from ObjectsUpdateSpec.
@@ -1328,8 +1328,8 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, error) {
-	return nil, errBoom
+func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+	return nil, false, errBoom
 }
 
 // nameErrorStore returns a non-NotFound error from ObjectsGetByName, driving
@@ -3088,4 +3088,244 @@ func TestGenerateNamePanicsRatherThanReturningTheNilUUID(t *testing.T) {
 		"beehive: unreachable: UUIDv7 from a 16-byte reader: "+errBoom.Error(),
 		func() { GenerateName("cache") },
 		"a swallowed error would make every name identical")
+}
+
+// specWriteFixture wires a Beehive with one registered kind and does not start it.
+// Register builds the work queue, so an enqueue is observable with no driver
+// running at all — which is the point: these tests assert that the *write* queued
+// the object, not that some pass later found it.
+func specWriteFixture(t *testing.T) (Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
+	t.Helper()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+	return NewClient[cSpec, cStatus](bh, clientTestGK), cc, r
+}
+
+// settle drives the generation handshake to "converged" and empties the queue, so
+// a following test step starts from a row that owes nothing.
+func settle(t *testing.T, ctx context.Context, cc ControllerClient[cStatus], r *reconciler, obj *Object[cSpec, cStatus]) {
+	t.Helper()
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+	drainQueue(r.work)
+	require.Empty(t, queuedIDs(r.work), "settle must leave the queue empty")
+}
+
+// A create enqueues its own first reconcile, so a controller runs against a new
+// object without waiting for the owed pass.
+func TestCreateEnqueuesItsFirstReconcile(t *testing.T) {
+	ctx := context.Background()
+	client, _, r := specWriteFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a create queues the new object")
+}
+
+// GetOrCreate queues only when it actually created the row: the found branch is a
+// pure read and must not nudge the reconciler.
+func TestGetOrCreateEnqueuesOnlyWhenItCreates(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	name := uniqueName()
+
+	obj, created, err := client.GetOrCreate(ctx, name, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.True(t, created)
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "the created branch queues")
+
+	settle(t, ctx, cc, r, obj)
+	_, created, err = client.GetOrCreate(ctx, name, cSpec{Val: "b"})
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Empty(t, queuedIDs(r.work), "the found branch writes nothing and queues nothing")
+}
+
+// A spec change enqueues the object at once, which is the latency this closes: the
+// owed pass would otherwise be the first thing to list it.
+func TestUpdateEnqueuesTheObject(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	updated, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	require.Greater(t, updated.Generation, obj.Generation, "a real spec change bumps the generation")
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a spec change queues the object")
+}
+
+// The gate is the row's settledness, not the fact that Update was called. A
+// byte-identical write skips the store write, so the generation does not move and
+// the row stays settled — and enqueueing it anyway is how a controller that
+// re-applies its own spec would wake itself forever.
+func TestNoOpUpdateOnASettledObjectEnqueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	same, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.Equal(t, obj.Generation, same.Generation, "identical bytes must not bump the generation")
+	assert.Empty(t, queuedIDs(r.work), "a settled row that did not move owes no pass")
+}
+
+// The enqueue rides AfterCommit, so an outer transaction that rolls back discards
+// it along with the write. Without that, a caller would see a reconcile for a spec
+// change that never landed.
+func TestSpecWriteEnqueuesNothingOnRollback(t *testing.T) {
+	runCommitRollback(t, func(t *testing.T, commit bool) {
+		ctx := context.Background()
+		client, cc, r := specWriteFixture(t)
+		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+		settle(t, ctx, cc, r, obj)
+
+		errRollback := errors.New("rollback")
+		err := cc.Within(ctx, func(ctx context.Context) error {
+			if _, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"}); err != nil {
+				return err
+			}
+			if commit {
+				return nil
+			}
+			return errRollback
+		})
+		if commit {
+			require.NoError(t, err)
+			assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a committed spec change queues")
+			return
+		}
+		require.ErrorIs(t, err, errRollback)
+		assert.Empty(t, queuedIDs(r.work), "a rolled-back spec change queues nothing")
+	})
+}
+
+// A client-only kind has no reconciler to enqueue into. The hook resolves to
+// nothing and the write succeeds, rather than erroring or panicking.
+func TestSpecWriteOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	clientOnly := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "NoController"})
+
+	obj, err := clientOnly.Create(ctx, uniqueName(), cSpec{Val: "a"})
+	require.NoError(t, err)
+	_, err = clientOnly.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+}
+
+// Composing a spec write and the matching status write in one outer transaction
+// commits a settled row, and still enqueues it. The gate reads the row as the spec
+// write left it — unsettled at that moment — so the enqueue is registered before the
+// status write settles the row.
+//
+// This is a duplicate, not a defect: the object is dispatched once more, reconciles
+// against current state and settles. Pinning it here because the alternative is
+// worse. Checking the committed row would cost a store read on every spec write, and
+// after the commit a read returns *current* state rather than what this transaction
+// wrote — so it would still not be exact, and it would fail in the direction that
+// skips an enqueue for work another transaction had just made owed.
+func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
+		updated, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+		if err != nil {
+			return err
+		}
+		return cc.UpdateStatus(ctx, obj.ID, updated.Generation, cStatus{Val: "done"})
+	}))
+
+	// The committed row is settled, so the owed pass would not list it...
+	bh := client.(*clientImpl[cSpec, cStatus]).bh
+	unsettled, err := bh.store.ObjectsListUnsettledIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	assert.Empty(t, unsettled, "the committed row is settled")
+
+	// ...and the enqueue stands anyway, from the moment the spec write left it.
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work),
+		"the gate reads the row this write produced, so composition enqueues a duplicate")
+}
+
+// respecController re-applies its own byte-identical spec on every reconcile and
+// then fails. CLAUDE.md names this shape directly: the store's no-op skip is what
+// stops a controller re-applying its own spec from waking itself forever, and the
+// spec-write enqueue must not defeat it.
+type respecController struct {
+	client Client[cSpec, cStatus]
+	calls  atomic.Int64
+	hot    chan struct{}
+	closed atomic.Bool
+}
+
+func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+	if c.calls.Add(1) >= 25 && c.closed.CompareAndSwap(false, true) {
+		close(c.hot)
+	}
+	_, _ = c.client.UpdateByID(ctx, obj.ID, obj.Spec) // identical bytes: the store skips it
+	return Result{}, errBoom
+}
+
+// A failing controller that re-writes its own spec must stay on its backoff ladder.
+//
+// The enqueue is gated on the store reporting that it *changed* the object, not on
+// the row being unsettled. A failing reconcile leaves the row unsettled forever, so
+// an unsettledness gate would fire on every one of these no-op writes — and the
+// enqueue is worse than a scan would be, because requeueNow cancels the backoff
+// alarm and marks the in-flight id dirty, so work.done redispatches it at once. The
+// result is a retry loop at full speed that never reaches the ladder.
+func TestFailingRespecControllerKeepsItsBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withoutGCSweeper())
+	require.NoError(t, err)
+	ctrl := &respecController{hot: make(chan struct{})}
+	_, err = Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	ctrl.client = client
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	_ = mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	select {
+	case <-ctrl.hot:
+		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed", ctrl.calls.Load())
+	case <-time.After(500 * time.Millisecond):
+		// The ladder starts at defaultBaseRetryInterval and doubles, so a handful of
+		// passes here is the ladder working. The failure mode is unbounded.
+		assert.Less(t, ctrl.calls.Load(), int64(25),
+			"a no-op write from a failing reconcile must not requeue past the backoff")
+	}
+}
+
+// The gate is "this write changed the object", not "the row is unsettled". A no-op
+// write on a row that is unsettled for some other reason enqueues nothing.
+func TestNoOpUpdateOnAnUnsettledObjectEnqueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	client, _, r := specWriteFixture(t)
+
+	// Never settled: observed_generation is NULL, so ObjectsListUnsettledIDs lists it.
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	drainQueue(r.work)
+	require.Empty(t, queuedIDs(r.work))
+
+	same, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.Equal(t, obj.Generation, same.Generation, "identical bytes must not bump the generation")
+
+	unsettled, err := client.(*clientImpl[cSpec, cStatus]).bh.store.ObjectsListUnsettledIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	require.Equal(t, []ObjectID{obj.ID}, unsettled, "the row is still unsettled")
+	assert.Empty(t, queuedIDs(r.work), "an unsettled row is not a reason to enqueue a write that changed nothing")
 }

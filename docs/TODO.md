@@ -4,49 +4,6 @@ Deferred work, and why. An item belongs here when it is a real defect or gap we
 chose not to fix yet — not a wishlist. Each one says what would make it worth doing,
 so the next reader can tell "we decided against this" from "nobody thought of it".
 
-- **Nothing enqueues an object when its own spec is written, so the owed
-  pass is the primary trigger rather than a backstop** — known, not fixed.
-  This is the largest latency in ordinary use, and fixing it needs none of
-  the push machinery in [the push conversion](specs/push-conversion.md).
-
-  A spec write bumps `generation` and stops. The owed pass lists the object
-  on its next tick, `defaultOwedPassInterval` being 30s. So a user's
-  `Update` waits up to 30 seconds before its controller runs. `CLAUDE.md`
-  records the workaround rather than the defect: every example calls
-  `Client.Requeue` after a create, because a write schedules nothing.
-
-  **The fix is small and needs no hub.** Register an `AfterCommit` hook on
-  the write and enqueue the object into its own reconciler's work queue.
-  No `gobus`, no drain, no new dependency. `AfterCommit` is the right hook
-  because a rollback discards it, including a savepoint unwind inside a
-  nested `Within`.
-
-  **Gate it on the generation, and on nothing else.** A reconcile ends in
-  `UpdateStatus`, which moves `resource_version`. An enqueue on every
-  version move would make every object schedule its own next reconcile,
-  forever. Gating on a generation bump is safe because no controller write
-  bumps the generation: `UpdateStatus`, both condition mutators and
-  `FinalizersDelete` all leave it alone. Only a spec write moves it, and a
-  spec write comes from the user.
-
-  The gate also matches the backstop exactly.
-  `ObjectsListUnsettledIDs` selects on `observed_generation < generation`,
-  so "the generation moved" is precisely "the owed pass would have listed
-  this". Push and backstop then see the same event, one at commit and one
-  on a tick.
-
-  **Deferred because it needs an ADR, not because it is hard.** The
-  [drivers ADR](adr/2026-07-28-periodic-scan-drivers.md) has a section
-  titled "Writes schedule nothing", and this contradicts it. The argument
-  that section makes still holds — the durable record and the signal are
-  the same write, so a rollback leaves nothing behind — and this change
-  does not weaken it, because the enqueue is an optimisation over a listing
-  that still runs. That reasoning belongs in an ADR before the code.
-
-  **It is also the precondition for lengthening the owed pass.** Any plan
-  that raises `defaultOwedPassInterval` must land this first, or it makes
-  the commonest latency in the system proportionally worse.
-
 - **`EventsWatch` polls with no gate, so every tick reads the whole event
   log for its object** — known, not fixed. It is the most expensive quiet
   tick in the watch surface, and the only watch with no cheap path.
