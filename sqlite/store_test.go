@@ -553,6 +553,32 @@ func TestEventsMaxVersionStoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// EventsMaxVersion is the gate EventsWatch pays on every quiet tick, so it must be
+// answered from idx_events_object_rv alone. COVERING is the whole assertion: with
+// only idx_events_object_cat the plan still names an index, but resource_version is
+// not in it, so the read costs a table-btree lookup for each of the object's runs.
+// That index exists for this one query — nothing else would notice it going.
+func TestEventsMaxVersionUsesCoveringIndex(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	ctx := context.Background()
+
+	rows, err := store.db.QueryContext(ctx,
+		`EXPLAIN QUERY PLAN SELECT MAX(resource_version) FROM events WHERE object_id = ?`, int64(1))
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notused, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+	assert.Contains(t, plan, "COVERING INDEX idx_events_object_rv",
+		"the watch gate must read the index alone:\n"+plan)
+}
+
 // EventsGetLatest surfaces a scan fault on the current run.
 func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()

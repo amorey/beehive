@@ -193,6 +193,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   incremental_vacuum` frees one page per step and so **must be `Exec`'d, never
   `Query`'d**; the `Query` path releases exactly one page and reports no error.
   → [ADR](docs/adr/2026-07-29-auto-vacuum-incremental.md)
+- **The schema is amended in place until the first release.** `sqlite/migrations/`
+  holds exactly one file, and a schema change edits `0001_init.sql` rather than adding
+  `0002` — nothing is deployed, so a fresh database is the only upgrade path and a
+  reader gets the whole schema in one file instead of a history to replay. It expires
+  at release, because `sqlitemigrate.Apply` skips every version already recorded, so
+  from then on an edit would reach fresh databases only. `TestTheSchemaIsOneMigration`
+  is the tripwire: adding a second file retires the policy.
+  → [ADR](docs/adr/2026-07-31-amend-the-schema-in-place-until-release.md)
 - **The generation handshake.** `Generation` increments on every spec change;
   `ObservedGeneration` records what the controller last settled, and is `nil` until
   the first `UpdateStatus` (which takes the generation explicitly). Mutators skip a

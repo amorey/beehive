@@ -17,6 +17,7 @@ package sqlite
 import (
 	"database/sql"
 	"errors"
+	"io/fs"
 	"path/filepath"
 	"testing"
 
@@ -72,6 +73,21 @@ func TestOpenApplyError(t *testing.T) {
 
 	_, err = open(db)
 	require.Error(t, err)
+}
+
+// The schema is amended in place until the first release, so `sqlite/migrations/`
+// holds exactly one file — see the amend-in-place ADR. This is the tripwire on that
+// policy: a second file means the schema has to be readable as a history instead,
+// and every in-place edit becomes a change that reaches fresh databases only.
+func TestTheSchemaIsOneMigration(t *testing.T) {
+	entries, err := fs.ReadDir(migrations, "migrations")
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.Equal(t, []string{"0001_init.sql"}, names,
+		"a second migration retires the amend-in-place policy; read its ADR before adding one")
 }
 
 func tableExists(t *testing.T, db *sql.DB, name string) bool {

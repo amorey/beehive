@@ -1841,18 +1841,15 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 }
 
 // EventsMaxVersion reads the high-water mark of id's event log. The
-// (object_id, ...) prefix of idx_events_object_cat selects the object's runs, so
-// the read is bounded by that object's log rather than by the table, and NULL (no
-// runs at all, an unknown id included) reads as 0. It is what EventsWatch reads on a
-// quiet tick instead of the listing.
+// (object_id, ...) prefix of idx_events_object_rv selects the object's runs and the
+// maximum sits at the tail of that range, so the read is a covering index seek that
+// never touches the table, and NULL (no runs at all, an unknown id included) reads
+// as 0. It is what EventsWatch reads on a quiet tick instead of the listing.
 //
-// It is not free: resource_version is not in that index, so the plan is one
-// table-btree lookup per run, and the column is declared last — after detail — so a
-// run whose detail spilled to an overflow page is walked past to reach it. It costs
-// what the listing costs minus the decode, the sort and the returned rows. A
-// covering (object_id, resource_version) index is what would make it a true scalar
-// read, and that is a schema change docs/TODO.md holds open together with dropping
-// the unused idx_events_rv.
+// That index exists for this read alone. Without it the plan falls back to
+// idx_events_object_cat, which does not carry resource_version: one table-btree
+// lookup per run, past an overflow chain for any run whose detail spilled, since the
+// column is declared last. TestEventsMaxVersionUsesCoveringIndex pins the plan.
 func (s *sqliteStore) EventsMaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
