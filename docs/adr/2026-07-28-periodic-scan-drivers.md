@@ -147,13 +147,19 @@ its memory cost.
 
 The other two watches share the interval and nothing else, so read the paragraph
 above as being about the object watches alone. `EventsWatch` also compares
-`resource_version`, but per run rather than per object, and it has **no cursor gate**:
-every tick runs the full `EventsList` for its object, blobs included. It emits no
-`Deleted` either, because an append-only log has no tombstone — a run only appears or
-grows, and retention removes runs silently. `SchedulesWatch` is further out still: it
-holds a `Schedule` rather than a version, reads memory rather than the store, and
-emits the gauge itself rather than a change. So of the four, only two are gated, and
-`EventsWatch` has the most expensive quiet tick in the watch surface.
+`resource_version`, but per run rather than per object, and its gate is **one number
+and no second read**: `EventsMaxVersion(ctx, id)`, the high-water mark of that one
+object's log, with the blob-bearing `EventsList` paid only when it moves. That number
+is cheaper than the listing rather than free — on SQLite it still reads one table row
+per run, because no index carries `events.resource_version` under `object_id` — so
+this quiet tick is the least indexed of the gated three. There is no
+liveness half because there is nothing to find with one — the watch emits no
+`Deleted`, since an append-only log has no tombstone, and retention removes runs
+silently. The mark spans every category, so a filtered watch can be woken by a run it
+will not be shown; that costs a listing that reports nothing, never a missed run.
+`SchedulesWatch` is further out still: it holds a `Schedule` rather than a version,
+reads memory rather than the store, and emits the gauge itself rather than a change.
+So of the four, three are gated and the fourth touches no store at all.
 
 ## GC is the one cadence that cannot be disabled
 

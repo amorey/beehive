@@ -4,40 +4,6 @@ Deferred work, and why. An item belongs here when it is a real defect or gap we
 chose not to fix yet — not a wishlist. Each one says what would make it worth doing,
 so the next reader can tell "we decided against this" from "nobody thought of it".
 
-- **`EventsWatch` polls with no gate, so every tick reads the whole event
-  log for its object** — known, not fixed. It is the most expensive quiet
-  tick in the watch surface, and the only watch with no cheap path.
-
-  `watchpoll.go` calls `EventsList` on every tick. That selects every
-  column, including the `Detail` blob, ordered, once for each subscriber.
-  The object watches read one scalar and one blob-free row when nothing has
-  moved. This one has no equivalent.
-
-  **A single scalar is enough here.** Add
-  `EventsMaxVersion(ctx, id) (int64, error)`: the highest
-  `resource_version` over that object's events, served by the
-  `(object_id, ...)` prefix of `idx_events_object_cat`. Skip the listing
-  when it has not moved.
-
-  No count is needed, unlike the object watches. An event watch reports no
-  deletions: a run only appears or grows, and retention removes runs
-  silently by design. So a moved version is the only thing this watch can
-  act on.
-
-  **One wrinkle to accept.** `EventsWatch` rebuilds its `seen` map from
-  each listing on purpose, so run ids removed by retention are not held for
-  the stream's life. Under a gate a quiet tick does not rebuild, so a
-  trimmed run's id lingers until the next real event. That is memory only,
-  it is bounded by the runs the stream has seen, and any new event clears
-  it. Note it where the rebuild comment lives.
-
-  **Deferred because it adds a `Store` member**, which breaks every backend
-  outside this repository. The
-  [write-shapes ADR](adr/2026-07-30-store-write-shapes.md) argues the break
-  cost is paid for each break rather than for each method, so this should
-  ride with the next one — `EventsAddInput`, below, is waiting for the same
-  window.
-
 - **`idx_events_rv` has no query** — known, not fixed. Its comment reads
   "Watch ordering (mirrors `idx_objects_rv`)", but nothing orders or
   filters on `events.resource_version`. `EventsList` sorts by
@@ -46,8 +12,16 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   per row from a listing it already has. The index appears to have been
   speculative from the start.
 
-  `EventsMaxVersion` above would not use it either, because that read needs
-  `object_id` leading.
+  `EventsMaxVersion`, the watch's gate read, does not use it either: that
+  read needs `object_id` leading, so it goes through
+  `idx_events_object_cat` — which does not carry `resource_version`, so
+  `EXPLAIN QUERY PLAN` shows one table-btree lookup per run, and the column
+  is declared after `detail`, so a run whose detail spilled is walked past
+  an overflow chain to reach it. It is still far below the listing it
+  replaced, and it is the read that would most like a
+  `(object_id, resource_version)` index: that would make the quiet tick a
+  true index-only max. Same schema-change question from the other side —
+  one index to add, one to drop.
 
   Deferred only on the migration question: the project keeps one migration
   file, so dropping an index means either editing `0001_init.sql` in place,
@@ -510,6 +484,14 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   paid per break rather than per method — so this wants to ride along with the next
   one that has to happen anyway, not to be its own. Revisit then, or sooner if a
   field is ever added to `Event` that a caller might reasonably try to set.
+
+  **It missed the `EventsMaxVersion` window** (2026-07-31), which added a `Store`
+  member and broke every external backend. That was a change to the same file and
+  the same event family, and taking this along would have cost those backends
+  nothing extra — the argument above says so in as many words. It was left out
+  because the change was scoped to the watch gate. So the next break is now the
+  *second* one an external backend pays for this, which is a point in favour of
+  taking it early rather than waiting for a third.
 
 - **Two writes still read the whole row to answer a narrow question** — known, not
   fixed, and the tail of the write-shapes pass. Every write that reports *no* row now

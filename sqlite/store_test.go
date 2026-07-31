@@ -459,6 +459,100 @@ func TestListEventsStoreErrors(t *testing.T) {
 	})
 }
 
+// EventsMaxVersion is the event watch's gate: the highest resource_version over one
+// object's runs, spanning every category, 0 for an object with no runs at all, and
+// scoped to the object asked for.
+func TestEventsMaxVersion(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+	other := newEventObject(t, store)
+
+	quiet, err := store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, quiet, "an object with no runs has no mark")
+
+	unknown, err := store.EventsMaxVersion(ctx, 999999)
+	require.NoError(t, err)
+	assert.Zero(t, unknown, "an id with no row reads the same as an empty log")
+
+	add := func(id storeapi.ObjectID, category, reason string) int64 {
+		t.Helper()
+		ev, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{
+			Category: category, Type: "Normal", Reason: reason})
+		require.NoError(t, err)
+		return ev.ResourceVersion
+	}
+
+	first := add(id, "connection", "Connected")
+	got, err := store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, first, got)
+
+	// Another category's run counts: the mark spans the object's whole log, which is
+	// why a filtered watch can be woken by a run it will not be shown.
+	elsewhere := add(id, "sync", "Synced")
+	got, err = store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, elsewhere, got, "the newest run of any category is the mark")
+
+	// Extending a run advances its version, so the mark moves without a new row.
+	extended := add(id, "sync", "Synced")
+	got, err = store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, extended, got, "an extended run moves the mark")
+
+	// Another object's log is invisible here.
+	add(other, "connection", "Connected")
+	got, err = store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, extended, got, "the mark is scoped to one object")
+}
+
+// The mark falls when retention removes the newest run, so a consumer must compare
+// for inequality rather than growth — the same rule ObjectWritesMaxVersion keeps.
+func TestEventsMaxVersionFallsWhenTheNewestRunGoes(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for _, reason := range []string{"A", "B"} {
+		_, err := store.EventsAdd(ctx, testGK, id,
+			storeapi.Event{Category: "c", Type: "Normal", Reason: reason})
+		require.NoError(t, err)
+	}
+	before, err := store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+
+	deleted, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, deleted, "the older run is swept, leaving the newest")
+
+	after, err := store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "sweeping an older run leaves the mark where it was")
+
+	// Now age the survivor out, so retention takes the run the mark points at: the
+	// mark falls back to the empty-log zero.
+	_, err = store.db.ExecContext(ctx, `UPDATE events SET last_at = 0`)
+	require.NoError(t, err)
+	deleted, err = store.EventsSweep(ctx, 0, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, 1, deleted)
+	after, err = store.EventsMaxVersion(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, after, "an emptied log reads as no mark at all")
+}
+
+// EventsMaxVersion surfaces a query fault rather than reporting a quiet log.
+func TestEventsMaxVersionStoreError(t *testing.T) {
+	store := newRawStore(t)
+	id := newEventObject(t, store)
+	dropEventsTable(t, store)
+	_, err := store.EventsMaxVersion(context.Background(), id)
+	require.Error(t, err)
+}
+
 // EventsGetLatest surfaces a scan fault on the current run.
 func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()

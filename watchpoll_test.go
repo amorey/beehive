@@ -238,15 +238,18 @@ type pollProbeStore struct {
 	// listed fires after a listing returns, so a test can cancel knowing the read
 	// already succeeded and the goroutine is on its way to the send.
 	listed chan struct{}
-	// eventsListed is the event watch's equivalent of listed; metaRead and
-	// eventsFailed cover the two reads a tick makes before it gets there.
+	// eventsListed is the event watch's equivalent of listed; metaRead, eventsMarked
+	// and eventsFailed cover the reads a tick makes before it gets there. A quiet
+	// tick stops at eventsMarked, which is what makes it the event watch's clock.
 	eventsListed chan struct{}
+	eventsMarked chan struct{}
 	metaRead     chan struct{}
 	eventsFailed chan struct{}
 	listErr      atomic.Bool
 	listIDsErr   atomic.Bool
 	getErr       atomic.Bool
 	eventsErr    atomic.Bool
+	markErr      atomic.Bool
 	metaErr      atomic.Bool
 }
 
@@ -292,6 +295,17 @@ func (s *pollProbeStore) ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawO
 	return s.Store.ObjectsGetMeta(ctx, id)
 }
 
+// EventsMaxVersion is the event watch's gate read, so it signals on every call —
+// error or not — the way ObjectsGetMeta does. It is the only store read a quiet
+// tick makes, so a test counting it is counting ticks.
+func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+	defer probeSignal(s.eventsMarked)
+	if s.markErr.Load() {
+		return 0, errBoom
+	}
+	return s.Store.EventsMaxVersion(ctx, id)
+}
+
 func (s *pollProbeStore) EventsList(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, error) {
 	if s.eventsErr.Load() {
 		probeSignal(s.eventsFailed)
@@ -312,6 +326,7 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 		polled:       make(chan struct{}, 256),
 		listed:       make(chan struct{}, 256),
 		eventsListed: make(chan struct{}, 256),
+		eventsMarked: make(chan struct{}, 256),
 		metaRead:     make(chan struct{}, 256),
 		eventsFailed: make(chan struct{}, 256),
 	}
@@ -537,8 +552,8 @@ func TestEventsWatchIsKindScoped(t *testing.T) {
 	}
 }
 
-// Both reads an event watch makes happen per tick, so either one failing costs a
-// tick rather than the stream — the same contract the object watches keep.
+// Every read an event watch makes happens per tick, so any one of them failing
+// costs a tick rather than the stream — the same contract the object watches keep.
 func TestEventsWatchSurvivesReadFailures(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -548,43 +563,91 @@ func TestEventsWatchSurvivesReadFailures(t *testing.T) {
 	bh.logger = logger
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	// A run the gate can see, so the failing log read below is actually reached.
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	store.metaErr.Store(true) // the kind check fails first
 	ch, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.metaRead, 2), "a poll while the kind check fails")
 
+	// Each handoff arms the next fault *before* clearing the current one, so no tick
+	// can slip through a moment where every read succeeds: the log holds a run from
+	// here on, so such a tick would list it and then block in the send while the test
+	// is parked in waitClosed, and the stream would never tick again.
+	store.markErr.Store(true) // then the gate read
 	store.metaErr.Store(false)
+	waitClosed(t, chanAfter(store.eventsMarked, 2), "a poll while the gate read fails")
+
 	store.eventsErr.Store(true) // and then the log read
+	store.markErr.Store(false)
 	waitClosed(t, chanAfter(store.eventsFailed, 2), "a poll while the log read fails")
 	store.eventsErr.Store(false)
 
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Recovered"}))
-	assert.Equal(t, "Recovered", recv(t, ch).Reason, "the stream outlived both failures")
+	// A failed listing does not advance the cursor, so the run it missed is still
+	// owed: both arrive, oldest first.
+	assert.Equal(t, "Probing", recv(t, ch).Reason, "the run the failed listing missed is not lost")
+	assert.Equal(t, "Recovered", recv(t, ch).Reason, "the stream outlived every failure")
 	assert.Contains(t, buf.String(), "event watch poll failed", "the skipped polls are reported")
 }
 
-// A run that has not moved since it was reported is not sent again. Without that
-// comparison every tick would re-deliver the whole window, and a subscriber could
-// not tell a new observation from a re-listing of an old one.
+// A run that has not moved since it was reported is not sent again, even on a tick
+// that does list. Without that comparison a listing forced by an event the watch
+// filters out would re-deliver the whole window, and a subscriber could not tell a
+// new observation from a re-listing of an old one.
 func TestEventsWatchEmitsOnlyWhatChanged(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	probe := EventSpec{Category: "probe", Type: EventNormal, Reason: "Probing"}
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, probe))
 
-	ch, err := client.EventsWatch(ctx, obj.ID)
+	ch, err := client.EventsWatch(ctx, obj.ID, WithEventCategory("probe"))
 	require.NoError(t, err)
 	require.Equal(t, "Probing", recv(t, ch).Reason)
 
-	// Several polls re-list that run while nothing changes. If any of them re-sent
-	// it, the receive below would return "Probing" again instead of the new run.
-	waitClosed(t, chanAfter(store.eventsListed, 3), "polls that re-list the unchanged run")
+	// The gate spans every category, so events in another one move it and force the
+	// listing — which re-reads the unchanged "probe" run. If any of those re-sent it,
+	// the receive below would return "Probing" again instead of the new run.
+	for range 3 {
+		require.NoError(t, cc.EventsAdd(ctx, obj.ID,
+			EventSpec{Category: "other", Type: EventNormal, Reason: "Noise"}))
+		waitClosed(t, chanAfter(store.eventsListed, 1), "a poll that re-lists the unchanged run")
+	}
 
-	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID,
+		EventSpec{Category: "probe", Type: EventNormal, Reason: "Connected"}))
 	assert.Equal(t, "Connected", recv(t, ch).Reason, "only the new run is delivered")
+}
+
+// A quiet tick costs one scalar read: the log's high-water mark gates the listing,
+// which is the whole cost of the watch when nothing is happening.
+func TestEventsWatchSkipsTheListingWhileTheLogIsQuiet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	ch, err := client.EventsWatch(ctx, obj.ID)
+	require.NoError(t, err)
+
+	// An empty log reads as the zero mark the stream starts with, so not even the
+	// first tick lists: there is nothing in it to report.
+	waitClosed(t, chanAfter(store.eventsMarked, 3), "ticks over an empty log")
+	assert.Empty(t, store.eventsListed, "an empty log is never listed")
+
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.Equal(t, "Probing", recv(t, ch).Reason)
+	waitClosed(t, chanAfter(store.eventsListed, 1), "the listing the new run forced")
+
+	// And the ticks after it go quiet again: the mark has not moved since that
+	// listing, so nothing pays for another one.
+	waitClosed(t, chanAfter(store.eventsMarked, 3), "quiet ticks after the run was delivered")
+	assert.Empty(t, store.eventsListed, "a quiet tick reads the mark and stops")
 }
 
 // An event send is abandoned on cancellation like any other, so a subscriber that
