@@ -567,24 +567,28 @@ type Store interface {
 	// schema version are in a different shape, so comparing them says nothing about
 	// whether the value changed, and such a write takes the normal path.
 	//
-	// Which of the two happened is not reported: a caller who needs to know compares
-	// Generation against one it read first.
+	// changed reports which of the two happened: true when the spec was written and
+	// Generation bumped, false for the no-op. It is what lets a caller act on a real
+	// spec change without a read of its own — beehive enqueues the object's reconcile
+	// on it, and enqueueing a no-op would let a controller re-applying its own spec
+	// requeue itself past its backoff, which is exactly what the no-op skip exists to
+	// prevent.
 	//
 	// Scoped to gk: another kind's id is rejected with ErrWrongKind, a missing id with
 	// ErrNotFound.
-	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (*RawObject, error)
+	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
 	// ObjectsUpdateSpecByName is ObjectsUpdateSpec keyed by name within gk: it
 	// writes whatever holds the name now, or returns ErrNotFound. A name this kind
 	// does not hold is absent rather than foreign, so there is no ErrWrongKind — as
 	// with DeletionRequestsCreateByName.
 	//
-	// Everything else matches ObjectsUpdateSpec, the content no-op included. An
-	// implementation MUST resolve and write within one transaction: the no-op skip
-	// needs the stored bytes to compare against, so a resolve-then-write split
-	// across two calls would let a concurrent collect hand the name to a
-	// replacement in between.
-	ObjectsUpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (*RawObject, error)
+	// Everything else matches ObjectsUpdateSpec, the content no-op and the changed
+	// flag included. An implementation MUST resolve and write within one transaction:
+	// the no-op skip needs the stored bytes to compare against, so a
+	// resolve-then-write split across two calls would let a concurrent collect hand
+	// the name to a replacement in between.
+	ObjectsUpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
 	// ObjectsUpdateStatus replaces an object's status, records the generation the
 	// controller observed, and stamps statusVersion (the migrator schema version

@@ -17,13 +17,15 @@ belong to.
 
 ## The shape of the answer
 
-Nothing is pushed, and **no write schedules a reconcile**. A write leaves a durable
-trace and a periodic driver finds it. There are exactly five traces, plus one
-mechanism that has no trace at all:
+A write leaves a durable trace and a periodic driver finds it. There are exactly five
+traces, plus one mechanism that has no trace at all. **One write also starts the work
+it recorded**: a spec write that leaves the row unsettled enqueues that row after its
+commit, so trace 1 has a prompt path as well as a driver. Nothing else is pushed, and
+no delete schedules a collect.
 
 | Trace | Column | Listed by | Driver |
 |---|---|---|---|
-| Spec not converged | `generation` vs `observed_generation` | `ObjectsListUnsettledIDs` | owed pass, per kind, 30s |
+| Spec not converged | `generation` vs `observed_generation` | `ObjectsListUnsettledIDs` | owed pass, per kind, 30s — **and the write's own enqueue** |
 | Wake owed | `reconcile_owed` | `ReconcileOwedListIDs` | owed pass, per kind, 30s |
 | Deletion requested | `deletion_requested_at` | `DeletionRequestsList` | GC sweeper, global, 30s, **cannot be disabled** |
 | Anything changed | `resource_version` | `ObjectWritesListSince` | dependency waker, global, 1s |
@@ -65,24 +67,49 @@ argument is shared:
 
 - **Found by:** `reconciler.enqueueUnsettled` → `ObjectsListUnsettledIDs`
   (`observed_generation IS NULL OR observed_generation < generation`).
-- **Normal:** ✅ the owed-pass tick, 30s. Nothing schedules it sooner — a create or
-  update returns without touching a queue, which is why the examples call
-  `Client.Requeue` rather than turning intervals down.
+- **Normal:** ✅ the write itself, at commit. `clientImpl.signalSpecWritten`
+  registers an `AfterCommit` hook that enqueues the row, **gated on the store
+  reporting that the write changed the object** — the `changed` return the two
+  `ObjectsUpdateSpec*` mutators now carry. A create always changes it. A
+  byte-identical update changes nothing and enqueues nothing, whatever the row's
+  settled state, which is what keeps case 2's loop-prevention intact.
+  → [ADR](adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
+- **Not** gated on the row being unsettled, which was the first design and was
+  wrong. A failing reconcile leaves the row unsettled indefinitely, so a controller
+  re-applying its own spec would pass that gate on every pass — and the enqueue is
+  worse there than a scan, because `requeueNow` cancels the backoff alarm and marks
+  the in-flight id dirty, so `work.done` redispatches it at once. Pinned by
+  `TestFailingRespecControllerKeepsItsBackoff`.
+- Writes that *compose* still enqueue a duplicate: a spec write followed by its
+  `UpdateStatus` in one outer `Within` commits a settled row and still enqueues,
+  because the signal is read as the write leaves it. The extra dispatch is harmless
+  and deliberate — see the ADR.
+- **Backstop:** ✅ the owed-pass tick, 30s. The enqueue lives in memory, so a crash
+  between commit and dispatch discards it; the row is still unsettled and the pass
+  lists it. A lost enqueue is latency, never divergence.
 - **Restart:** ✅ `reconciler.run` calls `enqueueOwedPass` before its workers start, and
-  it is *not* gated on `startupFullPass`.
+  it is *not* gated on `startupFullPass`. A write made after `Register` but before
+  `Start` does enqueue — `Register` builds the work queue, and the item waits in it
+  until the workers come up. Only a write to a kind that was never registered
+  resolves no reconciler; the owed pass is what covers that one.
 - **Tests:** `TestIntegrationStartupEnqueuesUnsettled`, `TestStartupAlwaysDrainsOwedWork`
   (pins that the drain happens even under `WithStartupFullPass(false)`),
-  `TestEnqueueUnsettledEnqueuesReturnedIDs`, `TestObjectsListUnsettledIDs`.
+  `TestEnqueueUnsettledEnqueuesReturnedIDs`, `TestObjectsListUnsettledIDs`,
+  `TestFailingRespecControllerKeepsItsBackoff`,
+  `TestNoOpUpdateOnAnUnsettledObjectEnqueuesNothing`.
 
 1. **Create** — `Create` / `GetOrCreate` insert with `generation=1`
    and `observed_generation` NULL (`sqliteStore.objectsCreate`). Tests:
    `TestIntegrationCreateTriggersReconcile`, `TestClientGetOrCreateOwesAPassOnlyOnCreate`,
-   `TestClientWritesAreOwedOnlyAfterOuterCommit`.
+   `TestClientWritesAreOwedOnlyAfterOuterCommit`, `TestCreateEnqueuesItsFirstReconcile`,
+   `TestGetOrCreateEnqueuesOnlyWhenItCreates`.
 2. **Spec update** — `ObjectsUpdateSpec` bumps `generation`. Suppressed on equal bytes
    at the same schema version, which is what stops a controller re-applying its own
    spec from waking itself forever. Tests: `TestIntegrationUpdateTriggersReconcile`,
    `TestObjectsUpdateSpecBumpsGeneration`, `TestClientNoOpUpdateOwesNothing`,
-   `TestSameVersionNoOpWritesNothing`.
+   `TestSameVersionNoOpWritesNothing`, `TestUpdateEnqueuesTheObject`,
+   `TestNoOpUpdateOnASettledObjectEnqueuesNothing`,
+   `TestSpecWriteEnqueuesNothingOnRollback`.
 3. **Schema-version re-stamp** — equal bytes at a *different* spec version deliberately
    falls through the no-op gate and bumps generation, because bytes in a different
    shape are not comparable. Tests: `TestCrossVersionWriteIsNotANoOp`,

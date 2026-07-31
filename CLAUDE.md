@@ -12,10 +12,11 @@ The README spec is implemented end to end and the suite is green. One loose end:
 the `fakeStore` double in `testutils_test.go` still `panic`s on many methods. They
 get filled in as tests need them, so the real `sqlite` store backs most tests.
 
-A write schedules nothing, so a demo that creates an object waits for the owed pass
-tick. Every example under `examples/` runs on production defaults and calls
-`Client.Requeue` after each create instead — the owed pass is no longer tunable from
-outside the package, and `Requeue` is what the docs point callers at. `cascade` is
+A spec write enqueues its own object, so a demo that creates one no longer waits for
+the owed pass tick. Every example under `examples/` still calls `Client.Requeue`
+after each create: the owed pass is not tunable from outside the package, `Requeue`
+is what the docs point callers at, and it still covers the case where the in-memory
+enqueue is lost. `cascade` is
 the exception: it sets `WithGCInterval`, since collection is what it demonstrates.
 Leave the production defaults alone otherwise.
 
@@ -111,10 +112,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   several writes must land together. The name-keyed create/delete writes (`Create`,
   `GetOrCreate`, `Delete`) differ only in what they do when the name is taken, and
   **none of them writes to a row it found** — there is no name-keyed upsert, so
-  changing an existing object is always `Update`. **No write schedules anything**: a spec write bumps the
+  changing an existing object is always `Update`. **A write's durable record is what a driver lists**: a spec write bumps the
   generation that the owed pass lists, a delete sets the `deletion_requested_at` that the
-  sweeper lists. `Store.AfterCommit` exists for one thing, the `WithOnCreate` hook.
-  → [ADR](docs/adr/2026-07-27-name-keyed-writes.md)
+  sweeper lists. **A spec write also enqueues its own object**, gated on the store
+  reporting that the write *changed* it (the `changed` bool both `ObjectsUpdateSpec*`
+  mutators return) — never on the row being unsettled, which a failing reconcile
+  leaves true forever and which would let a controller re-applying its own spec
+  requeue past its backoff. A byte-identical update wakes nothing, and the owed pass
+  stays the backstop. A delete still schedules nothing. `Store.AfterCommit` has two users: `WithOnCreate` and that
+  enqueue.
+  → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
+  [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **The name is the `Client` API's key; the id is the store's key.** The bare CRUD
   verbs take a name; `GetByID`/`UpdateByID`/`DeleteByID` take an id. A name-keyed
   call acts on whatever holds the name *now*, or reports absence; an id-keyed call

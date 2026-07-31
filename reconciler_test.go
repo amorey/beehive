@@ -2716,7 +2716,7 @@ func (h *watermarkHarness) stale(t *testing.T) []ObjectID {
 // before now.
 func (h *watermarkHarness) touchTarget(t *testing.T, spec string) {
 	t.Helper()
-	_, err := h.store.ObjectsUpdateSpec(context.Background(), clientTestGK, h.target, []byte(spec), 0)
+	_, _, err := h.store.ObjectsUpdateSpec(context.Background(), clientTestGK, h.target, []byte(spec), 0)
 	require.NoError(t, err)
 }
 
@@ -2948,7 +2948,7 @@ func TestReconcileHoldsDependencyWatermarkOnUndecodableRow(t *testing.T) {
 		return probe
 	})
 	// A valid create always decodes, so the poison bytes go in directly.
-	_, err := h.store.ObjectsUpdateSpec(ctx, clientTestGK, h.dep, []byte("not-json"), 0)
+	_, _, err := h.store.ObjectsUpdateSpec(ctx, clientTestGK, h.dep, []byte("not-json"), 0)
 	require.NoError(t, err)
 
 	_, err = h.tc.reconcile(ctx, h.dep)

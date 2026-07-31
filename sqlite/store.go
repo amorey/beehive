@@ -1273,7 +1273,7 @@ func stampVersion(stored, incoming int) (int, error) {
 }
 
 // ObjectsUpdateSpec replaces id's spec within gk. See updateSpec for the shape.
-func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	// The scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
 	// while doubling as the no-op compare's load — no separate kind check.
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
@@ -1285,7 +1285,7 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 //
 // No ErrWrongKind: the kind is in the WHERE, so a name this kind does not hold is
 // absent rather than foreign — as with DeletionRequestsCreateByName.
-func (s *sqliteStore) ObjectsUpdateSpecByName(ctx context.Context, gk storeapi.GroupKind, name string, spec []byte, specVersion int) (*storeapi.RawObject, error) {
+func (s *sqliteStore) ObjectsUpdateSpecByName(ctx context.Context, gk storeapi.GroupKind, name string, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
 		return s.getObjectRowByName(ctx, gk, name)
 	})
@@ -1306,8 +1306,9 @@ func (s *sqliteStore) updateSpec(
 	spec []byte,
 	specVersion int,
 	resolve func(context.Context) (*storeapi.RawObject, error),
-) (*storeapi.RawObject, error) {
+) (*storeapi.RawObject, bool, error) {
 	var result *storeapi.RawObject
+	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		obj, err := resolve(ctx)
@@ -1343,7 +1344,7 @@ func (s *sqliteStore) updateSpec(
 		// equal — which the level-triggered loop absorbs.
 		if stamp == obj.SpecVersion && bytes.Equal(obj.Spec, spec) {
 			result, err = s.attachConditions(ctx, obj)
-			return err
+			return err // changed stays false: nothing was written
 		}
 		rv, err := nextResourceVersion(ctx, c)
 		if err != nil {
@@ -1361,9 +1362,10 @@ func (s *sqliteStore) updateSpec(
 			RETURNING `+objectColumns,
 			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), obj.ID)
 		result, err = s.scanWritten(ctx, row)
+		changed = err == nil
 		return err
 	})
-	return result, err
+	return result, changed, err
 }
 
 // ObjectsUpdateStatus skips the status write when the incoming bytes equal the stored

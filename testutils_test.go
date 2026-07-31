@@ -229,11 +229,11 @@ func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID
 func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	panic("not implemented: fakeStore.ReconcileOwedDecrement")
 }
-func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, error) {
+func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }
 
-func (s *fakeStore) ObjectsUpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, error) {
+func (s *fakeStore) ObjectsUpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: ObjectsUpdateSpecByName")
 }
 func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
