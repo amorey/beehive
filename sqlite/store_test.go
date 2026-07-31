@@ -579,6 +579,133 @@ func TestEventsMaxVersionUsesCoveringIndex(t *testing.T) {
 		"the watch gate must read the index alone:\n"+plan)
 }
 
+// queryPlan returns the EXPLAIN QUERY PLAN text for q, one step per line.
+func queryPlan(t *testing.T, store *sqliteStore, q string, args ...any) string {
+	t.Helper()
+	rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+q, args...)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notused, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+	return plan
+}
+
+// The two (object_id, category, …) indexes answer opposite sort orders, and each
+// one's whole purpose is to keep a sort out of a plan. A temp B-tree in either is
+// the regression: it means the query fell back to the other key and is scanning
+// the object's entire timeline — unbounded, since event retention is off by
+// default — to produce what the right index delivers in order.
+func TestEventsIndexesKeepSortsOutOfPlans(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	// EventsAdd's run-boundary probe, once per event, ordered by append order.
+	plan := queryPlan(t, store,
+		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`, int64(1), "c")
+	assert.Contains(t, plan, "idx_events_latest",
+		"the append probe must ride the id-ordered index:\n"+plan)
+	assert.NotContains(t, plan, "TEMP B-TREE",
+		"the append probe must not sort the timeline to find one run:\n"+plan)
+
+	// EventsList's panel read. The id tiebreak is what makes this sort-free: stop
+	// the key at last_at and a limited read sorts the whole timeline for page one.
+	plan = queryPlan(t, store,
+		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY last_at DESC, id DESC LIMIT ?`, int64(1), "c", 50)
+	assert.Contains(t, plan, "idx_events_object_cat",
+		"the panel read must ride the last_at-ordered index:\n"+plan)
+	assert.NotContains(t, plan, "TEMP B-TREE",
+		"the panel read must arrive in order, LIMIT included:\n"+plan)
+}
+
+// The edge listings inherit their sort from the index they already probe, and
+// only a plan can show it — ordering on the edge column and on the joined o.id it
+// equals return the same rows. See edgeOrderByReferrer for why one streams and the
+// other sorts.
+//
+// These build their queries from the same two constants store.go does, so editing
+// either one to name o.id fails here rather than silently reinstating a temp
+// B-tree per matched edge. The chunked variant orders on columns it is
+// parameterized by, so it is pinned as written.
+func TestEdgeListsInheritTheIndexOrder(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	owned := string(storeapi.RelationOwnedBy)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{"incoming", `
+			SELECT o.id, o."group", o.kind
+			FROM edges r JOIN objects o ON o.id = r.from_id
+			WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer, []any{int64(1), owned}},
+		{"cascade children", `
+			SELECT o.id, o."group", o.kind, o.deletion_requested_at
+			FROM edges r JOIN objects o ON o.id = r.from_id
+			WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer, []any{int64(1), owned}},
+		{"outgoing by relation", `
+			SELECT o.id, o."group", o.kind
+			FROM edges r JOIN objects o ON o.id = r.to_id
+			WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget, []any{int64(1), owned}},
+		{"incoming batch", `
+			SELECT r.to_id, o.id, o."group", o.kind
+			FROM edges r JOIN objects o ON o.id = r.from_id
+			WHERE r.to_id IN (?,?) AND r.relation = ?
+			ORDER BY r.to_id, r.from_id`, []any{int64(1), int64(2), owned}},
+		{"outgoing batch", `
+			SELECT r.from_id, o.id, o."group", o.kind
+			FROM edges r JOIN objects o ON o.id = r.to_id
+			WHERE r.from_id IN (?,?) AND r.relation = ?
+			ORDER BY r.from_id, r.to_id`, []any{int64(1), int64(2), owned}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := queryPlan(t, store, tc.query, tc.args...)
+			assert.NotContains(t, plan, "ORDER BY",
+				"the edge index already delivers this order:\n"+plan)
+		})
+	}
+
+	// EdgesListOutgoing keeps one temp B-tree, for DISTINCT — it collapses an
+	// object reached through both relations, which no index can do. The ORDER BY
+	// is still free, so the plan must name DISTINCT and nothing else.
+	plan := queryPlan(t, store, `
+		SELECT DISTINCT o.id, o."group", o.kind
+		FROM edges r JOIN objects o ON o.id = r.to_id
+		WHERE r.from_id = ?`+edgeOrderByTarget, int64(1))
+	assert.Contains(t, plan, "TEMP B-TREE FOR DISTINCT", plan)
+	assert.NotContains(t, plan, "ORDER BY",
+		"only DISTINCT should need a sort here:\n"+plan)
+}
+
+// conditions carries no index of its own: PRIMARY KEY (object_id, type) already
+// builds one over exactly the prefix every read keys on. A conditions(object_id)
+// index would be a strict prefix of that key — chosen by nothing, written on every
+// upsert. This pins the reason it is absent rather than leaving it to look like an
+// oversight; the cascade probe is the one plan that might have wanted it.
+func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	for _, tc := range []struct{ name, query string }{
+		{"list one object", `SELECT ` + conditionColumns + ` FROM conditions WHERE object_id = ? ORDER BY type`},
+		{"get one type", `SELECT ` + conditionColumns + ` FROM conditions WHERE object_id = ? AND type = 'Ready'`},
+		{"cascade delete", `DELETE FROM objects WHERE id = ?`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := queryPlan(t, store, tc.query, int64(1))
+			assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
+				"conditions must be reached through its primary key:\n"+plan)
+		})
+	}
+}
+
 // EventsGetLatest surfaces a scan fault on the current run.
 func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()

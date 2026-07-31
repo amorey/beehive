@@ -651,6 +651,26 @@ const objectColumns = `id, "group", kind, name, spec, status,
 	generation, observed_generation, observed_at, resource_version,
 	deletion_requested_at, reconcile_owed, finalizers, created_at, updated_at`
 
+// The sort order of every edge listing, named so it is applied and not retyped.
+//
+// **They order on the edge column, never on the joined o.id it equals.** The two
+// are the same value by the ON clause, so the rows are identical either way — the
+// sort is not, and no behavioural test can tell them apart. idx_edges_to is
+// (to_id, relation) plus, because edges is WITHOUT ROWID, the primary-key tail
+// (from_id), so inside a (to_id=?, relation=?) probe the index already arrives in
+// from_id order; the primary key (from_id, to_id, relation) does the same for
+// to_id under a from_id probe. SQLite does not carry either ordering across the
+// join, so `ORDER BY o.id` plans a temp B-tree over every edge matched where the
+// edge column streams. Written the losing way this is a no-op-looking diff, which
+// is why it lives in one place that TestEdgeListsInheritTheIndexOrder explains.
+//
+// edgesByIDsChunk spells its own order out: it is parameterized on which column
+// routes and which joins, so it can only name the edge columns anyway.
+const (
+	edgeOrderByReferrer = "\n\t\tORDER BY r.from_id" // incoming: who points at this
+	edgeOrderByTarget   = "\n\t\tORDER BY r.to_id"   // outgoing: what this points at
+)
+
 // nextResourceVersion advances and returns the global write cursor. It draws
 // from a standalone counter (not MAX(objects.resource_version)) so that
 // physically deleting the highest-versioned row can never make the cursor
@@ -1714,6 +1734,12 @@ func scanEvent(sc scanner) (*storeapi.Event, error) {
 
 // latestEventRun returns the full newest run for (id, category), or nil if that
 // timeline is empty. EventsGetLatest returns it as-is.
+//
+// **ORDER BY id, not last_at.** The newest run is the last one appended, which is
+// an ordering the clock does not decide: a run's last_at moves every time it is
+// extended, so ordering on it would let a backwards clock step name an older run
+// as latest — and EventsAdd would then extend a run the log has already moved
+// past. idx_events_latest exists to serve this order; see 0001_init.sql.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
@@ -1846,10 +1872,11 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 // never touches the table, and NULL (no runs at all, an unknown id included) reads
 // as 0. It is what EventsWatch reads on a quiet tick instead of the listing.
 //
-// That index exists for this read alone. Without it the plan falls back to
-// idx_events_object_cat, which does not carry resource_version: one table-btree
-// lookup per run, past an overflow chain for any run whose detail spilled, since the
-// column is declared last. TestEventsMaxVersionUsesCoveringIndex pins the plan.
+// That index exists for this read alone. Without it the plan falls back to one of
+// the (object_id, category, …) keys, neither of which carries resource_version:
+// one table-btree lookup per run, past an overflow chain for any run whose detail
+// spilled, since the column is declared last. TestEventsMaxVersionUsesCoveringIndex
+// pins the plan.
 func (s *sqliteStore) EventsMaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
@@ -2087,8 +2114,7 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id
-		WHERE r.to_id = ? AND r.relation = ?
-		ORDER BY o.id`, ownerID, string(storeapi.RelationOwnedBy))
+		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, ownerID, string(storeapi.RelationOwnedBy))
 	if err != nil {
 		return nil, err
 	}
@@ -2293,8 +2319,7 @@ func (s *sqliteStore) EdgesListIncoming(ctx context.Context, toID storeapi.Objec
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.from_id
-		WHERE r.to_id = ? AND r.relation = ?
-		ORDER BY o.id`, toID, string(relation))
+		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, toID, string(relation))
 	if err != nil {
 		return nil, err
 	}
@@ -2349,7 +2374,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 		SELECT r.`+routeCol+`, o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.`+joinCol+`
 		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
-		ORDER BY r.`+routeCol+`, o.id`, args...)
+		ORDER BY r.`+routeCol+`, r.`+joinCol, args...)
 	if err != nil {
 		return err
 	}
@@ -2371,8 +2396,7 @@ func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.Obj
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ?
-		ORDER BY o.id`, fromID)
+		WHERE r.from_id = ?`+edgeOrderByTarget, fromID)
 	if err != nil {
 		return nil, err
 	}
@@ -2387,8 +2411,7 @@ func (s *sqliteStore) EdgesListOutgoingByRelation(ctx context.Context, fromID st
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ? AND r.relation = ?
-		ORDER BY o.id`, fromID, string(relation))
+		WHERE r.from_id = ? AND r.relation = ?`+edgeOrderByTarget, fromID, string(relation))
 	if err != nil {
 		return nil, err
 	}
