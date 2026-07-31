@@ -518,7 +518,17 @@ func TestEventsWatchIsKindScoped(t *testing.T) {
 
 	ch, err := client.EventsWatch(ctx, foreign.ID)
 	require.NoError(t, err)
-	waitClosed(t, chanAfter(store.metaRead, 3), "polls against the foreign id")
+	waitClosed(t, chanAfter(store.metaRead, 1), "the scoping read against the foreign id")
+
+	// The verdict is latched, so later ticks re-read nothing. An id's group and kind
+	// are fixed at insert and its id is never reused, so "foreign" cannot become
+	// false — re-reading would cost one row per tick, forever, to learn the same
+	// thing. Use an object watch as the clock: its ticks are independent of this
+	// stream's, so several of them passing proves the event watch also ticked.
+	_, err = client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	waitClosed(t, chanAfter(store.polled, 3), "three ticks after the foreign id resolved")
+	assert.Empty(t, store.metaRead, "a foreign id must be re-read no more than once")
 
 	select {
 	case ev := <-ch:

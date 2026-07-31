@@ -365,15 +365,23 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 	q := resolveEvents(opts)
 	out := make(chan Event)
 	seen := make(map[EventID]int64)
-	// scoped latches the kind check below. An object's group and kind are fixed at
-	// insert and its id is never reused, so the answer cannot change while the
-	// stream runs — checking it once keeps the steady-state cost at one query per
-	// tick rather than two.
-	var scoped bool
+	// scoped and foreign latch the kind check below, in both directions. An object's
+	// group and kind are fixed at insert and its id is never reused, so once the id
+	// resolves the answer cannot change while the stream runs — checking it once keeps
+	// the steady-state cost at one query per tick rather than two, and a foreign id at
+	// none. Only "not found yet" stays unlatched: ids are assigned on insert, so an id
+	// that does not exist can still be created later, as any kind.
+	var scoped, foreign bool
 
 	go func() {
 		defer close(out)
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
+			if foreign {
+				// Latched: this id belongs to another kind and always will, so there is
+				// nothing to re-read. The stream stays open and silent, which is the
+				// contract — closing it would tell the subscriber something different.
+				return true
+			}
 			if !scoped {
 				// Kind-scope the read: the object watches are scoped, and an unscoped log
 				// read would let a foreign id stream another kind's events through this
@@ -386,7 +394,8 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 					return c.pollFailed(ctx, "event watch", err, "id", id)
 				}
 				if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
-					return true // foreign id: nothing of this kind's to stream, ever
+					foreign = true // nothing of this kind's to stream, ever
+					return true
 				}
 				scoped = true
 			}

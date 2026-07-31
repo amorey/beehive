@@ -4,6 +4,254 @@ Deferred work, and why. An item belongs here when it is a real defect or gap we
 chose not to fix yet — not a wishlist. Each one says what would make it worth doing,
 so the next reader can tell "we decided against this" from "nobody thought of it".
 
+- **Nothing enqueues an object when its own spec is written, so the owed
+  pass is the primary trigger rather than a backstop** — known, not fixed.
+  This is the largest latency in ordinary use, and fixing it needs none of
+  the push machinery in [the push conversion](specs/push-conversion.md).
+
+  A spec write bumps `generation` and stops. The owed pass lists the object
+  on its next tick, `defaultOwedPassInterval` being 30s. So a user's
+  `Update` waits up to 30 seconds before its controller runs. `CLAUDE.md`
+  records the workaround rather than the defect: every example calls
+  `Client.Requeue` after a create, because a write schedules nothing.
+
+  **The fix is small and needs no hub.** Register an `AfterCommit` hook on
+  the write and enqueue the object into its own reconciler's work queue.
+  No `gobus`, no drain, no new dependency. `AfterCommit` is the right hook
+  because a rollback discards it, including a savepoint unwind inside a
+  nested `Within`.
+
+  **Gate it on the generation, and on nothing else.** A reconcile ends in
+  `UpdateStatus`, which moves `resource_version`. An enqueue on every
+  version move would make every object schedule its own next reconcile,
+  forever. Gating on a generation bump is safe because no controller write
+  bumps the generation: `UpdateStatus`, both condition mutators and
+  `FinalizersDelete` all leave it alone. Only a spec write moves it, and a
+  spec write comes from the user.
+
+  The gate also matches the backstop exactly.
+  `ObjectsListUnsettledIDs` selects on `observed_generation < generation`,
+  so "the generation moved" is precisely "the owed pass would have listed
+  this". Push and backstop then see the same event, one at commit and one
+  on a tick.
+
+  **Deferred because it needs an ADR, not because it is hard.** The
+  [drivers ADR](adr/2026-07-28-periodic-scan-drivers.md) has a section
+  titled "Writes schedule nothing", and this contradicts it. The argument
+  that section makes still holds — the durable record and the signal are
+  the same write, so a rollback leaves nothing behind — and this change
+  does not weaken it, because the enqueue is an optimisation over a listing
+  that still runs. That reasoning belongs in an ADR before the code.
+
+  **It is also the precondition for lengthening the owed pass.** Any plan
+  that raises `defaultOwedPassInterval` must land this first, or it makes
+  the commonest latency in the system proportionally worse.
+
+- **`EventsWatch` polls with no gate, so every tick reads the whole event
+  log for its object** — known, not fixed. It is the most expensive quiet
+  tick in the watch surface, and the only watch with no cheap path.
+
+  `watchpoll.go` calls `EventsList` on every tick. That selects every
+  column, including the `Detail` blob, ordered, once for each subscriber.
+  The object watches read one scalar and one blob-free row when nothing has
+  moved. This one has no equivalent.
+
+  **A single scalar is enough here.** Add
+  `EventsMaxVersion(ctx, id) (int64, error)`: the highest
+  `resource_version` over that object's events, served by the
+  `(object_id, ...)` prefix of `idx_events_object_cat`. Skip the listing
+  when it has not moved.
+
+  No count is needed, unlike the object watches. An event watch reports no
+  deletions: a run only appears or grows, and retention removes runs
+  silently by design. So a moved version is the only thing this watch can
+  act on.
+
+  **One wrinkle to accept.** `EventsWatch` rebuilds its `seen` map from
+  each listing on purpose, so run ids removed by retention are not held for
+  the stream's life. Under a gate a quiet tick does not rebuild, so a
+  trimmed run's id lingers until the next real event. That is memory only,
+  it is bounded by the runs the stream has seen, and any new event clears
+  it. Note it where the rebuild comment lives.
+
+  **Deferred because it adds a `Store` member**, which breaks every backend
+  outside this repository. The
+  [write-shapes ADR](adr/2026-07-30-store-write-shapes.md) argues the break
+  cost is paid for each break rather than for each method, so this should
+  ride with the next one — `EventsAddInput`, below, is waiting for the same
+  window.
+
+- **`idx_events_rv` has no query** — known, not fixed. Its comment reads
+  "Watch ordering (mirrors `idx_objects_rv`)", but nothing orders or
+  filters on `events.resource_version`. `EventsList` sorts by
+  `last_at DESC, id DESC`; `EventsSweep` deletes by rank within
+  `(object_id, category)` and by `last_at`; `EventsWatch` compares versions
+  per row from a listing it already has. The index appears to have been
+  speculative from the start.
+
+  `EventsMaxVersion` above would not use it either, because that read needs
+  `object_id` leading.
+
+  Deferred only on the migration question: the project keeps one migration
+  file, so dropping an index means either editing `0001_init.sql` in place,
+  which breaks an existing database, or adding `0002` through
+  `internal/sqlitemigrate`. Decide that once; several other deferred items
+  here also want a schema change.
+
+- **Do not remove `EventsAdd`'s return value, even though the write-shapes
+  rule says to** — a deliberate exception, recorded so nobody applies the
+  rule mechanically. `Store.EventsAdd` returns a run that no caller reads
+  today, which by the
+  [write-shapes ADR](adr/2026-07-30-store-write-shapes.md) means it should
+  return `error` alone.
+
+  [The events push spec](specs/events-push.md) builds its delta from
+  exactly that return value. The store already computes the run to write
+  it, so returning it costs nothing and saves the push path a read. Tidying
+  it away now would have to be undone.
+
+  Revisit only if the events push spec is abandoned.
+
+- **The stale-dependents pass rescans the whole dependency graph on every
+  sweep, and a cursor is only sound if the pass records what it finds** —
+  known, not fixed, and deferred on scale rather than on doubt. The fix is
+  understood; the graph is not yet large enough to pay for it.
+
+  **Measured cost.** One converged sweep, in-memory store, one kind:
+
+  | Objects | `depends_on` edges | One sweep |
+  | --- | --- | --- |
+  | 1,000 | 2,000 | 1.5 ms |
+  | 10,000 | 20,000 | 17 ms |
+  | 10,000 | 50,000 | 37 ms |
+  | 50,000 | 250,000 | 190 ms |
+
+  About 0.75 µs for each edge, tracking the edge count rather than the
+  object count. A converged sweep is the *worst* case: `LIMIT` cannot stop
+  the scan early when nothing matches, so a healthy system pays the full
+  scan in one query. With every dependent stale the first query costs
+  1.3 ms, because it stops after 256 groups.
+
+  Compare the owed pass on the same 50,000-object store, converged: 116 µs
+  for the unsettled listing and 25 µs for the reconcile-owed listing, both
+  returning nothing. Their indexes are partial, so they hold no entries when
+  the system is settled. The stale-dependents pass has no equivalent,
+  because "stale" compares `objects.resource_version` with
+  `dependency_watermarks.reconciled_against` — two columns in two different
+  rows, which no index can serve.
+
+  **Why there is no cursor today.** A cursor would limit the sweep to
+  targets written since the last one. It would then never re-examine a
+  dependent that is already stale and whose target has gone quiet. Three
+  ways that happens:
+
+  1. The pass found the dependent and the process died before the reconcile
+     ran. The enqueue was in memory, and nothing failed, so nothing was
+     recorded.
+  2. The reconcile succeeded and the watermark write failed. `reconciler.go`
+     writes it independently and swallows the error, on the stated ground
+     that "the next stale pass re-derives it".
+  3. `EdgesAdd` cleared the watermark for a new edge whose target is quiet.
+     This one is already covered, because `EdgesAdd` stamps
+     `reconcile_owed`.
+
+  **What makes a cursor sound: let the pass stamp `reconcile_owed` instead
+  of enqueueing in memory.** Then every finding is durable, the owed pass
+  drains it on an empty partial index, and the sweep may advance a cursor
+  because it never has to re-find anything. A failed reconcile already
+  leaves the count up — the decrement is gated on `reconcileErr == nil` —
+  so that half needs no change. Case 2 needs one: stamp the count when the
+  watermark write fails, rather than swallowing it.
+
+  **What that turns the pass into.** Listing targets above a cursor and
+  resolving their dependents through `edges` is the dependency waker, with
+  a durable stamp added. So this is not a new mechanism; it is the waker
+  made into a guarantee, replacing a scan whose cost is the graph with one
+  whose cost is the change rate.
+
+  **Three costs, which is why it waits.** It reintroduces the durable
+  cursor that the push conversion deletes with the waker. It turns a
+  read-only pass into one that writes once for each stale dependent, on the
+  single connection. And one cursor shared by two processes on one database
+  breaks — each would skip work the other's cursor claimed — where the full
+  scan is immune to that by construction.
+
+  **Revisit at roughly ten times the current measured graph.** At 250,000
+  edges the sweep is 190 ms, which is 0.06% of one connection at a
+  five-minute interval. At 2.5 million edges it is near 2 s a sweep, and
+  the arithmetic changes. Revisit sooner if the interval ever has to come
+  back down, since the cost is per sweep.
+
+  **Tripwires.** `TestStaleDependentsPassEnqueuesStaleDependents` closes
+  every other route to the dependent — the waker off, the full pass off,
+  the dependent settled — so it asserts the pass finds a dependent nobody
+  told it about. That is the property a cursor puts at risk.
+  `TestStaleDependentsSweepWarnsAndRetriesOnListFailure` is the sharper
+  one: its comment reads "there is no cursor to hold and nothing was
+  drained", which is the exact sentence a cursor invalidates. Adding one
+  makes "hold the cursor on a failed sweep" a new requirement, and that
+  test is where it has to be pinned. The measurements above came from a
+  throwaway benchmark; rebuild it before changing anything here.
+
+- **`SchedulesWatch` is the one watch left polling after the push
+  conversion, and no backstop can be built for it** — known, not fixed, and
+  dropped from [the push conversion](specs/push-conversion.md) on purpose
+  rather than forgotten. A draft spec existed and was deleted; this entry
+  is what it left behind.
+
+  Every other watch converts. `EventsWatch` gets push beside its poll,
+  and both object watches move to a per-kind hub backed by the stale-watch
+  pass. `SchedulesWatch` keeps a 1-second poll of `workQueue.nextRequeueAt`,
+  so the finished system has one watch on the old model and three on the
+  new one. That inconsistency is the whole of the defect: there is no
+  correctness problem and no measured cost.
+
+  **The push design is not the hard part.** A `conflate.Hub[ObjectID,
+  Schedule]` beside each reconciler, keyed by object id, newest-wins,
+  filtered per subscriber the way `ObjectsWatch` is. Notify wherever the
+  queue moves the next-requeue time — `addLocked`, `addAfter`, an alarm
+  firing, a dispatch, a completion — from one helper that both sets the
+  field and sends, because five call sites that can each forget a notify is
+  the actual risk. Notify outside the queue lock: `Send` takes the hub
+  lock, and nesting it inside the queue's critical section puts a second
+  lock on the hot path of every enqueue in the system. The existing
+  "send only if changed" check absorbs the overlap with the retained poll,
+  so both paths can feed one stream.
+
+  **What blocks it is the backstop rule, and the block is structural.** The
+  push conversion's rule is that every push consumer has a backstop that
+  asks *the store* what is true now, so a lost notify costs latency rather
+  than divergence. The schedule is not store state. It is memory, by design
+  — see [the schedule-watch ADR](adr/2026-07-27-schedule-watch.md) — which
+  is why a requeue bumps no generation and no `resource_version`. So the
+  only available backstop for a lost notify is a periodic read of the same
+  memory, which is the poll that push would be replacing. There is no
+  version of this that satisfies the rule.
+
+  **And the poll costs nothing to keep.** It is a map lookup under a mutex:
+  no store round trip, no blob, no index, unlike every other poll this plan
+  removes. It is also self-healing in a way a push path is not — a poll of
+  memory cannot drift from memory, while a missed notify leaves a
+  subscriber reporting a stale schedule until the next real change. So push
+  would buy latency on a gauge that already refreshes within one second,
+  and would trade a driver that cannot be wrong for one that can.
+
+  **Revisit if the poll interval ever has to grow.** The argument above
+  rests on the poll being cheap *and* frequent. If `withWatchPollInterval`
+  is ever raised for the sake of `EventsWatch` or `ObjectsWatch` — or if
+  those two convert and the interval loses its other users — then a
+  1-second gauge stops being free and this trade changes. It would also
+  change if the schedule ever became durable, but `docs/TODO.md` argues
+  against that separately under the `RequeueAfter` item, and for reasons
+  that still hold.
+
+  **Tripwires.** `TestSchedulesWatchEmitsOnlyOnChange` pins that the zero
+  `Schedule` is delivered as a real gauge value rather than withheld as an
+  absence, and that an unchanged gauge sends nothing on later ticks.
+  `TestClientWatchScheduleSnapshot` pins the first report. Any push version
+  has to keep the `first` flag for exactly those reasons, so these are what
+  constrain the fix.
+
 - **A dependency cycle of length ≥ 2 reconciles forever** — known, not fixed. The
   self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`, so an object
   that depends on itself does not re-queue itself. Two objects that depend on each
