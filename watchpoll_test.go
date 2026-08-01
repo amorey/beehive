@@ -1131,3 +1131,64 @@ func TestSchedulePublishAfterCloseIsNotFatal(t *testing.T) {
 
 	assert.NotPanics(t, func() { r.work.add(1) })
 }
+
+// The stream compares each delivered value against the last it reported, and
+// this is the case that comparison exists for: the gauge moved away and back
+// while nobody was reading, so the bus coalesced the pair and hands back a value
+// the subscriber already has.
+//
+// TestScheduleStreamRepeatsNothing does not reach it. There the gauge suppresses
+// the duplicate before it ever reaches the bus, so the stream never sees one.
+// Here the publish is made directly, which is also what a coarse clock produces:
+// two adds inside one tick stamp the same due-now time.
+func TestScheduleStreamDropsACoalescedRepeat(t *testing.T) {
+	ctx, _, client, r := pushOnlyClient(t)
+
+	ch, err := client.SchedulesWatch(ctx, 1)
+	require.NoError(t, err)
+
+	// Published before the snapshot is read, so it lands in the receiver's slot
+	// while the stream is still blocked delivering that snapshot. Same Schedule
+	// as the seed, higher Seq, so Accept takes it.
+	require.NoError(t, r.work.schedules.Send(1, stamped{Seq: 100}))
+
+	assert.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the snapshot")
+	assertQuiet(t, ch, "a value equal to the last reported must not be re-sent")
+
+	// The stream is still live and still delivers a change. Published the same
+	// way: an injected Seq sits above anything the gauge will produce, so a real
+	// enqueue would now be rejected by Accept — which is a property of this test's
+	// injection, not of the queue.
+	due := Schedule{NextRequeueAt: time.Now()}
+	require.NoError(t, r.work.schedules.Send(1, stamped{Schedule: due, Seq: 101}))
+	assert.Equal(t, due, recv(t, ch))
+}
+
+// A subscriber that cancels before reading its snapshot ends the stream rather
+// than parking the goroutine on a send nobody will take.
+func TestScheduleStreamCancelBeforeTheSnapshotIsRead(t *testing.T) {
+	_, _, client, _ := pushOnlyClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ch, err := client.SchedulesWatch(ctx, 1)
+	require.NoError(t, err)
+	cancel() // the snapshot is still unread
+
+	assertChanClosed(t, ch)
+}
+
+// The same for a later value: the stream is blocked delivering a move when the
+// caller cancels.
+func TestScheduleStreamCancelWhileDeliveringAMove(t *testing.T) {
+	_, _, client, r := pushOnlyClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ch, err := client.SchedulesWatch(ctx, 1)
+	require.NoError(t, err)
+	require.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the snapshot")
+
+	r.work.add(1) // delivered, but never read
+	cancel()
+
+	assertChanClosed(t, ch)
+}

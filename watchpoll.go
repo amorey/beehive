@@ -490,15 +490,15 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 		// ends the stream.
 		defer rx.Close()
 
-		// The bus does not deliver the seed back — it is the caller's own argument
-		// — so the snapshot is reported here and the receiver carries what
-		// supersedes it.
-		last := cur.Schedule
-		if !sendOrDone(ctx, out, last) {
-			return
-		}
-
+		// last is what the subscriber has been told; send says whether the value in
+		// hand still needs telling. The snapshot always does — the bus does not
+		// deliver the seed back, since it is the caller's own argument — and every
+		// value after it does unless it repeats what was already reported.
+		last, send := cur.Schedule, true
 		for {
+			if send && !sendOrDone(ctx, out, last) {
+				return // the caller's ctx ended
+			}
 			ev, err := rx.RecvContext(ctx)
 			if err != nil {
 				return // the sender closed, or the caller's ctx ended
@@ -508,13 +508,7 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 			// move away and back while nobody reads, and a repeated value must not
 			// reach the consumer.
 			next := ev.Value.Schedule
-			if next == last {
-				continue
-			}
-			last = next
-			if !sendOrDone(ctx, out, next) {
-				return
-			}
+			send, last = next != last, next
 		}
 	}()
 	return out, nil
