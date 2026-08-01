@@ -24,6 +24,8 @@ import (
 
 	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/logging"
+
+	"github.com/amorey/gobus/watch"
 )
 
 const (
@@ -371,6 +373,14 @@ func (r *reconciler) requeueNow(id ObjectID) {
 //
 // A kind with no queue reports the zero Schedule for the same reason: nothing is
 // scheduled for it.
+// watchSchedule registers a receiver for id and returns it with the schedule
+// current at registration. A reconciler with no queue cannot happen here:
+// SchedulesWatch resolves a registered controller first, and Register builds the
+// queue and the hub together.
+func (r *reconciler) watchSchedule(id ObjectID) (*watch.Receiver[ObjectID, stamped], stamped) {
+	return r.work.watchSchedule(id)
+}
+
 func (r *reconciler) scheduleAt(id ObjectID) stamped {
 	if r.work == nil {
 		return stamped{}

@@ -463,29 +463,71 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 // none, so it returns ErrNoController. See the Client interface for the full
 // contract.
 //
-// Unlike the other watches this polls in-memory state rather than the store, so the
-// interval costs nothing but latency. The zero Schedule ("nothing scheduled") is a
-// real value rather than an absence, so it is sent like any other; the first flag is
-// what separates "never reported" from "last reported the zero value".
+// Unlike the other watches this reports in-memory state rather than the store. The
+// work queue publishes every move of the schedule to a hub, and this stream reads
+// its own receiver; the poll runs beside it as the backstop while the push path is
+// new. The zero Schedule ("nothing scheduled") is a real value rather than an
+// absence, so it is delivered like any other.
+//
+// One goroutine owns the stream. last is its local and out has one sender, so the
+// two paths must not be two goroutines: that would be a data race on last and a
+// double send on out. The loop therefore selects over the ctx, the ticker and the
+// receiver, and both arms run the same comparison and the same send.
+//
+// The receiver is read through Chan rather than RecvContext because a select needs
+// a channel. That costs a feeder goroutine for each subscriber, which is why the
+// leak check in testutils_test.go must see gobus frames. When the poll goes, the
+// ticker arm goes with it and the loop becomes a blocking RecvContext.
 func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
 	if !ok {
 		return nil, ErrNoController
 	}
+	rx, cur := r.watchSchedule(id)
 	out := make(chan Schedule)
-	var last Schedule
-	first := true
 
 	go func() {
 		defer close(out)
-		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			cur := r.scheduleAt(id).Schedule
-			if !first && cur == last {
-				return true
+		// The receiver holds its key against the hub until it is closed, whatever
+		// ends the stream.
+		defer rx.Close()
+
+		// The bus does not deliver the seed back — it is the caller's own argument
+		// — so the snapshot is reported here and the receiver carries what
+		// supersedes it.
+		last := cur.Schedule
+		if !sendOrDone(ctx, out, last) {
+			return
+		}
+
+		tick, stop := driver.TickerChan(c.bh.watchPoll())
+		defer stop()
+		events := rx.Chan()
+		for {
+			var next Schedule
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick:
+				next = r.scheduleAt(id).Schedule
+			case ev, open := <-events:
+				if !open {
+					return
+				}
+				// No staleness check: Accept rejected every value the queue
+				// superseded. This comparison is for coalescing only — the gauge
+				// can move away and back while nobody reads, and a repeated value
+				// must not reach the consumer.
+				next = ev.Value.Schedule
 			}
-			first, last = false, cur
-			return sendOrDone(ctx, out, cur)
-		})
+			if next == last {
+				continue
+			}
+			last = next
+			if !sendOrDone(ctx, out, next) {
+				return
+			}
+		}
 	}()
 	return out, nil
 }
