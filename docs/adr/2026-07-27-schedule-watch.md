@@ -138,9 +138,16 @@ stream ends. `Hub.Close` is never called: it is hard tear-down with no drain, so
 a receiver that had not yet read the final value would lose it, and the loss
 would depend on timing.
 
-That final emit is partial by design. `stop` clears alarms, not the dirty set, so
-an id queued for immediate dispatch ends on a due-now that will not happen. The
-poll reported the same thing, because the gauge genuinely still says due-now.
+The final emit covers **every** id the gauge still describes, not only the ids
+whose schedule `stop` moved. That completeness is what makes a publish racing the
+close harmless: a move needs the queue lock, and `stop` sets `stopped` under it,
+so nothing can move after the snapshot and anything still in flight can only
+carry a duplicate of it. Publishing the moves alone would let a subscriber end on
+a value the queue had already left.
+
+An id queued for immediate dispatch still ends on a due-now that will not happen.
+`stop` clears alarms, not the dirty set, and the poll reported the same thing
+because the gauge genuinely still says due-now.
 
 ### Costs taken knowingly
 

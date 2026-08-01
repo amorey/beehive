@@ -517,13 +517,41 @@ func TestPublishStopSendsTheFinalValues(t *testing.T) {
 func TestPublishStopLeavesAQueuedIDDueNow(t *testing.T) {
 	q, tx := publishingQueue()
 	q.add(1)
+
+	q.stop()
+
+	assert.False(t, q.scheduleAt(1).NextRequeueAt.IsZero(),
+		"a queued id is not descheduled by stop")
+	last := tx.taken()
+	require.NotEmpty(t, last)
+	assert.False(t, last[len(last)-1].Schedule.NextRequeueAt.IsZero(),
+		"its final published value is that due-now, not a deschedule")
+}
+
+// stop publishes the final schedule of every id the gauge still describes, not
+// only the ids whose schedule it moved.
+//
+// That completeness is what makes a publish racing shutdown harmless. An enqueue
+// can move the gauge, release q.mu, and then lose its own publish to the closing
+// sender. Because no gauge move is possible once stopped is set, stop's snapshot
+// is the final state, so the lost publish can only ever have carried a duplicate
+// of it. Without the snapshot the subscriber would end on a value the queue had
+// already left.
+func TestPublishStopSnapshotsEveryScheduledID(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)                 // queued now
+	q.addAfter(2, time.Hour) // pending alarm
 	before := len(tx.taken())
 
 	q.stop()
 
-	assert.Len(t, tx.taken(), before, "a queued id moves nothing at stop")
-	assert.False(t, q.scheduleAt(1).NextRequeueAt.IsZero(),
-		"a queued id is not descheduled by stop")
+	final := make(map[ObjectID]Schedule)
+	for _, m := range tx.taken()[before:] {
+		final[m.ID] = m.Schedule
+	}
+	require.Len(t, final, 2, "both ids must appear in the final snapshot")
+	assert.True(t, final[2].NextRequeueAt.IsZero(), "the cleared alarm reads as unscheduled")
+	assert.False(t, final[1].NextRequeueAt.IsZero(), "the queued id keeps its due-now")
 }
 
 // A queue with no hub is a client-only kind. It must not panic.

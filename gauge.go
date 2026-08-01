@@ -153,8 +153,7 @@ func (g *gauge) clearAlarm(id ObjectID) (stamped, bool) {
 }
 
 // clearAllAlarms stops every pending timer, drops every alarm, and reports the
-// ids whose observable schedule moved. Shutdown calls it, and the reports are the
-// last values a subscriber sees.
+// ids whose observable schedule moved.
 //
 // An id that is also dirty is *not* reported: it reads as due now before and
 // after, since at consults dirty first. Reporting it would publish a Seq bump
@@ -171,4 +170,27 @@ func (g *gauge) clearAllAlarms() []keyed {
 		}
 	}
 	return moved
+}
+
+// remaining reports the current schedule of every id the gauge still describes.
+// Call it after clearAllAlarms, so what it returns is the ids still queued for
+// immediate dispatch.
+//
+// Shutdown needs this on top of the moves clearAllAlarms reports, and the reason
+// is a race rather than a state. An enqueue can move the gauge, release the
+// queue's lock, and only then publish — so its publish can lose the race to the
+// closing sender and be dropped. No gauge move is possible once the queue is
+// stopped, so a snapshot taken then is final, and a dropped publish can only have
+// carried a duplicate of it. Report the moves alone and that subscriber would end
+// on a value the queue had already left.
+//
+// The stamps are the gauge's current sequence rather than the one each id last
+// moved at, which is what makes the snapshot idempotent: an id whose publish did
+// land is rejected by the stream's own comparison rather than reported twice.
+func (g *gauge) remaining() []keyed {
+	out := make([]keyed, 0, len(g.dirty))
+	for id := range g.dirty {
+		out = append(out, keyed{ID: id, stamped: g.at(id)})
+	}
+	return out
 }

@@ -72,9 +72,12 @@ func newWorkQueue() *workQueue {
 //
 // gobus.ErrClosed is expected rather than exceptional: Client.Requeue is public
 // and reaches this queue from a user goroutine at any time, including while the
-// beehive tears down, so a publish can race the sender close. The value is lost
-// and nothing retries it, which is the same answer a caller gets from a stopped
-// beehive by any other route.
+// beehive tears down, so a publish can race the sender close and be dropped.
+//
+// Dropping it loses nothing, and that is a property of stop rather than luck.
+// A move requires the queue lock and stop sets stopped under it, so no move can
+// follow the snapshot stop publishes. Anything still in flight therefore carries
+// a value that snapshot already covers. See gauge.remaining.
 func (q *workQueue) publish(id ObjectID, m move) {
 	if !m.set {
 		return
@@ -232,7 +235,10 @@ func (q *workQueue) scheduleAt(id ObjectID) Schedule {
 func (q *workQueue) stop() {
 	q.mu.Lock()
 	q.stopped = true
-	final := q.gauge.clearAllAlarms()
+	// The alarm clears are moves; the rest is the state those moves leave behind.
+	// Both go out, because the snapshot is what makes a publish that races the
+	// closing sender harmless — see gauge.remaining.
+	final := append(q.gauge.clearAllAlarms(), q.gauge.remaining()...)
 	q.mu.Unlock()
 	// The final values go out before the sender closes, so a subscriber's last
 	// word is what the schedule became rather than nothing at all.
