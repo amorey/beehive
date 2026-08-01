@@ -28,6 +28,14 @@ import (
 // reconcile the same object concurrently. An add that arrives while the ID is
 // processing is remembered (dirty) and re-queued by done, so no wakeup is lost.
 // This is the standard Kubernetes work-queue discipline.
+// scheduleSender is what workQueue needs from the schedule hub, and all it may
+// reach. Keeping the boundary at one unexported method means no gobus type
+// reaches this file, and a test can record what the queue published without
+// standing up a hub and a receiver to observe it.
+type scheduleSender interface {
+	Send(id ObjectID, s stamped) error
+}
+
 type workQueue struct {
 	mu sync.Mutex
 	// gauge owns the state SchedulesWatch reports: which ids are queued now and
@@ -39,6 +47,9 @@ type workQueue struct {
 	items      []ObjectID
 	ready      chan struct{} // pulsed when items are available
 	stopped    bool          // set by stop; adds become no-ops
+	// schedules receives every move of the gauge. nil for a kind with no
+	// reconciler, which has no hub and no watchers.
+	schedules scheduleSender
 }
 
 // alarm is a pending delayed enqueue: the timer that will enqueue the id and the
@@ -57,22 +68,87 @@ func newWorkQueue() *workQueue {
 	}
 }
 
+// publish hands one move to the hub. It runs *after* q.mu is released: Send
+// takes the bus lock, and nesting that inside the queue's critical section would
+// put a second lock on the hot path of every enqueue in the system.
+//
+// Two moves for one id can therefore reach Send in the reverse of the order they
+// became true. The hub's Accept rule resolves that by comparing the stamps, so
+// the slot settles the same way whichever send runs second.
+//
+// gobus.ErrClosed is expected rather than exceptional: Client.Requeue is public
+// and reaches this queue from a user goroutine at any time, including while the
+// beehive tears down, so a publish can race the sender close. The value is lost
+// and nothing retries it, which is the same answer a caller gets from a stopped
+// beehive by any other route.
+func (q *workQueue) publish(moves ...keyed) {
+	if q.schedules == nil {
+		return // client-only kind: no reconciler, no hub
+	}
+	for _, m := range moves {
+		_ = q.schedules.Send(m.ID, m.stamped)
+	}
+}
+
+// moveSet collects what one critical section moved, keeping only the last value
+// for each id.
+//
+// requeueNow clears an alarm and then marks the id dirty. Reported separately
+// that is "nothing scheduled" followed by "due now", and the first is a state
+// that never existed between two consistent points. One rule here covers every
+// site that touches the gauge twice.
+type moveSet struct {
+	order []ObjectID
+	last  map[ObjectID]stamped
+}
+
+// put records a move. Callers gate on the gauge's own report, so anything that
+// reaches here did change the observable schedule.
+func (m *moveSet) put(id ObjectID, s stamped) {
+	if m.last == nil {
+		m.last = make(map[ObjectID]stamped, 1)
+	}
+	if _, seen := m.last[id]; !seen {
+		m.order = append(m.order, id)
+	}
+	m.last[id] = s
+}
+
+func (m *moveSet) drain() []keyed {
+	out := make([]keyed, 0, len(m.order))
+	for _, id := range m.order {
+		out = append(out, keyed{ID: id, stamped: m.last[id]})
+	}
+	return out
+}
+
 // add enqueues id unless it is already queued. If id is currently being
 // processed it is marked dirty instead of queued, so done re-queues it once the
 // in-flight reconcile completes rather than dispatching a second one in parallel.
 func (q *workQueue) add(id ObjectID) {
+	var moved moveSet
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.addLocked(id)
+	q.addLocked(id, &moved)
+	q.mu.Unlock()
+	q.publish(moved.drain()...)
 }
 
-func (q *workQueue) addLocked(id ObjectID) {
+// addLocked is the shared body of add, requeueNow and timerFired. It is not a
+// publish site of its own: the caller owns the critical section, so the caller
+// owns the publish, and treating this as a site would emit twice for the callers
+// that touch the gauge before it.
+//
+// The stopped check stays above the gauge call. Below it, a post-stop add would
+// move the gauge and publish a due-now after stop already sent the final values.
+func (q *workQueue) addLocked(id ObjectID, moved *moveSet) {
 	if q.stopped {
 		return
 	}
-	if _, ok := q.gauge.markDirty(id); !ok {
+	s, ok := q.gauge.markDirty(id)
+	if !ok {
 		return // already queued
 	}
+	moved.put(id, s)
 	if _, ok := q.processing[id]; !ok {
 		q.items = append(q.items, id)
 		q.signal()
@@ -95,20 +171,23 @@ func (q *workQueue) signal() {
 // cancelled so only the newest schedule fires.
 func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	if delay <= 0 {
-		q.add(id)
+		q.add(id) // this branch sets no alarm, so its move comes from markDirty
 		return
 	}
+	var moved moveSet
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.stopped {
-		return
+	if !q.stopped {
+		if prev := q.gauge.alarmAt(id); prev != nil {
+			prev.timer.Stop() // newest schedule wins; don't let the stale one fire
+		}
+		a := &alarm{fireAt: time.Now().Add(delay)}
+		a.timer = time.AfterFunc(delay, func() { q.timerFired(id, a) })
+		if s, ok := q.gauge.setAlarm(id, a); ok {
+			moved.put(id, s)
+		}
 	}
-	if prev := q.gauge.alarmAt(id); prev != nil {
-		prev.timer.Stop() // newest schedule wins; don't let the stale one fire
-	}
-	a := &alarm{fireAt: time.Now().Add(delay)}
-	a.timer = time.AfterFunc(delay, func() { q.timerFired(id, a) })
-	q.gauge.setAlarm(id, a)
+	q.mu.Unlock()
+	q.publish(moved.drain()...)
 }
 
 // timerFired runs when an alarm's timer fires. It enqueues id only if a is still
@@ -117,13 +196,19 @@ func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 // that newer schedule — not this superseded one — owns the enqueue. Adding here
 // regardless would run the work early, ignoring the newer delay.
 func (q *workQueue) timerFired(id ObjectID, a *alarm) {
+	var moved moveSet
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.gauge.alarmAt(id) != a {
-		return // superseded: a newer schedule owns the enqueue
+	if q.gauge.alarmAt(id) == a {
+		// One critical section, so a subscriber never sees the id go unscheduled
+		// between the clear and the enqueue. Under a poll that window was almost
+		// never observed; under push it would be observed every time.
+		if s, ok := q.gauge.clearAlarm(id); ok {
+			moved.put(id, s)
+		}
+		q.addLocked(id, &moved) // a no-op if stop ran between firing and here
 	}
-	q.gauge.clearAlarm(id)
-	q.addLocked(id) // a no-op if stop ran between firing and here
+	q.mu.Unlock()
+	q.publish(moved.drain()...)
 }
 
 // requeueNow cancels any pending delayed add for id and makes it immediately
@@ -131,13 +216,17 @@ func (q *workQueue) timerFired(id ObjectID, a *alarm) {
 // between the two. It is the queue primitive behind reconciler.requeueNow: a stale
 // backoff timer is dropped and the id is requeued for immediate reconcile.
 func (q *workQueue) requeueNow(id ObjectID) {
+	var moved moveSet
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if a := q.gauge.alarmAt(id); a != nil {
 		a.timer.Stop()
-		q.gauge.clearAlarm(id)
+		if s, ok := q.gauge.clearAlarm(id); ok {
+			moved.put(id, s)
+		}
 	}
-	q.addLocked(id)
+	q.addLocked(id, &moved)
+	q.mu.Unlock()
+	q.publish(moved.drain()...)
 }
 
 // scheduleAt reports id's current schedule. An id that is only being processed,
@@ -154,10 +243,13 @@ func (q *workQueue) scheduleAt(id ObjectID) stamped {
 // has drained. Idempotent.
 func (q *workQueue) stop() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.stopped = true
 	q.gauge.stopTimers()
-	q.gauge.clearAllAlarms()
+	final := q.gauge.clearAllAlarms()
+	q.mu.Unlock()
+	// The final values go out before the sender closes, so a subscriber's last
+	// word is what the schedule became rather than nothing at all.
+	q.publish(final...)
 }
 
 // get removes and returns the next item, moving it into the processing state
@@ -169,12 +261,16 @@ func (q *workQueue) get() (ObjectID, bool) {
 	if len(q.items) == 0 {
 		return 0, false
 	}
+	var moved moveSet
+	defer func() { q.publish(moved.drain()...) }()
 	id := q.items[0]
 	q.items = q.items[1:]
 	// Dispatch clears the dirty slot: absent a future alarm, the id is now
 	// unscheduled. The id is items[0] rather than a parameter, so the gauge call
 	// sits here rather than in a wrapper around the method.
-	q.gauge.clearDirty(id)
+	if s, ok := q.gauge.clearDirty(id); ok {
+		moved.put(id, s)
+	}
 	q.processing[id] = struct{}{}
 	if len(q.items) > 0 {
 		q.signal()
