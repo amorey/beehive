@@ -216,13 +216,18 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // Without that gate a failing controller would also lose its backoff ladder, because
 // requeueNow on an in-flight id makes it dispatchable at once. There is deliberately
 // no second answer to "was the edge new" for this gate to disagree with.
+//
+// The enqueue routes by res.From, which is fromID's own kind, and not by c.gk. The
+// edge is cross-kind, so the two differ whenever a controller declares a dependency
+// on another kind's behalf, and the caller's kind would reach the wrong reconciler
+// or none. This matches the store, which routes the durable stamp by the same row.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
 	res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
 	if res.ReconcileOwedStamped {
-		c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: c.gk.Group, Kind: c.gk.Kind})
+		c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: res.From.Group, Kind: res.From.Kind})
 	}
 	return nil
 }

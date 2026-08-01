@@ -484,9 +484,14 @@ func (f *declareFixture) requireNotOwed(t *testing.T) {
 // declaration queued the object, not that a later pass found it.
 func (f *declareFixture) queued(t *testing.T, gk GroupKind) []ObjectID {
 	t.Helper()
-	r, ok := f.bh.reconcilerFor(gk)
+	return queuedIDs(mustReconciler(t, f.bh, gk).work)
+}
+
+func mustReconciler(t *testing.T, bh *Beehive, gk GroupKind) *reconciler {
+	t.Helper()
+	r, ok := bh.reconcilerFor(gk)
 	require.True(t, ok, "the kind must be registered to have a queue")
-	return queuedIDs(r.work)
+	return r
 }
 
 // TestAddDependencyWakesOncePerEdge pins the declare-time guarantee and its
@@ -628,6 +633,27 @@ func TestAddDependencyEnqueuesOnlyWhatItStamped(t *testing.T) {
 
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, dep.ID))
 	assert.Empty(t, queuedIDs(r.work), "a self-edge stamps nothing, so it queues nothing")
+}
+
+// TestAddDependencyEnqueueRoutesByTheSourcesKind pins the routing. Edges are
+// cross-kind: a controller may declare a dependency on another kind's behalf, so
+// fromID is not necessarily the caller's kind. The enqueue must reach the
+// reconciler that owns the source.
+//
+// The fixture declares through the target kind's ControllerClient, so the source
+// belongs to a foreign kind by construction. An enqueue routed by the caller's kind
+// would reach the target kind's queue, or a kind with no reconciler at all, and the
+// source would wait for the owed pass. Nothing else in the suite catches that.
+func TestAddDependencyEnqueueRoutesByTheSourcesKind(t *testing.T) {
+	f := newDeclareFixture(t)
+	ctx := context.Background()
+	drainQueue(mustReconciler(t, f.bh, f.depGK).work)
+	drainQueue(mustReconciler(t, f.bh, f.targetGK).work)
+
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(t, f.depGK), "the source's own kind is queued")
+	assert.Empty(t, f.queued(t, f.targetGK), "the declarer's kind is not")
 }
 
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:
