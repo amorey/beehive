@@ -69,7 +69,7 @@ func newWorkQueue() *workQueue {
 // put a second lock on the hot path of every enqueue in the system.
 //
 // Two moves for one id can therefore reach Send in the reverse of the order they
-// became true. The hub's Accept rule resolves that by comparing the stamps, so
+// became true. The hub's Accept rule resolves that by comparing their order, so
 // the slot settles the same way whichever send runs second.
 //
 // gobus.ErrClosed is expected rather than exceptional: Client.Requeue is public
@@ -88,9 +88,9 @@ func (q *workQueue) publish(id ObjectID, m move) {
 }
 
 // publishAll is publish for the one caller that moves many ids at once.
-func (q *workQueue) publishAll(moves []keyed) {
+func (q *workQueue) publishAll(moves []keyedValue) {
 	for _, m := range moves {
-		_ = q.schedules.Send(m.ID, m.stamped)
+		_ = q.schedules.Send(m.ID, m.gaugeValue)
 	}
 }
 
@@ -107,13 +107,13 @@ func (q *workQueue) publishAll(moves []keyed) {
 // The one place that moves many — stop, draining every alarm — publishes the
 // gauge's own slice instead.
 type move struct {
-	value stamped
+	value gaugeValue
 	set   bool
 }
 
 // put records a move. Callers gate on the gauge's own report, so anything that
 // reaches here did change the observable schedule.
-func (m *move) put(s stamped) { m.value, m.set = s, true }
+func (m *move) put(s gaugeValue) { m.value, m.set = s, true }
 
 // add enqueues id unless it is already queued. If id is currently being
 // processed it is marked dirty instead of queued, so done re-queues it once the
@@ -303,23 +303,28 @@ func (q *workQueue) done(id ObjectID) {
 // The schedule: the queue's observable state, and how it is published.
 // ============================================================
 
-// stamped is a schedule plus the order it moved in.
+// gaugeValue is what the gauge reports and what the hub carries: a schedule plus
+// the order it moved in.
 //
-// Seq is assigned under workQueue.mu, so it is the *queue's* order and not the
-// order two publishes happen to reach the bus in. That distinction is the whole
-// reason it exists: a publish happens after the queue lock is released, so two
-// moves can unlock in one order and be sent in the other. The hub's Accept rule
-// compares Seq, so whichever send arrives second sees the other as prev and the
-// slot settles the same way either way.
-type stamped struct {
+// Seq is a counter, not a clock — the schedule already holds a time, and that
+// time cannot serve here, because get and stop both move the gauge without
+// writing one. It is assigned under workQueue.mu, so it is the *queue's* order
+// and not the order two publishes happen to reach the bus in.
+//
+// That distinction is the whole reason it exists: a publish happens after the
+// queue lock is released, so two moves can unlock in one order and be sent in the
+// other. The hub's Accept rule compares Seq, so whichever send arrives second
+// sees the other as prev and the slot settles the same way either way.
+type gaugeValue struct {
 	Schedule Schedule
 	Seq      uint64
 }
 
-// keyed is one id's move, for the mutator that moves many ids at once.
-type keyed struct {
+// keyedValue names the id a gaugeValue belongs to, for the paths that carry many
+// at once: the shutdown snapshot and the publish that drains it.
+type keyedValue struct {
 	ID ObjectID
-	stamped
+	gaugeValue
 }
 
 // gauge owns the two maps SchedulesWatch reports on. Nothing outside it touches
@@ -343,7 +348,7 @@ type gauge struct {
 	// where time.Now() would differ on each one and make SchedulesWatch emit
 	// forever (see the schedule-watch ADR: a repeated value must be impossible).
 	dirty  map[ObjectID]time.Time // queued (in items) and awaiting dispatch
-	alarms map[ObjectID]*alarm    // pending delayed adds (addAfter), keyed by id
+	alarms map[ObjectID]*alarm    // pending delayed adds (addAfter), keyedValue by id
 	seq    uint64
 }
 
@@ -378,27 +383,27 @@ func (g *gauge) scheduleLocked(id ObjectID) Schedule {
 // is a real value this watch delivers rather than an absence, so a second
 // result would carry nothing a caller could act on — both callers of the old
 // nextRequeueAt discarded it.
-func (g *gauge) at(id ObjectID) stamped {
-	return stamped{Schedule: g.scheduleLocked(id), Seq: g.seq}
+func (g *gauge) at(id ObjectID) gaugeValue {
+	return gaugeValue{Schedule: g.scheduleLocked(id), Seq: g.seq}
 }
 
 // report stamps a move, or reports nothing when the observable schedule did not
 // change. Every mutator below routes its answer through here, so "did a watcher
 // see this" is decided in one place rather than at each site.
-func (g *gauge) report(id ObjectID, before Schedule) (stamped, bool) {
+func (g *gauge) report(id ObjectID, before Schedule) (gaugeValue, bool) {
 	after := g.scheduleLocked(id)
 	if after == before {
-		return stamped{}, false
+		return gaugeValue{}, false
 	}
 	g.seq++
-	return stamped{Schedule: after, Seq: g.seq}, true
+	return gaugeValue{Schedule: after, Seq: g.seq}, true
 }
 
 // markDirty queues id for immediate dispatch. It is a no-op for an id already
 // queued, which is what keeps a burst of adds to one id at one reported move.
-func (g *gauge) markDirty(id ObjectID) (stamped, bool) {
+func (g *gauge) markDirty(id ObjectID) (gaugeValue, bool) {
 	if _, ok := g.dirty[id]; ok {
-		return stamped{}, false
+		return gaugeValue{}, false
 	}
 	before := g.scheduleLocked(id)
 	g.dirty[id] = time.Now()
@@ -413,7 +418,7 @@ func (g *gauge) dirtyAt(id ObjectID) bool {
 
 // clearDirty drops id's queued-now slot. The id then reads as its pending alarm,
 // or as unscheduled when it has none.
-func (g *gauge) clearDirty(id ObjectID) (stamped, bool) {
+func (g *gauge) clearDirty(id ObjectID) (gaugeValue, bool) {
 	before := g.scheduleLocked(id)
 	delete(g.dirty, id)
 	return g.report(id, before)
@@ -421,7 +426,7 @@ func (g *gauge) clearDirty(id ObjectID) (stamped, bool) {
 
 // setAlarm records a pending delayed add. It reports nothing when id is already
 // dirty, because at reads dirty first and the alarm is therefore invisible.
-func (g *gauge) setAlarm(id ObjectID, a *alarm) (stamped, bool) {
+func (g *gauge) setAlarm(id ObjectID, a *alarm) (gaugeValue, bool) {
 	before := g.scheduleLocked(id)
 	g.alarms[id] = a
 	return g.report(id, before)
@@ -433,7 +438,7 @@ func (g *gauge) alarmAt(id ObjectID) *alarm { return g.alarms[id] }
 
 // clearAlarm drops id's pending alarm without stopping its timer — the caller
 // owns that, because only the caller knows whether the timer is the one firing.
-func (g *gauge) clearAlarm(id ObjectID) (stamped, bool) {
+func (g *gauge) clearAlarm(id ObjectID) (gaugeValue, bool) {
 	before := g.scheduleLocked(id)
 	delete(g.alarms, id)
 	return g.report(id, before)
@@ -446,14 +451,14 @@ func (g *gauge) clearAlarm(id ObjectID) (stamped, bool) {
 // after, since at consults dirty first. Reporting it would publish a Seq bump
 // for a change no watcher can see — harmless, but it would break the rule every
 // other mutator keeps.
-func (g *gauge) clearAllAlarms() []keyed {
-	var moved []keyed
+func (g *gauge) clearAllAlarms() []keyedValue {
+	var moved []keyedValue
 	for id, a := range g.alarms {
 		a.timer.Stop()
 		before := g.scheduleLocked(id)
 		delete(g.alarms, id)
 		if s, ok := g.report(id, before); ok {
-			moved = append(moved, keyed{ID: id, stamped: s})
+			moved = append(moved, keyedValue{ID: id, gaugeValue: s})
 		}
 	}
 	return moved
@@ -477,10 +482,10 @@ func (g *gauge) clearAllAlarms() []keyed {
 // The stamps are the gauge's current sequence rather than the one each id last
 // moved at, which is what makes the snapshot idempotent: an id whose publish did
 // land is rejected by the stream's own comparison rather than reported twice.
-func (g *gauge) remaining() []keyed {
-	out := make([]keyed, 0, len(g.dirty))
+func (g *gauge) remaining() []keyedValue {
+	out := make([]keyedValue, 0, len(g.dirty))
 	for id := range g.dirty {
-		out = append(out, keyed{ID: id, stamped: g.at(id)})
+		out = append(out, keyedValue{ID: id, gaugeValue: g.at(id)})
 	}
 	return out
 }
@@ -488,7 +493,7 @@ func (g *gauge) remaining() []keyed {
 // scheduleHub carries the work queue's gauge to the SchedulesWatch subscribers
 // of one kind.
 //
-// gobus/watch is a keyed latest-value *state* bus: one slot for each watched
+// gobus/watch is a keyedValue latest-value *state* bus: one slot for each watched
 // key, seeded at registration with the value the caller has just read. That is
 // the right shape because SchedulesWatch is a gauge — it streams the value
 // itself rather than a change. Its sibling gobus/conflate is an event bus with
@@ -500,8 +505,8 @@ func (g *gauge) remaining() []keyed {
 // test can record what it published without standing up a hub and a receiver to
 // observe it.
 type scheduleSender interface {
-	Send(id ObjectID, s stamped) error
-	Watch(id ObjectID, initial stamped) *watch.Receiver[ObjectID, stamped]
+	Send(id ObjectID, s gaugeValue) error
+	Watch(id ObjectID, initial gaugeValue) *watch.Receiver[ObjectID, gaugeValue]
 	Close()
 }
 
@@ -515,12 +520,12 @@ type scheduleSender interface {
 // never the hub's: Hub.Close is hard tear-down with no drain, so a receiver that
 // had not yet read the final value would lose it on a timing coin flip.
 type scheduleHub struct {
-	hub *watch.Hub[ObjectID, stamped]
+	hub *watch.Hub[ObjectID, gaugeValue]
 }
 
-func (h scheduleHub) Send(id ObjectID, s stamped) error { return h.hub.Sender().Send(id, s) }
+func (h scheduleHub) Send(id ObjectID, s gaugeValue) error { return h.hub.Sender().Send(id, s) }
 
-func (h scheduleHub) Watch(id ObjectID, initial stamped) *watch.Receiver[ObjectID, stamped] {
+func (h scheduleHub) Watch(id ObjectID, initial gaugeValue) *watch.Receiver[ObjectID, gaugeValue] {
 	return h.hub.Watch(id, initial)
 }
 
@@ -546,7 +551,7 @@ func (h scheduleHub) Close() { h.hub.Sender().Close() }
 // deadlock. This one reads its two arguments and nothing else.
 func newScheduleHub() scheduleHub {
 	return scheduleHub{hub: watch.New[ObjectID](watch.WithAccept(
-		func(prev, next stamped) bool { return next.Seq > prev.Seq },
+		func(prev, next gaugeValue) bool { return next.Seq > prev.Seq },
 	))}
 }
 
@@ -569,7 +574,7 @@ func newScheduleHub() scheduleHub {
 // It returns the seed as well as the receiver. A caller that re-read the gauge
 // afterwards would take a second critical section and reopen the race this one
 // closes.
-func (q *workQueue) watchSchedule(id ObjectID) (*watch.Receiver[ObjectID, stamped], stamped) {
+func (q *workQueue) watchSchedule(id ObjectID) (*watch.Receiver[ObjectID, gaugeValue], gaugeValue) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	cur := q.gauge.at(id)

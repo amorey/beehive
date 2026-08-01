@@ -343,29 +343,29 @@ func TestWorkQueueRequeueNow(t *testing.T) {
 // fakeScheduleSender records what the queue published.
 type fakeScheduleSender struct {
 	mu   sync.Mutex
-	sent []keyed
+	sent []keyedValue
 	err  error
 }
 
-func (f *fakeScheduleSender) Send(id ObjectID, s stamped) error {
+func (f *fakeScheduleSender) Send(id ObjectID, s gaugeValue) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.sent = append(f.sent, keyed{ID: id, stamped: s})
+	f.sent = append(f.sent, keyedValue{ID: id, gaugeValue: s})
 	return f.err
 }
 
 // Watch and Close satisfy scheduleSender. These tests assert on what the queue
 // published, so neither needs to do anything.
-func (f *fakeScheduleSender) Watch(ObjectID, stamped) *watch.Receiver[ObjectID, stamped] {
+func (f *fakeScheduleSender) Watch(ObjectID, gaugeValue) *watch.Receiver[ObjectID, gaugeValue] {
 	panic("not implemented: fakeScheduleSender.Watch")
 }
 
 func (f *fakeScheduleSender) Close() {}
 
-func (f *fakeScheduleSender) taken() []keyed {
+func (f *fakeScheduleSender) taken() []keyedValue {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]keyed(nil), f.sent...)
+	return append([]keyedValue(nil), f.sent...)
 }
 
 // publishingQueue is a queue wired to a recording sender.
@@ -736,8 +736,8 @@ func TestHubStaleSendNeverReachesTheSlot(t *testing.T) {
 
 	// Two moves for one id, published in the reverse of the order they became
 	// true — the shape two racing publishes produce.
-	newer := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 9}
-	older := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Minute)}, Seq: 8}
+	newer := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 9}
+	older := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Minute)}, Seq: 8}
 	require.NoError(t, q.schedules.Send(1, newer))
 	require.NoError(t, q.schedules.Send(1, older))
 
@@ -758,10 +758,10 @@ func TestHubStaleSendDoesNotDisplaceAnUnreadValue(t *testing.T) {
 	rx, _ := q.watchSchedule(1)
 	defer rx.Close()
 
-	newer := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 5}
+	newer := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 5}
 	require.NoError(t, q.schedules.Send(1, newer))
 	// newer is now unread in the slot.
-	require.NoError(t, q.schedules.Send(1, stamped{Seq: 4}))
+	require.NoError(t, q.schedules.Send(1, gaugeValue{Seq: 4}))
 
 	ev, err := rx.Peek()
 	require.NoError(t, err)
@@ -832,7 +832,7 @@ func TestHubWatchScheduleSeedsFromTheGauge(t *testing.T) {
 	assert.ErrorIs(t, err, gobus.ErrEmpty)
 
 	// ...but the baseline is the prev, so an older publish is still rejected.
-	require.NoError(t, q.schedules.Send(1, stamped{Seq: want.Seq - 1}))
+	require.NoError(t, q.schedules.Send(1, gaugeValue{Seq: want.Seq - 1}))
 	_, err = rx.Peek()
 	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }

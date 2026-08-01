@@ -982,8 +982,8 @@ func TestScheduleStreamNeverShowsAStaleValue(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero())
 
-	newer := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 100}
-	older := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Minute)}, Seq: 99}
+	newer := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 100}
+	older := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Minute)}, Seq: 99}
 	require.NoError(t, r.work.schedules.Send(1, newer))
 	require.NoError(t, r.work.schedules.Send(1, older))
 
@@ -1150,7 +1150,7 @@ func TestScheduleStreamDropsACoalescedRepeat(t *testing.T) {
 	// Published before the snapshot is read, so it lands in the receiver's slot
 	// while the stream is still blocked delivering that snapshot. Same Schedule
 	// as the seed, higher Seq, so Accept takes it.
-	require.NoError(t, r.work.schedules.Send(1, stamped{Seq: 100}))
+	require.NoError(t, r.work.schedules.Send(1, gaugeValue{Seq: 100}))
 
 	assert.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the snapshot")
 	assertQuiet(t, ch, "a value equal to the last reported must not be re-sent")
@@ -1160,7 +1160,7 @@ func TestScheduleStreamDropsACoalescedRepeat(t *testing.T) {
 	// enqueue would now be rejected by Accept — which is a property of this test's
 	// injection, not of the queue.
 	due := Schedule{NextRequeueAt: time.Now()}
-	require.NoError(t, r.work.schedules.Send(1, stamped{Schedule: due, Seq: 101}))
+	require.NoError(t, r.work.schedules.Send(1, gaugeValue{Schedule: due, Seq: 101}))
 	assert.Equal(t, due, recv(t, ch))
 }
 
