@@ -172,7 +172,7 @@ func TestWorkQueueAddAfterOnStoppedQueue(t *testing.T) {
 
 	q.addAfter(1, time.Hour)
 
-	assert.Nil(t, q.gauge.alarmAt(1), "stopped queue must not track a new timer")
+	assert.Nil(t, q.gauge.alarmFor(1), "stopped queue must not track a new timer")
 	_, ok := q.get()
 	assert.False(t, ok, "addAfter on a stopped queue must not enqueue")
 }
@@ -304,7 +304,7 @@ func TestWorkQueueSupersededTimerDoesNotEnqueue(t *testing.T) {
 
 	_, ok := q.get()
 	assert.False(t, ok, "a superseded timer must not enqueue the id")
-	assert.NotNil(t, q.gauge.alarmAt(1), "the newer schedule must be left intact")
+	assert.NotNil(t, q.gauge.alarmFor(1), "the newer schedule must be left intact")
 }
 
 // TestWorkQueueTimerFiredEnqueues verifies a current (non-superseded) timer
@@ -316,7 +316,7 @@ func TestWorkQueueTimerFiredEnqueues(t *testing.T) {
 
 	q.timerFired(1, a)
 
-	assert.Nil(t, q.gauge.alarmAt(1), "firing must clear the schedule slot")
+	assert.Nil(t, q.gauge.alarmFor(1), "firing must clear the schedule slot")
 	id, ok := q.get()
 	require.True(t, ok, "a current timer must enqueue the id")
 	assert.Equal(t, ObjectID(1), id)
@@ -330,7 +330,7 @@ func TestWorkQueueRequeueNow(t *testing.T) {
 
 	q.requeueNow(1)
 
-	assert.Nil(t, q.gauge.alarmAt(1), "requeueNow must drop the pending delayed add")
+	assert.Nil(t, q.gauge.alarmFor(1), "requeueNow must drop the pending delayed add")
 	id, ok := q.get()
 	require.True(t, ok, "requeueNow must make the id dispatchable now")
 	assert.Equal(t, ObjectID(1), id)
@@ -354,7 +354,7 @@ func (f *fakeScheduleSender) Send(id ObjectID, s gaugeValue) error {
 	return f.err
 }
 
-// Watch and Close satisfy scheduleSender. These tests assert on what the queue
+// Watch and Close satisfy scheduleBus. These tests assert on what the queue
 // published, so neither needs to do anything.
 func (f *fakeScheduleSender) Watch(ObjectID, gaugeValue) *watch.Receiver[ObjectID, gaugeValue] {
 	panic("not implemented: fakeScheduleSender.Watch")
@@ -589,7 +589,7 @@ func BenchmarkWorkQueueHotPath(b *testing.B) {
 }
 
 // pendingAlarm builds an alarm as addAfter does. A real alarm always carries a
-// live timer, and clearAllAlarms stops it, so one built without a timer is not a
+// live timer, and finalValues stops it, so one built without a timer is not a
 // state the gauge ever holds.
 func pendingAlarm(in time.Duration) *alarm {
 	return &alarm{timer: time.NewTimer(in), fireAt: time.Now().Add(in)}
@@ -674,17 +674,37 @@ func TestGaugeClearAlarmReports(t *testing.T) {
 // Shutdown clears every alarm, but an id that is also dirty reads as due-now
 // before and after, so it must not be reported. Reporting it would publish a
 // Seq bump for a schedule nobody can see change.
-func TestGaugeClearAllAlarmsSkipsADirtyID(t *testing.T) {
+// finalValues answers for every id the gauge described, whether or not dropping
+// the alarms changed that id. An alarmed id becomes unscheduled and must be told
+// so; a queued id keeps its due-now, because dropping alarms dequeues nothing.
+func TestGaugeFinalValuesCoverEveryDescribedID(t *testing.T) {
 	g := newGauge()
-	g.setAlarm(1, pendingAlarm(time.Hour))
+	g.setAlarm(1, pendingAlarm(time.Hour)) // alarmed only
 	g.setAlarm(2, pendingAlarm(time.Hour))
-	g.markDirty(2) // 2 now reads as due now, so its alarm is invisible
+	g.markDirty(2) // alarmed and queued: reads as due now
 
-	got := g.clearAllAlarms()
+	got := g.finalValues()
 
-	require.Len(t, got, 1, "only the id whose observable schedule moved")
-	assert.Equal(t, ObjectID(1), got[0].ID)
-	assert.True(t, got[0].Schedule.NextRequeueAt.IsZero())
+	final := make(map[ObjectID]Schedule, len(got))
+	for _, k := range got {
+		final[k.ID] = k.Schedule
+	}
+	require.Len(t, final, 2)
+	assert.True(t, final[1].NextRequeueAt.IsZero(), "the alarm is gone, so id 1 is unscheduled")
+	assert.False(t, final[2].NextRequeueAt.IsZero(), "id 2 is queued, so it is still due now")
+}
+
+// Each final value must supersede whatever a subscriber already holds, or the
+// bus rejects it and the last word is lost.
+func TestGaugeFinalValuesAdvanceTheSeq(t *testing.T) {
+	g := newGauge()
+	last, ok := g.setAlarm(1, pendingAlarm(time.Hour))
+	require.True(t, ok)
+
+	got := g.finalValues()
+
+	require.Len(t, got, 1)
+	assert.Greater(t, got[0].Seq, last.Seq, "a final value must outrank the one it replaces")
 }
 
 // Seq is the queue's order, so it advances on every reported move and never

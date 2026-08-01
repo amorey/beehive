@@ -2142,12 +2142,12 @@ func TestReconcilerRequeueNow(t *testing.T) {
 	seeded := r.backoffNext(1)
 	r.work.addAfter(1, time.Hour)
 	require.NotZero(t, r.backoffFor[1], "precondition: backoff seeded")
-	require.NotNil(t, r.work.gauge.alarmAt(1), "precondition: retry timer scheduled")
+	require.NotNil(t, r.work.gauge.alarmFor(1), "precondition: retry timer scheduled")
 
 	r.requeueNow(1)
 
 	assert.Equal(t, seeded, r.backoffFor[1], "requeueNow must preserve the backoff entry")
-	assert.Nil(t, r.work.gauge.alarmAt(1), "requeueNow must cancel the stale retry timer")
+	assert.Nil(t, r.work.gauge.alarmFor(1), "requeueNow must cancel the stale retry timer")
 
 	id, ok := r.work.get()
 	require.True(t, ok, "requeueNow must make the id dispatchable now")
