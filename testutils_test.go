@@ -769,8 +769,15 @@ const hotLoopWindow = 500 * time.Millisecond
 // has no option, and WithMaxRetryInterval only caps upward — so a retry loop
 // running at full speed is told from one climbing its ladder by counting passes
 // inside a fixed window.
-func requireNoHotLoop(t *testing.T, hot *signal, calls *atomic.Int64, msg string) {
+//
+// It waits on first before it opens that window, and that wait is what stops the
+// count from being a bound with nothing under it. A window on its own passes when
+// the controller never ran at all, so a broken Start, a broken Register or a
+// broken enqueue would leave this green. first fires on the controller's own first
+// pass, so the assertion below reads "it ran, and then it did not run away".
+func requireNoHotLoop(t *testing.T, first, hot *signal, calls *atomic.Int64, msg string) {
 	t.Helper()
+	first.wait(t, "the first reconcile: nothing dispatched the object at all")
 	select {
 	case <-hot.rx.Chan():
 		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed: %s", calls.Load(), msg)

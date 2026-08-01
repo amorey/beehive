@@ -727,20 +727,27 @@ func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 
 // redeclareController fails on every pass and re-asserts the same dependency each
 // time, which is the converging shape a level-triggered controller has. It fires
-// hot once it has run enough times to prove the backoff was bypassed.
+// first on its first failing pass and hot once it has run enough times to prove
+// the backoff was bypassed.
+//
+// The target succeeds and is left alone. It shares this controller, so failing it
+// too would put a second backoff ladder under one counter, and the test could not
+// say which object's passes it had counted.
 type redeclareController struct {
-	target ObjectID
-	calls  atomic.Int64
-	hot    *signal
+	target     ObjectID
+	calls      atomic.Int64
+	first, hot *signal
 }
 
 func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	if obj.ID == c.target {
+		return Result{}, nil
+	}
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
 	}
-	if obj.ID != c.target {
-		_ = cc.DependenciesAdd(ctx, obj.ID, c.target)
-	}
+	c.first.fire()
+	_ = cc.DependenciesAdd(ctx, obj.ID, c.target)
 	return Result{}, errBoom
 }
 
@@ -758,7 +765,7 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 	bh, err := New(newClientTestStore(t), withoutGCSweeper())
 	require.NoError(t, err)
 	gk := GroupKind{Kind: "Widget"}
-	ctrl := &redeclareController{hot: newSignal()}
+	ctrl := &redeclareController{first: newSignal(), hot: newSignal()}
 	_, err = Register(bh, gk, ctrl)
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
@@ -772,7 +779,7 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 
 	_ = mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
-	requireNoHotLoop(t, ctrl.hot, &ctrl.calls,
+	requireNoHotLoop(t, ctrl.first, ctrl.hot, &ctrl.calls,
 		"a re-asserted edge must not requeue past the backoff")
 }
 

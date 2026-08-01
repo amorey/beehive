@@ -3265,16 +3265,16 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 // stops a controller re-applying its own spec from waking itself forever, and the
 // spec-write enqueue must not defeat it.
 type respecController struct {
-	client Client[cSpec, cStatus]
-	calls  atomic.Int64
-	hot    chan struct{}
-	closed atomic.Bool
+	client     Client[cSpec, cStatus]
+	calls      atomic.Int64
+	first, hot *signal
 }
 
 func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
-	if c.calls.Add(1) >= 25 && c.closed.CompareAndSwap(false, true) {
-		close(c.hot)
+	if c.calls.Add(1) >= hotLoopCalls {
+		c.hot.fire()
 	}
+	c.first.fire()
 	_, _ = c.client.UpdateByID(ctx, obj.ID, obj.Spec) // identical bytes: the store skips it
 	return Result{}, errBoom
 }
@@ -3293,7 +3293,7 @@ func TestFailingRespecControllerKeepsItsBackoff(t *testing.T) {
 
 	bh, err := New(newClientTestStore(t), withoutGCSweeper())
 	require.NoError(t, err)
-	ctrl := &respecController{hot: make(chan struct{})}
+	ctrl := &respecController{first: newSignal(), hot: newSignal()}
 	_, err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -3305,15 +3305,8 @@ func TestFailingRespecControllerKeepsItsBackoff(t *testing.T) {
 
 	_ = mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	select {
-	case <-ctrl.hot:
-		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed", ctrl.calls.Load())
-	case <-time.After(500 * time.Millisecond):
-		// The ladder starts at defaultBaseRetryInterval and doubles, so a handful of
-		// passes here is the ladder working. The failure mode is unbounded.
-		assert.Less(t, ctrl.calls.Load(), int64(25),
-			"a no-op write from a failing reconcile must not requeue past the backoff")
-	}
+	requireNoHotLoop(t, ctrl.first, ctrl.hot, &ctrl.calls,
+		"a no-op write from a failing reconcile must not requeue past the backoff")
 }
 
 // The gate is "this write changed the object", not "the row is unsettled". A no-op
