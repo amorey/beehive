@@ -988,8 +988,7 @@ func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID
 	if !ok {
 		return Schedule{}, nil // client-only kind: nothing is ever scheduled
 	}
-	at, _ := r.nextRequeueAt(id) // zero time when no requeue is scheduled
-	return Schedule{NextRequeueAt: at}, nil
+	return r.scheduleAt(id).Schedule, nil
 }
 
 func (c *clientImpl[Spec, Status]) DeleteByID(ctx context.Context, id ObjectID) error {

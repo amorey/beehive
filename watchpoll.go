@@ -479,8 +479,7 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 	go func() {
 		defer close(out)
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			at, _ := r.nextRequeueAt(id) // zero time when nothing is scheduled
-			cur := Schedule{NextRequeueAt: at}
+			cur := r.scheduleAt(id).Schedule
 			if !first && cur == last {
 				return true
 			}

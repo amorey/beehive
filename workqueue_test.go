@@ -169,7 +169,7 @@ func TestWorkQueueAddAfterOnStoppedQueue(t *testing.T) {
 
 	q.addAfter(1, time.Hour)
 
-	assert.Nil(t, q.alarms, "stopped queue must not track a new timer")
+	assert.Nil(t, q.gauge.alarmAt(1), "stopped queue must not track a new timer")
 	_, ok := q.get()
 	assert.False(t, ok, "addAfter on a stopped queue must not enqueue")
 }
@@ -235,8 +235,8 @@ func TestWorkQueueReaddAfterDone(t *testing.T) {
 // scheduled.
 func TestWorkQueueNextRequeueAtEmpty(t *testing.T) {
 	q := newWorkQueue()
-	_, ok := q.nextRequeueAt(1)
-	assert.False(t, ok, "unknown id must report nothing scheduled")
+	assert.True(t, q.scheduleAt(1).Schedule.NextRequeueAt.IsZero(),
+		"unknown id must report nothing scheduled")
 }
 
 // TestWorkQueueNextRequeueAtDispatchable verifies an ID queued for immediate
@@ -245,8 +245,8 @@ func TestWorkQueueNextRequeueAtDispatchable(t *testing.T) {
 	q := newWorkQueue()
 	q.add(1)
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok, "queued id must report as scheduled")
+	at := q.scheduleAt(1).Schedule.NextRequeueAt
+	require.False(t, at.IsZero(), "queued id must report as scheduled")
 	assert.False(t, at.After(time.Now()), "a queued-now id is due now, not in the future")
 }
 
@@ -256,8 +256,8 @@ func TestWorkQueueNextRequeueAtAfter(t *testing.T) {
 	q := newWorkQueue()
 	q.addAfter(1, time.Hour)
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok, "delayed id must report as scheduled")
+	at := q.scheduleAt(1).Schedule.NextRequeueAt
+	require.False(t, at.IsZero(), "delayed id must report as scheduled")
 	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
 }
 
@@ -269,8 +269,8 @@ func TestWorkQueueAddAfterNewestWins(t *testing.T) {
 	q.addAfter(1, time.Hour)
 	q.addAfter(1, 3*time.Hour)
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok)
+	at := q.scheduleAt(1).Schedule.NextRequeueAt
+	require.False(t, at.IsZero())
 	assert.True(t, at.After(time.Now().Add(2*time.Hour)), "newest schedule must win, got %s", at)
 }
 
@@ -283,8 +283,8 @@ func TestWorkQueueNextRequeueAtPrefersQueued(t *testing.T) {
 	q.addAfter(1, time.Hour) // future backoff/RequeueAfter timer
 	q.add(1)                 // ...then enqueued immediately
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok)
+	at := q.scheduleAt(1).Schedule.NextRequeueAt
+	require.False(t, at.IsZero())
 	assert.False(t, at.After(time.Now()), "a queued-now id is due now, not the future timer; got %s", at)
 }
 
@@ -294,26 +294,26 @@ func TestWorkQueueNextRequeueAtPrefersQueued(t *testing.T) {
 // that already fired but lost the race for the lock must not run the work early.
 func TestWorkQueueSupersededTimerDoesNotEnqueue(t *testing.T) {
 	q := newWorkQueue()
-	stale := &alarm{}
-	q.alarms[1] = &alarm{} // a newer schedule now occupies the slot
+	stale := &alarm{timer: time.NewTimer(time.Hour)}
+	q.gauge.setAlarm(1, &alarm{timer: time.NewTimer(time.Hour)}) // a newer schedule now occupies the slot
 
 	q.timerFired(1, stale) // the superseded timer fires late
 
 	_, ok := q.get()
 	assert.False(t, ok, "a superseded timer must not enqueue the id")
-	assert.NotNil(t, q.alarms[1], "the newer schedule must be left intact")
+	assert.NotNil(t, q.gauge.alarmAt(1), "the newer schedule must be left intact")
 }
 
 // TestWorkQueueTimerFiredEnqueues verifies a current (non-superseded) timer
 // clears its slot and enqueues the id when it fires.
 func TestWorkQueueTimerFiredEnqueues(t *testing.T) {
 	q := newWorkQueue()
-	a := &alarm{}
-	q.alarms[1] = a
+	a := &alarm{timer: time.NewTimer(time.Hour)}
+	q.gauge.setAlarm(1, a)
 
 	q.timerFired(1, a)
 
-	assert.Nil(t, q.alarms[1], "firing must clear the schedule slot")
+	assert.Nil(t, q.gauge.alarmAt(1), "firing must clear the schedule slot")
 	id, ok := q.get()
 	require.True(t, ok, "a current timer must enqueue the id")
 	assert.Equal(t, ObjectID(1), id)
@@ -327,7 +327,7 @@ func TestWorkQueueRequeueNow(t *testing.T) {
 
 	q.requeueNow(1)
 
-	assert.Nil(t, q.alarms[1], "requeueNow must drop the pending delayed add")
+	assert.Nil(t, q.gauge.alarmAt(1), "requeueNow must drop the pending delayed add")
 	id, ok := q.get()
 	require.True(t, ok, "requeueNow must make the id dispatchable now")
 	assert.Equal(t, ObjectID(1), id)

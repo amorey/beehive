@@ -30,17 +30,15 @@ import (
 // This is the standard Kubernetes work-queue discipline.
 type workQueue struct {
 	mu sync.Mutex
-	// dirty maps a queued id to the moment it became due. The value is what makes
-	// the schedule a gauge rather than a clock: nextRequeueAt answers with it, so an
-	// id that sits queued behind a slow reconcile reports the same time on every
-	// poll, where time.Now() would differ on each one and make SchedulesWatch emit
-	// forever (see the schedule-watch ADR: a repeated value must be impossible).
-	dirty      map[ObjectID]time.Time // queued (in items) and awaiting dispatch
-	processing map[ObjectID]struct{}  // handed out via get, not yet done
+	// gauge owns the state SchedulesWatch reports: which ids are queued now and
+	// which hold a pending alarm. It is separate from the queue's own bookkeeping
+	// so that every move of the observable schedule is reported from one place.
+	// See gauge.go.
+	gauge      *gauge
+	processing map[ObjectID]struct{} // handed out via get, not yet done
 	items      []ObjectID
-	ready      chan struct{}       // pulsed when items are available
-	stopped    bool                // set by stop; adds become no-ops
-	alarms     map[ObjectID]*alarm // pending delayed adds (addAfter), keyed by id
+	ready      chan struct{} // pulsed when items are available
+	stopped    bool          // set by stop; adds become no-ops
 }
 
 // alarm is a pending delayed enqueue: the timer that will enqueue the id and the
@@ -53,10 +51,9 @@ type alarm struct {
 
 func newWorkQueue() *workQueue {
 	return &workQueue{
-		dirty:      make(map[ObjectID]time.Time),
+		gauge:      newGauge(),
 		processing: make(map[ObjectID]struct{}),
 		ready:      make(chan struct{}, 1),
-		alarms:     make(map[ObjectID]*alarm),
 	}
 }
 
@@ -73,10 +70,9 @@ func (q *workQueue) addLocked(id ObjectID) {
 	if q.stopped {
 		return
 	}
-	if _, ok := q.dirty[id]; ok {
-		return
+	if _, ok := q.gauge.markDirty(id); !ok {
+		return // already queued
 	}
-	q.dirty[id] = time.Now()
 	if _, ok := q.processing[id]; !ok {
 		q.items = append(q.items, id)
 		q.signal()
@@ -107,12 +103,12 @@ func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 	if q.stopped {
 		return
 	}
-	if prev := q.alarms[id]; prev != nil {
+	if prev := q.gauge.alarmAt(id); prev != nil {
 		prev.timer.Stop() // newest schedule wins; don't let the stale one fire
 	}
 	a := &alarm{fireAt: time.Now().Add(delay)}
 	a.timer = time.AfterFunc(delay, func() { q.timerFired(id, a) })
-	q.alarms[id] = a
+	q.gauge.setAlarm(id, a)
 }
 
 // timerFired runs when an alarm's timer fires. It enqueues id only if a is still
@@ -122,15 +118,12 @@ func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
 // regardless would run the work early, ignoring the newer delay.
 func (q *workQueue) timerFired(id ObjectID, a *alarm) {
 	q.mu.Lock()
-	superseded := q.alarms[id] != a
-	if !superseded {
-		delete(q.alarms, id)
+	defer q.mu.Unlock()
+	if q.gauge.alarmAt(id) != a {
+		return // superseded: a newer schedule owns the enqueue
 	}
-	q.mu.Unlock()
-	if superseded {
-		return
-	}
-	q.add(id) // a no-op if stop ran between firing and here
+	q.gauge.clearAlarm(id)
+	q.addLocked(id) // a no-op if stop ran between firing and here
 }
 
 // requeueNow cancels any pending delayed add for id and makes it immediately
@@ -140,36 +133,20 @@ func (q *workQueue) timerFired(id ObjectID, a *alarm) {
 func (q *workQueue) requeueNow(id ObjectID) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if a := q.alarms[id]; a != nil {
+	if a := q.gauge.alarmAt(id); a != nil {
 		a.timer.Stop()
-		delete(q.alarms, id)
+		q.gauge.clearAlarm(id)
 	}
 	q.addLocked(id)
 }
 
-// nextRequeueAt reports when id is next due to be dispatched: an id already
-// queued for immediate dispatch returns the moment it became due (already past —
-// it is dispatchable now); otherwise a pending delayed add returns its fire time. Queued-now is checked first because an id
-// can hold both — a future backoff/RequeueAfter timer plus an immediate add from
-// a store change or requeue — and "due now" is the truthful answer then, not the
-// stale future time. ok is false when nothing is firmly scheduled — an id that is
-// only being processed, or one a periodic pass might later pick up, reports
-// nothing, since a pass is kind-wide and conditional, not a per-id schedule.
-func (q *workQueue) nextRequeueAt(id ObjectID) (time.Time, bool) {
+// scheduleAt reports id's current schedule. An id that is only being processed,
+// or one a periodic pass might later pick up, reports the zero Schedule: a pass
+// is kind-wide and conditional, not a per-id schedule.
+func (q *workQueue) scheduleAt(id ObjectID) stamped {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.nextRequeueAtLocked(id)
-}
-
-// nextRequeueAtLocked is the lock-free core of nextRequeueAt. Caller holds mu.
-func (q *workQueue) nextRequeueAtLocked(id ObjectID) (time.Time, bool) {
-	if at, ok := q.dirty[id]; ok {
-		return at, true
-	}
-	if a := q.alarms[id]; a != nil {
-		return a.fireAt, true
-	}
-	return time.Time{}, false
+	return q.gauge.at(id)
 }
 
 // stop quiesces the queue: it cancels every pending addAfter timer and makes all
@@ -179,10 +156,8 @@ func (q *workQueue) stop() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.stopped = true
-	for _, a := range q.alarms {
-		a.timer.Stop()
-	}
-	q.alarms = nil
+	q.gauge.stopTimers()
+	q.gauge.clearAllAlarms()
 }
 
 // get removes and returns the next item, moving it into the processing state
@@ -196,12 +171,14 @@ func (q *workQueue) get() (ObjectID, bool) {
 	}
 	id := q.items[0]
 	q.items = q.items[1:]
-	delete(q.dirty, id)
+	// Dispatch clears the dirty slot: absent a future alarm, the id is now
+	// unscheduled. The id is items[0] rather than a parameter, so the gauge call
+	// sits here rather than in a wrapper around the method.
+	q.gauge.clearDirty(id)
 	q.processing[id] = struct{}{}
 	if len(q.items) > 0 {
 		q.signal()
 	}
-	// Dispatch clears the dirty slot: absent a future alarm, the id is now unscheduled.
 	return id, true
 }
 
@@ -211,11 +188,11 @@ func (q *workQueue) done(id ObjectID) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	delete(q.processing, id)
-	if _, ok := q.dirty[id]; ok {
+	if q.gauge.dirtyAt(id) {
 		// Re-added during processing: make it dispatchable now.
 		q.items = append(q.items, id)
 		q.signal()
 	}
-	// No schedule emit: done only moves the id between processing and items, which
-	// nextRequeueAt ignores — the dirty/alarms state (hence the schedule) is unchanged.
+	// done calls no gauge mutator: it only moves the id between processing and
+	// items, which the gauge does not read, so the schedule is unchanged.
 }

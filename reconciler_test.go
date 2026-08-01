@@ -2142,38 +2142,38 @@ func TestReconcilerRequeueNow(t *testing.T) {
 	seeded := r.backoffNext(1)
 	r.work.addAfter(1, time.Hour)
 	require.NotZero(t, r.backoffFor[1], "precondition: backoff seeded")
-	require.NotNil(t, r.work.alarms[1], "precondition: retry timer scheduled")
+	require.NotNil(t, r.work.gauge.alarmAt(1), "precondition: retry timer scheduled")
 
 	r.requeueNow(1)
 
 	assert.Equal(t, seeded, r.backoffFor[1], "requeueNow must preserve the backoff entry")
-	assert.Nil(t, r.work.alarms[1], "requeueNow must cancel the stale retry timer")
+	assert.Nil(t, r.work.gauge.alarmAt(1), "requeueNow must cancel the stale retry timer")
 
 	id, ok := r.work.get()
 	require.True(t, ok, "requeueNow must make the id dispatchable now")
 	assert.Equal(t, ObjectID(1), id)
 }
 
-// TestReconcilerNextRequeueAt verifies nextRequeueAt reports a pending delayed
-// add's fire time and reports nothing for an id with no schedule.
-func TestReconcilerNextRequeueAt(t *testing.T) {
+// TestReconcilerScheduleAt verifies scheduleAt reports a pending delayed add's
+// fire time and reports the zero Schedule for an id with no schedule.
+func TestReconcilerScheduleAt(t *testing.T) {
 	r := &reconciler{work: newWorkQueue()}
 	r.work.addAfter(1, time.Hour)
 
-	at, ok := r.nextRequeueAt(1)
-	require.True(t, ok)
+	at := r.scheduleAt(1).Schedule.NextRequeueAt
+	require.False(t, at.IsZero())
 	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
 
-	_, ok = r.nextRequeueAt(2)
-	assert.False(t, ok, "an id with no schedule must report nothing")
+	assert.True(t, r.scheduleAt(2).Schedule.NextRequeueAt.IsZero(),
+		"an id with no schedule must report nothing")
 }
 
-// TestReconcilerNextRequeueAtNilWork verifies the scheduling methods are safe on
-// a reconciler with no work queue (built outside Register, e.g. in tests).
-func TestReconcilerNextRequeueAtNilWork(t *testing.T) {
+// TestReconcilerScheduleAtNilWork verifies the scheduling methods are safe on a
+// reconciler with no work queue (built outside Register, e.g. in tests).
+func TestReconcilerScheduleAtNilWork(t *testing.T) {
 	r := &reconciler{backoffFor: make(map[ObjectID]time.Duration)}
-	_, ok := r.nextRequeueAt(1)
-	assert.False(t, ok, "nil work queue must report nothing scheduled")
+	assert.True(t, r.scheduleAt(1).Schedule.NextRequeueAt.IsZero(),
+		"nil work queue must report nothing scheduled")
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
 }
 

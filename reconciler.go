@@ -363,17 +363,19 @@ func (r *reconciler) requeueNow(id ObjectID) {
 	}
 }
 
-// nextRequeueAt reports when the loop has scheduled id to be requeued (a pending
-// backoff/RequeueAfter delay, or now if already queued). ok is false when no
-// requeue is scheduled; it reports only per-id timers, so it excludes the periodic
-// drivers — the owed pass, the full pass and the dependency waker all reconcile
-// without one —
-// so the actual next reconcile may be sooner.
-func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
+// scheduleAt reports when the loop has scheduled id to be requeued (a pending
+// backoff/RequeueAfter delay, or now if already queued). The zero Schedule means
+// nothing is scheduled; it reports only per-id timers, so it excludes the
+// periodic drivers — the owed pass, the full pass and the dependency waker all
+// reconcile without one — so the actual next reconcile may be sooner.
+//
+// A kind with no queue reports the zero Schedule for the same reason: nothing is
+// scheduled for it.
+func (r *reconciler) scheduleAt(id ObjectID) stamped {
 	if r.work == nil {
-		return time.Time{}, false
+		return stamped{}
 	}
-	return r.work.nextRequeueAt(id)
+	return r.work.scheduleAt(id)
 }
 
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
