@@ -372,10 +372,14 @@ func withStaleDependentsInterval(d time.Duration) Option {
 	}
 }
 
-// withWatchPollInterval sets how often the Client watch surface
-// (ObjectsWatch, ObjectsWatchList, EventsWatch, SchedulesWatch) reads current
-// state and emits what changed. It is global and meaningful only at New; passed
-// elsewhere it is ignored.
+// withWatchPollInterval sets how often the store-backed Client watches
+// (ObjectsWatch, ObjectsWatchList, EventsWatch) read current state and emit what
+// changed. It is global and meaningful only at New; passed elsewhere it is
+// ignored.
+//
+// SchedulesWatch is not governed by it. That stream reports the work queue,
+// which publishes each move, so it takes no tick at all —
+// TestScheduleStreamMakesNoPeriodicRead is what holds that.
 //
 // It is deliberately unexported: watch latency and resolution are part of the
 // contract the streams document, not a per-embedder setting.

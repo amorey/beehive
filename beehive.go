@@ -357,12 +357,17 @@ func (bh *Beehive) stop(ctx context.Context) error {
 		drainErr = ctx.Err()
 	}
 
-	// Client watch streams poll the store directly and are not counted in wg, so
-	// stop does not terminate them: one ends when its own context is cancelled,
-	// and nothing else ends it. Closing the store under a stream does not — a
-	// failed read costs one tick and the poller retries on the next one, which is
-	// what keeps a transient store failure from killing a live subscriber. A
-	// subscriber that outlives its context therefore polls forever.
+	// The store-backed client watches (ObjectsWatch, ObjectsWatchList, EventsWatch)
+	// poll the store directly and are not counted in wg, so stop does not terminate
+	// them: one ends when its own context is cancelled, and nothing else ends it.
+	// Closing the store under a stream does not — a failed read costs one tick and
+	// the poller retries on the next one, which is what keeps a transient store
+	// failure from killing a live subscriber. A subscriber that outlives its
+	// context therefore polls forever.
+	//
+	// SchedulesWatch is the exception. It reports the work queue rather than the
+	// store, so stopping the reconcilers above has already published its final
+	// values and closed its hub's send side, and those streams end here.
 	bh.log().Info("control plane stopped")
 	return drainErr
 }

@@ -478,7 +478,12 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 // so it is delivered like any other.
 func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
-	if !ok {
+	if !ok || r.work == nil {
+		// The nil queue is unreachable through Register, which builds the queue and
+		// its hub together. It is guarded anyway so this agrees with
+		// reconciler.scheduleAt behind SchedulesGet: a reconciler with no
+		// scheduling machinery reports having none, rather than one path answering
+		// and its sibling panicking.
 		return nil, ErrNoController
 	}
 	rx, cur := r.work.watchSchedule(id)

@@ -1192,3 +1192,17 @@ func TestScheduleStreamCancelWhileDeliveringAMove(t *testing.T) {
 
 	assertChanClosed(t, ch)
 }
+
+// A registered reconciler always has a work queue, because Register builds the
+// queue and its hub together. The guard exists so that this path agrees with
+// reconciler.scheduleAt behind SchedulesGet, which has kept a nil-queue branch
+// for reconcilers built directly in tests: both report having no scheduling
+// machinery rather than one answering and its sibling panicking.
+func TestScheduleStreamNilQueueReportsNoController(t *testing.T) {
+	ctx, _, client, r := pushOnlyClient(t)
+	r.work = nil
+
+	_, err := client.SchedulesWatch(ctx, 1)
+
+	assert.ErrorIs(t, err, ErrNoController)
+}

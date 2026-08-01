@@ -235,9 +235,11 @@ func (q *workQueue) scheduleAt(id ObjectID) Schedule {
 func (q *workQueue) stop() {
 	q.mu.Lock()
 	q.stopped = true
-	// The alarm clears are moves; the rest is the state those moves leave behind.
-	// Both go out, because the snapshot is what makes a publish that races the
-	// closing sender harmless — see gauge.remaining.
+	// Every mutator is guarded on stopped, so from here the gauge cannot move and
+	// this snapshot is its final state. The alarm clears are moves; the rest is
+	// the state those moves leave behind. Both go out, because the snapshot is
+	// what makes a publish that races the closing sender harmless — see
+	// gauge.remaining.
 	final := append(q.gauge.clearAllAlarms(), q.gauge.remaining()...)
 	q.mu.Unlock()
 	// The final values go out before the sender closes, so a subscriber's last
@@ -251,7 +253,12 @@ func (q *workQueue) stop() {
 func (q *workQueue) get() (ObjectID, bool) {
 	var moved move
 	q.mu.Lock()
-	if len(q.items) == 0 {
+	// Stopped dispatches nothing, for the same reason it enqueues nothing: the
+	// reconcile loop has drained and the work would never be done. It also keeps
+	// the gauge still after stop, which is what lets stop's snapshot be the final
+	// state — see gauge.remaining. Without it this is the one mutator that could
+	// move the schedule after the snapshot and lose that move to a closed sender.
+	if q.stopped || len(q.items) == 0 {
 		q.mu.Unlock()
 		return 0, false
 	}

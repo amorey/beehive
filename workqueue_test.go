@@ -554,16 +554,22 @@ func TestPublishStopSnapshotsEveryScheduledID(t *testing.T) {
 	assert.False(t, final[1].NextRequeueAt.IsZero(), "the queued id keeps its due-now")
 }
 
-// A queue with no hub is a client-only kind. It must not panic.
-func TestPublishWithNoSenderIsSafe(t *testing.T) {
-	q := newWorkQueue() // no schedules sender
+// Dispatch is guarded on stopped like every other mutator. That is what makes
+// stop's snapshot the gauge's final state: get is otherwise the one mutator that
+// could move the schedule afterwards, and its publish would go to a closed
+// sender and be lost.
+func TestWorkQueueStoppedQueueDispatchesNothing(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
+	q.stop()
+	before := len(tx.taken())
 
-	assert.NotPanics(t, func() {
-		q.add(1)
-		q.get()
-		q.requeueNow(1)
-		q.stop()
-	})
+	_, ok := q.get()
+
+	assert.False(t, ok, "a stopped queue must dispatch nothing")
+	assert.Len(t, tx.taken(), before, "and must therefore publish nothing")
+	assert.False(t, q.scheduleAt(1).NextRequeueAt.IsZero(),
+		"the gauge is unchanged, so the final snapshot still describes it")
 }
 
 // BenchmarkWorkQueueHotPath measures one reconcile's worth of queue work with

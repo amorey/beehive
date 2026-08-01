@@ -326,11 +326,21 @@ type Client[Spec, Status any] interface {
 	// SchedulesWatch streams id's schedule as a gauge: the current value first, then a
 	// new Schedule whenever it changes — backoff step, RequeueAfter, a pass or
 	// dependency wake, dispatch, or Requeue — none of which the object watches see.
-	// The channel closes when ctx is cancelled. Like the object watches it polls on a
-	// fixed interval and emits only on change, so it converges to the current
-	// value and can skip intermediate ones. Unlike SchedulesGet, a client-only kind
-	// returns ErrNoController rather than hang on a stream that can never emit; id need
-	// not exist — an unscheduled id streams the zero Schedule until scheduled.
+	//
+	// The channel closes when ctx is cancelled **or when the Beehive stops**, and a
+	// reader cannot tell the two apart. Check your own ctx if you need to. A stopped
+	// Beehive delivers the final schedule before it ends the stream, and can never
+	// produce another value, so an open channel would be a promise it could not
+	// keep.
+	//
+	// Unlike the object watches this reports in-memory state as the work queue
+	// moves it, rather than polling. It emits only on change, so it converges to
+	// the current value and can skip intermediate ones — a busy object reports more
+	// than a poll would have, since nothing collapses a burst into one tick.
+	//
+	// Unlike SchedulesGet, a client-only kind returns ErrNoController rather than hang
+	// on a stream that can never emit; id need not exist — an unscheduled id streams
+	// the zero Schedule until scheduled.
 	SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error)
 	// Update replaces the spec of whatever holds name now, or returns ErrNotFound.
 	// Unlike Delete it does not fold absence to nil: a missing row is not "already

@@ -179,10 +179,13 @@ func (g *gauge) clearAllAlarms() []keyed {
 // Shutdown needs this on top of the moves clearAllAlarms reports, and the reason
 // is a race rather than a state. An enqueue can move the gauge, release the
 // queue's lock, and only then publish — so its publish can lose the race to the
-// closing sender and be dropped. No gauge move is possible once the queue is
-// stopped, so a snapshot taken then is final, and a dropped publish can only have
-// carried a duplicate of it. Report the moves alone and that subscriber would end
-// on a value the queue had already left.
+// closing sender and be dropped. Report the moves alone and that subscriber would
+// end on a value the queue had already left.
+//
+// A dropped publish loses nothing because every workQueue mutator is guarded on
+// stopped, which stop sets under the same lock this runs beneath. Nothing can
+// move the gauge after this snapshot, so anything still in flight can only carry
+// a duplicate of it.
 //
 // The stamps are the gauge's current sequence rather than the one each id last
 // moved at, which is what makes the snapshot idempotent: an id whose publish did
