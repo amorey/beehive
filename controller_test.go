@@ -495,6 +495,39 @@ func mustReconciler(t *testing.T, bh *Beehive, gk GroupKind) *reconciler {
 	return r
 }
 
+// sameKindFixture is one registered kind holding a source and a target, which is
+// the simple shape of a declaration. newDeclareFixture is the cross-kind one.
+type sameKindFixture struct {
+	cc          ControllerClient[tStatus]
+	r           *reconciler
+	dep, target *Object[tSpec, tStatus]
+}
+
+// newSameKindFixture leaves the work queue empty. Each create enqueues its own
+// object, so draining here is what makes the queue afterwards hold the
+// declaration's work and nothing else.
+func newSameKindFixture(t *testing.T) *sameKindFixture {
+	t.Helper()
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	f := &sameKindFixture{
+		cc:     cc,
+		r:      mustReconciler(t, bh, gk),
+		dep:    mustCreate(t, ctx, client, uniqueName(), tSpec{}),
+		target: mustCreate(t, ctx, client, uniqueName(), tSpec{}),
+	}
+	drainQueue(f.r.work)
+	return f
+}
+
+func (f *sameKindFixture) queued() []ObjectID { return queuedIDs(f.r.work) }
+
 // TestAddDependencyWakesOncePerEdge pins the declare-time guarantee and its
 // bound together. The guarantee: the call that creates the edge records one owed
 // reconcile, durably, so a declare reaches its dependent whatever the target was
@@ -576,24 +609,10 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 // routes by the caller's kind.
 func TestAddDependencyEnqueuesItsSource(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
-	r, ok := bh.reconcilerFor(gk)
-	require.True(t, ok)
+	f := newSameKindFixture(t)
 
-	client := NewClient[tSpec, tStatus](bh, gk)
-	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
-	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
-	// Each create enqueues its own object. Drain that, so what the queue holds
-	// below is the declaration's work and nothing else.
-	drainQueue(r.work)
-	require.Empty(t, queuedIDs(r.work))
-
-	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
-	assert.Equal(t, []ObjectID{dep.ID}, queuedIDs(r.work), "the new edge queues its source")
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(), "the new edge queues its source")
 }
 
 // TestAddDependencyEnqueuesOnlyWhatItStamped pins the gate. The enqueue reads the
@@ -611,29 +630,18 @@ func TestAddDependencyEnqueuesItsSource(t *testing.T) {
 // that depends on itself owes no wake from itself.
 func TestAddDependencyEnqueuesOnlyWhatItStamped(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
-	r, ok := bh.reconcilerFor(gk)
-	require.True(t, ok)
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
-	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
-	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
-	drainQueue(r.work)
-	require.Empty(t, queuedIDs(r.work))
+	f := newSameKindFixture(t)
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	drainQueue(f.r.work)
 
 	// The edge exists now, so every later declare of it stamps nothing.
 	for range 3 {
-		require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
+		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
 	}
-	assert.Empty(t, queuedIDs(r.work), "a re-asserted edge is not new, so it queues nothing")
+	assert.Empty(t, f.queued(), "a re-asserted edge is not new, so it queues nothing")
 
-	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, dep.ID))
-	assert.Empty(t, queuedIDs(r.work), "a self-edge stamps nothing, so it queues nothing")
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.dep.ID))
+	assert.Empty(t, f.queued(), "a self-edge stamps nothing, so it queues nothing")
 }
 
 // TestAddDependencyEnqueueRoutesByTheSourcesKind pins the routing. Edges are
@@ -718,17 +726,17 @@ func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 }
 
 // redeclareController fails on every pass and re-asserts the same dependency each
-// time, which is the converging shape a level-triggered controller has.
+// time, which is the converging shape a level-triggered controller has. It fires
+// hot once it has run enough times to prove the backoff was bypassed.
 type redeclareController struct {
 	target ObjectID
 	calls  atomic.Int64
-	hot    chan struct{}
-	closed atomic.Bool
+	hot    *signal
 }
 
 func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
-	if c.calls.Add(1) >= 25 && c.closed.CompareAndSwap(false, true) {
-		close(c.hot)
+	if c.calls.Add(1) >= hotLoopCalls {
+		c.hot.fire()
 	}
 	if obj.ID != c.target {
 		_ = cc.DependenciesAdd(ctx, obj.ID, c.target)
@@ -750,7 +758,7 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 	bh, err := New(newClientTestStore(t), withoutGCSweeper())
 	require.NoError(t, err)
 	gk := GroupKind{Kind: "Widget"}
-	ctrl := &redeclareController{hot: make(chan struct{})}
+	ctrl := &redeclareController{hot: newSignal()}
 	_, err = Register(bh, gk, ctrl)
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
@@ -764,13 +772,8 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 
 	_ = mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
-	select {
-	case <-ctrl.hot:
-		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed", ctrl.calls.Load())
-	case <-time.After(500 * time.Millisecond):
-		assert.Less(t, ctrl.calls.Load(), int64(25),
-			"a re-asserted edge must not requeue past the backoff")
-	}
+	requireNoHotLoop(t, ctrl.hot, &ctrl.calls,
+		"a re-asserted edge must not requeue past the backoff")
 }
 
 // TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce pins the accepted trade, and it
@@ -792,32 +795,22 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 // dispatchable while an alarm far in the future is set.
 func TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
-	r := mustReconciler(t, bh, gk)
-
-	client := NewClient[tSpec, tStatus](bh, gk)
-	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
-	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
-	drainQueue(r.work)
+	f := newSameKindFixture(t)
 
 	// Take the id, as a worker does before it runs the controller.
-	r.work.add(dep.ID)
-	got, ok := r.work.get()
+	f.r.work.add(f.dep.ID)
+	got, ok := f.r.work.get()
 	require.True(t, ok)
-	require.Equal(t, dep.ID, got)
+	require.Equal(t, f.dep.ID, got)
 
 	// The controller declares a new dependency and then fails.
-	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
 
 	// runWorker releases the id and only then sets the backoff.
-	r.work.done(dep.ID)
-	r.work.addAfter(dep.ID, time.Hour)
+	f.r.work.done(f.dep.ID)
+	f.r.work.addAfter(f.dep.ID, time.Hour)
 
-	assert.Equal(t, []ObjectID{dep.ID}, queuedIDs(r.work),
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(),
 		"the enqueue beat the backoff, so the id is dispatchable now")
 }
 

@@ -32,6 +32,7 @@ import (
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/gochan/oneshot"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -749,6 +750,32 @@ func unsettledIDs(t *testing.T, store Store) []ObjectID {
 func drainQueue(q *workQueue) {
 	for id, ok := q.get(); ok; id, ok = q.get() {
 		q.done(id)
+	}
+}
+
+// hotLoopCalls is how many reconciles of one object prove that a backoff ladder
+// was bypassed. The ladder starts at defaultBaseRetryInterval and doubles, so a
+// handful of passes inside hotLoopWindow is the ladder working. The failure mode
+// it separates from that is unbounded, not merely faster.
+const hotLoopCalls = 25
+
+// hotLoopWindow is how long a hot loop is given to prove itself. It is a failsafe
+// and not a synchronisation point: hot firing is what fails the test, and this
+// only bounds the wait for it.
+const hotLoopWindow = 500 * time.Millisecond
+
+// requireNoHotLoop fails if hot fired, which a controller does once it has run
+// hotLoopCalls times. There is no clock to assert on instead: baseRetryInterval
+// has no option, and WithMaxRetryInterval only caps upward — so a retry loop
+// running at full speed is told from one climbing its ladder by counting passes
+// inside a fixed window.
+func requireNoHotLoop(t *testing.T, hot *signal, calls *atomic.Int64, msg string) {
+	t.Helper()
+	select {
+	case <-hot.rx.Chan():
+		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed: %s", calls.Load(), msg)
+	case <-time.After(hotLoopWindow):
+		assert.Less(t, calls.Load(), int64(hotLoopCalls), msg)
 	}
 }
 

@@ -209,13 +209,13 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // commits, so a first declare does not wait for the owed-pass tick. The stamp stays
 // the backstop, and the enqueue adds no guarantee of its own.
 //
-// The enqueue is gated on what the store reports it did, never on the caller having
-// called this method. ReconcileOwedStamped is true only for a depends_on edge this
-// call created, self-edges excluded, so a controller that re-asserts its whole set
-// every pass — which is the normal shape — queues nothing after the first declare.
-// Without that gate a failing controller would also lose its backoff ladder, because
-// requeueNow on an in-flight id makes it dispatchable at once. There is deliberately
-// no second answer to "was the edge new" for this gate to disagree with.
+// signalRequeue requires its callers to gate, and this is the gate: what the store
+// reports it did, never the fact that the caller called this method.
+// ReconcileOwedStamped is true only for a depends_on edge this call created,
+// self-edges excluded, so a controller that re-asserts its whole set every pass —
+// which is the normal shape — queues nothing after the first declare. That
+// convergence is what bounds the enqueue to one per edge ever created. There is
+// deliberately no second answer to "was the edge new" for the gate to disagree with.
 //
 // The enqueue routes by res.From, which is fromID's own kind, and not by c.gk. The
 // edge is cross-kind, so the two differ whenever a controller declares a dependency
