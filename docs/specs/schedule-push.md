@@ -1,7 +1,15 @@
 # Spec: push the schedule gauge, and retire its poll
 
-Status: draft — **standalone.** It depends on no other spec and no other
-spec depends on it.
+Status: **landed.** Implemented over five commits, `246b465` to `d0a582a`.
+The decision is recorded in
+[the schedule-watch ADR](../adr/2026-07-27-schedule-watch.md), which is now
+the source of truth; this file is kept for the reasoning that led there.
+
+Two details differ from the text below, both settled during implementation:
+`scheduleSender` carries `Watch` and `Close` as well as `Send`, so the queue
+holds one field rather than a hub plus a sender; and the per-section
+collector is a single slot rather than a keyed set, because every publish
+site moves exactly one id.
 Date: 2026-08-01
 Scope: `workqueue.go` (the gauge and the sites that move it), `watchpoll.go`
 (`SchedulesWatch`), `reconciler.go` (`nextRequeueAt`, the hub field, shutdown
