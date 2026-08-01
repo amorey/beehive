@@ -590,6 +590,46 @@ func TestAddDependencyEnqueuesItsSource(t *testing.T) {
 	assert.Equal(t, []ObjectID{dep.ID}, queuedIDs(r.work), "the new edge queues its source")
 }
 
+// TestAddDependencyEnqueuesOnlyWhatItStamped pins the gate. The enqueue reads the
+// store's report of what the write did — EdgesAddResult.ReconcileOwedStamped — and
+// never the fact that the caller called DependenciesAdd.
+//
+// The gate is what bounds the enqueue. A level-triggered controller re-asserts its
+// whole dependency set on every pass, so an enqueue per call would schedule a pass
+// per pass, forever. Worse, requeueNow on an id that is in flight makes it
+// dispatchable at once, so a failing controller would retry at full speed and never
+// climb its backoff ladder. Only a genuinely new edge stamps, so only a genuinely
+// new edge queues, and the bound is one enqueue per edge ever created.
+//
+// A self-edge stamps nothing for the same reason the store excludes it: an object
+// that depends on itself owes no wake from itself.
+func TestAddDependencyEnqueuesOnlyWhatItStamped(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(gk)
+	require.True(t, ok)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
+	drainQueue(r.work)
+	require.Empty(t, queuedIDs(r.work))
+
+	// The edge exists now, so every later declare of it stamps nothing.
+	for range 3 {
+		require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
+	}
+	assert.Empty(t, queuedIDs(r.work), "a re-asserted edge is not new, so it queues nothing")
+
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, dep.ID))
+	assert.Empty(t, queuedIDs(r.work), "a self-edge stamps nothing, so it queues nothing")
+}
+
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:
 // a declaration rolled back by the controller's enclosing transaction never
 // happened, so there is no edge to have missed a change and nothing to requeue.

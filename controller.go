@@ -208,12 +208,22 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // The enqueue beside it is the prompt half. It schedules the source when the edge
 // commits, so a first declare does not wait for the owed-pass tick. The stamp stays
 // the backstop, and the enqueue adds no guarantee of its own.
+//
+// The enqueue is gated on what the store reports it did, never on the caller having
+// called this method. ReconcileOwedStamped is true only for a depends_on edge this
+// call created, self-edges excluded, so a controller that re-asserts its whole set
+// every pass — which is the normal shape — queues nothing after the first declare.
+// Without that gate a failing controller would also lose its backoff ladder, because
+// requeueNow on an in-flight id makes it dispatchable at once. There is deliberately
+// no second answer to "was the edge new" for this gate to disagree with.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
-	_, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
-	c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: c.gk.Group, Kind: c.gk.Kind})
+	if res.ReconcileOwedStamped {
+		c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: c.gk.Group, Kind: c.gk.Kind})
+	}
 	return nil
 }
 
