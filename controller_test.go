@@ -397,6 +397,7 @@ func TestAddDependencyAcceptsCycle(t *testing.T) {
 // dependent that owes nothing.
 type declareFixture struct {
 	cc          ControllerClient[tStatus] // the target kind's client: a foreign kind to dep
+	bh          *Beehive
 	store       Store
 	targetGK    GroupKind
 	depGK       GroupKind
@@ -415,6 +416,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 	require.NoError(t, err)
 
 	f := &declareFixture{
+		bh:       bh,
 		store:    store,
 		targetGK: GroupKind{Kind: "Target"},
 		depGK:    GroupKind{Kind: "Dependent"},
@@ -475,6 +477,16 @@ func (f *declareFixture) owedCount(t *testing.T) int64 {
 func (f *declareFixture) requireNotOwed(t *testing.T) {
 	t.Helper()
 	assert.Empty(t, f.owed(t), "no wake was owed")
+}
+
+// queued returns what gk's work queue holds. Register builds the queue, so an
+// enqueue is observable with no driver running: these tests assert that the
+// declaration queued the object, not that a later pass found it.
+func (f *declareFixture) queued(t *testing.T, gk GroupKind) []ObjectID {
+	t.Helper()
+	r, ok := f.bh.reconcilerFor(gk)
+	require.True(t, ok, "the kind must be registered to have a queue")
+	return queuedIDs(r.work)
 }
 
 // TestAddDependencyWakesOncePerEdge pins the declare-time guarantee and its
@@ -546,6 +558,36 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	owed, err := real.ReconcileOwedListIDs(ctx, gk)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
+}
+
+// TestAddDependencyEnqueuesItsSource pins the latency this closes. The durable
+// stamp records that the source owes a reconcile, but nothing scheduled it, so the
+// first pass waited for the owed-pass tick. The declaration now enqueues the source
+// when the edge commits.
+//
+// The source and the target share a kind here, which is the simple case. The
+// cross-kind case has its own test, because it is the one that fails if the enqueue
+// routes by the caller's kind.
+func TestAddDependencyEnqueuesItsSource(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(gk)
+	require.True(t, ok)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	// Each create enqueues its own object. Drain that, so what the queue holds
+	// below is the declaration's work and nothing else.
+	drainQueue(r.work)
+	require.Empty(t, queuedIDs(r.work))
+
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
+	assert.Equal(t, []ObjectID{dep.ID}, queuedIDs(r.work), "the new edge queues its source")
 }
 
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:

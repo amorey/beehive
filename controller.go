@@ -201,15 +201,20 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // decrement (see the ADR on stamping every new edge). The edge-new gate costs
 // nothing, riding the stamp statement's own NOT EXISTS.
 //
-// Nothing is scheduled here, and the store's EdgesAddResult is discarded for that
-// reason: reconcile_owed is a durable count the owed pass drains, routed by
-// fromID's own GroupKind inside the store — the edge is deliberately cross-kind, so
-// a controller may declare one on another kind's behalf. The count is the whole
-// mechanism: it is durable, so a crash between the commit and the pass loses
-// nothing.
+// The stamp is the durable half: reconcile_owed is a count the owed pass drains,
+// routed by fromID's own GroupKind inside the store. It survives a crash between the
+// commit and the pass, so it is what guarantees the reconcile.
+//
+// The enqueue beside it is the prompt half. It schedules the source when the edge
+// commits, so a first declare does not wait for the owed-pass tick. The stamp stays
+// the backstop, and the enqueue adds no guarantee of its own.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
 	_, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
-	return err
+	if err != nil {
+		return err
+	}
+	c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: c.gk.Group, Kind: c.gk.Kind})
+	return nil
 }
 
 // DependenciesDelete drops the edge and does nothing else. Dropping it can unblock
