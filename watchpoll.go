@@ -50,6 +50,16 @@ func (bh *Beehive) watchPoll() time.Duration {
 // landed. Every send in this file goes through it, so a subscriber that stops reading
 // cannot wedge its own poll goroutine past cancellation.
 func sendOrDone[V any](ctx context.Context, out chan<- V, v V) bool {
+	// Cancellation is checked first, and on its own. A subscriber that has already
+	// given up must not be handed one more value, and without this check it can
+	// be: once a reader parks on out, both arms of the select below are ready and
+	// Go picks between ready arms at random. Checking first makes "cancelled"
+	// the answer whenever it is true, whoever is waiting.
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
 	select {
 	case out <- v:
 		return true

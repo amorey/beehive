@@ -1169,11 +1169,14 @@ func TestScheduleStreamDropsACoalescedRepeat(t *testing.T) {
 func TestScheduleStreamCancelBeforeTheSnapshotIsRead(t *testing.T) {
 	_, _, client, _ := pushOnlyClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already given up before the stream produces anything
 
 	ch, err := client.SchedulesWatch(ctx, 1)
 	require.NoError(t, err)
-	cancel() // the snapshot is still unread
 
+	// The stream ends without delivering the snapshot. sendOrDone checks the
+	// context before it offers the value, so this holds however the reader and
+	// the stream goroutine interleave.
 	assertChanClosed(t, ch)
 }
 
