@@ -17,6 +17,8 @@ package beehive
 import (
 	"sync"
 	"time"
+
+	"github.com/amorey/gobus/watch"
 )
 
 // workQueue is a FIFO queue of ObjectIDs with set semantics: adding an ID that
@@ -50,6 +52,9 @@ type workQueue struct {
 	// schedules receives every move of the gauge. nil for a kind with no
 	// reconciler, which has no hub and no watchers.
 	schedules scheduleSender
+	// hub is what schedules sends into, held so a subscriber can register and
+	// teardown can close the send side. nil whenever schedules is.
+	hub *scheduleHub
 }
 
 // alarm is a pending delayed enqueue: the timer that will enqueue the id and the
@@ -227,6 +232,32 @@ func (q *workQueue) requeueNow(id ObjectID) {
 	q.addLocked(id, &moved)
 	q.mu.Unlock()
 	q.publish(moved.drain()...)
+}
+
+// watchSchedule registers a receiver for id, seeded with id's current schedule,
+// in one critical section.
+//
+// The single critical section is the whole of the correctness here. Watch calls
+// no caller code, so it is safe under this lock, and seeding it with the value
+// read under the same lock closes the subscribe race in both directions:
+//
+//   - a move whose critical section ran *before* this read is already in the
+//     seed, and its later publish carries a Seq at or below it, so Accept
+//     rejects it and the subscriber sees no duplicate;
+//   - a move whose critical section runs *after* finds the receiver registered,
+//     and its Seq exceeds the seed, so nothing is lost.
+//
+// The bus does not deliver the seed back — it is the caller's own argument — so
+// the caller reports it as the stream's first value and reads the receiver for
+// what supersedes it.
+// It returns the seed as well as the receiver. A caller that re-read the gauge
+// afterwards would take a second critical section and reopen the race this one
+// closes.
+func (q *workQueue) watchSchedule(id ObjectID) (*watch.Receiver[ObjectID, stamped], stamped) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	cur := q.gauge.at(id)
+	return q.hub.Watch(id, cur), cur
 }
 
 // scheduleAt reports id's current schedule. An id that is only being processed,

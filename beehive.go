@@ -410,10 +410,17 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		return nil, fmt.Errorf("beehive: controller already registered for %s/%s", gk.Group, gk.Kind)
 	}
 
+	// The hub is built here, beside the queue it observes, rather than in
+	// reconciler.run: a SchedulesWatch between Register and Start must find a hub
+	// rather than a nil pointer.
+	work := newWorkQueue()
+	work.hub = newScheduleHub()
+	work.schedules = work.hub.Sender()
+
 	r := &reconciler{
 		gk:               gk,
 		store:            bh.store,
-		work:             newWorkQueue(),
+		work:             work,
 		owedPassInterval: bh.owedPassInterval,
 		fullPassInterval: bh.fullPassInterval,
 		maxRetryInterval: defaultMaxRetryInterval,
