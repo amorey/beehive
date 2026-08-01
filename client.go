@@ -550,18 +550,10 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawOb
 // current state, which a concurrent write may have moved either way. Pinned by
 // TestSpecThenStatusInOneTransactionStillEnqueues.
 //
-// The reconciler is resolved inside the hook, not here: this runs inside the
-// caller's transaction, and bh.mu is a lock Register and stop also want. A
-// client-only kind resolves to nothing and the hook is a no-op. The enqueue does
-// not clear the backoff ladder, matching Client.Requeue's default — WithResetBackoff
-// is the explicit way to ask for that, and a new spec is not evidence that a past
-// failure will not repeat.
+// The enqueue itself is signalRequeue, which every commit-time enqueue shares. The
+// kind is this client's own, because a spec write is always to the client's kind.
 func (c *clientImpl[Spec, Status]) signalSpecWritten(ctx context.Context, id ObjectID) {
-	c.bh.store.AfterCommit(ctx, func(context.Context) {
-		if r, ok := c.bh.reconcilerFor(c.gk); ok {
-			r.requeueNow(id)
-		}
-	})
+	c.bh.signalRequeue(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 }
 
 // GetOrCreate returns the row holding name, creating it only when absent. The found
