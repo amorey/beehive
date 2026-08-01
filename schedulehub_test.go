@@ -33,17 +33,8 @@ import (
 // stream's equality check swallowed it", and the second passes with the hub
 // wired without Accept at all.
 
-// hubQueue builds a queue wired to a real hub, as Register does.
-func hubQueue() *workQueue {
-	q := newWorkQueue()
-	h := newScheduleHub()
-	q.schedules = h.Sender()
-	q.hub = h
-	return q
-}
-
 func TestHubStaleSendNeverReachesTheSlot(t *testing.T) {
-	q := hubQueue()
+	q := newWorkQueue()
 	rx, _ := q.watchSchedule(1)
 	defer rx.Close()
 
@@ -67,7 +58,7 @@ func TestHubStaleSendNeverReachesTheSlot(t *testing.T) {
 // upstream package replaced a waiting value on arrival order alone, which would
 // have let the stale send evict it.
 func TestHubStaleSendDoesNotDisplaceAnUnreadValue(t *testing.T) {
-	q := hubQueue()
+	q := newWorkQueue()
 	rx, _ := q.watchSchedule(1)
 	defer rx.Close()
 
@@ -85,14 +76,14 @@ func TestHubStaleSendDoesNotDisplaceAnUnreadValue(t *testing.T) {
 // that predates it is rejected by the same rule that rejects a reordered one.
 // This is what closes the subscribe seam.
 func TestHubSubscribeBaselineRejectsADuplicate(t *testing.T) {
-	q := hubQueue()
+	q := newWorkQueue()
 	q.add(1) // the move completes...
 
-	rx, _ := q.watchSchedule(1) // ...and the subscriber reads it as its baseline
+	rx, seed := q.watchSchedule(1) // ...and the subscriber reads it as its baseline
 	defer rx.Close()
 
 	// A publish carrying that same move now lands late.
-	require.NoError(t, q.schedules.Send(1, q.scheduleAt(1)))
+	require.NoError(t, q.schedules.Send(1, seed))
 
 	_, err := rx.Peek()
 	assert.ErrorIs(t, err, gobus.ErrEmpty, "the duplicate must never enter the slot")
@@ -102,7 +93,7 @@ func TestHubSubscribeBaselineRejectsADuplicate(t *testing.T) {
 // makes the first mean "B did not reach A" rather than "this receiver never
 // receives anything", and both fit on one receiver because Peek takes nothing.
 func TestHubKeyScope(t *testing.T) {
-	q := hubQueue()
+	q := newWorkQueue()
 	rx, _ := q.watchSchedule(1)
 	defer rx.Close()
 
@@ -119,13 +110,13 @@ func TestHubKeyScope(t *testing.T) {
 // stop publishes the final values before the sender closes, and a receiver
 // holding an unread value is not yet terminal — so the last word is readable.
 func TestHubFinalValueIsQueuedBeforeTheSenderCloses(t *testing.T) {
-	q := hubQueue()
+	q := newWorkQueue()
 	q.addAfter(1, time.Hour)
 	rx, _ := q.watchSchedule(1)
 	defer rx.Close()
 
 	q.stop()
-	q.hub.Sender().Close()
+	q.schedules.Close()
 
 	ev, err := rx.Peek()
 	require.NoError(t, err, "the final value is unread, so the receiver is not terminal")
@@ -135,7 +126,7 @@ func TestHubFinalValueIsQueuedBeforeTheSenderCloses(t *testing.T) {
 // watchSchedule reads the gauge and registers the watch in one critical section,
 // so the baseline is the value current at registration.
 func TestHubWatchScheduleSeedsFromTheGauge(t *testing.T) {
-	q := hubQueue()
+	q := newWorkQueue()
 	q.addAfter(1, time.Hour)
 	rx, want := q.watchSchedule(1)
 	defer rx.Close()

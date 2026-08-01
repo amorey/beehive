@@ -22,6 +22,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// pendingAlarm builds an alarm as addAfter does. A real alarm always carries a
+// live timer, and clearAllAlarms stops it, so one built without a timer is not a
+// state the gauge ever holds.
+func pendingAlarm(in time.Duration) *alarm {
+	return &alarm{timer: time.NewTimer(in), fireAt: time.Now().Add(in)}
+}
+
 // The gauge is what SchedulesWatch reports, and the whole push design rests on
 // one property: a mutator that moves the observable schedule says so, and one
 // that does not stays quiet. These tests hold that line without a bus, a queue
@@ -42,11 +49,11 @@ func TestGaugeMarkDirtyReports(t *testing.T) {
 
 func TestGaugeSetAlarmReports(t *testing.T) {
 	g := newGauge()
-	at := time.Now().Add(time.Hour)
+	a := pendingAlarm(time.Hour)
 
-	got, moved := g.setAlarm(7, &alarm{fireAt: at})
+	got, moved := g.setAlarm(7, a)
 	require.True(t, moved)
-	assert.Equal(t, at, got.Schedule.NextRequeueAt)
+	assert.Equal(t, a.fireAt, got.Schedule.NextRequeueAt)
 }
 
 // at reads dirty before alarms, so an alarm on an id already queued for
@@ -56,7 +63,7 @@ func TestGaugeSetAlarmOnDirtyIDReportsNothing(t *testing.T) {
 	_, moved := g.markDirty(7)
 	require.True(t, moved)
 
-	_, moved = g.setAlarm(7, &alarm{fireAt: time.Now().Add(time.Hour)})
+	_, moved = g.setAlarm(7, pendingAlarm(time.Hour))
 	assert.False(t, moved, "the id already reads as due now")
 }
 
@@ -77,18 +84,18 @@ func TestGaugeClearDirtyReports(t *testing.T) {
 // zero schedule: the id is still scheduled, just not now.
 func TestGaugeClearDirtyFallsBackToTheAlarm(t *testing.T) {
 	g := newGauge()
-	at := time.Now().Add(time.Hour)
-	g.setAlarm(7, &alarm{fireAt: at})
+	a := pendingAlarm(time.Hour)
+	g.setAlarm(7, a)
 	g.markDirty(7)
 
 	got, moved := g.clearDirty(7)
 	require.True(t, moved)
-	assert.Equal(t, at, got.Schedule.NextRequeueAt)
+	assert.Equal(t, a.fireAt, got.Schedule.NextRequeueAt)
 }
 
 func TestGaugeClearAlarmReports(t *testing.T) {
 	g := newGauge()
-	g.setAlarm(7, &alarm{fireAt: time.Now().Add(time.Hour)})
+	g.setAlarm(7, pendingAlarm(time.Hour))
 
 	got, moved := g.clearAlarm(7)
 	require.True(t, moved)
@@ -103,8 +110,8 @@ func TestGaugeClearAlarmReports(t *testing.T) {
 // Seq bump for a schedule nobody can see change.
 func TestGaugeClearAllAlarmsSkipsADirtyID(t *testing.T) {
 	g := newGauge()
-	g.setAlarm(1, &alarm{fireAt: time.Now().Add(time.Hour)})
-	g.setAlarm(2, &alarm{fireAt: time.Now().Add(time.Hour)})
+	g.setAlarm(1, pendingAlarm(time.Hour))
+	g.setAlarm(2, pendingAlarm(time.Hour))
 	g.markDirty(2) // 2 now reads as due now, so its alarm is invisible
 
 	got := g.clearAllAlarms()
@@ -137,9 +144,9 @@ func TestGaugeAtReportsTheCurrentSchedule(t *testing.T) {
 	g := newGauge()
 	assert.True(t, g.at(7).Schedule.NextRequeueAt.IsZero(), "an unknown id is unscheduled")
 
-	at := time.Now().Add(time.Hour)
-	g.setAlarm(7, &alarm{fireAt: at})
-	assert.Equal(t, at, g.at(7).Schedule.NextRequeueAt)
+	a := pendingAlarm(time.Hour)
+	g.setAlarm(7, a)
+	assert.Equal(t, a.fireAt, g.at(7).Schedule.NextRequeueAt)
 
 	// at does not move the gauge, so it does not consume a Seq.
 	before := g.at(7).Seq

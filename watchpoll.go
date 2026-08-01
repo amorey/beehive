@@ -481,7 +481,7 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 	if !ok {
 		return nil, ErrNoController
 	}
-	rx, cur := r.watchSchedule(id)
+	rx, cur := r.work.watchSchedule(id)
 	out := make(chan Schedule)
 
 	go func() {

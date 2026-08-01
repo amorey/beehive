@@ -107,10 +107,12 @@ func lingeringGoroutines() string {
 // nobody here can end. The goroutine doing the looking names the module too, so
 // it is excluded by the frame it is standing in.
 //
-// gobus is in the list because a SchedulesWatch stream reads its receiver
-// through Chan, which runs a feeder goroutine whose frames are all in that
-// module. Without it the leak this package is most likely to grow — a receiver
-// abandoned without Close — would be invisible here.
+// gobus is in the list as insurance. The SchedulesWatch stream reads its
+// receiver with RecvContext, which starts no goroutine of its own, so today
+// every frame it could leak is beehive's. A switch to Receiver.Chan would run a
+// feeder goroutine whose frames are all in gobus, and the leak this package is
+// most likely to grow — a receiver abandoned without Close — would be invisible
+// without this.
 func beehiveStacks(profile string) string {
 	var ours []string
 	for _, record := range strings.Split(profile, "\n\n") {

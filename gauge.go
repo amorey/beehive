@@ -152,9 +152,9 @@ func (g *gauge) clearAlarm(id ObjectID) (stamped, bool) {
 	return g.report(id, before)
 }
 
-// clearAllAlarms drops every pending alarm and reports the ids whose observable
-// schedule moved. Shutdown calls it, and the reports are the last values a
-// subscriber sees.
+// clearAllAlarms stops every pending timer, drops every alarm, and reports the
+// ids whose observable schedule moved. Shutdown calls it, and the reports are the
+// last values a subscriber sees.
 //
 // An id that is also dirty is *not* reported: it reads as due now before and
 // after, since at consults dirty first. Reporting it would publish a Seq bump
@@ -162,7 +162,8 @@ func (g *gauge) clearAlarm(id ObjectID) (stamped, bool) {
 // other mutator keeps.
 func (g *gauge) clearAllAlarms() []keyed {
 	var moved []keyed
-	for id := range g.alarms {
+	for id, a := range g.alarms {
+		a.timer.Stop()
 		before := g.scheduleLocked(id)
 		delete(g.alarms, id)
 		if s, ok := g.report(id, before); ok {
@@ -170,13 +171,4 @@ func (g *gauge) clearAllAlarms() []keyed {
 		}
 	}
 	return moved
-}
-
-// stopTimers stops every pending alarm's timer without touching the map. stop
-// calls it before clearAllAlarms, because cancelling the timer and reporting the
-// move are two different obligations.
-func (g *gauge) stopTimers() {
-	for _, a := range g.alarms {
-		a.timer.Stop()
-	}
 }

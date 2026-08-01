@@ -2160,11 +2160,11 @@ func TestReconcilerScheduleAt(t *testing.T) {
 	r := &reconciler{work: newWorkQueue()}
 	r.work.addAfter(1, time.Hour)
 
-	at := r.scheduleAt(1).Schedule.NextRequeueAt
+	at := r.scheduleAt(1).NextRequeueAt
 	require.False(t, at.IsZero())
 	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
 
-	assert.True(t, r.scheduleAt(2).Schedule.NextRequeueAt.IsZero(),
+	assert.True(t, r.scheduleAt(2).NextRequeueAt.IsZero(),
 		"an id with no schedule must report nothing")
 }
 
@@ -2172,7 +2172,7 @@ func TestReconcilerScheduleAt(t *testing.T) {
 // reconciler with no work queue (built outside Register, e.g. in tests).
 func TestReconcilerScheduleAtNilWork(t *testing.T) {
 	r := &reconciler{backoffFor: make(map[ObjectID]time.Duration)}
-	assert.True(t, r.scheduleAt(1).Schedule.NextRequeueAt.IsZero(),
+	assert.True(t, r.scheduleAt(1).NextRequeueAt.IsZero(),
 		"nil work queue must report nothing scheduled")
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
 }
