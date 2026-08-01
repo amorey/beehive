@@ -17,6 +17,8 @@ package beehive
 import (
 	"sync"
 	"time"
+
+	"github.com/amorey/gobus/watch"
 )
 
 // workQueue is a FIFO queue of ObjectIDs with set semantics: adding an ID that
@@ -295,4 +297,288 @@ func (q *workQueue) done(id ObjectID) {
 	}
 	// done calls no gauge mutator: it only moves the id between processing and
 	// items, which the gauge does not read, so the schedule is unchanged.
+}
+
+// ============================================================
+// The schedule: the queue's observable state, and how it is published.
+// ============================================================
+
+// stamped is a schedule plus the order it moved in.
+//
+// Seq is assigned under workQueue.mu, so it is the *queue's* order and not the
+// order two publishes happen to reach the bus in. That distinction is the whole
+// reason it exists: a publish happens after the queue lock is released, so two
+// moves can unlock in one order and be sent in the other. The hub's Accept rule
+// compares Seq, so whichever send arrives second sees the other as prev and the
+// slot settles the same way either way.
+type stamped struct {
+	Schedule Schedule
+	Seq      uint64
+}
+
+// keyed is one id's move, for the mutator that moves many ids at once.
+type keyed struct {
+	ID ObjectID
+	stamped
+}
+
+// gauge owns the two maps SchedulesWatch reports on. Nothing outside it touches
+// them, so a queue operation cannot move the schedule without calling a method
+// here — and every method that moves it says so.
+//
+// That is not a proof: it is one small type whose five mutators each return a
+// report their caller must consume, plus the tests in gauge_test.go that drive
+// all of them. It is what stands in for the backstop this stream does not have,
+// so keep the surface small and keep every mutator reporting.
+//
+// A future change that gives workQueue a second writer — an exported handle, a
+// shared queue, a durable schedule — breaks the argument entirely and the poll
+// would have to come back.
+//
+// The caller holds workQueue.mu for every method here, including the reads.
+type gauge struct {
+	// dirty maps a queued id to the moment it became due. The value is what makes
+	// the schedule a gauge rather than a clock: at answers with it, so an id that
+	// sits queued behind a slow reconcile reports the same time on every read,
+	// where time.Now() would differ on each one and make SchedulesWatch emit
+	// forever (see the schedule-watch ADR: a repeated value must be impossible).
+	dirty  map[ObjectID]time.Time // queued (in items) and awaiting dispatch
+	alarms map[ObjectID]*alarm    // pending delayed adds (addAfter), keyed by id
+	seq    uint64
+}
+
+func newGauge() *gauge {
+	return &gauge{
+		dirty:  make(map[ObjectID]time.Time),
+		alarms: make(map[ObjectID]*alarm),
+	}
+}
+
+// scheduleLocked is the gauge's whole reading rule: an id queued for immediate
+// dispatch is due now, otherwise a pending alarm names its fire time, otherwise
+// nothing is scheduled.
+//
+// dirty is consulted first because "due now" is the truthful answer for an id
+// that holds both — it is dispatchable, and the alarm is a later fallback rather
+// than the next event. That ordering is why setAlarm on a dirty id reports no
+// move: the alarm is real, but invisible.
+func (g *gauge) scheduleLocked(id ObjectID) Schedule {
+	if at, ok := g.dirty[id]; ok {
+		return Schedule{NextRequeueAt: at}
+	}
+	if a := g.alarms[id]; a != nil {
+		return Schedule{NextRequeueAt: a.fireAt}
+	}
+	return Schedule{}
+}
+
+// at reports id's schedule without moving anything.
+//
+// It returns no ok. The zero Schedule already means "nothing scheduled", which
+// is a real value this watch delivers rather than an absence, so a second
+// result would carry nothing a caller could act on — both callers of the old
+// nextRequeueAt discarded it.
+func (g *gauge) at(id ObjectID) stamped {
+	return stamped{Schedule: g.scheduleLocked(id), Seq: g.seq}
+}
+
+// report stamps a move, or reports nothing when the observable schedule did not
+// change. Every mutator below routes its answer through here, so "did a watcher
+// see this" is decided in one place rather than at each site.
+func (g *gauge) report(id ObjectID, before Schedule) (stamped, bool) {
+	after := g.scheduleLocked(id)
+	if after == before {
+		return stamped{}, false
+	}
+	g.seq++
+	return stamped{Schedule: after, Seq: g.seq}, true
+}
+
+// markDirty queues id for immediate dispatch. It is a no-op for an id already
+// queued, which is what keeps a burst of adds to one id at one reported move.
+func (g *gauge) markDirty(id ObjectID) (stamped, bool) {
+	if _, ok := g.dirty[id]; ok {
+		return stamped{}, false
+	}
+	before := g.scheduleLocked(id)
+	g.dirty[id] = time.Now()
+	return g.report(id, before)
+}
+
+// dirtyAt reports whether id is queued for immediate dispatch.
+func (g *gauge) dirtyAt(id ObjectID) bool {
+	_, ok := g.dirty[id]
+	return ok
+}
+
+// clearDirty drops id's queued-now slot. The id then reads as its pending alarm,
+// or as unscheduled when it has none.
+func (g *gauge) clearDirty(id ObjectID) (stamped, bool) {
+	before := g.scheduleLocked(id)
+	delete(g.dirty, id)
+	return g.report(id, before)
+}
+
+// setAlarm records a pending delayed add. It reports nothing when id is already
+// dirty, because at reads dirty first and the alarm is therefore invisible.
+func (g *gauge) setAlarm(id ObjectID, a *alarm) (stamped, bool) {
+	before := g.scheduleLocked(id)
+	g.alarms[id] = a
+	return g.report(id, before)
+}
+
+// alarmAt returns id's pending alarm, or nil. It is how the queue tests whether
+// a fired timer is still the current schedule without reaching into the maps.
+func (g *gauge) alarmAt(id ObjectID) *alarm { return g.alarms[id] }
+
+// clearAlarm drops id's pending alarm without stopping its timer — the caller
+// owns that, because only the caller knows whether the timer is the one firing.
+func (g *gauge) clearAlarm(id ObjectID) (stamped, bool) {
+	before := g.scheduleLocked(id)
+	delete(g.alarms, id)
+	return g.report(id, before)
+}
+
+// clearAllAlarms stops every pending timer, drops every alarm, and reports the
+// ids whose observable schedule moved.
+//
+// An id that is also dirty is *not* reported: it reads as due now before and
+// after, since at consults dirty first. Reporting it would publish a Seq bump
+// for a change no watcher can see — harmless, but it would break the rule every
+// other mutator keeps.
+func (g *gauge) clearAllAlarms() []keyed {
+	var moved []keyed
+	for id, a := range g.alarms {
+		a.timer.Stop()
+		before := g.scheduleLocked(id)
+		delete(g.alarms, id)
+		if s, ok := g.report(id, before); ok {
+			moved = append(moved, keyed{ID: id, stamped: s})
+		}
+	}
+	return moved
+}
+
+// remaining reports the current schedule of every id the gauge still describes.
+// Call it after clearAllAlarms, so what it returns is the ids still queued for
+// immediate dispatch.
+//
+// Shutdown needs this on top of the moves clearAllAlarms reports, and the reason
+// is a race rather than a state. An enqueue can move the gauge, release the
+// queue's lock, and only then publish — so its publish can lose the race to the
+// closing sender and be dropped. Report the moves alone and that subscriber would
+// end on a value the queue had already left.
+//
+// A dropped publish loses nothing because every workQueue mutator is guarded on
+// stopped, which stop sets under the same lock this runs beneath. Nothing can
+// move the gauge after this snapshot, so anything still in flight can only carry
+// a duplicate of it.
+//
+// The stamps are the gauge's current sequence rather than the one each id last
+// moved at, which is what makes the snapshot idempotent: an id whose publish did
+// land is rejected by the stream's own comparison rather than reported twice.
+func (g *gauge) remaining() []keyed {
+	out := make([]keyed, 0, len(g.dirty))
+	for id := range g.dirty {
+		out = append(out, keyed{ID: id, stamped: g.at(id)})
+	}
+	return out
+}
+
+// scheduleHub carries the work queue's gauge to the SchedulesWatch subscribers
+// of one kind.
+//
+// gobus/watch is a keyed latest-value *state* bus: one slot for each watched
+// key, seeded at registration with the value the caller has just read. That is
+// the right shape because SchedulesWatch is a gauge — it streams the value
+// itself rather than a change. Its sibling gobus/conflate is an event bus with
+// coalescing and annihilation, which is what a change stream wants and this one
+// does not.
+//
+// scheduleSender is what workQueue needs in order to publish a move and to
+// register a subscriber. The queue holds this rather than the concrete hub, so a
+// test can record what it published without standing up a hub and a receiver to
+// observe it.
+type scheduleSender interface {
+	Send(id ObjectID, s stamped) error
+	Watch(id ObjectID, initial stamped) *watch.Receiver[ObjectID, stamped]
+	Close()
+}
+
+// The hub lives beside the queue it observes, and newWorkQueue builds both. A
+// beehive-level hub would need the kind threaded through every queue operation,
+// and it would widen the send lock's blast radius from one kind's queue to the
+// whole process — which matters because a single subscriber puts every publish
+// for that hub on the locked path.
+//
+// scheduleHub adapts watch.Hub to scheduleSender. Close is the *sender's* close,
+// never the hub's: Hub.Close is hard tear-down with no drain, so a receiver that
+// had not yet read the final value would lose it on a timing coin flip.
+type scheduleHub struct {
+	hub *watch.Hub[ObjectID, stamped]
+}
+
+func (h scheduleHub) Send(id ObjectID, s stamped) error { return h.hub.Sender().Send(id, s) }
+
+func (h scheduleHub) Watch(id ObjectID, initial stamped) *watch.Receiver[ObjectID, stamped] {
+	return h.hub.Watch(id, initial)
+}
+
+func (h scheduleHub) Close() { h.hub.Sender().Close() }
+
+// newScheduleHub builds the hub with the rule that makes a reordered publish
+// safe.
+//
+// A publish happens after workQueue.mu is released, so two moves can unlock in
+// one order and reach Send in the other. Accept compares the queue's own order
+// rather than trusting arrival: whichever send runs second sees the first's
+// value as prev, so the slot settles the same way either way.
+//
+// The rule runs once for each receiver, against that receiver's own slot. Two
+// streams on one id can be seeded at different moments, so a value can be new
+// for one and old for the other, and a hub-wide answer would be wrong for one of
+// them. It also runs against the value passed to Watch, which is what rejects a
+// publish that predates a subscriber's snapshot.
+//
+// Accept runs under the bus lock and must not take a lock a caller may hold
+// while calling Watch, Send or a Close: Watch is expressly safe under the
+// queue's lock, so an Accept that took that lock would invert the two orders and
+// deadlock. This one reads its two arguments and nothing else.
+func newScheduleHub() scheduleHub {
+	return scheduleHub{hub: watch.New[ObjectID](watch.WithAccept(
+		func(prev, next stamped) bool { return next.Seq > prev.Seq },
+	))}
+}
+
+// watchSchedule registers a receiver for id, seeded with id's current schedule,
+// in one critical section.
+//
+// The single critical section is the whole of the correctness here. Watch calls
+// no caller code, so it is safe under this lock, and seeding it with the value
+// read under the same lock closes the subscribe race in both directions:
+//
+//   - a move whose critical section ran *before* this read is already in the
+//     seed, and its later publish carries a Seq at or below it, so Accept
+//     rejects it and the subscriber sees no duplicate;
+//   - a move whose critical section runs *after* finds the receiver registered,
+//     and its Seq exceeds the seed, so nothing is lost.
+//
+// The bus does not deliver the seed back — it is the caller's own argument — so
+// the caller reports it as the stream's first value and reads the receiver for
+// what supersedes it.
+// It returns the seed as well as the receiver. A caller that re-read the gauge
+// afterwards would take a second critical section and reopen the race this one
+// closes.
+func (q *workQueue) watchSchedule(id ObjectID) (*watch.Receiver[ObjectID, stamped], stamped) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	cur := q.gauge.at(id)
+	return q.schedules.Watch(id, cur), cur
+}
+
+// closeHub ends every schedule stream of this kind. Call it after stop, so the
+// final values are already published and each receiver reads its last one before
+// its stream ends.
+func (q *workQueue) closeHub() {
+	q.schedules.Close()
 }

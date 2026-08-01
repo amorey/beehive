@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -585,4 +586,253 @@ func BenchmarkWorkQueueHotPath(b *testing.B) {
 		id, _ := q.get()
 		q.done(id)
 	}
+}
+
+// pendingAlarm builds an alarm as addAfter does. A real alarm always carries a
+// live timer, and clearAllAlarms stops it, so one built without a timer is not a
+// state the gauge ever holds.
+func pendingAlarm(in time.Duration) *alarm {
+	return &alarm{timer: time.NewTimer(in), fireAt: time.Now().Add(in)}
+}
+
+// The gauge is what SchedulesWatch reports, and the whole push design rests on
+// one property: a mutator that moves the observable schedule says so, and one
+// that does not stays quiet. These tests hold that line without a bus, a queue
+// or a stream in the way.
+
+func TestGaugeMarkDirtyReports(t *testing.T) {
+	g := newGauge()
+
+	got, moved := g.markDirty(7)
+	require.True(t, moved, "an id that becomes due now moves the gauge")
+	assert.False(t, got.Schedule.NextRequeueAt.IsZero(), "due-now carries the moment it became due")
+	assert.NotZero(t, got.Seq)
+
+	// Already dirty: addLocked would return early, and so does the gauge.
+	_, moved = g.markDirty(7)
+	assert.False(t, moved, "a second markDirty changes nothing observable")
+}
+
+func TestGaugeSetAlarmReports(t *testing.T) {
+	g := newGauge()
+	a := pendingAlarm(time.Hour)
+
+	got, moved := g.setAlarm(7, a)
+	require.True(t, moved)
+	assert.Equal(t, a.fireAt, got.Schedule.NextRequeueAt)
+}
+
+// at reads dirty before alarms, so an alarm on an id already queued for
+// immediate dispatch changes nothing a watcher can see.
+func TestGaugeSetAlarmOnDirtyIDReportsNothing(t *testing.T) {
+	g := newGauge()
+	_, moved := g.markDirty(7)
+	require.True(t, moved)
+
+	_, moved = g.setAlarm(7, pendingAlarm(time.Hour))
+	assert.False(t, moved, "the id already reads as due now")
+}
+
+func TestGaugeClearDirtyReports(t *testing.T) {
+	g := newGauge()
+	_, moved := g.markDirty(7)
+	require.True(t, moved)
+
+	got, moved := g.clearDirty(7)
+	require.True(t, moved, "dispatch leaves the id unscheduled")
+	assert.True(t, got.Schedule.NextRequeueAt.IsZero())
+
+	_, moved = g.clearDirty(7)
+	assert.False(t, moved, "clearing what is already clear moves nothing")
+}
+
+// Dispatching an id that also holds a future alarm reports the alarm, not the
+// zero schedule: the id is still scheduled, just not now.
+func TestGaugeClearDirtyFallsBackToTheAlarm(t *testing.T) {
+	g := newGauge()
+	a := pendingAlarm(time.Hour)
+	g.setAlarm(7, a)
+	g.markDirty(7)
+
+	got, moved := g.clearDirty(7)
+	require.True(t, moved)
+	assert.Equal(t, a.fireAt, got.Schedule.NextRequeueAt)
+}
+
+func TestGaugeClearAlarmReports(t *testing.T) {
+	g := newGauge()
+	g.setAlarm(7, pendingAlarm(time.Hour))
+
+	got, moved := g.clearAlarm(7)
+	require.True(t, moved)
+	assert.True(t, got.Schedule.NextRequeueAt.IsZero())
+
+	_, moved = g.clearAlarm(7)
+	assert.False(t, moved, "clearing an absent alarm moves nothing")
+}
+
+// Shutdown clears every alarm, but an id that is also dirty reads as due-now
+// before and after, so it must not be reported. Reporting it would publish a
+// Seq bump for a schedule nobody can see change.
+func TestGaugeClearAllAlarmsSkipsADirtyID(t *testing.T) {
+	g := newGauge()
+	g.setAlarm(1, pendingAlarm(time.Hour))
+	g.setAlarm(2, pendingAlarm(time.Hour))
+	g.markDirty(2) // 2 now reads as due now, so its alarm is invisible
+
+	got := g.clearAllAlarms()
+
+	require.Len(t, got, 1, "only the id whose observable schedule moved")
+	assert.Equal(t, ObjectID(1), got[0].ID)
+	assert.True(t, got[0].Schedule.NextRequeueAt.IsZero())
+}
+
+// Seq is the queue's order, so it advances on every reported move and never
+// on a quiet one. Accept compares it, so a stalled Seq would let a stale
+// publish win.
+func TestGaugeSeqAdvancesOnlyOnAReportedMove(t *testing.T) {
+	g := newGauge()
+
+	first, moved := g.markDirty(1)
+	require.True(t, moved)
+	second, moved := g.markDirty(2)
+	require.True(t, moved)
+	assert.Greater(t, second.Seq, first.Seq)
+
+	_, moved = g.markDirty(1) // already dirty
+	require.False(t, moved)
+	third, moved := g.markDirty(3)
+	require.True(t, moved)
+	assert.Equal(t, second.Seq+1, third.Seq, "a quiet call consumed no Seq")
+}
+
+func TestGaugeAtReportsTheCurrentSchedule(t *testing.T) {
+	g := newGauge()
+	assert.True(t, g.at(7).Schedule.NextRequeueAt.IsZero(), "an unknown id is unscheduled")
+
+	a := pendingAlarm(time.Hour)
+	g.setAlarm(7, a)
+	assert.Equal(t, a.fireAt, g.at(7).Schedule.NextRequeueAt)
+
+	// at does not move the gauge, so it does not consume a Seq.
+	before := g.at(7).Seq
+	assert.Equal(t, before, g.at(7).Seq)
+}
+
+// Bus-boundary tests. Each holds a receiver from the hub and starts no stream on
+// it, because Peek is a single-consumer read: a live SchedulesWatch takes a
+// value the instant it lands, so a Peek racing it reports ErrEmpty on a
+// coin-flip and proves nothing.
+//
+// Peek is what makes these tests mean what they say. Reading alone cannot
+// distinguish "Accept rejected the value" from "the value arrived and the
+// stream's equality check swallowed it", and the second passes with the hub
+// wired without Accept at all.
+
+func TestHubStaleSendNeverReachesTheSlot(t *testing.T) {
+	q := newWorkQueue()
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	// Two moves for one id, published in the reverse of the order they became
+	// true — the shape two racing publishes produce.
+	newer := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 9}
+	older := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Minute)}, Seq: 8}
+	require.NoError(t, q.schedules.Send(1, newer))
+	require.NoError(t, q.schedules.Send(1, older))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, newer.Schedule, ev.Value.Schedule, "Accept must reject the older Seq")
+
+	ev, err = rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, newer.Schedule, ev.Value.Schedule)
+}
+
+// The same shape with the newer value still unread. An earlier draft of the
+// upstream package replaced a waiting value on arrival order alone, which would
+// have let the stale send evict it.
+func TestHubStaleSendDoesNotDisplaceAnUnreadValue(t *testing.T) {
+	q := newWorkQueue()
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	newer := stamped{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 5}
+	require.NoError(t, q.schedules.Send(1, newer))
+	// newer is now unread in the slot.
+	require.NoError(t, q.schedules.Send(1, stamped{Seq: 4}))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, newer.Schedule, ev.Value.Schedule)
+}
+
+// The value read at subscribe is the prev of the first Accept call, so a publish
+// that predates it is rejected by the same rule that rejects a reordered one.
+// This is what closes the subscribe seam.
+func TestHubSubscribeBaselineRejectsADuplicate(t *testing.T) {
+	q := newWorkQueue()
+	q.add(1) // the move completes...
+
+	rx, seed := q.watchSchedule(1) // ...and the subscriber reads it as its baseline
+	defer rx.Close()
+
+	// A publish carrying that same move now lands late.
+	require.NoError(t, q.schedules.Send(1, seed))
+
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "the duplicate must never enter the slot")
+}
+
+// A receiver watching one id holds nothing for another. The second half is what
+// makes the first mean "B did not reach A" rather than "this receiver never
+// receives anything", and both fit on one receiver because Peek takes nothing.
+func TestHubKeyScope(t *testing.T) {
+	q := newWorkQueue()
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	q.add(2)
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "another id's move must not reach this receiver")
+
+	q.add(1)
+	ev, err := rx.Peek()
+	require.NoError(t, err, "this id's move must reach it")
+	assert.False(t, ev.Value.Schedule.NextRequeueAt.IsZero())
+}
+
+// stop publishes the final values before the sender closes, and a receiver
+// holding an unread value is not yet terminal — so the last word is readable.
+func TestHubFinalValueIsQueuedBeforeTheSenderCloses(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour)
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	q.stop()
+	q.schedules.Close()
+
+	ev, err := rx.Peek()
+	require.NoError(t, err, "the final value is unread, so the receiver is not terminal")
+	assert.True(t, ev.Value.Schedule.NextRequeueAt.IsZero(), "nothing scheduled")
+}
+
+// watchSchedule reads the gauge and registers the watch in one critical section,
+// so the baseline is the value current at registration.
+func TestHubWatchScheduleSeedsFromTheGauge(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour)
+	rx, want := q.watchSchedule(1)
+	defer rx.Close()
+
+	// Nothing has superseded the baseline, so there is nothing to read...
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+
+	// ...but the baseline is the prev, so an older publish is still rejected.
+	require.NoError(t, q.schedules.Send(1, stamped{Seq: want.Seq - 1}))
+	_, err = rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }
