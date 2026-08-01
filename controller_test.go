@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -654,6 +655,170 @@ func TestAddDependencyEnqueueRoutesByTheSourcesKind(t *testing.T) {
 
 	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(t, f.depGK), "the source's own kind is queued")
 	assert.Empty(t, f.queued(t, f.targetGK), "the declarer's kind is not")
+}
+
+// TestAddDependencyEnqueuesNothingOnRollback pins that the enqueue rides
+// AfterCommit. A declaration the caller's transaction discards never happened, so
+// there is nothing to schedule.
+//
+// Neither shape here is what an ordinary reconcile produces: a reconcile opens no
+// transaction, so the hook usually runs inline and there is nothing to unwind. Both
+// shapes are opt-in, and they are the only ones that can roll back at all. The
+// nested case is the savepoint unwind, where the inner frame's hooks must go even
+// though the outer frame commits nothing.
+func TestAddDependencyEnqueuesNothingOnRollback(t *testing.T) {
+	runCommitRollback(t, func(t *testing.T, commit bool) {
+		f := newDeclareFixture(t)
+		ctx := context.Background()
+		drainQueue(mustReconciler(t, f.bh, f.depGK).work)
+
+		err := f.cc.Within(ctx, func(ctx context.Context) error {
+			return f.cc.Within(ctx, func(ctx context.Context) error {
+				if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID); err != nil {
+					return err
+				}
+				if commit {
+					return nil
+				}
+				return errBoom
+			})
+		})
+		if commit {
+			require.NoError(t, err)
+			assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(t, f.depGK), "a committed declaration queues")
+			return
+		}
+		require.ErrorIs(t, err, errBoom)
+		assert.Empty(t, f.queued(t, f.depGK), "a rolled-back declaration queues nothing")
+	})
+}
+
+// TestAddDependencyOnAClientOnlyKindEnqueuesNothing pins that a source whose kind
+// has no reconciler is not an error. The stamp still lands, and nothing in this
+// process drains it — which is unchanged by the enqueue, and is the client-only
+// kind's existing gap rather than one this path opens.
+func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh, err := New(store)
+	require.NoError(t, err)
+	targetGK := GroupKind{Kind: "Target"}
+	cc, err := Register(bh, targetGK, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	clientOnly := GroupKind{Kind: "NoController"}
+	dep := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnly), uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, targetGK), uniqueName(), tSpec{})
+
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID), "an unroutable enqueue is not an error")
+
+	owed, err := store.ReconcileOwedListIDs(ctx, clientOnly)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "the durable stamp still lands")
+}
+
+// redeclareController fails on every pass and re-asserts the same dependency each
+// time, which is the converging shape a level-triggered controller has.
+type redeclareController struct {
+	target ObjectID
+	calls  atomic.Int64
+	hot    chan struct{}
+	closed atomic.Bool
+}
+
+func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	if c.calls.Add(1) >= 25 && c.closed.CompareAndSwap(false, true) {
+		close(c.hot)
+	}
+	if obj.ID != c.target {
+		_ = cc.DependenciesAdd(ctx, obj.ID, c.target)
+	}
+	return Result{}, errBoom
+}
+
+// TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges pins the bound the
+// gate buys. A controller that re-asserts the same dependency on every failing pass
+// creates no edge after the first, so it stamps nothing, queues nothing, and climbs
+// its backoff ladder as it would with no declaration at all.
+//
+// This is the shape almost every controller has. The shape that escapes it has its
+// own test below.
+func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withoutGCSweeper())
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	ctrl := &redeclareController{hot: make(chan struct{})}
+	_, err = Register(bh, gk, ctrl)
+	require.NoError(t, err)
+	client := NewClient[tSpec, tStatus](bh, gk)
+
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	ctrl.target = target.ID
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	_ = mustCreate(t, ctx, client, uniqueName(), tSpec{})
+
+	select {
+	case <-ctrl.hot:
+		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed", ctrl.calls.Load())
+	case <-time.After(500 * time.Millisecond):
+		assert.Less(t, ctrl.calls.Load(), int64(25),
+			"a re-asserted edge must not requeue past the backoff")
+	}
+}
+
+// TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce pins the accepted trade, and it
+// is the sharpest edge in this path. A source that creates a genuinely new edge on
+// every failing pass loses its backoff ladder: requeueNow marks the in-flight id
+// dirty rather than queueing it, work.done then makes it dispatchable, and the
+// backoff alarm the worker sets a line later does not hold it back.
+//
+// The edge-new gate bounds this to controllers whose edge set never converges — one
+// that creates a fresh child per attempt, or that deletes and re-declares its set.
+// It costs CPU against a controller that is already failing, and never divergence.
+// Suppressing it would mean reading the work queue's in-flight state from a commit
+// hook, across kinds, which is why it is accepted rather than fixed here.
+//
+// The assertion is on the mechanism and not on the clock. "Retries at once" is a
+// claim about time, and this suite has no clock to assert on: baseRetryInterval has
+// no option, and WithMaxRetryInterval only caps upward. So the test drives the
+// worker's own sequence — get, declare, done, addAfter — and asserts the id is
+// dispatchable while an alarm far in the future is set.
+func TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+	r := mustReconciler(t, bh, gk)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	drainQueue(r.work)
+
+	// Take the id, as a worker does before it runs the controller.
+	r.work.add(dep.ID)
+	got, ok := r.work.get()
+	require.True(t, ok)
+	require.Equal(t, dep.ID, got)
+
+	// The controller declares a new dependency and then fails.
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
+
+	// runWorker releases the id and only then sets the backoff.
+	r.work.done(dep.ID)
+	r.work.addAfter(dep.ID, time.Hour)
+
+	assert.Equal(t, []ObjectID{dep.ID}, queuedIDs(r.work),
+		"the enqueue beat the backoff, so the id is dispatchable now")
 }
 
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:
