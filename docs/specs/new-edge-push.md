@@ -1,11 +1,16 @@
 # Spec: a new dependency edge enqueues its source at commit time
 
-Status: draft, and **the next landing in the plan**. It is the second
-severable piece of phase 2 of [push-conversion](push-conversion.md), after
-the self-enqueue. It is scheduled ahead of phase 1 because it is the
-smallest landing in the plan and it closes one of the two holds on phase
-5's owed-pass number. It builds no hub, so phase 1 is still the pilot for
-the push machinery.
+Status: **landed.** The decision is recorded in the
+[self-enqueue ADR](../adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
+under "Extension: a new dependency edge enqueues its source", which is now
+the authority. This file is kept only until the reader has no use for it —
+delete it, as the [specs README](README.md) requires of a landed spec.
+
+It was the second severable piece of phase 2 of
+[push-conversion](push-conversion.md), after the self-enqueue, and it
+landed ahead of phase 1 because it was the smallest landing in the plan and
+it closed one of the two holds on phase 5's owed-pass number. It built no
+hub, so phase 1 is still the pilot for the push machinery.
 Date: 2026-08-01
 Scope: `controller.go` (`DependenciesAdd`), and one shared helper in the
 beehive layer that `client.go`'s `signalSpecWritten` also calls.

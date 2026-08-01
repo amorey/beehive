@@ -18,15 +18,16 @@ belong to.
 ## The shape of the answer
 
 A write leaves a durable trace and a periodic driver finds it. There are exactly five
-traces, plus one mechanism that has no trace at all. **One write also starts the work
-it recorded**: a spec write that leaves the row unsettled enqueues that row after its
-commit, so trace 1 has a prompt path as well as a driver. Nothing else is pushed, and
-no delete schedules a collect.
+traces, plus one mechanism that has no trace at all. **Two writes also start the work
+they recorded**: a spec write that leaves the row unsettled enqueues that row after
+its commit, and a declaration that creates a `depends_on` edge enqueues the edge's
+source. So traces 1 and 2 each have a prompt path as well as a driver. Nothing else
+is pushed, and no delete schedules a collect.
 
 | Trace | Column | Listed by | Driver |
 |---|---|---|---|
 | Spec not converged | `generation` vs `observed_generation` | `ObjectsListUnsettledIDs` | owed pass, per kind, 30s — **and the write's own enqueue** |
-| Wake owed | `reconcile_owed` | `ReconcileOwedListIDs` | owed pass, per kind, 30s |
+| Wake owed | `reconcile_owed` | `ReconcileOwedListIDs` | owed pass, per kind, 30s — **and the new edge's own enqueue** |
 | Deletion requested | `deletion_requested_at` | `DeletionRequestsList` | GC sweeper, global, 30s, **cannot be disabled** |
 | Anything changed | `resource_version` | `ObjectWritesListSince` | dependency waker, global, 1s |
 | A dependency moved | `dependency_watermarks.reconciled_against` vs targets' `resource_version` | `DependentsListStale` | stale-dependents pass, global, 60s, **cannot be disabled** |
@@ -142,18 +143,33 @@ price, bounded by the edge-new gate.
 → [ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md)
 
 - **Recorded by:** `sqliteStore.EdgesAdd`, via `ControllerClient.DependenciesAdd`.
+  The same call also enqueues the source through `Beehive.signalRequeue`, on
+  `Store.AfterCommit`, gated on `EdgesAddResult.ReconcileOwedStamped` and routed by
+  `EdgesAddResult.From` — the source's own kind, which the edge being cross-kind
+  makes different from the declarer's.
 - **Found by:** `reconciler.enqueueReconcileOwed` → `ReconcileOwedListIDs`. Drained by
   `ReconcileOwedDecrement` in `typedController.reconcile`, which subtracts the whole
   count observed at load, not one.
-- **Normal:** ✅ owed-pass tick.
+- **Normal:** ✅ the declaration's own enqueue, backstopped by the owed-pass tick.
 - **Restart:** ✅ durable and drained unconditionally at startup — a crash between the
-  commit and the dispatch loses nothing. This is the case `TestDependencyRequeueLostAcrossRestart`
+  commit and the dispatch loses the enqueue and keeps the stamp, which is what
+  stamping is for. This is the case `TestDependencyRequeueLostAcrossRestart`
   pins, deliberately under `WithStartupFullPass(false)` so the full pass cannot heal it
   for unrelated reasons.
+- **Not covered by the enqueue:** a source whose kind has no reconciler, and a
+  declaration made from another process or through the embedder's own `Store`. Both
+  keep the stamp and wait for the pass.
 - **Tests:** `TestAddDependencyWakesOncePerEdge`, `TestAddDependencyStampRidesRefsAdd`,
   `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
   `TestRefsAddStampFailureLeavesNoEdge`, `TestRefsAddEdgeFailureLeavesStamp`,
-  `TestAddDependencyNoWakeOnRollback`, `TestDependencyRequeueRaceOnDeclare`,
+  `TestAddDependencyNoWakeOnRollback`, `TestAddDependencyEnqueuesItsSource`,
+  `TestAddDependencyEnqueuesOnlyWhatItStamped`,
+  `TestAddDependencyEnqueueRoutesByTheSourcesKind`,
+  `TestAddDependencyEnqueuesNothingOnRollback`,
+  `TestAddDependencyOnAClientOnlyKindEnqueuesNothing`,
+  `TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges`,
+  `TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce`,
+  `TestDependencyRequeueRaceOnDeclare`,
   `TestDependencyRequeueRaceOnOutOfBandDeclare`, `TestReconcileDecrementsReconcileOwed`,
   `TestReconcileDrainsMultipleOwedPasses`, `TestReconcileOwedSurvivesConcurrentIncrement`,
   `TestReconcileMidPassDeclareLeavesTheDependentOwed`,

@@ -1,9 +1,10 @@
 # Spec: replace the hot polls with commit-time push
 
-Status: draft. Three pieces have landed out of order, none of them a hub:
-the self-enqueue (`60b4ea4`), `EventsMaxVersion` (`1613685`) and the
-`EventsWatch` gate that reads it (`1613685`, `56af29d`). No push path in
-*this* plan exists yet. `gobus` is a dependency, brought in by the schedule
+Status: draft. Four pieces have landed out of order, none of them a hub:
+the self-enqueue (`60b4ea4`), `EventsMaxVersion` (`1613685`), the
+`EventsWatch` gate that reads it (`1613685`, `56af29d`) and the new-edge
+enqueue ([new-edge-push](new-edge-push.md)). No hub in *this* plan exists
+yet. `gobus` is a dependency, brought in by the schedule
 watch, which was carved out and built separately on `gobus/watch` — a
 different package from the `conflate` every phase below uses. See "Phases".
 Date: 2026-07-31
@@ -83,7 +84,7 @@ deliveries.
 | Push consumer | Backstop | What the backstop reads |
 | --- | --- | --- |
 | Dependent wakes ([wake-push](wake-push.md)) | Stale-dependents pass | The dependency watermarks |
-| Spec writes (landed) and new-edge stamps ([new-edge-push](new-edge-push.md)) | Owed pass | The unsettled specs and `reconcile_owed` |
+| Spec writes and new-edge stamps, both landed ([new-edge-push](new-edge-push.md)) | Owed pass | The unsettled specs and `reconcile_owed` |
 | Object deltas, one hub per kind ([watch-push](watch-push.md)) | **Open**: the retained object-watch poll, or the stale-watch pass | The poll re-reads and diffs against `seen`; the pass reads a per-kind summary — the highest `resource_version` and the live count |
 | Event runs ([events-push](events-push.md)) | The retained `EventsWatch` poll | One scalar, `EventsMaxVersion`; the listing only when it moved |
 
@@ -309,13 +310,14 @@ system ten times worse. `60b4ea4` closed that, so the owed pass now
 backstops a prompt path and its interval prices only how long a lost
 enqueue may delay an object.
 
-Two things still hold the owed-pass number, and both are small:
+One thing still holds the owed-pass number, and it is small. The other is
+now closed:
 
-- **The new-edge stamp does not push yet.** A fresh `depends_on` edge
-  stamps `reconcile_owed` and waits for the pass. Lengthening the pass
-  makes a first declare slower by the same factor.
-  [new-edge-push](new-edge-push.md) closes it, and is scheduled first in
-  the plan for that reason. It needs no hub, so it is not held by phase 2.
+- ~~**The new-edge stamp does not push yet.**~~ **Closed.** A fresh
+  `depends_on` edge now enqueues its source when it commits, so a first
+  declare no longer waits for the pass. Landed by
+  [new-edge-push](new-edge-push.md), which went first in the plan for this
+  reason.
 - **A write from outside this process pushes nothing.** The enqueue is
   registered in the beehive layer, so a second process, or the embedder
   writing through the `Store` they own, still waits for the pass. That is

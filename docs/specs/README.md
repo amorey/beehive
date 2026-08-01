@@ -68,22 +68,21 @@ every child inherits. Read it first.
 
 | # | Spec | What it does | State |
 | --- | --- | --- | --- |
-| 2a | [new-edge-push](new-edge-push.md) | Enqueues an edge's source at commit, so a fresh declare stops waiting for the owed pass. No hub. | **Next** |
+| 2a | [new-edge-push](new-edge-push.md) | Enqueues an edge's source at commit, so a fresh declare stops waiting for the owed pass. No hub. | **Landed**; see the [ADR](../adr/2026-07-31-a-spec-write-enqueues-its-own-object.md) |
 | 1 | [events-push](events-push.md) | Pushes the event log beside its poll. The pilot for push over a store write. | Poll gate landed; push half to do |
 | 2 | [wake-push](wake-push.md) | Adds the wake hub and the dependent wakes. | Self-enqueue landed; hub to do |
 | 3 | — | Was `store-reads`, which grouped two `Store` reads behind one break. Dissolved: each read now lands with the push path that uses it. | Dissolved |
 | 4 | [watch-push](watch-push.md) | Pushes the object-watch deltas. **Has an open decision at the top**: whether the poll stays as the backstop, or goes in favour of the stale-watch pass, `ObjectsGetSummary` and `Lagged`. | Blocked on that decision |
 | 5 | — | Lengthens the backstop intervals. No spec; land it last and alone. | To do |
 
-Order: **2a → 1 → 2 → 4 → 5.** The numbers are the phase numbers the
-umbrella spec uses, and they do not change; the order does.
+Order: **2a → 1 → 2 → 4 → 5**, and 2a has landed. The numbers are the phase
+numbers the umbrella spec uses, and they do not change; the order does.
+**Spec 1 is next.**
 
-**Spec 2a goes first, and it is not a phase-1 replacement.** It is
-independent of everything: it is the second piece to leave spec 2 because
-it needs no hub, so it can land at any time. It goes first because it is
-the smallest landing in the plan and because it closes one of the two holds
-on spec 5's owed-pass number. It builds no hub and adds no goroutine, so it
-proves none of the push machinery. Spec 1 is still the pilot for that.
+Spec 2a went first because it was the smallest landing in the plan and
+because it closed one of the two holds on spec 5's owed-pass number. It
+built no hub and added no goroutine, so it proved none of the push
+machinery. Spec 1 is still the pilot for that.
 
 **Spec 4's open decision is the only one left that changes the plan's
 shape.** It decides whether the stale-watch pass, `ObjectsGetSummary` and
@@ -112,10 +111,10 @@ its own core.
 a spec write enqueued its own object, the owed pass was the primary trigger
 for one rather than a backstop for it, and lengthening it would have made
 the commonest latency in the system ten times worse. `60b4ea4` closed that.
-Two smaller holds remain on the owed-pass number.
-[new-edge-push](new-edge-push.md) closes one of them; the other is a write
-from outside this process, which no push path can cover.
-[push-conversion](push-conversion.md) lists both under "Phases".
+Two smaller holds remained on the owed-pass number, and spec 2a closed the
+first. **One hold is left**: a write from outside this process, which no
+push path can cover. [push-conversion](push-conversion.md) has it under
+"Phases".
 
 **No poll is removed by this plan.** Every driver it touches keeps running,
 and push is added beside it. A poll scans the store, so it sees writes from
