@@ -101,16 +101,26 @@ func lingeringGoroutines() string {
 	return ""
 }
 
-// beehiveStacks keeps the records of a goroutine profile that name this module,
-// which is what makes the report actionable and what keeps it quiet about
-// runtime and database/sql goroutines nobody here can end. The goroutine doing
-// the looking names the module too, so it is excluded by the frame it is
-// standing in.
+// beehiveStacks keeps the records of a goroutine profile that name this module
+// or the bus it streams schedules over, which is what makes the report
+// actionable and what keeps it quiet about runtime and database/sql goroutines
+// nobody here can end. The goroutine doing the looking names the module too, so
+// it is excluded by the frame it is standing in.
+//
+// gobus is in the list as insurance. The SchedulesWatch stream reads its
+// receiver with RecvContext, which starts no goroutine of its own, so today
+// every frame it could leak is beehive's. A switch to Receiver.Chan would run a
+// feeder goroutine whose frames are all in gobus, and the leak this package is
+// most likely to grow — a receiver abandoned without Close — would be invisible
+// without this.
 func beehiveStacks(profile string) string {
 	var ours []string
 	for _, record := range strings.Split(profile, "\n\n") {
-		if strings.Contains(record, "github.com/amorey/beehive") &&
-			!strings.Contains(record, "beehive.lingeringGoroutines") {
+		if strings.Contains(record, "beehive.lingeringGoroutines") {
+			continue
+		}
+		if strings.Contains(record, "github.com/amorey/beehive") ||
+			strings.Contains(record, "github.com/amorey/gobus") {
 			ours = append(ours, strings.TrimSpace(record))
 		}
 	}

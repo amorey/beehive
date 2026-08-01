@@ -40,7 +40,8 @@ go test -run TestName ./  # single test
 
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.
 
-- **Nothing is pushed. Every driver is a periodic scan.** A write leaves a durable
+- **Nothing store-backed is pushed. Every driver over the store is a periodic
+  scan.** A write leaves a durable
   trace, and a driver finds it by scanning the column that moved. `internal/driver` holds
   the two loop shapes: `driver.Run` for one cadence, `driver.TickerChan` for a select
   over several. Six drivers: the owed pass (unsettled specs plus `reconcile_owed`,
@@ -48,7 +49,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   by default), the GC sweeper (`WithGCInterval`, deletion-pending, global, **cannot
   be disabled**), the dependency waker (the write log, global, 1s), the
   stale-dependents pass (dependency watermarks, global, 60s, **cannot be disabled**)
-  and the watch poll (the client watches, global, 1s). Startup always runs the owed pass; the
+  and the watch poll (the object and event watches, global, 1s). The schedule
+  watch is the one exception to the scan rule: it is pushed and has no poll at
+  all, because its value never reaches the store — see the schedule-watch bullet
+  below. Startup always runs the owed pass; the
   startup full pass is opt-in (`WithStartupFullPass`), like the periodic one and for
   the same reason — **no reconcile may depend on either full pass**, since both scale
   with the object count. **Only two of the six are publicly configurable** —
@@ -237,10 +241,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   comes out opaque, and is not versioned. Reads live on `Client`; retention runs in
   the GC sweeper. "Event" means this log and nothing else — the object-change streams
   are named apart. → [ADR](docs/adr/2026-07-27-events-api.md)
-- **The schedule watch is an in-memory gauge, not store state.**
-  `Client.SchedulesWatch`/`SchedulesGet` report the `workQueue`'s next-requeue time,
-  which bumps no generation or `resource_version` and so fires no object watch. It
-  lives in the beehive layer; the watch polls `nextRequeueAt` and emits on change.
+- **The schedule watch is an in-memory gauge, not store state, and it is the one
+  watch that does not poll.** `Client.SchedulesWatch`/`SchedulesGet` report the
+  `workQueue`'s next-requeue time, which bumps no generation or
+  `resource_version` and so fires no object watch. The queue publishes each move
+  of its `gauge` to a `gobus/watch` hub and a subscriber reads its own receiver,
+  so there is **no tick and no backstop** — the only such stream in beehive. That
+  rests on two properties: the queue is unexported and process-local, so the hub
+  sees every writer that exists, and `gauge` reports every move from one type, so
+  no queue site can change the schedule silently. Give `workQueue` a second
+  writer and the poll has to come back. A stream now ends when the beehive stops,
+  after the final value.
   → [ADR](docs/adr/2026-07-27-schedule-watch.md)
 
 ## Conventions

@@ -375,7 +375,9 @@ Worth stating, because each looks like one:
 - **`EventsAdd` wakes nothing** — it bumps no object `resource_version`, which is also
   what makes it the one write safe inside a dependency cycle.
 - **A schedule change wakes nothing** — `SchedulesWatch` reports an in-memory gauge; it
-  bumps no generation or `resource_version`.
+  bumps no generation or `resource_version`. It is delivered by a push hub rather
+  than a poll, which changes how a subscriber learns of it and nothing about what
+  it triggers.
 - **An object of a client-only kind is never reconciled.** It has no reconcile loop, so
   an unsettled spec on one is inert; only its deletion is ever acted on, by the sweeper.
 - **A queued id whose row is gone is a no-op success**, not a retry — `ObjectsGet`

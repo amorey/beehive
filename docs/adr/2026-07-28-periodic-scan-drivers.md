@@ -19,9 +19,20 @@ every write. The only open question is how that recorded work gets *found*.
 
 ## Decision
 
-Nothing is pushed. Every driver is a periodic scan, and the observable each one
+Nothing **store-backed** is pushed. Every driver over the store is a periodic
+scan, and the observable each one
 reads is the column the write already moved. A write's durable trace **is** its
 notification.
+
+**One value in beehive is pushed, and it is the one that never reaches the
+store.** The schedule gauge is the work queue's memory, so no second process and
+no embedder can move it: its hub sees every writer that exists, which no
+store-backed hub can. It therefore has a push path and no poll at all. The
+criterion, so it is an exception and not a loophole: a poll may go only when its
+hub can observe every writer, and when the notify is derived from the state
+rather than asserted at each site. Every driver in the table below fails the first
+test by construction, because a second process can always write to the store. See
+[the schedule-watch ADR](2026-07-27-schedule-watch.md).
 
 | Driver | What it scans | Paced by | Default |
 | --- | --- | --- | --- |

@@ -363,17 +363,19 @@ func (r *reconciler) requeueNow(id ObjectID) {
 	}
 }
 
-// nextRequeueAt reports when the loop has scheduled id to be requeued (a pending
-// backoff/RequeueAfter delay, or now if already queued). ok is false when no
-// requeue is scheduled; it reports only per-id timers, so it excludes the periodic
-// drivers — the owed pass, the full pass and the dependency waker all reconcile
-// without one —
-// so the actual next reconcile may be sooner.
-func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
+// scheduleAt reports when the loop has scheduled id to be requeued (a pending
+// backoff/RequeueAfter delay, or now if already queued). The zero Schedule means
+// nothing is scheduled; it reports only per-id timers, so it excludes the
+// periodic drivers — the owed pass, the full pass and the dependency waker all
+// reconcile without one — so the actual next reconcile may be sooner.
+//
+// A reconciler with no queue reports the zero Schedule for the same reason:
+// nothing is scheduled for it.
+func (r *reconciler) scheduleAt(id ObjectID) Schedule {
 	if r.work == nil {
-		return time.Time{}, false
+		return Schedule{}
 	}
-	return r.work.nextRequeueAt(id)
+	return r.work.scheduleAt(id)
 }
 
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
@@ -432,12 +434,29 @@ func (r *reconciler) run(ctx context.Context) {
 	}
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
 	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue.
-	// A live SchedulesWatch needs nothing here: it polls, so it simply reports the
-	// stopped queue's empty schedule until its own context ends.
+	//
+	// A live SchedulesWatch ends here, which is a change from when it polled: it
+	// used to report the stopped queue's empty schedule until its own context
+	// ended. stop publishes the final value of each id whose schedule moved, and
+	// closing the *sender* then lets each receiver read that value once before its
+	// stream ends. A hub with no queue behind it can never produce another value,
+	// so an open channel that will never speak again is a worse signal than a
+	// closed one.
+	//
+	// Never Hub.Close here. It is hard tear-down with no drain, so a receiver that
+	// had not yet read the final value would lose it, and the loss would depend on
+	// timing. Nothing leaks by omitting it: each stream closes its own receiver,
+	// and a receiver that drains after a sender close deregisters itself.
+	//
+	// Sender.Close is documented as unsafe beside an active Send from another
+	// goroutine, and beehive cannot promise quiescence — Client.Requeue is public
+	// and reaches this queue at any time. The implementation is memory-safe and a
+	// racing publish gets ErrClosed, which workQueue.publish already expects.
 	defer func() {
 		wg.Wait()
 		if r.work != nil {
 			r.work.stop()
+			r.work.closeHub()
 		}
 	}()
 

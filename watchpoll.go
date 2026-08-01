@@ -50,6 +50,16 @@ func (bh *Beehive) watchPoll() time.Duration {
 // landed. Every send in this file goes through it, so a subscriber that stops reading
 // cannot wedge its own poll goroutine past cancellation.
 func sendOrDone[V any](ctx context.Context, out chan<- V, v V) bool {
+	// Cancellation is checked first, and on its own. A subscriber that has already
+	// given up must not be handed one more value, and without this check it can
+	// be: once a reader parks on out, both arms of the select below are ready and
+	// Go picks between ready arms at random. Checking first makes "cancelled"
+	// the answer whenever it is true, whoever is waiting.
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
 	select {
 	case out <- v:
 		return true
@@ -463,30 +473,58 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 // none, so it returns ErrNoController. See the Client interface for the full
 // contract.
 //
-// Unlike the other watches this polls in-memory state rather than the store, so the
-// interval costs nothing but latency. The zero Schedule ("nothing scheduled") is a
-// real value rather than an absence, so it is sent like any other; the first flag is
-// what separates "never reported" from "last reported the zero value".
+// Unlike every other watch in beehive this one does not poll. The work queue
+// publishes each move of the schedule to a hub and this stream reads its own
+// receiver, so there is no tick and no backstop behind it.
+//
+// That is sound here and nowhere else. The queue is unexported and process-local,
+// so no second process and no embedder can move the gauge: the hub sees every
+// writer that exists, which no store-backed hub can say. And the gauge reports
+// each move from one type, so a queue operation cannot change the schedule
+// silently. Give workQueue a second writer and both halves fail — the poll would
+// have to come back. See docs/adr/2026-07-27-schedule-watch.md.
+//
+// The zero Schedule ("nothing scheduled") is a real value rather than an absence,
+// so it is delivered like any other.
 func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
-	if !ok {
+	if !ok || r.work == nil {
+		// The nil queue is unreachable through Register, which builds the queue and
+		// its hub together. It is guarded anyway so this agrees with
+		// reconciler.scheduleAt behind SchedulesGet: a reconciler with no
+		// scheduling machinery reports having none, rather than one path answering
+		// and its sibling panicking.
 		return nil, ErrNoController
 	}
+	rx, cur := r.work.watchSchedule(id)
 	out := make(chan Schedule)
-	var last Schedule
-	first := true
 
 	go func() {
 		defer close(out)
-		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			at, _ := r.nextRequeueAt(id) // zero time when nothing is scheduled
-			cur := Schedule{NextRequeueAt: at}
-			if !first && cur == last {
-				return true
+		// The receiver holds its key against the hub until it is closed, whatever
+		// ends the stream.
+		defer rx.Close()
+
+		// last is what the subscriber has been told; send says whether the value in
+		// hand still needs telling. The snapshot always does — the bus does not
+		// deliver the seed back, since it is the caller's own argument — and every
+		// value after it does unless it repeats what was already reported.
+		last, send := cur.Schedule, true
+		for {
+			if send && !sendOrDone(ctx, out, last) {
+				return // the caller's ctx ended
 			}
-			first, last = false, cur
-			return sendOrDone(ctx, out, cur)
-		})
+			ev, err := rx.RecvContext(ctx)
+			if err != nil {
+				return // the sender closed, or the caller's ctx ended
+			}
+			// No staleness check: Accept rejected every value the queue
+			// superseded. This comparison is for coalescing only — the gauge can
+			// move away and back while nobody reads, and a repeated value must not
+			// reach the consumer.
+			next := ev.Value.Schedule
+			send, last = next != last, next
+		}
 	}()
 	return out, nil
 }
