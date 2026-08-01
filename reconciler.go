@@ -444,12 +444,29 @@ func (r *reconciler) run(ctx context.Context) {
 	}
 	// Drain the workers, then cancel any retry/RequeueAfter timers they left
 	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue.
-	// A live SchedulesWatch needs nothing here: it polls, so it simply reports the
-	// stopped queue's empty schedule until its own context ends.
+	//
+	// A live SchedulesWatch ends here, which is a change from when it polled: it
+	// used to report the stopped queue's empty schedule until its own context
+	// ended. stop publishes the final value of each id whose schedule moved, and
+	// closing the *sender* then lets each receiver read that value once before its
+	// stream ends. A hub with no queue behind it can never produce another value,
+	// so an open channel that will never speak again is a worse signal than a
+	// closed one.
+	//
+	// Never Hub.Close here. It is hard tear-down with no drain, so a receiver that
+	// had not yet read the final value would lose it, and the loss would depend on
+	// timing. Nothing leaks by omitting it: each stream closes its own receiver,
+	// and a receiver that drains after a sender close deregisters itself.
+	//
+	// Sender.Close is documented as unsafe beside an active Send from another
+	// goroutine, and beehive cannot promise quiescence — Client.Requeue is public
+	// and reaches this queue at any time. The implementation is memory-safe and a
+	// racing publish gets ErrClosed, which workQueue.publish already expects.
 	defer func() {
 		wg.Wait()
 		if r.work != nil {
 			r.work.stop()
+			r.work.closeHub()
 		}
 	}()
 

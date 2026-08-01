@@ -463,21 +463,19 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 // none, so it returns ErrNoController. See the Client interface for the full
 // contract.
 //
-// Unlike the other watches this reports in-memory state rather than the store. The
-// work queue publishes every move of the schedule to a hub, and this stream reads
-// its own receiver; the poll runs beside it as the backstop while the push path is
-// new. The zero Schedule ("nothing scheduled") is a real value rather than an
-// absence, so it is delivered like any other.
+// Unlike every other watch in beehive this one does not poll. The work queue
+// publishes each move of the schedule to a hub and this stream reads its own
+// receiver, so there is no tick and no backstop behind it.
 //
-// One goroutine owns the stream. last is its local and out has one sender, so the
-// two paths must not be two goroutines: that would be a data race on last and a
-// double send on out. The loop therefore selects over the ctx, the ticker and the
-// receiver, and both arms run the same comparison and the same send.
+// That is sound here and nowhere else. The queue is unexported and process-local,
+// so no second process and no embedder can move the gauge: the hub sees every
+// writer that exists, which no store-backed hub can say. And the gauge reports
+// each move from one type, so a queue operation cannot change the schedule
+// silently. Give workQueue a second writer and both halves fail — the poll would
+// have to come back. See docs/adr/2026-07-27-schedule-watch.md.
 //
-// The receiver is read through Chan rather than RecvContext because a select needs
-// a channel. That costs a feeder goroutine for each subscriber, which is why the
-// leak check in testutils_test.go must see gobus frames. When the poll goes, the
-// ticker arm goes with it and the loop becomes a blocking RecvContext.
+// The zero Schedule ("nothing scheduled") is a real value rather than an absence,
+// so it is delivered like any other.
 func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
 	if !ok {
@@ -500,26 +498,16 @@ func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id Object
 			return
 		}
 
-		tick, stop := driver.TickerChan(c.bh.watchPoll())
-		defer stop()
-		events := rx.Chan()
 		for {
-			var next Schedule
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick:
-				next = r.scheduleAt(id).Schedule
-			case ev, open := <-events:
-				if !open {
-					return
-				}
-				// No staleness check: Accept rejected every value the queue
-				// superseded. This comparison is for coalescing only — the gauge
-				// can move away and back while nobody reads, and a repeated value
-				// must not reach the consumer.
-				next = ev.Value.Schedule
+			ev, err := rx.RecvContext(ctx)
+			if err != nil {
+				return // the sender closed, or the caller's ctx ended
 			}
+			// No staleness check: Accept rejected every value the queue
+			// superseded. This comparison is for coalescing only — the gauge can
+			// move away and back while nobody reads, and a repeated value must not
+			// reach the consumer.
+			next := ev.Value.Schedule
 			if next == last {
 				continue
 			}

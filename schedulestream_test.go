@@ -188,3 +188,62 @@ func assertQuiet(t *testing.T, ch <-chan Schedule, msg string) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+// TestScheduleStreamMakesNoPeriodicRead pins that the poll is gone: a stream on
+// a quiet queue reports its snapshot and then nothing, even though the watch
+// poll interval is short enough that a retained poll would have ticked many
+// times.
+func TestScheduleStreamMakesNoPeriodicRead(t *testing.T) {
+	bh, err := New(newClientTestStore(t), fast()...)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	ch, err := client.SchedulesWatch(ctx, 1)
+	require.NoError(t, err)
+	require.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the snapshot")
+
+	assertQuiet(t, ch, "a quiet queue must produce nothing without a move")
+}
+
+// Shutdown delivers the final value and then ends the stream. Both halves: a
+// test that only asserted the end would pass with the final value dropped.
+//
+// This is also the tripwire for Hub.Close. Reintroduce it and the final value
+// races the teardown, so this test goes flaky rather than red — run it under
+// -race in a loop when the shutdown path changes.
+func TestScheduleStreamShutdownDeliversThenEnds(t *testing.T) {
+	ctx, bh, client, r := pushOnlyClient(t)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	r.work.addAfter(1, time.Hour)
+
+	ch, err := client.SchedulesWatch(ctx, 1)
+	require.NoError(t, err)
+	require.False(t, recv(t, ch).NextRequeueAt.IsZero(), "the pending alarm")
+
+	require.NoError(t, stop(context.Background()))
+
+	assert.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the final value: nothing scheduled")
+	select {
+	case _, open := <-ch:
+		assert.False(t, open, "the stream ends after the final value")
+	case <-time.After(testTimeout):
+		t.Fatal("the stream must end when the beehive stops")
+	}
+}
+
+// A publish that races the sender close gets ErrClosed. Client.Requeue is
+// public and reaches the queue from a user goroutine at any time, so beehive
+// cannot promise the teardown is quiesced. The publish must not panic.
+func TestSchedulePublishAfterCloseIsNotFatal(t *testing.T) {
+	ctx, bh, _, r := pushOnlyClient(t)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	require.NoError(t, stop(context.Background()))
+
+	assert.NotPanics(t, func() { r.work.publish(keyed{ID: 1}) })
+}

@@ -187,6 +187,25 @@ func TestPublishStopSendsTheFinalValues(t *testing.T) {
 	assert.True(t, sent[0].Schedule.NextRequeueAt.IsZero(), "nothing scheduled")
 }
 
+// stop clears alarms, not the dirty set, so an id queued for immediate dispatch
+// still reads as due-now afterwards. Its final value is therefore a dispatch that
+// will never happen — which is exactly what the poll reported too, because the
+// gauge genuinely still says due-now.
+//
+// Pinned so nobody "fixes" it by clearing dirty in stop, which would change what
+// the queue does rather than what it reports.
+func TestPublishStopLeavesAQueuedIDDueNow(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
+	before := len(tx.taken())
+
+	q.stop()
+
+	assert.Len(t, tx.taken(), before, "a queued id moves nothing at stop")
+	assert.False(t, q.scheduleAt(1).Schedule.NextRequeueAt.IsZero(),
+		"a queued id is not descheduled by stop")
+}
+
 // A queue with no hub is a client-only kind. It must not panic.
 func TestPublishWithNoSenderIsSafe(t *testing.T) {
 	q := newWorkQueue() // no schedules sender

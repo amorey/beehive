@@ -260,6 +260,15 @@ func (q *workQueue) watchSchedule(id ObjectID) (*watch.Receiver[ObjectID, stampe
 	return q.hub.Watch(id, cur), cur
 }
 
+// closeHub ends every schedule stream of this kind. Call it after stop, so the
+// final values are already published and each receiver reads its last one before
+// its stream ends.
+func (q *workQueue) closeHub() {
+	if q.hub != nil {
+		q.hub.Sender().Close()
+	}
+}
+
 // scheduleAt reports id's current schedule. An id that is only being processed,
 // or one a periodic pass might later pick up, reports the zero Schedule: a pass
 // is kind-wide and conditional, not a per-id schedule.
