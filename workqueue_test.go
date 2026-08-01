@@ -343,14 +343,14 @@ func TestWorkQueueRequeueNow(t *testing.T) {
 // fakeScheduleSender records what the queue published.
 type fakeScheduleSender struct {
 	mu   sync.Mutex
-	sent []keyedValue
+	sent []keyedGaugeValue
 	err  error
 }
 
 func (f *fakeScheduleSender) Send(id ObjectID, s gaugeValue) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.sent = append(f.sent, keyedValue{ID: id, gaugeValue: s})
+	f.sent = append(f.sent, keyedGaugeValue{ID: id, gaugeValue: s})
 	return f.err
 }
 
@@ -362,10 +362,10 @@ func (f *fakeScheduleSender) Watch(ObjectID, gaugeValue) *watch.Receiver[ObjectI
 
 func (f *fakeScheduleSender) Close() {}
 
-func (f *fakeScheduleSender) taken() []keyedValue {
+func (f *fakeScheduleSender) taken() []keyedGaugeValue {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]keyedValue(nil), f.sent...)
+	return append([]keyedGaugeValue(nil), f.sent...)
 }
 
 // publishingQueue is a queue wired to a recording sender.

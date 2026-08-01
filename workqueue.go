@@ -88,7 +88,7 @@ func (q *workQueue) publish(id ObjectID, m move) {
 }
 
 // publishAll is publish for the one caller that moves many ids at once.
-func (q *workQueue) publishAll(moves []keyedValue) {
+func (q *workQueue) publishAll(moves []keyedGaugeValue) {
 	for _, m := range moves {
 		_ = q.schedules.Send(m.ID, m.gaugeValue)
 	}
@@ -320,9 +320,11 @@ type gaugeValue struct {
 	Seq      uint64
 }
 
-// keyedValue names the id a gaugeValue belongs to, for the paths that carry many
-// at once: the shutdown snapshot and the publish that drains it.
-type keyedValue struct {
+// keyedGaugeValue names the id a gaugeValue belongs to, for the two paths that
+// carry many at once: the shutdown snapshot and the publish that drains it.
+// Everywhere else the id is already a parameter, so the bare gaugeValue is what
+// travels.
+type keyedGaugeValue struct {
 	ID ObjectID
 	gaugeValue
 }
@@ -348,7 +350,7 @@ type gauge struct {
 	// where time.Now() would differ on each one and make SchedulesWatch emit
 	// forever (see the schedule-watch ADR: a repeated value must be impossible).
 	dirty  map[ObjectID]time.Time // queued (in items) and awaiting dispatch
-	alarms map[ObjectID]*alarm    // pending delayed adds (addAfter), keyedValue by id
+	alarms map[ObjectID]*alarm    // pending delayed adds (addAfter), keyed by id
 	seq    uint64
 }
 
@@ -451,14 +453,14 @@ func (g *gauge) clearAlarm(id ObjectID) (gaugeValue, bool) {
 // after, since at consults dirty first. Reporting it would publish a Seq bump
 // for a change no watcher can see — harmless, but it would break the rule every
 // other mutator keeps.
-func (g *gauge) clearAllAlarms() []keyedValue {
-	var moved []keyedValue
+func (g *gauge) clearAllAlarms() []keyedGaugeValue {
+	var moved []keyedGaugeValue
 	for id, a := range g.alarms {
 		a.timer.Stop()
 		before := g.scheduleLocked(id)
 		delete(g.alarms, id)
 		if s, ok := g.report(id, before); ok {
-			moved = append(moved, keyedValue{ID: id, gaugeValue: s})
+			moved = append(moved, keyedGaugeValue{ID: id, gaugeValue: s})
 		}
 	}
 	return moved
@@ -482,10 +484,10 @@ func (g *gauge) clearAllAlarms() []keyedValue {
 // The stamps are the gauge's current sequence rather than the one each id last
 // moved at, which is what makes the snapshot idempotent: an id whose publish did
 // land is rejected by the stream's own comparison rather than reported twice.
-func (g *gauge) remaining() []keyedValue {
-	out := make([]keyedValue, 0, len(g.dirty))
+func (g *gauge) remaining() []keyedGaugeValue {
+	out := make([]keyedGaugeValue, 0, len(g.dirty))
 	for id := range g.dirty {
-		out = append(out, keyedValue{ID: id, gaugeValue: g.at(id)})
+		out = append(out, keyedGaugeValue{ID: id, gaugeValue: g.at(id)})
 	}
 	return out
 }
@@ -493,7 +495,7 @@ func (g *gauge) remaining() []keyedValue {
 // scheduleHub carries the work queue's gauge to the SchedulesWatch subscribers
 // of one kind.
 //
-// gobus/watch is a keyedValue latest-value *state* bus: one slot for each watched
+// gobus/watch is a keyed latest-value *state* bus: one slot for each watched
 // key, seeded at registration with the value the caller has just read. That is
 // the right shape because SchedulesWatch is a gauge — it streams the value
 // itself rather than a change. Its sibling gobus/conflate is an event bus with
