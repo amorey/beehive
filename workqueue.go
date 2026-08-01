@@ -35,7 +35,7 @@ type workQueue struct {
 	// gauge owns the state SchedulesWatch reports: which ids are queued now and
 	// which hold a pending alarm. It is separate from the queue's own bookkeeping
 	// so that every move of the observable schedule is reported from one place.
-	// See gauge.go.
+	// See "The schedule" below.
 	gauge      *gauge
 	processing map[ObjectID]struct{} // handed out via get, not yet done
 	items      []ObjectID
@@ -48,8 +48,8 @@ type workQueue struct {
 }
 
 // alarm is a pending delayed enqueue: the timer that will enqueue the id and the
-// absolute time it fires, so nextRequeueAt can report when an id is next due
-// without re-deriving it from the timer.
+// absolute time it fires, so the gauge can report when an id is next due without
+// re-deriving it from the timer.
 type alarm struct {
 	timer  *time.Timer
 	fireAt time.Time
@@ -327,9 +327,9 @@ type keyed struct {
 // here — and every method that moves it says so.
 //
 // That is not a proof: it is one small type whose five mutators each return a
-// report their caller must consume, plus the tests in gauge_test.go that drive
-// all of them. It is what stands in for the backstop this stream does not have,
-// so keep the surface small and keep every mutator reporting.
+// report their caller must consume, plus the TestGauge* tests below that drive
+// all of them. It is what stands in for the backstop this stream does not have, so keep
+// the surface small and keep every mutator reporting.
 //
 // A future change that gives workQueue a second writer — an exported handle, a
 // shared queue, a durable schedule — breaks the argument entirely and the poll

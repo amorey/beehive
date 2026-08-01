@@ -1,7 +1,7 @@
 # The schedule watch is an in-memory gauge, not a store stream
 
-- **Status:** Accepted — implemented in `workqueue.go`, `gauge.go`,
-  `schedulehub.go`, `watchpoll.go`, `client.go`. **The gauge stays memory. The
+- **Status:** Accepted — implemented in `workqueue.go` (the gauge and its hub),
+  `watchpoll.go`, `client.go`. **The gauge stays memory. The
   delivery changed: it is pushed, and it has no poll.** See "Superseded: the
   poll" below.
 - **Date:** 2026-07-27 (recorded retroactively); delivery amended 2026-08-01
@@ -17,8 +17,8 @@ other signal captures them.
 ## Decision
 
 The schedule is **reconciler state, not store state.** It lives entirely in the
-beehive layer: the value *is* the in-memory `workQueue`'s view (`dirty` / `alarms`,
-read through `nextRequeueAt`), so there is no table, no migration, and no
+beehive layer: the value *is* the in-memory `workQueue`'s view (the `gauge`'s
+`dirty` / `alarms`), so there is no table, no migration, and no
 `storeapi` involvement. Persisting it would be wrong, not merely expensive — a
 next-requeue time is a fact about *this process's* queue, and a restart legitimately
 invalidates it.
@@ -47,7 +47,7 @@ distinguishes "never reported" from "last reported the zero value".
 
 `SchedulesGet` (the point read) folds unknown / foreign / client-only to a zero
 `Schedule` plus a nil error, via a no-store, no-kind-guard read of
-`reconciler.nextRequeueAt`. There is no public bare-`time.Time` getter — the
+`reconciler.scheduleAt`. There is no public bare-`time.Time` getter — the
 `Schedule` struct is the sole read shape, leaving room for the reserved trigger
 field.
 
