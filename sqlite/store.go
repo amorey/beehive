@@ -1084,6 +1084,7 @@ func (s *sqliteStore) updateSpec(
 		if err != nil {
 			return err
 		}
+		now := toMillis(time.Now().UTC())
 		// A real spec change bumps generation. Keyed on id alone: the kind boundary
 		// came from the resolve above, in this same transaction — keep the read if
 		// you move this statement.
@@ -1093,10 +1094,14 @@ func (s *sqliteStore) updateSpec(
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), obj.ID)
+			jsonText(spec), stamp, rv, now, obj.ID)
 		result, err = s.scanWritten(ctx, row)
-		changed = err == nil
-		return err
+		if err != nil {
+			return err
+		}
+		changed = true
+		gk := storeapi.GroupKind{Group: obj.Group, Kind: obj.Kind}
+		return appendWriteLog(ctx, c, obj.ID, gk, writeOpUpdate, rv, now)
 	})
 	return result, changed, err
 }
@@ -1146,13 +1151,17 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			if err != nil {
 				return err
 			}
+			now := toMillis(time.Now().UTC())
 			// No RETURNING: no row reported, and the scoped read proved existence.
 			_, err = c.ExecContext(ctx, `
 				UPDATE objects
 				SET observed_generation = ?, observed_at = ?, resource_version = ?
 				WHERE id = ?`,
-				observedGeneration, toMillis(time.Now().UTC()), rv, id)
-			return err
+				observedGeneration, now, rv, id)
+			if err != nil {
+				return err
+			}
+			return appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now)
 		}
 		rv, err := nextResourceVersion(ctx, c)
 		if err != nil {
@@ -1170,7 +1179,10 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?`,
 			jsonText(status), stamp, observedGeneration, now, rv, now, id)
-		return err
+		if err != nil {
+			return err
+		}
+		return appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now)
 	})
 }
 
@@ -1267,15 +1279,19 @@ func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, co
 
 // bumpObject advances id's resource_version — the visibility half of the
 // condition mutators, whose semantic write lives in another table.
-func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) error {
+func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID) error {
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
 		return err
 	}
+	now := toMillis(time.Now().UTC())
 	_, err = c.ExecContext(ctx, `
 		UPDATE objects SET resource_version = ?, updated_at = ?
-		WHERE id = ?`, rv, toMillis(time.Now().UTC()), id)
-	return err
+		WHERE id = ?`, rv, now, id)
+	if err != nil {
+		return err
+	}
+	return appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now)
 }
 
 // conditionUnchanged reports whether an existing condition already matches the
@@ -1332,7 +1348,7 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// A condition change bumps resource_version — what watch polls and the
 		// dependency waker look at.
-		return s.bumpObject(ctx, c, id)
+		return s.bumpObject(ctx, c, gk, id)
 	})
 }
 
@@ -1354,7 +1370,7 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 		if n == 0 {
 			return nil
 		}
-		return s.bumpObject(ctx, c, id)
+		return s.bumpObject(ctx, c, gk, id)
 	})
 }
 
@@ -1575,12 +1591,16 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		if err != nil {
 			return err
 		}
+		now := toMillis(time.Now().UTC())
 		// No RETURNING: no row reported, and the scoped read proved existence.
 		_, err = c.ExecContext(ctx, `
 			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?`,
-			jsonText(marshalFinalizers(remaining)), rv, toMillis(time.Now().UTC()), id)
-		return err
+			jsonText(marshalFinalizers(remaining)), rv, now, id)
+		if err != nil {
+			return err
+		}
+		return appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now)
 	})
 }
 
@@ -1599,21 +1619,31 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
 	args := append([]any{now, now}, whereArgs...)
-	res, err := c.ExecContext(ctx, `
+	// RETURNING, not RowsAffected: the write log entry needs the row's identity,
+	// and the where here is a predicate rather than a known id.
+	row := c.QueryRowContext(ctx, `
 		UPDATE objects
 		SET deletion_requested_at = ?,
 		    resource_version = (SELECT value + 1 FROM resource_version_seq WHERE id = 1),
 		    updated_at = ?
-		WHERE (`+where+`) AND deletion_requested_at IS NULL`, args...)
+		WHERE (`+where+`) AND deletion_requested_at IS NULL
+		RETURNING id, "group", kind, resource_version`, args...)
+	var id storeapi.ObjectID
+	var gk storeapi.GroupKind
+	var rv int64
+	err := row.Scan(&id, &gk.Group, &gk.Kind, &rv)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
-	if n == 0 {
-		return false, nil
-	}
 	// Commit the value the row above just took; same transaction, same connection.
 	if _, err := nextResourceVersion(ctx, c); err != nil {
+		return false, err
+	}
+	// The soft delete is an update: the row is still live and readable.
+	if err := appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now); err != nil {
 		return false, err
 	}
 	return true, nil

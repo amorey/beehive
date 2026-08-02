@@ -5898,3 +5898,111 @@ func TestObjectsCreateAppendsAWriteLogEntry(t *testing.T) {
 	assert.Equal(t, writeOpCreate, entries[0].Op)
 	assert.NotZero(t, entries[0].WrittenAt)
 }
+
+// Every write that bumps an objects row appends an update entry at that row's
+// new version. The negative cases matter as much: a content no-op writes
+// nothing at all, and an event draws a version without touching an objects row,
+// so it must leave the object log alone — a watch gated on this log must not
+// wake for a controller that records an event per reconcile.
+func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		// setup replaces the default bare object when the case needs a
+		// differently shaped one; it must create exactly one.
+		setup func(t *testing.T, store beehive.Store) *beehive.RawObject
+		write func(t *testing.T, store beehive.Store, obj *beehive.RawObject)
+		logs  bool
+	}{
+		{
+			name: "spec update",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+				require.NoError(t, err)
+			},
+			logs: true,
+		},
+		{
+			name: "status update",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+			},
+			logs: true,
+		},
+		{
+			name: "condition set",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{
+					Type: "Ready", Status: "True", Reason: "Settled",
+				}))
+			},
+			logs: true,
+		},
+		{
+			name: "finalizer cleared",
+			setup: func(t *testing.T, store beehive.Store) *beehive.RawObject {
+				obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+					Name: uniqueName(), Spec: []byte(`{}`), Finalizers: []string{"f"},
+				})
+				require.NoError(t, err)
+				return obj
+			},
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				require.NoError(t, store.FinalizersDelete(ctx, testGK, obj.ID, "f"))
+			},
+			logs: true,
+		},
+		{
+			name: "deletion requested",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+				require.NoError(t, err)
+			},
+			logs: true,
+		},
+		{
+			name: "byte-identical spec write",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, changed, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, obj.Spec, obj.SpecVersion)
+				require.NoError(t, err)
+				require.False(t, changed, "precondition: the store must skip this write")
+			},
+		},
+		{
+			name: "event appended",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, err := store.EventsAdd(ctx, testGK, obj.ID, storeapi.Event{
+					Category: "c", Type: "Normal", Reason: "R",
+				})
+				require.NoError(t, err)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			newObject := tt.setup
+			if newObject == nil {
+				newObject = newRefObject
+			}
+			obj := newObject(t, store)
+			require.Len(t, writeLogEntries(t, store), 1, "precondition: the create is logged")
+
+			tt.write(t, store, obj)
+
+			entries := writeLogEntries(t, store)
+			if !tt.logs {
+				assert.Len(t, entries, 1, "no objects row was written, so nothing is logged")
+				return
+			}
+			require.Len(t, entries, 2)
+			after, err := store.ObjectsGetMeta(ctx, obj.ID)
+			require.NoError(t, err)
+			assert.Equal(t, writeOpUpdate, entries[1].Op)
+			assert.Equal(t, obj.ID, entries[1].ObjectID)
+			assert.Equal(t, after.ResourceVersion, entries[1].ResourceVersion,
+				"the entry carries the version the row now holds")
+		})
+	}
+}
