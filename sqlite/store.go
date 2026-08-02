@@ -606,6 +606,22 @@ func appendWriteLog(ctx context.Context, c dbtx, id storeapi.ObjectID, gk storea
 	return err
 }
 
+// appendWriteLogDelete records a collection, carrying the row image a Deleted
+// change reports. image is stamped with the delete's own version: it is the
+// object's last, and the row that held the previous one no longer exists.
+func appendWriteLogDelete(ctx context.Context, c dbtx, image *storeapi.RawObject, rv, now int64) error {
+	image.ResourceVersion = rv
+	final, err := json.Marshal(image)
+	if err != nil {
+		return err
+	}
+	_, err = c.ExecContext(ctx, `
+		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at, final)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		rv, image.ID, image.Group, image.Kind, writeOpDelete, now, string(final))
+	return err
+}
+
 // asNameTaken translates the UNIQUE violation on ("group", kind, name) into
 // ErrNameTaken, leaving every other error alone. The name is the only uniqueness
 // a create can hit, so the code alone identifies it.
@@ -1776,8 +1792,15 @@ func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) e
 // without one the entry could not be ordered against the rest of the log. The
 // counter is shared with the event log, so collection moves that too.
 func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
+	c := s.conn(ctx)
+	// Read before the DELETE: the conditions cascade with the row, so this is the
+	// last moment the image can be assembled.
+	image, err := s.ObjectsGet(ctx, id)
+	if err != nil {
+		return err
+	}
 	// Zero rows means already collected: ErrNotFound. Conditions, events and edges cascade.
-	res, err := s.conn(ctx).ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
+	res, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -1785,7 +1808,11 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if n == 0 {
 		return storeapi.ErrNotFound
 	}
-	if _, err := nextResourceVersion(ctx, s.conn(ctx)); err != nil {
+	rv, err := nextResourceVersion(ctx, c)
+	if err != nil {
+		return err
+	}
+	if err := appendWriteLogDelete(ctx, c, image, rv, toMillis(time.Now().UTC())); err != nil {
 		return err
 	}
 	return nil

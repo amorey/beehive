@@ -17,8 +17,10 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -5862,12 +5864,13 @@ type writeLogEntry struct {
 	Kind            string
 	Op              int
 	WrittenAt       int64
+	Final           sql.NullString
 }
 
 func writeLogEntries(t *testing.T, store beehive.Store) []writeLogEntry {
 	t.Helper()
 	rows, err := store.(*sqliteStore).db.QueryContext(context.Background(),
-		`SELECT resource_version, object_id, "group", kind, op, written_at
+		`SELECT resource_version, object_id, "group", kind, op, written_at, final
 		   FROM object_writes ORDER BY resource_version`)
 	require.NoError(t, err)
 	defer rows.Close()
@@ -5876,7 +5879,7 @@ func writeLogEntries(t *testing.T, store beehive.Store) []writeLogEntry {
 	for rows.Next() {
 		var e writeLogEntry
 		require.NoError(t, rows.Scan(&e.ResourceVersion, &e.ObjectID, &e.Group,
-			&e.Kind, &e.Op, &e.WrittenAt))
+			&e.Kind, &e.Op, &e.WrittenAt, &e.Final))
 		out = append(out, e)
 	}
 	require.NoError(t, rows.Err())
@@ -6020,3 +6023,66 @@ func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
 
 	assert.Greater(t, seqValue(t, store.(*sqliteStore)), before)
 }
+
+// The delete entry carries the object as it was, conditions included. Nothing
+// else can: the row is gone and the conditions cascaded with it, so a Deleted
+// change has no other source for the body it promises.
+func TestObjectsDeleteAppendsARowImage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"}))
+	before, err := store.ObjectsGet(ctx, obj.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	entries := writeLogEntries(t, store)
+	last := entries[len(entries)-1]
+	assert.Equal(t, writeOpDelete, last.Op)
+	assert.Equal(t, obj.ID, last.ObjectID)
+	require.True(t, last.Final.Valid, "a delete carries the row image")
+
+	var image storeapi.RawObject
+	require.NoError(t, json.Unmarshal([]byte(last.Final.String), &image))
+	// ResourceVersion is the one field the image cannot match: the row held the
+	// version of its last update, and the entry holds the delete's own.
+	before.ResourceVersion = image.ResourceVersion
+	assert.Equal(t, *before, image)
+	assert.Len(t, image.Conditions, 1, "conditions cascade away with the row")
+}
+
+// The image must round-trip every RawObject field. A column added to objects and
+// surfaced on RawObject but missed here would report a zero value on a Deleted
+// change, and nothing in the write path would fail.
+func TestWriteLogImageCoversRawObject(t *testing.T) {
+	full := storeapi.RawObject{
+		ID: 7, Group: "acme.com", Kind: "Widget", Name: "w",
+		Spec: []byte(`{"a":1}`), Status: []byte(`{"b":2}`),
+		SpecVersion: 3, StatusVersion: 4,
+		Generation: 5, ObservedGeneration: ptr(int64(5)),
+		ObservedAt: ptr(time.UnixMilli(1).UTC()), ResourceVersion: 9,
+		DeletionRequestedAt: ptr(time.UnixMilli(2).UTC()), ReconcileOwed: 1,
+		Finalizers: []string{"f"},
+		Conditions: []storeapi.Condition{{Type: "Ready", Status: "True"}},
+		CreatedAt:  time.UnixMilli(3).UTC(), UpdatedAt: time.UnixMilli(4).UTC(),
+	}
+	v := reflect.ValueOf(full)
+	for i := range v.NumField() {
+		require.False(t, v.Field(i).IsZero(),
+			"%s: give every field a value, or this test cannot detect losing it",
+			v.Type().Field(i).Name)
+	}
+
+	encoded, err := json.Marshal(full)
+	require.NoError(t, err)
+	var back storeapi.RawObject
+	require.NoError(t, json.Unmarshal(encoded, &back))
+
+	assert.Equal(t, full, back)
+}
+
+// ptr is the address of a literal, for the pointer fields on RawObject.
+func ptr[T any](v T) *T { return &v }

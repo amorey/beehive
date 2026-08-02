@@ -270,7 +270,15 @@ CREATE TABLE object_writes (
     -- object is still live and readable, so it appends 2.
     op INTEGER NOT NULL CHECK (op IN (1, 2, 3)),
 
-    written_at INTEGER NOT NULL -- epoch ms
+    written_at INTEGER NOT NULL, -- epoch ms
+
+    -- Delete entries only, NULL otherwise: a JSON row image of the object as it
+    -- was when collected. NOT just its blobs — a Deleted change reports a whole
+    -- object, so the image carries name, generation, the handshake fields,
+    -- finalizers and timestamps too. Conditions live in their own ON DELETE
+    -- CASCADE table and are gone by collection, so they are captured here or
+    -- they are lost.
+    final TEXT
 ) STRICT;
 
 -- The watch tail: seek by kind, scan in cursor order. object_id and op are in
