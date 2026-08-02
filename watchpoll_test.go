@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1615,14 +1616,21 @@ func TestLagFailRejectsANonPositiveDepth(t *testing.T) {
 	defer cancel()
 	_, _, client, _ := watchFixture(t)
 
-	for _, depth := range []int{0, -1, -2} {
+	// Both ends: a non-positive depth, and one that cannot become a channel
+	// capacity — maxInt overflows the reserved slot to negative, and anything
+	// past the ceiling is an allocation no watch buffer has a use for.
+	for _, depth := range []int{0, -1, -2, math.MaxInt, math.MaxInt - 1, maxLagDepth + 1} {
 		_, ch, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagFail, depth))
 		require.ErrorIs(t, err, ErrInvalidOption, "depth %d", depth)
 		assert.Nil(t, ch)
 	}
 
+	// The ceiling itself is accepted.
+	_, _, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagFail, maxLagDepth))
+	require.NoError(t, err)
+
 	// LagBlock ignores depth, as documented.
-	_, _, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagBlock, 0))
+	_, _, err = client.ObjectsWatchList(ctx, WithLagPolicy(LagBlock, math.MaxInt))
 	require.NoError(t, err)
 }
 

@@ -72,14 +72,21 @@ func WithResumeFrom(rv int64) WatchOption {
 // producing a stream that reports itself lagged at once.
 func WithLagPolicy(p LagPolicy, depth int) WatchOption {
 	return func(c *watchConfig) error {
-		if p == LagFail && depth <= 0 {
-			return fmt.Errorf("%w: WithLagPolicy needs a positive depth under LagFail, got %d",
-				ErrInvalidOption, depth)
+		if p == LagFail && (depth <= 0 || depth > maxLagDepth) {
+			return fmt.Errorf("%w: WithLagPolicy needs a depth in [1, %d] under LagFail, got %d",
+				ErrInvalidOption, maxLagDepth, depth)
 		}
 		c.lag, c.lagDepth = p, depth
 		return nil
 	}
 }
+
+// maxLagDepth is the largest LagFail buffer. The ceiling exists because the
+// buffer becomes a channel capacity of depth+1: maxInt overflows that to
+// negative and panics in make, and anything near it is an allocation no watch
+// has a use for — one tick delivers at most tailPageCap changes, so a buffer
+// this size is already a subscriber that will never catch up.
+const maxLagDepth = 1 << 20
 
 // WithLoads eager-loads the same secondary lookups List takes, on the snapshot
 // and on every delivered batch. Batched per batch, not per object, so a watch
