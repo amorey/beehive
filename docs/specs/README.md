@@ -27,3 +27,4 @@ directory holds proposals for what it should become.
 ## Index
 
 - [Objects watch: a durable write log, a split snapshot, and resume](objects-watch.md)
+  - [Implementation plan](objects-watch-implementation.md) — red/green cycles
