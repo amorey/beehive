@@ -155,30 +155,35 @@ type EventQuery struct {
 
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON; the store never inspects them.
+// The json tags are a durable format, not decoration: a delete entry in the
+// object write log stores this struct as the row image a Deleted change reports.
+// Untagged, the on-disk keys would be Go field names, and renaming one would
+// change the format silently — json.Unmarshal leaves an unmatched field zero
+// rather than failing.
 type RawObject struct {
-	ID    ObjectID
-	Group string
-	Kind  string
+	ID    ObjectID `json:"id"`
+	Group string   `json:"group"`
+	Kind  string   `json:"kind"`
 	// Name is unique within its GroupKind and never empty on a returned row.
-	Name   string
-	Spec   []byte // JSON, user-owned
-	Status []byte // JSON, controller-owned; nil until first status write
+	Name   string `json:"name"`
+	Spec   []byte `json:"spec"`   // JSON, user-owned
+	Status []byte `json:"status"` // JSON, controller-owned; nil until first status write
 	// SpecVersion and StatusVersion are the migrator schema versions each blob
 	// was last written at. Persisted and returned, never interpreted.
-	SpecVersion         int
-	StatusVersion       int
-	Generation          int64
-	ObservedGeneration  *int64
-	ObservedAt          *time.Time
-	ResourceVersion     int64
-	DeletionRequestedAt *time.Time
+	SpecVersion         int        `json:"specVersion"`
+	StatusVersion       int        `json:"statusVersion"`
+	Generation          int64      `json:"generation"`
+	ObservedGeneration  *int64     `json:"observedGeneration,omitempty"`
+	ObservedAt          *time.Time `json:"observedAt,omitempty"`
+	ResourceVersion     int64      `json:"resourceVersion"`
+	DeletionRequestedAt *time.Time `json:"deletionRequestedAt,omitempty"`
 	// ReconcileOwed is the objects.reconcile_owed count; 0 means none. Store-
 	// owned: moved only by EdgesAdd's stamp and ReconcileOwedDecrement.
-	ReconcileOwed int64
-	Finalizers    []string
-	Conditions    []Condition // assembled on reads; nil when the object has none
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ReconcileOwed int64       `json:"reconcileOwed"`
+	Finalizers    []string    `json:"finalizers"`
+	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
+	CreatedAt     time.Time   `json:"createdAt"`
+	UpdatedAt     time.Time   `json:"updatedAt"`
 }
 
 // ReconcileLoad is everything one reconcile pass needs from its opening read.
@@ -387,7 +392,9 @@ type Store interface {
 	// ObjectsListByIDs returns the objects of kind gk whose ids are in ids,
 	// ordered by id — creation order, not the caller's order and not
 	// resource_version order. An id naming no object, or one of another kind, is
-	// absent: a short result is normal, not an error.
+	// absent: a short result is normal, not an error. Callers keep ids to a
+	// batch a backend can bind in one statement; the watch tail bounds it by its
+	// page cap.
 	ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
 
 	// ObjectsListIDs returns the ids of every object of kind gk, ordered by id.

@@ -15,11 +15,9 @@
 package beehive
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/amorey/beehive/internal/driver"
@@ -128,24 +126,17 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 // ObjectsWatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	return c.objectStream(ctx, resolveWatch(opts),
-		func(ctx context.Context) ([]*RawObject, int64, error) {
-			return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
-		},
-		func(ObjectID) bool { return true })
+	return c.objectStream(ctx, resolveWatch(opts), nil)
 }
 
 // ObjectsWatch streams changes to the single object id, polling a one-row
 // listing: an id that does not exist yet streams nothing until created, and its
 // removal reads as a Deleted.
 func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	// The tail is the kind's, filtered here: the log carries no index under
-	// object_id, so a single-object watch costs what its kind writes.
-	return c.objectStream(ctx, resolveWatch(opts),
-		func(ctx context.Context) ([]*RawObject, int64, error) {
-			return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, id)
-		},
-		func(changed ObjectID) bool { return changed == id })
+	// The tail is the kind's: the log carries no index under object_id, so a
+	// single-object watch scans what its kind writes. It reads and decodes only
+	// its own object, though — the filter runs before the batched read.
+	return c.objectStream(ctx, resolveWatch(opts), &id)
 }
 
 // objectStream is the tail behind both object watches.
@@ -163,7 +154,7 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 // DeletionRequestedAt set.
 //
 // Most ticks read nothing else: an unmoved log position for this kind proves
-// nothing was written, so a quiet tick costs one scalar read. The position is
+// nothing was written, so a quiet tick costs one query returning one number. The position is
 // the write log's, NOT the shared version counter — the counter moves for event
 // writes too, which would defeat the optimization permanently for any controller
 // that records an event per reconcile.
@@ -172,8 +163,7 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
 	cfg watchConfig,
-	snapshot func(context.Context) ([]*RawObject, int64, error),
-	match func(ObjectID) bool,
+	only *ObjectID,
 ) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The migrator is invariant for the stream's lifetime.
 	mig := c.bh.migratorFor(c.gk)
@@ -190,20 +180,13 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	} else {
 		// The snapshot, on the caller's goroutine; its failure is the one the
 		// caller can act on. Every later failure costs one tick.
-		raws, at, err := snapshot(ctx)
+		raws, at, err := c.snapshot(ctx, only)
 		if err != nil {
 			return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
 		snap.ResourceVersion = at
-		for _, raw := range raws {
-			obj, err := rawToTyped[Spec, Status](raw, mig)
-			if err != nil {
-				c.warnUndecodable("Watch", raw.ID, err)
-				continue
-			}
-			snap.Objects = append(snap.Objects, obj)
-		}
+		snap.Objects = c.decodeList(raws, "Watch")
 		if err := c.loadListRelated(ctx, snap.Objects, cfg.loads); err != nil {
 			return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
@@ -225,7 +208,7 @@ func (c *clientImpl[Spec, Status]) objectStream(
 		// it neither repeats it nor skips what followed.
 		cursor := at
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			changes, err := c.poll(ctx, mig, cfg.loads, &cursor)
+			changes, err := c.poll(ctx, mig, cfg.loads, only, &cursor)
 			if errors.Is(err, ErrWatchTooOld) {
 				// Terminal, unlike a transient read failure: the entries this
 				// stream had not read are gone, so it cannot continue truthfully.
@@ -236,9 +219,6 @@ func (c *clientImpl[Spec, Status]) objectStream(
 				return c.pollFailed(ctx, "watch", err)
 			}
 			for _, ch := range changes {
-				if !match(ch.Object.ID) {
-					continue
-				}
 				// Only the reserved slot is left, so this subscriber is behind by
 				// the whole buffer.
 				if cfg.lag == LagFail && len(out) >= cfg.lagDepth {
@@ -274,6 +254,14 @@ func (c *clientImpl[Spec, Status]) resumable(ctx context.Context, rv int64) erro
 	return nil
 }
 
+// snapshot reads the watch's starting state: one object, or the whole kind.
+func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID) ([]*RawObject, int64, error) {
+	if only != nil {
+		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *only)
+	}
+	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
+}
+
 // tailPageCap bounds one tick's read of the log. A busier interval than this
 // spills into the next tick, which is what keeps a burst from being unbounded.
 const tailPageCap = 512
@@ -290,6 +278,7 @@ func (c *clientImpl[Spec, Status]) poll(
 	ctx context.Context,
 	mig Migrator,
 	loads LoadSet,
+	only *ObjectID,
 	cursor *int64,
 ) ([]ObjectChange[Spec, Status], error) {
 	at, err := c.bh.store.ObjectWritesMaxVersion(ctx, c.gk)
@@ -316,25 +305,29 @@ func (c *clientImpl[Spec, Status]) poll(
 		return nil, nil
 	}
 
-	// Coalesce to the last entry per object, then order by that entry: a
-	// subscriber is told what happened in the order it happened, and an object
+	// Coalesce to the last entry per object. The page arrives ascending and
+	// resource_version is the log's primary key, so keeping the entry that
+	// matches each id's highest version preserves write order without a sort —
+	// a subscriber is told what happened in the order it happened, and an object
 	// written twice reports once.
-	latest := make(map[ObjectID]ObjectWrite, len(page))
+	last := make(map[ObjectID]int64, len(page))
 	for _, w := range page {
-		latest[w.ID] = w
+		if only != nil && w.ID != *only {
+			continue
+		}
+		last[w.ID] = w.ResourceVersion
 	}
-	order := make([]ObjectWrite, 0, len(latest))
-	for _, w := range latest {
-		order = append(order, w)
+	order := make([]ObjectWrite, 0, len(last))
+	for _, w := range page {
+		if last[w.ID] == w.ResourceVersion {
+			order = append(order, w)
+		}
 	}
-	slices.SortFunc(order, func(a, b ObjectWrite) int {
-		return cmp.Compare(a.ResourceVersion, b.ResourceVersion)
-	})
 
 	// One batched read for everything still live. Per-object reads would be
 	// serialized round trips on a single connection, which is what made the old
 	// full listing competitive.
-	var live []ObjectID
+	live := make([]ObjectID, 0, len(order))
 	for _, w := range order {
 		if w.Op != WriteDelete {
 			live = append(live, w.ID)
@@ -350,6 +343,9 @@ func (c *clientImpl[Spec, Status]) poll(
 	}
 
 	changes := make([]ObjectChange[Spec, Status], 0, len(order))
+	// Deleted objects come from a row image and have no relations to load: the
+	// edges went with the row.
+	loaded := make([]*Object[Spec, Status], 0, len(order))
 	for _, w := range order {
 		raw := w.Final
 		if w.Op != WriteDelete {
@@ -367,16 +363,11 @@ func (c *clientImpl[Spec, Status]) poll(
 			continue
 		}
 		changes = append(changes, ObjectChange[Spec, Status]{Type: changeType(w.Op), Object: obj})
-	}
-	// One relation query per batch rather than per object, the same path List
-	// uses. Deleted objects come from a row image and have no relations to load:
-	// the edges went with the row.
-	loaded := make([]*Object[Spec, Status], 0, len(changes))
-	for _, ch := range changes {
-		if ch.Type != Deleted {
-			loaded = append(loaded, ch.Object)
+		if w.Op != WriteDelete {
+			loaded = append(loaded, obj)
 		}
 	}
+	// One relation query per batch rather than per object, the same path List uses.
 	if err := c.loadListRelated(ctx, loaded, loads); err != nil {
 		return nil, err
 	}

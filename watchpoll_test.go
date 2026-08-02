@@ -782,13 +782,14 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 
 	// The fixture starts nothing, so every step below is the test's own: no sweeper
 	// and no reconcile loop can collect the row out from under the ordering.
-	_, bh, client, _ := watchFixture(t)
+	store, bh, client, _ := watchFixture(t)
 	watched := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "watched"})
 	newer := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "newer"})
 
 	snap, ch, err := client.ObjectsWatch(ctx, watched.ID)
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
+	drainProbe(store.byIDs)
 
 	require.NoError(t, client.DeleteByID(ctx, watched.ID))
 	pending := recv(t, ch)
@@ -807,6 +808,18 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	assert.Equal(t, Deleted, ev.Type)
 	assert.Equal(t, watched.ID, ev.Object.ID)
 	assert.Equal(t, "watched", ev.Object.Spec.Val, "the row image carries the final state")
+
+	// The filter runs before the batched read, so the other object's write was
+	// never read back or decoded.
+	for {
+		select {
+		case ids := <-store.byIDs:
+			assert.NotContains(t, ids, newer.ID, "a single-object watch reads only its own object")
+			continue
+		default:
+		}
+		break
+	}
 }
 
 // TestWatchTakesItsSnapshotBeforeReturning pins the guarantee that makes
@@ -1352,7 +1365,7 @@ func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	c := client.(*clientImpl[cSpec, cStatus])
-	changes, err := c.poll(ctx, c.bh.migratorFor(c.gk), LoadSet(0), new(int64))
+	changes, err := c.poll(ctx, c.bh.migratorFor(c.gk), LoadSet(0), nil, new(int64))
 	require.NoError(t, err)
 
 	require.Len(t, changes, 2, "three writes to two objects collapse to two changes")

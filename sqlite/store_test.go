@@ -4639,8 +4639,8 @@ func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 	assert.Equal(t, storeapi.WriteCreate, got[0].Op)
 	assert.Equal(t, gone.ID, got[1].ID)
 	assert.Equal(t, storeapi.WriteDelete, got[1].Op)
-	require.NotNil(t, got[1].Final, "the delete entry carries the row image")
-	assert.Equal(t, gone.Name, got[1].Final.Name)
+	assert.Nil(t, got[1].Final,
+		"no row image: this read routes by id and reads current state, so decoding one would be pure cost")
 }
 
 func TestObjectWritesListSinceAllDBError(t *testing.T) {
