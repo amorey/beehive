@@ -128,9 +128,6 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 // ObjectsWatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	if !c.bh.isRegistered(c.gk) {
-		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
-	}
 	return c.objectStream(ctx, resolveWatch(opts),
 		func(ctx context.Context) ([]*RawObject, int64, error) {
 			return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
@@ -142,9 +139,6 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ..
 // listing: an id that does not exist yet streams nothing until created, and its
 // removal reads as a Deleted.
 func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	if !c.bh.isRegistered(c.gk) {
-		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
-	}
 	// The tail is the kind's, filtered here: the log carries no index under
 	// object_id, so a single-object watch costs what its kind writes.
 	return c.objectStream(ctx, resolveWatch(opts),

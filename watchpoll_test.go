@@ -1531,3 +1531,27 @@ func TestLagBlockIsTheDefault(t *testing.T) {
 		assert.Equal(t, Added, recv(t, ch).Type)
 	}
 }
+
+// The tail needs no reconciler, so a kind nobody registered a controller for can
+// still be watched. SchedulesWatch keeps its ErrNoController: a schedule is a
+// reconciler's state, and a client-only kind has none.
+func TestWatchNeedsNoController(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(newClientTestStore(t), fast()...)
+	require.NoError(t, err)
+	clientOnly := GroupKind{Group: "acme.com", Kind: "Unregistered"}
+	client := NewClient[cSpec, cStatus](bh, clientOnly)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	snap, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	require.Len(t, snap.Objects, 1)
+
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
+
+	_, err = client.SchedulesWatch(ctx, obj.ID)
+	assert.ErrorIs(t, err, ErrNoController, "a schedule still needs a reconciler")
+}

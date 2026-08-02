@@ -168,8 +168,9 @@ type Client[Spec, Status any] interface {
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
 	// ObjectsWatch returns one object's current state, ObjectsWatchList every
 	// object of this client's kind, each with a stream of the changes above it:
-	// Added/Modified/Deleted until ctx is cancelled. Both require a registered
-	// controller and are kind-scoped.
+	// Added/Modified/Deleted until ctx is cancelled. Both are kind-scoped and
+	// need no registered controller: the tail reads the write log, not a
+	// reconciler.
 	//
 	// The snapshot is read before either returns, on the caller's goroutine, so a
 	// caller may subscribe and then act: a change it makes afterwards — including

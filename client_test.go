@@ -1749,19 +1749,24 @@ func TestStartAfterStopErrors(t *testing.T) {
 
 // TestWatchListErrForUnregisteredKind verifies that WatchList returns an error
 // (not a panic) when no controller is registered for the given GroupKind.
-func TestWatchListErrForUnregisteredKind(t *testing.T) {
-	ctx := context.Background()
+// Watching a kind nobody registered is not an error: the tail reads the write
+// log, so it needs no reconciler. An empty kind simply streams nothing.
+func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
 
-	_, _, err = client.ObjectsWatchList(ctx)
-	require.Error(t, err)
+	snap, _, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects)
 
-	_, _, err = client.ObjectsWatch(ctx, 0)
-	require.Error(t, err)
+	snap, _, err = client.ObjectsWatch(ctx, 0)
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects)
 }
 
 func TestClientGetOwner(t *testing.T) {
