@@ -32,14 +32,9 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Compile-time proof that this store satisfies the contracts beehive resolves
-// structurally. Store is here because Open returns *sqliteStore rather than the
-// interface, so nothing else pins it. The two optional capabilities are here
-// because they are acquired by type assertion with the failure discarded: a
-// drifted signature would not fail to build, it would silently turn the feature
-// off — reverting the waker to reseed-from-max, or leaving free pages
-// undrained — with every test still green, since the beehive-side tests drive
-// their own doubles.
+// Compile-time interface checks. The optional capabilities are acquired by type
+// assertion with the failure discarded, so a drifted signature would silently
+// turn the feature off rather than fail to build.
 var (
 	_ storeapi.Store             = (*sqliteStore)(nil)
 	_ storeapi.FreePagesReleaser = (*sqliteStore)(nil)
@@ -49,59 +44,37 @@ var (
 type sqliteStore struct {
 	db *sql.DB
 
-	// txCount counts transactions begun — incremented at the sole BeginTx below, so
-	// a nested Within (which joins on a savepoint) does not add to it. Test-only
-	// observability, and the only way to assert that a fast path answered without
-	// taking the write lock: the statements such a path avoids are all invisible
-	// from outside, and BEGIN IMMEDIATE is the cost that actually matters on a store
-	// that runs every caller through one connection.
+	// txCount counts transactions begun; a nested Within (savepoint) does not add.
+	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
 
-	// processStart stamps when this store opened. Liveness conditions written by a
-	// prior process (updated_at older than this) read as Unknown ("verifying")
-	// until a controller re-confirms them in this process.
+	// processStart: liveness conditions written before it read as Unknown until
+	// re-confirmed in this process.
 	processStart time.Time
 }
 
-// Close closes the database. It is idempotent (database/sql's Close is), and
-// after it the store is unusable. There is nothing else to tear down: the store
-// owns no goroutines and no fan-out, so a consumer scanning the write log simply
-// starts failing its next scan.
+// Close closes the database. Idempotent; the store owns no goroutines, so there
+// is nothing else to tear down.
 func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
 
-// The drain floor. A freelist is only worth releasing once it is past *both* an
-// absolute size and a share of the file: free pages are exactly what the next
-// inserts would have reused for free, so draining a small one means moving pages,
-// writing them to the WAL and re-writing pointer maps, only to re-grow the file on
-// the next write — all on the one write connection. The absolute floor keeps a
-// small or quiet database from being churned at all; the fraction keeps a large
-// steady-state one from being drained forever just because 1MB is a rounding error
-// in it. Together they are hysteresis: a churned file is walked down over
-// successive ticks until it falls back under the gate, and then left alone.
+// Drain floor: release only past both an absolute size and a share of the file.
+// Free pages are what the next inserts would have reused, so draining a small
+// freelist trades work for nothing.
 const (
 	freePagesFloor        = 256 // pages, ~1MB at the default 4KB page size
 	freePagesFloorDivisor = 8   // ...and at least 1/8 of the file
 )
 
-// FreePagesRelease hands up to maxPages of the freelist back to the operating
-// system with PRAGMA incremental_vacuum, and reports how many pages left the file.
-// It is the drain half of auto_vacuum=INCREMENTAL (set in the DSN by OpenPool and
-// OpenMemory); the GC sweeper calls it, since that is where the free pages are
-// produced. It releases nothing, without error, when the freelist is under the
-// floor above, or on a database that predates the pragma and is therefore still
-// auto_vacuum=NONE — there the pragma is a documented no-op.
+// FreePagesRelease hands up to maxPages of the freelist back to the OS with
+// PRAGMA incremental_vacuum, reporting how many pages left the file. It releases
+// nothing, without error, under the drain floor or on an auto_vacuum=NONE
+// database. The count is advisory: a difference of two reads, logged, never
+// acted on.
 //
-// The count is advisory. It is a difference of two reads taken around the drain,
-// so on a pool wider than one connection a concurrent writer can skew it; it is
-// logged, never acted on. All three statements share one *sql.Conn so the pool at
-// least cannot scatter them across connections.
-//
-// The pragma frees ONE PAGE PER STEP, which makes the transport load-bearing: it
-// must be Exec'd. Run through Query and closed without draining the rows, it
-// releases exactly one page and returns no error — a drain that looks alive and
-// reclaims 4KB per sweep.
+// The pragma frees one page per step, so it must be Exec'd, never Query'd —
+// Query releases exactly one page and reports no error.
 func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, error) {
 	if maxPages <= 0 {
 		return 0, nil
@@ -114,10 +87,8 @@ func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, 
 	return freePagesRelease(ctx, conn, maxPages)
 }
 
-// freePagesRelease is FreePagesRelease once the connection is in hand. Split out so
-// the drain's arithmetic can be tested against a scripted dbtx: its remaining
-// branches are a mid-drain fault and a freelist that grew under it, neither of which
-// a real connection can be asked for on demand.
+// freePagesRelease is FreePagesRelease once the connection is in hand, split out
+// so the arithmetic can be tested against a scripted dbtx.
 func freePagesRelease(ctx context.Context, c dbtx, maxPages int) (int, error) {
 	pages, free, err := pageCounters(ctx, c)
 	if err != nil {
@@ -138,8 +109,7 @@ func freePagesRelease(ctx context.Context, c dbtx, maxPages int) (int, error) {
 	}
 	released := free - freeAfter
 	if released < 0 {
-		// Another writer freed more pages than the drain took. Nothing is wrong;
-		// the count just can't be reported as negative.
+		// Another writer freed more than the drain took; don't report negative.
 		return 0, nil
 	}
 	return released, nil
@@ -160,96 +130,64 @@ func pageCounters(ctx context.Context, c dbtx) (pages, free int, err error) {
 // calls made with the ctx passed to Within join it.
 type txKey struct{}
 
-// txFrame is one Within frame: the transaction state every frame shares, plus this
-// frame's depth in the savepoint stack.
+// txFrame is one Within frame: the shared transaction state plus this frame's
+// depth in the savepoint stack.
 //
-// The depth travels *with* the state, never under a key of its own. A separate key
-// would be sticky — it survives everything that does not explicitly clear it, and
-// installing a transaction only installs txKey — so a ctx carrying a stale depth
-// from a finished transaction would install a fresh txState at height 0 while still
-// reporting nonzero depth, and the first nested call inside it would look like a
-// concurrent frame. AfterCommit's hook ctx is exactly such a ctx: it strips txKey and
-// nothing else. Folding the two into one value makes installing a transaction reset
-// the depth by construction, for the same reason txState keeps tx and hooks together.
+// Depth travels *with* the state, never under a key of its own — a stale depth
+// from a finished transaction would otherwise ride into a fresh one
+// (AfterCommit's hook ctx strips only txKey).
 type txFrame struct {
 	st    *txState
 	depth int
-	// id is this frame's savepoint number, 0 for the outermost. It records which
-	// frame owns a queued hook, so an unwind can drop the hooks belonging to itself
-	// and to anything nested inside it while leaving enclosing frames' alone.
+	// id is this frame's savepoint number, 0 for the outermost; it records which
+	// frame owns a queued hook, so an unwind drops only its own and its
+	// descendants'.
 	id int64
 }
 
 // txState is what a transaction puts on the context: the connection every store
-// call made with that ctx joins, plus the hooks owed its commit.
-//
-// The two travel as one value on purpose — "am I inside a transaction?" and
-// "where do I defer until it commits?" are the same question, and answering them
-// from two independent context keys would let a future path install one without
-// the other.
+// call made with that ctx joins, plus the hooks owed its commit. One value so
+// neither half can be installed without the other.
 type txState struct {
 	tx *sql.Tx
 
-	// mu guards this state against a Within whose fn fans calls across goroutines on
-	// the tx ctx. A nested Within from a sibling goroutine is refused outright (see
-	// pushSavepoint), but AfterCommit and bare reads are not nested Withins and stay
-	// legal concurrently — which is why a queued hook records its owning frame rather
-	// than relying on where it landed in the slice.
-	//
+	// mu guards against a Within fn fanning calls across goroutines; AfterCommit
+	// and bare reads stay legal concurrently.
 	mu    sync.Mutex
 	hooks []queuedHook
 
-	// closed latches once the transaction is over, by either outcome, and is the whole
-	// answer to "is this ctx still inside a transaction?". A ctx carrying this txState
-	// outlives the transaction — AfterCommit's contract lets a hook pass back the tx
-	// ctx it captured — so every consumer degrades on it together: Within opens a
-	// fresh transaction, conn falls back to the pool, and AfterCommit runs the hook
-	// inline, which is what it already does for a ctx that never had a transaction.
-	//
+	// closed latches once the transaction is over, by either outcome. A ctx
+	// carrying this txState outlives the transaction, so every consumer degrades
+	// on it together: fresh transaction, pool, inline hook.
 	closed bool
 
-	// committed records *how* it ended, and only flush sets it — which runs only after
-	// tx.Commit returned nil. closed alone cannot answer AfterCommit: a hook runs if
-	// and only if the transaction it was registered against committed, so "over" and
-	// "over and durable" are different questions and the pair is not redundant.
+	// committed records *how* it ended; only flush sets it. A hook runs iff its
+	// transaction committed, so "over" and "over and durable" differ.
 	committed bool
 
-	// sealed latches just before the commit, and is what pushSavepoint refuses on. It
-	// is deliberately not closed: between the seal and the drain the transaction is
-	// still heading for a successful commit, so a hook arriving in that window must
-	// queue and run, not be treated as belonging to a finished transaction.
+	// sealed latches just before the commit; pushSavepoint refuses on it. Not
+	// closed: a hook arriving between seal and drain must still queue and run.
 	sealed bool
 
-	// dead is the id ranges of frames that unwound. Dropping a frame's queued hooks is
-	// not enough on its own, because its ctx can outlive it: a registration arriving
-	// afterwards would be queued fresh and ride the outer commit, firing for writes
-	// that were rolled back.
+	// dead is the id ranges of frames that unwound: a late registration on a dead
+	// frame's ctx must be refused, not queued fresh for the outer commit.
 	dead []idRange
 
-	// savepoints counts the savepoints this transaction has opened, ever. It names
-	// them; it is not a stack height. Monotonic on purpose: a depth-indexed name is
-	// reused after an unwind, and ROLLBACK TO on a duplicate name rewinds to the most
-	// recent match — correct, but it leaves the next reader proving it.
+	// savepoints counts savepoints ever opened — it names them, not a stack
+	// height. Monotonic so ROLLBACK TO never hits a reused name.
 	savepoints int64
 
-	// height is the current savepoint stack depth, which a nested frame's ctx depth
-	// must match to be the rightful next frame. Unlike savepoints it goes back down.
+	// height is the current savepoint stack depth, which a nested frame's ctx
+	// depth must match.
 	height int
 
-	// poisoned latches the first failed unwind. After one, the transaction's state is
-	// unknown, so it must neither take further nested work nor commit.
-	//
-	// Not paranoia: SQLite rolls the whole transaction back — savepoint stack
-	// included — on SQLITE_FULL, SQLITE_IOERR and SQLITE_NOMEM, and a ROLLBACK TO
-	// issued after one of those genuinely fails, because the savepoint it names is
-	// gone. The common errors are not in that class: SQLITE_BUSY and constraint
-	// violations abort a statement, not the transaction, so savepoints behave
-	// normally through them.
+	// poisoned latches the first failed unwind: state unknown, so no further
+	// nested work and no commit. Real: SQLITE_FULL/IOERR/NOMEM roll back the whole
+	// transaction, savepoints included, so a later ROLLBACK TO genuinely fails.
 	poisoned error
 }
 
-// poison latches err as the first failed unwind. A later one adds nothing: the
-// state was already unknown.
+// poison latches err as the first failed unwind.
 func (st *txState) poison(err error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -264,11 +202,8 @@ func (st *txState) poisonErr() error {
 	return st.poisoned
 }
 
-// savepointStmt builds "<verb> bh_sp_<n>". The name is interpolated rather than
-// bound because SQLite accepts no parameter where a savepoint name goes; n is an
-// int64 this package owns, so there is nothing to escape. AppendInt over a stack
-// array keeps this off fmt, which matters because modernc.org/sqlite compiles each
-// statement fresh and these are the most trivial statements we issue.
+// savepointStmt builds "<verb> bh_sp_<n>". Interpolated because SQLite accepts
+// no parameter where a savepoint name goes; n is package-owned, nothing to escape.
 func savepointStmt(verb string, n int64) string {
 	var buf [40]byte
 	b := append(buf[:0], verb...)
@@ -277,23 +212,17 @@ func savepointStmt(verb string, n int64) string {
 	return string(b)
 }
 
-// pushSavepoint admits a new nested frame, reserving its savepoint name and the hook
-// watermark to unwind to. All under mu, since a Within fn may fan store calls across
-// goroutines — which is also what depth guards against: a frame whose ctx depth does
-// not match the live stack height was entered from somewhere that does not own the
-// top of the stack.
+// pushSavepoint admits a new nested frame under mu, reserving its savepoint
+// name. A frame whose ctx depth does not match the live height was entered from
+// somewhere that does not own the top of the stack.
 func (st *txState) pushSavepoint(depth int, caller int64) (name int64, err error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.poisoned != nil {
 		return 0, st.poisoned
 	}
-	// The caller's own frame is checked as well as the depth, because depth alone is
-	// reusable: once a frame unwinds, a later sibling restores the height it had, and a
-	// ctx captured from the dead frame would match again. Admitting it would rewrite
-	// its rolled-back work into a transaction heading for a commit, while addHook goes
-	// on discarding hooks registered on that same ctx — the store answering "is this
-	// frame alive" two different ways.
+	// The caller's own frame is checked as well as the depth: depth is reusable
+	// after an unwind, and a ctx captured from the dead frame would match again.
 	if st.sealed || depth != st.height || st.deadLocked(caller) {
 		return 0, storeapi.ErrStaleTxContext
 	}
@@ -302,14 +231,10 @@ func (st *txState) pushSavepoint(depth int, caller int64) (name int64, err error
 	return st.savepoints, nil
 }
 
-// sealForCommit closes the transaction to new frames and reports whether committing
-// is safe. It answers both questions under the same lock that admits frames, so
-// nothing can be admitted between the check and the commit — a frame slipping into
-// that gap would have its savepoint released by the commit and its writes persisted
-// with no way left to unwind them.
-//
-// Every nested frame pops in a defer, so on a single goroutine the stack is empty by
-// the time fn returns; a live frame here can only belong to another goroutine.
+// sealForCommit closes the transaction to new frames and reports whether
+// committing is safe — both under the lock that admits frames, so nothing slips
+// between the check and the commit. A live frame here can only belong to another
+// goroutine.
 func (st *txState) sealForCommit() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -323,34 +248,23 @@ func (st *txState) sealForCommit() error {
 	return nil
 }
 
-// popSavepoint restores the stack height. It runs on every exit path from an admitted
-// frame, including one whose SAVEPOINT failed: leaving the height raised would give
-// every later sibling on this transaction a spurious ErrConcurrentNestedTx.
+// popSavepoint restores the stack height. It runs on every exit path from an
+// admitted frame, including one whose SAVEPOINT failed.
 func (st *txState) popSavepoint() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	// Unconditional: every push is paired with exactly one deferred pop, so a guard
-	// here could only hide an imbalance rather than tolerate one.
+	// Unconditional: every push pairs with exactly one deferred pop.
 	st.height--
 }
 
 // nested runs fn inside a SAVEPOINT on the ambient transaction, so an error fn
-// returns unwinds fn's writes and its queued hooks whatever the outer caller then
-// does with that error — including swallowing it. The outermost transaction is
-// still the only thing that commits, and a savepoint adds no fsync, so durability
-// is unchanged.
+// returns unwinds fn's writes and its queued hooks even if the outer caller
+// swallows it. Only the outermost transaction commits.
 //
-// Nothing here recovers. A panic unwinding through this frame skips the RELEASE and
-// leaves the savepoint open on the SQLite side, so the frame is *abandoned* rather
-// than settled — and COMMIT releases every open savepoint, which would land the
-// writes of a frame that never completed. The outermost deferred tx.Rollback only
-// covers a panic that escapes Within entirely; a caller that recovers inside its own
-// fn and returns nil defeats it. So an abandoned frame poisons, which is the one
-// state that survives a recover.
+// Nothing here recovers: a panic through this frame leaves the savepoint open,
+// and COMMIT would release it and land the writes — so an abandoned frame
+// poisons, the one state that survives a recover.
 func (st *txState) nested(ctx context.Context, depth int, caller int64, fn func(ctx context.Context) error) error {
-	// pushSavepoint refuses outright once an unwind has failed. The outermost check
-	// is what guarantees the rollback; this one keeps a caller that swallowed the
-	// poison error from piling writes onto a transaction in unknown state.
 	name, err := st.pushSavepoint(depth, caller)
 	if err != nil {
 		return err
@@ -363,31 +277,24 @@ func (st *txState) nested(ctx context.Context, depth int, caller int64, fn func(
 		}
 	}()
 	if _, err := st.tx.ExecContext(ctx, savepointStmt("SAVEPOINT", name)); err != nil {
-		// Nothing was pushed on the SQLite side, so the state is still known and the
-		// caller's ordinary error handling is the right answer. No poison.
+		// Nothing was pushed on the SQLite side; state is still known. No poison.
 		settled = true
 		return err
 	}
-	// The unwind must outlive fn's ctx. That ctx belongs to the caller, who may hand
-	// this frame a cancellable child and cancel it inside fn; ExecContext returns
-	// before running a statement on a canceled ctx, so an unwind issued on it would
-	// silently skip, leaving this frame's writes applied and poisoning a transaction
-	// that is otherwise healthy. Cancellation is the caller's signal about fn, not
-	// about the bookkeeping that cleans up after it.
+	// The unwind must outlive fn's ctx: a caller may cancel inside fn, and
+	// ExecContext skips a statement on a canceled ctx — silently skipping the unwind.
 	cleanupCtx := context.WithoutCancel(ctx)
 	ferr := fn(context.WithValue(ctx, txKey{}, &txFrame{st: st, depth: depth + 1, id: name}))
 	if ferr != nil {
 		st.unwindFrame(name)
 		if _, err := st.tx.ExecContext(cleanupCtx, savepointStmt("ROLLBACK TO", name)); err != nil {
-			settled = true // already poisoned, and with a better error than the defer's
+			settled = true // already poisoned, with a better error than the defer's
 			st.poison(err)
 			return errors.Join(ferr, err)
 		}
 	}
 	// RELEASE pops the savepoint on both outcomes: ROLLBACK TO rewinds to it but
-	// leaves it on the stack, so without this the stack would grow for the life of the
-	// transaction. errors.Join drops a nil ferr, so the success path returns the
-	// RELEASE error alone.
+	// leaves it on the stack. errors.Join drops a nil ferr.
 	if _, err := st.tx.ExecContext(cleanupCtx, savepointStmt("RELEASE", name)); err != nil {
 		settled = true // as above: the specific failure beats the generic one
 		st.poison(err)
@@ -397,29 +304,23 @@ func (st *txState) nested(ctx context.Context, depth int, caller int64, fn func(
 	return ferr
 }
 
-// errAbandonedFrame poisons a transaction whose nested frame exited without settling
-// its savepoint — in practice, a panic unwinding through it. The savepoint is still
-// open, and COMMIT would release it and land that frame's writes.
+// errAbandonedFrame poisons a transaction whose nested frame exited without
+// settling its savepoint (a panic); COMMIT would land that frame's writes.
 var errAbandonedFrame = errors.New("beehive: nested transaction frame abandoned without unwinding")
 
-// queuedHook is a hook plus the frame that registered it. Ownership is recorded
-// rather than inferred from slice position: AfterCommit is not a nested Within, so it
-// stays legal from another goroutine, and a concurrent append lands at a position
-// that says nothing about which frame it belongs to.
+// queuedHook is a hook plus the frame that registered it — ownership recorded,
+// not inferred from slice position, since concurrent appends interleave.
 type queuedHook struct {
 	owner int64
 	fn    func()
 }
 
-// idRange is a half of the frame-id space belonging to a frame that unwound: the
-// frame itself, and every frame opened inside it. Ids are monotonic and a frame only
-// opens while its enclosing frame is live, so the descendants of frame lo are exactly
-// the ids issued between lo and the counter's value when lo unwound.
+// idRange is a frame that unwound plus every frame opened inside it: ids are
+// monotonic and a frame only opens while its parent is live.
 type idRange struct{ lo, hi int64 }
 
-// hookDisposition is what addHook decided to do with a hook. A hook runs if and only
-// if the transaction it was registered against committed and the frame it was
-// registered against did not unwind; the three outcomes are that rule's branches.
+// hookDisposition: a hook runs iff its transaction committed and its frame did
+// not unwind; the three outcomes are that rule's branches.
 type hookDisposition int
 
 const (
@@ -428,34 +329,28 @@ const (
 	hookDiscard                        // the writes it was owed to are gone; it must never run
 )
 
-// addHook queues fn and reports what became of it. Queueing where nothing will look
-// again is a silent drop, which is what this return exists to prevent.
+// addHook queues fn and reports what became of it — queueing where nothing will
+// look again would be a silent drop.
 func (st *txState) addHook(owner int64, fn func()) hookDisposition {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	// Checked before closed: a frame that rolled back must not run its hooks whatever
-	// became of the transaction around it.
+	// Checked before closed: a rolled-back frame never runs its hooks.
 	if st.deadLocked(owner) {
 		return hookDiscard
 	}
 	if st.closed {
 		if !st.committed {
-			// A rolled-back outermost transaction is a nested frame unwinding, one level
-			// up, and gets the same answer: its writes are gone, so nothing owed to its
-			// commit may fire. Running inline here would be the create-conditional side
-			// effect for a row that never landed — the one failure this exists to stop.
+			// Rolled back: the writes are gone, so nothing owed the commit may fire.
 			return hookDiscard
 		}
-		// Committed and drained, so "after the commit" is now. Queueing would be a
-		// silent drop.
+		// Committed and drained: "after the commit" is now.
 		return hookRunNow
 	}
 	st.hooks = append(st.hooks, queuedHook{owner: owner, fn: fn})
 	return hookQueued
 }
 
-// close latches the transaction closed, by either outcome. Idempotent, so the
-// commit path can call it eagerly and the deferred call still covers the rest.
+// close latches the transaction closed, by either outcome. Idempotent.
 func (st *txState) close() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -468,10 +363,9 @@ func (st *txState) isClosed() bool {
 	return st.closed
 }
 
-// flush latches the transaction closed *and committed* and drains the queue in one
-// critical section, so no registration can land after the close but before the drain
-// and be queued where nothing will look again. Only the commit path calls it, which
-// is what makes committed trustworthy.
+// flush latches closed *and committed* and drains the queue in one critical
+// section, so no registration lands between close and drain. Only the commit
+// path calls it, which is what makes committed trustworthy.
 func (st *txState) flush() []queuedHook {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -480,10 +374,8 @@ func (st *txState) flush() []queuedHook {
 	return hooks
 }
 
-// unwindFrame discards the hooks owned by frame name and by every frame opened inside
-// it, and marks that whole id range dead so a later registration against any of them
-// is refused rather than queued fresh. Hooks from enclosing frames keep their place
-// and their order.
+// unwindFrame discards the hooks owned by frame name and its descendants and
+// marks that id range dead; enclosing frames' hooks keep their place and order.
 func (st *txState) unwindFrame(name int64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -494,9 +386,7 @@ func (st *txState) unwindFrame(name int64) {
 		}
 	}
 	st.hooks = kept
-	// Ranges from frames opened inside this one are subsumed by the range about to be
-	// appended, so drop them rather than letting the list grow per unwind and be
-	// rescanned by every addHook.
+	// Ranges from inner frames are subsumed by the one about to be appended.
 	live := st.dead[:0]
 	for _, r := range st.dead {
 		if r.lo < name {
@@ -530,17 +420,10 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// conn returns the ambient transaction if ctx carries a live one, else the pool. A
-// closed txState degrades to the pool for the same reason Within opens a fresh
-// transaction on one: the ctx outlives its transaction, and half of it behaving as
-// "the transaction is over" would be worse than neither half doing so.
-//
-// The cost of that choice, stated plainly: a *write* issued on a captured ctx after
-// its transaction finished used to fail loudly with sql.ErrTxDone and now commits
-// standalone on the pool. Reads are what the fallback is for; writes come along with
-// it, and nothing here can tell them apart. A hook should use the detached ctx it was
-// handed rather than the one it captured — that is what the AfterCommit contract asks
-// for, and it is the only ctx that means "the transaction is over" unambiguously.
+// conn returns the ambient transaction if ctx carries a live one, else the pool.
+// A closed txState degrades to the pool — the ctx outlives its transaction, so a
+// write issued on it commits standalone rather than failing with sql.ErrTxDone.
+// Hooks should use the detached ctx AfterCommit hands them.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
 		return fr.st.tx
@@ -548,31 +431,16 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 	return s.db
 }
 
-// Within runs fn inside a single transaction. A nested Within (ctx already
-// carries a tx) joins the outer transaction rather than opening a new one.
+// Within runs fn inside a single transaction. A nested Within joins the outer
+// transaction on a SAVEPOINT — a real rollback boundary: an error fn returns
+// unwinds its own writes and queued hooks even if the outer caller swallows it.
 //
-// Read-modify-write atomicity rests on the DSN's _txlock=immediate: BeginTx
-// issues BEGIN IMMEDIATE, so a transaction holds the sole WAL write lock from
-// BEGIN through Commit, before its first read. No other writer can commit in
-// between, so a compare-then-write (ObjectsUpdateSpec's no-op suppression, ConditionsSet,
-// FinalizersDelete, …) can't act on a stale snapshot, independent of pool size.
-// This only covers compound writes routed through Within; a read then a separate
-// write on the bare pool is not atomic, so keep multi-statement mutations here.
+// Read-modify-write atomicity rests on the DSN's _txlock=immediate: BEGIN
+// IMMEDIATE holds the sole write lock from before the first read, so a
+// compare-then-write cannot act on a stale snapshot. Only writes routed through
+// Within get this — keep multi-statement mutations here.
 //
-// Nothing is published on commit: a write becomes visible by landing in the
-// table, and consumers find it by scanning resource_version (see
-// ObjectWritesListSince). A rolled-back transaction is therefore invisible for
-// free — its rows are gone and its versions were never committed — with no buffer
-// to discard and no ordering to hold between the commit and a publication.
-//
-// AfterCommit hooks are the one thing deferred to the commit, and they run only
-// on a clean one. A nested Within joins the outer transaction's queue, so a hook
-// registered deep inside a caller's Within still waits for the outermost commit.
-//
-// A nested Within is a real rollback boundary: it runs fn inside a SAVEPOINT, so an
-// error fn returns unwinds fn's own writes and its own queued hooks even if the
-// outer caller swallows that error. Without it, any multi-write composition would be
-// atomic only by the grace of its callers.
+// AfterCommit hooks run only on a clean outermost commit.
 func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) error) error {
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
 		// nested: a savepoint on the outer tx, joining its hook queue
@@ -591,27 +459,20 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	if err := fn(ctx); err != nil {
 		return err // hooks discarded, nothing ran
 	}
-	// A clean return from fn is not enough to commit on. A failed unwind inside leaves
-	// state we cannot reason about, and a frame still open belongs to another
-	// goroutine — COMMIT releases every open savepoint, so committing would land that
-	// frame's writes and leave it holding an error it can no longer act on. The depth
-	// check cannot see the latter: a frame entered while the stack happened to be
-	// empty passes it legitimately, and only outliving fn makes it a fault.
-	//
-	// Both are asked, and the door is shut on new frames, in one critical section. The
-	// deferred Rollback is what actually discards the transaction on either answer.
+	// A clean fn return is not enough: a failed unwind leaves unknown state, and a
+	// frame still open belongs to another goroutine — COMMIT would release its
+	// savepoint and land its writes. Both are checked, and the door shut on new
+	// frames, in one critical section; the deferred Rollback does the discarding.
 	if err := st.sealForCommit(); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// flush latches closed before the hooks below run — they run inside this function,
-	// so a close deferred to its return would read false for the whole window in which
-	// a hook can hand its captured tx ctx back to the store.
+	// flush latches closed before the hooks below run — a close deferred to return
+	// would read false while a hook can hand its captured tx ctx back to the store.
 	hooks := st.flush()
-	// Outside any lock: a hook is caller code and may write to the store, which would
-	// re-enter Within.
+	// Outside any lock: a hook may write to the store and re-enter Within.
 	for _, hook := range hooks {
 		hook.fn()
 	}
@@ -619,11 +480,8 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 }
 
 // AfterCommit defers fn to the outermost transaction's commit. Outside a
-// transaction there is nothing to wait for — the write has landed already — so fn
-// runs inline on the caller's own ctx. So does a registration that arrives too
-// late to be queued: a hook holding the tx ctx it was registered on can call back
-// in here after the commit drained the queue, and "run after the commit" is
-// satisfied by running now, not by queueing where nothing will look again.
+// transaction — or once the commit has drained the queue — fn runs inline:
+// "after the commit" is satisfied by running now.
 func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context)) {
 	fr, ok := txFrom(ctx)
 	if !ok {
@@ -631,17 +489,14 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 		return
 	}
 	st := fr.st
-	// Strip the transaction before handing the ctx on: by the time the hook runs
-	// that *sql.Tx is committed, so a store call joining it would fail outright.
-	// A hook that writes gets a fresh transaction, which is the only thing it could
-	// have meant. Everything else on the ctx is inherited.
+	// Strip the transaction: by hook time the *sql.Tx is committed, so a store
+	// call joining it would fail. A hook that writes gets a fresh transaction.
 	hookCtx := context.WithValue(ctx, txKey{}, nil)
 	switch st.addHook(fr.id, func() { fn(hookCtx) }) {
 	case hookRunNow:
 		fn(hookCtx)
 	case hookDiscard:
-		// Deliberately nothing: the frame it was registered against rolled back, so
-		// running it would fire for writes that are gone.
+		// Deliberately nothing: the frame rolled back, so its writes are gone.
 	}
 }
 
@@ -651,30 +506,17 @@ const objectColumns = `id, "group", kind, name, spec, status,
 	generation, observed_generation, observed_at, resource_version,
 	deletion_requested_at, reconcile_owed, finalizers, created_at, updated_at`
 
-// The sort order of every edge listing, named so it is applied and not retyped.
-//
-// **They order on the edge column, never on the joined o.id it equals.** The two
-// are the same value by the ON clause, so the rows are identical either way — the
-// sort is not, and no behavioural test can tell them apart. idx_edges_to is
-// (to_id, relation) plus, because edges is WITHOUT ROWID, the primary-key tail
-// (from_id), so inside a (to_id=?, relation=?) probe the index already arrives in
-// from_id order; the primary key (from_id, to_id, relation) does the same for
-// to_id under a from_id probe. SQLite does not carry either ordering across the
-// join, so `ORDER BY o.id` plans a temp B-tree over every edge matched where the
-// edge column streams. Written the losing way this is a no-op-looking diff, which
-// is why it lives in one place that TestEdgeListsInheritTheIndexOrder explains.
-//
-// edgesByIDsChunk spells its own order out: it is parameterized on which column
-// routes and which joins, so it can only name the edge columns anyway.
+// The sort order of every edge listing. Order on the edge column, never the
+// joined o.id it equals: the edge index already arrives in that order, while
+// ORDER BY o.id plans a temp B-tree (see TestEdgeListsInheritTheIndexOrder).
 const (
 	edgeOrderByReferrer = "\n\t\tORDER BY r.from_id" // incoming: who points at this
 	edgeOrderByTarget   = "\n\t\tORDER BY r.to_id"   // outgoing: what this points at
 )
 
-// nextResourceVersion advances and returns the global write cursor. It draws
-// from a standalone counter (not MAX(objects.resource_version)) so that
-// physically deleting the highest-versioned row can never make the cursor
-// regress and hand out a reused version.
+// nextResourceVersion advances and returns the global write cursor. A standalone
+// counter, not MAX(objects.resource_version): deleting the highest-versioned row
+// must never regress the cursor and hand out a reused version.
 func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	var rv int64
 	err := c.QueryRowContext(ctx,
@@ -682,11 +524,8 @@ func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
 	return rv, err
 }
 
-// scanWritten scans a mutator's RETURNING row and assembles its conditions, so the
-// returned object carries the full conditions set regardless of which column the
-// write touched, matching Get/List. Only ObjectsUpdateSpec needs it: it is the one
-// mutator that both returns a row and can be writing a row that already has
-// conditions (ObjectsCreate's cannot — see objectsCreate).
+// scanWritten scans a mutator's RETURNING row and attaches its conditions,
+// matching Get/List.
 func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.RawObject, error) {
 	obj, err := scanObject(sc)
 	if err != nil {
@@ -699,11 +538,8 @@ func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.Ra
 }
 
 func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
-	// Self-wrapping keeps the version draw and the insert atomic: a create is two
-	// statements (nextResourceVersion, then INSERT ... RETURNING), and a scan of the
-	// write log orders rows by the version they were stamped with. Store is public,
-	// so this cannot rest on every caller happening to be inside a transaction
-	// already; a nested Within is free.
+	// Self-wrapped: the version draw and the insert must be atomic, and Store is
+	// public, so this cannot rest on the caller already being in a transaction.
 	var created *storeapi.RawObject
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
@@ -717,11 +553,8 @@ func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 }
 
 func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
-	// Refused here rather than left to the column's CHECK. The constraint is the
-	// backstop for writes that bypass this store entirely (a migration, a foreign
-	// writer), but a driver's constraint error carries no sentinel a caller can match
-	// on, and its text is the driver's to change. The contract on ObjectsCreateInput
-	// promises ErrInvalidName, so this is where that promise is kept — before the
+	// Refused here, not left to the column's CHECK: the contract promises
+	// ErrInvalidName, and a driver constraint error carries no sentinel. Before the
 	// version draw, so a refused create burns no resource_version.
 	if in.Name == "" {
 		return nil, fmt.Errorf("%w: pass the name the object should be addressable by", storeapi.ErrInvalidName)
@@ -734,8 +567,7 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	}
 	now := toMillis(time.Now().UTC())
 
-	// RETURNING hands back the freshly written row — including the assigned id —
-	// in the same statement, so there's no follow-up read.
+	// RETURNING hands back the written row, assigned id included — no follow-up read.
 	row := c.QueryRowContext(ctx, `
 		INSERT INTO objects
 			("group", kind, name, spec, status, schema_version_spec,
@@ -744,9 +576,8 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 		RETURNING `+objectColumns,
 		gk.Group, gk.Kind, in.Name, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
-	// scanObject, not scanWritten: a condition references an object id, and this id
-	// did not exist until the statement above. So the row provably has none, and
-	// nil Conditions is what assembling them would have produced anyway.
+	// scanObject, not scanWritten: the id did not exist before this statement, so
+	// the row provably has no conditions.
 	obj, err := scanObject(row)
 	if err != nil {
 		return nil, asNameTaken(err)
@@ -754,14 +585,9 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	return obj, nil
 }
 
-// asNameTaken translates the UNIQUE violation on ("group", kind, name) into the
-// storeapi sentinel, leaving every other error alone.
-//
-// The name is the only uniqueness constraint a caller can hit on a create — the id
-// is AUTOINCREMENT and everything else on the row is unconstrained — so the code
-// alone identifies it, with no need to parse which index the driver named. Callers
-// generating names retry on this and on nothing else, which is exactly why it cannot
-// stay a driver error: the text is modernc's to reword.
+// asNameTaken translates the UNIQUE violation on ("group", kind, name) into
+// ErrNameTaken, leaving every other error alone. The name is the only uniqueness
+// a create can hit, so the code alone identifies it.
 func asNameTaken(err error) error {
 	var serr *sqlite.Error
 	if errors.As(err, &serr) && serr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
@@ -770,13 +596,9 @@ func asNameTaken(err error) error {
 	return err
 }
 
-// probeObjectScoped answers "does id exist, is it gk's, and is it already
-// deletion-pending?" and nothing else. It reads three columns rather than the whole
-// row, so unlike getObjectRowScoped it touches neither blob and unmarshals no
-// finalizers — which matters because every caller is a write path that throws the
-// row away: a kind gate, or the branch that has to tell a foreign id from a
-// collected one. Same errors as a scoped read, ErrNotFound and ErrWrongKind, so
-// callers read identically.
+// probeObjectScoped answers "does id exist, is it gk's, and is it
+// deletion-pending?" from three columns — no blobs, no finalizer unmarshal. Same
+// errors as a scoped read: ErrNotFound, ErrWrongKind.
 func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (deletionPending bool, err error) {
 	var group, kind string
 	var deletionAt sql.NullInt64
@@ -796,17 +618,13 @@ func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKi
 	return deletionAt.Valid, nil
 }
 
-// checkObjectScoped is probeObjectScoped for the callers that only need the gate.
-// The deletion state rides along on the same row read, so asking for less would
-// cost the same.
+// checkObjectScoped is probeObjectScoped for callers that only need the gate.
 func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
 	_, err := s.probeObjectScoped(ctx, gk, id)
 	return err
 }
 
-// getObjectRow reads the objects row without assembling conditions. Internal
-// callers that don't need the conditions (existence checks, pre-write reads) use
-// it to avoid the extra per-object conditions query ObjectsGet would run.
+// getObjectRow reads the objects row without assembling conditions.
 func (s *sqliteStore) getObjectRow(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE id = ?`, id)
@@ -814,9 +632,7 @@ func (s *sqliteStore) getObjectRow(ctx context.Context, id storeapi.ObjectID) (*
 }
 
 // getObjectRowScoped loads id's bare row (no conditions) and confirms it belongs
-// to gk. Returns ErrNotFound if the row is gone, ErrWrongKind if it names another
-// kind. It reads the bare row rather than a full ObjectsGet because the kind
-// boundary is all it enforces, which drops the conditions marshal.
+// to gk: ErrNotFound if gone, ErrWrongKind if it names another kind.
 func (s *sqliteStore) getObjectRowScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	obj, err := s.getObjectRow(ctx, id)
 	if err != nil {
@@ -837,11 +653,9 @@ func (s *sqliteStore) ObjectsGet(ctx context.Context, id storeapi.ObjectID) (*st
 	return s.attachConditions(ctx, obj)
 }
 
-// ObjectsGetForReconcile is the reconcile loop's opening read (see the contract on
-// storeapi.Store). The cursor and the dependency flag are correlated subqueries —
-// one over the single-row resource_version_seq, one an EXISTS on the edges
-// primary-key prefix — so they ride the row read rather than adding round trips on
-// a pool of one connection.
+// ObjectsGetForReconcile is the reconcile loop's opening read (see the contract
+// on storeapi.Store). The cursor and the dependency flag are correlated
+// subqueries, riding the row read rather than adding round trips.
 func (s *sqliteStore) ObjectsGetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
 	var load storeapi.ReconcileLoad
 	row := s.conn(ctx).QueryRowContext(ctx, `
@@ -861,15 +675,14 @@ func (s *sqliteStore) ObjectsGetForReconcile(ctx context.Context, id storeapi.Ob
 	return load, nil
 }
 
-// ObjectsGetMeta is getObjectRow exposed across the store boundary: id's row with
-// no conditions assembled, for metadata-only callers (GC collect, ref checks).
+// ObjectsGetMeta is getObjectRow across the store boundary: no conditions
+// assembled, for metadata-only callers.
 func (s *sqliteStore) ObjectsGetMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	return s.getObjectRow(ctx, id)
 }
 
-// getObjectRowByName is getObjectRow keyed by name within gk: the bare row, no
-// conditions assembled. The name-keyed sibling of getObjectRowScoped — no
-// ErrWrongKind, since the kind is in the WHERE rather than checked after the read.
+// getObjectRowByName is getObjectRow keyed by name within gk. No ErrWrongKind:
+// the kind is in the WHERE.
 func (s *sqliteStore) getObjectRowByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
@@ -889,15 +702,11 @@ func (s *sqliteStore) ObjectsList(ctx context.Context, gk storeapi.GroupKind) ([
 	return s.listObjectsWhere(ctx, `WHERE o."group" = ? AND o.kind = ?`, gk.Group, gk.Kind)
 }
 
-// ObjectsListByIncomingEdge returns the full rows of the objects pointing at toID
-// through relation, restricted to kind gk — the blob-bearing form of
-// EdgesListIncoming (which returns bare id/GroupKind referrers). Resolving the
-// edges in the statement is what saves the caller a Get per child.
+// ObjectsListByIncomingEdge returns the full rows of the objects pointing at
+// toID through relation, restricted to gk — the blob-bearing EdgesListIncoming.
 //
-// The edge is a semi-join, not a join: written as a join the planner drives from
-// idx_objects_kind (which already delivers ORDER BY o.id) and probes edges once
-// per object *of the kind*. IN (SELECT …) lets idx_edges_to drive instead, so the
-// work scales with the owner's children rather than the whole table.
+// The edge is a semi-join, not a join: IN (SELECT …) lets idx_edges_to drive, so
+// the work scales with the referrers rather than every object of the kind.
 func (s *sqliteStore) ObjectsListByIncomingEdge(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
 	return s.listObjectsWhere(ctx, `
 		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
@@ -905,31 +714,25 @@ func (s *sqliteStore) ObjectsListByIncomingEdge(ctx context.Context, gk storeapi
 		toID, string(relation), gk.Group, gk.Kind)
 }
 
-// listObjectsWhere is the shared multi-row object read: the rows matching tail,
-// ordered by id, each with its conditions attached. The predicate runs once, in
-// the blob-bearing SELECT; the conditions are then fetched by the ids it
-// returned (see conditionsByIDs). tail is a fixed internal fragment, never user
-// input, so concatenating it is injection-safe; only its bound arguments come
-// from the caller.
+// listObjectsWhere is the shared multi-row object read: rows matching tail,
+// ordered by id, conditions attached. tail is a fixed internal fragment, never
+// user input; only its bound arguments come from the caller.
 func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ...any) ([]*storeapi.RawObject, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT `+objectColumns+` FROM objects o `+tail+` ORDER BY o.id`, args...)
 	if err != nil {
 		return nil, err
 	}
-	// scanObjects closes rows on return, which is what frees the single-connection
-	// pool for the conditions query below — no explicit Close needed here.
+	// scanObjects closes rows, freeing the single connection for the conditions query.
 	out, err := scanObjects(rows)
 	if err != nil {
 		return nil, err
 	}
 	if len(out) == 0 {
-		// Nothing to attach to. conditionsByIDs is already a no-op on an empty id
-		// list (it binds no query at all), so this only makes the skip obvious.
 		return out, nil
 	}
 
-	// One batched query for the whole result set avoids an N+1 per-object lookup.
+	// One batched query avoids an N+1 per-object lookup.
 	ids := make([]storeapi.ObjectID, len(out))
 	for i, obj := range out {
 		ids[i] = obj.ID
@@ -944,19 +747,11 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 	return out, nil
 }
 
-// conditionsByIDs returns the conditions of the given objects, grouped by object
-// id and ordered by type within each object — the conditions half of
-// listObjectsWhere. Kept a separate query because the two can't be one:
-// conditions are a per-object fan-out, and folding them into the blob-bearing
-// SELECT would re-send each row's spec/status per condition.
-//
-// It keys off the ids already scanned rather than re-running the object
-// predicate. The two statements are not in one transaction, so a re-run could
-// match a different set — a concurrent ref or object write between them would
-// silently drop the conditions of a row we are about to return. Keying off the
-// ids also avoids paying the predicate (an edges semi-join, for
-// ObjectsListByIncomingEdge) twice. The list is chunked under the bound-parameter
-// limit (see idChunkSize).
+// conditionsByIDs returns the given objects' conditions, grouped by object id
+// and ordered by type. A separate query: folding conditions into the blob SELECT
+// would re-send each row's spec/status per condition. It keys off the already
+// scanned ids because the two statements share no transaction — re-running the
+// predicate could match a different set. Chunked under idChunkSize.
 func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.ObjectID) (map[storeapi.ObjectID][]storeapi.Condition, error) {
 	byID := make(map[storeapi.ObjectID][]storeapi.Condition, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
@@ -967,9 +762,8 @@ func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.Object
 	return byID, nil
 }
 
-// conditionsByIDsChunk runs conditionsByIDs for one chunk of ids, merging rows
-// into out. It closes its result set before returning so the next chunk's query
-// can run on the single-connection store.
+// conditionsByIDsChunk runs one chunk, merging rows into out; it closes its
+// result set so the next chunk can run on the single connection.
 func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
 	args := make([]any, len(ids))
 	placeholders := make([]string, len(ids))
@@ -1011,13 +805,10 @@ func (s *sqliteStore) ObjectsListUnsettledIDs(ctx context.Context, gk storeapi.G
 }
 
 func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
-	// Kind-agnostic: no group/kind filter, so the global GC sweeper sees every
-	// finalizing object. The kind rides along because the sweeper routes on it
-	// (see the Store doc), and idx_objects_deleting is keyed to match — partial on
-	// deletion_requested_at IS NOT NULL, over (id, "group", kind) — so this is a
-	// covering scan already in id order: no row fetch, no sort. Keep the column
-	// list and the index key in step; dropping either group/kind or the ORDER BY
-	// out of alignment with it silently costs a table fetch or a temp B-tree.
+	// Kind-agnostic, so the global sweeper sees every finalizing object; the kind
+	// rides along for routing. idx_objects_deleting covers exactly this column
+	// list and order — keep them in step, or the plan silently gains a row fetch
+	// or a temp B-tree.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id, "group", kind FROM objects
 		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`)
@@ -1040,27 +831,20 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 	return scanIDs(rows)
 }
 
-// ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs on the
-// owed-wake count. The decrement's contract (kind scope, no resource_version bump,
-// why it takes the observed count) is on storeapi.Store; the subtraction floors at
-// 0 with max() so it can never drive the count negative.
+// ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs
+// on the owed-wake count; the decrement floors at 0 (contract on storeapi.Store).
 //
-// The increment is deliberately *not* on that interface: production wakes are
-// produced by EdgesAdd, whose stamp must be indivisible from the edge insert, so the
-// declare path cannot route through a separate call and no other producer exists
-// yet. It stays here as the standalone form — reachable on the concrete store, so
-// tests can seed a count without staging the whole declare race — and is where a
-// future non-edge producer (see the dependency-waker item in docs/TODO.md) would hook in.
+// The increment is deliberately not on that interface: production wakes come
+// from EdgesAdd, whose stamp must be indivisible from the edge insert. It stays
+// here so tests can seed a count.
 func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)
 	return err
 }
 
-// ReconcileOwedDecrement folds the kind into the UPDATE, so a foreign id matches no
-// row. Distinguishing the two ways that happens costs a read, so it is paid only on
-// the branch that wrote nothing — unreachable from the reconciler, which passes the
-// kind it loaded the row for a line earlier.
+// ReconcileOwedDecrement folds the kind into the UPDATE, so a foreign id matches
+// no row; the disambiguating read is paid only when nothing was written.
 func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observed int64) error {
 	res, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0)
@@ -1072,8 +856,7 @@ func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.Gr
 	if err != nil || n > 0 {
 		return err
 	}
-	// No row matched: another kind's id, or one collected since the caller loaded it.
-	// Only the first is a fault — a vanished row owes no wake to anyone.
+	// No row: another kind's id, or one collected since. Only the first is a fault.
 	if err := s.checkObjectScoped(ctx, gk, id); err != nil && !errors.Is(err, storeapi.ErrNotFound) {
 		return err
 	}
@@ -1081,44 +864,17 @@ func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.Gr
 }
 
 // DependentsListStale re-derives which dependents are owed a pass (see the
-// contract on storeapi.Store). The join through edges.to_id is total by
-// construction rather than by luck: to_id is ON DELETE RESTRICT, so a target row
-// always outlives every edge pointing at it and there is no window in which a
-// dependent's edge survives a collected target. Nothing here has to handle a
-// missing target, and no LEFT JOIN is needed on that side — only the watermark,
-// whose absence is what "never reconciled against a known point" looks like.
+// contract on storeapi.Store). to_id is ON DELETE RESTRICT, so a target always
+// outlives its edges — only the watermark side needs a LEFT JOIN.
 //
-// **The CROSS JOINs pin the join order, and the query is superlinear without
-// them.** SQLite treats CROSS JOIN as "do not reorder" and nothing else, so the
-// results are unchanged. Left to choose, the planner drives from
-// idx_objects_kind — every object of a registered kind, probing edges per row —
-// and, because that index is keyed on (group, kind, rowid) rather than on
-// from_id, it cannot stream the GROUP BY and materialises a temp B-tree of every
-// remaining match *before* LIMIT applies. Paging to exhaustion then costs one
-// full scan per page. Driving from edges instead gives the bound this method
-// claims. Measured on the 0001 schema, modernc:
+// The CROSS JOINs pin the join order; the query is superlinear without them.
+// Left to choose, the planner drives from idx_objects_kind and materialises a
+// temp B-tree before LIMIT — one full scan per page. Driving from edges bounds
+// the cost by the dependency graph, not the object count.
 //
-//	SEARCH e USING PRIMARY KEY (from_id>?)
-//	SEARCH d USING INTEGER PRIMARY KEY (rowid=?)
-//	SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
-//	SEARCH c USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
-//
-// So: one covering range scan over the depends_on edges above afterID, three
-// rowid seeks each, and no sort at all — the scan already arrives in from_id
-// order, which is what lets LIMIT stop it after `limit` groups. Cost is bounded
-// by the dependency graph rather than by the object count, which is what
-// separates this from a full pass, and the two-column comparison in the last
-// predicate — which no index can serve — is only ever evaluated on rows that scan
-// already reached.
-//
-// GROUP BY, not SELECT DISTINCT: a dependent with several stale targets must
-// appear once, and with the scan in from_id order the grouping is free, where
-// DISTINCT plans a temp B-tree for itself and a second one for the ORDER BY.
-//
-// The kinds list is not chunked under idChunkSize as the id-list reads are. Those
-// take caller data of unbounded size; this takes the registered-kind set, which
-// comes from Register calls in code — a store with enough kinds to exhaust
-// SQLITE_MAX_VARIABLE_NUMBER cannot be written.
+// GROUP BY, not DISTINCT: with the scan in from_id order the grouping is free,
+// where DISTINCT plans two temp B-trees. The kinds list is not chunked: it comes
+// from Register calls, not caller data.
 func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.GroupKind, afterID storeapi.ObjectID, limit int) ([]storeapi.ObjectRef, error) {
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, nil
@@ -1152,22 +908,14 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 }
 
 // DependencyWatermarksSet upserts id's dependency watermark (see the contract on
-// storeapi.Store). The EXISTS rides the edges primary-key prefix, so the
-// has-dependencies gate costs a b-tree probe and no separate read — and, since a
-// collected object's edges cascade away with it, the same probe is what keeps the
-// foreign key satisfied when gcCollect removes the row mid-pass.
+// storeapi.Store). The EXISTS gate rides the edges primary-key prefix, and is
+// also what keeps the foreign key satisfied when gcCollect removes the row
+// mid-pass.
 //
-// The WHERE on DO UPDATE does two jobs, and neither is optional. It makes the
-// stored cursor monotonic, so an out-of-order write cannot regress it and
-// un-converge a dependent. And when the cursor has not advanced it suppresses the
-// write outright — no page dirtied, no WAL frame — which is what keeps a
-// RequeueAfter polling controller that declares dependencies from paying a row
-// write per pass in a store nobody else is writing to. MAX(…) in the SET would give
-// monotonicity alone and still rewrite the row every pass.
-//
-// It is also what couples reconciled_at to reconciled_against structurally: one
-// predicate guards both columns, so the timestamp cannot move on a pass that
-// observed nothing new (see the table comment on why it is not a heartbeat).
+// The WHERE on DO UPDATE is load-bearing twice: it keeps the stored cursor
+// monotonic, and it suppresses a no-advance write outright — no page dirtied —
+// so a polling dependent pays no row write per pass. One predicate guards both
+// columns, so reconciled_at cannot move without reconciled_against.
 func (s *sqliteStore) DependencyWatermarksSet(ctx context.Context, id storeapi.ObjectID, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
@@ -1191,17 +939,13 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// ObjectWritesMaxVersion reads the high-water mark of the object write log: the
-// highest resource_version any live objects row holds. Covered by idx_objects_rv,
-// so it is an index-max lookup rather than a scan, and NULL (an empty store) reads
-// as 0.
+// ObjectWritesMaxVersion reads the high-water mark of the object write log: the highest
+// resource_version any live objects row holds (covered by idx_objects_rv; an
+// empty store reads 0).
 //
-// It reads the objects rows rather than resource_version_seq, which is the same
-// number only when nothing else draws from that sequence — and the event log does.
-// A consumer of this pair (this and ObjectWritesListSince, which selects objects)
-// must not see the cursor move for a write it can never be shown: an EventsAdd
-// bumping the sequence would otherwise read as "something changed", and a
-// controller recording an event per reconcile would make that permanent.
+// It reads objects, not resource_version_seq: the event log draws from that
+// sequence too, and a consumer of this pair must not see the cursor move for a
+// write it can never be shown.
 func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
@@ -1209,28 +953,14 @@ func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error)
 	return rv.Int64, err
 }
 
-// ObjectWritesListSince returns the writes above afterRV: live rows, in cursor
-// order, at most limit of them. Blob-free — it selects no spec or status, and is
-// covered by idx_objects_rv — because its consumers route by id and read current
-// state themselves.
-//
-// This is how a change reaches anyone: there is no push. A consumer holds a
-// watermark, scans on its own cadence, and advances it, which is lossless however
-// long the gap between scans, since resource_version is globally monotonic and
-// never reused.
-//
-// Kind-agnostic: a depends_on edge may point at a kind with no controller, so a
-// per-kind query could not name every target whose change matters. Ordered by
-// resource_version so the caller pages by taking the last row's version as its
-// next cursor.
-//
-// A row deleted since afterRV is simply absent (see the type's own note on why
-// that cannot strand a dependent).
+// ObjectWritesListSince returns the writes above afterRV: live rows, in cursor order,
+// at most limit of them. Blob-free and covered by idx_objects_rv — consumers
+// route by id and read current state themselves. Kind-agnostic, since a
+// depends_on edge may point at a kind with no controller. A row deleted since
+// afterRV is simply absent.
 func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
 	if limit <= 0 {
-		// An exported entry point: a non-positive limit would reach SQLite as
-		// "LIMIT -1" (unbounded, the opposite of what was asked) and a negative one
-		// would panic in make below.
+		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, nil
 	}
 	rows, err := s.conn(ctx).QueryContext(ctx,
@@ -1241,8 +971,7 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, 
 		return nil, err
 	}
 	defer rows.Close()
-	// Capped: limit is the caller's, and a large one must not preallocate for rows
-	// the store may not have.
+	// Capped: a large caller limit must not preallocate for rows the store may not have.
 	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
 	for rows.Next() {
 		var w storeapi.ObjectWrite
@@ -1264,22 +993,11 @@ func scanIDs(rows *sql.Rows) ([]storeapi.ObjectID, error) {
 	return ids, rows.Err()
 }
 
-// stampVersion resolves the schema version a write should leave on the row, given
-// what's stored and what the caller reports. It is the write-side twin of
-// convertBlob and applies to *both* branches of ObjectsUpdateSpec/UpdateStatus — the
-// content no-op and the real content write — because the tag records the shape the
-// bytes are in, and a wrong tag corrupts every later read the same way regardless
-// of whether the bytes moved.
-//
-// An incoming 0 means "no opinion": the kind isn't versioned, or this build lost
-// the migrator. convertBlob reads that as identity rather than converting, so the
-// write must leave the stored tag alone rather than zero it — a build that can't
-// interpret the version has no business relabelling data as unversioned, and
-// stamping 0 over a v3 row makes a later re-registered migrator convert v3 bytes
-// from 0. Below the stored version (non-zero) is a genuine downgrade: refuse it,
-// exactly as the read path refuses from > current. Such a caller could not have
-// decoded the row it is writing back, so this is a bug worth surfacing, not a
-// case to clamp silently.
+// stampVersion resolves the schema version a write leaves on the row. Incoming 0
+// means "no opinion": leave the stored tag alone — a build that can't interpret
+// the version must not relabel data as unversioned. Below the stored version is
+// a genuine downgrade and refused: such a caller could not have decoded the row
+// it is writing back.
 func stampVersion(stored, incoming int) (int, error) {
 	switch {
 	case incoming == 0:
@@ -1294,32 +1012,23 @@ func stampVersion(stored, incoming int) (int, error) {
 
 // ObjectsUpdateSpec replaces id's spec within gk. See updateSpec for the shape.
 func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
-	// The scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
-	// while doubling as the no-op compare's load — no separate kind check.
+	// The scoped read enforces the kind boundary while doubling as the compare's load.
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
 		return s.getObjectRowScoped(ctx, gk, id)
 	})
 }
 
-// ObjectsUpdateSpecByName replaces the spec of whatever holds name within gk.
-//
-// No ErrWrongKind: the kind is in the WHERE, so a name this kind does not hold is
-// absent rather than foreign — as with DeletionRequestsCreateByName.
+// ObjectsUpdateSpecByName replaces the spec of whatever holds name within gk. No
+// ErrWrongKind: the kind is in the WHERE, so a foreign name is simply absent.
 func (s *sqliteStore) ObjectsUpdateSpecByName(ctx context.Context, gk storeapi.GroupKind, name string, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
 		return s.getObjectRowByName(ctx, gk, name)
 	})
 }
 
-// updateSpec is the read-compare-write body both spec mutators share, differing only
-// in how they resolve the row.
-//
-// The read is not optional, which is why neither mutator keys its UPDATE on the
-// caller's key directly: the no-op skip below compares stored bytes and schema
-// version against the incoming ones, and a bare UPDATE has nothing to compare
-// against. Atomicity comes from Within rather than from statement count — the store
-// runs every caller through one connection under BEGIN IMMEDIATE, so a read and a
-// write in one transaction are as indivisible as one statement, which is also what
+// updateSpec is the read-compare-write body both spec mutators share. The read
+// is required: the no-op skip compares stored bytes, and a bare UPDATE has
+// nothing to compare against. Within (BEGIN IMMEDIATE, one connection) is what
 // makes keying the UPDATE on the resolved id safe.
 func (s *sqliteStore) updateSpec(
 	ctx context.Context,
@@ -1335,33 +1044,17 @@ func (s *sqliteStore) updateSpec(
 		if err != nil {
 			return err
 		}
-		// Never downward — see stampVersion. A build that can't read this row's
-		// version can't be trusted to retag it either.
+		// Never downward — see stampVersion.
 		stamp, err := stampVersion(obj.SpecVersion, specVersion)
 		if err != nil {
 			return err
 		}
-		// Identical spec *at the same schema version*: nothing changed, so don't bump
-		// generation/resource_version. A bump would falsely unsettle a converged object
-		// and trigger a needless reconcile, and it would show a watch poll a spurious
-		// diff (mirrors DeletionRequestsCreate's idempotent no-op).
-		//
-		// The version gate is what makes the byte compare meaningful. Convert-on-read
-		// leaves old rows tagged at the version they were written in, so a caller at a
-		// newer version hands us bytes in a *different shape* — equal bytes there can
-		// carry different values (a converter reading v1's absent field as a default
-		// the v2 shape spells explicitly). Suppressing that as a no-op would change
-		// what every later read decodes while bumping no resource_version and emitting
-		// nothing, so no watcher learns and the client skips the controller wake.
-		// When the shapes disagree we can't compare, so we
-		// fall through and write it as the real change it may be — generation bump
-		// included. That is the point, not a side effect: bumping resource_version
-		// while leaving generation would re-stamp a row that stays settled
-		// (ObservedGeneration == Generation), so neither the reconciler nor
-		// ObjectsListUnsettledIDs would ever re-derive status against the new shape. Worst
-		// case a re-stamp costs one generation bump and one spurious reconcile per
-		// row per version bump — at most once per row, since the next write compares
-		// equal — which the level-triggered loop absorbs.
+		// Identical spec *at the same schema version*: write nothing — a bump would
+		// falsely unsettle a converged object and show watchers a spurious diff.
+		// The version gate is what makes the byte compare meaningful: bytes in a
+		// different shape can carry different values, so shape disagreement falls
+		// through as the real change it may be, generation bump included — at most
+		// one spurious reconcile per row per version bump.
 		if stamp == obj.SpecVersion && bytes.Equal(obj.Spec, spec) {
 			result, err = s.attachConditions(ctx, obj)
 			return err // changed stays false: nothing was written
@@ -1370,9 +1063,8 @@ func (s *sqliteStore) updateSpec(
 		if err != nil {
 			return err
 		}
-		// A real spec change bumps generation so the convergence handshake notices.
-		// Keyed on id alone: the kind boundary came from the resolve above, in this
-		// same transaction, and group/kind are write-once at insert. Keep the read if
+		// A real spec change bumps generation. Keyed on id alone: the kind boundary
+		// came from the resolve above, in this same transaction — keep the read if
 		// you move this statement.
 		row := c.QueryRowContext(ctx, `
 			UPDATE objects
@@ -1389,91 +1081,51 @@ func (s *sqliteStore) updateSpec(
 }
 
 // ObjectsUpdateStatus skips the status write when the incoming bytes equal the stored
-// ones, mirroring ObjectsUpdateSpec/FinalizersDelete/ConditionsDelete: no resource_version
-// bump and no updated_at touch — a watch poll would otherwise report a spurious
-// Modified, and the dependency waker, which scans exactly that version, would wake
-// every dependent on each unchanged health poll.
-//
-// The convergence handshake is the one thing a content no-op must still carry:
-// observed_generation/observed_at record *that the controller ran*, not what it
-// wrote, and ObjectsListUnsettledIDs (the owed-pass backstop) keys off
-// observed_generation
-// < generation. Leaving it behind on an identical-status reconcile would strand
-// the object unsettled forever, re-enqueued every full pass. And that advance is a
-// real transition — the object just settled at a new generation — so it bumps
-// resource_version even though the bytes didn't move: anything
-// gating on ObservedGeneration == Generation would otherwise wait for the next
-// owed pass to learn the object converged. It can't spin a controller re-applying
-// its own status, because it fires at most once per generation; the repeat poll
-// takes the already-settled path below.
-//
-// The no-op is gated on the schema version matching, not just the bytes: bytes
-// written in a different shape aren't comparable, so a caller at a newer version
-// takes the content path even when the bytes look identical. Identical status at
-// the same version, with the generation already recorded, writes nothing at all.
+// ones at the same schema version: no resource_version bump, so no spurious
+// watch diff or dependent wake. A content no-op that advances the generation
+// handshake still writes observed_generation/observed_at and bumps
+// resource_version — settling at a new generation is a real transition, and it
+// fires at most once per generation. Identical status with the generation
+// already recorded writes nothing at all.
 func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
-	// Within keeps the read-compare-write atomic so a concurrent writer can't slip
-	// between the no-op check and the update.
+	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary (ErrWrongKind for a foreign id)
-		// while doubling as the no-op compare's load — no separate kind check.
+		// Scoped read enforces the kind boundary while doubling as the compare's load.
 		obj, err := s.getObjectRowScoped(ctx, gk, id)
 		if err != nil {
 			return err
 		}
-		// Was the WHERE generation >= ? guard: a controller can only have observed a
-		// generation that exists, and recording a future one would falsely settle
-		// the object once its spec caught up. An older value is fine — the normal
-		// case where the spec changed mid-reconcile. The guard fires on the no-op
-		// path too; a stale-ahead observedGeneration is a caller bug either way.
+		// A controller can only have observed a generation that exists; recording a
+		// future one would falsely settle the object once its spec caught up. An
+		// older value is fine (spec changed mid-reconcile).
 		if obj.Generation < observedGeneration {
 			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
 				storeapi.ErrObservedGenerationFuture, observedGeneration, obj.Generation, id)
 		}
-		// Never downward — see stampVersion. A build that can't read this row's
-		// version can't be trusted to retag it either.
+		// Never downward — see stampVersion.
 		stamp, err := stampVersion(obj.StatusVersion, statusVersion)
 		if err != nil {
 			return err
 		}
 		if stamp == obj.StatusVersion && bytes.Equal(obj.Status, status) {
-			// Content no-op: write only the bookkeeping, and only if it would
-			// actually move.
-			//
-			// The version gate is what makes the byte compare meaningful — see
-			// ObjectsUpdateSpec for the argument. A caller at a newer schema version holds
-			// bytes in a different shape, so equal bytes aren't equal values; that
-			// case falls through to the content write below, which stamps, bumps
-			// resource_version and emits. It writes the reported generation verbatim
-			// like any content write: there is something to relay, so the settled
-			// clamp below doesn't apply.
-			//
-			// >=, not ==: with no content to write, a report at or below the recorded
-			// generation is nothing new to record. Treating a stale one as an advance
-			// would roll observed_generation backwards, re-unsettling a converged
-			// object for ObjectsListUnsettledIDs and emitting a Modified that wakes every
-			// dependent — all to relay strictly less than what's already stored. The
-			// changed-status path below deliberately does *not* clamp: there the
-			// stale reporter overwrote the status content, so unsettling the object
-			// is what gets that content re-derived. Identical bytes means there is
-			// nothing to heal, which is what makes suppressing it free here.
+			// Content no-op: write only the bookkeeping, and only if it would move.
+			// >=, not ==: a report at or below the recorded generation would roll
+			// observed_generation backwards, re-unsettling a converged object. (The
+			// content path below deliberately does not clamp: there the stale
+			// reporter overwrote the content, and unsettling gets it re-derived.)
 			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
 			if settled {
 				return nil
 			}
-			// The handshake advanced: the object settled at a generation it hadn't
-			// settled at before. That's watch-visible even with identical bytes.
-			// updated_at still tracks content and stays put — observed_at is what
-			// records the handshake. schema_version_status isn't written: this branch
-			// only runs when the stamp already equals the stored version, so
-			// re-stamping happens on the content path below, never here.
+			// The handshake advanced — watch-visible even with identical bytes.
+			// updated_at tracks content and stays put; observed_at records the
+			// handshake.
 			rv, err := nextResourceVersion(ctx, c)
 			if err != nil {
 				return err
 			}
-			// No RETURNING: the caller gets no row, and the scoped read above already
-			// proved this id exists inside this transaction.
+			// No RETURNING: no row reported, and the scoped read proved existence.
 			_, err = c.ExecContext(ctx, `
 				UPDATE objects
 				SET observed_generation = ?, observed_at = ?, resource_version = ?
@@ -1486,17 +1138,11 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			return err
 		}
 		now := toMillis(time.Now().UTC())
-		// observedGeneration is written verbatim, unclamped — deliberately, unlike
-		// the no-op path above. A reporter behind the recorded generation just
-		// overwrote the status with content derived from an older spec, and letting
-		// its generation land is what marks the object unsettled so the full pass
-		// backstop re-derives that content. Clamping here would pin stale status as
-		// converged, and nothing would ever revisit it.
-		//
-		// Keyed on id alone, like ObjectsUpdateSpec's: the kind boundary and the
-		// generation guard both came from the scoped read above, in this same
-		// transaction, and group/kind are write-once at insert. Keep the read if you
-		// move this statement.
+		// observedGeneration lands verbatim, unclamped: a stale reporter just
+		// overwrote the status, and its generation marking the object unsettled is
+		// what gets that content re-derived. Keyed on id alone: the kind boundary
+		// came from the scoped read in this transaction — keep the read if you move
+		// this statement.
 		_, err = c.ExecContext(ctx, `
 			UPDATE objects
 			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
@@ -1507,9 +1153,9 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 	})
 }
 
-// conditionColumns is the canonical select list for a condition row; scanCondition
-// reads them in order. object_id leads so the same scan serves both the
-// single-object read and the batched by-kind read (which groups on it).
+// conditionColumns is the canonical select list for a condition row;
+// scanCondition reads them in order. object_id leads so one scan serves both the
+// single-object and batched reads.
 const conditionColumns = `object_id, type, status, reason, message, liveness,
 	transitioned_at, updated_at`
 
@@ -1534,9 +1180,9 @@ func (s *sqliteStore) loadConditions(ctx context.Context, id storeapi.ObjectID) 
 	return out, rows.Err()
 }
 
-// scanCondition decodes one condition row (conditionColumns order), returning its
-// object id alongside the condition. The liveness downgrade is applied by the
-// read-path callers, not here, so getCondition's no-op comparison sees stored truth.
+// scanCondition decodes one condition row (conditionColumns order). The liveness
+// downgrade is applied by read-path callers, not here, so getCondition's no-op
+// comparison sees stored truth.
 func scanCondition(sc scanner) (storeapi.ObjectID, storeapi.Condition, error) {
 	var (
 		id             storeapi.ObjectID
@@ -1560,17 +1206,14 @@ func scanCondition(sc scanner) (storeapi.ObjectID, storeapi.Condition, error) {
 }
 
 // livenessStale reports whether cond is a liveness condition last written before
-// this process started: such a condition is only valid in the process that wrote
-// it, so until a controller re-confirms it (bumping updated_at) it reads as
-// "verifying". Store-truth conditions are never stale.
+// this process started — valid only in the writing process, so it reads as
+// "verifying" until re-confirmed. Store-truth conditions are never stale.
 func (s *sqliteStore) livenessStale(cond *storeapi.Condition) bool {
 	return cond.Liveness && cond.UpdatedAt.Before(s.processStart)
 }
 
-// downgradeLiveness applies the "verifying" rule on the read path: a stale
-// liveness condition surfaces as Unknown. Applied only when assembling conditions
-// for callers — not in getCondition, whose no-op comparison must see the actually
-// stored status.
+// downgradeLiveness surfaces a stale liveness condition as Unknown on the read
+// path — not in getCondition, whose no-op comparison must see stored truth.
 func (s *sqliteStore) downgradeLiveness(cond *storeapi.Condition) {
 	if s.livenessStale(cond) {
 		cond.Status = "Unknown"
@@ -1601,11 +1244,8 @@ func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, co
 	return &cond, nil
 }
 
-// bumpObject advances id's resource_version. The condition mutators share it: a
-// condition lives in its own table, so the version bump — which is what makes the
-// change visible to a scan of the write log — can't be folded into the semantic
-// write and is a separate UPDATE. No RETURNING: neither mutator reports a row, and
-// each has already read this one under its kind scope in this same transaction.
+// bumpObject advances id's resource_version — the visibility half of the
+// condition mutators, whose semantic write lives in another table.
 func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) error {
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -1618,17 +1258,13 @@ func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.Object
 }
 
 // conditionUnchanged reports whether an existing condition already matches the
-// proposed write — the no-op case that skips the write, the resource_version
-// bump, and the emit.
+// proposed write — the no-op case.
 func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want storeapi.Condition) bool {
 	if existing == nil {
 		return false
 	}
-	// A stale liveness condition (written by a prior process) reads as "verifying"
-	// until its updated_at advances past processStart. A re-confirmation with
-	// identical fields must therefore NOT be suppressed — letting the write through
-	// refreshes updated_at and clears the downgrade; skipping it would leave the
-	// condition pinned to Unknown forever.
+	// A stale liveness re-confirmation must NOT be suppressed: the write refreshes
+	// updated_at and clears the downgrade; skipping it would pin Unknown forever.
 	if s.livenessStale(existing) {
 		return false
 	}
@@ -1639,22 +1275,15 @@ func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want stor
 }
 
 func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) error {
-	// Within keeps the condition write and the object's version bump atomic: it
-	// opens a transaction when called standalone and joins the caller's when
-	// nested (the reconcile path), so a crash between the two statements can't
-	// leave a changed condition with an unbumped resource_version.
+	// Within keeps the condition write and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Metadata-only gate: confirms the object exists and belongs to gk first,
-		// yielding a clean ErrNotFound/ErrWrongKind rather than a foreign-key
-		// violation or a cross-kind write from the conditions insert. Nothing here
-		// reports a row, so nothing here reads one — a full read would also make a
-		// corrupt finalizers blob fail a condition write that never touches it.
+		// Metadata-only gate: clean ErrNotFound/ErrWrongKind instead of an FK
+		// violation, and no row read on a path that reports none.
 		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
-		// No-op suppression: an identical condition leaves resource_version where it is,
-		// so no scan finds anything (mirrors DeletionRequestsCreate).
+		// No-op suppression: an identical condition leaves resource_version alone.
 		existing, err := s.getCondition(ctx, id, cond.Type)
 		if err != nil {
 			return err
@@ -1680,8 +1309,8 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 			now, now); err != nil {
 			return err
 		}
-		// A condition change bumps the object's resource_version, which is what a watch
-		// poll and the dependency waker both look at.
+		// A condition change bumps resource_version — what watch polls and the
+		// dependency waker look at.
 		return s.bumpObject(ctx, c, id)
 	})
 }
@@ -1690,9 +1319,7 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 	// Within keeps the delete and the version bump atomic (see ConditionsSet).
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Same metadata-only gate as ConditionsSet: the conditions table carries no
-		// group/kind to fold into the DELETE, so the kind boundary is a separate read
-		// — of two columns, not of the row.
+		// Same metadata-only gate as ConditionsSet.
 		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
@@ -1702,8 +1329,7 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 			return err
 		}
 		n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
-		// Absent condition: nothing changed, so don't bump resource_version — a watch
-		// poll would otherwise report a spurious diff.
+		// Absent condition: nothing changed, no bump.
 		if n == 0 {
 			return nil
 		}
@@ -1733,13 +1359,11 @@ func scanEvent(sc scanner) (*storeapi.Event, error) {
 }
 
 // latestEventRun returns the full newest run for (id, category), or nil if that
-// timeline is empty. EventsGetLatest returns it as-is.
+// timeline is empty.
 //
-// **ORDER BY id, not last_at.** The newest run is the last one appended, which is
-// an ordering the clock does not decide: a run's last_at moves every time it is
-// extended, so ordering on it would let a backwards clock step name an older run
-// as latest — and EventsAdd would then extend a run the log has already moved
-// past. idx_events_latest exists to serve this order; see 0001_init.sql.
+// ORDER BY id, not last_at: last_at moves on every extend, so a backwards clock
+// step could name an older run latest — and EventsAdd would extend a run the log
+// has moved past. idx_events_latest serves this order.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
@@ -1754,12 +1378,9 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 	return e, nil
 }
 
-// latestEventKey returns just the run key (id, type, reason) of the newest run
-// for (id, category), or ok=false if that timeline is empty. EventsAdd needs
-// only the key to decide extend-vs-append, so it deliberately does not decode the
-// full row (unlike EventsGetLatest): probing the columns it is about to discard
-// would let a decode fault in an older run mask — rather than surface through —
-// the write EventsAdd is about to make.
+// latestEventKey returns just the run key of the newest run for (id, category),
+// ok=false on an empty timeline. EventsAdd needs only the key; decoding columns
+// it would discard would let a decode fault mask the write.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
 	row := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
@@ -1775,13 +1396,11 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 }
 
 func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
-	// Within serializes the read-latest-then-write (via _txlock=immediate) so the
-	// run-boundary decision can't race, and joins the caller's tx when nested.
+	// Within serializes read-latest-then-write so the run-boundary decision can't race.
 	var result *storeapi.Event
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary (ErrNotFound/ErrWrongKind), like
-		// ConditionsSet — the events table carries no group/kind to fold in.
+		// Scoped read enforces the kind boundary; events carries no group/kind to fold in.
 		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
 			return err
 		}
@@ -1866,17 +1485,10 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 	return scanEvents(rows)
 }
 
-// EventsMaxVersion reads the high-water mark of id's event log. The
-// (object_id, ...) prefix of idx_events_object_rv selects the object's runs and the
-// maximum sits at the tail of that range, so the read is a covering index seek that
-// never touches the table, and NULL (no runs at all, an unknown id included) reads
-// as 0. It is what EventsWatch reads on a quiet tick instead of the listing.
-//
-// That index exists for this read alone. Without it the plan falls back to one of
-// the (object_id, category, …) keys, neither of which carries resource_version:
-// one table-btree lookup per run, past an overflow chain for any run whose detail
-// spilled, since the column is declared last. TestEventsMaxVersionUsesCoveringIndex
-// pins the plan.
+// EventsMaxVersion reads the high-water mark of id's event log — a covering seek
+// on idx_events_object_rv, NULL reading as 0. That index exists for this read
+// alone; without it the plan fetches one table row per run, past overflow chains
+// (TestEventsMaxVersionUsesCoveringIndex pins the plan).
 func (s *sqliteStore) EventsMaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
@@ -1894,8 +1506,7 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge tim
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		if perObject > 0 {
-			// Rank each run within its (object, category) timeline newest-first and
-			// drop everything past the cap — the per-timeline ring.
+			// Rank runs newest-first per (object, category) and drop past the cap.
 			res, err := c.ExecContext(ctx, `
 				DELETE FROM events WHERE id IN (
 					SELECT id FROM (
@@ -1926,9 +1537,7 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge tim
 }
 
 func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) error {
-	// Within keeps the read-modify-write of the finalizer list atomic: it opens a
-	// transaction standalone and joins the caller's on the reconcile path, so a
-	// concurrent writer can't slip between the load and the rewrite.
+	// Within keeps the read-modify-write of the finalizer list atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary while loading the finalizer list.
@@ -1937,8 +1546,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 			return err
 		}
 		remaining, removed := removeFinalizer(obj.Finalizers, finalizer)
-		// Absent finalizer: nothing changed, so don't bump resource_version — a watch
-		// poll would otherwise report a spurious diff (mirrors ConditionsDelete).
+		// Absent finalizer: nothing changed, no bump.
 		if !removed {
 			return nil
 		}
@@ -1946,8 +1554,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		if err != nil {
 			return err
 		}
-		// No RETURNING: the caller gets no row, and the scoped read above already
-		// proved this id exists inside this transaction.
+		// No RETURNING: no row reported, and the scoped read proved existence.
 		_, err = c.ExecContext(ctx, `
 			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?`,
@@ -1956,31 +1563,17 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 	})
 }
 
-// markForDeletion stamps the deletion clock of the row named by key, once: the
-// `IS NULL` guard makes a repeat a no-op, so retries don't churn the watch
-// cursor. where is the caller's whole
-// row predicate, keying and scope together — `id = ?` plus a kind scope, or the
-// group/kind/name triple — so a new keying is a call-site change rather than a
-// second copy of this statement. It is parenthesized before the guard is appended,
-// so a disjunctive key can't bind loosely enough to escape the IS NULL and re-stamp
-// an already-deleting row. Like edgesByIDs' column names it is a compile-time
-// fragment, never user input; only whereArgs carry values. Runs on the ambient
-// connection — callers wrap it in Within to make the rv bump and the write atomic.
+// markForDeletion stamps the deletion clock of the row named by where, once: the
+// IS NULL guard makes a repeat a no-op. where is a compile-time fragment, never
+// user input, parenthesized before the guard so a disjunctive key cannot escape
+// the IS NULL. It reports only whether it stamped; requestDeletion's probe
+// disambiguates a zero-row result (guard, scope or missing).
 //
-// It reports only whether it stamped a row. RowsAffected == 0 is the same signal
-// RETURNING's ErrNotFound used to carry, and just as ambiguous: guard, scope or
-// missing. requestDeletion's probe is what tells them apart.
-//
-// **The version is drawn lazily, which is why this doesn't call
-// nextResourceVersion.** That helper is an UPDATE on resource_version_seq, so
-// calling it first would make every repeat delete — the steady state for a
-// controller that idempotently removes a child — commit a counter write and its
-// fsync to stamp nothing. Instead the UPDATE reads `value + 1` inline and the
-// counter is advanced only once a row was actually stamped, so the guard-blocked
-// path is a pure read. The two statements are in the caller's transaction, on one
-// connection, so no other writer can draw the same value in between; and the
-// subquery is safe against a multi-row match only because there is never one —
-// every `where` here keys on a unique column (id, or group/kind/name).
+// The version is drawn lazily — calling nextResourceVersion first would make
+// every repeat delete commit a counter write to stamp nothing. The inline
+// `value + 1` matches the later draw exactly: same transaction, one connection.
+// The subquery tolerates a multi-row match only because every where here keys on
+// a unique column.
 func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (bool, error) {
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
@@ -1998,23 +1591,16 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	if n == 0 {
 		return false, nil
 	}
-	// Commit the value the row above just took. Must match it exactly, which it does:
-	// same transaction, same single connection, nothing between the two statements.
+	// Commit the value the row above just took; same transaction, same connection.
 	if _, err := nextResourceVersion(ctx, c); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-// probeDeletionByName is probeObjectScoped keyed by name. Existence is the whole
-// question here: names are unique per kind, so a name this kind does not hold is
-// absent rather than foreign, and there is no ErrWrongKind to distinguish.
-//
-// The saving over getObjectRowByName is Go-side, not page-side: UNIQUE ("group",
-// kind, name) does not cover deletion_requested_at, so the index seek is still
-// followed by a row fetch either way. What it avoids is copying the spec and status
-// blobs into Go and unmarshalling the finalizers — one allocation instead of
-// scanObject's handful, on a path that discards everything but a bool.
+// probeDeletionByName is probeObjectScoped keyed by name; a name this kind does
+// not hold is absent, not foreign. Saves the blob copies and finalizer unmarshal
+// of a full row read.
 func (s *sqliteStore) probeDeletionByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
 	var deletionAt sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
@@ -2029,24 +1615,11 @@ func (s *sqliteStore) probeDeletionByName(ctx context.Context, gk storeapi.Group
 	return deletionAt.Valid, nil
 }
 
-// requestDeletion is the probe-then-mark protocol behind both deletion entry points.
-//
-// The probe runs first and lock-free, so both idempotent outcomes — no such row, and
-// a row already deletion-pending — answer without BEGIN IMMEDIATE. That is the whole
-// point: absence and already-pending are the *steady state* here, since a controller
-// that idempotently removes a child re-runs the delete every reconcile and exactly
-// one of those calls ever deletes anything.
-//
-// The probe is advisory and cannot be wrong: the fall-through still runs the atomic
-// mark, whose "deletion_requested_at IS NULL" guard re-checks everything, and a row
-// that appears or vanishes in between yields the same answer either way. A zero-row
-// mark after a probe that said "live" means the row moved, so the probe runs again
-// inside the transaction to resolve which — the branch that tells a foreign id from
-// a collected one.
-//
-// Within keeps the rv-bump and the write atomic whether or not a caller wrapped
-// this: the mutators self-wrap, and nested they join the caller's transaction — e.g.
-// the GC cascade.
+// requestDeletion is the probe-then-mark protocol behind both deletion entry
+// points. The probe runs first and lock-free, so the idempotent outcomes —
+// absent, or already pending, the steady state — answer without BEGIN IMMEDIATE.
+// It is advisory: the mark's IS NULL guard re-checks everything, and a zero-row
+// mark re-probes inside the transaction to tell a foreign id from a collected one.
 func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
 	probe func(context.Context) (pending bool, err error),
@@ -2075,29 +1648,20 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
 }
 
-// DeletionRequestsCreateByName marks the gk row holding name. The name rides in the
-// UPDATE's own WHERE the way the kind does for DeletionRequestsCreate, so the resolve and
-// the mark are one statement: atomic, and a round trip cheaper than the alternative
-// of wrapping a ObjectsGetByName + DeletionRequestsCreate pair in a Within — which matters
-// on a store that runs every caller through one connection.
+// DeletionRequestsCreateByName marks the gk row holding name; the resolve and the mark
+// are one statement.
 func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeDeletionByName(ctx, gk, name) },
 		`"group" = ? AND kind = ? AND name = ?`, gk.Group, gk.Kind, name)
 }
 
-// DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children. One indexed
-// pass over the owned_by edge (idx_edges_to) reads each child's deletion state;
-// markForDeletion then stamps only those not already deleting. So a re-cascade over
-// an already-deleting subtree (the steady-state case) is a lone SELECT — no
-// writes, no events. It returns every owned child for requeue, deleting or not.
+// DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children,
+// returning every owned child for requeue, deleting or not. A re-cascade over an
+// already-deleting subtree is a lone SELECT.
 func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
-	// Self-wrapped for the same reason as ObjectsCreate and ObjectsDelete: it stamps
-	// several children, each drawing a version and publishing, and publication is in
-	// commit order only inside Within. Outside one, two of this loop's own writes can
-	// reach the store-wide stream in the wrong order — which corrupts the backlog
-	// bound a consumer reads as a cursor. The in-tree caller already wraps it, so this
-	// is for the external ones Store's public surface admits.
+	// Self-wrapped: several children each draw a version, and publication is in
+	// commit order only inside Within.
 	var out []storeapi.ObjectRef
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
@@ -2126,14 +1690,12 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	for rows.Next() {
 		var ch child
 		var delAt *int64
-		// id/group/kind (INTEGER/TEXT NOT NULL) and deletion_requested_at (nullable
-		// INTEGER -> *int64) all scan without error.
+		// All columns scan without error (NOT NULL, or nullable INTEGER -> *int64).
 		_ = rows.Scan(&ch.ref.ID, &ch.ref.Group, &ch.ref.Kind, &delAt)
 		ch.deleting = delAt != nil
 		children = append(children, ch)
 	}
-	// rows.Err() can't report a late failure here: the modernc driver buffers the
-	// whole result set on the first Next, so any query error already surfaced above.
+	// modernc buffers the whole result set on the first Next; no late failure.
 	_ = rows.Err()
 	rows.Close() // free the single-conn pool before the per-child writes below
 
@@ -2143,9 +1705,8 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 		if ch.deleting {
 			continue // already deletion-pending: nothing to stamp
 		}
-		// A race could have set the flag since the SELECT; markForDeletion's guard
-		// then stamps nothing and reports changed=false — benign here, which is why
-		// only the error matters.
+		// A race may have set the flag since the SELECT; the guard then stamps
+		// nothing — benign, so only the error matters.
 		if _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
 			return nil, err
 		}
@@ -2154,20 +1715,16 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 }
 
 func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) error {
-	// Self-wrapped for the same reason as ObjectsCreate: the delete cascades to
-	// conditions, events and edges, and those go together or not at all.
+	// Self-wrapped: the cascade to conditions, events and edges goes together or
+	// not at all.
 	return s.Within(ctx, func(ctx context.Context) error { return s.objectsDelete(ctx, id) })
 }
 
 // objectsDelete physically removes the row. A delete draws no resource_version:
-// versions live on rows, and this one is gone, so there is nothing left for a
-// scan of the write log to report. Consumers that must observe removals — the
-// client's watch surface — diff their own snapshot and derive the tombstone from
-// the row's absence.
+// the row is gone, so there is nothing for a write-log scan to report — watches
+// derive the tombstone from absence.
 func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
-	// A zero-row delete scans to ErrNotFound, which is how callers learn the row
-	// was already collected. The object's conditions, events and edges are
-	// cascade-deleted by this statement.
+	// Zero rows means already collected: ErrNotFound. Conditions, events and edges cascade.
 	res, err := s.conn(ctx).ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -2179,44 +1736,28 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	return nil
 }
 
-// edgeIsNew is the "this call is the one creating the edge" test, as a WHERE
-// fragment over (from_id, to_id, relation) — a probe straight down the edges
-// primary key, which is the table itself since edges is WITHOUT ROWID, so a
-// statement carrying it costs no extra round trip and no pre-read. Two of
-// EdgesAdd's statements are gated on it and both must decide it identically; it
-// is a const so they cannot drift, which is the property the alternative — one
-// pre-read feeding both — would have bought with a round trip.
+// edgeIsNew is the "this call creates the edge" test as a WHERE fragment — a
+// probe down the edges primary key (the table itself, WITHOUT ROWID). A const so
+// the two EdgesAdd statements gated on it cannot drift.
 const edgeIsNew = `NOT EXISTS (
 	SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?)`
 
 // EdgesAdd inserts a (from_id, to_id, relation) edge, stamping an owed dependency
-// wake for every new depends_on edge it creates (see storeapi.Store.EdgesAdd for
-// the contract). It does not bump resource_version — a ref is not a field of the
-// object, so no watch poll would see a diff anyway.
+// wake for every new depends_on edge it creates (see storeapi.Store.EdgesAdd). It
+// does not bump resource_version — a ref is not a field of the object. It
+// self-wraps in Within, so the endpoint check, stamp and insert are one atomic
+// unit however it is called.
 //
-// It self-wraps in Within like the other mutators, so the endpoint check, the
-// wake stamp and the insert are one atomic unit however it is called, rather than
-// relying on the caller to supply the transaction or on sqlite serializing
-// writers on one connection.
-//
-// The insert is deliberately the *last* write: every fallible step precedes the
-// edge coming into existence. The self-wrap above now makes that atomic on its own —
-// a nested Within is a savepoint boundary, so a caller who swallows this method's
-// error commits neither the stamp nor the edge — and the ordering is kept anyway,
-// because it points the residual failure the harmless way without depending on the
-// boundary holding. A stamp with no edge is one spurious owed wake, which costs a
-// no-op reconcile and drains back to zero; an edge with no stamp is a dependent
-// stranded on a stale read that ObjectsListUnsettledIDs structurally cannot see.
-// Getting the cheap half of that for free is worth not spending the boundary on.
+// The insert is deliberately the *last* write, so any residual failure lands the
+// harmless way: a stamp with no edge is one spurious wake that drains; an edge
+// with no stamp is a dependent stranded on a stale read that ObjectsListUnsettledIDs
+// structurally cannot see.
 func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesAddResult, error) {
 	var out storeapi.EdgesAddResult
 	err := s.Within(ctx, func(ctx context.Context) error {
-		// One round-trip, and without loading the row blobs. Joining the two rows
-		// rather than projecting each column as its own scalar subquery keeps this at
-		// one rowid seek per endpoint — SQLite does no common subexpression
-		// elimination, so "group" and kind as separate subqueries would seek the same
-		// row twice. Either endpoint missing yields no row at all, which is the clean
-		// ErrNotFound over a raw FK violation.
+		// One round-trip, no blobs. A join, not scalar subqueries: SQLite does no
+		// CSE, so separate subqueries would seek the same row twice. A missing
+		// endpoint yields no row — clean ErrNotFound over an FK violation.
 		var group, kind string
 		err := s.conn(ctx).QueryRowContext(ctx, `
 			SELECT f."group", f.kind
@@ -2228,24 +1769,12 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		if err != nil {
 			return err
 		}
-		// The durable wake stamp, before the insert (see the func doc for why the
-		// ordering carries the guarantee). Its NOT EXISTS is the edge-new test, a probe
-		// straight down the edges primary key — which, edges being WITHOUT ROWID, is
-		// the table itself, so it is one statement with no extra round-trip.
-		//
-		// Every new depends_on edge stamps: recording owed work is
-		// the only mechanism that survives every interleaving, because a stamp landing
-		// mid-pass sits above the count the pass observed at load and so survives the
-		// decrement. The watermark clear below cannot say the same — a dependent whose
-		// own pass is in flight rewrites the row this call just cleared, from a cursor
-		// that never saw the new target, and a target that never moves again is then
-		// never reconciled against. The
-		// edge-new test is what bounds the cost at one extra pass per edge ever
-		// created. Self-edges are skipped, as every scan skips them: an object's own
-		// pass always reads its current self, so there is nothing a self-wake could
-		// deliver.
-		// One predicate for both writes below, so a future edit to either gate cannot
-		// silently split the stamp from the clear.
+		// The durable wake stamp, before the insert (see the func doc). Only
+		// recorded owed work survives every interleaving: a stamp landing mid-pass
+		// sits above the count the pass observed at load, so the decrement cannot
+		// consume it. The edge-new test bounds the cost at one pass per edge ever
+		// created; self-edges are skipped as every scan skips them. One predicate
+		// for both writes below, so an edit cannot split the stamp from the clear.
 		newDependency := relation == storeapi.RelationDependsOn && fromID != toID
 		var stamped bool
 		if newDependency {
@@ -2256,28 +1785,18 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 			if err != nil {
 				return err
 			}
-			// The error is discarded as at the other RowsAffected sites — modernc caches
-			// the count and cannot fail here, and a branch this driver can never take is
-			// untestable dead code. Worth knowing if the driver ever changes: this site is
-			// the one where a wrong count is not a wrong return value but a silently
-			// skipped wake, and a lost dependency wake is permanent and invisible.
+			// modernc caches the count and cannot fail here. Worth knowing if the
+			// driver changes: a wrong count here is a silently skipped wake,
+			// permanent and invisible.
 			n, _ := res.RowsAffected()
 			stamped = n > 0
 		}
-		// A new depends_on edge also invalidates the dependent's staleness watermark,
-		// so drop it: the row was recorded over a smaller dependency set, so it cannot
-		// speak for a target just added, and an absent row already means "never
-		// reconciled against a known point". The stamp above is what *guarantees* the
-		// dependent a pass — this clear can be undone by a pass already in flight,
-		// which is why it stopped being the covering mechanism — but leaving a false
-		// watermark standing would still misreport convergence to DependentsListStale
-		// for the window until the owed pass runs, so the derived state is kept honest
-		// alongside the durable record.
-		//
-		// Gated on the same edge-new test as the stamp, so re-asserting a dependency
-		// set every pass still costs nothing after the first. Self-edges are skipped to
-		// match DependentsListStale, which excludes them: clearing for one would drop a
-		// watermark no scan will ever re-derive from that edge.
+		// A new depends_on edge also drops the dependent's watermark: it was
+		// recorded over a smaller dependency set and cannot speak for the new
+		// target. The stamp above is the guarantee — this clear can be undone by a
+		// pass in flight — but a false watermark would misreport convergence to
+		// DependentsListStale until the owed pass. Same edge-new gate; self-edges
+		// skipped to match DependentsListStale.
 		if newDependency {
 			if _, err := s.conn(ctx).ExecContext(ctx, `
 				DELETE FROM dependency_watermarks
@@ -2333,21 +1852,14 @@ func (s *sqliteStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []storea
 	return s.edgesByIDs(ctx, toIDs, relation, "to_id", "from_id")
 }
 
-// idChunkSize bounds how many ids the batched by-id reads (edgesByIDs,
-// conditionsByIDs) bind in a single query, kept under SQLite's
-// SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc) with room for the extra
-// parameters — otherwise a large List would fail with "too many SQL variables".
-// A var, not a const, so tests can shrink it to exercise the multi-chunk merge
-// without seeding tens of thousands of rows.
+// idChunkSize bounds the ids bound per batched query, under SQLite's
+// SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc). A var so tests can shrink it to
+// exercise the multi-chunk merge.
 var idChunkSize = 30000
 
-// edgesByIDs is the shared batched edge lookup behind EdgesGroupIncomingByID and
-// EdgesGroupOutgoingByID: it filters edges by routeCol IN (ids), joins objects on
-// the opposite endpoint joinCol, and buckets each referrer under its routeCol
-// value. routeCol/joinCol are fixed internal column names (never user input), so
-// concatenating them is injection-safe. The id list is chunked under the bound-
-// parameter limit (see idChunkSize); each chunk merges into the same map,
-// and a routeCol value with no matching edge never appears.
+// edgesByIDs is the shared batched edge lookup: edges filtered by routeCol IN
+// (ids), joined on joinCol, bucketed by routeCol. The column names are fixed
+// internal strings, never user input. Chunked under idChunkSize.
 func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
 	out := make(map[storeapi.ObjectID][]storeapi.ObjectRef, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
@@ -2359,9 +1871,8 @@ func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, r
 	return out, nil
 }
 
-// edgesByIDsChunk runs edgesByIDs for one chunk of ids, merging rows into out. It
-// closes its result set before returning so the next chunk's query can run on the
-// single-connection store (which permits one open result set at a time).
+// edgesByIDsChunk runs one chunk, merging rows into out; it closes its result
+// set so the next chunk can run on the single connection.
 func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
 	args := make([]any, 0, len(ids)+1)
 	placeholders := make([]string, len(ids))
@@ -2382,16 +1893,15 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 	for rows.Next() {
 		var route storeapi.ObjectID
 		var d storeapi.ObjectRef
-		// All columns are INTEGER/TEXT NOT NULL; the scan never fails (see scanObjectRefs).
+		// INTEGER/TEXT NOT NULL columns; the scan never fails.
 		_ = rows.Scan(&route, &d.ID, &d.Group, &d.Kind)
 		out[route] = append(out[route], d)
 	}
 	return rows.Err()
 }
 
-// EdgesListOutgoing returns the distinct objects fromID points at (any relation),
-// the inverse of EdgesListIncoming. DISTINCT collapses an object reached through
-// more than one relation (e.g. both owned_by and depends_on) to a single row.
+// EdgesListOutgoing returns the distinct objects fromID points at (any
+// relation); DISTINCT collapses an object reached through several relations.
 func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
@@ -2403,10 +1913,8 @@ func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.Obj
 	return scanObjectRefs(rows)
 }
 
-// EdgesListOutgoingByRelation returns the objects fromID points at through the
-// given relation, ordered by id — the relation-filtered form of
-// EdgesListOutgoing. No DISTINCT is needed: (from_id, to_id, relation) is unique,
-// so a fixed relation can reach each target at most once.
+// EdgesListOutgoingByRelation returns the objects fromID points at through relation. No
+// DISTINCT needed: (from_id, to_id, relation) is unique.
 func (s *sqliteStore) EdgesListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
@@ -2425,11 +1933,9 @@ func (s *sqliteStore) EdgesGroupOutgoingByID(ctx context.Context, fromIDs []stor
 	return s.edgesByIDs(ctx, fromIDs, relation, "from_id", "to_id")
 }
 
-// scanObjectRefs collects an (id, group, kind) SELECT into ObjectRefs, closing rows
-// on return. Like scanObjects it ends in `return out, rows.Err()`: the id/group/
-// kind columns are INTEGER/TEXT NOT NULL scanned into int64/string, which never
-// fails, and modernc's buffered result set leaves rows.Err clean after a good
-// query — so the tail error is reported in one statement, not a dead branch.
+// scanObjectRefs collects an (id, group, kind) SELECT into ObjectRefs, closing
+// rows. The columns never fail to scan, and modernc's buffered result set leaves
+// rows.Err clean after a good query.
 func scanObjectRefs(rows *sql.Rows) ([]storeapi.ObjectRef, error) {
 	defer rows.Close()
 	var out []storeapi.ObjectRef
@@ -2442,10 +1948,9 @@ func scanObjectRefs(rows *sql.Rows) ([]storeapi.ObjectRef, error) {
 	return out, rows.Err()
 }
 
-// EdgesDeleteFinalizingDependsOn removes depends_on edges into toID whose source
-// is itself deletion-pending, breaking the deadlock where mutually dependent (or
-// self-dependent) finalizing objects each hold the other's RESTRICT. Like
-// EdgesDelete it bumps no version.
+// EdgesDeleteFinalizingDependsOn removes depends_on edges into toID whose source is
+// itself deletion-pending, breaking the mutual-RESTRICT deadlock between
+// finalizing objects. Bumps no version.
 func (s *sqliteStore) EdgesDeleteFinalizingDependsOn(ctx context.Context, toID storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		DELETE FROM edges
@@ -2455,13 +1960,10 @@ func (s *sqliteStore) EdgesDeleteFinalizingDependsOn(ctx context.Context, toID s
 	return err
 }
 
-// EdgesHasIncoming reports whether any object with a live claim points at id: an
-// owned_by edge, or a depends_on edge from a source that is not itself
-// finalizing. A depends_on edge from a deletion-pending source is ignored — that
-// dependent is going away and no longer has a claim, so it must not gate a
-// finalizer (EdgesHasIncoming would otherwise never clear when two finalizing
-// objects depend on each other). owned_by always counts: the foreground cascade
-// must wait for the owned child to be physically removed.
+// EdgesHasIncoming reports whether any object with a live claim points at id. A
+// depends_on edge from a deletion-pending source is ignored — otherwise two
+// finalizing objects depending on each other would never clear. owned_by always
+// counts: the foreground cascade waits for physical removal.
 func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID) (bool, error) {
 	var exists int
 	err := s.conn(ctx).QueryRowContext(ctx, `
@@ -2477,9 +1979,8 @@ func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID
 	return exists == 1, nil
 }
 
-// DriverCursorsGet reads name's persisted cursor (see storeapi.DriverCursorer).
-// A missing row is reported as ok=false, not sql.ErrNoRows: absence is the
-// ordinary first-run state, not a fault.
+// DriverCursorsGet reads name's persisted cursor (see storeapi.DriverCursorer). A
+// missing row is ok=false: absence is the ordinary first-run state, not a fault.
 func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64, bool, error) {
 	var cursor int64
 	err := s.conn(ctx).QueryRowContext(ctx,
@@ -2494,11 +1995,8 @@ func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64,
 }
 
 // DriverCursorsSet upserts name's persisted cursor (see storeapi.DriverCursorer).
-// The WHERE on DO UPDATE mirrors DependencyWatermarksSet: it makes the stored
-// cursor monotonic, so an out-of-order write cannot regress it, and it
-// suppresses the write outright when the cursor has not advanced — no page
-// dirtied, no WAL frame — which is what keeps a quiet store from paying a row
-// write on every driver tick.
+// The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
+// write outright — no page dirtied on a quiet tick.
 func (s *sqliteStore) DriverCursorsSet(ctx context.Context, name string, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
@@ -2514,10 +2012,9 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-// scanObject reads objectColumns into a RawObject. extra binds any columns the
-// statement appended *after* objectColumns, for a caller that rides its own values
-// on the row read (see ObjectsGetForReconcile); the positional coupling is why
-// extras go last in both places.
+// scanObject reads objectColumns into a RawObject. extra binds columns the
+// statement appended after objectColumns (positional — extras go last in both
+// places).
 func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 	var (
 		obj         storeapi.RawObject
@@ -2561,11 +2058,9 @@ func scanObject(sc scanner, extra ...any) (*storeapi.RawObject, error) {
 	return &obj, nil
 }
 
-// scanObjects collects every row of an objectColumns SELECT, closing rows on
-// return. It ends in `return out, rows.Err()` so the post-iteration error is a
-// single tail statement rather than a separate, effectively-unreachable branch
-// (the modernc driver materializes the result set on the first Next, so neither
-// a trailing rows.Err nor a second-row scan can fail after a clean query).
+// scanObjects collects every row of an objectColumns SELECT, closing rows.
+// modernc materializes the result set on the first Next, so the tail rows.Err is
+// the only reachable error site.
 func scanObjects(rows *sql.Rows) ([]*storeapi.RawObject, error) {
 	defer rows.Close()
 	var out []*storeapi.RawObject
@@ -2579,9 +2074,7 @@ func scanObjects(rows *sql.Rows) ([]*storeapi.RawObject, error) {
 	return out, rows.Err()
 }
 
-// removeFinalizer returns f without target and whether target was present. A
-// missing target leaves the slice untouched (removed=false), which the caller
-// treats as a no-op.
+// removeFinalizer returns f without target and whether target was present.
 func removeFinalizer(f []string, target string) (remaining []string, removed bool) {
 	remaining = make([]string, 0, len(f))
 	for _, x := range f {

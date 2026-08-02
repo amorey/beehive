@@ -13,9 +13,8 @@
 // limitations under the License.
 
 // Package sqlite provides a durable, SQLite-backed implementation of the
-// beehive Store: rows, edges, the event log, the write cursor every change
-// notification is derived from, and schema migrations. It holds no in-memory
-// fan-out — consumers scan the write log from a watermark.
+// beehive Store. It holds no in-memory fan-out — consumers scan the write log
+// from a watermark.
 package sqlite
 
 import (
@@ -37,12 +36,11 @@ func Open(path string) (*sqliteStore, error) {
 	return open(sqlitemigrate.OpenPool(path, 1))
 }
 
-// OpenMemory opens a Beehive SQLite database in memory.
-// Intended for testing; data is lost when the store is closed.
+// OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
+// data is lost when the store is closed.
 //
-// auto_vacuum matches OpenPool so tests run the production on-disk format — it is
-// the one pragma that cannot be changed after the first table exists, so a test
-// database on a different mode would silently not exercise FreePagesRelease.
+// auto_vacuum matches OpenPool: it cannot change after the first table exists,
+// so a test database on another mode would silently skip FreePagesRelease.
 func OpenMemory() (*sqliteStore, error) {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")
@@ -58,10 +56,8 @@ func open(db *sql.DB) (*sqliteStore, error) {
 	}
 	return &sqliteStore{
 		db: db,
-		// Truncate to milliseconds to match condition timestamps' precision: the
-		// liveness "verifying" check compares a ms-truncated updated_at against
-		// processStart, so a sub-ms processStart would wrongly flag a condition
-		// written in the same millisecond the process started.
+		// Truncated to ms to match condition timestamps: a sub-ms processStart would
+		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
 	}, nil
 }
