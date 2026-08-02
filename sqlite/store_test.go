@@ -6212,3 +6212,21 @@ func TestObjectWritesSweepCapsEachKind(t *testing.T) {
 	require.Len(t, pageB, 1, "the quiet kind keeps its only entry")
 	assert.Equal(t, quiet.ResourceVersion, pageB[0].ResourceVersion)
 }
+
+// A kind whose log aged out entirely must keep its position. Reporting 0 against
+// a tail parked at the last version would make the gate fire on every tick —
+// forever, on the kind that writes least.
+func TestObjectWritesMaxVersionHoldsTheHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	backdateWriteLogEntry(t, store, obj.ResourceVersion, time.Hour)
+
+	deleted, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 1, deleted, "precondition: the log is now empty for this kind")
+
+	at, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, obj.ResourceVersion, at)
+}

@@ -2253,13 +2253,23 @@ func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind)
 }
 
 // ObjectWritesMaxVersion reads gk's log position, covered by
-// idx_object_writes_kind. An empty log reads 0.
+// idx_object_writes_kind. The horizon is folded in because retention lowers the
+// log's own maximum: a kind trimmed empty would report 0 against a tail parked
+// higher and list on every tick. Folded, the position only ever rises, which is
+// why the tail gates on > rather than !=.
 func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx, `
 		SELECT MAX(resource_version) FROM object_writes
 		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&rv)
-	return rv.Int64, err
+	if err != nil {
+		return 0, err
+	}
+	trimmed, err := s.trimmedThrough(ctx, gk)
+	if err != nil {
+		return 0, err
+	}
+	return max(rv.Int64, trimmed), nil
 }
 
 // ObjectWritesSweep trims the log and records what it removed. The delete and
