@@ -27,18 +27,18 @@ import (
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
-// flakyListStore fails the first n ObjectsList calls and then succeeds, so a test
-// can prove a poll failure costs one tick rather than the whole stream.
+// flakyListStore fails the first n tail listings and then succeeds, so a test can
+// prove a poll failure costs one tick rather than the whole stream.
 type flakyListStore struct {
 	Store
 	failures atomic.Int64
 }
 
-func (s *flakyListStore) ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+func (s *flakyListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.failures.Add(-1) >= 0 {
-		return nil, errBoom
+		return nil, 0, errBoom
 	}
-	return s.Store.ObjectsList(ctx, gk)
+	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
 }
 
 // A poll that fails is skipped, not fatal. Tearing the stream down would turn a
@@ -247,12 +247,17 @@ type pollProbeStore struct {
 	eventsMarked chan struct{}
 	metaRead     chan struct{}
 	eventsFailed chan struct{}
-	listErr      atomic.Bool
-	listIDsErr   atomic.Bool
-	getErr       atomic.Bool
-	eventsErr    atomic.Bool
-	markErr      atomic.Bool
-	metaErr      atomic.Bool
+	// byIDs records the id batches the tail read, so a test can assert it read
+	// what changed rather than the whole kind.
+	byIDs chan []ObjectID
+	// tailed fires after the tail's own listing of the write log returns.
+	tailed     chan struct{}
+	listErr    atomic.Bool
+	listIDsErr atomic.Bool
+	getErr     atomic.Bool
+	eventsErr  atomic.Bool
+	markErr    atomic.Bool
+	metaErr    atomic.Bool
 }
 
 func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
@@ -279,15 +284,37 @@ func (s *pollProbeStore) ObjectWritesSnapshotByID(ctx context.Context, gk GroupK
 	return s.Store.ObjectWritesSnapshotByID(ctx, gk, id)
 }
 
-// ObjectsList signals *after* the read returns, which is the seam the cancellation
-// tests need: past it the only thing left that can observe a cancelled context is
-// the send itself.
+// ObjectWritesListSince is the tail's own listing: it carries listErr and signals
+// after the read, which is the seam the cancellation tests need — past it the only
+// thing left that can observe a cancelled context is the send itself.
+func (s *pollProbeStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	if s.listErr.Load() {
+		return nil, 0, errBoom
+	}
+	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	probeSignal(s.tailed)
+	return page, trimmed, err
+}
+
+// ObjectsList signals *after* the read returns.
 func (s *pollProbeStore) ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
 	if s.listErr.Load() {
 		return nil, errBoom
 	}
 	out, err := s.Store.ObjectsList(ctx, gk)
 	probeSignal(s.listed)
+	return out, err
+}
+
+func (s *pollProbeStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+	if s.getErr.Load() {
+		return nil, errBoom
+	}
+	out, err := s.Store.ObjectsListByIDs(ctx, gk, ids)
+	select {
+	case s.byIDs <- ids:
+	default:
+	}
 	return out, err
 }
 
@@ -349,6 +376,8 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 		eventsMarked: make(chan struct{}, 256),
 		metaRead:     make(chan struct{}, 256),
 		eventsFailed: make(chan struct{}, 256),
+		byIDs:        make(chan []ObjectID, 256),
+		tailed:       make(chan struct{}, 256),
 	}
 	bh, err := New(store, fast()...)
 	require.NoError(t, err)
@@ -377,7 +406,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	// A change to find, and a read that fails while it tries. Wait for ticks that
 	// come *after* the failure is armed, so the recovery below is the stream
 	// outliving a failure rather than never meeting one.
-	store.getErr.Store(true)
+	store.getErr.Store(true) // the tail's batched read of what changed
 	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	drainProbe(store.polled)
@@ -407,14 +436,16 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
 
-	// With the object reported and no further writes, the cursor stops moving, so
-	// every tick from here consults the id listing — which now fails.
-	store.listIDsErr.Store(true)
+	// A write moves the position, so every tick from here reaches the tail's
+	// listing — which now fails.
+	store.listErr.Store(true)
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "a2"})
+	require.NoError(t, err)
 	drainProbe(store.polled)
-	waitClosed(t, chanAfter(store.polled, 2), "polls while the delete check fails")
-	store.listIDsErr.Store(false)
+	waitClosed(t, chanAfter(store.polled, 2), "polls while the tail listing fails")
+	store.listErr.Store(false)
 
-	// A real change proves the stream is still live and still diffing.
+	// A real change proves the stream is still live and still tailing.
 	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
@@ -447,15 +478,19 @@ func TestWatchAbandonsASendWhenTheSubscriberGoesAway(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store, _, client, _ := watchFixture(t)
 
-	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	_, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	// Nobody reads ch, so the poll goroutine parks in the send. Waiting for the
-	// listing that produced the change is what puts the cancellation after the read
-	// and before the send, which is the only place left that can observe it.
-	waitClosed(t, chanAfter(store.listed, 1), "the listing that found the object")
+	// A change after subscribing, which only the stream can carry. Nobody reads
+	// ch, so the poll goroutine parks in the send. Waiting for the tail that
+	// produced it is what puts the cancellation after the read and before the
+	// send, which is the only place left that can observe it.
+	drainProbe(store.tailed)
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	waitClosed(t, chanAfter(store.tailed, 1), "the tail that found the change")
 	cancel()
 
 	waitClosed(t, closedWhenDrained(ch), "the stream to close on cancellation")
@@ -473,12 +508,11 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
 
-	// Remove the row outright and stop reading: the next poll finds the id set has
-	// shrunk, lists, derives the tombstone, and parks in the send. Draining first is
-	// what makes the wait below answer to that listing rather than to the snapshot's.
-	drainProbe(store.listed)
+	// Remove the row outright and stop reading: the next poll tails the delete
+	// entry, builds the tombstone from its row image, and parks in the send.
+	drainProbe(store.tailed)
 	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
-	waitClosed(t, chanAfter(store.listed, 1), "the listing that observes the removal")
+	waitClosed(t, chanAfter(store.tailed, 1), "the tail that observes the removal")
 	cancel()
 
 	waitClosed(t, closedWhenDrained(ch), "the stream to close on cancellation")
@@ -732,15 +766,17 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 // The removal under test draws no version and does not move the write log's
 // high-water mark — another object was written after the deletion mark — so the
 // quiet path is the only thing that can notice it. The kind-wide listing is wired
-// to fail throughout, so a probe that reached for it could not answer at all.
-func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
+// A single-object watch reports the whole delete lifecycle: the deletion request
+// is an ordinary write and arrives as a Modified, and only the collection is a
+// Deleted. The tail is the kind's, so another object's write in between must not
+// disturb it.
+func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// The fixture starts nothing, so every step below is the test's own: no sweeper
 	// and no reconcile loop can collect the row out from under the ordering.
-	store, bh, client, _ := watchFixture(t)
-	store.listIDsErr.Store(true)
+	_, bh, client, _ := watchFixture(t)
 	watched := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "watched"})
 	newer := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "newer"})
 
@@ -748,20 +784,14 @@ func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 
-	// The deletion mark is an ordinary write, so it arrives as a Modified.
 	require.NoError(t, client.DeleteByID(ctx, watched.ID))
-	require.Equal(t, Modified, recv(t, ch).Type)
+	pending := recv(t, ch)
+	require.Equal(t, Modified, pending.Type, "the deletion request is an ordinary write")
+	assert.NotNil(t, pending.Object.DeletionRequestedAt)
 
-	// Put another object's write above that mark, and let the stream take it in, so
-	// the collect below cannot move the high-water mark it compares against.
+	// Another object's write, which this watch must not report.
 	_, err = client.UpdateByID(ctx, newer.ID, cSpec{Val: "newest"})
 	require.NoError(t, err)
-	// Wait for a *quiet* tick, not merely for ticks. The liveness probe only runs on
-	// a tick that found the high-water mark unmoved, so a token here proves the
-	// cursor has caught up to that write — and until it has, the collect below would
-	// be found by an ordinary listing rather than by the probe.
-	drainProbe(store.metaRead)
-	waitClosed(t, chanAfter(store.metaRead, 2), "a quiet poll after the newer write")
 
 	gone, err := bh.gcCollect(ctx, watched.ID)
 	require.NoError(t, err)
@@ -770,37 +800,7 @@ func TestWatchSingleObjectFindsADeleteWithoutListingTheKind(t *testing.T) {
 	ev := recv(t, ch)
 	assert.Equal(t, Deleted, ev.Type)
 	assert.Equal(t, watched.ID, ev.Object.ID)
-	assert.Equal(t, "watched", ev.Object.Spec.Val, "the tombstone carries the last known state")
-}
-
-// The liveness probe can fail like any other read, and costs the same one tick:
-// ending the stream would leave the subscriber with no way to learn it should
-// resubscribe.
-func TestWatchSingleObjectSurvivesALivenessProbeFailure(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	store, bh, client, _ := watchFixture(t)
-	logger, buf := captureLogger(slog.LevelWarn)
-	bh.logger = logger
-
-	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	snap, ch, err := client.ObjectsWatch(ctx, obj.ID)
-	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
-
-	// With the object reported and no further writes, every tick from here consults
-	// the liveness probe — which now fails.
-	store.metaErr.Store(true)
-	drainProbe(store.polled)
-	waitClosed(t, chanAfter(store.polled, 2), "polls while the liveness probe fails")
-	store.metaErr.Store(false)
-
-	// A real change proves the stream is still live and still diffing.
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
-	require.NoError(t, err)
-	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
-	assert.Contains(t, buf.String(), "watch poll failed")
+	assert.Equal(t, "watched", ev.Object.Spec.Val, "the row image carries the final state")
 }
 
 // TestWatchTakesItsSnapshotBeforeReturning pins the guarantee that makes
@@ -1257,4 +1257,100 @@ func TestObjectsWatchListReturnsASnapshot(t *testing.T) {
 	ev := recv(t, ch)
 	assert.Equal(t, Added, ev.Type)
 	assert.Equal(t, after.ID, ev.Object.ID, "the stream carries only what the snapshot missed")
+}
+
+// The tail reads what the log says changed, not the whole kind. That is the
+// whole point of the log: a tick costs what moved, not what exists.
+func TestObjectStreamTailsTheWriteLog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	quiet := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "quiet"})
+	busy := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "busy"})
+
+	snap, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	require.Len(t, snap.Objects, 2)
+	drainProbe(store.listed)
+	drainProbe(store.byIDs)
+
+	_, err = client.UpdateByID(ctx, busy.ID, cSpec{Val: "busy2"})
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	require.Equal(t, Modified, ev.Type)
+	require.Equal(t, busy.ID, ev.Object.ID)
+
+	select {
+	case ids := <-store.byIDs:
+		assert.Equal(t, []ObjectID{busy.ID}, ids, "only the changed object is read")
+	case <-time.After(testTimeout):
+		t.Fatal("the tail never read the changed object")
+	}
+	select {
+	case <-store.listed:
+		t.Fatal("a tick must not list the kind")
+	default:
+	}
+	assert.NotEqual(t, quiet.ID, ev.Object.ID)
+}
+
+// A Deleted change is built from the log entry's row image. Nothing else can
+// supply it: the row is gone and its conditions cascaded with it.
+func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "doomed"})
+	require.NoError(t, cc.ConditionsSet(ctx, obj.ID, Condition{
+		Type: "Ready", Status: ConditionTrue, Reason: "Settled",
+	}))
+
+	_, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	store.listIDsErr.Store(true) // the liveness probe is gone; using it would fail here
+
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	ev := recv(t, ch)
+	require.Equal(t, Deleted, ev.Type)
+	require.NotNil(t, ev.Object)
+	assert.Equal(t, obj.ID, ev.Object.ID)
+	assert.Equal(t, "doomed", ev.Object.Spec.Val)
+	assert.Len(t, ev.Object.Conditions, 1, "the image carries what cascaded away")
+}
+
+// Delivery stays level-triggered: several writes inside one interval collapse to
+// one change carrying current state, and a batch arrives in write order rather
+// than the id order the batched read returns.
+func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "first"})
+	second := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "second"})
+
+	_, _, err = client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+
+	// The lower id is written last, so id order and write order disagree.
+	_, err = client.UpdateByID(ctx, second.ID, cSpec{Val: "second2"})
+	require.NoError(t, err)
+	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "first2"})
+	require.NoError(t, err)
+	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "first3"})
+	require.NoError(t, err)
+
+	c := client.(*clientImpl[cSpec, cStatus])
+	changes, err := c.poll(ctx, c.bh.migratorFor(c.gk), new(int64))
+	require.NoError(t, err)
+
+	require.Len(t, changes, 2, "three writes to two objects collapse to two changes")
+	assert.Equal(t, second.ID, changes[0].Object.ID, "write order, not id order")
+	assert.Equal(t, first.ID, changes[1].Object.ID)
+	assert.Equal(t, "first3", changes[1].Object.Spec.Val, "current state, not a superseded one")
 }
