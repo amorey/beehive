@@ -879,12 +879,21 @@ func TestWatchReportsAFailedFirstRead(t *testing.T) {
 	assert.Nil(t, ch, "and gets no stream to wait on")
 	assert.Contains(t, err.Error(), "initial read failed")
 
+	// The single-object watch reads its own one-row snapshot, so it answers the
+	// same way.
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
+	store.getErr.Store(true)
+	_, ch, err = client.Watch(ctx, obj.ID)
+	require.ErrorIs(t, err, errBoom)
+	assert.Nil(t, ch)
+
 	// It is the read that failed, not the subscription: with the store answering
 	// again, subscribing works.
 	store.listErr.Store(false)
+	store.getErr.Store(false)
 	snap, _, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	assert.Len(t, snap.Objects, 1)
+	assert.Len(t, snap.Objects, 2)
 }
 
 // A context already cancelled at subscribe is the same story told by the store:
