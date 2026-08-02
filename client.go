@@ -125,14 +125,15 @@ type Client[Spec, Status any] interface {
 	// when "already there" is acceptable. The new object is unsettled and owed
 	// its first reconcile.
 	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	// Delete soft-deletes whatever holds name now by setting
-	// DeletionRequestedAt; the GC sweeper takes it from there. Idempotent: a
-	// missing name and an already-pending row both return nil. Kind-scoped.
-	Delete(ctx context.Context, name string) error
-	// DeleteByID is Delete keyed by incarnation: it acts on that one row, or
-	// returns ErrNotFound — an id naming no object was collected out from under
-	// the caller, which is worth hearing about.
-	DeleteByID(ctx context.Context, id ObjectID) error
+	// Delete soft-deletes id by setting DeletionRequestedAt; the GC sweeper
+	// takes it from there. Returns ErrNotFound if id holds no object — it was
+	// collected out from under the caller, which is worth hearing about.
+	// Idempotent on an already-pending row. Kind-scoped.
+	Delete(ctx context.Context, id ObjectID) error
+	// DeleteByName is Delete keyed by name: it acts on whatever holds name now.
+	// Idempotent, and absence folds to nil — a name nothing holds is the
+	// desired state — which is the one place it departs from Delete.
+	DeleteByName(ctx context.Context, name string) error
 	// DependenciesList returns the objects id depends on (outgoing depends_on).
 	// The lazy counterpart to LoadDependencies().
 	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
@@ -151,12 +152,14 @@ type Client[Spec, Status any] interface {
 	// controller and polls, so a run extended several times within one interval
 	// is delivered once, carrying its latest state.
 	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
-	// Get loads whatever holds name now, or returns ErrNotFound. Kind-scoped:
-	// another kind's row holding the same name is not found.
-	Get(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
-	// GetByID is Get keyed by incarnation — the read half of a
-	// read-modify-write, whose write half is UpdateByID.
-	GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+	// Get loads id, or returns ErrNotFound. Kind-scoped: another kind's row is
+	// not found. The read half of a read-modify-write, whose write half is
+	// Update.
+	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+	// GetByName is Get keyed by name: it loads whatever holds name now, or
+	// returns ErrNotFound. Kind-scoped — another kind's row holding the same
+	// name is not found.
+	GetByName(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
 	// GetOrCreate returns the object with the given name, creating it from spec
 	// if absent. It NEVER mutates an existing row: a name held by a live or
 	// deletion-pending row is returned as-is with created=false, options
@@ -221,22 +224,23 @@ type Client[Spec, Status any] interface {
 	// stops (after delivering the final schedule); a reader cannot tell the two
 	// apart. A client-only kind returns ErrNoController; id need not exist.
 	SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error)
-	// Update replaces the spec of whatever holds name now, or returns
-	// ErrNotFound (a missing row is not "already in the desired state"). A spec
-	// whose bytes match what is stored writes nothing at all, so a controller
-	// re-applying its own spec does not wake itself forever. For a
-	// read-modify-write use UpdateByID, so a collect-and-recreate in between
-	// cannot land the write on a different incarnation.
-	Update(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
-	// UpdateByID is Update keyed by incarnation: it writes that one row, or
-	// returns ErrNotFound. The write half of a read-modify-write.
-	UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+	// Update replaces id's spec, or returns ErrNotFound (a missing row is not
+	// "already in the desired state"). A spec whose bytes match what is stored
+	// writes nothing at all, so a controller re-applying its own spec does not
+	// wake itself forever. The write half of a read-modify-write.
+	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+	// UpdateByName is Update keyed by name: it writes whatever holds name now,
+	// resolving and writing in one transaction. Not for a read-modify-write —
+	// a collect-and-recreate between the read and the write would land it on a
+	// different incarnation; use Update.
+	UpdateByName(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
 	// Watch returns one object's current state, WatchList every object of this
 	// client's kind, each with a stream of the changes above it:
 	// Added/Modified/Deleted until ctx is cancelled. Both are kind-scoped and
 	// need no registered controller: the tail reads the write log, not a
-	// reconciler. An id holding nothing yet is a nil ObjectSnapshot.Object, not
-	// ErrNotFound; its creation arrives as Added.
+	// reconciler. Watch follows one incarnation: an id holding nothing is a nil
+	// ObjectSnapshot.Object rather than ErrNotFound, and a recreate under the
+	// same name is a different id, so the stream ends at Deleted.
 	//
 	// The snapshot is read before either returns, on the caller's goroutine, so a
 	// caller may subscribe and then act: a change it makes afterwards — including
@@ -442,21 +446,21 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 	return obj, created, nil
 }
 
-func (c *clientImpl[Spec, Status]) Update(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error) {
-	if err := checkName(name); err != nil {
-		return nil, err
-	}
-	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
-		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
-	})
-}
-
-func (c *clientImpl[Spec, Status]) UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
 		// ObjectsUpdateSpec folds this client's kind into the write;
 		// hideWrongKind keeps a foreign id invisible.
 		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
 		return raw, changed, c.hideWrongKind(err)
+	})
+}
+
+func (c *clientImpl[Spec, Status]) UpdateByName(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
+		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
 	})
 }
 
@@ -494,7 +498,7 @@ func (c *clientImpl[Spec, Status]) update(
 	return obj, nil
 }
 
-func (c *clientImpl[Spec, Status]) GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error) {
 	raw, err := c.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
@@ -532,7 +536,7 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	return err
 }
 
-func (c *clientImpl[Spec, Status]) Get(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error) {
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
@@ -787,7 +791,7 @@ func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID
 	return r.scheduleAt(id), nil
 }
 
-func (c *clientImpl[Spec, Status]) DeleteByID(ctx context.Context, id ObjectID) error {
+func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
 	// DeletionRequestsCreate bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
@@ -800,14 +804,14 @@ func (c *clientImpl[Spec, Status]) DeleteByID(ctx context.Context, id ObjectID) 
 	return nil
 }
 
-// Delete is DeleteByID keyed by name; the store resolves and marks in one
+// DeleteByName is Delete keyed by name; the store resolves and marks in one
 // statement.
-func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, name string) error {
+func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string) error {
 	if err := checkName(name); err != nil {
 		return err
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
-	// name — the one place a name delete departs from DeleteByID.
+	// name — the one place a name delete departs from Delete.
 	if _, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone

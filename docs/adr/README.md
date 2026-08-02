@@ -31,7 +31,7 @@ directory of archaeology.
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)
-- [The name is the Client API's key; the id is the store's key](2026-07-30-name-primary-key.md)
+- [The id is the Client API's key; the name resolves through ByName siblings](2026-08-02-id-primary-key-with-byname-siblings.md)
 - [Name-keyed writes](2026-07-27-name-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)

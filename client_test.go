@@ -245,7 +245,7 @@ func TestClientUpdateMarshalError(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
-	_, err = client.UpdateByID(ctx, 1, errMarshaler{})
+	_, err = client.Update(ctx, 1, errMarshaler{})
 	require.Error(t, err)
 }
 
@@ -314,7 +314,7 @@ func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 	// The finalizer keeps the tombstone around after Delete, so the name is still
 	// held when Create runs.
 	mustCreate(t, ctx, client, "doomed", cSpec{Val: "first"}, WithFinalizers("test/hold"))
-	require.NoError(t, client.Delete(ctx, "doomed"))
+	require.NoError(t, client.DeleteByName(ctx, "doomed"))
 
 	_, err = client.Create(ctx, "doomed", cSpec{Val: "second"})
 
@@ -343,19 +343,19 @@ func TestClientRejectsEmptyName(t *testing.T) {
 		assert.False(t, created)
 	})
 	t.Run("Update", func(t *testing.T) {
-		_, err := client.Update(ctx, "", cSpec{Val: "a"})
+		_, err := client.UpdateByName(ctx, "", cSpec{Val: "a"})
 		require.ErrorIs(t, err, ErrInvalidName)
 	})
 	t.Run("Get", func(t *testing.T) {
 		// Not ErrNotFound: that would send the caller hunting for a missing row
 		// when what is missing is a config value.
-		_, err := client.Get(ctx, "")
+		_, err := client.GetByName(ctx, "")
 		require.ErrorIs(t, err, ErrInvalidName)
 	})
 	t.Run("Delete", func(t *testing.T) {
 		// Delete folds absence to nil, so a silent nil here would be the worst
 		// possible answer — indistinguishable from a successful no-op.
-		require.ErrorIs(t, client.Delete(ctx, ""), ErrInvalidName)
+		require.ErrorIs(t, client.DeleteByName(ctx, ""), ErrInvalidName)
 	})
 }
 
@@ -379,10 +379,10 @@ func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 	assert.Empty(t, after, "a rejected create writes nothing")
 }
 
-// The name is the API's key and the id is the store's key, so the bare CRUD verbs
-// take the name and the ByID siblings take the id. This pins both halves at once,
-// because the interesting property is that they address different things.
-func TestClientCRUDIsNameKeyedWithByIDSiblings(t *testing.T) {
+// The id is the key everywhere, so the bare CRUD verbs take the id and the
+// ByName siblings resolve. This pins both halves at once, because the
+// interesting property is that they address different things.
+func TestClientCRUDIsIDKeyedWithByNameSiblings(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -390,20 +390,20 @@ func TestClientCRUDIsNameKeyedWithByIDSiblings(t *testing.T) {
 
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "a"})
 
-	byName, err := client.Get(ctx, "prod")
+	byName, err := client.GetByName(ctx, "prod")
 	require.NoError(t, err)
-	byID, err := client.GetByID(ctx, created.ID)
+	byID, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, byName.ID)
 	assert.Equal(t, created.ID, byID.ID)
 
 	// Absence splits the same way it always has: a name folds to nil (idempotent),
 	// an id reports ErrNotFound.
-	require.NoError(t, client.Delete(ctx, "no-such-name"))
-	require.ErrorIs(t, client.DeleteByID(ctx, 99999), ErrNotFound)
+	require.NoError(t, client.DeleteByName(ctx, "no-such-name"))
+	require.ErrorIs(t, client.Delete(ctx, 99999), ErrNotFound)
 
-	require.NoError(t, client.Delete(ctx, "prod"))
-	got, err := client.GetByID(ctx, created.ID)
+	require.NoError(t, client.DeleteByName(ctx, "prod"))
+	got, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, got.DeletionRequestedAt, "the name-keyed delete marked the row")
 }
@@ -500,7 +500,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, child.Finalizers)
 
 	// Name is persisted and looked up via Get.
-	got, err := client.Get(ctx, "child-1")
+	got, err := client.GetByName(ctx, "child-1")
 	require.NoError(t, err)
 	assert.Equal(t, child.ID, got.ID)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
@@ -528,7 +528,7 @@ func TestClientCreateOwnerRefError(t *testing.T) {
 	assert.Empty(t, objs)
 }
 
-func TestClientGetByID(t *testing.T) {
+func TestClientGet(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -536,7 +536,7 @@ func TestClientGetByID(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	got, err := client.GetByID(ctx, created.ID)
+	got, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, got.ID)
 	assert.Equal(t, "hello", got.Spec.Val)
@@ -549,7 +549,7 @@ func TestClientGetAbsentName(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Get(ctx, "nonexistent")
+	_, err = client.GetByName(ctx, "nonexistent")
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -569,7 +569,7 @@ func TestClientList(t *testing.T) {
 	assert.Equal(t, b.ID, list[1].ID)
 }
 
-func TestClientUpdateByID(t *testing.T) {
+func TestClientUpdate(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -577,7 +577,7 @@ func TestClientUpdateByID(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
 
-	updated, err := client.UpdateByID(ctx, created.ID, cSpec{Val: "v2"})
+	updated, err := client.Update(ctx, created.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, updated.ID)
 	assert.Equal(t, int64(2), updated.Generation)
@@ -598,7 +598,7 @@ func TestClientGetOrCreateCreates(t *testing.T) {
 	assert.Equal(t, int64(1), obj.Generation)
 	assert.Equal(t, "a", obj.Spec.Val)
 
-	got, err := client.Get(ctx, "w1")
+	got, err := client.GetByName(ctx, "w1")
 	require.NoError(t, err)
 	assert.Equal(t, obj.ID, got.ID)
 }
@@ -631,7 +631,7 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	// The finalizer keeps the tombstone around after Delete, so the name is still
 	// held by a deletion-pending row when GetOrCreate runs.
 	orig := mustCreate(t, ctx, client, "w1", cSpec{Val: "a"}, WithFinalizers("test/hold"))
-	require.NoError(t, client.DeleteByID(ctx, orig.ID))
+	require.NoError(t, client.Delete(ctx, orig.ID))
 
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
 	require.NoError(t, err)
@@ -763,11 +763,11 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	drainQueue(r.work)
 	require.Empty(t, queuedIDs(r.work), "precondition: queue drained")
 
-	_, err = client.UpdateByID(ctx, orig.ID, conditionalBadSpec{Val: "bad", Bad: true})
+	_, err = client.Update(ctx, orig.ID, conditionalBadSpec{Val: "bad", Bad: true})
 	require.Error(t, err, "the new spec's bytes must fail to decode")
 	assert.Empty(t, queuedIDs(r.work), "a rolled-back update must not wake the reconciler")
 
-	got, err := client.GetByID(ctx, orig.ID)
+	got, err := client.Get(ctx, orig.ID)
 	require.NoError(t, err, "the prior good spec must still decode")
 	assert.Equal(t, "good", got.Spec.Val, "the spec update must have rolled back")
 	assert.Equal(t, orig.Generation, got.Generation, "no generation bump on a rolled-back update")
@@ -875,7 +875,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 			return err
 		}},
 		{"Update", func(ctx context.Context, c Client[cSpec, cStatus], seeded ObjectID) error {
-			_, err := c.UpdateByID(ctx, seeded, cSpec{Val: "b"})
+			_, err := c.Update(ctx, seeded, cSpec{Val: "b"})
 			return err
 		}},
 	}
@@ -939,12 +939,12 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "a"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "a"})
 	require.NoError(t, err)
 	assert.Empty(t, unsettledIDs(t, store), "re-applying the identical spec leaves it settled")
 
 	// A real change still unsettles it, so the suppression is scoped to the no-op.
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a real spec change is owed a pass")
 }
@@ -968,7 +968,7 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 
 		cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 		err = cc.Within(ctx, func(ctx context.Context) error {
-			require.NoError(t, client.DeleteByID(ctx, obj.ID))
+			require.NoError(t, client.Delete(ctx, obj.ID))
 			if !commit {
 				return errBoom
 			}
@@ -1020,7 +1020,7 @@ func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 	require.True(t, created)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, obj.Finalizers)
 
-	got, err := client.Get(ctx, "w1")
+	got, err := client.GetByName(ctx, "w1")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
 }
@@ -1085,13 +1085,13 @@ func TestClientGetOrCreateRawToTypedError(t *testing.T) {
 	assert.False(t, created)
 }
 
-func TestClientGetByIDNotFound(t *testing.T) {
+func TestClientGetNotFound(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.GetByID(ctx, 999)
+	_, err = client.Get(ctx, 999)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -1110,33 +1110,14 @@ func TestClientWatchNonExistentID(t *testing.T) {
 	assertChanClosed(t, ch)
 }
 
-func TestClientDeleteByIDNotFound(t *testing.T) {
+func TestClientDeleteNotFound(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	err = client.DeleteByID(ctx, 999)
+	err = client.Delete(ctx, 999)
 	require.ErrorIs(t, err, ErrNotFound)
-}
-
-func TestClientDeleteByID(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	created := mustCreate(t, ctx, client, uniqueName(), cSpec{})
-
-	err = client.DeleteByID(ctx, created.ID)
-	require.NoError(t, err)
-
-	// object still present (no finalizers cleared), but marked for deletion. The
-	// the default full pass is enabled, so the client-only object isn't collected
-	// synchronously by Delete — the idle sweeper is its backstop.
-	got, err := client.GetByID(ctx, created.ID)
-	require.NoError(t, err)
-	assert.NotNil(t, got.DeletionRequestedAt)
 }
 
 func TestClientDelete(t *testing.T) {
@@ -1145,27 +1126,20 @@ func TestClientDelete(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	mustCreate(t, ctx, client, "w1", cSpec{})
+	created := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 
-	require.NoError(t, client.Delete(ctx, "w1"))
+	err = client.Delete(ctx, created.ID)
+	require.NoError(t, err)
 
-	// As in TestClientDelete, the object lingers marked for deletion rather than
-	// being collected synchronously.
-	got, err := client.Get(ctx, "w1")
+	// object still present (no finalizers cleared), but marked for deletion. The
+	// the default full pass is enabled, so the client-only object isn't collected
+	// synchronously by Delete — the idle sweeper is its backstop.
+	got, err := client.Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, got.DeletionRequestedAt)
 }
 
-func TestClientDeleteNotFoundIsNil(t *testing.T) {
-	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	assert.NoError(t, client.Delete(ctx, "never-created"))
-}
-
-func TestClientDeleteIdempotent(t *testing.T) {
+func TestClientDeleteByName(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
@@ -1173,8 +1147,34 @@ func TestClientDeleteIdempotent(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
-	require.NoError(t, client.Delete(ctx, "w1"))
-	assert.NoError(t, client.Delete(ctx, "w1"))
+	require.NoError(t, client.DeleteByName(ctx, "w1"))
+
+	// As in TestClientDelete, the object lingers marked for deletion rather than
+	// being collected synchronously.
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err)
+	assert.NotNil(t, got.DeletionRequestedAt)
+}
+
+func TestClientDeleteByNameNotFoundIsNil(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	assert.NoError(t, client.DeleteByName(ctx, "never-created"))
+}
+
+func TestClientDeleteByNameIdempotent(t *testing.T) {
+	ctx := context.Background()
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, "w1", cSpec{})
+
+	require.NoError(t, client.DeleteByName(ctx, "w1"))
+	assert.NoError(t, client.DeleteByName(ctx, "w1"))
 }
 
 // A row held deletion-pending by a finalizer must absorb a second Delete
@@ -1188,14 +1188,14 @@ func TestClientDeleteAlreadyDeleting(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, "w1", cSpec{}, WithFinalizers("test/hold"))
 
-	require.NoError(t, client.DeleteByID(ctx, obj.ID))
-	pending, err := client.Get(ctx, "w1")
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	pending, err := client.GetByName(ctx, "w1")
 	require.NoError(t, err)
 	require.NotNil(t, pending.DeletionRequestedAt)
 
-	require.NoError(t, client.Delete(ctx, "w1"))
+	require.NoError(t, client.DeleteByName(ctx, "w1"))
 
-	got, err := client.Get(ctx, "w1")
+	got, err := client.GetByName(ctx, "w1")
 	require.NoError(t, err)
 	assert.Equal(t, pending.ID, got.ID)
 	assert.Equal(t, pending.DeletionRequestedAt, got.DeletionRequestedAt)
@@ -1219,13 +1219,13 @@ func TestClientDeleteMarksForCollection(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, "w1", cSpec{}, WithFinalizers("test/hold"))
 
-	require.NoError(t, client.Delete(ctx, "w1"))
+	require.NoError(t, client.DeleteByName(ctx, "w1"))
 	pending, err := store.DeletionRequestsList(ctx)
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "the mark is the whole signal: it puts the row in the sweeper's listing")
 	assert.Equal(t, obj.ID, pending[0].ID)
 
-	require.NoError(t, client.Delete(ctx, "absent"))
+	require.NoError(t, client.DeleteByName(ctx, "absent"))
 	pending, err = store.DeletionRequestsList(ctx)
 	require.NoError(t, err)
 	assert.Len(t, pending, 1, "an unresolved name marks nothing")
@@ -1243,9 +1243,9 @@ func TestClientDeleteKindScoped(t *testing.T) {
 
 	w := mustCreate(t, ctx, widgets, "shared", cSpec{Val: "v1"})
 
-	require.NoError(t, gadgets.Delete(ctx, "shared"))
+	require.NoError(t, gadgets.DeleteByName(ctx, "shared"))
 
-	got, err := widgets.GetByID(ctx, w.ID)
+	got, err := widgets.Get(ctx, w.ID)
 	require.NoError(t, err)
 	assert.Nil(t, got.DeletionRequestedAt, "the Widget must be untouched")
 }
@@ -1256,7 +1256,7 @@ func TestClientDeleteStoreError(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	require.ErrorIs(t, client.Delete(ctx, "w1"), errBoom)
+	require.ErrorIs(t, client.DeleteByName(ctx, "w1"), errBoom)
 }
 
 // TestClientIDOpsScopedToKind verifies that ID-based operations on a Client are
@@ -1274,15 +1274,15 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	w := mustCreate(t, ctx, widgets, uniqueName(), cSpec{Val: "v1"})
 
 	// The Gadget client must not see or mutate the Widget by its id.
-	_, err = gadgets.GetByID(ctx, w.ID)
+	_, err = gadgets.Get(ctx, w.ID)
 	require.ErrorIs(t, err, ErrNotFound)
-	_, err = gadgets.UpdateByID(ctx, w.ID, cSpec{Val: "hijacked"})
+	_, err = gadgets.Update(ctx, w.ID, cSpec{Val: "hijacked"})
 	require.ErrorIs(t, err, ErrNotFound)
-	err = gadgets.DeleteByID(ctx, w.ID)
+	err = gadgets.Delete(ctx, w.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 
 	// The Widget is unchanged: original spec, no deletion request.
-	got, err := widgets.GetByID(ctx, w.ID)
+	got, err := widgets.Get(ctx, w.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "v1", got.Spec.Val)
 	assert.Equal(t, int64(1), got.Generation)
@@ -1410,7 +1410,7 @@ func TestClientUpdateStoreError(t *testing.T) {
 	bh, err := New(&errorUpdateSpecStore{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.UpdateByID(context.Background(), 1, tSpec{})
+	_, err = client.Update(context.Background(), 1, tSpec{})
 	require.Error(t, err)
 }
 
@@ -1418,7 +1418,7 @@ func TestClientUpdateRawToTypedError(t *testing.T) {
 	bh, err := New(&updateBadJSONStore{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.UpdateByID(context.Background(), 1, tSpec{})
+	_, err = client.Update(context.Background(), 1, tSpec{})
 	require.Error(t, err)
 }
 
@@ -1530,7 +1530,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 	// Drain the Added event from Create.
 	recv(t, ch)
 
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "v2"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
 	evt := recv(t, ch)
@@ -1552,7 +1552,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	// Drain the Added event from Create.
 	recv(t, ch)
 
-	require.NoError(t, client.DeleteByID(ctx, obj.ID))
+	require.NoError(t, client.Delete(ctx, obj.ID))
 
 	evt := recv(t, ch)
 	assert.Equal(t, Modified, evt.Type)
@@ -1571,16 +1571,16 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 	recv(t, ch) // drain Added
 
-	require.NoError(t, client.DeleteByID(ctx, obj.ID))
+	require.NoError(t, client.Delete(ctx, obj.ID))
 	recv(t, ch) // drain first Modified
 
 	// Second Delete is idempotent. Pinned at the mechanism first: the watch emits
 	// off resource_version, so a write that leaves it alone is invisible to the
 	// poller no matter when it looks.
-	before, err := client.GetByID(ctx, obj.ID)
+	before, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
-	require.NoError(t, client.DeleteByID(ctx, obj.ID))
-	after, err := client.GetByID(ctx, obj.ID)
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	after, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, before.ResourceVersion, after.ResourceVersion,
 		"an idempotent delete bumped resource_version, which is what the watch emits on")
@@ -1610,11 +1610,11 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	assert.Equal(t, obj1.ID, snap.Object.ID)
 
 	// Update obj2 first — this event must not appear on ch.
-	_, err = client.UpdateByID(ctx, obj2.ID, cSpec{Val: "b2"})
+	_, err = client.Update(ctx, obj2.ID, cSpec{Val: "b2"})
 	require.NoError(t, err)
 
 	// Update obj1 — this must appear.
-	_, err = client.UpdateByID(ctx, obj1.ID, cSpec{Val: "a2"})
+	_, err = client.Update(ctx, obj1.ID, cSpec{Val: "a2"})
 	require.NoError(t, err)
 
 	evt := recv(t, ch)
@@ -1818,7 +1818,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{a.ID}, objectRefIDs(dependents), "a self-dependency is still a dependency")
 
-	got, err := client.GetByID(ctx, a.ID, LoadDependents())
+	got, err := client.Get(ctx, a.ID, LoadDependents())
 	require.NoError(t, err)
 	loaded, err := got.Dependents()
 	require.NoError(t, err)
@@ -1954,7 +1954,7 @@ func TestClientListOwnedObjectsIncludesDeletionPending(t *testing.T) {
 	child, err := widgets.Create(ctx, "w1", cSpec{Val: "w1"},
 		WithOwner(owner.ID), WithFinalizers("test/hold"))
 	require.NoError(t, err)
-	require.NoError(t, widgets.DeleteByID(ctx, child.ID))
+	require.NoError(t, widgets.Delete(ctx, child.ID))
 
 	got, err := widgets.OwnedObjectsList(ctx, owner.ID)
 	require.NoError(t, err)
@@ -2053,13 +2053,13 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	// Without the selector the owner is not loaded — accessing it errors.
-	plain, err := client.GetByID(ctx, child.ID)
+	plain, err := client.Get(ctx, child.ID)
 	require.NoError(t, err)
 	_, _, err = plain.Owner()
 	assert.ErrorIs(t, err, ErrNotLoaded, "owner not loaded without LoadOwner()")
 
 	// With it, the owner is populated in the same read.
-	got, err := client.GetByID(ctx, child.ID, LoadOwner())
+	got, err := client.Get(ctx, child.ID, LoadOwner())
 	require.NoError(t, err)
 	ref, ok, err := got.Owner()
 	require.NoError(t, err)
@@ -2068,7 +2068,7 @@ func TestClientGetWithLoadOwner(t *testing.T) {
 
 	// Get honours selectors too.
 	mustCreate(t, ctx, client, "s1", cSpec{Val: "named"}, WithOwner(owner.ID))
-	byName, err := client.Get(ctx, "s1", LoadOwner())
+	byName, err := client.GetByName(ctx, "s1", LoadOwner())
 	require.NoError(t, err)
 	ref, ok, err = byName.Owner()
 	require.NoError(t, err)
@@ -2139,20 +2139,20 @@ func TestClientLoadsOwned(t *testing.T) {
 	}
 
 	// Without the selector the owned set is not loaded — accessing it errors.
-	plain, err := client.GetByID(ctx, owner.ID)
+	plain, err := client.Get(ctx, owner.ID)
 	require.NoError(t, err)
 	_, err = plain.Owned()
 	assert.ErrorIs(t, err, ErrNotLoaded, "owned not loaded without LoadOwned()")
 
 	// Single-object path populates the owner's children.
-	got, err := client.GetByID(ctx, owner.ID, LoadOwned())
+	got, err := client.Get(ctx, owner.ID, LoadOwned())
 	require.NoError(t, err)
 	owned, err := got.Owned()
 	require.NoError(t, err)
 	assert.Equal(t, childIDs, objectRefIDs(owned))
 
 	// A child owns nothing: loaded but empty.
-	leaf, err := client.GetByID(ctx, childIDs[0], LoadOwned())
+	leaf, err := client.Get(ctx, childIDs[0], LoadOwned())
 	require.NoError(t, err)
 	owned, err = leaf.Owned()
 	require.NoError(t, err, "loaded even though empty")
@@ -2183,7 +2183,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, RelationDependsOn)) // a depends on b
 
-	got, err := client.GetByID(ctx, a.ID, LoadDependencies(), LoadDependents())
+	got, err := client.Get(ctx, a.ID, LoadDependencies(), LoadDependents())
 	require.NoError(t, err)
 	deps, err := got.Dependencies()
 	require.NoError(t, err)
@@ -2192,7 +2192,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	require.NoError(t, err, "loaded even though empty")
 	assert.Empty(t, dependents)
 
-	got, err = client.GetByID(ctx, b.ID, LoadDependents())
+	got, err = client.Get(ctx, b.ID, LoadDependents())
 	require.NoError(t, err)
 	dependents, err = got.Dependents()
 	require.NoError(t, err)
@@ -2257,12 +2257,12 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	obj := mustCreate(t, ctx, client, "x1", cSpec{Val: "x"})
 
 	loads := []LoadOption{LoadOwner(), LoadDependencies(), LoadDependents(), LoadOwned()}
-	// Single-object path: each relation's store error surfaces through Get/GetByID.
+	// Single-object path: each relation's store error surfaces through Get/GetByName.
 	for _, l := range loads {
-		_, err := client.GetByID(ctx, obj.ID, l)
+		_, err := client.Get(ctx, obj.ID, l)
 		require.ErrorIs(t, err, errBoom)
 	}
-	_, err = client.Get(ctx, "x1", LoadOwner())
+	_, err = client.GetByName(ctx, "x1", LoadOwner())
 	require.ErrorIs(t, err, errBoom)
 
 	// Batched path: each relation's store error surfaces through List.
@@ -2292,7 +2292,7 @@ func TestClientLazyRefsMissingIDReadsEmpty(t *testing.T) {
 }
 
 // getBadJSONStore returns an undecodable spec from the scoped and name-keyed
-// reads, driving the decode-error branch of Client.Get / Client.GetByID.
+// reads, driving the decode-error branch of Client.Get / Client.GetByName.
 type getBadJSONStore struct {
 	fakeStore
 	gk GroupKind
@@ -2311,9 +2311,9 @@ func TestGetDecodeError(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.GetByID(ctx, 1)
+	_, err = client.Get(ctx, 1)
 	require.Error(t, err)
-	_, err = client.Get(ctx, "any")
+	_, err = client.GetByName(ctx, "any")
 	require.Error(t, err)
 }
 
@@ -2581,7 +2581,7 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	assert.ErrorIs(t, err, errBoom)
 	_, _, err = client.EventsGetLatest(ctx, obj.ID, "c")
 	assert.ErrorIs(t, err, errBoom)
-	_, err = client.GetByID(ctx, obj.ID, LoadEvents())
+	_, err = client.Get(ctx, obj.ID, LoadEvents())
 	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on Get")
 	_, err = client.List(ctx, LoadEvents())
 	assert.ErrorIs(t, err, errBoom, "eager LoadEvents on List")
@@ -2681,12 +2681,12 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
-	plain, err := client.GetByID(ctx, obj.ID)
+	plain, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	_, err = plain.Events()
 	assert.ErrorIs(t, err, ErrNotLoaded, "not loaded without LoadEvents()")
 
-	loaded, err := client.GetByID(ctx, obj.ID, LoadEvents())
+	loaded, err := client.Get(ctx, obj.ID, LoadEvents())
 	require.NoError(t, err)
 	evs, err := loaded.Events()
 	require.NoError(t, err)
@@ -2841,22 +2841,22 @@ func TestEventFromRaw(t *testing.T) {
 	assert.Equal(t, last, e.LastAt)
 }
 
-// Update joins the name-keyed family: leaving it out would split the CRUD set,
-// letting a caller create, read and delete by name but forcing an id to write.
-func TestClientUpdateIsNameKeyedWithByIDSibling(t *testing.T) {
+// UpdateByName joins the ByName family: leaving it out would split the CRUD
+// set, letting a caller read and delete by name but forcing an id to write.
+func TestClientUpdateIsIDKeyedWithByNameSibling(t *testing.T) {
 	ctx := context.Background()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
 
-	byName, err := client.Update(ctx, "prod", cSpec{Val: "v2"})
+	byName, err := client.UpdateByName(ctx, "prod", cSpec{Val: "v2"})
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, byName.ID)
 	assert.Equal(t, "v2", byName.Spec.Val)
 	assert.Equal(t, int64(2), byName.Generation, "a real spec change bumps generation")
 
-	byID, err := client.UpdateByID(ctx, created.ID, cSpec{Val: "v3"})
+	byID, err := client.Update(ctx, created.ID, cSpec{Val: "v3"})
 	require.NoError(t, err)
 	assert.Equal(t, "v3", byID.Spec.Val)
 }
@@ -2869,7 +2869,7 @@ func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.Update(ctx, "no-such-name", cSpec{Val: "v1"})
+	_, err = client.UpdateByName(ctx, "no-such-name", cSpec{Val: "v1"})
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -2884,19 +2884,18 @@ func TestClientUpdateIsKindScoped(t *testing.T) {
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 	w := mustCreate(t, ctx, widgets, "shared", cSpec{Val: "widget"})
 
-	_, err = gadgets.Update(ctx, "shared", cSpec{Val: "gadget"})
+	_, err = gadgets.UpdateByName(ctx, "shared", cSpec{Val: "gadget"})
 	require.ErrorIs(t, err, ErrNotFound, "another kind's row holding the same name is not this client's to write")
 
-	unchanged, err := widgets.GetByID(ctx, w.ID)
+	unchanged, err := widgets.Get(ctx, w.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "widget", unchanged.Spec.Val)
 }
 
-// The ABA contract, both directions. This is the executable form of the promise
-// the README used to make — "everything after the create takes an ObjectID, so a
-// delete and recreate under the same name can't make you act on the wrong row" —
-// which the name-keyed CRUD surface retires. What replaces it is a split, and a
-// split is only real if both halves are pinned:
+// The ABA contract, both directions. The bare verbs keep the README's promise —
+// everything after the create takes an ObjectID, so a delete and recreate under
+// the same name can't make you act on the wrong row — and the ByName siblings
+// are the opt-out. A split is only real if both halves are pinned:
 //
 //	a name-keyed call acts on whatever holds that name NOW, or reports absence;
 //	an id-keyed call acts on that ONE incarnation, or returns ErrNotFound.
@@ -2914,7 +2913,7 @@ func TestClientNameKeyedWritesFollowTheNameAcrossARecreate(t *testing.T) {
 	// Retire the first incarnation completely. Until GC collects it the tombstone
 	// still holds the name's UNIQUE constraint, so the recreate below could not
 	// even happen — which is what makes this window narrow in practice.
-	require.NoError(t, client.Delete(ctx, "prod"))
+	require.NoError(t, client.DeleteByName(ctx, "prod"))
 	collected, err := bh.gcCollect(ctx, first.ID)
 	require.NoError(t, err)
 	require.True(t, collected, "the row must be physically gone before the name is free")
@@ -2923,22 +2922,22 @@ func TestClientNameKeyedWritesFollowTheNameAcrossARecreate(t *testing.T) {
 	require.NotEqual(t, first.ID, second.ID, "AUTOINCREMENT never reuses an id")
 
 	// The name follows the name to the live incarnation.
-	updated, err := client.Update(ctx, "prod", cSpec{Val: "third"})
+	updated, err := client.UpdateByName(ctx, "prod", cSpec{Val: "third"})
 	require.NoError(t, err)
 	assert.Equal(t, second.ID, updated.ID, "the name-keyed write landed on whatever holds the name now")
 
 	// The id still means the incarnation it always meant, which no longer exists.
-	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "resurrect"})
+	_, err = client.Update(ctx, first.ID, cSpec{Val: "resurrect"})
 	require.ErrorIs(t, err, ErrNotFound, "the id-keyed write refuses to act on a collected row")
 
-	_, err = client.GetByID(ctx, first.ID)
+	_, err = client.Get(ctx, first.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 
 	// The delete pair splits the same way: the name deletes the live row, the dead
 	// id reports absence rather than silently succeeding.
-	require.ErrorIs(t, client.DeleteByID(ctx, first.ID), ErrNotFound)
-	require.NoError(t, client.Delete(ctx, "prod"))
-	live, err := client.GetByID(ctx, second.ID)
+	require.ErrorIs(t, client.Delete(ctx, first.ID), ErrNotFound)
+	require.NoError(t, client.DeleteByName(ctx, "prod"))
+	live, err := client.Get(ctx, second.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, live.DeletionRequestedAt, "the name-keyed delete marked the live incarnation")
 }
@@ -2972,7 +2971,7 @@ func TestClientUpdateDoesNotResolveTheNameSeparately(t *testing.T) {
 	mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
 	probe.resolved.Store(false)
 
-	_, err = client.Update(ctx, "prod", cSpec{Val: "v2"})
+	_, err = client.UpdateByName(ctx, "prod", cSpec{Val: "v2"})
 	require.NoError(t, err)
 
 	assert.False(t, probe.resolved.Load(),
@@ -3150,7 +3149,7 @@ func TestUpdateEnqueuesTheObject(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
-	updated, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	updated, err := client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	require.Greater(t, updated.Generation, obj.Generation, "a real spec change bumps the generation")
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a spec change queues the object")
@@ -3166,7 +3165,7 @@ func TestNoOpUpdateOnASettledObjectEnqueuesNothing(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
-	same, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "a"})
+	same, err := client.Update(ctx, obj.ID, cSpec{Val: "a"})
 	require.NoError(t, err)
 	require.Equal(t, obj.Generation, same.Generation, "identical bytes must not bump the generation")
 	assert.Empty(t, queuedIDs(r.work), "a settled row that did not move owes no pass")
@@ -3184,7 +3183,7 @@ func TestSpecWriteEnqueuesNothingOnRollback(t *testing.T) {
 
 		errRollback := errors.New("rollback")
 		err := cc.Within(ctx, func(ctx context.Context) error {
-			if _, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"}); err != nil {
+			if _, err := client.Update(ctx, obj.ID, cSpec{Val: "b"}); err != nil {
 				return err
 			}
 			if commit {
@@ -3212,7 +3211,7 @@ func TestSpecWriteOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 
 	obj, err := clientOnly.Create(ctx, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, err)
-	_, err = clientOnly.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = clientOnly.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 }
 
@@ -3234,7 +3233,7 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 	settle(t, ctx, cc, r, obj)
 
 	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
-		updated, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+		updated, err := client.Update(ctx, obj.ID, cSpec{Val: "b"})
 		if err != nil {
 			return err
 		}
@@ -3267,7 +3266,7 @@ func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cSt
 		c.hot.fire()
 	}
 	c.first.fire()
-	_, _ = c.client.UpdateByID(ctx, obj.ID, obj.Spec) // identical bytes: the store skips it
+	_, _ = c.client.Update(ctx, obj.ID, obj.Spec) // identical bytes: the store skips it
 	return Result{}, errBoom
 }
 
@@ -3312,7 +3311,7 @@ func TestNoOpUpdateOnAnUnsettledObjectEnqueuesNothing(t *testing.T) {
 	drainQueue(r.work)
 	require.Empty(t, queuedIDs(r.work))
 
-	same, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "a"})
+	same, err := client.Update(ctx, obj.ID, cSpec{Val: "a"})
 	require.NoError(t, err)
 	require.Equal(t, obj.Generation, same.Generation, "identical bytes must not bump the generation")
 

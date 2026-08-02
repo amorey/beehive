@@ -200,7 +200,7 @@ func watchCascade(
 		}
 		deleted = true
 		fmt.Printf("\nall ready; deleting Cluster %d — watch the cascade:\n", clusterID)
-		exitOnErr(clusterClient.DeleteByID(ctx, clusterID))
+		exitOnErr(clusterClient.Delete(ctx, clusterID))
 	}
 
 	timeout := time.After(30 * time.Second)

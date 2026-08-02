@@ -36,7 +36,7 @@ type Option func(target any) error
 var ErrInvalidOption = errors.New("beehive: option value is invalid")
 
 // LoadOption selects a secondary lookup to fetch alongside an object on a read
-// (Get/GetByID/List). The lazy alternative: omit it and call
+// (Get/GetByName/List). The lazy alternative: omit it and call
 // Client.OwnersGet/DependenciesList when the data is needed.
 type LoadOption func(*LoadSet)
 

@@ -320,21 +320,24 @@ type ObjectListSnapshot[Spec, Status any] struct {
 }
 
 type Client[Spec, Status any] interface {
-    // Name-keyed: acts on whatever holds the name now.
+    // Creating: the name is positional, because there is no id yet.
     Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
     GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
-    Update(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
-    Get(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
-    Delete(ctx context.Context, name string) error // idempotent: absent or already-deleting is a nil no-op
-    List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
 
     // Id-keyed: acts on one incarnation, or returns ErrNotFound.
-    UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
-    GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
-    DeleteByID(ctx context.Context, id ObjectID) error
+    Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+    Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
+    Delete(ctx context.Context, id ObjectID) error
+    List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
+
+    // Name-keyed: acts on whatever holds the name now.
+    UpdateByName(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
+    GetByName(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
+    DeleteByName(ctx context.Context, name string) error // idempotent: absent or already-deleting is a nil no-op
 
     // Watching: a snapshot plus the changes above it. Kind-scoped; no controller
-    // needed; an id holding nothing yet is a nil Object, not ErrNotFound.
+    // needed; follows one incarnation, so an id holding nothing is a nil Object
+    // rather than ErrNotFound, and the stream ends at Deleted.
     Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
     WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
@@ -364,17 +367,18 @@ func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
 
 #### Writes
 
-**The name is the API's key; the id is the store's key.** Every object is named at
-creation, and the name is what the ordinary CRUD surface addresses it by, so a
-caller who names things never has to hold an `ObjectID` to get work done. The id
-keeps every job it does inside the store — incarnation identity, foreign-key
-target, work-queue key, scan ordering — and stays reachable through the `…ByID`
-siblings. Finalizers and other metadata are options:
+**The id is the key; the name is how you find it.** Every object is named at
+creation — the name is positional on `Create`, because there is no id yet — and it
+is unique and immutable thereafter. Everything after the create takes an
+`ObjectID`: the same key the store uses for incarnation identity, foreign-key
+targets, the work queue and scan ordering. The `…ByName` siblings resolve a name to
+whatever holds it now, for callers who have a name and no id. Finalizers and other
+metadata are options:
 
 ```go
 client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 obj, _ := client.Create(ctx, "prod-cluster", ClusterSpec{...}, beehive.WithFinalizers("kstack.sh/cluster"))
-client.Update(ctx, "prod-cluster", ClusterSpec{...})
+client.Update(ctx, obj.ID, ClusterSpec{...})
 ```
 
 The name is required and immutable — there is no `UpdateName`, and a rename is
@@ -411,26 +415,31 @@ exactly when a name has been reused:
 > A **name-keyed** call acts on whatever holds that name *now*, or reports absence.
 > An **id-keyed** call acts on that one incarnation, or returns `ErrNotFound`.
 
-That split is the level-triggered principle applied to the API surface, not a
-compromise. "Ensure this child exists" / "remove this child" is a statement about a
-*name*, and should re-evaluate against current state on every reconcile — which is
-what a name-keyed call does. "Finish what I read a moment ago" is a statement about
-an *incarnation*, and that is what an id is for.
+**The id is the key, and the `ByName` siblings are the opt-out.** The bare verbs
+take an `ObjectID`, so a delete and recreate under the same name cannot make you act
+on the wrong row — the safe thing is what you get by not thinking about it. Reach
+for `ByName` when acting on whatever holds the name now is what you actually mean:
+"ensure this child exists" / "remove this child" is a statement about a *name*, and
+re-evaluating it against current state on every reconcile is the level-triggered
+principle, not a compromise.
 
-So **read-modify-write goes through `UpdateByID`**. `Get(ctx, "prod")` → mutate →
-`Update(ctx, "prod", spec)` names the row twice, and a GC collect plus a fresh
-create in between would land the write on a different incarnation. The object `Get`
-returned carries `ID`, so the fix is always to hand:
+That is why **read-modify-write needs no rule**. The object a read returns carries
+`ID`, so the natural way to write it back is already the incarnation-safe one:
 
 ```go
-obj, _ := client.Get(ctx, "prod-cluster")
+obj, _ := client.GetByName(ctx, "prod-cluster")
 obj.Spec.Replicas++
-client.UpdateByID(ctx, obj.ID, obj.Spec)   // this incarnation, or ErrNotFound
+client.Update(ctx, obj.ID, obj.Spec)   // this incarnation, or ErrNotFound
 ```
 
-The window is narrower than it looks — a tombstone holds the name's `UNIQUE`
-constraint until GC clears finalizers, so opening it takes a full collect *plus* a
-new create — but it is real, and `UpdateByID` closes it with no extra surface.
+Composing `GetByName` → mutate → `UpdateByName` names the row twice, and a GC
+collect plus a fresh create in between would land the write on a different
+incarnation. The window is narrower than it looks — a tombstone holds the name's
+`UNIQUE` constraint until GC clears finalizers, so opening it takes a full collect
+*plus* a new create — but it is real, and using the id closes it.
+
+Each `ByName` call is atomic on its own: it resolves and writes in one transaction,
+never two store calls. The hazard is only in composing two of them.
 
 **A name is an opaque key and beehive does not validate it** — no character rules, no length limit, no normalization — with exactly one exception: **the empty string is rejected with `ErrInvalidName`**, by the writes and the reads alike. `""` is not a name anyone chooses; it is what an unset configuration field reads as, and treating it as an ordinary name would quietly point every caller whose config was unset at one shared row. Every other malformed name at least addresses the row its author meant. Validate names that come from outside your code; beehive only catches the one case where the mistake is invisible. The store enforces it too, not just the client — `Store` is a public extension point, and a row admitted under `""` is one no name-keyed call could address again.
 
@@ -442,7 +451,7 @@ The two name-keyed creates differ **only in what they do when the name is taken*
 | a live row              | fails (`UNIQUE`) | returns it untouched, `created=false` |
 | a deletion-pending row  | fails (`UNIQUE`) | returns it untouched, `created=false` |
 
-**There is no name-keyed upsert.** Neither create branch ever writes to a row it found, so changing an existing object is always `Update`. A caller that wants ensure-then-set composes `GetOrCreate` with `Update` inside its own `Within` — and should think about the deletion-pending row before it does, since `GetOrCreate` hands that back like any other and the `Update` would write a spec onto an object being torn down.
+**There is no name-keyed upsert.** Neither create branch ever writes to a row it found, so changing an existing object is always a separate `Update`. A caller that wants ensure-then-set composes `GetOrCreate` with `Update` — on the id it just got back — inside its own `Within` — and should think about the deletion-pending row before it does, since `GetOrCreate` hands that back like any other and the `Update` would write a spec onto an object being torn down.
 
 Re-applying the spec a row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever.
 
@@ -496,17 +505,17 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
 
 The options apply **only when the call creates the row** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). Options that don't apply are ignored, as everywhere else.
 
-That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `OwnersGet`, or `Get(ctx, name, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
+That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `OwnersGet`, or `GetByName(ctx, name, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
 
-`Delete` is the other half of the pair: `GetOrCreate` creates if absent, `Delete` deletes if present. Both are idempotent and both understand tombstones, so a controller that ensures a name-keyed child on one branch and removes it on another writes one call for each. It replaces the usual open-coding of `Get`, treating `ErrNotFound` as success, treating `DeletionRequestedAt` as a no-op, then deleting:
+`DeleteByName` is the other half of the pair: `GetOrCreate` creates if absent, `DeleteByName` deletes if present. Both are idempotent and both understand tombstones, so a controller that ensures a name-keyed child on one branch and removes it on another writes one call for each. It replaces the usual open-coding of `GetByName`, treating `ErrNotFound` as success, treating `DeletionRequestedAt` as a no-op, then deleting:
 
-| Name held by           | `Delete`                                                     |
+| Name held by           | `DeleteByName`                                               |
 | ---------------------- | ----------------------------------------------------------- |
 | nothing                | `nil` — already gone                                         |
 | a live row             | soft-deletes it (sets `DeletionRequestedAt`), advances GC    |
 | a deletion-pending row | no-op — no write at all — advances GC; `nil`                 |
 
-It marks the object and hands it to the controller to clear its finalizers. The row is removed once they clear, and only then is the name free again. It is scoped to the kind, like `Get`: another kind's row holding the same name is simply not found, which is reported as success rather than as a wrong-kind error. `DeleteByID` is the incarnation-keyed sibling, and reports `ErrNotFound` where this folds absence to `nil`.
+It marks the object and hands it to the controller to clear its finalizers. The row is removed once they clear, and only then is the name free again. It is scoped to the kind, like `GetByName`: another kind's row holding the same name is simply not found, which is reported as success rather than as a wrong-kind error. `Delete` is the incarnation-keyed sibling, and reports `ErrNotFound` where this folds absence to `nil`.
 
 Both idempotent outcomes — no such row, and a row already deletion-pending — are answered by a lock-free probe **without opening a write transaction**. That is the steady state of the call: a controller that removes a child re-runs it every reconcile, and exactly one of those calls ever deletes anything, so taking the store's single write lock to discover there is nothing to do was the whole cost.
 
@@ -669,7 +678,7 @@ Conversion is lazy and per column: a blob is re-stamped when it is next written,
 A blob that fails to convert, fails to unmarshal, or came from a newer build is a decode failure, and each read path handles it in the way that fails safest:
 
 - `List` and the watches skip the bad row, log it and carry on. A watch remembers its version, so it warns once per change rather than once per poll.
-- `Get`/`GetByID` return the error.
+- `Get`/`GetByName` return the error.
 - **The reconcile loop quarantines the row.** It cannot reconcile what it cannot decode, and the bytes will not change until someone rewrites the spec, so it logs and treats the pass as a successful no-op rather than retrying the same bytes forever under backoff. A deletion-pending row is still collected, since GC needs only the id. The owed pass re-queues the unsettled row every tick, so the warning repeats at that interval — deliberately, so a bad row stays visible instead of logging once and going quiet.
 
 A kind with no migrator is untouched; its columns stay `0`. Only registered kinds can have a migrator, so client-only kinds cannot.
