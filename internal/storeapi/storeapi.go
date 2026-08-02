@@ -532,6 +532,14 @@ type Store interface {
 	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind. Not
 	// monotonic — a delete lowers it — so consumers compare for inequality.
 	ObjectWritesMaxVersionAll(ctx context.Context) (int64, error)
+
+	// ObjectWritesSweep trims the write log to the retention bounds and returns
+	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
+	// its newest perKind entries; maxAge > 0 drops entries written more than
+	// maxAge ago. A zero bound is skipped. It raises each affected kind's
+	// horizon in the same transaction that deletes that kind's entries, so a
+	// resume is never accepted against a log with a hole in it.
+	ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
 }
 
 // FreePagesReleaser is an optional Store capability: a backend that can hand

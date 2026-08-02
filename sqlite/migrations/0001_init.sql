@@ -291,6 +291,29 @@ CREATE TABLE object_writes (
 CREATE INDEX idx_object_writes_kind
     ON object_writes("group", kind, resource_version, object_id, op);
 
+-- ObjectWritesSweep's maxAge bound. Without it the age sweep is a full scan of
+-- what will be the largest table in the database, on every GC tick.
+CREATE INDEX idx_object_writes_age ON object_writes(written_at);
+
+-- ============================================================
+-- object_writes_horizon
+-- What retention has removed from object_writes, per kind. A
+-- resume BELOW trimmed_through is refused: the log has a hole
+-- under it. A cursor sitting exactly on it has lost nothing —
+-- the next unread entry is trimmed_through + 1.
+-- ObjectWritesSweep is the only writer.
+-- ============================================================
+
+-- WITHOUT ROWID, for the edges reasons: a composite text key a rowid table would
+-- store twice, tiny rows, one row per kind rather than per write, and reads
+-- always by full primary key.
+CREATE TABLE object_writes_horizon (
+    "group"         TEXT    NOT NULL,
+    kind            TEXT    NOT NULL,
+    trimmed_through INTEGER NOT NULL, -- highest resource_version trimmed for this kind
+    PRIMARY KEY ("group", kind)
+) STRICT, WITHOUT ROWID;
+
 -- ============================================================
 -- resource_version_seq
 -- Monotonic global write cursor, decoupled from the objects table.

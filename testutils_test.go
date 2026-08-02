@@ -423,6 +423,9 @@ func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]sto
 func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
 }
+func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int, error) {
+	panic("not implemented: fakeStore.ObjectWritesSweep")
+}
 func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.

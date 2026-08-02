@@ -2232,8 +2232,24 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.Gro
 		}
 		writes = append(writes, w)
 	}
-	// Retention does not exist yet, so nothing has been trimmed.
-	return writes, 0, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	trimmed, err := s.trimmedThrough(ctx, gk)
+	return writes, trimmed, err
+}
+
+// trimmedThrough is gk's retention horizon; no row means nothing has been
+// trimmed, which is 0 rather than an error.
+func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
+	var trimmed int64
+	err := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT trimmed_through FROM object_writes_horizon
+		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&trimmed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return trimmed, err
 }
 
 // ObjectWritesMaxVersion reads gk's log position, covered by
@@ -2244,4 +2260,80 @@ func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context, gk storeapi.Gr
 		SELECT MAX(resource_version) FROM object_writes
 		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&rv)
 	return rv.Int64, err
+}
+
+// ObjectWritesSweep trims the log and records what it removed. The delete and
+// the horizon raise share a transaction: a horizon that lagged its deletes would
+// read as "nothing trimmed" and let a resume succeed against a hole.
+//
+// RETURNING, not a bare DELETE: the horizon is per kind, so the sweep has to
+// learn which kinds it touched and how far.
+func (s *sqliteStore) ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error) {
+	var deleted int
+	err := s.Within(ctx, func(ctx context.Context) error {
+		if maxAge > 0 {
+			n, err := s.trimWriteLog(ctx, `written_at < ?`,
+				toMillis(time.Now().UTC().Add(-maxAge)))
+			if err != nil {
+				return err
+			}
+			deleted += n
+		}
+		if perKind > 0 {
+			// The newest perKind per ("group", kind), read through
+			// idx_object_writes_kind backwards.
+			n, err := s.trimWriteLog(ctx, `resource_version <= (
+				SELECT w.resource_version FROM object_writes w
+				 WHERE w."group" = object_writes."group" AND w.kind = object_writes.kind
+				 ORDER BY w.resource_version DESC LIMIT 1 OFFSET ?)`, perKind)
+			if err != nil {
+				return err
+			}
+			deleted += n
+		}
+		return nil
+	})
+	return deleted, err
+}
+
+// trimWriteLog deletes the entries matching where and raises each affected
+// kind's horizon to the highest version it removed there.
+func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...any) (int, error) {
+	c := s.conn(ctx)
+	rows, err := c.QueryContext(ctx,
+		`DELETE FROM object_writes WHERE `+where+`
+		 RETURNING "group", kind, resource_version`, args...)
+	if err != nil {
+		return 0, err
+	}
+	type gk = storeapi.GroupKind
+	highest := map[gk]int64{}
+	var deleted int
+	for rows.Next() {
+		var k gk
+		var rv int64
+		if err := rows.Scan(&k.Group, &k.Kind, &rv); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		highest[k] = max(highest[k], rv)
+		deleted++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	for k, rv := range highest {
+		if _, err := c.ExecContext(ctx, `
+			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
+			VALUES (?, ?, ?)
+			    ON CONFLICT("group", kind) DO UPDATE SET trimmed_through = excluded.trimmed_through
+			 WHERE excluded.trimmed_through > object_writes_horizon.trimmed_through`,
+			k.Group, k.Kind, rv); err != nil {
+			return 0, err
+		}
+	}
+	return deleted, nil
 }

@@ -6136,3 +6136,79 @@ func TestObjectWritesMaxVersionScopesToKind(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, empty)
 }
+
+// backdateWriteLogEntry ages one entry so retention can see it, instead of
+// sleeping for it.
+func backdateWriteLogEntry(t *testing.T, store beehive.Store, rv int64, age time.Duration) {
+	t.Helper()
+	_, err := store.(*sqliteStore).db.ExecContext(context.Background(),
+		`UPDATE object_writes SET written_at = ? WHERE resource_version = ?`,
+		toMillis(time.Now().UTC().Add(-age)), rv)
+	require.NoError(t, err)
+}
+
+// The sweep records what it removed, per kind. A single global DELETE trims the
+// rows and learns nothing about which kinds it touched, which leaves the horizon
+// empty — and an empty horizon reads as "nothing was trimmed", so every later
+// resume succeeds against a log with a hole in it.
+func TestObjectWritesSweepRecordsThePerKindHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+
+	staleA := newRefObject(t, store)
+	oldA := newRefObject(t, store)
+	oldB, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	keptA := newRefObject(t, store)
+	keptB, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	backdateWriteLogEntry(t, store, staleA.ResourceVersion, time.Hour)
+	backdateWriteLogEntry(t, store, oldA.ResourceVersion, time.Hour)
+	backdateWriteLogEntry(t, store, oldB.ResourceVersion, time.Hour)
+
+	deleted, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, 3, deleted, "entries removed, not kinds touched")
+
+	pageA, trimmedA, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pageA, 1)
+	assert.Equal(t, keptA.ResourceVersion, pageA[0].ResourceVersion)
+	assert.Equal(t, oldA.ResourceVersion, trimmedA, "the horizon is the highest version removed for this kind")
+
+	pageB, trimmedB, err := store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pageB, 1)
+	assert.Equal(t, keptB.ResourceVersion, pageB[0].ResourceVersion)
+	assert.Equal(t, oldB.ResourceVersion, trimmedB, "each kind carries its own horizon")
+}
+
+// The count bound is a per-kind ring, so a hot kind cannot evict a quiet one.
+func TestObjectWritesSweepCapsEachKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	for range 3 {
+		newRefObject(t, store)
+	}
+	quiet, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	_, err = store.ObjectWritesSweep(ctx, 2, 0)
+	require.NoError(t, err)
+
+	pageA, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	assert.Len(t, pageA, 2, "the busy kind is capped at its newest two")
+	pageB, _, err := store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pageB, 1, "the quiet kind keeps its only entry")
+	assert.Equal(t, quiet.ResourceVersion, pageB[0].ResourceVersion)
+}
