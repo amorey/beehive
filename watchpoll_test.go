@@ -1568,3 +1568,60 @@ func TestWatchNeedsNoController(t *testing.T) {
 	_, err = client.SchedulesWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController, "a schedule still needs a reconciler")
 }
+
+// A create followed by an update inside one interval is still a create. The
+// coalesced entry is the update, but the object was absent from the snapshot, so
+// reporting Modified would hand a cache a change for an id it does not hold —
+// and a controller writing status right after a create makes this the common
+// case, not a rare one.
+func TestCoalescedCreateThenUpdateStaysAdded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, client, _ := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	_, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+
+	// Resuming from 0 puts both entries in one page, as one interval would.
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(0))
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Added, ev.Type, "the unread run began with a create")
+	assert.Equal(t, "b", ev.Object.Spec.Val, "carrying current state, as every change does")
+}
+
+// A create and a delete in one interval still report Deleted: the row is gone,
+// and the entry carries the state to report.
+func TestCoalescedCreateThenDeleteReportsDeleted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(0))
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Deleted, ev.Type)
+	assert.Equal(t, obj.ID, ev.Object.ID)
+}
+
+// A LagFail depth is public input, so an invalid one is an option error rather
+// than a panic in make() or a stream that reports itself lagged immediately.
+func TestLagFailRejectsANonPositiveDepth(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, client, _ := watchFixture(t)
+
+	for _, depth := range []int{0, -1, -2} {
+		_, ch, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagFail, depth))
+		require.ErrorIs(t, err, ErrInvalidOption, "depth %d", depth)
+		assert.Nil(t, ch)
+	}
+
+	// LagBlock ignores depth, as documented.
+	_, _, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagBlock, 0))
+	require.NoError(t, err)
+}

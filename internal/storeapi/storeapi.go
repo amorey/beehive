@@ -528,10 +528,14 @@ type Store interface {
 	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
 
 	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
-	// order, at most limit. trimmedThrough is gk's retention horizon, read in
-	// the same statement: afterRV < trimmedThrough means entries were trimmed
-	// unread and the caller must resync. Equality is fine — the next unread
+	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
+	// unread and the caller must resync; equality is fine, since the next unread
 	// entry is trimmedThrough + 1.
+	//
+	// An implementation MUST read the page and the horizon atomically. Read
+	// apart, a retention sweep landing between them can trim entries the page
+	// already captured and then report a horizon above the caller's cursor,
+	// which reads as unrecoverable loss for a stream that lost nothing.
 	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for

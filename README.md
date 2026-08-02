@@ -521,7 +521,7 @@ snap, ch, err := client.ObjectsWatchList(ctx)
 
 Both are **polls, not subscriptions.** Each tick reads the kind's write-log position, and only a position that moved costs anything more: the entries above the cursor, then one batched read of the objects they name. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
-- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying current state. A batch arrives in write order, not id order.
+- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying current state. An object created *and* updated in the same interval still reports `Added`, since it was not in your snapshot. A batch arrives in write order, not id order.
 - **Latency is the poll interval**, not the write. A quiet tick is one indexed read of a single number. Writing to the event log does not move it, so an object watch stays quiet through a controller that records events on every pass.
 
 **`Deleted` means collected, not requested.** Deleting an object sets `DeletionRequestedAt` and leaves the row live and readable, so you get a `Modified` with that field set. `Deleted` follows only when the GC sweeper physically removes the row — after its finalizers clear, which is controller-defined and unbounded, and after nothing references it any more. So: key on `DeletionRequestedAt != nil` to stop using an object, and on `Deleted` to evict it from a cache.
@@ -533,7 +533,7 @@ A failed poll is logged and skipped rather than fatal, so the stream survives a 
 ```go
 WithResumeFrom(rv int64)             // stream above rv instead of taking a snapshot; ErrWatchTooOld if it was trimmed
 WithLoads(loads ...LoadOption)       // the same eager relations List takes, batched per delivery
-WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffers depth then ends with ErrWatchLagged
+WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffers depth (must be > 0) then ends with ErrWatchLagged
 ```
 
 Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet; an absent object is an empty snapshot, and its creation arrives as `Added`.

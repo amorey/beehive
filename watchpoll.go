@@ -32,7 +32,7 @@ import (
 // WatchOption configures one watch call. A distinct type from Option: these are
 // meaningful only here, and dispatching them on a Beehive or a controller would
 // silently accept nonsense.
-type WatchOption func(*watchConfig)
+type WatchOption func(*watchConfig) error
 
 type watchConfig struct {
 	// resumeFrom is the position to stream above, or nil to take a snapshot.
@@ -49,7 +49,7 @@ const (
 	// LagBlock waits for the subscriber. No change is ever dropped, and a
 	// subscriber that stops reading stalls its own stream and nothing else.
 	LagBlock LagPolicy = iota
-	// LagFail buffers a bounded number of changes and then ends the stream with
+	// LagFail buffers a positive number of changes and then ends the stream with
 	// ErrWatchLagged, so a stalled consumer is told rather than served.
 	LagFail
 )
@@ -59,30 +59,46 @@ const (
 // ErrWatchTooOld when retention has already removed entries above rv, which the
 // caller answers by subscribing again without this option.
 func WithResumeFrom(rv int64) WatchOption {
-	return func(c *watchConfig) { c.resumeFrom = &rv }
+	return func(c *watchConfig) error {
+		c.resumeFrom = &rv
+		return nil
+	}
 }
 
 // WithLagPolicy sets what happens when the subscriber does not keep up. Under
 // LagFail the stream buffers depth changes and then ends with ErrWatchLagged;
 // depth is ignored under LagBlock, the default, and must be positive under
-// LagFail.
+// LagFail — a non-positive one fails with ErrInvalidOption rather than
+// producing a stream that reports itself lagged at once.
 func WithLagPolicy(p LagPolicy, depth int) WatchOption {
-	return func(c *watchConfig) { c.lag, c.lagDepth = p, depth }
+	return func(c *watchConfig) error {
+		if p == LagFail && depth <= 0 {
+			return fmt.Errorf("%w: WithLagPolicy needs a positive depth under LagFail, got %d",
+				ErrInvalidOption, depth)
+		}
+		c.lag, c.lagDepth = p, depth
+		return nil
+	}
 }
 
 // WithLoads eager-loads the same secondary lookups List takes, on the snapshot
 // and on every delivered batch. Batched per batch, not per object, so a watch
 // does not become an N+1.
 func WithLoads(loads ...LoadOption) WatchOption {
-	return func(c *watchConfig) { c.loads = resolveLoads(loads) }
+	return func(c *watchConfig) error {
+		c.loads = resolveLoads(loads)
+		return nil
+	}
 }
 
-func resolveWatch(opts []WatchOption) watchConfig {
+func resolveWatch(opts []WatchOption) (watchConfig, error) {
 	var cfg watchConfig
 	for _, opt := range opts {
-		opt(&cfg)
+		if err := opt(&cfg); err != nil {
+			return watchConfig{}, err
+		}
 	}
-	return cfg
+	return cfg, nil
 }
 
 // watchPoll returns the poll interval; the fallback covers only a Beehive built
@@ -126,7 +142,11 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 // ObjectsWatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	return c.objectStream(ctx, resolveWatch(opts), nil)
+	cfg, err := resolveWatch(opts)
+	if err != nil {
+		return Snapshot[Spec, Status]{}, nil, err
+	}
+	return c.objectStream(ctx, cfg, nil)
 }
 
 // ObjectsWatch streams changes to the single object id, polling a one-row
@@ -136,7 +156,11 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 	// The tail is the kind's: the log carries no index under object_id, so a
 	// single-object watch scans what its kind writes. It reads and decodes only
 	// its own object, though — the filter runs before the batched read.
-	return c.objectStream(ctx, resolveWatch(opts), &id)
+	cfg, err := resolveWatch(opts)
+	if err != nil {
+		return Snapshot[Spec, Status]{}, nil, err
+	}
+	return c.objectStream(ctx, cfg, &id)
 }
 
 // objectStream is the tail behind both object watches.
@@ -311,11 +335,20 @@ func (c *clientImpl[Spec, Status]) poll(
 	// a subscriber is told what happened in the order it happened, and an object
 	// written twice reports once.
 	last := make(map[ObjectID]int64, len(page))
+	// Whether this run began with a create. The coalesced entry is the last one,
+	// which for create-then-update is a WriteUpdate — but the object was absent
+	// from the snapshot, so reporting Modified would hand a cache a change for an
+	// id it does not hold. A controller writing status right after a create makes
+	// that the common case.
+	created := make(map[ObjectID]bool, len(page))
 	for _, w := range page {
 		if only != nil && w.ID != *only {
 			continue
 		}
 		last[w.ID] = w.ResourceVersion
+		if w.Op == WriteCreate {
+			created[w.ID] = true
+		}
 	}
 	order := make([]ObjectWrite, 0, len(last))
 	for _, w := range page {
@@ -362,7 +395,11 @@ func (c *clientImpl[Spec, Status]) poll(
 			c.warnUndecodable("Watch", w.ID, err)
 			continue
 		}
-		changes = append(changes, ObjectChange[Spec, Status]{Type: changeType(w.Op), Object: obj})
+		typ := changeType(w.Op)
+		if typ == Modified && created[w.ID] {
+			typ = Added
+		}
+		changes = append(changes, ObjectChange[Spec, Status]{Type: typ, Object: obj})
 		if w.Op != WriteDelete {
 			loaded = append(loaded, obj)
 		}
@@ -375,9 +412,11 @@ func (c *clientImpl[Spec, Status]) poll(
 	return changes, nil
 }
 
-// changeType maps a log entry to what a subscriber is told. The soft delete is a
-// WriteUpdate, so a finalizing object reports Modified — Deleted means the row
-// is gone.
+// changeType maps one log entry to what a subscriber is told. The soft delete is
+// a WriteUpdate, so a finalizing object reports Modified — Deleted means the row
+// is gone. A coalesced run promotes Modified to Added when the run began with a
+// create; a run ending in a delete stays Deleted either way, since the row is
+// gone and the entry carries the state to report.
 func changeType(op WriteOp) ChangeType {
 	switch op {
 	case WriteCreate:

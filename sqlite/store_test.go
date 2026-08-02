@@ -6317,3 +6317,29 @@ func TestObjectsListByIDsIsKindScoped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 }
+
+// The horizon comes back with the page it belongs to, on both paths: carried by
+// the page's own statement when there are rows, and read on its own when there
+// are none. Reading it separately from a non-empty page would let a sweep landing
+// in between report a horizon above entries the page already captured, ending a
+// stream that lost nothing.
+func TestObjectWritesListSinceCarriesTheHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	old := newRefObject(t, store)
+	kept := newRefObject(t, store)
+	backdateWriteLogEntry(t, store, old.ResourceVersion, time.Hour)
+	_, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	require.NoError(t, err)
+
+	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "precondition: one entry survived")
+	assert.Equal(t, kept.ResourceVersion, page[0].ResourceVersion)
+	assert.Equal(t, old.ResourceVersion, trimmed, "carried by the page's statement")
+
+	empty, trimmed, err := store.ObjectWritesListSince(ctx, testGK, kept.ResourceVersion, 10)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+	assert.Equal(t, old.ResourceVersion, trimmed, "and read on its own when the page is empty")
+}

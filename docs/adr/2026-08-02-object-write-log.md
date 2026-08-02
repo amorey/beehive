@@ -45,9 +45,13 @@ transaction and taking the `resource_version` that write was assigned.
   read on the caller's goroutine, so subscribe-then-act still holds, and
   `Snapshot.ResourceVersion` is the exact seam: the stream carries changes
   strictly above it. Entries coalesce per object and are delivered in write
-  order, keeping delivery level-triggered. One batched `ObjectsListByIDs` reads
-  what a batch names — per-object reads would be serialized round trips on a
-  single connection, which is what made the old full listing competitive.
+  order, keeping delivery level-triggered. A coalesced run that began with a
+  create still reports `Added`: the surviving entry is the later update, but the
+  object was absent from the snapshot, and a controller stamping status right
+  after a create makes that the common case rather than a corner. One batched
+  `ObjectsListByIDs` reads what a batch names — per-object reads would be
+  serialized round trips on a single connection, which is what made the old full
+  listing competitive.
 - **Retention is per kind and bounded by default** (`WithWriteLogRetention`,
   24h). Unlike the event log, an entry lands on every object write and a status
   write bumps `resource_version`, so the log grows at reconcile rate whether or
@@ -55,6 +59,11 @@ transaction and taking the `resource_version` that write was assigned.
   `object_writes_horizon`, in the same transaction as the delete: an empty
   horizon reads as "nothing trimmed", so a lagging horizon would let a resume
   succeed against a log with a hole in it.
+- **The page and its horizon are read atomically**, as one statement. Read
+  apart, a sweep landing between them can trim entries the page already captured
+  and then report a horizon above the caller's cursor — a terminal failure for a
+  stream that lost nothing. An empty page reads the horizon on its own, which is
+  safe: with nothing captured, anything the sweep took really was unread.
 - **The horizon is the resume boundary, and the test is strictly `<`.** A cursor
   equal to `trimmed_through` has lost nothing — the next unread entry is
   `trimmed_through + 1`. This is not an edge case: a kind that stops writing has

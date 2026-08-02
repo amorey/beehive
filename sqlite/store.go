@@ -1046,8 +1046,7 @@ const writeLogColumns = `resource_version, object_id, "group", kind, op`
 // one caller that reports them.
 func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, error) {
 	defer rows.Close()
-	// Capped: a large caller limit must not preallocate for rows the store may not have.
-	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
+	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
 	for rows.Next() {
 		var w storeapi.ObjectWrite
 		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op); err != nil {
@@ -1057,6 +1056,26 @@ func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, error) {
 	}
 	return writes, rows.Err()
 }
+
+// scanWriteLogWithHorizon is scanWriteLog over a select that carries the
+// retention horizon as a trailing column. Every row repeats the same value.
+func scanWriteLogWithHorizon(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	defer rows.Close()
+	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
+	var trimmed int64
+	for rows.Next() {
+		var w storeapi.ObjectWrite
+		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &trimmed); err != nil {
+			return nil, 0, err
+		}
+		writes = append(writes, w)
+	}
+	return writes, trimmed, rows.Err()
+}
+
+// writeLogPageCap caps the preallocation: a large caller limit must not
+// preallocate for rows the store may not have.
+func writeLogPageCap(limit int) int { return min(limit, 1024) }
 
 // attachImages fills Final on the delete entries in page, in one query, and does
 // nothing when the page has none. op identifies them without reading the blob,
@@ -2264,31 +2283,42 @@ func millisPtr(ms int64) *time.Time {
 }
 
 // ObjectWritesListSince reads gk's log entries above afterRV, covered by
-// idx_object_writes_kind except where a delete entry's image is fetched. The
-// horizon rides the same statement so a caller cannot check it against a page
-// the sweep has already moved past.
+// idx_object_writes_kind except where a delete entry's image is fetched.
+//
+// The horizon rides the page's own statement, as a scalar subquery, and MUST
+// keep doing so. Read separately, a sweep landing between the two would trim
+// entries this page already captured and then report a horizon above the
+// caller's cursor — a terminal ErrWatchTooOld for a stream that lost nothing.
+// An empty page is the one case that reads it on its own, and it is safe: with
+// no entries captured, anything the sweep took really was unread.
 func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, 0, nil
 	}
 	rows, err := s.conn(ctx).QueryContext(ctx, `
-		SELECT `+writeLogColumns+` FROM object_writes
+		SELECT `+writeLogColumns+`,
+		       coalesce((SELECT trimmed_through FROM object_writes_horizon
+		                  WHERE "group" = ? AND kind = ?), 0)
+		  FROM object_writes
 		 WHERE "group" = ? AND kind = ? AND resource_version > ?
 		 ORDER BY resource_version LIMIT ?`,
-		gk.Group, gk.Kind, afterRV, limit)
+		gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
 	if err != nil {
 		return nil, 0, err
 	}
-	writes, err := scanWriteLog(rows, limit)
+	writes, trimmed, err := scanWriteLogWithHorizon(rows, limit)
 	if err != nil {
 		return nil, 0, err
+	}
+	if len(writes) == 0 {
+		trimmed, err = s.trimmedThrough(ctx, gk)
+		return nil, trimmed, err
 	}
 	if err := s.attachImages(ctx, writes); err != nil {
 		return nil, 0, err
 	}
-	trimmed, err := s.trimmedThrough(ctx, gk)
-	return writes, trimmed, err
+	return writes, trimmed, nil
 }
 
 // trimmedThrough is gk's retention horizon; no row means nothing has been
