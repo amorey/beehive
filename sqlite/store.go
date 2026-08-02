@@ -2347,3 +2347,48 @@ func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...an
 	}
 	return deleted, nil
 }
+
+// ObjectWritesSnapshot lists gk and reads its log position in one transaction.
+// Separately they could straddle a write: a row listed after the position was
+// read would never reach the stream, since the stream starts above it.
+func (s *sqliteStore) ObjectWritesSnapshot(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, int64, error) {
+	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+		return s.ObjectsList(ctx, gk)
+	})
+}
+
+// ObjectWritesSnapshotByID reads one row rather than the kind, and folds both
+// "not there" cases — missing and foreign — into an empty result.
+func (s *sqliteStore) ObjectWritesSnapshotByID(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
+	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+		obj, err := s.ObjectsGet(ctx, id)
+		if errors.Is(err, storeapi.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil || obj.Group != gk.Group || obj.Kind != gk.Kind {
+			return nil, err
+		}
+		return []*storeapi.RawObject{obj}, nil
+	})
+}
+
+func (s *sqliteStore) snapshot(
+	ctx context.Context,
+	gk storeapi.GroupKind,
+	list func(context.Context) ([]*storeapi.RawObject, error),
+) ([]*storeapi.RawObject, int64, error) {
+	var rows []*storeapi.RawObject
+	var at int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if rows, err = list(ctx); err != nil {
+			return err
+		}
+		at, err = s.ObjectWritesMaxVersion(ctx, gk)
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return rows, at, nil
+}

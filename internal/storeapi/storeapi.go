@@ -533,6 +533,16 @@ type Store interface {
 	// monotonic — a delete lowers it — so consumers compare for inequality.
 	ObjectWritesMaxVersionAll(ctx context.Context) (int64, error)
 
+	// ObjectWritesSnapshot returns every object of kind gk and the log position
+	// the listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what ObjectWritesMaxVersion reports.
+	ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error)
+
+	// ObjectWritesSnapshotByID is ObjectWritesSnapshot for one object: the row,
+	// or no rows when id does not exist or belongs to another kind, and gk's log
+	// position — the kind's, because the stream that follows tails the kind.
+	ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
+
 	// ObjectWritesSweep trims the write log to the retention bounds and returns
 	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
 	// its newest perKind entries; maxAge > 0 drops entries written more than

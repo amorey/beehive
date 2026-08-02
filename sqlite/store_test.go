@@ -6230,3 +6230,50 @@ func TestObjectWritesMaxVersionHoldsTheHorizon(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, obj.ResourceVersion, at)
 }
+
+// The snapshot and its position are read together, so a stream that resumes at
+// that position sees every write made after the listing and none made before it.
+func TestObjectWritesSnapshotIsConsistent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	first := newRefObject(t, store)
+	second := newRefObject(t, store)
+
+	rows, at, err := store.ObjectWritesSnapshot(ctx, testGK)
+	require.NoError(t, err)
+	assert.Len(t, rows, 2)
+	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, position, at)
+	assert.GreaterOrEqual(t, at, second.ResourceVersion)
+
+	later := newRefObject(t, store)
+	assert.Greater(t, later.ResourceVersion, at, "a write after the listing is above its position")
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, at, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "the stream picks up exactly what the snapshot missed")
+	assert.Equal(t, later.ID, page[0].ID)
+	assert.NotEqual(t, first.ID, page[0].ID)
+}
+
+// The one-object snapshot reads one row but reports the KIND's position: the
+// stream that follows it tails the kind's log.
+func TestObjectWritesSnapshotByIDReadsOneRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	mine := newRefObject(t, store)
+	newRefObject(t, store)
+
+	rows, at, err := store.ObjectWritesSnapshotByID(ctx, testGK, mine.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, mine.ID, rows[0].ID)
+	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, position, at, "the kind's position, not this row's version")
+
+	foreign, _, err := store.ObjectWritesSnapshotByID(ctx, beehive.GroupKind{Kind: "Other"}, mine.ID)
+	require.NoError(t, err)
+	assert.Empty(t, foreign, "another kind cannot see this row")
+}
