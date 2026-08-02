@@ -6492,6 +6492,18 @@ func TestWriteLogReadsSurfaceADBError(t *testing.T) {
 	}
 }
 
+// The page read surfaces a broken log rather than reporting an empty page, which
+// a tail would take as "nothing changed" and advance past.
+func TestObjectWritesListSinceSurfacesABrokenLog(t *testing.T) {
+	store := newRawStore(t)
+	newRefObject(t, store)
+	dropWriteLog(t, store)
+
+	_, _, err := store.ObjectWritesListSince(context.Background(), testGK, 0, 10)
+
+	require.Error(t, err)
+}
+
 // A missing or foreign id reads as no rows, not as an error: the watch it backs
 // streams nothing until the id exists.
 func TestObjectWritesSnapshotByIDFoldsAbsence(t *testing.T) {
@@ -6561,6 +6573,18 @@ func TestObjectWritesSweepSurfacesBrokenTables(t *testing.T) {
 		dropWriteLog(t, store)
 
 		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		require.Error(t, err)
+	})
+
+	// The age bound trims without enumerating kinds, so it reaches the delete on
+	// its own path. Covered explicitly rather than left to whichever background
+	// sweeper happens to meet a torn-down store first.
+	t.Run("no log to age out", func(t *testing.T) {
+		store := newRawStore(t)
+		newRefObject(t, store)
+		dropWriteLog(t, store)
+
+		_, err := store.ObjectWritesSweep(ctx, 0, time.Hour)
 		require.Error(t, err)
 	})
 
