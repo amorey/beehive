@@ -18,6 +18,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -203,6 +204,27 @@ func TestWakeHubPublishesPerCascadedKind(t *testing.T) {
 	assert.NoError(t, err, "cascade published no wake for ChildA")
 	_, err = rxB.RecvContext(ctx)
 	assert.NoError(t, err, "cascade published no wake for ChildB")
+}
+
+// A write that never commits wakes nobody: the publish rides AfterCommit, so a
+// rollback discards it with the row it would have announced.
+func TestWakeHubSilentOnRollback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	w := newWriteWorld(t)
+	rx := w.bh.wakes.Watch(clientTestGK)
+	defer rx.Close()
+
+	err := w.bh.store.Within(ctx, func(ctx context.Context) error {
+		_, err := w.client.Create(ctx, "rolled-back", cSpec{})
+		require.NoError(t, err)
+		return errBoom
+	})
+	require.ErrorIs(t, err, errBoom)
+
+	_, err = rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }
 
 // writeWorld is the beehive plus both write surfaces the wake table drives.
