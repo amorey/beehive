@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/amorey/gobus"
+	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -256,6 +257,45 @@ func TestWakeHubClosesOnStop(t *testing.T) {
 		_, err = rx.RecvContext(ctx)
 		assert.ErrorIs(t, err, gobus.ErrClosed)
 	})
+}
+
+// A commit wakes the tailer, which delivers without any interval elapsing.
+func TestTailerDeliversOnWake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	w := newWriteWorld(t)
+	tailer, rx := startTailer(t, w.bh, clientTestGK)
+
+	obj := mustCreate(t, ctx, w.client, "tailed", cSpec{Val: "a"})
+
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, ev.Key)
+	assert.Equal(t, WriteCreate, ev.Value.Op)
+	require.NotNil(t, ev.Value.Object)
+	assert.Equal(t, obj.ResourceVersion, ev.Value.Object.ResourceVersion)
+	assert.Equal(t, tailer.gk, clientTestGK)
+}
+
+// startTailer runs one tailer with a receiver attached, and tears both down with
+// the test.
+func startTailer(t *testing.T, bh *Beehive, gk GroupKind) (*objectTailer, *conflate.Receiver[ObjectID, rawChange]) {
+	t.Helper()
+	tailer, err := newObjectTailer(context.Background(), bh, gk)
+	require.NoError(t, err)
+	rx := tailer.hub.Receiver()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tailer.run(bh.tailCtx)
+	}()
+	t.Cleanup(func() {
+		rx.Close()
+		bh.tailCancel()
+		<-done
+	})
+	return tailer, rx
 }
 
 // writeWorld is the beehive plus both write surfaces the wake table drives.

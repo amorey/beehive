@@ -15,8 +15,11 @@
 package beehive
 
 import (
+	"context"
+	"fmt"
 	"sync/atomic"
 
+	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
 )
 
@@ -63,4 +66,182 @@ func (h wakeHub) Close() {
 	if h.hub != nil {
 		h.hub.Sender().Close()
 	}
+}
+
+// rawChange is what the tailer fans out: one object's newest log entry plus the
+// state to report it with. Undecoded on purpose — two clients may watch one kind
+// with different type parameters, so decode belongs to each subscriber.
+type rawChange struct {
+	ID              ObjectID
+	Op              WriteOp
+	ResourceVersion int64
+	// Object is the row as read back, or the log entry's row image for a delete.
+	Object *RawObject
+}
+
+// objectTailer is one kind's shared reader: it owns the kind's cursor, runs the
+// gate, log page and batched read once, and fans the result out to every watch
+// on the kind. One goroutine per kind, not per watch.
+type objectTailer struct {
+	bh     *Beehive
+	gk     GroupKind
+	hub    *conflate.Hub[ObjectID, rawChange]
+	wakes  *watch.Receiver[GroupKind, int64]
+	cursor int64
+}
+
+// newObjectTailer registers the wake receiver BEFORE reading the starting
+// cursor — a write landing between the two would otherwise be lost to both —
+// and reads the cursor before returning, so a subscriber that snapshots after
+// this call cannot fall into the gap either.
+func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTailer, error) {
+	t := &objectTailer{
+		bh:    bh,
+		gk:    gk,
+		hub:   conflate.New[ObjectID](mergeRawChange),
+		wakes: bh.wakes.Watch(gk),
+	}
+	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)
+	if err != nil {
+		t.close()
+		return nil, err
+	}
+	t.cursor = at
+	return t, nil
+}
+
+// close releases the tailer's hub and wake receiver.
+func (t *objectTailer) close() {
+	t.wakes.Close()
+	t.hub.Sender().Close()
+}
+
+// mergeRawChange resolves two undelivered changes for one object into one.
+func mergeRawChange(prev, next rawChange) (rawChange, bool) {
+	return next, true
+}
+
+// run tails the kind's log until ctx ends, waking on a commit rather than a
+// tick. Everything at or below the starting cursor is a subscriber's snapshot
+// to report, not the tail's.
+func (t *objectTailer) run(ctx context.Context) {
+	defer t.close()
+	for {
+		if _, err := t.wakes.RecvContext(ctx); err != nil {
+			return
+		}
+		if err := t.step(ctx); err != nil {
+			t.bh.log().Warn("watch tail step failed", "kind", t.gk.Kind, "err", err)
+		}
+	}
+}
+
+// step reads one page of the kind's log above the cursor and publishes what it
+// found. The gate read makes a quiet wake cost one number.
+func (t *objectTailer) step(ctx context.Context) error {
+	at, err := t.bh.store.ObjectWritesMaxVersion(ctx, t.gk)
+	if err != nil {
+		return err
+	}
+	// The position folds in the retention horizon, so it only rises: > is the
+	// test, and an unmoved position means nothing was written.
+	if at <= t.cursor {
+		return nil
+	}
+	page, trimmedThrough, err := t.bh.store.ObjectWritesListSince(ctx, t.gk, t.cursor, tailPageCap)
+	if err != nil {
+		return err
+	}
+	// Strictly <: a cursor sitting exactly on the horizon has lost nothing.
+	if t.cursor < trimmedThrough {
+		return fmt.Errorf("%w: %s/%s trimmed through %d, tail was at %d",
+			ErrWatchTooOld, t.gk.Group, t.gk.Kind, trimmedThrough, t.cursor)
+	}
+	if len(page) == 0 {
+		return nil
+	}
+
+	changes, err := t.collect(ctx, page)
+	if err != nil {
+		return err
+	}
+	for _, ch := range changes {
+		if err := t.hub.Sender().Send(ch.ID, ch); err != nil {
+			return nil // sender closed: the beehive is stopping
+		}
+	}
+	t.cursor = page[len(page)-1].ResourceVersion
+	return nil
+}
+
+// collect coalesces a log page to the last entry per object and reads the
+// current state of everything still live, in one batch.
+func (t *objectTailer) collect(ctx context.Context, page []ObjectWrite) ([]rawChange, error) {
+	// The page arrives ascending and resource_version is the log's primary key,
+	// so keeping the entry that matches each id's highest version preserves write
+	// order without a sort.
+	last := make(map[ObjectID]int64, len(page))
+	// Whether this run began with a create. The coalesced entry is the last one,
+	// which for create-then-update is a WriteUpdate — but the object was absent
+	// from the subscriber's snapshot, so reporting Modified would hand a cache a
+	// change for an id it does not hold.
+	created := make(map[ObjectID]bool, len(page))
+	for _, w := range page {
+		last[w.ID] = w.ResourceVersion
+		if w.Op == WriteCreate {
+			created[w.ID] = true
+		}
+	}
+	order := make([]ObjectWrite, 0, len(last))
+	for _, w := range page {
+		if last[w.ID] == w.ResourceVersion {
+			order = append(order, w)
+		}
+	}
+
+	// One batched read for everything still live. Per-object reads would be
+	// serialized round trips on a single connection.
+	live := make([]ObjectID, 0, len(order))
+	for _, w := range order {
+		if w.Op != WriteDelete {
+			live = append(live, w.ID)
+		}
+	}
+	rows, err := t.bh.store.ObjectsListByIDs(ctx, t.gk, live)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[ObjectID]*RawObject, len(rows))
+	for _, raw := range rows {
+		byID[raw.ID] = raw
+	}
+
+	changes := make([]rawChange, 0, len(order))
+	for _, w := range order {
+		raw := w.Final
+		if w.Op != WriteDelete {
+			// Absent means collected between the two reads. Skip it: the delete
+			// appended its own entry above this page, so it arrives later.
+			if raw = byID[w.ID]; raw == nil {
+				continue
+			}
+		}
+		if raw == nil {
+			// A delete entry with no row image. The store contract forbids this,
+			// but Store is a public extension point.
+			t.bh.log().Warn("watch tail dropped a change", "kind", t.gk.Kind, "id", w.ID, "err", errNoRowImage)
+			continue
+		}
+		op := w.Op
+		if op == WriteUpdate && created[w.ID] {
+			op = WriteCreate
+		}
+		changes = append(changes, rawChange{
+			ID:              w.ID,
+			Op:              op,
+			ResourceVersion: w.ResourceVersion,
+			Object:          raw,
+		})
+	}
+	return changes, nil
 }
