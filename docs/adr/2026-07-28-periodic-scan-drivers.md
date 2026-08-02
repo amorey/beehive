@@ -144,7 +144,7 @@ concurrency until a workload shows the stall.
 
 ### Client watches poll and diff
 
-The two object watches — `ObjectsWatch` and `ObjectsWatchList` — hold the
+The two object watches — `Watch` and `WatchList` — hold the
 `resource_version` of what they last reported and emit the difference: absent then
 present is `Added`, a moved version is `Modified`, present then absent is `Deleted`.
 

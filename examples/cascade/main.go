@@ -144,9 +144,9 @@ func main() {
 
 	// Watch before creating, so each object's lifecycle reads in order from Added.
 	// A poll coalesces, so a step shorter than the interval can still be skipped.
-	_, clusterCh, err := clusterClient.ObjectsWatchList(ctx)
+	_, clusterCh, err := clusterClient.WatchList(ctx)
 	exitOnErr(err)
-	_, cacheCh, err := cacheClient.ObjectsWatchList(ctx)
+	_, cacheCh, err := cacheClient.WatchList(ctx)
 	exitOnErr(err)
 
 	// A Cluster guarded by a connection finalizer, owning two caches that each

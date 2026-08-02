@@ -207,7 +207,7 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	snap, _, err := client.ObjectsWatchList(ctx)
+	snap, _, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	require.Len(t, snap.Objects, 1, "the poison row is quarantined, not fatal")
@@ -1102,7 +1102,7 @@ func TestClientWatchNonExistentID(t *testing.T) {
 
 	// Watch a non-existent ID: the snapshot loader returns (nil, nil) via the
 	// ErrNotFound path, yielding an empty snapshot and an open channel.
-	_, ch, err := client.ObjectsWatch(ctx, 9999)
+	_, ch, err := client.Watch(ctx, 9999)
 	require.NoError(t, err)
 
 	// Cancel ctx — channel must close cleanly (no events, just the cancel).
@@ -1505,7 +1505,7 @@ func watchTestClient(t *testing.T) (context.Context, Client[cSpec, cStatus]) {
 func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	_, ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -1523,7 +1523,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 
 	// Subscribe before creating so the snapshot is empty and the first event is
 	// the Modified from the Update, not an Added from the snapshot.
-	_, ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
@@ -1545,7 +1545,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	_, ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
@@ -1565,7 +1565,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	_, ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
@@ -1602,12 +1602,12 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	obj1 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	obj2 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
-	snap, ch, err := client.ObjectsWatch(ctx, obj1.ID)
+	snap, ch, err := client.Watch(ctx, obj1.ID)
 	require.NoError(t, err)
 
 	// The snapshot holds obj1 and nothing else; the stream carries what follows.
-	require.Len(t, snap.Objects, 1)
-	assert.Equal(t, obj1.ID, snap.Objects[0].ID)
+	require.NotNil(t, snap.Object)
+	assert.Equal(t, obj1.ID, snap.Object.ID)
 
 	// Update obj2 first — this event must not appear on ch.
 	_, err = client.UpdateByID(ctx, obj2.ID, cSpec{Val: "b2"})
@@ -1628,7 +1628,7 @@ func TestWatchListClosesOnCtxCancel(t *testing.T) {
 	parent, client := watchTestClient(t)
 	ctx, cancel := context.WithCancel(parent)
 
-	_, ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	cancel()
@@ -1643,7 +1643,7 @@ func TestWatchClosesOnCtxCancel(t *testing.T) {
 	obj, err := client.Create(parent, "decoded", cSpec{})
 	require.NoError(t, err)
 
-	_, ch, err := client.ObjectsWatch(ctx, obj.ID)
+	_, ch, err := client.Watch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	cancel()
@@ -1678,7 +1678,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 
 	// Subscribe after create: the object is in the snapshot, and the stream
 	// carries the Modified that UpdateStatus makes next.
-	snap, ch, err := client2.ObjectsWatchList(ctx)
+	snap, ch, err := client2.WatchList(ctx)
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 	assert.Equal(t, obj.ID, snap.Objects[0].ID)
@@ -1701,7 +1701,7 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
-	snap, _, err := client.ObjectsWatchList(ctx)
+	snap, _, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	seen := map[ObjectID]string{}
@@ -1719,12 +1719,12 @@ func TestWatchInitialSnapshot(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	snap, _, err := client.ObjectsWatch(ctx, obj.ID)
+	snap, _, err := client.Watch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	require.Len(t, snap.Objects, 1)
-	assert.Equal(t, obj.ID, snap.Objects[0].ID)
-	assert.Equal(t, "hello", snap.Objects[0].Spec.Val)
+	require.NotNil(t, snap.Object)
+	assert.Equal(t, obj.ID, snap.Object.ID)
+	assert.Equal(t, "hello", snap.Object.Spec.Val)
 }
 
 // TestStartAfterStopErrors verifies that Beehive is a one-shot object: calling
@@ -1760,13 +1760,13 @@ func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
 
-	snap, _, err := client.ObjectsWatchList(ctx)
+	snap, _, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, snap.Objects)
 
-	snap, _, err = client.ObjectsWatch(ctx, 0)
+	one, _, err := client.Watch(ctx, 0)
 	require.NoError(t, err)
-	assert.Empty(t, snap.Objects)
+	assert.Nil(t, one.Object)
 }
 
 func TestClientGetOwner(t *testing.T) {

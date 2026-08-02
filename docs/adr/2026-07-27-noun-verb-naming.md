@@ -27,8 +27,9 @@ for many. Plural rather than singular so each family has exactly one prefix —
 `EdgesListIncoming`.
 
 **Omit the prefix when the family is already the receiver's own.** `Client` is its
-kind, so `Create`/`Get`/`Update`/`Delete`/`List` stay bare; only its secondary nouns
-(events, schedule, relations, the object watches) take one. On `ControllerClient` the
+kind, so `Create`/`Get`/`Update`/`Delete`/`List`/`Watch`/`WatchList` stay bare; only
+its secondary nouns (events, schedule, relations) take one. See the amendment below:
+the object watches were listed here as a secondary noun until 2026-08-02. On `ControllerClient` the
 line falls between a **column on the object's row** and a **table of its own**:
 `UpdateStatus` stays bare, while conditions, finalizers, events and edges — each its
 own table — are prefixed.
@@ -138,3 +139,13 @@ change to a public surface rather than a rename, so it is not part of this work.
 
 The convention covers every public surface, so a new method has exactly one
 defensible name and reviewers argue about the noun rather than the shape.
+
+## Amendments
+
+**2026-08-02 — the object watches lost their prefix.** `ObjectsWatch` and
+`ObjectsWatchList` became `Watch` and `WatchList`. Listing them as a secondary noun
+was the error: they stream the client's own kind, so the omit-the-prefix rule reaches
+them exactly as it reaches `List`. Bare `Watch` beside `EventsWatch` reads the way
+bare `List` already reads beside `EventsList`, and the `Get`/`List` cardinality
+pairing returns. The `Object` noun stays where it carries information — the return
+types `ObjectSnapshot`, `ObjectListSnapshot` and `ObjectChange`.

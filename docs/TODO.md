@@ -566,7 +566,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
 - **`EventsWatch` did not follow the object watches onto the write log** — so
   two watch surfaces on the same `Client` now behave differently for reasons a
-  caller cannot see. Object watches return a `Snapshot` plus a stream, resume
+  caller cannot see. Object watches return a snapshot plus a stream, resume
   from a `resource_version`, and end with `ErrWatchTooOld` when their entries
   are trimmed. `EventsWatch` still polls, diffs by `EventID`, hands its initial
   runs back through the channel, and cannot resume.

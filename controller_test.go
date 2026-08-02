@@ -147,7 +147,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	snap, ch, err := client.ObjectsWatchList(ctx)
+	snap, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 

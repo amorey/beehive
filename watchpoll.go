@@ -55,7 +55,7 @@ const (
 )
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
-// returned Snapshot holds no objects and carries rv back. Fails with
+// returned snapshot holds no objects and carries rv back. Fails with
 // ErrWatchTooOld when retention has already removed entries above rv, which the
 // caller answers by subscribing again without this option.
 func WithResumeFrom(rv int64) WatchOption {
@@ -152,33 +152,41 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 	return true
 }
 
-// ObjectsWatchList streams changes to every object of this client's kind. See
+// WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	cfg, err := resolveWatch(opts)
 	if err != nil {
-		return Snapshot[Spec, Status]{}, nil, err
+		return ObjectListSnapshot[Spec, Status]{}, nil, err
 	}
 	return c.objectStream(ctx, cfg, nil)
 }
 
-// ObjectsWatch streams changes to the single object id, polling a one-row
+// Watch streams changes to the single object id, polling a one-row
 // listing: an id that does not exist yet streams nothing until created, and its
 // removal reads as a Deleted.
-func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The tail is the kind's: the log carries no index under object_id, so a
 	// single-object watch scans what its kind writes. It reads and decodes only
 	// its own object, though — the filter runs before the batched read.
 	cfg, err := resolveWatch(opts)
 	if err != nil {
-		return Snapshot[Spec, Status]{}, nil, err
+		return ObjectSnapshot[Spec, Status]{}, nil, err
 	}
-	return c.objectStream(ctx, cfg, &id)
+	list, ch, err := c.objectStream(ctx, cfg, &id)
+	if err != nil {
+		return ObjectSnapshot[Spec, Status]{}, nil, err
+	}
+	snap := ObjectSnapshot[Spec, Status]{ResourceVersion: list.ResourceVersion}
+	if len(list.Objects) > 0 {
+		snap.Object = list.Objects[0]
+	}
+	return snap, ch, nil
 }
 
 // objectStream is the tail behind both object watches.
 //
-// The returned Snapshot is read on the caller's goroutine, which is what makes
+// The returned snapshot is read on the caller's goroutine, which is what makes
 // "subscribe, then act" safe: a change the caller makes next — including a
 // delete — lands above the position the snapshot carries. A failed first read
 // therefore returns an error instead of a stream whose guarantee is quietly
@@ -201,17 +209,17 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
 	cfg watchConfig,
 	only *ObjectID,
-) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The migrator is invariant for the stream's lifetime.
 	mig := c.bh.migratorFor(c.gk)
 
-	var snap Snapshot[Spec, Status]
+	var snap ObjectListSnapshot[Spec, Status]
 	if cfg.resumeFrom != nil {
 		// A resume reads no state; it only has to prove the position is still
 		// inside the log. The probe is one bounded listing, and a trim after it
 		// is caught by the tail's own check.
 		if err := c.resumable(ctx, *cfg.resumeFrom); err != nil {
-			return Snapshot[Spec, Status]{}, nil, err
+			return ObjectListSnapshot[Spec, Status]{}, nil, err
 		}
 		snap.ResourceVersion = *cfg.resumeFrom
 	} else {
@@ -219,13 +227,13 @@ func (c *clientImpl[Spec, Status]) objectStream(
 		// caller can act on. Every later failure costs one tick.
 		raws, at, err := c.snapshot(ctx, only)
 		if err != nil {
-			return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+			return ObjectListSnapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
 		snap.ResourceVersion = at
 		snap.Objects = c.decodeList(raws, "Watch")
 		if err := c.loadListRelated(ctx, snap.Objects, cfg.loads); err != nil {
-			return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+			return ObjectListSnapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
 	}
