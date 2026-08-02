@@ -154,7 +154,7 @@ func TestWakerSeedsFromTheStoredCursor(t *testing.T) {
 	assert.Equal(t, []int64{200}, store.cursors(), "the first scan resumes at the stored cursor")
 }
 
-// ObjectWritesMaxVersion is a max over live rows, so deleting the
+// ObjectWritesMaxVersionAll is a max over live rows, so deleting the
 // highest-versioned object legitimately lowers it below a cursor the waker
 // really did process. A stored cursor above the mark is therefore not evidence
 // of a swapped or truncated database, and clamping to the mark rather than

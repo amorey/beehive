@@ -89,7 +89,26 @@ type ObjectWrite struct {
 
 	// ResourceVersion is the store-wide cursor value the row now holds.
 	ResourceVersion int64
+
+	Group string
+	Kind  string
+	Op    WriteOp
+
+	// Final is the object as it was when collected, set on a WriteDelete entry
+	// and nil otherwise. A live row is read back from objects, so only a delete
+	// has nowhere else to put its state.
+	Final *RawObject
 }
+
+// WriteOp is what an ObjectWrite recorded. The soft delete is a WriteUpdate: the
+// row is still live and readable, so only collection is WriteDelete.
+type WriteOp int
+
+const (
+	WriteCreate WriteOp = 1
+	WriteUpdate WriteOp = 2
+	WriteDelete WriteOp = 3
+)
 
 // Condition is the untyped form of one condition row. Status is "True", "False"
 // or "Unknown". Liveness marks an in-process condition, valid only inside the
@@ -493,19 +512,26 @@ type Store interface {
 	// narrowing to registered targets would silently strand its dependents.
 	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
 
-	// ObjectWritesListSince returns the live writes above afterRV in cursor order,
-	// at most limit. No blobs, every kind. A row deleted since afterRV is
-	// simply absent — no tombstones. resource_version always increases and is
-	// never reused, so a watermark scan is lossless however stale.
-	ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
+	// order, at most limit. trimmedThrough is gk's retention horizon, read in
+	// the same statement: afterRV < trimmedThrough means entries were trimmed
+	// unread and the caller must resync. Equality is fine — the next unread
+	// entry is trimmedThrough + 1.
+	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
-	// ObjectWritesMaxVersion returns the high-water mark of the object write log:
-	// every committed object write is at or below it, and ObjectWritesListSince
-	// returns nothing above it. Maximum over live rows, not the counter, so it
-	// is NOT monotonic — a delete can lower it, which is exactly what a poller
-	// comparing for inequality wants to see, and writes to other logs sharing
-	// the counter (events) never move it.
-	ObjectWritesMaxVersion(ctx context.Context) (int64, error)
+	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for
+	// the dependency waker: an edge can point at a kind with no controller. It
+	// reports no horizon, because the waker's cursor is an optimisation over the
+	// stale-dependents pass rather than a guarantee.
+	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+
+	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at
+	// or below it, and ObjectWritesListSince returns nothing above it.
+	ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error)
+
+	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind. Not
+	// monotonic — a delete lowers it — so consumers compare for inequality.
+	ObjectWritesMaxVersionAll(ctx context.Context) (int64, error)
 }
 
 // FreePagesReleaser is an optional Store capability: a backend that can hand

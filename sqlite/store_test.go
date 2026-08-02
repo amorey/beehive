@@ -2902,7 +2902,7 @@ type writeProbe struct {
 // what lands after this call.
 func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersion(context.Background())
+	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return &writeProbe{t: t, store: store, rv: rv}
 }
@@ -2910,7 +2910,7 @@ func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 // writes returns everything above the cursor without moving it.
 func (p *writeProbe) writes() []storeapi.ObjectWrite {
 	p.t.Helper()
-	got, err := p.store.ObjectWritesListSince(context.Background(), p.rv, 100)
+	got, err := p.store.ObjectWritesListSinceAll(context.Background(), p.rv, 100)
 	require.NoError(p.t, err)
 	return got
 }
@@ -4571,7 +4571,7 @@ func TestScopedMutatorWrongKind(t *testing.T) {
 // cursor, in cursor order, bounded by limit. Kind-agnostic on purpose — a
 // depends_on edge may point at a kind with no controller, so a per-kind query
 // could not name every target whose change was dropped.
-func TestObjectWritesListSince(t *testing.T) {
+func TestObjectWritesListSinceAll(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	otherGK := beehive.GroupKind{Kind: "Other"}
@@ -4590,7 +4590,7 @@ func TestObjectWritesListSince(t *testing.T) {
 
 	// Everything above the first object's version, so `first` is excluded: the
 	// cursor is what the consumer already processed, not where it wants to start.
-	got, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 10)
+	got, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
 		{ID: second.ID, ResourceVersion: second.ResourceVersion},
@@ -4599,18 +4599,18 @@ func TestObjectWritesListSince(t *testing.T) {
 
 	// A limit truncates from the low end, so the caller can page forward by taking
 	// the last row's version as its next cursor.
-	page, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 1)
+	page, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	assert.Equal(t, second.ID, page[0].ID, "the oldest missed change comes first")
 
-	next, err := store.ObjectWritesListSince(ctx, page[0].ResourceVersion, 1)
+	next, err := store.ObjectWritesListSinceAll(ctx, page[0].ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, next, 1)
 	assert.Equal(t, third.ID, next[0].ID, "paging forward from the last row's version")
 
 	// Caught up: nothing above the newest version.
-	none, err := store.ObjectWritesListSince(ctx, third.ResourceVersion, 10)
+	none, err := store.ObjectWritesListSinceAll(ctx, third.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
@@ -4620,7 +4620,7 @@ func TestObjectWritesListSince(t *testing.T) {
 // while anything depends on it, and from_id's CASCADE means a dependent deleted
 // first took its own edge with it — so a row that vanished has no dependents left
 // to strand.
-func TestObjectWritesListSinceSkipsDeletedRows(t *testing.T) {
+func TestObjectWritesListSinceAllSkipsDeletedRows(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -4628,15 +4628,15 @@ func TestObjectWritesListSinceSkipsDeletedRows(t *testing.T) {
 	gone := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
 
-	got, err := store.ObjectWritesListSince(ctx, base.ResourceVersion, 10)
+	got, err := store.ObjectWritesListSinceAll(ctx, base.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Empty(t, got, "the deleted row is absent, not an error")
 }
 
-func TestObjectWritesListSinceDBError(t *testing.T) {
+func TestObjectWritesListSinceAllDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.ObjectWritesListSince(context.Background(), 0, 10)
+	_, err := store.ObjectWritesListSinceAll(context.Background(), 0, 10)
 	require.Error(t, err)
 }
 
@@ -4680,7 +4680,7 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 	newRefObject(t, store)
 
 	for _, limit := range []int{0, -1} {
-		got, err := store.ObjectWritesListSince(ctx, 0, limit)
+		got, err := store.ObjectWritesListSinceAll(ctx, 0, limit)
 		require.NoError(t, err)
 		assert.Empty(t, got, "limit %d asks for nothing, not for everything", limit)
 	}
@@ -5099,7 +5099,7 @@ func TestDriverCursorsSetKeysByName(t *testing.T) {
 // it — what a dependent records as its watermark.
 func cursorNow(t *testing.T, store beehive.Store) int64 {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersion(context.Background())
+	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return rv
 }
@@ -5415,7 +5415,7 @@ func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, before, cursorNow(t, store), "an event write is not an object write")
-	writes, err := store.ObjectWritesListSince(ctx, before, 10)
+	writes, err := store.ObjectWritesListSinceAll(ctx, before, 10)
 	require.NoError(t, err)
 	assert.Empty(t, writes, "and the listing agrees: nothing above the mark")
 }
@@ -6086,3 +6086,53 @@ func TestWriteLogImageCoversRawObject(t *testing.T) {
 
 // ptr is the address of a literal, for the pointer fields on RawObject.
 func ptr[T any](v T) *T { return &v }
+
+// The tail reads one kind. Another kind's writes must not move it, or every
+// watch pays a listing for traffic it can never be shown.
+func TestObjectWritesListSinceScopesToKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	mine := newRefObject(t, store)
+	_, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "only this kind's entries")
+	assert.Equal(t, mine.ID, page[0].ID)
+	assert.Equal(t, mine.ResourceVersion, page[0].ResourceVersion)
+	assert.Equal(t, storeapi.WriteCreate, page[0].Op)
+	assert.Zero(t, trimmed, "nothing has been trimmed")
+
+	page, _, err = store.ObjectWritesListSince(ctx, testGK, mine.ResourceVersion, 10)
+	require.NoError(t, err)
+	assert.Empty(t, page, "afterRV is exclusive")
+}
+
+// The tick gate is per kind for the same reason the listing is.
+func TestObjectWritesMaxVersionScopesToKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	mine := newRefObject(t, store)
+
+	at, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, mine.ResourceVersion, at)
+
+	_, err = store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	again, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, at, again, "another kind's write does not move this kind's position")
+
+	empty, err := store.ObjectWritesMaxVersion(ctx, beehive.GroupKind{Kind: "Nothing"})
+	require.NoError(t, err)
+	assert.Zero(t, empty)
+}

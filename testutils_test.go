@@ -414,10 +414,16 @@ func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) er
 	panic("not implemented: fakeStore.DependencyWatermarksSet")
 }
 
-func (s *fakeStore) ObjectWritesListSince(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
+func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
-func (s *fakeStore) ObjectWritesMaxVersion(context.Context) (int64, error) {
+func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
+	panic("not implemented: fakeStore.ObjectWritesListSinceAll")
+}
+func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
+	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
+}
+func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.
 	return 0, nil
@@ -460,14 +466,14 @@ func changedAt(versions ...int64) []ObjectWrite {
 	return refs
 }
 
-// replayStore serves ObjectWritesListSince from a fixed set of rows, recording the
+// replayStore serves ObjectWritesListSinceAll from a fixed set of rows, recording the
 // cursor and limit of every page it was asked for. It is the whole of what the
 // waker can see, so a test scripts a scan by setting rows and reads back what the
 // waker asked for.
 type replayStore struct {
 	depsStore
 	rows    []ObjectWrite // every live row, in version order
-	seed    int64         // what ObjectWritesMaxVersion reports
+	seed    int64         // what ObjectWritesMaxVersionAll reports
 	pages   [][2]int64    // (afterRV, limit) per call
 	read    int           // rows actually served, across every page
 	listed  *signal       // fires on the first page request, when set
@@ -482,7 +488,7 @@ type replayStore struct {
 	failFromCall int
 }
 
-func (s *replayStore) ObjectWritesMaxVersion(context.Context) (int64, error) {
+func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
 	if s.seedErr != nil {
 		return 0, s.seedErr
 	}
@@ -499,7 +505,7 @@ func (s *replayStore) cursors() []int64 {
 	return out
 }
 
-func (s *replayStore) ObjectWritesListSince(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
 	if s.listed != nil {
 		s.listed.fire()

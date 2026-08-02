@@ -34,7 +34,7 @@ type waker struct {
 	bh *Beehive
 
 	// cursors persists the watermark across restarts when the store supports it;
-	// nil means every restart reseeds from ObjectWritesMaxVersion.
+	// nil means every restart reseeds from ObjectWritesMaxVersionAll.
 	cursors DriverCursorer
 
 	// watermark is the highest resource_version this waker has processed. The
@@ -99,7 +99,7 @@ func (dw *waker) run(ctx context.Context) {
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
 func (dw *waker) seed(ctx context.Context) bool {
-	mark, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
+	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false // shutdown, not a loss
@@ -165,7 +165,7 @@ func (dw *waker) scan(ctx context.Context) {
 	// persists whatever earlier pages advanced the watermark to.
 	defer dw.persist(ctx)
 	for pages := 0; pages < wakeScanPagesPerTick; pages++ {
-		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, wakeScanPageCap)
+		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
 				return // shutdown cancelled this read

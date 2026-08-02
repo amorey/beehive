@@ -253,8 +253,8 @@ type pollProbeStore struct {
 	metaErr      atomic.Bool
 }
 
-func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx)
+func (s *pollProbeStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
+	at, err := s.Store.ObjectWritesMaxVersionAll(ctx)
 	probeSignal(s.polled)
 	return at, err
 }

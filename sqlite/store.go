@@ -983,7 +983,7 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 // It reads objects, not resource_version_seq: the event log draws from that
 // sequence too, and a consumer of this pair must not see the cursor move for a
 // write it can never be shown.
-func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
+func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT MAX(resource_version) FROM objects`).Scan(&rv)
@@ -995,7 +995,7 @@ func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error)
 // route by id and read current state themselves. Kind-agnostic, since a
 // depends_on edge may point at a kind with no controller. A row deleted since
 // afterRV is simply absent.
-func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
+func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, nil
@@ -2195,4 +2195,53 @@ func fromMillis(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
 func millisPtr(ms int64) *time.Time {
 	t := fromMillis(ms)
 	return &t
+}
+
+// ObjectWritesListSince reads gk's log entries above afterRV, covered by
+// idx_object_writes_kind except where a delete entry's image is fetched. The
+// horizon rides the same statement so a caller cannot check it against a page
+// the sweep has already moved past.
+func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	if limit <= 0 {
+		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
+		return nil, 0, nil
+	}
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT resource_version, object_id, op, final FROM object_writes
+		 WHERE "group" = ? AND kind = ? AND resource_version > ?
+		 ORDER BY resource_version LIMIT ?`,
+		gk.Group, gk.Kind, afterRV, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	// Capped: a large caller limit must not preallocate for rows the store may not have.
+	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
+	for rows.Next() {
+		w := storeapi.ObjectWrite{Group: gk.Group, Kind: gk.Kind}
+		var final sql.NullString
+		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Op, &final); err != nil {
+			return nil, 0, err
+		}
+		if final.Valid {
+			w.Final = &storeapi.RawObject{}
+			if err := json.Unmarshal([]byte(final.String), w.Final); err != nil {
+				return nil, 0, err
+			}
+		}
+		writes = append(writes, w)
+	}
+	// Retention does not exist yet, so nothing has been trimmed.
+	return writes, 0, rows.Err()
+}
+
+// ObjectWritesMaxVersion reads gk's log position, covered by
+// idx_object_writes_kind. An empty log reads 0.
+func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
+	var rv sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT MAX(resource_version) FROM object_writes
+		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&rv)
+	return rv.Int64, err
 }

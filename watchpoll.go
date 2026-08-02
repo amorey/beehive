@@ -213,7 +213,7 @@ func (c *clientImpl[Spec, Status]) poll(
 	seen map[ObjectID]tracked[Spec, Status],
 	cursor *int64,
 ) ([]ObjectChange[Spec, Status], error) {
-	at, err := c.bh.store.ObjectWritesMaxVersion(ctx)
+	at, err := c.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		return nil, err
 	}
