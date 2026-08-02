@@ -11,12 +11,12 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   [write-shapes ADR](adr/2026-07-30-store-write-shapes.md) means it should
   return `error` alone.
 
-  [The events push spec](specs/events-push.md) builds its delta from
-  exactly that return value. The store already computes the run to write
-  it, so returning it costs nothing and saves the push path a read. Tidying
-  it away now would have to be undone.
+  An events push path builds its delta from exactly that return value. The
+  store already computes the run to write it, so returning it costs nothing
+  and saves the push path a read. Tidying it away now would have to be
+  undone.
 
-  Revisit only if the events push spec is abandoned.
+  Revisit only if an events push path is ruled out for good.
 
 - **The stale-dependents pass rescans the whole dependency graph on every
   sweep, and a cursor is only sound if the pass records what it finds** —
