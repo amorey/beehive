@@ -130,48 +130,61 @@ func (t *objectTailer) run(ctx context.Context) {
 		if _, err := t.wakes.RecvContext(ctx); err != nil {
 			return
 		}
-		if err := t.step(ctx); err != nil {
-			t.bh.log().Warn("watch tail step failed", "kind", t.gk.Kind, "err", err)
+		// Drain before blocking again: a burst coalesces into one wake, so a
+		// tailer that read a single page per wake would strand the remainder
+		// until some later write. A short page means the log is drained —
+		// exactly, and without the second position read that asking the store
+		// again would cost.
+		for {
+			n, err := t.step(ctx)
+			if err != nil {
+				t.bh.log().Warn("watch tail step failed", "kind", t.gk.Kind, "err", err)
+				break
+			}
+			if n < tailPageCap {
+				break
+			}
 		}
 	}
 }
 
-// step reads one page of the kind's log above the cursor and publishes what it
-// found. The gate read makes a quiet wake cost one number.
-func (t *objectTailer) step(ctx context.Context) error {
+// step reads one page of the kind's log above the cursor, publishes what it
+// found, and returns the page length. The gate read makes a quiet wake cost one
+// number.
+func (t *objectTailer) step(ctx context.Context) (int, error) {
 	at, err := t.bh.store.ObjectWritesMaxVersion(ctx, t.gk)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// The position folds in the retention horizon, so it only rises: > is the
 	// test, and an unmoved position means nothing was written.
 	if at <= t.cursor {
-		return nil
+		return 0, nil
 	}
 	page, trimmedThrough, err := t.bh.store.ObjectWritesListSince(ctx, t.gk, t.cursor, tailPageCap)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// Strictly <: a cursor sitting exactly on the horizon has lost nothing.
 	if t.cursor < trimmedThrough {
-		return fmt.Errorf("%w: %s/%s trimmed through %d, tail was at %d",
+		return 0, fmt.Errorf("%w: %s/%s trimmed through %d, tail was at %d",
 			ErrWatchTooOld, t.gk.Group, t.gk.Kind, trimmedThrough, t.cursor)
 	}
 	if len(page) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	changes, err := t.collect(ctx, page)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for _, ch := range changes {
 		if err := t.hub.Sender().Send(ch.ID, ch); err != nil {
-			return nil // sender closed: the beehive is stopping
+			return 0, nil // sender closed: the beehive is stopping
 		}
 	}
 	t.cursor = page[len(page)-1].ResourceVersion
-	return nil
+	return len(page), nil
 }
 
 // collect coalesces a log page to the last entry per object and reads the

@@ -16,7 +16,9 @@ package beehive
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/amorey/gobus"
@@ -318,6 +320,55 @@ func TestTailerLosesNoWriteAtStartup(t *testing.T) {
 	ev, err := rx.RecvContext(ctx)
 	require.NoError(t, err, "the write that raced startup was never delivered")
 	assert.Equal(t, raced, ev.Key)
+}
+
+// countingTailStore counts the reads a tail step makes.
+type countingTailStore struct {
+	Store
+	gateReads atomic.Int64
+}
+
+func (s *countingTailStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	s.gateReads.Add(1)
+	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+}
+
+// A burst larger than one page drains on its own. The wakes coalesce into one
+// slot, so a tailer that read a single page per wake would strand the remainder
+// until some unrelated later write. The drain loop ends on a short page rather
+// than on a second position read, so a step costs one gate read.
+func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	const burst = tailPageCap + 88
+
+	store := &countingTailStore{Store: newClientTestStore(t)}
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, rx := startTailer(t, bh, clientTestGK)
+	gateReadsAtStart := store.gateReads.Load()
+
+	// One transaction: every write commits together, so the burst is one wake.
+	require.NoError(t, bh.store.Within(ctx, func(ctx context.Context) error {
+		for i := range burst {
+			if _, err := client.Create(ctx, fmt.Sprintf("burst-%d", i), cSpec{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	seen := make(map[ObjectID]bool, burst)
+	for len(seen) < burst {
+		ev, err := rx.RecvContext(ctx)
+		require.NoError(t, err, "burst stalled after %d of %d", len(seen), burst)
+		seen[ev.Key] = true
+	}
+	// Two pages, so two steps, so two gate reads.
+	assert.Equal(t, int64(2), store.gateReads.Load()-gateReadsAtStart)
 }
 
 // startTailer runs one tailer with a receiver attached, and tears both down with
