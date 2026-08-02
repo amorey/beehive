@@ -1684,3 +1684,162 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	assert.Equal(t, survivor.ID, ev.Object.ID)
 	assert.Contains(t, buf.String(), "Watch")
 }
+
+// edgelessStore fails the batched relation read the eager loaders use, so a
+// watch that asked for relations cannot quietly deliver objects without them.
+type edgelessStore struct {
+	Store
+	broken atomic.Bool
+	// failed fires after a refused load, so a test can wait for the tail to have
+	// met the failure instead of watching a log buffer race.
+	failed chan struct{}
+}
+
+func (s *edgelessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
+	if s.broken.Load() {
+		probeSignal(s.failed)
+		return nil, errBoom
+	}
+	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
+}
+
+// A watch that asked for relations fails rather than delivering objects whose
+// accessors would report ErrNotLoaded. On the snapshot that is the call's own
+// error; on a later batch it costs one tick, like any other poll failure.
+func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
+	store.broken.Store(true)
+	bh, err := New(store, fast()...)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	_, _, err = client.ObjectsWatchList(ctx, WithLoads(LoadOwner()))
+	require.ErrorIs(t, err, errBoom, "the snapshot's loads are part of its read")
+	assert.Contains(t, err.Error(), "initial read failed")
+
+	// Drain the snapshot's own signal, or the wait below would be satisfied by it
+	// and the tail would never be observed failing at all.
+	drainProbe(store.failed)
+
+	// Resuming skips the snapshot, so only the tail can fail here.
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(0), WithLoads(LoadOwner()))
+	require.NoError(t, err)
+	waitClosed(t, chanAfter(store.failed, 1), "the tail to meet the failed load")
+	select {
+	case ev := <-ch:
+		t.Fatalf("a batch whose loads failed must deliver nothing, got %+v", ev)
+	default:
+	}
+
+	// One tick, not the stream: with the relation read answering again, the same
+	// batch comes through.
+	store.broken.Store(false)
+	ev := recv(t, ch)
+	assert.Equal(t, obj.ID, ev.Object.ID)
+	_, ok, err := ev.Object.Owner()
+	require.NoError(t, err, "and it carries the relation that was asked for")
+	assert.False(t, ok, "this object has no owner")
+}
+
+// A watch option is validated on both entry points, not only the list watch.
+func TestObjectsWatchValidatesItsOptions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, client, _ := watchFixture(t)
+
+	_, ch, err := client.ObjectsWatch(ctx, 1, WithLagPolicy(LagFail, 0))
+
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.Nil(t, ch)
+}
+
+// A resume checks the horizon before returning a stream, so a store that cannot
+// answer fails the call rather than handing back a stream of unknown standing.
+func TestResumeSurfacesAFailedHorizonCheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	store.listErr.Store(true)
+
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(0))
+
+	require.ErrorIs(t, err, errBoom)
+	assert.Nil(t, ch)
+	assert.Contains(t, err.Error(), "resume check failed")
+}
+
+// emptyPageStore reports a position above the cursor but hands back no entries,
+// which a correct store cannot do. The tail must return quietly rather than
+// indexing the last element of an empty page.
+type emptyPageStore struct {
+	Store
+}
+
+func (s *emptyPageStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
+	return 1 << 40, nil
+}
+
+func (s *emptyPageStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]ObjectWrite, int64, error) {
+	return nil, 0, nil
+}
+
+func TestAnEmptyPageAboveTheCursorIsQuiet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh, err := New(&emptyPageStore{newClientTestStore(t)}, fast()...)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+
+	select {
+	case ev, ok := <-ch:
+		t.Fatalf("nothing to report, got %+v (open=%v)", ev, ok)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// vanishingStore answers the batched read with nothing, standing in for an
+// object collected between the log read and the read of what it named.
+type vanishingStore struct {
+	Store
+	read chan struct{}
+}
+
+func (s *vanishingStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
+	probeSignal(s.read)
+	return nil, nil
+}
+
+// An object the batched read no longer returns is skipped, not reported half
+// built: its delete appended an entry of its own above this page, so it arrives
+// as a Deleted on a later tick.
+func TestAVanishedObjectIsSkipped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &vanishingStore{Store: newClientTestStore(t), read: make(chan struct{}, 256)}
+	bh, err := New(store, fast()...)
+	require.NoError(t, err)
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(0))
+	require.NoError(t, err)
+
+	waitClosed(t, chanAfter(store.read, 1), "the tail to read what the page named")
+	select {
+	case ev := <-ch:
+		t.Fatalf("nothing to report for a row that is gone, got %+v", ev)
+	default:
+	}
+}

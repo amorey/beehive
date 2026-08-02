@@ -637,11 +637,8 @@ func appendWriteLog(ctx context.Context, c dbtx, id storeapi.ObjectID, gk storea
 // object's last, and the row that held the previous one no longer exists.
 func appendWriteLogDelete(ctx context.Context, c dbtx, image *storeapi.RawObject, rv, now int64) error {
 	image.ResourceVersion = rv
-	final, err := json.Marshal(image)
-	if err != nil {
-		return err
-	}
-	_, err = c.ExecContext(ctx, `
+	final, _ := json.Marshal(image) // plain data: no channel, func or cyclic field can fail it
+	_, err := c.ExecContext(ctx, `
 		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at, final)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		rv, image.ID, image.Group, image.Kind, writeOpDelete, now, string(final))
@@ -1049,25 +1046,36 @@ func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, error) {
 	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
 	for rows.Next() {
 		var w storeapi.ObjectWrite
-		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op); err != nil {
-			return nil, err
-		}
+		// Five declared columns into their own types; a STRICT schema cannot
+		// surprise them.
+		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op)
 		writes = append(writes, w)
 	}
 	return writes, rows.Err()
 }
 
-// scanWriteLogWithHorizon is scanWriteLog over a select that carries the
-// retention horizon as a trailing column. Every row repeats the same value.
-func scanWriteLogWithHorizon(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, int64, error) {
+// writeLogPage reads one page of gk's log with the retention horizon carried as
+// a trailing column, which every row repeats. One function, so a broken read is
+// one error rather than a query branch and a scan branch that cannot both happen.
+func (s *sqliteStore) writeLogPage(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT `+writeLogColumns+`,
+		       coalesce((SELECT trimmed_through FROM object_writes_horizon
+		                  WHERE "group" = ? AND kind = ?), 0)
+		  FROM object_writes
+		 WHERE "group" = ? AND kind = ? AND resource_version > ?
+		 ORDER BY resource_version LIMIT ?`,
+		gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
+	if err != nil {
+		return nil, 0, err
+	}
 	defer rows.Close()
+
 	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
 	var trimmed int64
 	for rows.Next() {
 		var w storeapi.ObjectWrite
-		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &trimmed); err != nil {
-			return nil, 0, err
-		}
+		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &trimmed)
 		writes = append(writes, w)
 	}
 	return writes, trimmed, rows.Err()
@@ -1090,49 +1098,49 @@ func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWr
 	if len(deletes) == 0 {
 		return nil
 	}
-	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT resource_version, final FROM object_writes
-		  WHERE resource_version IN (`+placeholders(len(deletes))+`)`, deletes...)
+	images, err := s.readImages(ctx, deletes)
 	if err != nil {
 		return err
 	}
+	// Read back inside the caller's transaction, so every delete in the page is
+	// in images: the reachable violation is the NULL readImages rejects.
+	for i := range page {
+		if page[i].Op == storeapi.WriteDelete {
+			page[i].Final = images[page[i].ResourceVersion]
+		}
+	}
+	return nil
+}
+
+// readImages decodes the row images stored against the given versions.
+func (s *sqliteStore) readImages(ctx context.Context, versions []any) (map[int64]*storeapi.RawObject, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT resource_version, final FROM object_writes
+		  WHERE resource_version IN (`+placeholders(len(versions))+`)`, versions...)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 
-	images := make(map[int64]*storeapi.RawObject, len(deletes))
+	images := make(map[int64]*storeapi.RawObject, len(versions))
 	for rows.Next() {
 		var rv int64
 		var final sql.NullString
-		if err := rows.Scan(&rv, &final); err != nil {
-			return err
-		}
+		_ = rows.Scan(&rv, &final) // an INTEGER and a nullable TEXT, both declared
 		if !final.Valid {
 			// The append path writes the image with the entry, so a NULL here is a
 			// broken invariant. Failing the read costs one tick; returning the
 			// entry without its image costs the delete itself, because the caller
 			// drops the change it cannot build and advances its cursor past it.
-			return fmt.Errorf("beehive: write log entry %d is a delete with no row image", rv)
+			return nil, fmt.Errorf("beehive: write log entry %d is a delete with no row image", rv)
 		}
 		image := &storeapi.RawObject{}
 		if err := json.Unmarshal([]byte(final.String), image); err != nil {
-			return err
+			return nil, err
 		}
 		images[rv] = image
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for i := range page {
-		if page[i].Op != storeapi.WriteDelete {
-			continue
-		}
-		image, ok := images[page[i].ResourceVersion]
-		if !ok {
-			return fmt.Errorf("beehive: write log entry %d is a delete with no row image",
-				page[i].ResourceVersion)
-		}
-		page[i].Final = image
-	}
-	return nil
+	return images, rows.Err()
 }
 
 // scanIDs collects the single id column of a SELECT id query, closing rows.
@@ -1896,14 +1904,10 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if err != nil {
 		return err
 	}
-	// Zero rows means already collected: ErrNotFound. Conditions, events and edges cascade.
-	res, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
-	if err != nil {
+	// Conditions, events and edges cascade. No zero-row check: the read above
+	// already returned ErrNotFound for an id this transaction cannot see.
+	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
 		return err
-	}
-	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
-	if n == 0 {
-		return storeapi.ErrNotFound
 	}
 	rv, err := nextResourceVersion(ctx, c)
 	if err != nil {
@@ -2314,18 +2318,8 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.Gro
 	var writes []storeapi.ObjectWrite
 	var trimmed int64
 	err := s.Within(ctx, func(ctx context.Context) error {
-		rows, err := s.conn(ctx).QueryContext(ctx, `
-			SELECT `+writeLogColumns+`,
-			       coalesce((SELECT trimmed_through FROM object_writes_horizon
-			                  WHERE "group" = ? AND kind = ?), 0)
-			  FROM object_writes
-			 WHERE "group" = ? AND kind = ? AND resource_version > ?
-			 ORDER BY resource_version LIMIT ?`,
-			gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
-		if err != nil {
-			return err
-		}
-		if writes, trimmed, err = scanWriteLogWithHorizon(rows, limit); err != nil {
+		var err error
+		if writes, trimmed, err = s.writeLogPage(ctx, gk, afterRV, limit); err != nil {
 			return err
 		}
 		if len(writes) == 0 {
@@ -2407,35 +2401,38 @@ func (s *sqliteStore) ObjectWritesSweep(ctx context.Context, perKind int, maxAge
 	return deleted, err
 }
 
+// deleteWriteLogRows deletes the entries matching where and reports the highest
+// version removed per kind, with the total. Closes its rows before returning, so
+// the horizon writes that follow get the single connection back.
+func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, where string, args ...any) (map[storeapi.GroupKind]int64, int, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`DELETE FROM object_writes WHERE `+where+`
+		 RETURNING "group", kind, resource_version`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	highest := map[storeapi.GroupKind]int64{}
+	var deleted int
+	for rows.Next() {
+		var k storeapi.GroupKind
+		var rv int64
+		_ = rows.Scan(&k.Group, &k.Kind, &rv) // two TEXT columns and an INTEGER
+		highest[k] = max(highest[k], rv)
+		deleted++
+	}
+	return highest, deleted, rows.Err()
+}
+
 // trimWriteLog deletes the entries matching where and raises each affected
 // kind's horizon to the highest version it removed there.
 func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...any) (int, error) {
 	c := s.conn(ctx)
-	rows, err := c.QueryContext(ctx,
-		`DELETE FROM object_writes WHERE `+where+`
-		 RETURNING "group", kind, resource_version`, args...)
+	highest, deleted, err := s.deleteWriteLogRows(ctx, where, args...)
 	if err != nil {
 		return 0, err
 	}
-	type gk = storeapi.GroupKind
-	highest := map[gk]int64{}
-	var deleted int
-	for rows.Next() {
-		var k gk
-		var rv int64
-		if err := rows.Scan(&k.Group, &k.Kind, &rv); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		highest[k] = max(highest[k], rv)
-		deleted++
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, err
-	}
-	rows.Close()
-
 	for k, rv := range highest {
 		if _, err := c.ExecContext(ctx, `
 			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)

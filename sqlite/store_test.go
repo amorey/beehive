@@ -6362,3 +6362,228 @@ func TestObjectWritesListSinceRefusesAnImagelessDelete(t *testing.T) {
 	require.Error(t, err, "a delete with no image must not be returned as success")
 	assert.Contains(t, err.Error(), "row image")
 }
+
+// dropWriteLog removes the write log, so any write that must record itself
+// fails. The log is not optional: a write nobody can see is worse than a write
+// that failed.
+func dropWriteLog(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE object_writes`)
+	require.NoError(t, err)
+}
+
+// Every mutator fails when it cannot record itself, rather than committing a
+// write no watch will ever report.
+func TestWritesFailWhenTheWriteLogIsGone(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		write func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error
+	}{
+		{
+			name: "create",
+			write: func(t *testing.T, store *sqliteStore, _ *beehive.RawObject) error {
+				_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+					Name: uniqueName(), Spec: []byte(`{}`),
+				})
+				return err
+			},
+		},
+		{
+			name: "spec update",
+			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
+				_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+				return err
+			},
+		},
+		{
+			name: "deletion request",
+			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
+				_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+				return err
+			},
+		},
+		{
+			name: "collection",
+			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
+				return store.ObjectsDelete(ctx, obj.ID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newRawStore(t)
+			obj := newRefObject(t, store)
+			dropWriteLog(t, store)
+
+			require.Error(t, tt.write(t, store, obj))
+		})
+	}
+}
+
+// A page carrying a delete comes back with its row image attached, in the same
+// transaction that read the page.
+func TestObjectWritesListSinceAttachesImages(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	kept := newRefObject(t, store)
+	gone := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 3, "two creates and a collection")
+	assert.Nil(t, page[0].Final, "a create carries no image")
+	assert.Equal(t, kept.ID, page[0].ID)
+	last := page[len(page)-1]
+	require.Equal(t, storeapi.WriteDelete, last.Op)
+	require.NotNil(t, last.Final)
+	assert.Equal(t, gone.Name, last.Final.Name)
+}
+
+// A non-positive limit reads nothing rather than reaching SQLite as an unbounded
+// LIMIT -1.
+func TestObjectWritesListSinceRejectsANonPositiveLimit(t *testing.T) {
+	store := newTestStore(t)
+	newRefObject(t, store)
+
+	page, trimmed, err := store.ObjectWritesListSince(context.Background(), testGK, 0, 0)
+
+	require.NoError(t, err)
+	assert.Empty(t, page)
+	assert.Zero(t, trimmed)
+}
+
+// The reads and the sweep surface a broken store rather than reporting an empty
+// log, which a tail would read as "nothing changed".
+func TestWriteLogReadsSurfaceADBError(t *testing.T) {
+	ctx := context.Background()
+	tests := map[string]func(store *sqliteStore) error{
+		"list since": func(store *sqliteStore) error {
+			_, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+			return err
+		},
+		"max version": func(store *sqliteStore) error {
+			_, err := store.ObjectWritesMaxVersion(ctx, testGK)
+			return err
+		},
+		"snapshot": func(store *sqliteStore) error {
+			_, _, err := store.ObjectWritesSnapshot(ctx, testGK)
+			return err
+		},
+		"snapshot by id": func(store *sqliteStore) error {
+			_, _, err := store.ObjectWritesSnapshotByID(ctx, testGK, 1)
+			return err
+		},
+		"sweep": func(store *sqliteStore) error {
+			_, err := store.ObjectWritesSweep(ctx, 1, time.Hour)
+			return err
+		},
+	}
+
+	for name, read := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := newRawStore(t)
+			store.db.Close()
+
+			require.Error(t, read(store))
+		})
+	}
+}
+
+// A missing or foreign id reads as no rows, not as an error: the watch it backs
+// streams nothing until the id exists.
+func TestObjectWritesSnapshotByIDFoldsAbsence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	missing, at, err := store.ObjectWritesSnapshotByID(ctx, testGK, 9999)
+	require.NoError(t, err)
+	assert.Empty(t, missing)
+	assert.Equal(t, obj.ResourceVersion, at, "still the kind's position")
+
+	foreign, _, err := store.ObjectWritesSnapshotByID(ctx,
+		beehive.GroupKind{Kind: "Other"}, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, foreign)
+}
+
+// A corrupt row image fails the read rather than surfacing a delete entry the
+// caller cannot build a change from.
+func TestObjectWritesListSinceRefusesAnUndecodableImage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	_, err := store.(*sqliteStore).db.ExecContext(ctx,
+		`UPDATE object_writes SET final = 'not json' WHERE op = ?`, writeOpDelete)
+	require.NoError(t, err)
+
+	_, _, err = store.ObjectWritesListSince(ctx, testGK, 0, 10)
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "row image", "this one failed to decode, not to exist")
+}
+
+// The image read surfaces a broken store rather than reporting deletes with no
+// state to report.
+func TestReadImagesSurfacesADBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.readImages(context.Background(), []any{int64(1)})
+
+	require.Error(t, err)
+}
+
+// Collection needs a version for its log entry, so a store that cannot draw one
+// fails the delete rather than removing the row unrecorded.
+func TestObjectsDeleteFailsWithoutAVersionToDraw(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+	require.NoError(t, err)
+
+	require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+}
+
+// The sweep surfaces a broken log and a broken horizon table separately: the
+// first cannot delete, the second cannot record what it deleted.
+func TestObjectWritesSweepSurfacesBrokenTables(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no log to trim", func(t *testing.T) {
+		store := newRawStore(t)
+		newRefObject(t, store)
+		dropWriteLog(t, store)
+
+		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		require.Error(t, err)
+	})
+
+	t.Run("no horizon to record", func(t *testing.T) {
+		store := newRawStore(t)
+		newRefObject(t, store)
+		newRefObject(t, store)
+		_, err := store.db.ExecContext(ctx, `DROP TABLE object_writes_horizon`)
+		require.NoError(t, err)
+
+		_, err = store.ObjectWritesSweep(ctx, 1, 0)
+		require.Error(t, err, "trimming without recording the horizon would let a resume cross a hole")
+	})
+}
+
+// The snapshot surfaces a failed listing rather than reporting an empty kind,
+// which a subscriber would read as "nothing exists yet".
+func TestObjectWritesSnapshotSurfacesAFailedListing(t *testing.T) {
+	store := newRawStore(t)
+	newRefObject(t, store)
+	dropObjects(t, store)
+
+	_, _, err := store.ObjectWritesSnapshot(context.Background(), testGK)
+
+	require.Error(t, err)
+}
