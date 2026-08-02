@@ -91,7 +91,7 @@ func main() {
 	// controller's UpdateStatus as the Modified after it. (A watch started later
 	// would still converge — its first poll reports current state — but it could
 	// report the settled object in one event and never show the intermediate.)
-	watchCh, err := client.ObjectsWatchList(ctx)
+	_, watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
 	obj, err := client.Create(ctx, "world", GreetingSpec{Name: "world"})

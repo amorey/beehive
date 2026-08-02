@@ -78,11 +78,14 @@ type tracked[Spec, Status any] struct {
 
 // ObjectsWatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
-		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
 	return c.objectStream(ctx,
+		func(ctx context.Context) ([]*RawObject, int64, error) {
+			return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
+		},
 		func(ctx context.Context) ([]*RawObject, error) {
 			return c.bh.store.ObjectsList(ctx, c.gk)
 		},
@@ -94,11 +97,14 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan
 // ObjectsWatch streams changes to the single object id, polling a one-row
 // listing: an id that does not exist yet streams nothing until created, and its
 // removal reads as a Deleted.
-func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
-		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
+		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
 	return c.objectStream(ctx,
+		func(ctx context.Context) ([]*RawObject, int64, error) {
+			return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, id)
+		},
 		func(ctx context.Context) ([]*RawObject, error) {
 			raw, err := c.scopedRow(ctx, id, c.bh.store.ObjectsGet)
 			if raw == nil || err != nil {
@@ -148,58 +154,66 @@ func (c *clientImpl[Spec, Status]) scopedRow(
 // is Added, version moved is Modified, present→absent is Deleted (carrying the
 // last known body, since the row is gone). An unmoved version sends nothing.
 //
-// Most ticks skip the listing: an unmoved store-wide cursor proves no row was
-// created or modified, so a quiet tick costs one scalar read plus one blob-free
-// liveness read for deletes (which draw no version). The cursor is the object
-// write log's high-water mark, NOT the shared version counter — the counter
-// moves for event writes too, which would defeat the optimization permanently
-// for any controller that records an event per reconcile.
+// Most ticks skip the listing: an unmoved log position for this kind proves no
+// row was created or modified, so a quiet tick costs one scalar read plus one
+// blob-free liveness read for deletes. The position is the write log's, NOT the
+// shared version counter — the counter moves for event writes too, which would
+// defeat the optimization permanently for any controller that records an event
+// per reconcile.
 //
 // A row that fails to decode is quarantined as List does it.
 func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
+	snapshot func(context.Context) ([]*RawObject, int64, error),
 	list func(context.Context) ([]*RawObject, error),
 	live func(context.Context) ([]ObjectID, error),
-) (<-chan ObjectChange[Spec, Status], error) {
+) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The migrator is invariant for the stream's lifetime.
 	mig := c.bh.migratorFor(c.gk)
-	seen := make(map[ObjectID]tracked[Spec, Status])
-	var cursor int64
 
 	// The snapshot, on the caller's goroutine; its failure is the one the
 	// caller can act on. Every later failure costs one tick.
-	initial, err := c.poll(ctx, list, live, mig, seen, &cursor)
+	raws, at, err := snapshot(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 			c.gk.Group, c.gk.Kind, err)
+	}
+
+	// seen starts where the snapshot left off, so the stream reports what
+	// happened after it and never repeats it.
+	seen := make(map[ObjectID]tracked[Spec, Status], len(raws))
+	snap := Snapshot[Spec, Status]{ResourceVersion: at}
+	for _, raw := range raws {
+		obj, err := rawToTyped[Spec, Status](raw, mig)
+		if err != nil {
+			seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion}
+			c.warnUndecodable("Watch", raw.ID, err)
+			continue
+		}
+		seen[raw.ID] = tracked[Spec, Status]{rv: raw.ResourceVersion, obj: obj}
+		snap.Objects = append(snap.Objects, obj)
 	}
 
 	out := make(chan ObjectChange[Spec, Status])
 	go func() {
 		defer close(out)
-		// The driver's eager first step delivers the snapshot instead of
-		// repeating the read; sending must happen here because a send blocks
-		// until the subscriber reads, which it can't until objectStream returns.
-		pending, delivered := initial, false
+		// Seeded from the snapshot: the stream starts where the listing ended, so
+		// a quiet kind never lists again.
+		cursor := at
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			if delivered {
-				var err error
-				pending, err = c.poll(ctx, list, live, mig, seen, &cursor)
-				if err != nil {
-					return c.pollFailed(ctx, "watch", err)
-				}
+			changes, err := c.poll(ctx, list, live, mig, seen, &cursor)
+			if err != nil {
+				return c.pollFailed(ctx, "watch", err)
 			}
-			delivered = true
-			for _, ch := range pending {
+			for _, ch := range changes {
 				if !sendOrDone(ctx, out, ch) {
 					return false
 				}
 			}
-			pending = nil // don't hold the snapshot's objects past delivery
 			return true
 		})
 	}()
-	return out, nil
+	return snap, out, nil
 }
 
 // poll runs one object-watch tick: read current state, fold it into seen,
@@ -213,7 +227,7 @@ func (c *clientImpl[Spec, Status]) poll(
 	seen map[ObjectID]tracked[Spec, Status],
 	cursor *int64,
 ) ([]ObjectChange[Spec, Status], error) {
-	at, err := c.bh.store.ObjectWritesMaxVersionAll(ctx)
+	at, err := c.bh.store.ObjectWritesMaxVersion(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}

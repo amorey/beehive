@@ -147,14 +147,9 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	ch, err := client.ObjectsWatchList(ctx)
+	snap, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
-	select { // snapshot
-	case ev := <-ch:
-		require.Equal(t, Added, ev.Type)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the snapshot event")
-	}
+	require.Len(t, snap.Objects, 1)
 
 	// Same status: silent. Checked at the mechanism rather than by waiting out a
 	// grace period on the channel — the watch emits off resource_version, so a

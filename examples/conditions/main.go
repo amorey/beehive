@@ -164,7 +164,7 @@ func main() {
 	// Watch before creating, so the create arrives as an Added and the controller's
 	// writes as the Modifieds after it. A watch is a poll, so it converges on
 	// current state either way — starting first is what keeps the sequence legible.
-	watchCh, err := client.ObjectsWatchList(ctx)
+	_, watchCh, err := client.ObjectsWatchList(ctx)
 	exitOnErr(err)
 
 	obj, err := client.Create(ctx, "web", ServerSpec{Replicas: 3})

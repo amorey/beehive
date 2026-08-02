@@ -78,6 +78,14 @@ func checkName(name string) error {
 	return nil
 }
 
+// Snapshot is a watch's starting state: the objects as they were, and the log
+// position they are complete as of. The stream that comes with it carries
+// changes strictly above that position.
+type Snapshot[Spec, Status any] struct {
+	Objects         []*Object[Spec, Status]
+	ResourceVersion int64
+}
+
 // ObjectChange reports a change to a watched object. On a Deleted change,
 // Object carries the row's final state.
 type ObjectChange[Spec, Status any] struct {
@@ -143,19 +151,23 @@ type Client[Spec, Status any] interface {
 	// the process can't read.
 	GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
-	// ObjectsWatch streams changes to one object, ObjectsWatchList to every
-	// object of this client's kind: current state as Added, then
+	// ObjectsWatch returns one object's current state, ObjectsWatchList every
+	// object of this client's kind, each with a stream of the changes above it:
 	// Added/Modified/Deleted until ctx is cancelled. Both require a registered
 	// controller and are kind-scoped.
 	//
-	// Both read current state before returning, so a caller may subscribe and
-	// then act: a change it makes afterwards — including a delete — is always
-	// reported. That costs one read on the subscribing goroutine, whose failure
-	// is returned. Everything after is polled, which bounds latency and
-	// collapses changes within one interval. A watch cannot be opened inside a
-	// transaction (the read would deadlock on the single connection).
-	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
-	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
+	// The snapshot is read before either returns, on the caller's goroutine, so a
+	// caller may subscribe and then act: a change it makes afterwards — including
+	// a delete — is always in the stream. Snapshot.ResourceVersion is the log
+	// position the snapshot is complete as of, and the stream carries changes
+	// strictly above it: no overlap, no gap. A failed snapshot read is returned
+	// rather than handed back as a stream whose guarantee is void.
+	//
+	// Everything after is polled, which bounds latency and collapses changes
+	// within one interval. A watch cannot be opened inside a transaction (the
+	// read would deadlock on the single connection).
+	ObjectsWatch(ctx context.Context, id ObjectID) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	ObjectsWatchList(ctx context.Context) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
