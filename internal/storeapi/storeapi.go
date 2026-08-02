@@ -382,6 +382,12 @@ type Store interface {
 	// empty, not ErrNotFound.
 	ObjectsListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
 
+	// ObjectsListByIDs returns the objects of kind gk whose ids are in ids,
+	// ordered by id — creation order, not the caller's order and not
+	// resource_version order. An id naming no object, or one of another kind, is
+	// absent: a short result is normal, not an error.
+	ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
+
 	// ObjectsListIDs returns the ids of every object of kind gk, ordered by id.
 	ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 

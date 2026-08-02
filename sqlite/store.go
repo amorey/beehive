@@ -2392,3 +2392,25 @@ func (s *sqliteStore) snapshot(
 	}
 	return rows, at, nil
 }
+
+// ObjectsListByIDs reads one batch of ids in one query. The tail calls it once
+// per batch rather than ObjectsGet per changed object: the pool is size 1, so
+// those would be serialized round trips and a churny kind would cost more than
+// the full listing this design replaced.
+func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKind, ids []storeapi.ObjectID) ([]*storeapi.RawObject, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(ids)+2)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	args = append(args, gk.Group, gk.Kind)
+	return s.listObjectsWhere(ctx,
+		`WHERE o.id IN (`+placeholders(len(ids))+`) AND o."group" = ? AND o.kind = ?`, args...)
+}
+
+// placeholders builds "?, ?, ?" for an IN list of n values.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
+}

@@ -6277,3 +6277,30 @@ func TestObjectWritesSnapshotByIDReadsOneRow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, foreign, "another kind cannot see this row")
 }
+
+// The tail reads the objects one batch named, in one query. A short result is
+// normal: an id collected between the log read and this one is simply absent,
+// and its delete arrives as a later entry.
+func TestObjectsListByIDsIsKindScoped(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	mine := newRefObject(t, store)
+	alsoMine := newRefObject(t, store)
+	foreign, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	got, err := store.ObjectsListByIDs(ctx, testGK, []beehive.ObjectID{
+		alsoMine.ID, mine.ID, foreign.ID, 9999,
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 2, "another kind's row and a missing id are absent, not errors")
+	assert.Equal(t, mine.ID, got[0].ID)
+	assert.Equal(t, alsoMine.ID, got[1].ID)
+
+	empty, err := store.ObjectsListByIDs(ctx, testGK, nil)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}

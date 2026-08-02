@@ -423,6 +423,9 @@ func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]sto
 func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
 }
+func (s *fakeStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
+	panic("not implemented: fakeStore.ObjectsListByIDs")
+}
 func (s *fakeStore) ObjectWritesSnapshot(context.Context, GroupKind) ([]*RawObject, int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesSnapshot")
 }
