@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/amorey/gobus"
@@ -276,6 +277,47 @@ func TestTailerDeliversOnWake(t *testing.T) {
 	require.NotNil(t, ev.Value.Object)
 	assert.Equal(t, obj.ResourceVersion, ev.Value.Object.ResourceVersion)
 	assert.Equal(t, tailer.gk, clientTestGK)
+}
+
+// writeDuringMaxVersionStore commits one write inside the first position read,
+// after the read has taken its value — the interleaving that costs a wake if the
+// tailer registers its receiver second.
+type writeDuringMaxVersionStore struct {
+	Store
+	once   sync.Once
+	onRead func()
+}
+
+func (s *writeDuringMaxVersionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+	s.once.Do(func() {
+		if s.onRead != nil {
+			s.onRead()
+		}
+	})
+	return at, err
+}
+
+// The tailer registers its wake receiver before it reads its starting cursor. A
+// write that commits in between is above the cursor and its wake is in the slot;
+// the other order drops it and the object is never delivered.
+func TestTailerLosesNoWriteAtStartup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &writeDuringMaxVersionStore{Store: newClientTestStore(t)}
+	bh, err := New(store)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	var raced ObjectID
+	store.onRead = func() { raced = mustCreate(t, ctx, client, "raced", cSpec{}).ID }
+
+	_, rx := startTailer(t, bh, clientTestGK)
+
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err, "the write that raced startup was never delivered")
+	assert.Equal(t, raced, ev.Key)
 }
 
 // startTailer runs one tailer with a receiver attached, and tears both down with
