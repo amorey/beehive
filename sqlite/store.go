@@ -41,6 +41,14 @@ var (
 	_ storeapi.DriverCursorer    = (*sqliteStore)(nil)
 )
 
+// object_writes.op. The soft delete is an ordinary update: the row is still
+// live and readable, so only the GC's physical removal is writeOpDelete.
+const (
+	writeOpCreate = 1
+	writeOpUpdate = 2
+	writeOpDelete = 3
+)
+
 type sqliteStore struct {
 	db *sql.DB
 
@@ -582,7 +590,20 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	if err != nil {
 		return nil, asNameTaken(err)
 	}
+	if err := appendWriteLog(ctx, c, obj.ID, gk, writeOpCreate, rv, now); err != nil {
+		return nil, err
+	}
 	return obj, nil
+}
+
+// appendWriteLog records one committed object write. Callers pass the version the
+// write took, so the entry orders against the row it describes.
+func appendWriteLog(ctx context.Context, c dbtx, id storeapi.ObjectID, gk storeapi.GroupKind, op int, rv, now int64) error {
+	_, err := c.ExecContext(ctx, `
+		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		rv, id, gk.Group, gk.Kind, op, now)
+	return err
 }
 
 // asNameTaken translates the UNIQUE violation on ("group", kind, name) into

@@ -242,6 +242,48 @@ CREATE INDEX idx_events_latest ON events(object_id, category, id DESC);
 CREATE INDEX idx_events_object_rv ON events(object_id, resource_version);
 
 -- ============================================================
+-- object_writes
+-- Append-only change log. One entry per committed object write,
+-- inserted in that write's transaction and carrying the
+-- resource_version it was assigned.
+-- ============================================================
+
+-- A rowid table, unlike edges. INTEGER PRIMARY KEY makes resource_version the
+-- rowid itself, so the table is already clustered in cursor order with no
+-- separate key index — WITHOUT ROWID would add nothing here.
+CREATE TABLE object_writes (
+    -- From resource_version_seq, so it orders against objects.resource_version
+    -- and events.resource_version. Never reused. The rowid alias: an append is
+    -- an in-order insert at the end of the B-tree.
+    resource_version INTEGER PRIMARY KEY,
+
+    -- NO FOREIGN KEY, deliberately. ON DELETE CASCADE would erase exactly the
+    -- delete entries this log exists to record; ON DELETE RESTRICT would make
+    -- the log block collection. The id is a routing key, not a reference, and
+    -- ids are never reused (objects.id is AUTOINCREMENT).
+    object_id INTEGER NOT NULL,
+
+    "group" TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+
+    -- 1 create, 2 update, 3 physical delete. The soft delete is an UPDATE: the
+    -- object is still live and readable, so it appends 2.
+    op INTEGER NOT NULL CHECK (op IN (1, 2, 3)),
+
+    written_at INTEGER NOT NULL -- epoch ms
+) STRICT;
+
+-- The watch tail: seek by kind, scan in cursor order. object_id and op are in
+-- the key to make it covering — without them every entry costs a row fetch.
+--
+-- resource_version is spelled out even though it is the rowid and every index
+-- entry carries the rowid anyway: the implicit copy sorts LAST, so relying on it
+-- would order by ("group", kind, object_id, op, resource_version) and lose the
+-- range seek the tail is built on.
+CREATE INDEX idx_object_writes_kind
+    ON object_writes("group", kind, resource_version, object_id, op);
+
+-- ============================================================
 -- resource_version_seq
 -- Monotonic global write cursor, decoupled from the objects table.
 -- ============================================================

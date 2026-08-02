@@ -5852,3 +5852,49 @@ func TestDeletionRequestsCreateByNameSurfacesAProbeReadError(t *testing.T) {
 	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "a broken read is not an absent row")
 	assert.False(t, changed)
 }
+
+// writeLogEntry is one object_writes row, read straight from the table so the
+// log's tests do not depend on the read API that lands later.
+type writeLogEntry struct {
+	ResourceVersion int64
+	ObjectID        beehive.ObjectID
+	Group           string
+	Kind            string
+	Op              int
+	WrittenAt       int64
+}
+
+func writeLogEntries(t *testing.T, store beehive.Store) []writeLogEntry {
+	t.Helper()
+	rows, err := store.(*sqliteStore).db.QueryContext(context.Background(),
+		`SELECT resource_version, object_id, "group", kind, op, written_at
+		   FROM object_writes ORDER BY resource_version`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var out []writeLogEntry
+	for rows.Next() {
+		var e writeLogEntry
+		require.NoError(t, rows.Scan(&e.ResourceVersion, &e.ObjectID, &e.Group,
+			&e.Kind, &e.Op, &e.WrittenAt))
+		out = append(out, e)
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+// A create appends one log entry at the row's own resource_version.
+func TestObjectsCreateAppendsAWriteLogEntry(t *testing.T) {
+	store := newTestStore(t)
+
+	obj := newRefObject(t, store)
+
+	entries := writeLogEntries(t, store)
+	require.Len(t, entries, 1)
+	assert.Equal(t, obj.ResourceVersion, entries[0].ResourceVersion)
+	assert.Equal(t, obj.ID, entries[0].ObjectID)
+	assert.Equal(t, testGK.Group, entries[0].Group)
+	assert.Equal(t, testGK.Kind, entries[0].Kind)
+	assert.Equal(t, writeOpCreate, entries[0].Op)
+	assert.NotZero(t, entries[0].WrittenAt)
+}
