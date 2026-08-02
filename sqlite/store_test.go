@@ -6587,3 +6587,37 @@ func TestObjectWritesSnapshotSurfacesAFailedListing(t *testing.T) {
 
 	require.Error(t, err)
 }
+
+// The count bound records its horizon per kind too, and trims each kind against
+// its own cap. The trim runs one statement per kind, so a kind under its cap
+// must come through untouched and with no horizon of its own — a shared cutoff
+// would let a busy kind's trim strand a quiet kind's subscribers.
+func TestObjectWritesSweepCapsEachKindWithItsOwnHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+
+	busy := make([]*beehive.RawObject, 0, 3)
+	for range 3 {
+		busy = append(busy, newRefObject(t, store))
+	}
+	quiet, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	deleted, err := store.ObjectWritesSweep(ctx, 2, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted, "only the busy kind's oldest entry")
+
+	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 2)
+	assert.Equal(t, busy[0].ResourceVersion, trimmed, "the busy kind carries its own horizon")
+
+	page, trimmed, err = store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, quiet.ResourceVersion, page[0].ResourceVersion)
+	assert.Zero(t, trimmed, "the quiet kind was never trimmed, so its horizon never moved")
+}

@@ -78,6 +78,13 @@ transaction and taking the `resource_version` that write was assigned.
   trimmed empty reports 0 against a tail parked higher and lists on every tick —
   on the kind that writes least.
 
+The count bound trims one statement per kind rather than one subquery per row.
+Keyed on a literal kind the cutoff is uncorrelated, so SQLite evaluates it once
+and every step is a covering-index seek; a kind under its cap yields NULL and
+matches nothing. Kinds number in the handful where entries number in the
+millions, so enumerating kinds is the right axis — the alternative, a window
+function partitioned by kind, still numbers every row in the log on every sweep.
+
 `object_writes` is a rowid table: `INTEGER PRIMARY KEY` makes
 `resource_version` the rowid, so it is already clustered in cursor order with no
 duplicate key index, and delete entries carry blobs that `WITHOUT ROWID` handles

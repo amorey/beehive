@@ -2385,20 +2385,50 @@ func (s *sqliteStore) ObjectWritesSweep(ctx context.Context, perKind int, maxAge
 			deleted += n
 		}
 		if perKind > 0 {
-			// The newest perKind per ("group", kind), read through
-			// idx_object_writes_kind backwards.
-			n, err := s.trimWriteLog(ctx, `resource_version <= (
-				SELECT w.resource_version FROM object_writes w
-				 WHERE w."group" = object_writes."group" AND w.kind = object_writes.kind
-				 ORDER BY w.resource_version DESC LIMIT 1 OFFSET ?)`, perKind)
+			// One statement per kind, not one subquery per row. Keyed on a literal
+			// kind, the cutoff is uncorrelated, so it is evaluated once and every
+			// step rides idx_object_writes_kind: a seek for the cutoff, a range
+			// delete below it. A kind under its cap yields NULL, and
+			// `resource_version <= NULL` matches nothing, so it costs one seek.
+			kinds, err := s.writeLogKinds(ctx)
 			if err != nil {
 				return err
 			}
-			deleted += n
+			for _, gk := range kinds {
+				n, err := s.trimWriteLog(ctx, `"group" = ? AND kind = ? AND resource_version <= (
+					SELECT resource_version FROM object_writes
+					 WHERE "group" = ? AND kind = ?
+					 ORDER BY resource_version DESC LIMIT 1 OFFSET ?)`,
+					gk.Group, gk.Kind, gk.Group, gk.Kind, perKind)
+				if err != nil {
+					return err
+				}
+				deleted += n
+			}
 		}
 		return nil
 	})
 	return deleted, err
+}
+
+// writeLogKinds lists the kinds present in the log. An index-only scan, and the
+// only step of the count trim that is not a seek — kinds number in the handful
+// where entries number in the millions, so it is the right axis to iterate.
+func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT DISTINCT "group", kind FROM object_writes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var kinds []storeapi.GroupKind
+	for rows.Next() {
+		var gk storeapi.GroupKind
+		_ = rows.Scan(&gk.Group, &gk.Kind) // two declared TEXT columns
+		kinds = append(kinds, gk)
+	}
+	return kinds, rows.Err()
 }
 
 // deleteWriteLogRows deletes the entries matching where and reports the highest
