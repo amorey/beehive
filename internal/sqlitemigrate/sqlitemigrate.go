@@ -12,19 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sqlitemigrate is a tiny, forward-only SQL migration runner for SQLite
-// databases. A caller embeds its numbered `*.sql` files and hands them to Apply;
-// the runner records progress in a schema_migrations table and brings the DB up to
-// the latest version. Beehive's sqlite store is the only caller.
-//
-// It is deliberately minimal — no down-migrations, no external dependency. Each
-// migration runs in its own transaction so a crash mid-upgrade leaves the DB at
-// the last committed version and the next start resumes from there. A DB written
-// by a newer binary is refused rather than truncated.
-//
-// It sits below the public surface because OpenPool is not a neutral opener: it
-// decides the on-disk format (see auto_vacuum there), which is a choice only
-// Beehive's storage strategy earns the right to make.
+// Package sqlitemigrate is a tiny, forward-only SQL migration runner for
+// SQLite. A caller embeds numbered `*.sql` files and hands them to Apply,
+// which records progress in a schema_migrations table. No down-migrations;
+// each migration runs in its own transaction, so a crash mid-upgrade resumes
+// from the last committed version. A DB written by a newer binary is refused.
 package sqlitemigrate
 
 import (
@@ -40,35 +32,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// OpenPool opens a modernc-sqlite connection pool at path with standard PRAGMAs
-// baked into the DSN — WAL journal, 5s busy_timeout, synchronous=NORMAL,
-// foreign_keys on, auto_vacuum=INCREMENTAL, and immediate txlock so writes grab
-// the lock up front. maxConns caps the pool: pass 1 for a writer pool (writes
-// serialize at the pool instead of fighting at the SQLite layer), or a larger
-// value for a WAL reader pool. Callers run Apply against the returned pool to
-// migrate it.
-//
-// These are Beehive's pragmas, not a neutral set: this is an opinionated opener,
-// and auto_vacuum in particular decides the on-disk format of every database it
-// opens. That opinion is what keeps this package internal — nobody outside gets it
-// imposed on them. INCREMENTAL costs about one pointer-map page per 200 (~0.5% file
-// growth) and nothing measurable per commit; in exchange a database whose row
-// count churns can be made to give its pages back, which auto_vacuum=NONE can
-// never do without a full VACUUM rewrite. A caller that never drains the
-// freelist pays only the 0.5%, and can still drain or VACUUM later without a
-// format change — the reverse is not true, which is why the default leans this way.
+// OpenPool opens a modernc-sqlite pool at path with Beehive's PRAGMAs baked
+// into the DSN — WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys on,
+// auto_vacuum=INCREMENTAL, immediate txlock. maxConns caps the pool: 1 for a
+// writer pool, larger for a WAL reader pool. Run Apply against the result.
+// See docs/adr/2026-07-29-auto-vacuum-incremental.md.
 func OpenPool(path string, maxConns int) *sql.DB {
-	// _pragma values are URL-encoded; modernc parses them and applies on each
-	// new connection.
-	//
-	// auto_vacuum MUST be set here rather than in a migration. SQLite writes the
-	// mode into the file header when the first table is created, and ignores the
-	// pragma both on a non-empty database and inside a transaction — and Apply
-	// creates schema_migrations before it runs migration 0001, each migration in
-	// its own transaction. So a `PRAGMA auto_vacuum` in a .sql file is a silent
-	// no-op twice over. On the DSN, modernc applies it at connection open, while
-	// the database is still empty. On an existing NONE database it is likewise a
-	// silent no-op, so adding it cannot disturb a file already written.
+	// auto_vacuum MUST be set on the DSN, never in a migration: SQLite ignores
+	// the pragma on a non-empty database and inside a transaction, both of
+	// which a migration is. On an existing NONE database it is a silent no-op.
 	dsn := "file:" + path +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(5000)" +
@@ -83,9 +55,9 @@ func OpenPool(path string, maxConns int) *sql.DB {
 	return db
 }
 
-// migration is one numbered SQL file. Version comes from the leading digits of
-// the filename (e.g. 0001_init.sql -> 1) and is used both for ordering and as
-// the row id in schema_migrations.
+// migration is one numbered SQL file. Version comes from the filename's
+// leading digits (0001_init.sql -> 1): the ordering and the schema_migrations
+// row id.
 type migration struct {
 	version int
 	name    string
@@ -104,9 +76,7 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
-		// Filenames look like NNNN_description.sql. Pull the leading digits as
-		// the version; anything non-numeric is a packaging bug, not user input,
-		// so surface it loudly.
+		// NNNN_description.sql; a non-numeric prefix is a packaging bug.
 		base := e.Name()
 		underscore := strings.IndexByte(base, '_')
 		if underscore <= 0 {
@@ -123,8 +93,7 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 		out = append(out, migration{version: v, name: base, sql: string(b)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
-	// Versions must be unique and gap-free so a missing file in a release is
-	// caught at startup, not after the schema is half-applied.
+	// Unique and gap-free, so a missing file is caught at startup.
 	for i, m := range out {
 		if m.version != i+1 {
 			return nil, fmt.Errorf("migration version gap: expected %d, got %d (%s)", i+1, m.version, m.name)
@@ -133,12 +102,10 @@ func loadMigrations(fsys fs.FS, dir string) ([]migration, error) {
 	return out, nil
 }
 
-// Apply brings db up to the latest migration found in fsys under dir. Files are
-// NNNN_name.sql, applied in version order, each in its own transaction,
-// recorded in a schema_migrations(version, name, applied_at) table. Returns the
-// highest version present in the DB on disk after the call. A crash mid-upgrade
-// leaves the DB at the last committed version and the next call resumes from
-// there. A DB whose recorded version is newer than the embedded set is refused.
+// Apply brings db up to the latest migration in fsys under dir, each file in
+// its own transaction, recorded in schema_migrations. Returns the highest
+// version present after the call. A DB whose recorded version is newer than
+// the embedded set is refused.
 func Apply(ctx context.Context, db *sql.DB, fsys fs.FS, dir string) (int, error) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,
