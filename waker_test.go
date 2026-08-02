@@ -154,12 +154,11 @@ func TestWakerSeedsFromTheStoredCursor(t *testing.T) {
 	assert.Equal(t, []int64{200}, store.cursors(), "the first scan resumes at the stored cursor")
 }
 
-// ObjectWritesMaxVersionAll is a max over live rows, so deleting the
-// highest-versioned object legitimately lowers it below a cursor the waker
-// really did process. A stored cursor above the mark is therefore not evidence
-// of a swapped or truncated database, and clamping to the mark rather than
-// resetting to zero is what makes replaying that case free: the next listing
-// asks for everything above the mark, which is empty by definition.
+// Retention trims the write log's tail, so the mark can legitimately sit below a
+// cursor the waker really did process. A stored cursor above the mark is
+// therefore not evidence of a swapped or truncated database, and clamping to the
+// mark rather than resetting to zero is what makes replaying that case free: the
+// wakes it re-derives are idempotent.
 func TestWakerClampsAStoredCursorAboveTheMark(t *testing.T) {
 	store := &cursorStore{
 		replayStore: replayStore{seed: 90, rows: replayRows(3)},

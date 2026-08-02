@@ -142,8 +142,11 @@ func (dw *waker) seed(ctx context.Context) bool {
 }
 
 // resumeWatermark decides where seed resumes from; pure so the clamp is
-// testable. min, not stored: the mark steps back when the highest-versioned row
-// is deleted, so a cursor above it is not evidence of a foreign database.
+// testable. min, not stored: retention trims the log's tail, so the mark can sit
+// below a cursor the waker really did process, and that is not evidence of a
+// foreign database. Clamping replays from the mark, which is free — the wakes it
+// re-derives are idempotent, and the stale-dependents pass is the guarantee
+// either way.
 func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 	if !ok {
 		return mark

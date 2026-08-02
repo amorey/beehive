@@ -4593,8 +4593,10 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 	got, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
-		{ID: second.ID, ResourceVersion: second.ResourceVersion},
-		{ID: third.ID, ResourceVersion: third.ResourceVersion},
+		{ID: second.ID, ResourceVersion: second.ResourceVersion,
+			Group: otherGK.Group, Kind: otherGK.Kind, Op: storeapi.WriteCreate},
+		{ID: third.ID, ResourceVersion: third.ResourceVersion,
+			Group: testGK.Group, Kind: testGK.Kind, Op: storeapi.WriteCreate},
 	}, got, "cursor-ordered, exclusive of afterRV, spanning kinds")
 
 	// A limit truncates from the low end, so the caller can page forward by taking
@@ -4620,7 +4622,10 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 // while anything depends on it, and from_id's CASCADE means a dependent deleted
 // first took its own edge with it — so a row that vanished has no dependents left
 // to strand.
-func TestObjectWritesListSinceAllSkipsDeletedRows(t *testing.T) {
+// A collection is a log entry like any other. Reading live rows made a delete
+// invisible — the waker could not see one at all, and a watch had to find it by
+// absence.
+func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -4630,7 +4635,12 @@ func TestObjectWritesListSinceAllSkipsDeletedRows(t *testing.T) {
 
 	got, err := store.ObjectWritesListSinceAll(ctx, base.ResourceVersion, 10)
 	require.NoError(t, err)
-	assert.Empty(t, got, "the deleted row is absent, not an error")
+	require.Len(t, got, 2, "the create and the collection of the second object")
+	assert.Equal(t, storeapi.WriteCreate, got[0].Op)
+	assert.Equal(t, gone.ID, got[1].ID)
+	assert.Equal(t, storeapi.WriteDelete, got[1].Op)
+	require.NotNil(t, got[1].Final, "the delete entry carries the row image")
+	assert.Equal(t, gone.Name, got[1].Final.Name)
 }
 
 func TestObjectWritesListSinceAllDBError(t *testing.T) {
@@ -5431,16 +5441,19 @@ func TestObjectWritesMaxVersionOnAnEmptyStore(t *testing.T) {
 // sound for both of its uses — nothing exists at the versions it steps back over,
 // so a seeded watermark cannot skip a live write, and a poller that re-reads
 // because the mark moved finds exactly the delete that moved it.
-func TestObjectWritesMaxVersionFallsWhenTheNewestRowGoes(t *testing.T) {
+// Collection raises the mark rather than lowering it: the delete is an entry of
+// its own, above the row it removed. Reading live rows made the mark step back
+// here, which is what the waker's clamp was written for.
+func TestObjectWritesMaxVersionAllRisesOnCollection(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	first := newRefObject(t, store)
+	newRefObject(t, store)
 	second := newRefObject(t, store)
 	require.Equal(t, second.ResourceVersion, cursorNow(t, store))
 
 	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
 
-	assert.Equal(t, first.ResourceVersion, cursorNow(t, store))
+	assert.Greater(t, cursorNow(t, store), second.ResourceVersion)
 }
 
 // ---------------------------------------------------------------------------

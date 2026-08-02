@@ -976,43 +976,61 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// ObjectWritesMaxVersion reads the high-water mark of the object write log: the highest
-// resource_version any live objects row holds (covered by idx_objects_rv; an
-// empty store reads 0).
+// ObjectWritesMaxVersionAll reads the write log's high-water mark across every
+// kind, covered by the log's primary key. An empty log reads 0.
 //
-// It reads objects, not resource_version_seq: the event log draws from that
-// sequence too, and a consumer of this pair must not see the cursor move for a
-// write it can never be shown.
+// It reads object_writes, not resource_version_seq: the event log draws from
+// that sequence too, and a consumer of this pair must not see the cursor move
+// for a write it can never be shown. Retention is the only thing that lowers it.
 func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT MAX(resource_version) FROM objects`).Scan(&rv)
+		`SELECT MAX(resource_version) FROM object_writes`).Scan(&rv)
 	return rv.Int64, err
 }
 
-// ObjectWritesListSince returns the writes above afterRV: live rows, in cursor order,
-// at most limit of them. Blob-free and covered by idx_objects_rv — consumers
-// route by id and read current state themselves. Kind-agnostic, since a
-// depends_on edge may point at a kind with no controller. A row deleted since
-// afterRV is simply absent.
+// ObjectWritesListSinceAll returns the log entries above afterRV across every
+// kind, in cursor order, at most limit of them. Kind-agnostic, since a
+// depends_on edge may point at a kind with no controller. Consumers route by id
+// and read current state themselves, so create and update entries carry no
+// payload; a delete carries the row image, since nothing survives to be read.
 func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, nil
 	}
 	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT id, resource_version FROM objects
+		`SELECT `+writeLogColumns+` FROM object_writes
 		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
 		afterRV, limit)
 	if err != nil {
 		return nil, err
 	}
+	return scanWriteLog(rows, limit)
+}
+
+// writeLogColumns is the canonical select list for a log entry; scanWriteLog
+// reads them in order. "group" and kind are covered by idx_object_writes_kind,
+// so a kind-scoped read costs nothing to select them back.
+const writeLogColumns = `resource_version, object_id, "group", kind, op, final`
+
+// scanWriteLog collects log entries, decoding the row image a delete carries.
+func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, error) {
 	defer rows.Close()
 	// Capped: a large caller limit must not preallocate for rows the store may not have.
 	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
 	for rows.Next() {
 		var w storeapi.ObjectWrite
-		_ = rows.Scan(&w.ID, &w.ResourceVersion) // two INTEGER columns into int64 never error
+		var final sql.NullString
+		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &final); err != nil {
+			return nil, err
+		}
+		if final.Valid {
+			w.Final = &storeapi.RawObject{}
+			if err := json.Unmarshal([]byte(final.String), w.Final); err != nil {
+				return nil, err
+			}
+		}
 		writes = append(writes, w)
 	}
 	return writes, rows.Err()
@@ -2207,32 +2225,15 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.Gro
 		return nil, 0, nil
 	}
 	rows, err := s.conn(ctx).QueryContext(ctx, `
-		SELECT resource_version, object_id, op, final FROM object_writes
+		SELECT `+writeLogColumns+` FROM object_writes
 		 WHERE "group" = ? AND kind = ? AND resource_version > ?
 		 ORDER BY resource_version LIMIT ?`,
 		gk.Group, gk.Kind, afterRV, limit)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
-
-	// Capped: a large caller limit must not preallocate for rows the store may not have.
-	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
-	for rows.Next() {
-		w := storeapi.ObjectWrite{Group: gk.Group, Kind: gk.Kind}
-		var final sql.NullString
-		if err := rows.Scan(&w.ResourceVersion, &w.ID, &w.Op, &final); err != nil {
-			return nil, 0, err
-		}
-		if final.Valid {
-			w.Final = &storeapi.RawObject{}
-			if err := json.Unmarshal([]byte(final.String), w.Final); err != nil {
-				return nil, 0, err
-			}
-		}
-		writes = append(writes, w)
-	}
-	if err := rows.Err(); err != nil {
+	writes, err := scanWriteLog(rows, limit)
+	if err != nil {
 		return nil, 0, err
 	}
 	trimmed, err := s.trimmedThrough(ctx, gk)
