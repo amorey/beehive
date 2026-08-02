@@ -100,8 +100,11 @@ type Beehive struct {
 	// reconciler) resolve through.
 	migrators map[GroupKind]Migrator
 	// order preserves registration order so Start launches loops deterministically.
-	order  []*reconciler
-	waker  *waker
+	order []*reconciler
+	waker *waker
+	// wakes carries each committed object write's log position to the kind's
+	// tailer. Built in New, not Start: watches work on a Beehive that never ran.
+	wakes  wakeHub
 	state  beehiveState
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -306,6 +309,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		staleDependentsInterval: defaultStaleDependentsInterval,
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),
+		wakes:                   newWakeHub(),
 	}
 	cursors, _ := s.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
@@ -403,6 +407,15 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {
 			r.requeueNow(ref.ID)
 		}
+	})
+}
+
+// signalObjectWritten wakes gk's tailer with the write's log position once the
+// write commits. AfterCommit for the same reasons as signalRequeue: a rollback
+// publishes nothing, and the wake cannot outrun the row it announces.
+func (bh *Beehive) signalObjectWritten(ctx context.Context, gk GroupKind, rv int64) {
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		_ = bh.wakes.Send(gk, rv) // ErrClosed after stop; nothing is left to wake
 	})
 }
 
