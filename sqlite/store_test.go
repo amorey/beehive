@@ -6006,3 +6006,17 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		})
 	}
 }
+
+// Collection draws a resource_version. The row is gone, so nothing in objects
+// carries it — the write log's delete entry does, and it needs a version to
+// order against every other entry.
+func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	before := seqValue(t, store.(*sqliteStore))
+
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	assert.Greater(t, seqValue(t, store.(*sqliteStore)), before)
+}

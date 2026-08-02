@@ -1771,9 +1771,10 @@ func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	return s.Within(ctx, func(ctx context.Context) error { return s.objectsDelete(ctx, id) })
 }
 
-// objectsDelete physically removes the row. A delete draws no resource_version:
-// the row is gone, so there is nothing for a write-log scan to report — watches
-// derive the tombstone from absence.
+// objectsDelete physically removes the row. It draws a resource_version even
+// though no row survives to hold it: the write log's delete entry takes it, and
+// without one the entry could not be ordered against the rest of the log. The
+// counter is shared with the event log, so collection moves that too.
 func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
 	// Zero rows means already collected: ErrNotFound. Conditions, events and edges cascade.
 	res, err := s.conn(ctx).ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
@@ -1783,6 +1784,9 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
 	if n == 0 {
 		return storeapi.ErrNotFound
+	}
+	if _, err := nextResourceVersion(ctx, s.conn(ctx)); err != nil {
+		return err
 	}
 	return nil
 }
