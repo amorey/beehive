@@ -10,7 +10,7 @@ spec and status. A one-to-many join would repeat that JSON once per edge.
 
 ## Decision: two paths, one set of loaders
 
-- **Eager** — `LoadOption`s passed to `Get`, `GetByID`, `List` or
+- **Eager** — `LoadOption`s passed to `Get`, `GetByName`, `List` or
   `OwnedObjectsList`. `resolveLoads` folds them into a `LoadSet` bitset;
   `loadObjectRelated` handles one object and `loadListRelated` a list, running one
   batched query per relation rather than one per object.

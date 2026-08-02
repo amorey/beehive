@@ -322,7 +322,7 @@ All three cases share one trace and one driver:
   `TestIntegrationGCSweepsClientOnlyKind`, `TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete`,
   `TestGCSweepLogsCollectFailure`, `TestWithGCIntervalRejectsNonPositive`.
 
-7. **A delete request** — `Delete` / `DeleteByID` stamp `deletion_requested_at` and
+7. **A delete request** — `Delete` / `DeleteByName` stamp `deletion_requested_at` and
    nothing else. Tests: `TestIntegrationDeleteTriggersReconcile`,
    `TestDeletionRequestsCreateIsIdempotent`, `TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion`.
 8. **Cascade to owned children** — `gcCollect` marks them via

@@ -68,7 +68,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	// The next two listings fail. Only a tick that has something to list reaches
 	// them, so give it a change to find.
 	store.failures.Store(2)
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -101,7 +101,7 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 	// A real change is the barrier. Many ticks pass while the object is untouched;
 	// if any of them re-sent it, that Modified would arrive carrying the old spec
 	// and this assertion would see it instead of the new one.
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -414,7 +414,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	// come *after* the failure is armed, so the recovery below is the stream
 	// outliving a failure rather than never meeting one.
 	store.getErr.Store(true) // the tail's batched read of what changed
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	drainProbe(store.polled)
 	waitClosed(t, chanAfter(store.polled, 2), "polls while the read fails")
@@ -446,14 +446,14 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	// A write moves the position, so every tick from here reaches the tail's
 	// listing — which now fails.
 	store.listErr.Store(true)
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "a2"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "a2"})
 	require.NoError(t, err)
 	drainProbe(store.polled)
 	waitClosed(t, chanAfter(store.polled, 2), "polls while the tail listing fails")
 	store.listErr.Store(false)
 
 	// A real change proves the stream is still live and still tailing.
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch poll failed")
@@ -495,7 +495,7 @@ func TestWatchAbandonsASendWhenTheSubscriberGoesAway(t *testing.T) {
 	// produced it is what puts the cancellation after the read and before the
 	// send, which is the only place left that can observe it.
 	drainProbe(store.tailed)
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.tailed, 1), "the tail that found the change")
 	cancel()
@@ -792,13 +792,13 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	require.NotNil(t, snap.Object)
 	drainProbe(store.byIDs)
 
-	require.NoError(t, client.DeleteByID(ctx, watched.ID))
+	require.NoError(t, client.Delete(ctx, watched.ID))
 	pending := recv(t, ch)
 	require.Equal(t, Modified, pending.Type, "the deletion request is an ordinary write")
 	assert.NotNil(t, pending.Object.DeletionRequestedAt)
 
 	// Another object's write, which this watch must not report.
-	_, err = client.UpdateByID(ctx, newer.ID, cSpec{Val: "newest"})
+	_, err = client.Update(ctx, newer.ID, cSpec{Val: "newest"})
 	require.NoError(t, err)
 
 	gone, err := bh.gcCollect(ctx, watched.ID)
@@ -1303,7 +1303,7 @@ func TestObjectStreamTailsTheWriteLog(t *testing.T) {
 	drainProbe(store.listed)
 	drainProbe(store.byIDs)
 
-	_, err = client.UpdateByID(ctx, busy.ID, cSpec{Val: "busy2"})
+	_, err = client.Update(ctx, busy.ID, cSpec{Val: "busy2"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -1367,11 +1367,11 @@ func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	// The lower id is written last, so id order and write order disagree.
-	_, err = client.UpdateByID(ctx, second.ID, cSpec{Val: "second2"})
+	_, err = client.Update(ctx, second.ID, cSpec{Val: "second2"})
 	require.NoError(t, err)
-	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "first2"})
+	_, err = client.Update(ctx, first.ID, cSpec{Val: "first2"})
 	require.NoError(t, err)
-	_, err = client.UpdateByID(ctx, first.ID, cSpec{Val: "first3"})
+	_, err = client.Update(ctx, first.ID, cSpec{Val: "first3"})
 	require.NoError(t, err)
 
 	c := client.(*clientImpl[cSpec, cStatus])
@@ -1398,7 +1398,7 @@ func TestTrimUnderALiveStreamEndsIt(t *testing.T) {
 
 	// The horizon moves above where this stream is parked.
 	store.forceTrimmed.Store(snap.ResourceVersion + 1)
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -1423,7 +1423,7 @@ func TestAQuietKindIsNotTornDownByATrim(t *testing.T) {
 
 	// Trimmed through exactly where the tail sits: nothing it had not read is gone.
 	store.forceTrimmed.Store(snap.ResourceVersion)
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -1443,7 +1443,7 @@ func TestWithResumeFromSkipsTheSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	drainProbe(store.listed)
 
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	snap, ch, err := client.WatchList(ctx, WithResumeFrom(first.ResourceVersion))
@@ -1499,7 +1499,7 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 		}
 	}
 
-	_, err = client.UpdateByID(ctx, child.ID, cSpec{Val: "child2"})
+	_, err = client.Update(ctx, child.ID, cSpec{Val: "child2"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)
@@ -1571,7 +1571,7 @@ func TestWatchNeedsNoController(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
 
@@ -1589,7 +1589,7 @@ func TestCoalescedCreateThenUpdateStaysAdded(t *testing.T) {
 	defer cancel()
 	_, _, client, _ := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	_, err := client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err := client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	// Resuming from 0 puts both entries in one page, as one interval would.
@@ -1685,7 +1685,7 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, bh.store.ObjectsDelete(ctx, doomed.ID))
-	_, err = client.UpdateByID(ctx, survivor.ID, cSpec{Val: "still here"})
+	_, err = client.Update(ctx, survivor.ID, cSpec{Val: "still here"})
 	require.NoError(t, err)
 
 	ev := recv(t, ch)

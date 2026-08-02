@@ -3,12 +3,13 @@
 - **Status:** Accepted — implemented in `client.go`, `sqlite/store.go`.
 - **Date:** 2026-07-27 (recorded retroactively)
 
-> **Superseded in part.** The name is now the `Client` API's key for all of CRUD, so
-> `DeleteByName` is spelled `Delete` and `Update` has a name form of its own. The
-> name is also required, which retired `WithName` and `ErrConflictingOption` — so the
-> `WithName` paragraph below is void, not merely renamed. Everything else here, the
+> **Superseded in part.** The `Client` CRUD verbs are keyed on the id, and the name
+> forms are `GetByName`, `UpdateByName` and `DeleteByName`. The name is also
+> required, which retired `WithName` and `ErrConflictingOption` — so the `WithName`
+> paragraph below is void, not merely renamed. Everything else here, the
 > transaction-boundary reasoning above all, is unchanged and is what the newer
-> decision builds on. → [ADR](2026-07-30-name-primary-key.md)
+> decision builds on.
+> → [ADR](2026-08-02-id-primary-key-with-byname-siblings.md)
 
 ## Reconcile is not transactional
 

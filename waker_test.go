@@ -755,7 +755,7 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 	waitClosed(t, probe.watermarkSet, "the dependent's watermark write")
 	drainProbe(reconciled)
 
-	_, err = client.UpdateByID(ctx, target.ID, cSpec{Val: "moved"})
+	_, err = client.Update(ctx, target.ID, cSpec{Val: "moved"})
 	require.NoError(t, err)
 
 	awaitMatch(t, reconciled, func(id ObjectID) bool { return id == dep.ID },

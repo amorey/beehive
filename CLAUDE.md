@@ -95,14 +95,16 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   enqueue and the new-edge enqueue (shared via `Beehive.signalRequeue`).
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
-- **The name is the `Client` API's key; the id is the store's key.** Name-keyed
-  calls act on whatever holds the name *now*; id-keyed calls act on one
-  incarnation — so read-modify-write goes through `UpdateByID`. Names are
-  required, immutable, opaque; `""` is rejected with `ErrInvalidName` in the
-  store itself. A taken name (tombstones included) is `ErrNameTaken`;
-  `GenerateName(prefix)` builds one and callers bound-retry on the sentinel.
-  Foreign keys stay integer ids, which are never reused.
-  → [ADR](docs/adr/2026-07-30-name-primary-key.md)
+- **The id is the key everywhere; the name is a lookup.** The bare CRUD verbs
+  take an `ObjectID` and act on one incarnation; the `…ByName` siblings act on
+  whatever holds the name *now*, resolving and writing in one transaction. The
+  name is positional on `Create`/`GetOrCreate` only, where there is no id yet.
+  Read-modify-write needs no rule: the read hands back `ID`. Names are required,
+  immutable, opaque; `""` is rejected with `ErrInvalidName` in the store itself.
+  A taken name (tombstones included) is `ErrNameTaken`; `GenerateName(prefix)`
+  builds one and callers bound-retry on the sentinel. Foreign keys stay integer
+  ids, which are never reused.
+  → [ADR](docs/adr/2026-08-02-id-primary-key-with-byname-siblings.md)
 - **A store write takes only what it honours and returns only what a caller
   reads.** `ObjectsCreate` takes `ObjectsCreateInput`; only it and the
   `ObjectsUpdateSpec*` mutators return a row. `EventsAdd` is a kept exception

@@ -319,7 +319,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 	if obj.ID != c.depID {
 		return Result{}, nil // the target's own reconcile is not under test
 	}
-	target, err := c.client.GetByID(ctx, c.targetID)
+	target, err := c.client.Get(ctx, c.targetID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -650,7 +650,7 @@ func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 
 	// A changed spec: the write must not be suppressed as an identical-byte no-op,
 	// or nothing would wake it and the test would pass for the wrong reason.
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
 	assert.Equal(t, obj.ID, recv(t, reconciled), "a spec write wakes it without the self-edge")
@@ -1916,7 +1916,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
-	got, err := client.GetByID(ctx, obj.ID)
+	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "done", got.Status.Val)
@@ -1948,12 +1948,12 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	// create into a single pass.
 	ctrl.firstDone.wait(t, "first reconcile")
 
-	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "v2"})
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
 	ctrl.secondDone.wait(t, "second reconcile after spec update")
 
-	got, err := client.GetByID(ctx, obj.ID)
+	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "v2", got.Status.Val)
@@ -1982,7 +1982,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
-	require.NoError(t, client.DeleteByID(ctx, obj.ID))
+	require.NoError(t, client.Delete(ctx, obj.ID))
 	ctrl.deleted.wait(t, "reconcile after deletion requested")
 }
 
@@ -2015,7 +2015,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 
 	ctrl.signal.wait(t, "reconcile wrote status before erroring")
 
-	got, err := client.GetByID(ctx, obj.ID)
+	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status, "status write commits even though the reconcile returned an error")
 	assert.Equal(t, "persisted", got.Status.Val)
@@ -2056,7 +2056,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	ctrl.reconciled.wait(t, "first reconcile")
 
 	// Flows through Get.
-	got, err := client.GetByID(ctx, obj.ID)
+	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	ready := findCondition(got.Conditions, "Ready")
 	require.NotNil(t, ready, "condition set in Reconcile must be committed")
@@ -2097,7 +2097,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 
 	ctrl.signal.wait(t, "reconcile set condition before erroring")
 
-	got, err := client.GetByID(ctx, obj.ID)
+	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	ready := findCondition(got.Conditions, "Ready")
 	require.NotNil(t, ready, "condition commits even though the reconcile returned an error")
@@ -2667,7 +2667,7 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
-	require.NoError(t, targetClient.DeleteByID(ctx, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
 	awaitReconcile(t, reconciled, dep.ID,
 		"the dependent was never woken by its target's tombstone, so nothing can drop the edge that RESTRICT-blocks collection")
 
