@@ -36,6 +36,11 @@ var ErrNoController = errors.New("beehive: no controller registered for kind")
 // snapshot.
 var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
 
+// ErrWatchLagged ends a watch whose subscriber fell behind its configured buffer
+// under LagFail. Reported on a Failed change, so a stalled consumer is told
+// rather than silently served stale changes forever.
+var ErrWatchLagged = errors.New("beehive: watch subscriber fell behind")
+
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
 // objects have no natural name:
 //

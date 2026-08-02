@@ -1486,3 +1486,48 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, owner.ID, got.ID)
 }
+
+// A subscriber that stops reading can be failed instead of blocking the tail.
+// Resuming from 0 puts every create in one batch, so the batch is bigger than the
+// buffer and the policy fires without anyone having to be slow on a clock.
+func TestLagFailEndsAStalledSubscriber(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, client, _ := watchFixture(t)
+	for range 3 {
+		mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	}
+
+	_, ch, err := client.ObjectsWatchList(ctx,
+		WithResumeFrom(0), WithLagPolicy(LagFail, 1))
+	require.NoError(t, err)
+
+	var got []ObjectChange[cSpec, cStatus]
+	for ev := range ch {
+		got = append(got, ev)
+	}
+
+	require.NotEmpty(t, got)
+	last := got[len(got)-1]
+	assert.Equal(t, Failed, last.Type, "the stream ends rather than waiting forever")
+	assert.ErrorIs(t, last.Err, ErrWatchLagged)
+	assert.Less(t, len(got), 4, "it stopped short of the whole batch")
+}
+
+// The default keeps today's behaviour: the tail blocks until the subscriber
+// reads, and no change is ever dropped.
+func TestLagBlockIsTheDefault(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, client, _ := watchFixture(t)
+	for range 3 {
+		mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	}
+
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(0))
+	require.NoError(t, err)
+
+	for range 3 {
+		assert.Equal(t, Added, recv(t, ch).Type)
+	}
+}
