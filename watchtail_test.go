@@ -227,6 +227,37 @@ func TestWakeHubSilentOnRollback(t *testing.T) {
 	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }
 
+// Stop closes the wake sender so a blocked tailer ends instead of hanging. The
+// watch machinery comes up in New, not Start, so it goes down either way.
+func TestWakeHubClosesOnStop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	t.Run("after start", func(t *testing.T) {
+		bh, err := New(newClientTestStore(t), fast()...)
+		require.NoError(t, err)
+		stop, err := bh.Start(ctx)
+		require.NoError(t, err)
+		rx := bh.wakes.Watch(clientTestGK)
+		defer rx.Close()
+
+		require.NoError(t, stop(ctx))
+		_, err = rx.RecvContext(ctx)
+		assert.ErrorIs(t, err, gobus.ErrClosed)
+	})
+
+	t.Run("never started", func(t *testing.T) {
+		bh, err := New(newClientTestStore(t))
+		require.NoError(t, err)
+		rx := bh.wakes.Watch(clientTestGK)
+		defer rx.Close()
+
+		require.NoError(t, bh.stop(ctx))
+		_, err = rx.RecvContext(ctx)
+		assert.ErrorIs(t, err, gobus.ErrClosed)
+	})
+}
+
 // writeWorld is the beehive plus both write surfaces the wake table drives.
 type writeWorld struct {
 	bh     *Beehive

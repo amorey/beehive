@@ -58,4 +58,9 @@ func (h wakeHub) Watch(gk GroupKind) *watch.Receiver[GroupKind, int64] {
 	return h.hub.Watch(gk, 0)
 }
 
-func (h wakeHub) Close() { h.hub.Sender().Close() }
+// Close is a no-op on the zero hub; see Send.
+func (h wakeHub) Close() {
+	if h.hub != nil {
+		h.hub.Sender().Close()
+	}
+}

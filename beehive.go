@@ -102,12 +102,15 @@ type Beehive struct {
 	// order preserves registration order so Start launches loops deterministically.
 	order []*reconciler
 	waker *waker
-	// wakes carries each committed object write's log position to the kind's
-	// tailer. Built in New, not Start: watches work on a Beehive that never ran.
-	wakes  wakeHub
-	state  beehiveState
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// wakes tells a kind's tailer that the kind moved; tailCtx is what the
+	// tailers run under. Both come from New, not Start: watches work on a
+	// Beehive that never ran, and stop tears them down either way.
+	wakes      wakeHub
+	tailCtx    context.Context
+	tailCancel context.CancelFunc
+	state      beehiveState
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // log returns a non-nil logger; Stop and tests can run before Start resolves it.
@@ -260,10 +263,12 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 }
 
 // stop cancels the reconcile loops and waits for them to drain, bounded by ctx.
-// It returns non-nil only when the drain hit ctx's deadline. No-op if not
-// running.
+// It returns non-nil only when the drain hit ctx's deadline. No-op for the
+// reconcile loops if not running — but the watch machinery comes up in New
+// rather than Start, so it is torn down either way.
 func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Lock()
+	bh.stopWatchTail()
 	if bh.state != beehiveRunning {
 		bh.mu.Unlock()
 		return nil
@@ -311,6 +316,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		migrators:               make(map[GroupKind]Migrator),
 		wakes:                   newWakeHub(),
 	}
+	bh.tailCtx, bh.tailCancel = context.WithCancel(context.Background())
 	cursors, _ := s.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
 	for _, o := range opts {
@@ -408,6 +414,15 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 			r.requeueNow(ref.ID)
 		}
 	})
+}
+
+// stopWatchTail ends the watch machinery: tailers see their context cancelled,
+// and a tailer blocked on a wake sees the sender closed. Called under bh.mu.
+func (bh *Beehive) stopWatchTail() {
+	if bh.tailCancel != nil {
+		bh.tailCancel()
+	}
+	bh.wakes.Close()
 }
 
 // signalObjectWritten wakes gk's tailer once a write to gk commits. AfterCommit
