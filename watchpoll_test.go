@@ -408,7 +408,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 
 	snap, ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
+	require.NotNil(t, snap.Object, "the object is in the snapshot, not the stream")
 
 	// A change to find, and a read that fails while it tries. Wait for ticks that
 	// come *after* the failure is armed, so the recovery below is the stream
@@ -789,7 +789,7 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 
 	snap, ch, err := client.ObjectsWatch(ctx, watched.ID)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1)
+	require.NotNil(t, snap.Object)
 	drainProbe(store.byIDs)
 
 	require.NoError(t, client.DeleteByID(ctx, watched.ID))
@@ -854,8 +854,8 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	t.Run("single-object watch", func(t *testing.T) {
 		snap, _, err := client.ObjectsWatch(ctx, obj.ID)
 		require.NoError(t, err)
-		require.Len(t, snap.Objects, 1)
-		assert.Equal(t, obj.ID, snap.Objects[0].ID)
+		require.NotNil(t, snap.Object)
+		assert.Equal(t, obj.ID, snap.Object.ID)
 	})
 }
 

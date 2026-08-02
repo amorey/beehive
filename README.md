@@ -309,7 +309,12 @@ type ObjectChange[Spec, Status any] struct {
     Err    error                 // non-nil on Failed only
 }
 
-type Snapshot[Spec, Status any] struct {
+type ObjectSnapshot[Spec, Status any] struct {
+    Object          *Object[Spec, Status] // nil when the id holds nothing yet
+    ResourceVersion int64                 // the log position the snapshot is complete as of
+}
+
+type ObjectListSnapshot[Spec, Status any] struct {
     Objects         []*Object[Spec, Status]
     ResourceVersion int64 // the log position the snapshot is complete as of
 }
@@ -327,8 +332,8 @@ type Client[Spec, Status any] interface {
     UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
     GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
     DeleteByID(ctx context.Context, id ObjectID) error
-    ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
-    ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    ObjectsWatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
     OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
@@ -508,11 +513,14 @@ Looking the name up is **atomic with the delete** — the name goes into the sto
 
 #### Watching
 
-`ObjectsWatch` and `ObjectsWatchList` return the current state as a `Snapshot`, plus a stream of the changes above it. The channel closes when `ctx` is cancelled.
+`ObjectsWatch` and `ObjectsWatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `ObjectsWatch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `ObjectsWatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled.
 
 ```go
 snap, ch, err := client.ObjectsWatchList(ctx)
 // snap.Objects is current state; snap.ResourceVersion is where the stream starts.
+
+one, ch, err := client.ObjectsWatch(ctx, id)
+// one.Object is current state, or nil; one.ResourceVersion is where the stream starts.
 ```
 
 **Do not open a watch inside `Within`.** The read below happens on your goroutine, and the store runs on a single connection — so it waits for the connection your transaction is holding, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
@@ -538,7 +546,7 @@ WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffe
 
 A `WatchOption` can reject the call itself: `WithLagPolicy` returns `ErrInvalidOption` for an unknown policy, or for a `LagFail` depth outside `1..1<<20`. You get the error instead of a stream, as with a failed snapshot read.
 
-Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet; an absent object is an empty snapshot, and its creation arrives as `Added`.
+Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet; an absent object is a `nil` `Object`, and its creation arrives as `Added`.
 
 (The event *log* below, `EventsList`/`EventsWatch`, is a different thing: an `ObjectChange` says an object changed, an `Event` is a log entry.)
 

@@ -89,10 +89,18 @@ func checkName(name string) error {
 	return nil
 }
 
-// Snapshot is a watch's starting state: the objects as they were, and the log
-// position they are complete as of. The stream that comes with it carries
-// changes strictly above that position.
-type Snapshot[Spec, Status any] struct {
+// ObjectSnapshot is a single-object watch's starting state. Object is nil when
+// the id holds nothing yet; the stream that comes with it carries changes
+// strictly above ResourceVersion.
+type ObjectSnapshot[Spec, Status any] struct {
+	Object          *Object[Spec, Status]
+	ResourceVersion int64
+}
+
+// ObjectListSnapshot is a kind-wide watch's starting state: the objects as they
+// were, and the log position they are complete as of. The stream that comes
+// with it carries changes strictly above that position.
+type ObjectListSnapshot[Spec, Status any] struct {
 	Objects         []*Object[Spec, Status]
 	ResourceVersion int64
 }
@@ -174,16 +182,16 @@ type Client[Spec, Status any] interface {
 	//
 	// The snapshot is read before either returns, on the caller's goroutine, so a
 	// caller may subscribe and then act: a change it makes afterwards — including
-	// a delete — is always in the stream. Snapshot.ResourceVersion is the log
-	// position the snapshot is complete as of, and the stream carries changes
-	// strictly above it: no overlap, no gap. A failed snapshot read is returned
-	// rather than handed back as a stream whose guarantee is void.
+	// a delete — is always in the stream. The snapshot's ResourceVersion is the
+	// log position it is complete as of, and the stream carries changes strictly
+	// above it: no overlap, no gap. A failed snapshot read is returned rather
+	// than handed back as a stream whose guarantee is void.
 	//
 	// Everything after is polled, which bounds latency and collapses changes
 	// within one interval. A watch cannot be opened inside a transaction (the
 	// read would deadlock on the single connection).
-	ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
-	ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	ObjectsWatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)

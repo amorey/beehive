@@ -1606,8 +1606,8 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	require.NoError(t, err)
 
 	// The snapshot holds obj1 and nothing else; the stream carries what follows.
-	require.Len(t, snap.Objects, 1)
-	assert.Equal(t, obj1.ID, snap.Objects[0].ID)
+	require.NotNil(t, snap.Object)
+	assert.Equal(t, obj1.ID, snap.Object.ID)
 
 	// Update obj2 first — this event must not appear on ch.
 	_, err = client.UpdateByID(ctx, obj2.ID, cSpec{Val: "b2"})
@@ -1722,9 +1722,9 @@ func TestWatchInitialSnapshot(t *testing.T) {
 	snap, _, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	require.Len(t, snap.Objects, 1)
-	assert.Equal(t, obj.ID, snap.Objects[0].ID)
-	assert.Equal(t, "hello", snap.Objects[0].Spec.Val)
+	require.NotNil(t, snap.Object)
+	assert.Equal(t, obj.ID, snap.Object.ID)
+	assert.Equal(t, "hello", snap.Object.Spec.Val)
 }
 
 // TestStartAfterStopErrors verifies that Beehive is a one-shot object: calling
@@ -1764,9 +1764,9 @@ func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, snap.Objects)
 
-	snap, _, err = client.ObjectsWatch(ctx, 0)
+	one, _, err := client.ObjectsWatch(ctx, 0)
 	require.NoError(t, err)
-	assert.Empty(t, snap.Objects)
+	assert.Nil(t, one.Object)
 }
 
 func TestClientGetOwner(t *testing.T) {

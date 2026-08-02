@@ -41,9 +41,9 @@ transaction and taking the `resource_version` that write was assigned.
   `objectsDelete` said so as intent — but a delete entry needs a version to be
   ordered against the rest of the log. The shared counter therefore moves on
   collection, and the event log draws from it too.
-- **Watches return a `Snapshot` and tail the log above it.** The snapshot is
-  read on the caller's goroutine, so subscribe-then-act still holds, and
-  `Snapshot.ResourceVersion` is the exact seam: the stream carries changes
+- **Watches return a snapshot and tail the log above it.** The snapshot is
+  read on the caller's goroutine, so subscribe-then-act still holds, and its
+  `ResourceVersion` is the exact seam: the stream carries changes
   strictly above it. Entries coalesce per object and are delivered in write
   order, keeping delivery level-triggered. A coalesced run that began with a
   create still reports `Added`: the surviving entry is the later update, but the
