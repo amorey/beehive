@@ -332,8 +332,11 @@ type Client[Spec, Status any] interface {
     UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
     GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
     DeleteByID(ctx context.Context, id ObjectID) error
-    ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
-    ObjectsWatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+
+    // Watching: a snapshot plus the changes above it. Kind-scoped; no controller
+    // needed; an id holding nothing yet is a nil Object, not ErrNotFound.
+    Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
     OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
@@ -513,13 +516,13 @@ Looking the name up is **atomic with the delete** — the name goes into the sto
 
 #### Watching
 
-`ObjectsWatch` and `ObjectsWatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `ObjectsWatch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `ObjectsWatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled.
+`Watch` and `WatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `Watch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled.
 
 ```go
-snap, ch, err := client.ObjectsWatchList(ctx)
+snap, ch, err := client.WatchList(ctx)
 // snap.Objects is current state; snap.ResourceVersion is where the stream starts.
 
-one, ch, err := client.ObjectsWatch(ctx, id)
+one, ch, err := client.Watch(ctx, id)
 // one.Object is current state, or nil; one.ResourceVersion is where the stream starts.
 ```
 
@@ -546,7 +549,7 @@ WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffe
 
 A `WatchOption` can reject the call itself: `WithLagPolicy` returns `ErrInvalidOption` for an unknown policy, or for a `LagFail` depth outside `1..1<<20`. You get the error instead of a stream, as with a failed snapshot read.
 
-Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet; an absent object is a `nil` `Object`, and its creation arrives as `Added`.
+Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `Watch` on another kind's id streams nothing. The id need not exist yet; an absent object is a `nil` `Object`, and its creation arrives as `Added`.
 
 (The event *log* below, `EventsList`/`EventsWatch`, is a different thing: an `ObjectChange` says an object changed, an `Event` is a log entry.)
 
@@ -581,7 +584,7 @@ The scheduling API reports when an object is **next due to reconcile**, as a [`S
 
 `SchedulesGet` is the point read: a non-blocking read of in-memory state, with no store lookup and no kind check, so it returns no error today (the error is reserved for symmetry with the rest of the surface). A missing id, another kind's id and a client-only kind all read as the zero `Schedule`, which looks the same as a real object with nothing scheduled.
 
-`SchedulesWatch` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `ObjectsWatch`/`ObjectsWatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It polls on the same 1s cadence as the object watches and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `SchedulesGet` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
+`SchedulesWatch` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It polls on the same 1s cadence as the object watches and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `SchedulesGet` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
 
 Both are on `Client` only, and both read **per-id timers only**. Neither predicts the next reconcile: the real one can come **earlier**, because the owed pass, the full pass and the dependency wake are not per-id timers, and **a zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee.
 

@@ -152,9 +152,9 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 	return true
 }
 
-// ObjectsWatchList streams changes to every object of this client's kind. See
+// WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	cfg, err := resolveWatch(opts)
 	if err != nil {
 		return ObjectListSnapshot[Spec, Status]{}, nil, err
@@ -162,10 +162,10 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ..
 	return c.objectStream(ctx, cfg, nil)
 }
 
-// ObjectsWatch streams changes to the single object id, polling a one-row
+// Watch streams changes to the single object id, polling a one-row
 // listing: an id that does not exist yet streams nothing until created, and its
 // removal reads as a Deleted.
-func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The tail is the kind's: the log carries no index under object_id, so a
 	// single-object watch scans what its kind writes. It reads and decodes only
 	// its own object, though — the filter runs before the batched read.

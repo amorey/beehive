@@ -174,24 +174,6 @@ type Client[Spec, Status any] interface {
 	// the process can't read.
 	GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
-	// ObjectsWatch returns one object's current state, ObjectsWatchList every
-	// object of this client's kind, each with a stream of the changes above it:
-	// Added/Modified/Deleted until ctx is cancelled. Both are kind-scoped and
-	// need no registered controller: the tail reads the write log, not a
-	// reconciler.
-	//
-	// The snapshot is read before either returns, on the caller's goroutine, so a
-	// caller may subscribe and then act: a change it makes afterwards — including
-	// a delete — is always in the stream. The snapshot's ResourceVersion is the
-	// log position it is complete as of, and the stream carries changes strictly
-	// above it: no overlap, no gap. A failed snapshot read is returned rather
-	// than handed back as a stream whose guarantee is void.
-	//
-	// Everything after is polled, which bounds latency and collapses changes
-	// within one interval. A watch cannot be opened inside a transaction (the
-	// read would deadlock on the single connection).
-	ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
-	ObjectsWatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
@@ -249,6 +231,25 @@ type Client[Spec, Status any] interface {
 	// UpdateByID is Update keyed by incarnation: it writes that one row, or
 	// returns ErrNotFound. The write half of a read-modify-write.
 	UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+	// Watch returns one object's current state, WatchList every object of this
+	// client's kind, each with a stream of the changes above it:
+	// Added/Modified/Deleted until ctx is cancelled. Both are kind-scoped and
+	// need no registered controller: the tail reads the write log, not a
+	// reconciler. An id holding nothing yet is a nil ObjectSnapshot.Object, not
+	// ErrNotFound; its creation arrives as Added.
+	//
+	// The snapshot is read before either returns, on the caller's goroutine, so a
+	// caller may subscribe and then act: a change it makes afterwards — including
+	// a delete — is always in the stream. The snapshot's ResourceVersion is the
+	// log position it is complete as of, and the stream carries changes strictly
+	// above it: no overlap, no gap. A failed snapshot read is returned rather
+	// than handed back as a stream whose guarantee is void.
+	//
+	// Everything after is polled, which bounds latency and collapses changes
+	// within one interval. A watch cannot be opened inside a transaction (the
+	// read would deadlock on the single connection).
+	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must

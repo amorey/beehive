@@ -11,7 +11,7 @@
 `Client.SchedulesWatch(id)` / `SchedulesGet(id)` observe an object's next-requeue
 time: the reschedules (`addAfter` backoff / `RequeueAfter`, `requeueNow`, dispatch,
 enqueues from a owed pass, a full pass or a dependency wake, or `Requeue`) that bump
-no generation and no `resource_version`, and so are invisible to `ObjectsWatch`. No
+no generation and no `resource_version`, and so are invisible to `Client.Watch`. No
 other signal captures them.
 
 ## Decision
@@ -62,7 +62,7 @@ fine, though — it simply streams the zero `Schedule` until something schedules
   one, and a zero `NextRequeueAt` means "nothing scheduled", not "will not
   reconcile". Observability, not a guarantee.
 - It is the third watch surface alongside the object-change streams
-  (`ObjectsWatch` / `ObjectsWatchList`) and `EventsWatch` (the log). A schedule is a
+  (`Watch` / `WatchList`) and `EventsWatch` (the log). A schedule is a
   single mutable *future* value, deliberately not routed through the append-only,
   retained event log.
 

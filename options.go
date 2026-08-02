@@ -292,7 +292,7 @@ func withStaleDependentsInterval(d time.Duration) Option {
 }
 
 // withWatchPollInterval sets how often the store-backed Client watches
-// (ObjectsWatch, ObjectsWatchList, EventsWatch) poll. Global and meaningful
+// (Watch, WatchList, EventsWatch) poll. Global and meaningful
 // only at New; SchedulesWatch is not governed by it (that stream takes no
 // tick). Unexported: watch latency and resolution are part of the streams'
 // documented contract. It is both the latency a subscriber sees and the

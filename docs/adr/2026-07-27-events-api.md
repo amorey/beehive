@@ -78,8 +78,8 @@ The object-change surfaces are deliberately named apart:
 - The dependency waker reads the store's write log through
   `Store.ObjectWritesListSince(ctx, afterRV, limit)` — store-wide, paged, yielding
   `[]ObjectWrite` (id plus `ChangeType` = `Added` / `Modified` / `Deleted`, no row).
-- Typed `ObjectChange[Spec,Status]` values reach users through `Client.ObjectsWatch` /
-  `ObjectsWatchList`, which poll and diff.
+- Typed `ObjectChange[Spec,Status]` values reach users through `Client.Watch` /
+  `WatchList`, which poll and diff.
 - `Client.EventsWatch` streams the log's aggregated `Event`s — the value itself, not
   a `Change`, because an append-only log has nothing for a change type to say.
 
