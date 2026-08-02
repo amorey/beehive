@@ -1,11 +1,13 @@
-# A spec write enqueues its own object, gated on the write having changed it
+# A write enqueues the object it made owe a reconcile, gated on what it changed
 
 - **Status:** Accepted — implemented in `client.go` (`signalSpecWritten`,
   `signalCreated`) over a `changed` bool added to both `ObjectsUpdateSpec*`
-  mutators in `internal/storeapi` and `sqlite/store.go`. Narrows the "Writes schedule nothing" section of
+  mutators in `internal/storeapi` and `sqlite/store.go`, and in `controller.go`
+  (`DependenciesAdd`) over `EdgesAddResult`. Both go through
+  `Beehive.signalRequeue`. Narrows the "Writes schedule nothing" section of
   [the drivers ADR](2026-07-28-periodic-scan-drivers.md), which still governs
   every other write.
-- **Date:** 2026-07-31
+- **Date:** 2026-07-31, extended 2026-08-01 to the new-edge stamp
 
 ## Context
 
@@ -95,10 +97,12 @@ The enqueue does not clear the backoff ladder, matching `Client.Requeue`'s defau
 `WithResetBackoff` stays the explicit way to ask for that. A new spec is not
 evidence that a previous failure will not repeat.
 
-The reconciler is resolved inside the hook rather than at registration time,
-because the helper runs inside the caller's transaction and `bh.mu` is a lock
-`Register` and `stop` also want. A client-only kind resolves to nothing and the
-hook is a no-op.
+The reconciler is resolved inside the hook rather than at registration time. On the
+`Within` path the helper may run inside the caller's transaction, and `bh.mu` is a
+lock `Register` and `stop` also want. Outside a transaction the hook runs inline on
+the caller's goroutine and takes `bh.mu` there, which does not deadlock because
+`stop` releases `bh.mu` before it waits. A client-only kind resolves to nothing and
+the hook is a no-op.
 
 ## Consequences
 
@@ -125,3 +129,51 @@ hook is a no-op.
   the same database, still waits for the owed pass. That is the same boundary every
   in-process signal in beehive has, and the reason the scans remain what guarantees
   convergence.
+
+## Extension: a new dependency edge enqueues its source
+
+`EdgesAdd` increments `reconcile_owed` for every `depends_on` edge it creates, and
+that count waited for the owed pass. The same decision applies at that site, so it
+is recorded here rather than in a second ADR that repeats the argument.
+
+**The gate, the hook and the routing are one decision applied twice.** The gate is
+`EdgesAddResult.ReconcileOwedStamped`, which is the store's report that this call
+created the edge — the same discipline as the `changed` bool, and for the same
+reason: a caller's claim that it wrote is not evidence that anything moved. A
+level-triggered controller re-asserts its whole dependency set on every pass, so
+an ungated enqueue would schedule a pass per pass. The hook is `Store.AfterCommit`,
+so a rollback or a savepoint unwind discards it.
+
+**The routing is what differs.** A spec write is always to the client's own kind. An
+edge is deliberately cross-kind, so the enqueue routes by `EdgesAddResult.From` —
+`fromID`'s own kind, which the store also uses for the durable stamp. Routing by the
+caller's kind would reach the wrong reconciler, or none.
+`TestAddDependencyEnqueueRoutesByTheSourcesKind` is the only test that catches it.
+
+### The backoff ladder does not survive a non-converging edge set
+
+This is a known cost of `requeueNow`, and it is accepted rather than fixed.
+
+`requeueNow` on an id that is in flight marks it dirty rather than queueing it.
+`runWorker` then calls `work.done(id)` before `work.addAfter(id, backoff)`, and
+`done` makes a dirty id dispatchable at once, so the backoff alarm set on the next
+line does not hold it. A failing pass that created an edge therefore retries
+immediately, however deep its ladder is.
+
+The edge-new gate bounds this to controllers whose edge set never converges: one
+that creates a fresh child per attempt, and one that deletes and re-declares its set
+every pass. An ordinary failing controller re-asserts the same edges, stamps
+nothing, and keeps its ladder.
+
+The alternative was to skip the enqueue when the source is the object this
+reconciler currently has in flight. There is no clean signal for that at the call
+site — the hook is cross-kind, so the source may sit in another kind's queue — and
+reading the work queue's in-flight state from a commit hook is a worse coupling than
+the cost it removes. The cost falls on a controller that is already failing, and it
+is CPU rather than divergence.
+
+The property is pinned in both directions:
+`TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges` and
+`TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce`. A fix, if one is ever wanted,
+belongs at `requeueNow` or at the `done`/`addAfter` ordering, where it would also
+cover `Client.Requeue` and the spec write's own enqueue.

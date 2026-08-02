@@ -131,8 +131,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   mutators return) — never on the row being unsettled, which a failing reconcile
   leaves true forever and which would let a controller re-applying its own spec
   requeue past its backoff. A byte-identical update wakes nothing, and the owed pass
-  stays the backstop. A delete still schedules nothing. `Store.AfterCommit` has two users: `WithOnCreate` and that
-  enqueue.
+  stays the backstop. A delete still schedules nothing. `Store.AfterCommit` has three
+  users: `WithOnCreate`, that enqueue and the new-edge enqueue below. The last two
+  share `Beehive.signalRequeue`, which takes an `ObjectRef` so it can route to a kind
+  that is not the caller's.
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **The name is the `Client` API's key; the id is the store's key.** The bare CRUD
@@ -228,8 +230,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   that pass observed at load, so the decrement cannot consume it. The edge-new gate
   is what bounds it: re-asserting a dependency set every pass stamps nothing after
   the first. There is no version claim — the parameter the old conditional stamp
-  read was removed once nothing conditioned on it.
-  → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)
+  read was removed once nothing conditioned on it. **The declaration also enqueues
+  the source at commit**, on the same edge-new gate (`ReconcileOwedStamped`) and
+  routed by the source's own kind (`EdgesAddResult.From`), because the edge is
+  cross-kind. The stamp stays the backstop. One cost is accepted and pinned: a source
+  whose edge set never converges loses its backoff ladder, because `requeueNow` on an
+  in-flight id beats the alarm.
+  → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md),
+  [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **Secondary lookups (owner, dependencies, dependents, owned) are read on request**,
   never folded into the `SELECT` that carries the blobs. Eager `LoadOption`s and lazy
   `Client`/`ControllerClient` getters share the same loaders, and accessors return

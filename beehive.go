@@ -491,6 +491,36 @@ func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 	return r, ok
 }
 
+// signalRequeue enqueues ref's own reconcile when the write that owes it commits.
+// It is the one place a commit-time enqueue is registered, so every caller gets the
+// same three properties.
+//
+// AfterCommit gives the first two. A rollback discards the hook, and so does a
+// savepoint unwind inside a nested Within, so the enqueue fires only for a write
+// that is real. Outside a transaction there is nothing to defer to, so the hook runs
+// inline on the caller's goroutine — which is the usual path for a controller write,
+// because a reconcile opens no transaction of its own.
+//
+// The reconciler is resolved inside the hook, not at registration. On the Within
+// path the registration may run inside the caller's transaction. On the inline path
+// the hook takes bh.mu on the reconcile goroutine, which does not deadlock, because
+// stop releases bh.mu before it waits (see stop). A client-only kind resolves to
+// nothing and the hook does nothing.
+//
+// The enqueue does not clear the backoff ladder, matching Client.Requeue's default:
+// a new write is not evidence that a past failure will not repeat. Note that
+// requeueNow on an id that is in flight marks it dirty, and work.done then makes it
+// dispatchable at once, so the caller's ladder does not apply to that pass. Callers
+// must gate on what the write changed to keep that bounded — see signalSpecWritten
+// and DependenciesAdd.
+func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {
+			r.requeueNow(ref.ID)
+		}
+	})
+}
+
 // enqueuerForPage returns an enqueue function that resolves each kind once and then
 // caches it, for a caller queueing many ids across a few kinds at once. Resolving per
 // id would take bh.mu every time, and one page of the dependency waker's scan can

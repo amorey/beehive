@@ -201,15 +201,35 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // decrement (see the ADR on stamping every new edge). The edge-new gate costs
 // nothing, riding the stamp statement's own NOT EXISTS.
 //
-// Nothing is scheduled here, and the store's EdgesAddResult is discarded for that
-// reason: reconcile_owed is a durable count the owed pass drains, routed by
-// fromID's own GroupKind inside the store — the edge is deliberately cross-kind, so
-// a controller may declare one on another kind's behalf. The count is the whole
-// mechanism: it is durable, so a crash between the commit and the pass loses
-// nothing.
+// The stamp is the durable half: reconcile_owed is a count the owed pass drains,
+// routed by fromID's own GroupKind inside the store. It survives a crash between the
+// commit and the pass, so it is what guarantees the reconcile.
+//
+// The enqueue beside it is the prompt half. It schedules the source when the edge
+// commits, so a first declare does not wait for the owed-pass tick. The stamp stays
+// the backstop, and the enqueue adds no guarantee of its own.
+//
+// signalRequeue requires its callers to gate, and this is the gate: what the store
+// reports it did, never the fact that the caller called this method.
+// ReconcileOwedStamped is true only for a depends_on edge this call created,
+// self-edges excluded, so a controller that re-asserts its whole set every pass —
+// which is the normal shape — queues nothing after the first declare. That
+// convergence is what bounds the enqueue to one per edge ever created. There is
+// deliberately no second answer to "was the edge new" for the gate to disagree with.
+//
+// The enqueue routes by res.From, which is fromID's own kind, and not by c.gk. The
+// edge is cross-kind, so the two differ whenever a controller declares a dependency
+// on another kind's behalf, and the caller's kind would reach the wrong reconciler
+// or none. This matches the store, which routes the durable stamp by the same row.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
-	_, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
-	return err
+	res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
+	if err != nil {
+		return err
+	}
+	if res.ReconcileOwedStamped {
+		c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: res.From.Group, Kind: res.From.Kind})
+	}
+	return nil
 }
 
 // DependenciesDelete drops the edge and does nothing else. Dropping it can unblock

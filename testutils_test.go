@@ -32,6 +32,7 @@ import (
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/gochan/oneshot"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -749,6 +750,39 @@ func unsettledIDs(t *testing.T, store Store) []ObjectID {
 func drainQueue(q *workQueue) {
 	for id, ok := q.get(); ok; id, ok = q.get() {
 		q.done(id)
+	}
+}
+
+// hotLoopCalls is how many reconciles of one object prove that a backoff ladder
+// was bypassed. The ladder starts at defaultBaseRetryInterval and doubles, so a
+// handful of passes inside hotLoopWindow is the ladder working. The failure mode
+// it separates from that is unbounded, not merely faster.
+const hotLoopCalls = 25
+
+// hotLoopWindow is how long a hot loop is given to prove itself. It is a failsafe
+// and not a synchronisation point: hot firing is what fails the test, and this
+// only bounds the wait for it.
+const hotLoopWindow = 500 * time.Millisecond
+
+// requireNoHotLoop fails if hot fired, which a controller does once it has run
+// hotLoopCalls times. There is no clock to assert on instead: baseRetryInterval
+// has no option, and WithMaxRetryInterval only caps upward — so a retry loop
+// running at full speed is told from one climbing its ladder by counting passes
+// inside a fixed window.
+//
+// It waits on first before it opens that window, and that wait is what stops the
+// count from being a bound with nothing under it. A window on its own passes when
+// the controller never ran at all, so a broken Start, a broken Register or a
+// broken enqueue would leave this green. first fires on the controller's own first
+// pass, so the assertion below reads "it ran, and then it did not run away".
+func requireNoHotLoop(t *testing.T, first, hot *signal, calls *atomic.Int64, msg string) {
+	t.Helper()
+	first.wait(t, "the first reconcile: nothing dispatched the object at all")
+	select {
+	case <-hot.rx.Chan():
+		t.Fatalf("hot loop: %d reconciles, so the backoff ladder was bypassed: %s", calls.Load(), msg)
+	case <-time.After(hotLoopWindow):
+		assert.Less(t, calls.Load(), int64(hotLoopCalls), msg)
 	}
 }
 
