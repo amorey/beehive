@@ -176,8 +176,8 @@ type Client[Spec, Status any] interface {
 	// Everything after is polled, which bounds latency and collapses changes
 	// within one interval. A watch cannot be opened inside a transaction (the
 	// read would deadlock on the single connection).
-	ObjectsWatch(ctx context.Context, id ObjectID) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
-	ObjectsWatchList(ctx context.Context) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)

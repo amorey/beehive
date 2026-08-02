@@ -31,6 +31,32 @@ import (
 // intermediate states are invisible (changes within one interval collapse into
 // the latest state), and latency is the poll interval, not the write.
 
+// WatchOption configures one watch call. A distinct type from Option: these are
+// meaningful only here, and dispatching them on a Beehive or a controller would
+// silently accept nonsense.
+type WatchOption func(*watchConfig)
+
+type watchConfig struct {
+	// resumeFrom is the position to stream above, or nil to take a snapshot.
+	resumeFrom *int64
+}
+
+// WithResumeFrom streams the changes above rv instead of taking a snapshot. The
+// returned Snapshot holds no objects and carries rv back. Fails with
+// ErrWatchTooOld when retention has already removed entries above rv, which the
+// caller answers by subscribing again without this option.
+func WithResumeFrom(rv int64) WatchOption {
+	return func(c *watchConfig) { c.resumeFrom = &rv }
+}
+
+func resolveWatch(opts []WatchOption) watchConfig {
+	var cfg watchConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
 // watchPoll returns the poll interval; the fallback covers only a Beehive built
 // field by field in a test.
 func (bh *Beehive) watchPoll() time.Duration {
@@ -71,11 +97,11 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 
 // ObjectsWatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
 		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	return c.objectStream(ctx,
+	return c.objectStream(ctx, resolveWatch(opts),
 		func(ctx context.Context) ([]*RawObject, int64, error) {
 			return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
 		},
@@ -85,13 +111,13 @@ func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (Snapsh
 // ObjectsWatch streams changes to the single object id, polling a one-row
 // listing: an id that does not exist yet streams nothing until created, and its
 // removal reads as a Deleted.
-func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	if !c.bh.isRegistered(c.gk) {
 		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
 	// The tail is the kind's, filtered here: the log carries no index under
 	// object_id, so a single-object watch costs what its kind writes.
-	return c.objectStream(ctx,
+	return c.objectStream(ctx, resolveWatch(opts),
 		func(ctx context.Context) ([]*RawObject, int64, error) {
 			return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, id)
 		},
@@ -121,29 +147,41 @@ func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID
 // A row that fails to decode is quarantined as List does it.
 func (c *clientImpl[Spec, Status]) objectStream(
 	ctx context.Context,
+	cfg watchConfig,
 	snapshot func(context.Context) ([]*RawObject, int64, error),
 	match func(ObjectID) bool,
 ) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The migrator is invariant for the stream's lifetime.
 	mig := c.bh.migratorFor(c.gk)
 
-	// The snapshot, on the caller's goroutine; its failure is the one the
-	// caller can act on. Every later failure costs one tick.
-	raws, at, err := snapshot(ctx)
-	if err != nil {
-		return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
-			c.gk.Group, c.gk.Kind, err)
-	}
-
-	snap := Snapshot[Spec, Status]{ResourceVersion: at}
-	for _, raw := range raws {
-		obj, err := rawToTyped[Spec, Status](raw, mig)
-		if err != nil {
-			c.warnUndecodable("Watch", raw.ID, err)
-			continue
+	var snap Snapshot[Spec, Status]
+	if cfg.resumeFrom != nil {
+		// A resume reads no state; it only has to prove the position is still
+		// inside the log. The probe is one bounded listing, and a trim after it
+		// is caught by the tail's own check.
+		if err := c.resumable(ctx, *cfg.resumeFrom); err != nil {
+			return Snapshot[Spec, Status]{}, nil, err
 		}
-		snap.Objects = append(snap.Objects, obj)
+		snap.ResourceVersion = *cfg.resumeFrom
+	} else {
+		// The snapshot, on the caller's goroutine; its failure is the one the
+		// caller can act on. Every later failure costs one tick.
+		raws, at, err := snapshot(ctx)
+		if err != nil {
+			return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+				c.gk.Group, c.gk.Kind, err)
+		}
+		snap.ResourceVersion = at
+		for _, raw := range raws {
+			obj, err := rawToTyped[Spec, Status](raw, mig)
+			if err != nil {
+				c.warnUndecodable("Watch", raw.ID, err)
+				continue
+			}
+			snap.Objects = append(snap.Objects, obj)
+		}
 	}
+	at := snap.ResourceVersion
 
 	out := make(chan ObjectChange[Spec, Status])
 	go func() {
@@ -174,6 +212,21 @@ func (c *clientImpl[Spec, Status]) objectStream(
 		})
 	}()
 	return snap, out, nil
+}
+
+// resumable reports whether a stream may start above rv, reading the horizon the
+// tail's own listing reports.
+func (c *clientImpl[Spec, Status]) resumable(ctx context.Context, rv int64) error {
+	_, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, rv, 1)
+	if err != nil {
+		return fmt.Errorf("beehive: watch on %s/%s: resume check failed: %w",
+			c.gk.Group, c.gk.Kind, err)
+	}
+	if rv < trimmedThrough {
+		return fmt.Errorf("%w: %s/%s trimmed through %d, resume asked for %d",
+			ErrWatchTooOld, c.gk.Group, c.gk.Kind, trimmedThrough, rv)
+	}
+	return nil
 }
 
 // tailPageCap bounds one tick's read of the log. A busier interval than this

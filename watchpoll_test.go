@@ -1407,3 +1407,50 @@ func TestAQuietKindIsNotTornDownByATrim(t *testing.T) {
 	assert.Equal(t, Modified, ev.Type)
 	assert.Equal(t, "b", ev.Object.Spec.Val)
 }
+
+// A resumed stream takes no snapshot: it starts from the position the caller
+// already holds and carries only what happened above it.
+func TestWithResumeFromSkipsTheSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	first, _, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	drainProbe(store.listed)
+
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+
+	snap, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(first.ResourceVersion))
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects, "a resume reads no state")
+	assert.Equal(t, first.ResourceVersion, snap.ResourceVersion)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Modified, ev.Type)
+	assert.Equal(t, "b", ev.Object.Spec.Val, "the change the caller missed")
+
+	select {
+	case <-store.listed:
+		t.Fatal("a resume must not list the kind")
+	default:
+	}
+}
+
+// A resume below the horizon is refused by the call, not by the stream: there is
+// no honest stream to hand back, so the caller learns it must resync now rather
+// than after subscribing.
+func TestResumeBelowTheHorizonIsRefused(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	store.forceTrimmed.Store(obj.ResourceVersion + 10)
+
+	_, ch, err := client.ObjectsWatchList(ctx, WithResumeFrom(obj.ResourceVersion))
+
+	require.ErrorIs(t, err, ErrWatchTooOld)
+	assert.Nil(t, ch, "no stream, because none could be truthful")
+}
