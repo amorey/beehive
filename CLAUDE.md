@@ -73,7 +73,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   is an ordinary update. Retention is per kind and **bounded by default** (24h),
   unlike the event log, because entries land at reconcile rate; what it trims is
   recorded per kind in `object_writes_horizon`, and that horizon is the resume
-  boundary. → [spec](docs/specs/objects-watch.md)
+  boundary. → [ADR](docs/adr/2026-08-02-object-write-log.md)
 - **Client watches return a snapshot and tail that log** (`watchpoll.go`). A
   quiet tick costs one read of the kind's log position
   (`ObjectWritesMaxVersion`, which folds in the horizon so it only rises — gate

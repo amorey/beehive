@@ -23,6 +23,7 @@ directory of archaeology.
 
 ## Index
 
+- [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
