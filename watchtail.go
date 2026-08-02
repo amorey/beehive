@@ -15,24 +15,42 @@
 package beehive
 
 import (
+	"sync/atomic"
+
 	"github.com/amorey/gobus/watch"
 )
 
-// wakeHub carries a committed write's log position from the commit path to the
-// kind's tailer. Keyed by GroupKind and latest-value: a burst coalesces into one
-// pending wake, and a publish that lands mid-read waits in the slot. Close
-// closes the sender, never the hub — scheduleHub's rule.
+// wakeHub tells a kind's tailer that the kind moved. Keyed by GroupKind and
+// latest-value: a burst coalesces into one pending wake, and a publish that
+// lands mid-read waits in the slot. Close closes the sender, never the hub —
+// scheduleHub's rule.
+//
+// The value is a process-local tick, not the write's resource version: most
+// store writes return no version (see the write-shapes ADR), and the tailer
+// reads its own cursor from the store anyway. All the value has to do is rise,
+// so Accept can drop a publish the hub has already superseded.
 type wakeHub struct {
 	hub *watch.Hub[GroupKind, int64]
+	seq *atomic.Int64
 }
 
 func newWakeHub() wakeHub {
-	return wakeHub{hub: watch.New[GroupKind](watch.WithAccept(
-		func(prev, next int64) bool { return next > prev },
-	))}
+	return wakeHub{
+		hub: watch.New[GroupKind](watch.WithAccept(
+			func(prev, next int64) bool { return next > prev },
+		)),
+		seq: new(atomic.Int64),
+	}
 }
 
-func (h wakeHub) Send(gk GroupKind, rv int64) error { return h.hub.Sender().Send(gk, rv) }
+// Send is a no-op on the zero hub, which is what a Beehive assembled without
+// New has — the same courtesy bh.log() extends to an unresolved logger.
+func (h wakeHub) Send(gk GroupKind) error {
+	if h.hub == nil {
+		return nil
+	}
+	return h.hub.Sender().Send(gk, h.seq.Add(1))
+}
 
 // Watch registers a receiver for gk, seeded at zero: the tailer reads its own
 // starting cursor from the store, not from the hub.

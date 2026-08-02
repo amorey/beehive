@@ -90,10 +90,19 @@ amendment about the cadence, not an exception.
 Two hubs, one per direction, each from a package already in the tree:
 
 - **Commit → tailer:** `gobus/watch`, the keyed latest-value gauge bus the
-  schedule watch already uses. Key: `GroupKind`. Value: the committed write's
-  resource version. Accept: `next > prev`, so stale publishes vanish and a
-  burst coalesces into one pending wake. One key per receiver fits: a tailer
-  watches one kind. `Sender` is safe to share across committing goroutines.
+  schedule watch already uses. Key: `GroupKind`. Value: a process-local tick.
+  Accept: `next > prev`, so a superseded publish vanishes and a burst coalesces
+  into one pending wake. One key per receiver fits: a tailer watches one kind.
+  `Sender` is safe to share across committing goroutines.
+
+  The value is **not** the write's resource version. Most store writes return
+  no version — `ObjectsUpdateStatus`, `ConditionsSet`, `FinalizersDelete` and
+  the deletion verbs all return `error` or `(bool, error)`, and the
+  [write-shapes ADR](../adr/2026-07-30-store-write-shapes.md) is why. Carrying
+  a real version would mean widening those returns for a number the tailer
+  never reads: it reads its own cursor from the store, so the wake only has to
+  say "this kind moved" and to rise monotonically so `Accept` can drop what the
+  hub has already superseded.
 - **Tailer → subscribers:** `gobus/conflate`, the single-producer keyed
   fan-out bus. This is its stated use case (Kubernetes-style informers). Key:
   `ObjectID`. Value: a raw envelope, not a decoded change (see below). Merge:
@@ -131,7 +140,7 @@ is not another's.
 ### Wake producer
 
 `Beehive` owns the wake hub, created in `New`. Each beehive-layer write path
-publishes its kind and resource version through `Store.AfterCommit` — the
+publishes its kind through `Store.AfterCommit` — the
 boundary `signalRequeue` uses, for the same reasons: a rollback publishes
 nothing, and the wake cannot arrive before the write is readable. On stop,
 close the sender, not the hub (`Hub.Close` is a hard tear-down; see

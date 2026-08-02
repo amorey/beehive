@@ -410,12 +410,14 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 	})
 }
 
-// signalObjectWritten wakes gk's tailer with the write's log position once the
-// write commits. AfterCommit for the same reasons as signalRequeue: a rollback
-// publishes nothing, and the wake cannot outrun the row it announces.
-func (bh *Beehive) signalObjectWritten(ctx context.Context, gk GroupKind, rv int64) {
+// signalObjectWritten wakes gk's tailer once a write to gk commits. AfterCommit
+// for the same reasons as signalRequeue: a rollback publishes nothing, and the
+// wake cannot outrun the row it announces. Callers gate on the write having
+// changed something only where the store already reports it — a spurious wake
+// costs one gate read, a missed one costs a floor tick of staleness.
+func (bh *Beehive) signalObjectWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
-		_ = bh.wakes.Send(gk, rv) // ErrClosed after stop; nothing is left to wake
+		_ = bh.wakes.Send(gk) // ErrClosed after stop; nothing is left to wake
 	})
 }
 

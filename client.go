@@ -375,7 +375,7 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawOb
 	}
 	// A create always changes the object: there was nothing before it.
 	c.signalSpecWritten(ctx, raw.ID)
-	c.bh.signalObjectWritten(ctx, c.gk, raw.ResourceVersion)
+	c.bh.signalObjectWritten(ctx, c.gk)
 }
 
 // signalSpecWritten enqueues id's own reconcile once the write that changed its
@@ -490,6 +490,7 @@ func (c *clientImpl[Spec, Status]) update(
 		}
 		if changed {
 			c.signalSpecWritten(ctx, raw.ID)
+			c.bh.signalObjectWritten(ctx, c.gk)
 		}
 		return nil
 	})
@@ -796,9 +797,12 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// DeletionRequestsCreate bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
-	_, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	marked, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
+	}
+	if marked {
+		c.bh.signalObjectWritten(ctx, c.gk)
 	}
 	// Nothing is scheduled: the mark is the signal, and the GC tick is
 	// guaranteed (WithGCInterval refuses to be disabled).
@@ -813,11 +817,15 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	if _, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name); err != nil {
+	marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
 		return err
+	}
+	if marked {
+		c.bh.signalObjectWritten(ctx, c.gk)
 	}
 	return nil
 }
