@@ -174,6 +174,37 @@ func TestWakeHubPublishesOnEveryWrite(t *testing.T) {
 	}
 }
 
+// The owner cascade marks children of several kinds in one call, so one wake on
+// the caller's kind is not enough: it is routed by the refs the store returns.
+// The collection is driven directly — DeletionRequestsCreateFromOwner has one
+// caller, gcCollect, and Delete on the owner only marks the owner.
+func TestWakeHubPublishesPerCascadedKind(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	gkChildA := GroupKind{Kind: "ChildA"}
+	gkChildB := GroupKind{Kind: "ChildB"}
+
+	w := newWriteWorld(t)
+	owner := mustCreate(t, ctx, w.client, "owner", cSpec{})
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](w.bh, gkChildA), "a", cSpec{}, WithOwner(owner.ID))
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](w.bh, gkChildB), "b", cSpec{}, WithOwner(owner.ID))
+	require.NoError(t, w.client.Delete(ctx, owner.ID))
+
+	rxA := w.bh.wakes.Watch(gkChildA)
+	defer rxA.Close()
+	rxB := w.bh.wakes.Watch(gkChildB)
+	defer rxB.Close()
+
+	_, err := w.bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+
+	_, err = rxA.RecvContext(ctx)
+	assert.NoError(t, err, "cascade published no wake for ChildA")
+	_, err = rxB.RecvContext(ctx)
+	assert.NoError(t, err, "cascade published no wake for ChildB")
+}
+
 // writeWorld is the beehive plus both write surfaces the wake table drives.
 type writeWorld struct {
 	bh     *Beehive

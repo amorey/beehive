@@ -32,8 +32,13 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Mark owned children for deletion; the mark puts them in the sweeper's listing.
-		if _, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id); err != nil {
+		// The refs are cross-kind, so each one's own kind is what gets woken.
+		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
+		if err != nil {
 			return err
+		}
+		for _, ch := range children {
+			bh.signalObjectWritten(ctx, ch.GroupKind())
 		}
 
 		// The controller hasn't finished cleanup.
