@@ -59,11 +59,14 @@ transaction and taking the `resource_version` that write was assigned.
   `object_writes_horizon`, in the same transaction as the delete: an empty
   horizon reads as "nothing trimmed", so a lagging horizon would let a resume
   succeed against a log with a hole in it.
-- **The page and its horizon are read atomically**, as one statement. Read
-  apart, a sweep landing between them can trim entries the page already captured
-  and then report a horizon above the caller's cursor — a terminal failure for a
-  stream that lost nothing. An empty page reads the horizon on its own, which is
-  safe: with nothing captured, anything the sweep took really was unread.
+- **A page, its horizon and its delete images are read atomically**, in one
+  transaction. They describe one instant or they are wrong: a sweep landing
+  between them can report a horizon above entries the page already captured — a
+  terminal failure for a stream that lost nothing — or delete a captured entry's
+  row image, leaving a delete with no state to report. The tail treats a missing
+  image as a quarantined row rather than dereferencing it, since `Store` is a
+  public extension point and a backend that breaks the contract must cost one
+  change, not the process.
 - **The horizon is the resume boundary, and the test is strictly `<`.** A cursor
   equal to `trimmed_through` has lost nothing — the next unread entry is
   `trimmed_through + 1`. This is not an edge case: a kind that stops writing has

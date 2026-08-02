@@ -2285,37 +2285,45 @@ func millisPtr(ms int64) *time.Time {
 // ObjectWritesListSince reads gk's log entries above afterRV, covered by
 // idx_object_writes_kind except where a delete entry's image is fetched.
 //
-// The horizon rides the page's own statement, as a scalar subquery, and MUST
-// keep doing so. Read separately, a sweep landing between the two would trim
-// entries this page already captured and then report a horizon above the
-// caller's cursor — a terminal ErrWatchTooOld for a stream that lost nothing.
-// An empty page is the one case that reads it on its own, and it is safe: with
-// no entries captured, anything the sweep took really was unread.
+// Self-wrapped, because the contract is atomic and this takes more than one
+// statement: the page, the horizon and the delete images must all describe the
+// same instant. A retention sweep landing between them would either report a
+// horizon above entries the page already captured — a terminal ErrWatchTooOld
+// for a stream that lost nothing — or delete a captured entry's row image out
+// from under the caller.
+//
+// The horizon still rides the page's own statement as a scalar subquery, which
+// costs nothing and keeps the empty-page case honest.
 func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, 0, nil
 	}
-	rows, err := s.conn(ctx).QueryContext(ctx, `
-		SELECT `+writeLogColumns+`,
-		       coalesce((SELECT trimmed_through FROM object_writes_horizon
-		                  WHERE "group" = ? AND kind = ?), 0)
-		  FROM object_writes
-		 WHERE "group" = ? AND kind = ? AND resource_version > ?
-		 ORDER BY resource_version LIMIT ?`,
-		gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
+	var writes []storeapi.ObjectWrite
+	var trimmed int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		rows, err := s.conn(ctx).QueryContext(ctx, `
+			SELECT `+writeLogColumns+`,
+			       coalesce((SELECT trimmed_through FROM object_writes_horizon
+			                  WHERE "group" = ? AND kind = ?), 0)
+			  FROM object_writes
+			 WHERE "group" = ? AND kind = ? AND resource_version > ?
+			 ORDER BY resource_version LIMIT ?`,
+			gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
+		if err != nil {
+			return err
+		}
+		if writes, trimmed, err = scanWriteLogWithHorizon(rows, limit); err != nil {
+			return err
+		}
+		if len(writes) == 0 {
+			// No rows carried the subquery, so read it on its own.
+			trimmed, err = s.trimmedThrough(ctx, gk)
+			return err
+		}
+		return s.attachImages(ctx, writes)
+	})
 	if err != nil {
-		return nil, 0, err
-	}
-	writes, trimmed, err := scanWriteLogWithHorizon(rows, limit)
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(writes) == 0 {
-		trimmed, err = s.trimmedThrough(ctx, gk)
-		return nil, trimmed, err
-	}
-	if err := s.attachImages(ctx, writes); err != nil {
 		return nil, 0, err
 	}
 	return writes, trimmed, nil

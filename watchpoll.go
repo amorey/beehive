@@ -286,6 +286,10 @@ func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID)
 	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
 }
 
+// errNoRowImage reports a delete entry the store returned without the row image
+// a Deleted change is built from.
+var errNoRowImage = errors.New("beehive: delete log entry carries no row image")
+
 // tailPageCap bounds one tick's read of the log. A busier interval than this
 // spills into the next tick, which is what keeps a burst from being unbounded.
 const tailPageCap = 512
@@ -388,6 +392,13 @@ func (c *clientImpl[Spec, Status]) poll(
 			if raw = byID[w.ID]; raw == nil {
 				continue
 			}
+		}
+		if raw == nil {
+			// A delete entry with no row image. The store contract forbids this,
+			// but Store is a public extension point, so a backend that breaks it
+			// costs one change rather than the process.
+			c.warnUndecodable("Watch", w.ID, errNoRowImage)
+			continue
 		}
 		obj, err := rawToTyped[Spec, Status](raw, mig)
 		if err != nil {

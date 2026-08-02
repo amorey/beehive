@@ -532,10 +532,14 @@ type Store interface {
 	// unread and the caller must resync; equality is fine, since the next unread
 	// entry is trimmedThrough + 1.
 	//
-	// An implementation MUST read the page and the horizon atomically. Read
-	// apart, a retention sweep landing between them can trim entries the page
-	// already captured and then report a horizon above the caller's cursor,
-	// which reads as unrecoverable loss for a stream that lost nothing.
+	// An implementation MUST read the page, the horizon and the delete entries'
+	// row images atomically — they describe one instant or they are wrong. Read
+	// apart, a retention sweep landing between them can report a horizon above
+	// entries the page already captured, which reads as unrecoverable loss for a
+	// stream that lost nothing, or delete a captured entry's image, leaving a
+	// WriteDelete with a nil Final that has no state to report.
+	//
+	// Every WriteDelete entry returned MUST carry a non-nil Final.
 	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for

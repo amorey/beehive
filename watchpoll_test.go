@@ -1625,3 +1625,47 @@ func TestLagFailRejectsANonPositiveDepth(t *testing.T) {
 	_, _, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagBlock, 0))
 	require.NoError(t, err)
 }
+
+// imagelessStore strips the row image off every delete entry, standing in for a
+// backend that breaks ObjectWritesListSince's atomicity contract.
+type imagelessStore struct {
+	Store
+}
+
+func (s *imagelessStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	for i := range page {
+		page[i].Final = nil
+	}
+	return page, trimmed, err
+}
+
+// A delete entry with no row image is quarantined like any other undecodable
+// row, not dereferenced. Store is a public extension point, so a backend that
+// breaks the atomicity contract must cost one change, never the process.
+func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh, err := New(&imagelessStore{newClientTestStore(t)}, fast()...)
+	require.NoError(t, err)
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh.logger = logger
+	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	doomed := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "doomed"})
+	survivor := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "survivor"})
+
+	_, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, bh.store.ObjectsDelete(ctx, doomed.ID))
+	_, err = client.UpdateByID(ctx, survivor.ID, cSpec{Val: "still here"})
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Modified, ev.Type, "the imageless delete is dropped, the next change is not")
+	assert.Equal(t, survivor.ID, ev.Object.ID)
+	assert.Contains(t, buf.String(), "Watch")
+}
