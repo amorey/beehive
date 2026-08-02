@@ -1352,7 +1352,7 @@ func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	c := client.(*clientImpl[cSpec, cStatus])
-	changes, err := c.poll(ctx, c.bh.migratorFor(c.gk), new(int64))
+	changes, err := c.poll(ctx, c.bh.migratorFor(c.gk), LoadSet(0), new(int64))
 	require.NoError(t, err)
 
 	require.Len(t, changes, 2, "three writes to two objects collapse to two changes")
@@ -1453,4 +1453,36 @@ func TestResumeBelowTheHorizonIsRefused(t *testing.T) {
 
 	require.ErrorIs(t, err, ErrWatchTooOld)
 	assert.Nil(t, ch, "no stream, because none could be truthful")
+}
+
+// A watch can carry the same eager relations List does, batched per delivery so
+// a stream does not become an N+1 of relation reads.
+func TestWatchAppliesLoadOptions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	snap, ch, err := client.ObjectsWatchList(ctx, WithLoads(LoadOwner()))
+	require.NoError(t, err)
+
+	for _, obj := range snap.Objects {
+		if obj.ID == child.ID {
+			got, ok, err := obj.Owner()
+			require.NoError(t, err, "the snapshot's objects carry the requested relation")
+			require.True(t, ok)
+			assert.Equal(t, owner.ID, got.ID)
+		}
+	}
+
+	_, err = client.UpdateByID(ctx, child.ID, cSpec{Val: "child2"})
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	require.Equal(t, child.ID, ev.Object.ID)
+	got, ok, err := ev.Object.Owner()
+	require.NoError(t, err, "so do the stream's")
+	require.True(t, ok)
+	assert.Equal(t, owner.ID, got.ID)
 }

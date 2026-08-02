@@ -39,6 +39,7 @@ type WatchOption func(*watchConfig)
 type watchConfig struct {
 	// resumeFrom is the position to stream above, or nil to take a snapshot.
 	resumeFrom *int64
+	loads      LoadSet
 }
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
@@ -47,6 +48,13 @@ type watchConfig struct {
 // caller answers by subscribing again without this option.
 func WithResumeFrom(rv int64) WatchOption {
 	return func(c *watchConfig) { c.resumeFrom = &rv }
+}
+
+// WithLoads eager-loads the same secondary lookups List takes, on the snapshot
+// and on every delivered batch. Batched per batch, not per object, so a watch
+// does not become an N+1.
+func WithLoads(loads ...LoadOption) WatchOption {
+	return func(c *watchConfig) { c.loads = resolveLoads(loads) }
 }
 
 func resolveWatch(opts []WatchOption) watchConfig {
@@ -180,6 +188,10 @@ func (c *clientImpl[Spec, Status]) objectStream(
 			}
 			snap.Objects = append(snap.Objects, obj)
 		}
+		if err := c.loadListRelated(ctx, snap.Objects, cfg.loads); err != nil {
+			return Snapshot[Spec, Status]{}, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+				c.gk.Group, c.gk.Kind, err)
+		}
 	}
 	at := snap.ResourceVersion
 
@@ -190,7 +202,7 @@ func (c *clientImpl[Spec, Status]) objectStream(
 		// it neither repeats it nor skips what followed.
 		cursor := at
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			changes, err := c.poll(ctx, mig, &cursor)
+			changes, err := c.poll(ctx, mig, cfg.loads, &cursor)
 			if errors.Is(err, ErrWatchTooOld) {
 				// Terminal, unlike a transient read failure: the entries this
 				// stream had not read are gone, so it cannot continue truthfully.
@@ -244,6 +256,7 @@ const tailPageCap = 512
 func (c *clientImpl[Spec, Status]) poll(
 	ctx context.Context,
 	mig Migrator,
+	loads LoadSet,
 	cursor *int64,
 ) ([]ObjectChange[Spec, Status], error) {
 	at, err := c.bh.store.ObjectWritesMaxVersion(ctx, c.gk)
@@ -321,6 +334,18 @@ func (c *clientImpl[Spec, Status]) poll(
 			continue
 		}
 		changes = append(changes, ObjectChange[Spec, Status]{Type: changeType(w.Op), Object: obj})
+	}
+	// One relation query per batch rather than per object, the same path List
+	// uses. Deleted objects come from a row image and have no relations to load:
+	// the edges went with the row.
+	loaded := make([]*Object[Spec, Status], 0, len(changes))
+	for _, ch := range changes {
+		if ch.Type != Deleted {
+			loaded = append(loaded, ch.Object)
+		}
+	}
+	if err := c.loadListRelated(ctx, loaded, loads); err != nil {
+		return nil, err
 	}
 	*cursor = page[len(page)-1].ResourceVersion
 	return changes, nil
