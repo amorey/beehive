@@ -187,7 +187,7 @@ price, bounded by the edge-new gate.
   by `workQueue`'s dirty bit and re-dispatched by `done`.
 - **Restart:** ✅ **by case 7, though this mechanism now resumes rather than always
   reseeding.** `seed` reads a cursor the waker persisted (`driver_cursors`) and
-  resumes there instead of at `ObjectWritesMaxVersion`, so a change committed while
+  resumes there instead of at `ObjectWritesMaxVersionAll`, so a change committed while
   the process was down is scanned on the first tick back. Case 7 is still the
   guarantee, because three things bypass the cursor: a store with no
   `DriverCursorer`, the first start of a fresh one, and a wake queued but never
