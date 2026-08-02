@@ -531,10 +531,12 @@ A failed poll is logged and skipped rather than fatal, so the stream survives a 
 `WatchOption`s tune the rest:
 
 ```go
-WithResumeFrom(rv int64)             // stream above rv instead of taking a snapshot; ErrWatchTooOld if it was trimmed
-WithLoads(loads ...LoadOption)       // the same eager relations List takes, batched per delivery
-WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffers depth (1..1<<20) then ends with ErrWatchLagged
+WithResumeFrom(rv int64)              // stream above rv instead of taking a snapshot; ErrWatchTooOld if it was trimmed
+WithLoads(loads ...LoadOption)        // the same eager relations List takes, batched per delivery
+WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffers depth then ends with ErrWatchLagged
 ```
+
+A `WatchOption` can reject the call itself: `WithLagPolicy` returns `ErrInvalidOption` for an unknown policy, or for a `LagFail` depth outside `1..1<<20`. You get the error instead of a stream, as with a failed snapshot read.
 
 Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet; an absent object is an empty snapshot, and its creation arrives as `Added`.
 

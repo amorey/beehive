@@ -1106,7 +1106,11 @@ func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWr
 			return err
 		}
 		if !final.Valid {
-			continue
+			// The append path writes the image with the entry, so a NULL here is a
+			// broken invariant. Failing the read costs one tick; returning the
+			// entry without its image costs the delete itself, because the caller
+			// drops the change it cannot build and advances its cursor past it.
+			return fmt.Errorf("beehive: write log entry %d is a delete with no row image", rv)
 		}
 		image := &storeapi.RawObject{}
 		if err := json.Unmarshal([]byte(final.String), image); err != nil {
@@ -1118,7 +1122,15 @@ func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWr
 		return err
 	}
 	for i := range page {
-		page[i].Final = images[page[i].ResourceVersion]
+		if page[i].Op != storeapi.WriteDelete {
+			continue
+		}
+		image, ok := images[page[i].ResourceVersion]
+		if !ok {
+			return fmt.Errorf("beehive: write log entry %d is a delete with no row image",
+				page[i].ResourceVersion)
+		}
+		page[i].Final = image
 	}
 	return nil
 }

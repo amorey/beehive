@@ -1625,8 +1625,15 @@ func TestLagFailRejectsANonPositiveDepth(t *testing.T) {
 		assert.Nil(t, ch)
 	}
 
+	// An unrecognised policy is refused too. Accepting it would set a value
+	// matching neither branch downstream, so a caller asking for a failing
+	// stream would silently get an unbounded blocking one.
+	_, ch, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagPolicy(2), 5))
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.Nil(t, ch)
+
 	// The ceiling itself is accepted.
-	_, _, err := client.ObjectsWatchList(ctx, WithLagPolicy(LagFail, maxLagDepth))
+	_, _, err = client.ObjectsWatchList(ctx, WithLagPolicy(LagFail, maxLagDepth))
 	require.NoError(t, err)
 
 	// LagBlock ignores depth, as documented.

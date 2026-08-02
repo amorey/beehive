@@ -72,6 +72,12 @@ func WithResumeFrom(rv int64) WatchOption {
 // producing a stream that reports itself lagged at once.
 func WithLagPolicy(p LagPolicy, depth int) WatchOption {
 	return func(c *watchConfig) error {
+		// The policy first: an unrecognised one matches neither branch that reads
+		// it, so it would quietly deliver a blocking stream to a caller who asked
+		// for a failing one.
+		if p != LagBlock && p != LagFail {
+			return fmt.Errorf("%w: WithLagPolicy got an unknown policy %d", ErrInvalidOption, p)
+		}
 		if p == LagFail && (depth <= 0 || depth > maxLagDepth) {
 			return fmt.Errorf("%w: WithLagPolicy needs a depth in [1, %d] under LagFail, got %d",
 				ErrInvalidOption, maxLagDepth, depth)

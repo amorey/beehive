@@ -6343,3 +6343,22 @@ func TestObjectWritesListSinceCarriesTheHorizon(t *testing.T) {
 	require.Empty(t, empty)
 	assert.Equal(t, old.ResourceVersion, trimmed, "and read on its own when the page is empty")
 }
+
+// A delete entry with a NULL image is a broken invariant, not a row to hand back
+// half-built: the contract promises every WriteDelete carries its final state,
+// and a caller that trusts that would drop the change and advance its cursor
+// past it, losing the delete for good.
+func TestObjectWritesListSinceRefusesAnImagelessDelete(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	_, err := store.(*sqliteStore).db.ExecContext(ctx,
+		`UPDATE object_writes SET final = NULL WHERE op = ?`, writeOpDelete)
+	require.NoError(t, err)
+
+	_, _, err = store.ObjectWritesListSince(ctx, testGK, 0, 10)
+
+	require.Error(t, err, "a delete with no image must not be returned as success")
+	assert.Contains(t, err.Error(), "row image")
+}
