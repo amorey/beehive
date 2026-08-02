@@ -36,6 +36,10 @@ const (
 	defaultFullPassInterval time.Duration = 0
 	defaultStartupFullPass                = false
 	defaultGCInterval                     = 30 * time.Second
+	// The default resume window: how long a subscriber may be disconnected and
+	// still resume without a full resync. A day covers a restart, a deploy, and a
+	// night of maintenance.
+	defaultWriteLogMaxAge = 24 * time.Hour
 	// Free pages the GC sweeper releases per tick (~4MB/30s at ~3.7µs a page).
 	// Not an option: there is no measurement a caller could tune it against.
 	freePagesPerSweep = 1000
@@ -77,6 +81,11 @@ type Beehive struct {
 	// disables the sweep.
 	eventRetentionPerObject int
 	eventRetentionMaxAge    time.Duration
+	// Write-log retention, applied globally by the GC sweeper. Bounded by
+	// default, unlike the event log: an entry lands on every object write, so
+	// the log grows at reconcile rate whether or not the user opts in.
+	writeLogRetentionPerKind int
+	writeLogRetentionMaxAge  time.Duration
 	// startupFullPass is the default copied into each reconciler; off unless
 	// asked for (see WithStartupFullPass).
 	startupFullPass bool
@@ -169,6 +178,7 @@ func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 	driver.Run(ctx, bh.gcInterval, func(ctx context.Context) bool {
 		bh.deletionPendingSweep(ctx)
 		bh.eventRetentionSweep(ctx)
+		bh.writeLogRetentionSweep(ctx)
 		bh.freePagesSweep(ctx)
 		return true
 	})
@@ -185,7 +195,18 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 	}
 }
 
-// freePagesSweep hands space freed by the two sweeps above back to the OS, for
+// writeLogRetentionSweep trims the object write log to the configured retention.
+// A failed sweep is retried on the next tick; the horizon it did raise stands.
+func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
+	if bh.writeLogRetentionPerKind <= 0 && bh.writeLogRetentionMaxAge <= 0 {
+		return
+	}
+	if _, err := bh.store.ObjectWritesSweep(ctx, bh.writeLogRetentionPerKind, bh.writeLogRetentionMaxAge); err != nil {
+		bh.log().Warn("write log retention sweep failed; retry next sweep", "err", err)
+	}
+}
+
+// freePagesSweep hands space freed by the sweeps above back to the OS, for
 // a store that implements FreePagesReleaser. Best-effort: nothing is incorrect
 // while the space is unreclaimed.
 func (bh *Beehive) freePagesSweep(ctx context.Context) {
@@ -279,6 +300,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		owedPassInterval:        defaultOwedPassInterval,
 		fullPassInterval:        defaultFullPassInterval,
 		gcInterval:              defaultGCInterval,
+		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeInterval:            defaultWakeInterval,
 		watchPollInterval:       defaultWatchPollInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,

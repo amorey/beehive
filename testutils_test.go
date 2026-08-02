@@ -424,7 +424,9 @@ func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, e
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
 }
 func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int, error) {
-	panic("not implemented: fakeStore.ObjectWritesSweep")
+	// Zero rather than a panic: write-log retention is on by default, so every
+	// Beehive whose GC sweeper ticks reaches this.
+	return 0, nil
 }
 func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
