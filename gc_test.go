@@ -371,7 +371,7 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -402,7 +402,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -452,7 +452,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// from under the stream before it has looked.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -486,7 +486,7 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	// the object is in its snapshot and the Deleted below cannot be missed.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatch(wctx, obj.ID)
+	_, w, err := client.ObjectsWatch(wctx, obj.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, client.DeleteByID(ctx, obj.ID))
@@ -517,7 +517,7 @@ func TestIntegrationGCCascadeWithFullPassDisabled(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	require.NoError(t, client.DeleteByID(ctx, owner.ID))
@@ -544,7 +544,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	// Deleting only the owner must cascade to the child and remove both.
@@ -589,7 +589,7 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	// only the sweeper can collect that client-only child.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	wOwner, err := owners.ObjectsWatchList(wctx)
+	_, wOwner, err := owners.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	require.NoError(t, owners.DeleteByID(ctx, owner.ID))
@@ -708,7 +708,7 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -805,7 +805,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w, err := client.ObjectsWatchList(wctx)
+	_, w, err := client.ObjectsWatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)

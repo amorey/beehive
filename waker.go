@@ -34,7 +34,7 @@ type waker struct {
 	bh *Beehive
 
 	// cursors persists the watermark across restarts when the store supports it;
-	// nil means every restart reseeds from ObjectWritesMaxVersion.
+	// nil means every restart reseeds from ObjectWritesMaxVersionAll.
 	cursors DriverCursorer
 
 	// watermark is the highest resource_version this waker has processed. The
@@ -99,7 +99,7 @@ func (dw *waker) run(ctx context.Context) {
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
 func (dw *waker) seed(ctx context.Context) bool {
-	mark, err := dw.bh.store.ObjectWritesMaxVersion(ctx)
+	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false // shutdown, not a loss
@@ -142,8 +142,11 @@ func (dw *waker) seed(ctx context.Context) bool {
 }
 
 // resumeWatermark decides where seed resumes from; pure so the clamp is
-// testable. min, not stored: the mark steps back when the highest-versioned row
-// is deleted, so a cursor above it is not evidence of a foreign database.
+// testable. min, not stored: retention trims the log's tail, so the mark can sit
+// below a cursor the waker really did process, and that is not evidence of a
+// foreign database. Clamping replays from the mark, which is free — the wakes it
+// re-derives are idempotent, and the stale-dependents pass is the guarantee
+// either way.
 func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 	if !ok {
 		return mark
@@ -165,7 +168,7 @@ func (dw *waker) scan(ctx context.Context) {
 	// persists whatever earlier pages advanced the watermark to.
 	defer dw.persist(ctx)
 	for pages := 0; pages < wakeScanPagesPerTick; pages++ {
-		page, err := dw.bh.store.ObjectWritesListSince(ctx, dw.watermark, wakeScanPageCap)
+		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
 				return // shutdown cancelled this read

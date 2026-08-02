@@ -333,3 +333,52 @@ func TestRunGCSweeperTicks(t *testing.T) {
 	recv(t, store.gcSwept) // startup pass
 	recv(t, store.gcSwept) // a periodic tick
 }
+
+// writeLogRetentionSweep trims the write log to the configured bound. Unlike the
+// event log it is bounded by default: entries land on every object write, and a
+// status write bumps resource_version, so the log grows at reconcile rate
+// whether or not anyone opts in.
+func TestSweepWriteLogRetention(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("bounded by default", func(t *testing.T) {
+		bh, err := New(newClientTestStore(t))
+		require.NoError(t, err)
+		assert.Equal(t, defaultWriteLogMaxAge, bh.writeLogRetentionMaxAge)
+		assert.Zero(t, bh.writeLogRetentionPerKind, "no count bound by default")
+	})
+
+	t.Run("both zero disables the sweep", func(t *testing.T) {
+		store := newClientTestStore(t)
+		bh, err := New(store, WithWriteLogRetention(0, 0))
+		require.NoError(t, err)
+		gk := GroupKind{Kind: "Widget"}
+		for range 3 {
+			_, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+			require.NoError(t, err)
+		}
+
+		bh.writeLogRetentionSweep(ctx)
+
+		page, _, err := store.ObjectWritesListSince(ctx, gk, 0, 10)
+		require.NoError(t, err)
+		assert.Len(t, page, 3)
+	})
+
+	t.Run("caps per kind", func(t *testing.T) {
+		store := newClientTestStore(t)
+		bh, err := New(store, WithWriteLogRetention(2, 0))
+		require.NoError(t, err)
+		gk := GroupKind{Kind: "Widget"}
+		for range 3 {
+			_, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+			require.NoError(t, err)
+		}
+
+		bh.writeLogRetentionSweep(ctx)
+
+		page, _, err := store.ObjectWritesListSince(ctx, gk, 0, 10)
+		require.NoError(t, err)
+		assert.Len(t, page, 2)
+	})
+}

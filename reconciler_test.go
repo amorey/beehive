@@ -2573,8 +2573,8 @@ type seedProbeStore struct {
 	seeded chan struct{}
 }
 
-func (s *seedProbeStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx)
+func (s *seedProbeStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
+	at, err := s.Store.ObjectWritesMaxVersionAll(ctx)
 	probeSignal(s.seeded)
 	return at, err
 }

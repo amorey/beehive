@@ -300,11 +300,18 @@ const (
     Added    ChangeType = "Added"
     Modified ChangeType = "Modified"
     Deleted  ChangeType = "Deleted"
+    Failed   ChangeType = "Failed" // terminal: the stream is over, Err says why
 )
 
 type ObjectChange[Spec, Status any] struct {
     Type   ChangeType
-    Object *Object[Spec, Status]
+    Object *Object[Spec, Status] // nil on Failed
+    Err    error                 // non-nil on Failed only
+}
+
+type Snapshot[Spec, Status any] struct {
+    Objects         []*Object[Spec, Status]
+    ResourceVersion int64 // the log position the snapshot is complete as of
 }
 
 type Client[Spec, Status any] interface {
@@ -320,8 +327,8 @@ type Client[Spec, Status any] interface {
     UpdateByID(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
     GetByID(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
     DeleteByID(ctx context.Context, id ObjectID) error
-    ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
-    ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
+    ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
     OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
@@ -501,20 +508,37 @@ Looking the name up is **atomic with the delete** — the name goes into the sto
 
 #### Watching
 
-`ObjectsWatch` and `ObjectsWatchList` emit the current state as `Added` changes on start, then stream subsequent changes as `ObjectChange` values. The channel closes when `ctx` is cancelled.
+`ObjectsWatch` and `ObjectsWatchList` return the current state as a `Snapshot`, plus a stream of the changes above it. The channel closes when `ctx` is cancelled.
+
+```go
+snap, ch, err := client.ObjectsWatchList(ctx)
+// snap.Objects is current state; snap.ResourceVersion is where the stream starts.
+```
 
 **Do not open a watch inside `Within`.** The read below happens on your goroutine, and the store runs on a single connection — so it waits for the connection your transaction is holding, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
 
-**Subscribe, then act.** Both read current state *before returning*, so a change you make after subscribing is measured against a snapshot that already exists — delete an object on the next line and its `Deleted` is guaranteed, where a snapshot taken one tick later could miss the object entirely. The cost is one store read on your goroutine, and if that read fails you get the error rather than a stream: a watch with no snapshot could not report that delete, and you would wait for a tombstone that never comes.
+**Subscribe, then act.** The snapshot is read *before either returns*, so a change you make after subscribing is always in the stream — delete an object on the next line and its `Deleted` will come. If that read fails you get the error rather than a stream, since a watch with no snapshot could not report that delete. The stream carries changes strictly above `snap.ResourceVersion`: no overlap with the snapshot, no gap between them. That is also what makes "have I caught up?" a value rather than a guess — you hold the starting state before you read the first change.
 
-Both are **polls, not subscriptions.** Each remembers the `resource_version` it last reported to you and, on each watch-poll tick (1s), sends the difference: a new object is `Added`, a moved version is `Modified`, a row that has gone is `Deleted` and carries its last known state. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
+Both are **polls, not subscriptions.** Each tick reads the kind's write-log position, and only a position that moved costs anything more: the entries above the cursor, then one batched read of the objects they name. Two things follow, and both are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
-- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying the third. An object created and deleted within a single interval is never reported at all — but not one that existed when you subscribed, since the snapshot above is what it is compared against.
-- **Latency is the poll interval**, not the write. A quiet tick is cheap: reading the object write log's high-water mark is one indexed query, and only a mark that moved — or an object that vanished, since deletes draw no version — pays for the full listing. Writing to the event log does not move it, so an object watch stays quiet through a controller that records events on every pass.
+- **Changes inside one interval collapse together.** Three writes between two polls produce one `Modified` carrying current state. An object created *and* updated in the same interval still reports `Added`, since it was not in your snapshot. A batch arrives in write order, not id order.
+- **Latency is the poll interval**, not the write. A quiet tick is one indexed read of a single number. Writing to the event log does not move it, so an object watch stays quiet through a controller that records events on every pass.
 
-A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error instead of ending quietly under a subscriber with no way to notice. That applies to every poll after the first — the first one's failure is returned to you, since there is no earlier state for the stream to fall back on.
+**`Deleted` means collected, not requested.** Deleting an object sets `DeletionRequestedAt` and leaves the row live and readable, so you get a `Modified` with that field set. `Deleted` follows only when the GC sweeper physically removes the row — after its finalizers clear, which is controller-defined and unbounded, and after nothing references it any more. So: key on `DeletionRequestedAt != nil` to stop using an object, and on `Deleted` to evict it from a cache.
 
-Both need a **registered controller** for the kind, as `EventsWatch` does, and both are scoped to it: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet — an absent object is just an empty listing, and the stream reports it as `Added` once it is created.
+A failed poll is logged and skipped rather than fatal, so the stream survives a transient store error. One failure is terminal: if retention trims log entries this stream had not read, it gets a `Failed` change carrying `ErrWatchTooOld` and closes, because it cannot continue truthfully. Subscribe again for a fresh snapshot.
+
+`WatchOption`s tune the rest:
+
+```go
+WithResumeFrom(rv int64)              // stream above rv instead of taking a snapshot; ErrWatchTooOld if it was trimmed
+WithLoads(loads ...LoadOption)        // the same eager relations List takes, batched per delivery
+WithLagPolicy(p LagPolicy, depth int) // LagBlock (default) waits; LagFail buffers depth then ends with ErrWatchLagged
+```
+
+A `WatchOption` can reject the call itself: `WithLagPolicy` returns `ErrInvalidOption` for an unknown policy, or for a `LagFail` depth outside `1..1<<20`. You get the error instead of a stream, as with a failed snapshot read.
+
+Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `ObjectsWatch` on another kind's id streams nothing. The id need not exist yet; an absent object is an empty snapshot, and its creation arrives as `Added`.
 
 (The event *log* below, `EventsList`/`EventsWatch`, is a different thing: an `ObjectChange` says an object changed, an `Event` is a log entry.)
 
@@ -558,6 +582,8 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 #### Events
 
 `EventsList` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `EventsWatch` sends the current runs first, then streams new runs and extensions to existing ones, on the same interval and the same snapshot-then-poll contract as the object watches. Its quiet tick is cheaper for the same reason theirs is: it reads the high-water mark of that object's log — one indexed query, returning one number — and lists only when the mark moved. The mark spans the object's whole log, so an event in a category you filtered out costs one listing that reports nothing. Runs are matched by `EventID`, so you see at most one update per run per interval — a count bump updates the run in place instead of arriving as a new one. There are no tombstones, since an append-only log means a run can only appear or grow. `EventsGetLatest` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `OwnersGet` does.
+
+`WithWriteLogRetention` bounds the object write log, which is what the watches tail and what a resume reads. It looks like `WithEventRetention` and defaults the other way: an event is written when a controller chooses to write one, while a log entry lands on **every** object write — and a status write bumps `resource_version`, so the log grows at reconcile rate whether or not you opt in. Hence a 24h default rather than unbounded. The value is a resume window before it is a storage bound: it is how long a subscriber may be disconnected and still resume instead of resyncing. It also governs how long a collected object's final state lives on, since the delete entry carries the row image a `Deleted` change reports.
 
 `WithEventRetention` bounds the log per `(object, category)`: a ring that keeps the newest N runs in each timeline, so a flapping timeline can't evict a quiet one on the same object, plus an optional maximum age. The GC sweeper enforces it, and deleting an object deletes its events.
 
@@ -653,6 +679,7 @@ func WithStartupFullPass(enabled bool) Option      // also re-dispatch settled o
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
 func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring + optional age bound (0 = no age bound)
+func WithWriteLogRetention(perKind int, maxAge time.Duration) Option // write-log retention: per-(group,kind) cap-N ring + age bound (default: 24h, no count bound)
 ```
 
 `WithOwner` writes an `owned_by` edge in the same transaction as the `Create`. Deleting the owner then cascades to the child through GC.

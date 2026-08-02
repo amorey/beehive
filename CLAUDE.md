@@ -61,17 +61,27 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   on that same edge is what guarantees the dependent a pass.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The dependency waker scans the write log from a watermark**
-  (`ObjectWritesListSince`, paged, store-wide — an edge can point at a
+  (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
   client-only kind). Cost is bounded by what changed. The cursor persists via
   the optional `DriverCursorer`; it is an optimisation over the stale-dependents
   pass, never a guarantee.
   → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md)
-- **Client watches poll and diff** (`watchpoll.go`), remembering the last
-  reported `resource_version` per object; deletes are found by absence. A quiet
-  tick costs one high-water-mark read (`ObjectWritesMaxVersion`, live-rows max —
-  not the shared counter, which events also draw from) plus one blob-free
-  liveness read. `EventsWatch` is gated the same way on `EventsMaxVersion`, with
-  no liveness half: the log has no tombstones.
+- **Object writes are recorded in an append-only log** (`object_writes`), one
+  entry per committed write, in that write's transaction. A create/update entry
+  carries no payload — consumers route by id and read current state; a physical
+  delete carries a row image, since nothing survives to be read. The soft delete
+  is an ordinary update. Retention is per kind and **bounded by default** (24h),
+  unlike the event log, because entries land at reconcile rate; what it trims is
+  recorded per kind in `object_writes_horizon`, and that horizon is the resume
+  boundary. → [ADR](docs/adr/2026-08-02-object-write-log.md)
+- **Client watches return a snapshot and tail that log** (`watchpoll.go`). A
+  quiet tick costs one read of the kind's log position
+  (`ObjectWritesMaxVersion`, which folds in the horizon so it only rises — gate
+  on `>`, not `!=`); a busy one reads the entries above the cursor and then one
+  batched `ObjectsListByIDs`. Entries coalesce per object and deliver in write
+  order. A cursor **below** the horizon (strictly: equality has lost nothing)
+  ends the stream with `ErrWatchTooOld`. `EventsWatch` still polls and diffs,
+  gated on `EventsMaxVersion`.
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on

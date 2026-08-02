@@ -526,3 +526,59 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   that ADR is touched. If the invariant ever stops holding — a design that records owed
   work in a *different* transaction from the change that owes it — the answer is
   `synchronous=FULL`, and that is the tripwire to watch for.
+
+- **Owner-scoped watches** — wanted, deliberately out of the first write-log
+  design ([ADR](adr/2026-08-02-object-write-log.md)). `OwnedObjectsList` has a
+  typed, batched read but no watch counterpart, so a subscriber that wants one
+  owner's children watches the whole kind and filters client-side.
+
+  The obvious implementation is wrong. Denormalising `owner_id` into
+  `object_writes` filters on ownership *as of the write*, and ownership can
+  change afterwards: a re-parented object keeps arriving on its old owner's
+  stream and never appears on its new one, until something writes to it again.
+  Confirming each entry against current state costs a read per entry, which is
+  most of what the index was there to buy.
+
+  Worth doing when someone has a real fan-out of children per owner. The design
+  choice to settle first is whether an ownership change should itself be a write
+  to the child — which would make the logged value correct by construction, and
+  would also fix `DependentsList`/`DependenciesList`, which have the same hole.
+
+- **The watches have no push path, so latency is the poll interval** — by design
+  today, and the design is worth revisiting once someone needs sub-second
+  reaction. A tail tick is cheap (one indexed read of one number for a quiet
+  kind), but a change still waits up to `withWatchPollInterval` (1s) before a
+  subscriber sees it.
+
+  The write log makes the missing piece small: a process-local hub that the
+  commit path signals, waking the tail early. It stays a *hint* — the tick
+  remains the guarantee, exactly as `Client.Requeue` is a hint over the periodic
+  passes — so a lost signal costs latency and never correctness. That is what
+  keeps it inside the constraints the
+  [drivers ADR](adr/2026-07-28-periodic-scan-drivers.md) sets, unlike the
+  schedule watch, which is only sound because its gauge has a single
+  process-local writer.
+
+  Deferred because nothing in-tree needs it and an unused signal path is a
+  second way for the tail to be wrong. Revisit when a caller has a latency
+  budget the interval cannot meet; the measurement that justifies it is
+  end-to-end write-to-delivery, not tick cost.
+
+- **`EventsWatch` did not follow the object watches onto the write log** — so
+  two watch surfaces on the same `Client` now behave differently for reasons a
+  caller cannot see. Object watches return a `Snapshot` plus a stream, resume
+  from a `resource_version`, and end with `ErrWatchTooOld` when their entries
+  are trimmed. `EventsWatch` still polls, diffs by `EventID`, hands its initial
+  runs back through the channel, and cannot resume.
+
+  The asymmetry is not obviously wrong — an event log has no tombstones, so
+  absence is not a change, and the poll-and-diff it uses is sound. But the
+  argument for splitting the snapshot out ("am I synced?" should be a value, not
+  a guess) applies to events unchanged, and a caller reading both surfaces has
+  to hold two models.
+
+  Worth doing when events grow a consumer that needs to resume — a UI that
+  reconnects, or an exporter. The work is mostly mechanical; the real decision
+  is whether events get a retention horizon of their own, since
+  `WithEventRetention` already trims runs out from under a reader with no way to
+  tell them.

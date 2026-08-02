@@ -17,8 +17,10 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2900,7 +2902,7 @@ type writeProbe struct {
 // what lands after this call.
 func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersion(context.Background())
+	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return &writeProbe{t: t, store: store, rv: rv}
 }
@@ -2908,7 +2910,7 @@ func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 // writes returns everything above the cursor without moving it.
 func (p *writeProbe) writes() []storeapi.ObjectWrite {
 	p.t.Helper()
-	got, err := p.store.ObjectWritesListSince(context.Background(), p.rv, 100)
+	got, err := p.store.ObjectWritesListSinceAll(context.Background(), p.rv, 100)
 	require.NoError(p.t, err)
 	return got
 }
@@ -4569,7 +4571,7 @@ func TestScopedMutatorWrongKind(t *testing.T) {
 // cursor, in cursor order, bounded by limit. Kind-agnostic on purpose — a
 // depends_on edge may point at a kind with no controller, so a per-kind query
 // could not name every target whose change was dropped.
-func TestObjectWritesListSince(t *testing.T) {
+func TestObjectWritesListSinceAll(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	otherGK := beehive.GroupKind{Kind: "Other"}
@@ -4588,27 +4590,29 @@ func TestObjectWritesListSince(t *testing.T) {
 
 	// Everything above the first object's version, so `first` is excluded: the
 	// cursor is what the consumer already processed, not where it wants to start.
-	got, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 10)
+	got, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
-		{ID: second.ID, ResourceVersion: second.ResourceVersion},
-		{ID: third.ID, ResourceVersion: third.ResourceVersion},
+		{ID: second.ID, ResourceVersion: second.ResourceVersion,
+			Group: otherGK.Group, Kind: otherGK.Kind, Op: storeapi.WriteCreate},
+		{ID: third.ID, ResourceVersion: third.ResourceVersion,
+			Group: testGK.Group, Kind: testGK.Kind, Op: storeapi.WriteCreate},
 	}, got, "cursor-ordered, exclusive of afterRV, spanning kinds")
 
 	// A limit truncates from the low end, so the caller can page forward by taking
 	// the last row's version as its next cursor.
-	page, err := store.ObjectWritesListSince(ctx, first.ResourceVersion, 1)
+	page, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	assert.Equal(t, second.ID, page[0].ID, "the oldest missed change comes first")
 
-	next, err := store.ObjectWritesListSince(ctx, page[0].ResourceVersion, 1)
+	next, err := store.ObjectWritesListSinceAll(ctx, page[0].ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, next, 1)
 	assert.Equal(t, third.ID, next[0].ID, "paging forward from the last row's version")
 
 	// Caught up: nothing above the newest version.
-	none, err := store.ObjectWritesListSince(ctx, third.ResourceVersion, 10)
+	none, err := store.ObjectWritesListSinceAll(ctx, third.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
@@ -4618,7 +4622,10 @@ func TestObjectWritesListSince(t *testing.T) {
 // while anything depends on it, and from_id's CASCADE means a dependent deleted
 // first took its own edge with it — so a row that vanished has no dependents left
 // to strand.
-func TestObjectWritesListSinceSkipsDeletedRows(t *testing.T) {
+// A collection is a log entry like any other. Reading live rows made a delete
+// invisible — the waker could not see one at all, and a watch had to find it by
+// absence.
+func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -4626,15 +4633,20 @@ func TestObjectWritesListSinceSkipsDeletedRows(t *testing.T) {
 	gone := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
 
-	got, err := store.ObjectWritesListSince(ctx, base.ResourceVersion, 10)
+	got, err := store.ObjectWritesListSinceAll(ctx, base.ResourceVersion, 10)
 	require.NoError(t, err)
-	assert.Empty(t, got, "the deleted row is absent, not an error")
+	require.Len(t, got, 2, "the create and the collection of the second object")
+	assert.Equal(t, storeapi.WriteCreate, got[0].Op)
+	assert.Equal(t, gone.ID, got[1].ID)
+	assert.Equal(t, storeapi.WriteDelete, got[1].Op)
+	assert.Nil(t, got[1].Final,
+		"no row image: this read routes by id and reads current state, so decoding one would be pure cost")
 }
 
-func TestObjectWritesListSinceDBError(t *testing.T) {
+func TestObjectWritesListSinceAllDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.ObjectWritesListSince(context.Background(), 0, 10)
+	_, err := store.ObjectWritesListSinceAll(context.Background(), 0, 10)
 	require.Error(t, err)
 }
 
@@ -4678,7 +4690,7 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 	newRefObject(t, store)
 
 	for _, limit := range []int{0, -1} {
-		got, err := store.ObjectWritesListSince(ctx, 0, limit)
+		got, err := store.ObjectWritesListSinceAll(ctx, 0, limit)
 		require.NoError(t, err)
 		assert.Empty(t, got, "limit %d asks for nothing, not for everything", limit)
 	}
@@ -5097,7 +5109,7 @@ func TestDriverCursorsSetKeysByName(t *testing.T) {
 // it — what a dependent records as its watermark.
 func cursorNow(t *testing.T, store beehive.Store) int64 {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersion(context.Background())
+	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return rv
 }
@@ -5413,7 +5425,7 @@ func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, before, cursorNow(t, store), "an event write is not an object write")
-	writes, err := store.ObjectWritesListSince(ctx, before, 10)
+	writes, err := store.ObjectWritesListSinceAll(ctx, before, 10)
 	require.NoError(t, err)
 	assert.Empty(t, writes, "and the listing agrees: nothing above the mark")
 }
@@ -5429,16 +5441,19 @@ func TestObjectWritesMaxVersionOnAnEmptyStore(t *testing.T) {
 // sound for both of its uses — nothing exists at the versions it steps back over,
 // so a seeded watermark cannot skip a live write, and a poller that re-reads
 // because the mark moved finds exactly the delete that moved it.
-func TestObjectWritesMaxVersionFallsWhenTheNewestRowGoes(t *testing.T) {
+// Collection raises the mark rather than lowering it: the delete is an entry of
+// its own, above the row it removed. Reading live rows made the mark step back
+// here, which is what the waker's clamp was written for.
+func TestObjectWritesMaxVersionAllRisesOnCollection(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	first := newRefObject(t, store)
+	newRefObject(t, store)
 	second := newRefObject(t, store)
 	require.Equal(t, second.ResourceVersion, cursorNow(t, store))
 
 	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
 
-	assert.Equal(t, first.ResourceVersion, cursorNow(t, store))
+	assert.Greater(t, cursorNow(t, store), second.ResourceVersion)
 }
 
 // ---------------------------------------------------------------------------
@@ -5851,4 +5866,782 @@ func TestDeletionRequestsCreateByNameSurfacesAProbeReadError(t *testing.T) {
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "a broken read is not an absent row")
 	assert.False(t, changed)
+}
+
+// writeLogEntry is one object_writes row, read straight from the table so the
+// log's tests do not depend on the read API that lands later.
+type writeLogEntry struct {
+	ResourceVersion int64
+	ObjectID        beehive.ObjectID
+	Group           string
+	Kind            string
+	Op              int
+	WrittenAt       int64
+	Final           sql.NullString
+}
+
+func writeLogEntries(t *testing.T, store beehive.Store) []writeLogEntry {
+	t.Helper()
+	rows, err := store.(*sqliteStore).db.QueryContext(context.Background(),
+		`SELECT resource_version, object_id, "group", kind, op, written_at, final
+		   FROM object_writes ORDER BY resource_version`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var out []writeLogEntry
+	for rows.Next() {
+		var e writeLogEntry
+		require.NoError(t, rows.Scan(&e.ResourceVersion, &e.ObjectID, &e.Group,
+			&e.Kind, &e.Op, &e.WrittenAt, &e.Final))
+		out = append(out, e)
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+// A create appends one log entry at the row's own resource_version.
+func TestObjectsCreateAppendsAWriteLogEntry(t *testing.T) {
+	store := newTestStore(t)
+
+	obj := newRefObject(t, store)
+
+	entries := writeLogEntries(t, store)
+	require.Len(t, entries, 1)
+	assert.Equal(t, obj.ResourceVersion, entries[0].ResourceVersion)
+	assert.Equal(t, obj.ID, entries[0].ObjectID)
+	assert.Equal(t, testGK.Group, entries[0].Group)
+	assert.Equal(t, testGK.Kind, entries[0].Kind)
+	assert.Equal(t, writeOpCreate, entries[0].Op)
+	assert.NotZero(t, entries[0].WrittenAt)
+}
+
+// Every write that bumps an objects row appends an update entry at that row's
+// new version. The negative cases matter as much: a content no-op writes
+// nothing at all, and an event draws a version without touching an objects row,
+// so it must leave the object log alone — a watch gated on this log must not
+// wake for a controller that records an event per reconcile.
+func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		// setup replaces the default bare object when the case needs a
+		// differently shaped one; it must create exactly one.
+		setup func(t *testing.T, store beehive.Store) *beehive.RawObject
+		write func(t *testing.T, store beehive.Store, obj *beehive.RawObject)
+		logs  bool
+	}{
+		{
+			name: "spec update",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+				require.NoError(t, err)
+			},
+			logs: true,
+		},
+		{
+			name: "status update",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+			},
+			logs: true,
+		},
+		{
+			name: "condition set",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{
+					Type: "Ready", Status: "True", Reason: "Settled",
+				}))
+			},
+			logs: true,
+		},
+		{
+			name: "finalizer cleared",
+			setup: func(t *testing.T, store beehive.Store) *beehive.RawObject {
+				obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+					Name: uniqueName(), Spec: []byte(`{}`), Finalizers: []string{"f"},
+				})
+				require.NoError(t, err)
+				return obj
+			},
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				require.NoError(t, store.FinalizersDelete(ctx, testGK, obj.ID, "f"))
+			},
+			logs: true,
+		},
+		{
+			name: "deletion requested",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+				require.NoError(t, err)
+			},
+			logs: true,
+		},
+		{
+			name: "byte-identical spec write",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, changed, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, obj.Spec, obj.SpecVersion)
+				require.NoError(t, err)
+				require.False(t, changed, "precondition: the store must skip this write")
+			},
+		},
+		{
+			name: "event appended",
+			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
+				_, err := store.EventsAdd(ctx, testGK, obj.ID, storeapi.Event{
+					Category: "c", Type: "Normal", Reason: "R",
+				})
+				require.NoError(t, err)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			newObject := tt.setup
+			if newObject == nil {
+				newObject = newRefObject
+			}
+			obj := newObject(t, store)
+			require.Len(t, writeLogEntries(t, store), 1, "precondition: the create is logged")
+
+			tt.write(t, store, obj)
+
+			entries := writeLogEntries(t, store)
+			if !tt.logs {
+				assert.Len(t, entries, 1, "no objects row was written, so nothing is logged")
+				return
+			}
+			require.Len(t, entries, 2)
+			after, err := store.ObjectsGetMeta(ctx, obj.ID)
+			require.NoError(t, err)
+			assert.Equal(t, writeOpUpdate, entries[1].Op)
+			assert.Equal(t, obj.ID, entries[1].ObjectID)
+			assert.Equal(t, after.ResourceVersion, entries[1].ResourceVersion,
+				"the entry carries the version the row now holds")
+		})
+	}
+}
+
+// Collection draws a resource_version. The row is gone, so nothing in objects
+// carries it — the write log's delete entry does, and it needs a version to
+// order against every other entry.
+func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	before := seqValue(t, store.(*sqliteStore))
+
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	assert.Greater(t, seqValue(t, store.(*sqliteStore)), before)
+}
+
+// The delete entry carries the object as it was, conditions included. Nothing
+// else can: the row is gone and the conditions cascaded with it, so a Deleted
+// change has no other source for the body it promises.
+func TestObjectsDeleteAppendsARowImage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"}))
+	before, err := store.ObjectsGet(ctx, obj.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	entries := writeLogEntries(t, store)
+	last := entries[len(entries)-1]
+	assert.Equal(t, writeOpDelete, last.Op)
+	assert.Equal(t, obj.ID, last.ObjectID)
+	require.True(t, last.Final.Valid, "a delete carries the row image")
+
+	var image storeapi.RawObject
+	require.NoError(t, json.Unmarshal([]byte(last.Final.String), &image))
+	// ResourceVersion is the one field the image cannot match: the row held the
+	// version of its last update, and the entry holds the delete's own.
+	before.ResourceVersion = image.ResourceVersion
+	assert.Equal(t, *before, image)
+	assert.Len(t, image.Conditions, 1, "conditions cascade away with the row")
+}
+
+// The image must round-trip every RawObject field. A column added to objects and
+// surfaced on RawObject but missed here would report a zero value on a Deleted
+// change, and nothing in the write path would fail.
+func TestWriteLogImageCoversRawObject(t *testing.T) {
+	full := storeapi.RawObject{
+		ID: 7, Group: "acme.com", Kind: "Widget", Name: "w",
+		Spec: []byte(`{"a":1}`), Status: []byte(`{"b":2}`),
+		SpecVersion: 3, StatusVersion: 4,
+		Generation: 5, ObservedGeneration: ptr(int64(5)),
+		ObservedAt: ptr(time.UnixMilli(1).UTC()), ResourceVersion: 9,
+		DeletionRequestedAt: ptr(time.UnixMilli(2).UTC()), ReconcileOwed: 1,
+		Finalizers: []string{"f"},
+		Conditions: []storeapi.Condition{{Type: "Ready", Status: "True"}},
+		CreatedAt:  time.UnixMilli(3).UTC(), UpdatedAt: time.UnixMilli(4).UTC(),
+	}
+	v := reflect.ValueOf(full)
+	for i := range v.NumField() {
+		require.False(t, v.Field(i).IsZero(),
+			"%s: give every field a value, or this test cannot detect losing it",
+			v.Type().Field(i).Name)
+	}
+
+	encoded, err := json.Marshal(full)
+	require.NoError(t, err)
+	var back storeapi.RawObject
+	require.NoError(t, json.Unmarshal(encoded, &back))
+
+	assert.Equal(t, full, back)
+}
+
+// ptr is the address of a literal, for the pointer fields on RawObject.
+func ptr[T any](v T) *T { return &v }
+
+// The tail reads one kind. Another kind's writes must not move it, or every
+// watch pays a listing for traffic it can never be shown.
+func TestObjectWritesListSinceScopesToKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	mine := newRefObject(t, store)
+	_, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "only this kind's entries")
+	assert.Equal(t, mine.ID, page[0].ID)
+	assert.Equal(t, mine.ResourceVersion, page[0].ResourceVersion)
+	assert.Equal(t, storeapi.WriteCreate, page[0].Op)
+	assert.Zero(t, trimmed, "nothing has been trimmed")
+
+	page, _, err = store.ObjectWritesListSince(ctx, testGK, mine.ResourceVersion, 10)
+	require.NoError(t, err)
+	assert.Empty(t, page, "afterRV is exclusive")
+}
+
+// The tick gate is per kind for the same reason the listing is.
+func TestObjectWritesMaxVersionScopesToKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	mine := newRefObject(t, store)
+
+	at, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, mine.ResourceVersion, at)
+
+	_, err = store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	again, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, at, again, "another kind's write does not move this kind's position")
+
+	empty, err := store.ObjectWritesMaxVersion(ctx, beehive.GroupKind{Kind: "Nothing"})
+	require.NoError(t, err)
+	assert.Zero(t, empty)
+}
+
+// backdateWriteLogEntry ages one entry so retention can see it, instead of
+// sleeping for it.
+func backdateWriteLogEntry(t *testing.T, store beehive.Store, rv int64, age time.Duration) {
+	t.Helper()
+	_, err := store.(*sqliteStore).db.ExecContext(context.Background(),
+		`UPDATE object_writes SET written_at = ? WHERE resource_version = ?`,
+		toMillis(time.Now().UTC().Add(-age)), rv)
+	require.NoError(t, err)
+}
+
+// The sweep records what it removed, per kind. A single global DELETE trims the
+// rows and learns nothing about which kinds it touched, which leaves the horizon
+// empty — and an empty horizon reads as "nothing was trimmed", so every later
+// resume succeeds against a log with a hole in it.
+func TestObjectWritesSweepRecordsThePerKindHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+
+	staleA := newRefObject(t, store)
+	oldA := newRefObject(t, store)
+	oldB, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	keptA := newRefObject(t, store)
+	keptB, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	backdateWriteLogEntry(t, store, staleA.ResourceVersion, time.Hour)
+	backdateWriteLogEntry(t, store, oldA.ResourceVersion, time.Hour)
+	backdateWriteLogEntry(t, store, oldB.ResourceVersion, time.Hour)
+
+	deleted, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, 3, deleted, "entries removed, not kinds touched")
+
+	pageA, trimmedA, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pageA, 1)
+	assert.Equal(t, keptA.ResourceVersion, pageA[0].ResourceVersion)
+	assert.Equal(t, oldA.ResourceVersion, trimmedA, "the horizon is the highest version removed for this kind")
+
+	pageB, trimmedB, err := store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pageB, 1)
+	assert.Equal(t, keptB.ResourceVersion, pageB[0].ResourceVersion)
+	assert.Equal(t, oldB.ResourceVersion, trimmedB, "each kind carries its own horizon")
+}
+
+// The count bound is a per-kind ring, so a hot kind cannot evict a quiet one.
+func TestObjectWritesSweepCapsEachKind(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	for range 3 {
+		newRefObject(t, store)
+	}
+	quiet, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	_, err = store.ObjectWritesSweep(ctx, 2, 0)
+	require.NoError(t, err)
+
+	pageA, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	assert.Len(t, pageA, 2, "the busy kind is capped at its newest two")
+	pageB, _, err := store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pageB, 1, "the quiet kind keeps its only entry")
+	assert.Equal(t, quiet.ResourceVersion, pageB[0].ResourceVersion)
+}
+
+// A kind whose log aged out entirely must keep its position. Reporting 0 against
+// a tail parked at the last version would make the gate fire on every tick —
+// forever, on the kind that writes least.
+func TestObjectWritesMaxVersionHoldsTheHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	backdateWriteLogEntry(t, store, obj.ResourceVersion, time.Hour)
+
+	deleted, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 1, deleted, "precondition: the log is now empty for this kind")
+
+	at, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, obj.ResourceVersion, at)
+}
+
+// The snapshot and its position are read together, so a stream that resumes at
+// that position sees every write made after the listing and none made before it.
+func TestObjectWritesSnapshotIsConsistent(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	first := newRefObject(t, store)
+	second := newRefObject(t, store)
+
+	rows, at, err := store.ObjectWritesSnapshot(ctx, testGK)
+	require.NoError(t, err)
+	assert.Len(t, rows, 2)
+	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, position, at)
+	assert.GreaterOrEqual(t, at, second.ResourceVersion)
+
+	later := newRefObject(t, store)
+	assert.Greater(t, later.ResourceVersion, at, "a write after the listing is above its position")
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, at, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "the stream picks up exactly what the snapshot missed")
+	assert.Equal(t, later.ID, page[0].ID)
+	assert.NotEqual(t, first.ID, page[0].ID)
+}
+
+// The one-object snapshot reads one row but reports the KIND's position: the
+// stream that follows it tails the kind's log.
+func TestObjectWritesSnapshotByIDReadsOneRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	mine := newRefObject(t, store)
+	newRefObject(t, store)
+
+	rows, at, err := store.ObjectWritesSnapshotByID(ctx, testGK, mine.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, mine.ID, rows[0].ID)
+	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, position, at, "the kind's position, not this row's version")
+
+	foreign, _, err := store.ObjectWritesSnapshotByID(ctx, beehive.GroupKind{Kind: "Other"}, mine.ID)
+	require.NoError(t, err)
+	assert.Empty(t, foreign, "another kind cannot see this row")
+}
+
+// The tail reads the objects one batch named, in one query. A short result is
+// normal: an id collected between the log read and this one is simply absent,
+// and its delete arrives as a later entry.
+func TestObjectsListByIDsIsKindScoped(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+	mine := newRefObject(t, store)
+	alsoMine := newRefObject(t, store)
+	foreign, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	got, err := store.ObjectsListByIDs(ctx, testGK, []beehive.ObjectID{
+		alsoMine.ID, mine.ID, foreign.ID, 9999,
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 2, "another kind's row and a missing id are absent, not errors")
+	assert.Equal(t, mine.ID, got[0].ID)
+	assert.Equal(t, alsoMine.ID, got[1].ID)
+
+	empty, err := store.ObjectsListByIDs(ctx, testGK, nil)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}
+
+// The horizon comes back with the page it belongs to, on both paths: carried by
+// the page's own statement when there are rows, and read on its own when there
+// are none. Reading it separately from a non-empty page would let a sweep landing
+// in between report a horizon above entries the page already captured, ending a
+// stream that lost nothing.
+func TestObjectWritesListSinceCarriesTheHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	old := newRefObject(t, store)
+	kept := newRefObject(t, store)
+	backdateWriteLogEntry(t, store, old.ResourceVersion, time.Hour)
+	_, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	require.NoError(t, err)
+
+	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "precondition: one entry survived")
+	assert.Equal(t, kept.ResourceVersion, page[0].ResourceVersion)
+	assert.Equal(t, old.ResourceVersion, trimmed, "carried by the page's statement")
+
+	empty, trimmed, err := store.ObjectWritesListSince(ctx, testGK, kept.ResourceVersion, 10)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+	assert.Equal(t, old.ResourceVersion, trimmed, "and read on its own when the page is empty")
+}
+
+// A delete entry with a NULL image is a broken invariant, not a row to hand back
+// half-built: the contract promises every WriteDelete carries its final state,
+// and a caller that trusts that would drop the change and advance its cursor
+// past it, losing the delete for good.
+func TestObjectWritesListSinceRefusesAnImagelessDelete(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	_, err := store.(*sqliteStore).db.ExecContext(ctx,
+		`UPDATE object_writes SET final = NULL WHERE op = ?`, writeOpDelete)
+	require.NoError(t, err)
+
+	_, _, err = store.ObjectWritesListSince(ctx, testGK, 0, 10)
+
+	require.Error(t, err, "a delete with no image must not be returned as success")
+	assert.Contains(t, err.Error(), "row image")
+}
+
+// dropWriteLog removes the write log, so any write that must record itself
+// fails. The log is not optional: a write nobody can see is worse than a write
+// that failed.
+func dropWriteLog(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `DROP TABLE object_writes`)
+	require.NoError(t, err)
+}
+
+// Every mutator fails when it cannot record itself, rather than committing a
+// write no watch will ever report.
+func TestWritesFailWhenTheWriteLogIsGone(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		write func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error
+	}{
+		{
+			name: "create",
+			write: func(t *testing.T, store *sqliteStore, _ *beehive.RawObject) error {
+				_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+					Name: uniqueName(), Spec: []byte(`{}`),
+				})
+				return err
+			},
+		},
+		{
+			name: "spec update",
+			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
+				_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+				return err
+			},
+		},
+		{
+			name: "deletion request",
+			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
+				_, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+				return err
+			},
+		},
+		{
+			name: "collection",
+			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
+				return store.ObjectsDelete(ctx, obj.ID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newRawStore(t)
+			obj := newRefObject(t, store)
+			dropWriteLog(t, store)
+
+			require.Error(t, tt.write(t, store, obj))
+		})
+	}
+}
+
+// A page carrying a delete comes back with its row image attached, in the same
+// transaction that read the page.
+func TestObjectWritesListSinceAttachesImages(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	kept := newRefObject(t, store)
+	gone := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 3, "two creates and a collection")
+	assert.Nil(t, page[0].Final, "a create carries no image")
+	assert.Equal(t, kept.ID, page[0].ID)
+	last := page[len(page)-1]
+	require.Equal(t, storeapi.WriteDelete, last.Op)
+	require.NotNil(t, last.Final)
+	assert.Equal(t, gone.Name, last.Final.Name)
+}
+
+// A non-positive limit reads nothing rather than reaching SQLite as an unbounded
+// LIMIT -1.
+func TestObjectWritesListSinceRejectsANonPositiveLimit(t *testing.T) {
+	store := newTestStore(t)
+	newRefObject(t, store)
+
+	page, trimmed, err := store.ObjectWritesListSince(context.Background(), testGK, 0, 0)
+
+	require.NoError(t, err)
+	assert.Empty(t, page)
+	assert.Zero(t, trimmed)
+}
+
+// The reads and the sweep surface a broken store rather than reporting an empty
+// log, which a tail would read as "nothing changed".
+func TestWriteLogReadsSurfaceADBError(t *testing.T) {
+	ctx := context.Background()
+	tests := map[string]func(store *sqliteStore) error{
+		"list since": func(store *sqliteStore) error {
+			_, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+			return err
+		},
+		"max version": func(store *sqliteStore) error {
+			_, err := store.ObjectWritesMaxVersion(ctx, testGK)
+			return err
+		},
+		"snapshot": func(store *sqliteStore) error {
+			_, _, err := store.ObjectWritesSnapshot(ctx, testGK)
+			return err
+		},
+		"snapshot by id": func(store *sqliteStore) error {
+			_, _, err := store.ObjectWritesSnapshotByID(ctx, testGK, 1)
+			return err
+		},
+		"sweep": func(store *sqliteStore) error {
+			_, err := store.ObjectWritesSweep(ctx, 1, time.Hour)
+			return err
+		},
+	}
+
+	for name, read := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := newRawStore(t)
+			store.db.Close()
+
+			require.Error(t, read(store))
+		})
+	}
+}
+
+// The page read surfaces a broken log rather than reporting an empty page, which
+// a tail would take as "nothing changed" and advance past.
+func TestObjectWritesListSinceSurfacesABrokenLog(t *testing.T) {
+	store := newRawStore(t)
+	newRefObject(t, store)
+	dropWriteLog(t, store)
+
+	_, _, err := store.ObjectWritesListSince(context.Background(), testGK, 0, 10)
+
+	require.Error(t, err)
+}
+
+// A missing or foreign id reads as no rows, not as an error: the watch it backs
+// streams nothing until the id exists.
+func TestObjectWritesSnapshotByIDFoldsAbsence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	missing, at, err := store.ObjectWritesSnapshotByID(ctx, testGK, 9999)
+	require.NoError(t, err)
+	assert.Empty(t, missing)
+	assert.Equal(t, obj.ResourceVersion, at, "still the kind's position")
+
+	foreign, _, err := store.ObjectWritesSnapshotByID(ctx,
+		beehive.GroupKind{Kind: "Other"}, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, foreign)
+}
+
+// A corrupt row image fails the read rather than surfacing a delete entry the
+// caller cannot build a change from.
+func TestObjectWritesListSinceRefusesAnUndecodableImage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	_, err := store.(*sqliteStore).db.ExecContext(ctx,
+		`UPDATE object_writes SET final = 'not json' WHERE op = ?`, writeOpDelete)
+	require.NoError(t, err)
+
+	_, _, err = store.ObjectWritesListSince(ctx, testGK, 0, 10)
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "row image", "this one failed to decode, not to exist")
+}
+
+// The image read surfaces a broken store rather than reporting deletes with no
+// state to report.
+func TestReadImagesSurfacesADBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.readImages(context.Background(), []any{int64(1)})
+
+	require.Error(t, err)
+}
+
+// Collection needs a version for its log entry, so a store that cannot draw one
+// fails the delete rather than removing the row unrecorded.
+func TestObjectsDeleteFailsWithoutAVersionToDraw(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+	require.NoError(t, err)
+
+	require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+}
+
+// The sweep surfaces a broken log and a broken horizon table separately: the
+// first cannot delete, the second cannot record what it deleted.
+func TestObjectWritesSweepSurfacesBrokenTables(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no log to trim", func(t *testing.T) {
+		store := newRawStore(t)
+		newRefObject(t, store)
+		dropWriteLog(t, store)
+
+		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		require.Error(t, err)
+	})
+
+	// The age bound trims without enumerating kinds, so it reaches the delete on
+	// its own path. Covered explicitly rather than left to whichever background
+	// sweeper happens to meet a torn-down store first.
+	t.Run("no log to age out", func(t *testing.T) {
+		store := newRawStore(t)
+		newRefObject(t, store)
+		dropWriteLog(t, store)
+
+		_, err := store.ObjectWritesSweep(ctx, 0, time.Hour)
+		require.Error(t, err)
+	})
+
+	t.Run("no horizon to record", func(t *testing.T) {
+		store := newRawStore(t)
+		newRefObject(t, store)
+		newRefObject(t, store)
+		_, err := store.db.ExecContext(ctx, `DROP TABLE object_writes_horizon`)
+		require.NoError(t, err)
+
+		_, err = store.ObjectWritesSweep(ctx, 1, 0)
+		require.Error(t, err, "trimming without recording the horizon would let a resume cross a hole")
+	})
+}
+
+// The snapshot surfaces a failed listing rather than reporting an empty kind,
+// which a subscriber would read as "nothing exists yet".
+func TestObjectWritesSnapshotSurfacesAFailedListing(t *testing.T) {
+	store := newRawStore(t)
+	newRefObject(t, store)
+	dropObjects(t, store)
+
+	_, _, err := store.ObjectWritesSnapshot(context.Background(), testGK)
+
+	require.Error(t, err)
+}
+
+// The count bound records its horizon per kind too, and trims each kind against
+// its own cap. The trim runs one statement per kind, so a kind under its cap
+// must come through untouched and with no horizon of its own — a shared cutoff
+// would let a busy kind's trim strand a quiet kind's subscribers.
+func TestObjectWritesSweepCapsEachKindWithItsOwnHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
+
+	busy := make([]*beehive.RawObject, 0, 3)
+	for range 3 {
+		busy = append(busy, newRefObject(t, store))
+	}
+	quiet, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	deleted, err := store.ObjectWritesSweep(ctx, 2, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted, "only the busy kind's oldest entry")
+
+	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 2)
+	assert.Equal(t, busy[0].ResourceVersion, trimmed, "the busy kind carries its own horizon")
+
+	page, trimmed, err = store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, quiet.ResourceVersion, page[0].ResourceVersion)
+	assert.Zero(t, trimmed, "the quiet kind was never trimmed, so its horizon never moved")
 }

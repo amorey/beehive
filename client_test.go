@@ -207,18 +207,12 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	ch, err := client.ObjectsWatchList(ctx)
+	snap, _, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	select {
-	case ev, ok := <-ch:
-		require.True(t, ok, "stream must stay open past the poison row")
-		require.NotNil(t, ev.Object)
-		assert.Equal(t, good.ID, ev.Object.ID, "the good object flows even though the poison one preceded it")
-		assert.Equal(t, "good", ev.Object.Spec.Val)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the good object's event")
-	}
+	require.Len(t, snap.Objects, 1, "the poison row is quarantined, not fatal")
+	assert.Equal(t, good.ID, snap.Objects[0].ID, "the good object survives the poison one")
+	assert.Equal(t, "good", snap.Objects[0].Spec.Val)
 }
 
 func newClientTestStore(t *testing.T) Store {
@@ -1108,7 +1102,7 @@ func TestClientWatchNonExistentID(t *testing.T) {
 
 	// Watch a non-existent ID: the snapshot loader returns (nil, nil) via the
 	// ErrNotFound path, yielding an empty snapshot and an open channel.
-	ch, err := client.ObjectsWatch(ctx, 9999)
+	_, ch, err := client.ObjectsWatch(ctx, 9999)
 	require.NoError(t, err)
 
 	// Cancel ctx — channel must close cleanly (no events, just the cancel).
@@ -1511,7 +1505,7 @@ func watchTestClient(t *testing.T) (context.Context, Client[cSpec, cStatus]) {
 func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -1529,7 +1523,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 
 	// Subscribe before creating so the snapshot is empty and the first event is
 	// the Modified from the Update, not an Added from the snapshot.
-	ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
@@ -1551,7 +1545,7 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
@@ -1571,7 +1565,7 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
@@ -1608,13 +1602,12 @@ func TestWatchReceivesOnlyMatchingID(t *testing.T) {
 	obj1 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	obj2 := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
-	ch, err := client.ObjectsWatch(ctx, obj1.ID)
+	snap, ch, err := client.ObjectsWatch(ctx, obj1.ID)
 	require.NoError(t, err)
 
-	// Drain the initial snapshot Added event for obj1.
-	snap := recv(t, ch)
-	assert.Equal(t, Added, snap.Type)
-	assert.Equal(t, obj1.ID, snap.Object.ID)
+	// The snapshot holds obj1 and nothing else; the stream carries what follows.
+	require.Len(t, snap.Objects, 1)
+	assert.Equal(t, obj1.ID, snap.Objects[0].ID)
 
 	// Update obj2 first — this event must not appear on ch.
 	_, err = client.UpdateByID(ctx, obj2.ID, cSpec{Val: "b2"})
@@ -1635,7 +1628,7 @@ func TestWatchListClosesOnCtxCancel(t *testing.T) {
 	parent, client := watchTestClient(t)
 	ctx, cancel := context.WithCancel(parent)
 
-	ch, err := client.ObjectsWatchList(ctx)
+	_, ch, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
 	cancel()
@@ -1650,7 +1643,7 @@ func TestWatchClosesOnCtxCancel(t *testing.T) {
 	obj, err := client.Create(parent, "decoded", cSpec{})
 	require.NoError(t, err)
 
-	ch, err := client.ObjectsWatch(ctx, obj.ID)
+	_, ch, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	cancel()
@@ -1683,15 +1676,12 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client2, uniqueName(), cSpec{Val: "x"})
 
-	// Subscribe after create: the snapshot emits Added(obj) first, then we
-	// expect Modified from UpdateStatus.
-	ch, err := client2.ObjectsWatchList(ctx)
+	// Subscribe after create: the object is in the snapshot, and the stream
+	// carries the Modified that UpdateStatus makes next.
+	snap, ch, err := client2.ObjectsWatchList(ctx)
 	require.NoError(t, err)
-
-	// Drain the initial snapshot Added event.
-	snap := recv(t, ch)
-	assert.Equal(t, Added, snap.Type)
-	assert.Equal(t, obj.ID, snap.Object.ID)
+	require.Len(t, snap.Objects, 1)
+	assert.Equal(t, obj.ID, snap.Objects[0].ID)
 
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
@@ -1703,41 +1693,38 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 }
 
 // TestWatchListInitialSnapshot verifies that WatchList emits Added events for
-// objects that already exist in the store at subscription time.
+// objects that already exist in the store at subscription time. They come back
+// as the Snapshot, not as Added changes.
 func TestWatchListInitialSnapshot(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
-	ch, err := client.ObjectsWatchList(ctx)
+	snap, _, err := client.ObjectsWatchList(ctx)
 	require.NoError(t, err)
 
-	// Two snapshot Added events must arrive, one per existing object.
 	seen := map[ObjectID]string{}
-	for range 2 {
-		evt := recv(t, ch)
-		assert.Equal(t, Added, evt.Type)
-		seen[evt.Object.ID] = evt.Object.Spec.Val
+	for _, obj := range snap.Objects {
+		seen[obj.ID] = obj.Spec.Val
 	}
 	assert.Equal(t, "a", seen[a.ID])
 	assert.Equal(t, "b", seen[b.ID])
 }
 
-// TestWatchInitialSnapshot verifies that Watch(id) emits an Added event for an
-// object that already exists in the store at subscription time.
+// TestWatchInitialSnapshot verifies that Watch(id) returns an object that
+// already exists in the store at subscription time.
 func TestWatchInitialSnapshot(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	ch, err := client.ObjectsWatch(ctx, obj.ID)
+	snap, _, err := client.ObjectsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	evt := recv(t, ch)
-	assert.Equal(t, Added, evt.Type)
-	assert.Equal(t, obj.ID, evt.Object.ID)
-	assert.Equal(t, "hello", evt.Object.Spec.Val)
+	require.Len(t, snap.Objects, 1)
+	assert.Equal(t, obj.ID, snap.Objects[0].ID)
+	assert.Equal(t, "hello", snap.Objects[0].Spec.Val)
 }
 
 // TestStartAfterStopErrors verifies that Beehive is a one-shot object: calling
@@ -1762,19 +1749,24 @@ func TestStartAfterStopErrors(t *testing.T) {
 
 // TestWatchListErrForUnregisteredKind verifies that WatchList returns an error
 // (not a panic) when no controller is registered for the given GroupKind.
-func TestWatchListErrForUnregisteredKind(t *testing.T) {
-	ctx := context.Background()
+// Watching a kind nobody registered is not an error: the tail reads the write
+// log, so it needs no reconciler. An empty kind simply streams nothing.
+func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	bh, err := New(newClientTestStore(t))
 	require.NoError(t, err)
 
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
 
-	_, err = client.ObjectsWatchList(ctx)
-	require.Error(t, err)
+	snap, _, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects)
 
-	_, err = client.ObjectsWatch(ctx, 0)
-	require.Error(t, err)
+	snap, _, err = client.ObjectsWatch(ctx, 0)
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects)
 }
 
 func TestClientGetOwner(t *testing.T) {

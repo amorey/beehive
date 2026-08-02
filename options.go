@@ -328,6 +328,25 @@ func WithEventRetention(perObject int, maxAge time.Duration) Option {
 	}
 }
 
+// WithWriteLogRetention bounds the object write log, enforced globally by the
+// GC sweeper. perKind > 0 caps each (group, kind) log to its newest perKind
+// entries — per kind, so a hot kind cannot evict a quiet one; maxAge > 0 drops
+// entries written more than maxAge ago. A zero bound is skipped.
+//
+// The default is defaultWriteLogMaxAge and no count bound; both zero leaves the
+// log unbounded, which also leaves every resume window unbounded. Retention is
+// what defines that window: a stream cannot resume below what has been trimmed.
+// Meaningful only at New.
+func WithWriteLogRetention(perKind int, maxAge time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.writeLogRetentionPerKind = perKind
+			t.writeLogRetentionMaxAge = maxAge
+		}
+		return nil
+	}
+}
+
 // WithMigrator registers a Migrator for the controller's kind, applied to
 // stored Spec/Status JSON on read. Meaningful only at Register, which installs
 // it into the registry both the client and the reconciler decode through.

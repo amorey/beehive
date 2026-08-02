@@ -41,6 +41,14 @@ var (
 	_ storeapi.DriverCursorer    = (*sqliteStore)(nil)
 )
 
+// object_writes.op. The soft delete is an ordinary update: the row is still
+// live and readable, so only the GC's physical removal is writeOpDelete.
+const (
+	writeOpCreate = 1
+	writeOpUpdate = 2
+	writeOpDelete = 3
+)
+
 type sqliteStore struct {
 	db *sql.DB
 
@@ -582,7 +590,59 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	if err != nil {
 		return nil, asNameTaken(err)
 	}
+	if err := appendWriteLog(ctx, c, obj.ID, gk, writeOpCreate, rv, now); err != nil {
+		return nil, err
+	}
 	return obj, nil
+}
+
+// recordObjectWrite draws the version an object write will take and logs it in
+// one step, returning the version and the timestamp the caller stamps its row
+// with. Bound together deliberately: drawing a version without logging it is
+// exactly the mistake that makes a write invisible to every watch, and the
+// caller cannot write its row without the value this returns.
+//
+// For callers that know the row up front. objectsCreate and markForDeletion
+// learn the id from their own RETURNING, and objectsDelete needs the row image,
+// so those three call appendWriteLog directly.
+func (s *sqliteStore) recordObjectWrite(
+	ctx context.Context,
+	c dbtx,
+	gk storeapi.GroupKind,
+	id storeapi.ObjectID,
+	op int,
+) (rv, now int64, err error) {
+	if rv, err = nextResourceVersion(ctx, c); err != nil {
+		return 0, 0, err
+	}
+	now = toMillis(time.Now().UTC())
+	if err = appendWriteLog(ctx, c, id, gk, op, rv, now); err != nil {
+		return 0, 0, err
+	}
+	return rv, now, nil
+}
+
+// appendWriteLog records one committed object write. Callers pass the version the
+// write took, so the entry orders against the row it describes.
+func appendWriteLog(ctx context.Context, c dbtx, id storeapi.ObjectID, gk storeapi.GroupKind, op int, rv, now int64) error {
+	_, err := c.ExecContext(ctx, `
+		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		rv, id, gk.Group, gk.Kind, op, now)
+	return err
+}
+
+// appendWriteLogDelete records a collection, carrying the row image a Deleted
+// change reports. image is stamped with the delete's own version: it is the
+// object's last, and the row that held the previous one no longer exists.
+func appendWriteLogDelete(ctx context.Context, c dbtx, image *storeapi.RawObject, rv, now int64) error {
+	image.ResourceVersion = rv
+	final, _ := json.Marshal(image) // plain data: no channel, func or cyclic field can fail it
+	_, err := c.ExecContext(ctx, `
+		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at, final)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		rv, image.ID, image.Group, image.Kind, writeOpDelete, now, string(final))
+	return err
 }
 
 // asNameTaken translates the UNIQUE violation on ("group", kind, name) into
@@ -939,46 +999,148 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// ObjectWritesMaxVersion reads the high-water mark of the object write log: the highest
-// resource_version any live objects row holds (covered by idx_objects_rv; an
-// empty store reads 0).
+// ObjectWritesMaxVersionAll reads the write log's high-water mark across every
+// kind, covered by the log's primary key. An empty log reads 0.
 //
-// It reads objects, not resource_version_seq: the event log draws from that
-// sequence too, and a consumer of this pair must not see the cursor move for a
-// write it can never be shown.
-func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context) (int64, error) {
+// It reads object_writes, not resource_version_seq: the event log draws from
+// that sequence too, and a consumer of this pair must not see the cursor move
+// for a write it can never be shown. Retention is the only thing that lowers it.
+func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT MAX(resource_version) FROM objects`).Scan(&rv)
+		`SELECT MAX(resource_version) FROM object_writes`).Scan(&rv)
 	return rv.Int64, err
 }
 
-// ObjectWritesListSince returns the writes above afterRV: live rows, in cursor order,
-// at most limit of them. Blob-free and covered by idx_objects_rv — consumers
-// route by id and read current state themselves. Kind-agnostic, since a
-// depends_on edge may point at a kind with no controller. A row deleted since
-// afterRV is simply absent.
-func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
+// ObjectWritesListSinceAll returns the log entries above afterRV across every
+// kind, in cursor order, at most limit of them. Kind-agnostic, since a
+// depends_on edge may point at a kind with no controller. No row images: the
+// waker routes by id and reads current state, so decoding a collected object
+// only to discard it is pure cost.
+func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, nil
 	}
 	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT id, resource_version FROM objects
+		`SELECT `+writeLogColumns+` FROM object_writes
 		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
 		afterRV, limit)
 	if err != nil {
 		return nil, err
 	}
+	return scanWriteLog(rows, limit)
+}
+
+// writeLogColumns is the canonical select list for a log entry; scanWriteLog
+// reads them in order. Exactly the columns idx_object_writes_kind carries, so a
+// page is answered from the index alone — final is deliberately absent, since
+// selecting it forces a table row fetch for EVERY entry, not only the rare
+// delete that has one.
+const writeLogColumns = `resource_version, object_id, "group", kind, op`
+
+// scanWriteLog collects log entries. Row images are attached separately, by the
+// one caller that reports them.
+func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, error) {
 	defer rows.Close()
-	// Capped: a large caller limit must not preallocate for rows the store may not have.
-	writes := make([]storeapi.ObjectWrite, 0, min(limit, 1024))
+	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
 	for rows.Next() {
 		var w storeapi.ObjectWrite
-		_ = rows.Scan(&w.ID, &w.ResourceVersion) // two INTEGER columns into int64 never error
+		// Five declared columns into their own types; a STRICT schema cannot
+		// surprise them.
+		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op)
 		writes = append(writes, w)
 	}
 	return writes, rows.Err()
+}
+
+// writeLogPage reads one page of gk's log with the retention horizon carried as
+// a trailing column, which every row repeats. One function, so a broken read is
+// one error rather than a query branch and a scan branch that cannot both happen.
+func (s *sqliteStore) writeLogPage(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT `+writeLogColumns+`,
+		       coalesce((SELECT trimmed_through FROM object_writes_horizon
+		                  WHERE "group" = ? AND kind = ?), 0)
+		  FROM object_writes
+		 WHERE "group" = ? AND kind = ? AND resource_version > ?
+		 ORDER BY resource_version LIMIT ?`,
+		gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
+	var trimmed int64
+	for rows.Next() {
+		var w storeapi.ObjectWrite
+		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &trimmed)
+		writes = append(writes, w)
+	}
+	return writes, trimmed, rows.Err()
+}
+
+// writeLogPageCap caps the preallocation: a large caller limit must not
+// preallocate for rows the store may not have.
+func writeLogPageCap(limit int) int { return min(limit, 1024) }
+
+// attachImages fills Final on the delete entries in page, in one query, and does
+// nothing when the page has none. op identifies them without reading the blob,
+// which is why it is in the covering index.
+func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWrite) error {
+	var deletes []any
+	for _, w := range page {
+		if w.Op == storeapi.WriteDelete {
+			deletes = append(deletes, w.ResourceVersion)
+		}
+	}
+	if len(deletes) == 0 {
+		return nil
+	}
+	images, err := s.readImages(ctx, deletes)
+	if err != nil {
+		return err
+	}
+	// Read back inside the caller's transaction, so every delete in the page is
+	// in images: the reachable violation is the NULL readImages rejects.
+	for i := range page {
+		if page[i].Op == storeapi.WriteDelete {
+			page[i].Final = images[page[i].ResourceVersion]
+		}
+	}
+	return nil
+}
+
+// readImages decodes the row images stored against the given versions.
+func (s *sqliteStore) readImages(ctx context.Context, versions []any) (map[int64]*storeapi.RawObject, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT resource_version, final FROM object_writes
+		  WHERE resource_version IN (`+placeholders(len(versions))+`)`, versions...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	images := make(map[int64]*storeapi.RawObject, len(versions))
+	for rows.Next() {
+		var rv int64
+		var final sql.NullString
+		_ = rows.Scan(&rv, &final) // an INTEGER and a nullable TEXT, both declared
+		if !final.Valid {
+			// The append path writes the image with the entry, so a NULL here is a
+			// broken invariant. Failing the read costs one tick; returning the
+			// entry without its image costs the delete itself, because the caller
+			// drops the change it cannot build and advances its cursor past it.
+			return nil, fmt.Errorf("beehive: write log entry %d is a delete with no row image", rv)
+		}
+		image := &storeapi.RawObject{}
+		if err := json.Unmarshal([]byte(final.String), image); err != nil {
+			return nil, err
+		}
+		images[rv] = image
+	}
+	return images, rows.Err()
 }
 
 // scanIDs collects the single id column of a SELECT id query, closing rows.
@@ -1059,7 +1221,8 @@ func (s *sqliteStore) updateSpec(
 			result, err = s.attachConditions(ctx, obj)
 			return err // changed stays false: nothing was written
 		}
-		rv, err := nextResourceVersion(ctx, c)
+		gk := storeapi.GroupKind{Group: obj.Group, Kind: obj.Kind}
+		rv, now, err := s.recordObjectWrite(ctx, c, gk, obj.ID, writeOpUpdate)
 		if err != nil {
 			return err
 		}
@@ -1072,7 +1235,7 @@ func (s *sqliteStore) updateSpec(
 			    resource_version = ?, updated_at = ?
 			WHERE id = ?
 			RETURNING `+objectColumns,
-			jsonText(spec), stamp, rv, toMillis(time.Now().UTC()), obj.ID)
+			jsonText(spec), stamp, rv, now, obj.ID)
 		result, err = s.scanWritten(ctx, row)
 		changed = err == nil
 		return err
@@ -1121,7 +1284,7 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 			// The handshake advanced — watch-visible even with identical bytes.
 			// updated_at tracks content and stays put; observed_at records the
 			// handshake.
-			rv, err := nextResourceVersion(ctx, c)
+			rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 			if err != nil {
 				return err
 			}
@@ -1130,14 +1293,13 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 				UPDATE objects
 				SET observed_generation = ?, observed_at = ?, resource_version = ?
 				WHERE id = ?`,
-				observedGeneration, toMillis(time.Now().UTC()), rv, id)
+				observedGeneration, now, rv, id)
 			return err
 		}
-		rv, err := nextResourceVersion(ctx, c)
+		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
 		}
-		now := toMillis(time.Now().UTC())
 		// observedGeneration lands verbatim, unclamped: a stale reporter just
 		// overwrote the status, and its generation marking the object unsettled is
 		// what gets that content re-derived. Keyed on id alone: the kind boundary
@@ -1246,14 +1408,14 @@ func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, co
 
 // bumpObject advances id's resource_version — the visibility half of the
 // condition mutators, whose semantic write lives in another table.
-func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, id storeapi.ObjectID) error {
-	rv, err := nextResourceVersion(ctx, c)
+func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID) error {
+	rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 	if err != nil {
 		return err
 	}
 	_, err = c.ExecContext(ctx, `
 		UPDATE objects SET resource_version = ?, updated_at = ?
-		WHERE id = ?`, rv, toMillis(time.Now().UTC()), id)
+		WHERE id = ?`, rv, now, id)
 	return err
 }
 
@@ -1311,7 +1473,7 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// A condition change bumps resource_version — what watch polls and the
 		// dependency waker look at.
-		return s.bumpObject(ctx, c, id)
+		return s.bumpObject(ctx, c, gk, id)
 	})
 }
 
@@ -1333,7 +1495,7 @@ func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKin
 		if n == 0 {
 			return nil
 		}
-		return s.bumpObject(ctx, c, id)
+		return s.bumpObject(ctx, c, gk, id)
 	})
 }
 
@@ -1550,7 +1712,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		if !removed {
 			return nil
 		}
-		rv, err := nextResourceVersion(ctx, c)
+		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
 		}
@@ -1558,7 +1720,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		_, err = c.ExecContext(ctx, `
 			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?`,
-			jsonText(marshalFinalizers(remaining)), rv, toMillis(time.Now().UTC()), id)
+			jsonText(marshalFinalizers(remaining)), rv, now, id)
 		return err
 	})
 }
@@ -1578,21 +1740,31 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
 	args := append([]any{now, now}, whereArgs...)
-	res, err := c.ExecContext(ctx, `
+	// RETURNING, not RowsAffected: the write log entry needs the row's identity,
+	// and the where here is a predicate rather than a known id.
+	row := c.QueryRowContext(ctx, `
 		UPDATE objects
 		SET deletion_requested_at = ?,
 		    resource_version = (SELECT value + 1 FROM resource_version_seq WHERE id = 1),
 		    updated_at = ?
-		WHERE (`+where+`) AND deletion_requested_at IS NULL`, args...)
+		WHERE (`+where+`) AND deletion_requested_at IS NULL
+		RETURNING id, "group", kind, resource_version`, args...)
+	var id storeapi.ObjectID
+	var gk storeapi.GroupKind
+	var rv int64
+	err := row.Scan(&id, &gk.Group, &gk.Kind, &rv)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
-	if n == 0 {
-		return false, nil
-	}
 	// Commit the value the row above just took; same transaction, same connection.
 	if _, err := nextResourceVersion(ctx, c); err != nil {
+		return false, err
+	}
+	// The soft delete is an update: the row is still live and readable.
+	if err := appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1720,18 +1892,29 @@ func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	return s.Within(ctx, func(ctx context.Context) error { return s.objectsDelete(ctx, id) })
 }
 
-// objectsDelete physically removes the row. A delete draws no resource_version:
-// the row is gone, so there is nothing for a write-log scan to report — watches
-// derive the tombstone from absence.
+// objectsDelete physically removes the row. It draws a resource_version even
+// though no row survives to hold it: the write log's delete entry takes it, and
+// without one the entry could not be ordered against the rest of the log. The
+// counter is shared with the event log, so collection moves that too.
 func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
-	// Zero rows means already collected: ErrNotFound. Conditions, events and edges cascade.
-	res, err := s.conn(ctx).ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id)
+	c := s.conn(ctx)
+	// Read before the DELETE: the conditions cascade with the row, so this is the
+	// last moment the image can be assembled.
+	image, err := s.ObjectsGet(ctx, id)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
-	if n == 0 {
-		return storeapi.ErrNotFound
+	// Conditions, events and edges cascade. No zero-row check: the read above
+	// already returned ErrNotFound for an id this transaction cannot see.
+	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
+		return err
+	}
+	rv, err := nextResourceVersion(ctx, c)
+	if err != nil {
+		return err
+	}
+	if err := appendWriteLogDelete(ctx, c, image, rv, toMillis(time.Now().UTC())); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2113,4 +2296,249 @@ func fromMillis(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
 func millisPtr(ms int64) *time.Time {
 	t := fromMillis(ms)
 	return &t
+}
+
+// ObjectWritesListSince reads gk's log entries above afterRV, covered by
+// idx_object_writes_kind except where a delete entry's image is fetched.
+//
+// Self-wrapped, because the contract is atomic and this takes more than one
+// statement: the page, the horizon and the delete images must all describe the
+// same instant. A retention sweep landing between them would either report a
+// horizon above entries the page already captured — a terminal ErrWatchTooOld
+// for a stream that lost nothing — or delete a captured entry's row image out
+// from under the caller.
+//
+// The horizon still rides the page's own statement as a scalar subquery, which
+// costs nothing and keeps the empty-page case honest.
+func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	if limit <= 0 {
+		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
+		return nil, 0, nil
+	}
+	var writes []storeapi.ObjectWrite
+	var trimmed int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if writes, trimmed, err = s.writeLogPage(ctx, gk, afterRV, limit); err != nil {
+			return err
+		}
+		if len(writes) == 0 {
+			// No rows carried the subquery, so read it on its own.
+			trimmed, err = s.trimmedThrough(ctx, gk)
+			return err
+		}
+		return s.attachImages(ctx, writes)
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return writes, trimmed, nil
+}
+
+// trimmedThrough is gk's retention horizon; no row means nothing has been
+// trimmed, which is 0 rather than an error.
+func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
+	var trimmed int64
+	err := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT trimmed_through FROM object_writes_horizon
+		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&trimmed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return trimmed, err
+}
+
+// ObjectWritesMaxVersion reads gk's log position, covered by
+// idx_object_writes_kind. The horizon is folded in because retention lowers the
+// log's own maximum: a kind trimmed empty would report 0 against a tail parked
+// higher and list on every tick. Folded, the position only ever rises, which is
+// why the tail gates on > rather than !=.
+func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
+	// One statement, not two: this is a watch's entire quiet-tick budget, and
+	// both halves are covering-index seeks that fold for free.
+	var at int64
+	err := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT max(
+			coalesce((SELECT MAX(resource_version) FROM object_writes
+			           WHERE "group" = ? AND kind = ?), 0),
+			coalesce((SELECT trimmed_through FROM object_writes_horizon
+			           WHERE "group" = ? AND kind = ?), 0))`,
+		gk.Group, gk.Kind, gk.Group, gk.Kind).Scan(&at)
+	return at, err
+}
+
+// ObjectWritesSweep trims the log and records what it removed. The delete and
+// the horizon raise share a transaction: a horizon that lagged its deletes would
+// read as "nothing trimmed" and let a resume succeed against a hole.
+//
+// RETURNING, not a bare DELETE: the horizon is per kind, so the sweep has to
+// learn which kinds it touched and how far.
+func (s *sqliteStore) ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error) {
+	var deleted int
+	err := s.Within(ctx, func(ctx context.Context) error {
+		if maxAge > 0 {
+			n, err := s.trimWriteLog(ctx, `written_at < ?`,
+				toMillis(time.Now().UTC().Add(-maxAge)))
+			if err != nil {
+				return err
+			}
+			deleted += n
+		}
+		if perKind > 0 {
+			// One statement per kind, not one subquery per row. Keyed on a literal
+			// kind, the cutoff is uncorrelated, so it is evaluated once and every
+			// step rides idx_object_writes_kind: a seek for the cutoff, a range
+			// delete below it. A kind under its cap yields NULL, and
+			// `resource_version <= NULL` matches nothing, so it costs one seek.
+			kinds, err := s.writeLogKinds(ctx)
+			if err != nil {
+				return err
+			}
+			for _, gk := range kinds {
+				n, err := s.trimWriteLog(ctx, `"group" = ? AND kind = ? AND resource_version <= (
+					SELECT resource_version FROM object_writes
+					 WHERE "group" = ? AND kind = ?
+					 ORDER BY resource_version DESC LIMIT 1 OFFSET ?)`,
+					gk.Group, gk.Kind, gk.Group, gk.Kind, perKind)
+				if err != nil {
+					return err
+				}
+				deleted += n
+			}
+		}
+		return nil
+	})
+	return deleted, err
+}
+
+// writeLogKinds lists the kinds present in the log. An index-only scan, and the
+// only step of the count trim that is not a seek — kinds number in the handful
+// where entries number in the millions, so it is the right axis to iterate.
+func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`SELECT DISTINCT "group", kind FROM object_writes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var kinds []storeapi.GroupKind
+	for rows.Next() {
+		var gk storeapi.GroupKind
+		_ = rows.Scan(&gk.Group, &gk.Kind) // two declared TEXT columns
+		kinds = append(kinds, gk)
+	}
+	return kinds, rows.Err()
+}
+
+// deleteWriteLogRows deletes the entries matching where and reports the highest
+// version removed per kind, with the total. Closes its rows before returning, so
+// the horizon writes that follow get the single connection back.
+func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, where string, args ...any) (map[storeapi.GroupKind]int64, int, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx,
+		`DELETE FROM object_writes WHERE `+where+`
+		 RETURNING "group", kind, resource_version`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	highest := map[storeapi.GroupKind]int64{}
+	var deleted int
+	for rows.Next() {
+		var k storeapi.GroupKind
+		var rv int64
+		_ = rows.Scan(&k.Group, &k.Kind, &rv) // two TEXT columns and an INTEGER
+		highest[k] = max(highest[k], rv)
+		deleted++
+	}
+	return highest, deleted, rows.Err()
+}
+
+// trimWriteLog deletes the entries matching where and raises each affected
+// kind's horizon to the highest version it removed there.
+func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...any) (int, error) {
+	c := s.conn(ctx)
+	highest, deleted, err := s.deleteWriteLogRows(ctx, where, args...)
+	if err != nil {
+		return 0, err
+	}
+	for k, rv := range highest {
+		if _, err := c.ExecContext(ctx, `
+			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
+			VALUES (?, ?, ?)
+			    ON CONFLICT("group", kind) DO UPDATE SET trimmed_through = excluded.trimmed_through
+			 WHERE excluded.trimmed_through > object_writes_horizon.trimmed_through`,
+			k.Group, k.Kind, rv); err != nil {
+			return 0, err
+		}
+	}
+	return deleted, nil
+}
+
+// ObjectWritesSnapshot lists gk and reads its log position in one transaction.
+// Separately they could straddle a write: a row listed after the position was
+// read would never reach the stream, since the stream starts above it.
+func (s *sqliteStore) ObjectWritesSnapshot(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, int64, error) {
+	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+		return s.ObjectsList(ctx, gk)
+	})
+}
+
+// ObjectWritesSnapshotByID reads one row rather than the kind, and folds both
+// "not there" cases — missing and foreign — into an empty result.
+func (s *sqliteStore) ObjectWritesSnapshotByID(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
+	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+		obj, err := s.ObjectsGet(ctx, id)
+		if errors.Is(err, storeapi.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil || obj.Group != gk.Group || obj.Kind != gk.Kind {
+			return nil, err
+		}
+		return []*storeapi.RawObject{obj}, nil
+	})
+}
+
+func (s *sqliteStore) snapshot(
+	ctx context.Context,
+	gk storeapi.GroupKind,
+	list func(context.Context) ([]*storeapi.RawObject, error),
+) ([]*storeapi.RawObject, int64, error) {
+	var rows []*storeapi.RawObject
+	var at int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if rows, err = list(ctx); err != nil {
+			return err
+		}
+		at, err = s.ObjectWritesMaxVersion(ctx, gk)
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return rows, at, nil
+}
+
+// ObjectsListByIDs reads one batch of ids in one query. The tail calls it once
+// per batch rather than ObjectsGet per changed object: the pool is size 1, so
+// those would be serialized round trips and a churny kind would cost more than
+// the full listing this design replaced.
+func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKind, ids []storeapi.ObjectID) ([]*storeapi.RawObject, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(ids)+2)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	args = append(args, gk.Group, gk.Kind)
+	return s.listObjectsWhere(ctx,
+		`WHERE o.id IN (`+placeholders(len(ids))+`) AND o."group" = ? AND o.kind = ?`, args...)
+}
+
+// placeholders builds "?, ?, ?" for an IN list of n values.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }

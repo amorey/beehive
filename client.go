@@ -30,6 +30,17 @@ import (
 // registered controller: there is no reconcile loop to schedule against.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
+// ErrWatchTooOld ends a watch whose unread log entries retention has already
+// removed. The stream cannot continue truthfully, so it reports this on a Failed
+// change and closes; the caller answers by subscribing again for a fresh
+// snapshot.
+var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
+
+// ErrWatchLagged ends a watch whose subscriber fell behind its configured buffer
+// under LagFail. Reported on a Failed change, so a stalled consumer is told
+// rather than silently served stale changes forever.
+var ErrWatchLagged = errors.New("beehive: watch subscriber fell behind")
+
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
 // objects have no natural name:
 //
@@ -78,11 +89,23 @@ func checkName(name string) error {
 	return nil
 }
 
+// Snapshot is a watch's starting state: the objects as they were, and the log
+// position they are complete as of. The stream that comes with it carries
+// changes strictly above that position.
+type Snapshot[Spec, Status any] struct {
+	Objects         []*Object[Spec, Status]
+	ResourceVersion int64
+}
+
 // ObjectChange reports a change to a watched object. On a Deleted change,
-// Object carries the row's final state.
+// Object carries the row's final state. On a Failed change, Object is nil and
+// Err is non-nil: the stream is over, and a Failed change is always the last
+// value before the channel closes. A channel that closes with no Failed change
+// ended because the caller's context did.
 type ObjectChange[Spec, Status any] struct {
 	Type   ChangeType
 	Object *Object[Spec, Status]
+	Err    error
 }
 
 // Client is the user-facing API for a single resource kind: creating, reading,
@@ -143,19 +166,24 @@ type Client[Spec, Status any] interface {
 	// the process can't read.
 	GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
-	// ObjectsWatch streams changes to one object, ObjectsWatchList to every
-	// object of this client's kind: current state as Added, then
-	// Added/Modified/Deleted until ctx is cancelled. Both require a registered
-	// controller and are kind-scoped.
+	// ObjectsWatch returns one object's current state, ObjectsWatchList every
+	// object of this client's kind, each with a stream of the changes above it:
+	// Added/Modified/Deleted until ctx is cancelled. Both are kind-scoped and
+	// need no registered controller: the tail reads the write log, not a
+	// reconciler.
 	//
-	// Both read current state before returning, so a caller may subscribe and
-	// then act: a change it makes afterwards — including a delete — is always
-	// reported. That costs one read on the subscribing goroutine, whose failure
-	// is returned. Everything after is polled, which bounds latency and
-	// collapses changes within one interval. A watch cannot be opened inside a
-	// transaction (the read would deadlock on the single connection).
-	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
-	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
+	// The snapshot is read before either returns, on the caller's goroutine, so a
+	// caller may subscribe and then act: a change it makes afterwards — including
+	// a delete — is always in the stream. Snapshot.ResourceVersion is the log
+	// position the snapshot is complete as of, and the stream carries changes
+	// strictly above it: no overlap, no gap. A failed snapshot read is returned
+	// rather than handed back as a stream whose guarantee is void.
+	//
+	// Everything after is polled, which bounds latency and collapses changes
+	// within one interval. A watch cannot be opened inside a transaction (the
+	// read would deadlock on the single connection).
+	ObjectsWatch(ctx context.Context, id ObjectID, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	ObjectsWatchList(ctx context.Context, opts ...WatchOption) (Snapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)

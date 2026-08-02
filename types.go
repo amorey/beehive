@@ -65,8 +65,19 @@ const (
 	RelationDependsOn = storeapi.RelationDependsOn
 )
 
-// ObjectWrite names one object whose version is above a scan's cursor.
+// ObjectWrite is one entry of the object write log.
 type ObjectWrite = storeapi.ObjectWrite
+
+// WriteOp is what an ObjectWrite recorded.
+type WriteOp = storeapi.WriteOp
+
+// The soft delete is a WriteUpdate: the row is still live and readable, so only
+// collection is WriteDelete.
+const (
+	WriteCreate = storeapi.WriteCreate
+	WriteUpdate = storeapi.WriteUpdate
+	WriteDelete = storeapi.WriteDelete
+)
 
 // ChangeType classifies a Change.
 type ChangeType = storeapi.ChangeType
@@ -75,6 +86,8 @@ const (
 	Added    = storeapi.Added
 	Modified = storeapi.Modified
 	Deleted  = storeapi.Deleted
+	// Failed is terminal: the stream is over and the change carries the reason.
+	Failed = storeapi.Failed
 )
 
 // ErrNotFound is returned by Store reads when no object matches.

@@ -273,3 +273,14 @@ func TestResolveLoads(t *testing.T) {
 	// A repeated selector is idempotent.
 	assert.Equal(t, LoadOwnerBit, resolveLoads([]LoadOption{LoadOwner(), LoadOwner()}))
 }
+
+func TestWithWriteLogRetentionDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithWriteLogRetention(50, time.Hour)(bh))
+	assert.Equal(t, 50, bh.writeLogRetentionPerKind)
+	assert.Equal(t, time.Hour, bh.writeLogRetentionMaxAge)
+
+	// Retention is global (Beehive-level); other targets ignore it.
+	require.NoError(t, WithWriteLogRetention(9, time.Minute)(&reconciler{}))
+	require.NoError(t, WithWriteLogRetention(9, time.Minute)("unrelated"))
+}

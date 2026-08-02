@@ -80,6 +80,8 @@ const (
 	Added    ChangeType = "Added"
 	Modified ChangeType = "Modified"
 	Deleted  ChangeType = "Deleted"
+	// Failed is terminal: the stream is over and the change carries the reason.
+	Failed ChangeType = "Failed"
 )
 
 // ObjectWrite is a write-log row: which object holds a version above the
@@ -89,7 +91,26 @@ type ObjectWrite struct {
 
 	// ResourceVersion is the store-wide cursor value the row now holds.
 	ResourceVersion int64
+
+	Group string
+	Kind  string
+	Op    WriteOp
+
+	// Final is the object as it was when collected, set on a WriteDelete entry
+	// and nil otherwise. A live row is read back from objects, so only a delete
+	// has nowhere else to put its state.
+	Final *RawObject
 }
+
+// WriteOp is what an ObjectWrite recorded. The soft delete is a WriteUpdate: the
+// row is still live and readable, so only collection is WriteDelete.
+type WriteOp int
+
+const (
+	WriteCreate WriteOp = 1
+	WriteUpdate WriteOp = 2
+	WriteDelete WriteOp = 3
+)
 
 // Condition is the untyped form of one condition row. Status is "True", "False"
 // or "Unknown". Liveness marks an in-process condition, valid only inside the
@@ -134,30 +155,35 @@ type EventQuery struct {
 
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON; the store never inspects them.
+// The json tags are a durable format, not decoration: a delete entry in the
+// object write log stores this struct as the row image a Deleted change reports.
+// Untagged, the on-disk keys would be Go field names, and renaming one would
+// change the format silently — json.Unmarshal leaves an unmatched field zero
+// rather than failing.
 type RawObject struct {
-	ID    ObjectID
-	Group string
-	Kind  string
+	ID    ObjectID `json:"id"`
+	Group string   `json:"group"`
+	Kind  string   `json:"kind"`
 	// Name is unique within its GroupKind and never empty on a returned row.
-	Name   string
-	Spec   []byte // JSON, user-owned
-	Status []byte // JSON, controller-owned; nil until first status write
+	Name   string `json:"name"`
+	Spec   []byte `json:"spec"`   // JSON, user-owned
+	Status []byte `json:"status"` // JSON, controller-owned; nil until first status write
 	// SpecVersion and StatusVersion are the migrator schema versions each blob
 	// was last written at. Persisted and returned, never interpreted.
-	SpecVersion         int
-	StatusVersion       int
-	Generation          int64
-	ObservedGeneration  *int64
-	ObservedAt          *time.Time
-	ResourceVersion     int64
-	DeletionRequestedAt *time.Time
+	SpecVersion         int        `json:"specVersion"`
+	StatusVersion       int        `json:"statusVersion"`
+	Generation          int64      `json:"generation"`
+	ObservedGeneration  *int64     `json:"observedGeneration,omitempty"`
+	ObservedAt          *time.Time `json:"observedAt,omitempty"`
+	ResourceVersion     int64      `json:"resourceVersion"`
+	DeletionRequestedAt *time.Time `json:"deletionRequestedAt,omitempty"`
 	// ReconcileOwed is the objects.reconcile_owed count; 0 means none. Store-
 	// owned: moved only by EdgesAdd's stamp and ReconcileOwedDecrement.
-	ReconcileOwed int64
-	Finalizers    []string
-	Conditions    []Condition // assembled on reads; nil when the object has none
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ReconcileOwed int64       `json:"reconcileOwed"`
+	Finalizers    []string    `json:"finalizers"`
+	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
+	CreatedAt     time.Time   `json:"createdAt"`
+	UpdatedAt     time.Time   `json:"updatedAt"`
 }
 
 // ReconcileLoad is everything one reconcile pass needs from its opening read.
@@ -363,6 +389,14 @@ type Store interface {
 	// empty, not ErrNotFound.
 	ObjectsListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
 
+	// ObjectsListByIDs returns the objects of kind gk whose ids are in ids,
+	// ordered by id — creation order, not the caller's order and not
+	// resource_version order. An id naming no object, or one of another kind, is
+	// absent: a short result is normal, not an error. Callers keep ids to a
+	// batch a backend can bind in one statement; the watch tail bounds it by its
+	// page cap.
+	ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
+
 	// ObjectsListIDs returns the ids of every object of kind gk, ordered by id.
 	ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
@@ -493,19 +527,52 @@ type Store interface {
 	// narrowing to registered targets would silently strand its dependents.
 	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
 
-	// ObjectWritesListSince returns the live writes above afterRV in cursor order,
-	// at most limit. No blobs, every kind. A row deleted since afterRV is
-	// simply absent — no tombstones. resource_version always increases and is
-	// never reused, so a watermark scan is lossless however stale.
-	ObjectWritesListSince(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
+	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
+	// unread and the caller must resync; equality is fine, since the next unread
+	// entry is trimmedThrough + 1.
+	//
+	// An implementation MUST read the page, the horizon and the delete entries'
+	// row images atomically — they describe one instant or they are wrong. Read
+	// apart, a retention sweep landing between them can report a horizon above
+	// entries the page already captured, which reads as unrecoverable loss for a
+	// stream that lost nothing, or delete a captured entry's image, leaving a
+	// WriteDelete with a nil Final that has no state to report.
+	//
+	// Every WriteDelete entry returned MUST carry a non-nil Final.
+	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
-	// ObjectWritesMaxVersion returns the high-water mark of the object write log:
-	// every committed object write is at or below it, and ObjectWritesListSince
-	// returns nothing above it. Maximum over live rows, not the counter, so it
-	// is NOT monotonic — a delete can lower it, which is exactly what a poller
-	// comparing for inequality wants to see, and writes to other logs sharing
-	// the counter (events) never move it.
-	ObjectWritesMaxVersion(ctx context.Context) (int64, error)
+	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for
+	// the dependency waker: an edge can point at a kind with no controller. It
+	// reports no horizon, because the waker's cursor is an optimisation over the
+	// stale-dependents pass rather than a guarantee.
+	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+
+	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at
+	// or below it, and ObjectWritesListSince returns nothing above it.
+	ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error)
+
+	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind. Not
+	// monotonic — a delete lowers it — so consumers compare for inequality.
+	ObjectWritesMaxVersionAll(ctx context.Context) (int64, error)
+
+	// ObjectWritesSnapshot returns every object of kind gk and the log position
+	// the listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what ObjectWritesMaxVersion reports.
+	ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error)
+
+	// ObjectWritesSnapshotByID is ObjectWritesSnapshot for one object: the row,
+	// or no rows when id does not exist or belongs to another kind, and gk's log
+	// position — the kind's, because the stream that follows tails the kind.
+	ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
+
+	// ObjectWritesSweep trims the write log to the retention bounds and returns
+	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
+	// its newest perKind entries; maxAge > 0 drops entries written more than
+	// maxAge ago. A zero bound is skipped. It raises each affected kind's
+	// horizon in the same transaction that deletes that kind's entries, so a
+	// resume is never accepted against a log with a hole in it.
+	ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
 }
 
 // FreePagesReleaser is an optional Store capability: a backend that can hand
