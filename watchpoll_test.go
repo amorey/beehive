@@ -251,13 +251,16 @@ type pollProbeStore struct {
 	// what changed rather than the whole kind.
 	byIDs chan []ObjectID
 	// tailed fires after the tail's own listing of the write log returns.
-	tailed     chan struct{}
-	listErr    atomic.Bool
-	listIDsErr atomic.Bool
-	getErr     atomic.Bool
-	eventsErr  atomic.Bool
-	markErr    atomic.Bool
-	metaErr    atomic.Bool
+	tailed chan struct{}
+	// forceTrimmed overrides the horizon the tail's listing reports, so a test
+	// can sit exactly on the boundary without staging real retention.
+	forceTrimmed atomic.Int64
+	listErr      atomic.Bool
+	listIDsErr   atomic.Bool
+	getErr       atomic.Bool
+	eventsErr    atomic.Bool
+	markErr      atomic.Bool
+	metaErr      atomic.Bool
 }
 
 func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
@@ -292,6 +295,9 @@ func (s *pollProbeStore) ObjectWritesListSince(ctx context.Context, gk GroupKind
 		return nil, 0, errBoom
 	}
 	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	if forced := s.forceTrimmed.Load(); forced > 0 {
+		trimmed = forced
+	}
 	probeSignal(s.tailed)
 	return page, trimmed, err
 }
@@ -1353,4 +1359,51 @@ func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	assert.Equal(t, second.ID, changes[0].Object.ID, "write order, not id order")
 	assert.Equal(t, first.ID, changes[1].Object.ID)
 	assert.Equal(t, "first3", changes[1].Object.Spec.Val, "current state, not a superseded one")
+}
+
+// Retention can trim past a live stream's cursor between ticks, and a tail that
+// just read an empty page would skip those changes silently — the exact failure
+// ErrWatchTooOld exists to prevent. The check rides the same read as the page.
+func TestTrimUnderALiveStreamEndsIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	snap, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+
+	// The horizon moves above where this stream is parked.
+	store.forceTrimmed.Store(snap.ResourceVersion + 1)
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Failed, ev.Type)
+	assert.ErrorIs(t, ev.Err, ErrWatchTooOld)
+	assert.Nil(t, ev.Object)
+	waitClosed(t, closedWhenDrained(ch), "the stream to close behind the failure")
+}
+
+// The boundary, and it is the common case rather than an edge one: a kind that
+// stops writing has its whole log age out, and the horizon converges onto exactly
+// the position every live tail is parked at. Testing <= there would tear down
+// every established watcher on every idle kind.
+func TestAQuietKindIsNotTornDownByATrim(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	snap, ch, err := client.ObjectsWatchList(ctx)
+	require.NoError(t, err)
+
+	// Trimmed through exactly where the tail sits: nothing it had not read is gone.
+	store.forceTrimmed.Store(snap.ResourceVersion)
+	_, err = client.UpdateByID(ctx, obj.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Modified, ev.Type)
+	assert.Equal(t, "b", ev.Object.Spec.Val)
 }

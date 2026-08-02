@@ -153,6 +153,12 @@ func (c *clientImpl[Spec, Status]) objectStream(
 		cursor := at
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
 			changes, err := c.poll(ctx, mig, &cursor)
+			if errors.Is(err, ErrWatchTooOld) {
+				// Terminal, unlike a transient read failure: the entries this
+				// stream had not read are gone, so it cannot continue truthfully.
+				sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: err})
+				return false
+			}
 			if err != nil {
 				return c.pollFailed(ctx, "watch", err)
 			}
@@ -196,9 +202,16 @@ func (c *clientImpl[Spec, Status]) poll(
 	if at <= *cursor {
 		return nil, nil
 	}
-	page, _, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, *cursor, tailPageCap)
+	page, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, *cursor, tailPageCap)
 	if err != nil {
 		return nil, err
+	}
+	// Strictly <: a cursor sitting exactly on the horizon has lost nothing, and a
+	// kind that stops writing converges onto exactly that. The check rides this
+	// read because retention can move between ticks.
+	if *cursor < trimmedThrough {
+		return nil, fmt.Errorf("%w: %s/%s trimmed through %d, stream was at %d",
+			ErrWatchTooOld, c.gk.Group, c.gk.Kind, trimmedThrough, *cursor)
 	}
 	if len(page) == 0 {
 		return nil, nil

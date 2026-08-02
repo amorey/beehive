@@ -30,6 +30,12 @@ import (
 // registered controller: there is no reconcile loop to schedule against.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
+// ErrWatchTooOld ends a watch whose unread log entries retention has already
+// removed. The stream cannot continue truthfully, so it reports this on a Failed
+// change and closes; the caller answers by subscribing again for a fresh
+// snapshot.
+var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
+
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
 // objects have no natural name:
 //
@@ -87,10 +93,14 @@ type Snapshot[Spec, Status any] struct {
 }
 
 // ObjectChange reports a change to a watched object. On a Deleted change,
-// Object carries the row's final state.
+// Object carries the row's final state. On a Failed change, Object is nil and
+// Err is non-nil: the stream is over, and a Failed change is always the last
+// value before the channel closes. A channel that closes with no Failed change
+// ended because the caller's context did.
 type ObjectChange[Spec, Status any] struct {
 	Type   ChangeType
 	Object *Object[Spec, Status]
+	Err    error
 }
 
 // Client is the user-facing API for a single resource kind: creating, reading,
