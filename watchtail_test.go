@@ -774,3 +774,50 @@ func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
 	assert.Equal(t, mine.ID, ev.Object.ID)
 	assert.Equal(t, "c", ev.Object.Spec.Val)
 }
+
+// A burst costs one relation query per drained batch, not one per object: the
+// subscriber drains what is pending before loading. A per-object load would make
+// every watch with relations an N+1.
+func TestWatchLoadsAreBatchedPerDrain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	const burst = 64
+
+	store := &countingLoadStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, ch, err := client.WatchList(ctx, WithLoads(LoadOwner()))
+	require.NoError(t, err)
+	store.relationReads.Store(0)
+
+	require.NoError(t, bh.store.Within(ctx, func(ctx context.Context) error {
+		for i := range burst {
+			if _, err := client.Create(ctx, fmt.Sprintf("load-%d", i), cSpec{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	for range burst {
+		ev := recv(t, ch)
+		_, _, err := ev.Object.Owner()
+		require.NoError(t, err, "the relation the watch asked for is loaded")
+	}
+	// How many drains the burst takes depends on when the subscriber wakes; what
+	// must not happen is one query per object.
+	assert.Less(t, store.relationReads.Load(), int64(burst))
+}
+
+// countingLoadStore counts the batched relation reads the eager loaders make.
+type countingLoadStore struct {
+	Store
+	relationReads atomic.Int64
+}
+
+func (s *countingLoadStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+	s.relationReads.Add(1)
+	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+}
