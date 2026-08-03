@@ -106,9 +106,12 @@ type ObjectListSnapshot[Spec, Status any] struct {
 // value before the channel closes. A channel that closes with no Failed change
 // ended because the caller's context did.
 type ObjectChange[Spec, Status any] struct {
-	Type   ChangeType
-	Object *Object[Spec, Status]
-	Err    error
+	Type ChangeType
+	// ResourceVersion is the log position this change was reported at, and what
+	// WithResumeFrom takes to continue from here. Zero on a Failed change.
+	ResourceVersion int64
+	Object          *Object[Spec, Status]
+	Err             error
 }
 
 // Client is the user-facing API for a single resource kind: creating, reading,

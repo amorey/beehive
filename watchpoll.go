@@ -116,7 +116,7 @@ func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchO
 	if err != nil {
 		return ObjectListSnapshot[Spec, Status]{}, nil, err
 	}
-	return c.objectStream(ctx, cfg, nil)
+	return c.tailStream(ctx, cfg, nil)
 }
 
 // Watch streams changes to the single object id, polling a one-row

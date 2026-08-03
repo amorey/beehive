@@ -158,12 +158,11 @@ func TestRawToTypedConversion(t *testing.T) {
 func TestListSkipsUndecodableRows(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
@@ -190,9 +189,8 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
@@ -231,21 +229,19 @@ func (errMarshaler) MarshalJSON() ([]byte, error) { return nil, errors.New("cann
 
 func TestClientCreateMarshalError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, "bad-marshal", errMarshaler{})
+	_, err := client.Create(ctx, "bad-marshal", errMarshaler{})
 	require.Error(t, err)
 }
 
 func TestClientUpdateMarshalError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
-	_, err = client.Update(ctx, 1, errMarshaler{})
+	_, err := client.Update(ctx, 1, errMarshaler{})
 	require.Error(t, err)
 }
 
@@ -253,8 +249,7 @@ func TestClientUpdateMarshalError(t *testing.T) {
 // per-call Option (before any store write), so a bad option fails fast.
 func TestClientCreateOptionError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	// An option that fails when applied to the create-options target.
 	badOpt := func(target any) error {
@@ -265,14 +260,13 @@ func TestClientCreateOptionError(t *testing.T) {
 	}
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, "bad-opt", cSpec{Val: "x"}, badOpt)
+	_, err := client.Create(ctx, "bad-opt", cSpec{Val: "x"}, badOpt)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestClientCreate(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, "hello-1", cSpec{Val: "hello"})
@@ -290,12 +284,11 @@ func TestClientCreate(t *testing.T) {
 // at the new signature.
 func TestClientCreateRejectsTakenName(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "taken", cSpec{Val: "first"})
 
-	_, err = client.Create(ctx, "taken", cSpec{Val: "second"})
+	_, err := client.Create(ctx, "taken", cSpec{Val: "second"})
 
 	require.ErrorIs(t, err, ErrNameTaken,
 		"a name already held fails rather than returning the existing row, and says so matchably")
@@ -306,8 +299,7 @@ func TestClientCreateRejectsTakenName(t *testing.T) {
 // the same error, or a delete-then-recreate looks like a different failure.
 func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -316,7 +308,7 @@ func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 	mustCreate(t, ctx, client, "doomed", cSpec{Val: "first"}, WithFinalizers("test/hold"))
 	require.NoError(t, client.DeleteByName(ctx, "doomed"))
 
-	_, err = client.Create(ctx, "doomed", cSpec{Val: "second"})
+	_, err := client.Create(ctx, "doomed", cSpec{Val: "second"})
 
 	require.ErrorIs(t, err, ErrNameTaken, "a deletion-pending row still holds its name")
 }
@@ -329,8 +321,7 @@ func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 // validate names".
 func TestClientRejectsEmptyName(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	t.Run("Create", func(t *testing.T) {
@@ -364,14 +355,13 @@ func TestClientRejectsEmptyName(t *testing.T) {
 // stays hidden until a cold start or a GC sweep removes the row.
 func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// An unmarshalable spec would also fail this call — assert the name is checked
 	// first, so the caller hears about the argument they actually got wrong.
 	bad := NewClient[errMarshaler, cStatus](bh, clientTestGK)
-	_, err = bad.Create(ctx, "", errMarshaler{})
+	_, err := bad.Create(ctx, "", errMarshaler{})
 	require.ErrorIs(t, err, ErrInvalidName)
 
 	after, err := client.List(ctx)
@@ -384,8 +374,7 @@ func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 // interesting property is that they address different things.
 func TestClientCRUDIsIDKeyedWithByNameSiblings(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "a"})
@@ -417,11 +406,10 @@ func TestClientCRUDIsIDKeyedWithByNameSiblings(t *testing.T) {
 // *owner*.
 func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.Create(ctx, "unclearable", cSpec{Val: "a"}, WithFinalizers("cleanup"))
+	_, err := client.Create(ctx, "unclearable", cSpec{Val: "a"}, WithFinalizers("cleanup"))
 
 	require.ErrorIs(t, err, ErrInvalidOption)
 	assert.Contains(t, err.Error(), "WithFinalizers")
@@ -436,8 +424,7 @@ func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 // happens before the name lookup.
 func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"}, WithFinalizers("cleanup"))
@@ -452,10 +439,9 @@ func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 // exists and strand the first time it does not.
 func TestClientGetOrCreateRejectsFinalizersOnTheFoundBranch(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, "w1", cSpec{Val: "a"})
+	_, err := client.Create(ctx, "w1", cSpec{Val: "a"})
 	require.NoError(t, err, "the row exists, so the create branch is not reached")
 
 	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "b"}, WithFinalizers("cleanup"))
@@ -469,8 +455,7 @@ func TestClientGetOrCreateRejectsFinalizersOnTheFoundBranch(t *testing.T) {
 // the finalizer makes one uncollectable.
 func TestClientCreateWithoutFinalizersAllowsUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj, err := client.Create(ctx, "owned", cSpec{Val: "a"})
@@ -482,8 +467,7 @@ func TestClientCreateWithoutFinalizersAllowsUnregisteredKind(t *testing.T) {
 func TestClientCreateWithOptions(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -514,13 +498,12 @@ func TestClientCreateWithOptions(t *testing.T) {
 
 func TestClientCreateOwnerRefError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	// The owner must exist: the ref's foreign key rejects a dangling owner, and
 	// Within rolls the half-made child back with it.
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Create(ctx, "orphan", cSpec{Val: "child"}, WithOwner(9999))
+	_, err := client.Create(ctx, "orphan", cSpec{Val: "child"}, WithOwner(9999))
 	require.Error(t, err)
 
 	objs, err := client.List(ctx)
@@ -530,8 +513,7 @@ func TestClientCreateOwnerRefError(t *testing.T) {
 
 func TestClientGet(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -545,18 +527,16 @@ func TestClientGet(t *testing.T) {
 
 func TestClientGetAbsentName(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.GetByName(ctx, "nonexistent")
+	_, err := client.GetByName(ctx, "nonexistent")
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestClientList(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -571,8 +551,7 @@ func TestClientList(t *testing.T) {
 
 func TestClientUpdate(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
@@ -586,8 +565,7 @@ func TestClientUpdate(t *testing.T) {
 
 func TestClientGetOrCreateCreates(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -605,8 +583,7 @@ func TestClientGetOrCreateCreates(t *testing.T) {
 
 func TestClientGetOrCreateReturnsExisting(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	first, _, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -623,8 +600,7 @@ func TestClientGetOrCreateReturnsExisting(t *testing.T) {
 
 func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -647,9 +623,8 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -684,8 +659,7 @@ func (badDecodeSpec) MarshalJSON() ([]byte, error) { return []byte(`"not-an-obje
 func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "BadDecode"}
 	client := NewClient[badDecodeSpec, cStatus](bh, gk)
 
@@ -710,10 +684,9 @@ func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 func TestClientCreateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "BadDecode"}
-	_, err = Register(bh, gk, &noopController[badDecodeSpec, cStatus]{})
+	_, err := Register(bh, gk, &noopController[badDecodeSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(gk)
 	require.True(t, ok)
@@ -750,10 +723,9 @@ func (s conditionalBadSpec) MarshalJSON() ([]byte, error) {
 func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "CondBad"}
-	_, err = Register(bh, gk, &noopController[conditionalBadSpec, cStatus]{})
+	_, err := Register(bh, gk, &noopController[conditionalBadSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(gk)
 	require.True(t, ok)
@@ -778,8 +750,7 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 // returns an existing row.
 func TestClientWithOnCreateFiresOnlyOnCreate(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	var calls int
@@ -927,9 +898,8 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -991,8 +961,7 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 func TestClientGetOrCreateWithOwner(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -1009,8 +978,7 @@ func TestClientGetOrCreateWithOwner(t *testing.T) {
 
 func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1027,8 +995,7 @@ func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 
 func TestClientGetOrCreateMarshalError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, created, err := client.GetOrCreate(ctx, "w1", errMarshaler{})
@@ -1038,8 +1005,7 @@ func TestClientGetOrCreateMarshalError(t *testing.T) {
 
 func TestClientGetOrCreateStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&nameErrorStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &nameErrorStore{})
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -1049,8 +1015,7 @@ func TestClientGetOrCreateStoreError(t *testing.T) {
 
 func TestClientGetOrCreateOptionError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	badOpt := func(any) error { return errBoom }
 
@@ -1062,8 +1027,7 @@ func TestClientGetOrCreateOptionError(t *testing.T) {
 
 func TestClientGetOrCreateCreateError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&createErrorStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &createErrorStore{})
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -1073,8 +1037,7 @@ func TestClientGetOrCreateCreateError(t *testing.T) {
 
 func TestClientGetOrCreateRawToTypedError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&getOrCreateBadJSONStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &getOrCreateBadJSONStore{})
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -1087,11 +1050,10 @@ func TestClientGetOrCreateRawToTypedError(t *testing.T) {
 
 func TestClientGetNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, err = client.Get(ctx, 999)
+	_, err := client.Get(ctx, 999)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -1112,23 +1074,21 @@ func TestClientWatchNonExistentID(t *testing.T) {
 
 func TestClientDeleteNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	err = client.Delete(ctx, 999)
+	err := client.Delete(ctx, 999)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestClientDelete(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 
-	err = client.Delete(ctx, created.ID)
+	err := client.Delete(ctx, created.ID)
 	require.NoError(t, err)
 
 	// object still present (no finalizers cleared), but marked for deletion. The
@@ -1141,8 +1101,7 @@ func TestClientDelete(t *testing.T) {
 
 func TestClientDeleteByName(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
@@ -1158,8 +1117,7 @@ func TestClientDeleteByName(t *testing.T) {
 
 func TestClientDeleteByNameNotFoundIsNil(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	assert.NoError(t, client.DeleteByName(ctx, "never-created"))
@@ -1167,8 +1125,7 @@ func TestClientDeleteByNameNotFoundIsNil(t *testing.T) {
 
 func TestClientDeleteByNameIdempotent(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
@@ -1181,8 +1138,7 @@ func TestClientDeleteByNameIdempotent(t *testing.T) {
 // as a pure no-op: no error, and no second state change for watchers to see.
 func TestClientDeleteAlreadyDeleting(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1211,9 +1167,8 @@ func TestClientDeleteAlreadyDeleting(t *testing.T) {
 func TestClientDeleteMarksForCollection(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1235,8 +1190,7 @@ func TestClientDeleteMarksForCollection(t *testing.T) {
 // Delete reports success (nothing of this kind to delete) and leaves it be.
 func TestClientDeleteKindScoped(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
@@ -1252,8 +1206,7 @@ func TestClientDeleteKindScoped(t *testing.T) {
 
 func TestClientDeleteStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&requestDeletionByNameErrorStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &requestDeletionByNameErrorStore{})
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	require.ErrorIs(t, client.DeleteByName(ctx, "w1"), errBoom)
@@ -1265,8 +1218,7 @@ func TestClientDeleteStoreError(t *testing.T) {
 // left untouched, never updated or marked for deletion through the wrong client.
 func TestClientIDOpsScopedToKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
@@ -1274,7 +1226,7 @@ func TestClientIDOpsScopedToKind(t *testing.T) {
 	w := mustCreate(t, ctx, widgets, uniqueName(), cSpec{Val: "v1"})
 
 	// The Gadget client must not see or mutate the Widget by its id.
-	_, err = gadgets.Get(ctx, w.ID)
+	_, err := gadgets.Get(ctx, w.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = gadgets.Update(ctx, w.ID, cSpec{Val: "hijacked"})
 	require.ErrorIs(t, err, ErrNotFound)
@@ -1391,43 +1343,38 @@ func (s *badJSONStore) ObjectsList(_ context.Context, _ GroupKind) ([]*RawObject
 }
 
 func TestClientCreateStoreError(t *testing.T) {
-	bh, err := New(&errorObjectsCreateStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &errorObjectsCreateStore{})
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.Create(context.Background(), "closed-a", tSpec{})
+	_, err := client.Create(context.Background(), "closed-a", tSpec{})
 	require.Error(t, err)
 }
 
 func TestClientCreateRawToTypedError(t *testing.T) {
-	bh, err := New(&createBadJSONStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &createBadJSONStore{})
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.Create(context.Background(), "closed-b", tSpec{})
+	_, err := client.Create(context.Background(), "closed-b", tSpec{})
 	require.Error(t, err)
 }
 
 func TestClientUpdateStoreError(t *testing.T) {
-	bh, err := New(&errorUpdateSpecStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &errorUpdateSpecStore{})
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.Update(context.Background(), 1, tSpec{})
+	_, err := client.Update(context.Background(), 1, tSpec{})
 	require.Error(t, err)
 }
 
 func TestClientUpdateRawToTypedError(t *testing.T) {
-	bh, err := New(&updateBadJSONStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &updateBadJSONStore{})
 	client := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
-	_, err = client.Update(context.Background(), 1, tSpec{})
+	_, err := client.Update(context.Background(), 1, tSpec{})
 	require.Error(t, err)
 }
 
 func TestClientListStoreError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&errorListObjectsStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &errorListObjectsStore{})
 	client := NewClient[tSpec, tStatus](bh, gk)
-	_, err = client.List(context.Background())
+	_, err := client.List(context.Background())
 	require.Error(t, err)
 }
 
@@ -1436,8 +1383,7 @@ func TestClientListStoreError(t *testing.T) {
 // whose Spec is invalid JSON, so List returns no error and an empty result.
 func TestClientListRawToTypedError(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
-	bh, err := New(&badJSONStore{gk: gk})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &badJSONStore{gk: gk})
 	client := NewClient[tSpec, tStatus](bh, gk)
 	objs, err := client.List(context.Background())
 	require.NoError(t, err, "a poison row is skipped, not fatal")
@@ -1489,9 +1435,8 @@ func assertChanClosed[T any](t *testing.T, ch <-chan T) {
 // single-proc race build.
 func watchTestClient(t *testing.T) (context.Context, Client[cSpec, cStatus]) {
 	t.Helper()
-	bh, err := New(newClientTestStore(t), fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	// Registered after the store's own close, so it runs before it: the streams
 	// are cancelled first, and none of them sees the closed store at all.
@@ -1732,9 +1677,8 @@ func TestWatchInitialSnapshot(t *testing.T) {
 // control plane.
 func TestStartAfterStopErrors(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1754,8 +1698,7 @@ func TestStartAfterStopErrors(t *testing.T) {
 func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
@@ -1772,8 +1715,7 @@ func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 func TestClientGetOwner(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -1807,8 +1749,7 @@ func TestClientGetOwner(t *testing.T) {
 func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -1828,8 +1769,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 func TestClientListDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -1858,8 +1798,7 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 func TestClientListOwned(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -1883,8 +1822,7 @@ func TestClientListOwned(t *testing.T) {
 func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus], Client[cSpec, cStatus], ObjectID, []*Object[cSpec, cStatus]) {
 	t.Helper()
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	// One consumer of this fixture creates a child WithFinalizers, which is legal
 	// only on a registered kind.
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1983,11 +1921,10 @@ func (*ownedObjectsErrorStore) ObjectsListByIncomingEdge(context.Context, GroupK
 
 func TestClientListOwnedObjectsStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&ownedObjectsErrorStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &ownedObjectsErrorStore{})
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.OwnedObjectsList(ctx, 1)
+	_, err := client.OwnedObjectsList(ctx, 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -2007,8 +1944,7 @@ func (s *ownedObjectsBadJSONStore) ObjectsListByIncomingEdge(context.Context, Gr
 
 func TestClientListOwnedObjectsQuarantinesUndecodable(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&ownedObjectsBadJSONStore{gk: clientTestGK})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &ownedObjectsBadJSONStore{gk: clientTestGK})
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	got, err := client.OwnedObjectsList(ctx, 1)
@@ -2034,19 +1970,17 @@ func (*ownedObjectsLoadErrorStore) EdgesGroupOutgoingByID(context.Context, []Obj
 
 func TestClientListOwnedObjectsLoadError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&ownedObjectsLoadErrorStore{gk: clientTestGK})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &ownedObjectsLoadErrorStore{gk: clientTestGK})
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.OwnedObjectsList(ctx, 1, LoadOwner())
+	_, err := client.OwnedObjectsList(ctx, 1, LoadOwner())
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestClientGetWithLoadOwner(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -2097,8 +2031,7 @@ func (s *countingStore) EdgesGroupIncomingByID(ctx context.Context, ids []Object
 func TestClientListWithLoadOwnerBatches(t *testing.T) {
 	ctx := context.Background()
 	store := &countingStore{Store: newClientTestStore(t)}
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -2126,8 +2059,7 @@ func TestClientListWithLoadOwnerBatches(t *testing.T) {
 func TestClientLoadsOwned(t *testing.T) {
 	ctx := context.Background()
 	store := &countingStore{Store: newClientTestStore(t)}
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -2175,8 +2107,7 @@ func TestClientLoadsOwned(t *testing.T) {
 func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -2202,8 +2133,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
 	store := &countingStore{Store: newClientTestStore(t)}
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -2250,8 +2180,7 @@ func (edgeErrorStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relati
 func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	ctx := context.Background()
 	store := &edgeErrorStore{Store: newClientTestStore(t)}
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj := mustCreate(t, ctx, client, "x1", cSpec{Val: "x"})
@@ -2262,7 +2191,7 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 		_, err := client.Get(ctx, obj.ID, l)
 		require.ErrorIs(t, err, errBoom)
 	}
-	_, err = client.GetByName(ctx, "x1", LoadOwner())
+	_, err := client.GetByName(ctx, "x1", LoadOwner())
 	require.ErrorIs(t, err, errBoom)
 
 	// Batched path: each relation's store error surfaces through List.
@@ -2274,8 +2203,7 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 
 func TestClientLazyRefsMissingIDReadsEmpty(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// The lazy lookups drop the scopedGet kind guard for speed, so a missing id
@@ -2307,11 +2235,10 @@ func (s *getBadJSONStore) ObjectsGetByName(context.Context, GroupKind, string) (
 
 func TestGetDecodeError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(&getBadJSONStore{gk: clientTestGK})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &getBadJSONStore{gk: clientTestGK})
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.Get(ctx, 1)
+	_, err := client.Get(ctx, 1)
 	require.Error(t, err)
 	_, err = client.GetByName(ctx, "any")
 	require.Error(t, err)
@@ -2321,11 +2248,10 @@ func TestGetDecodeError(t *testing.T) {
 // for an id that does not exist, before reaching any reconciler.
 func TestClientRequeueNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	err = client.Requeue(ctx, 999)
+	err := client.Requeue(ctx, 999)
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -2334,13 +2260,12 @@ func TestClientRequeueNotFound(t *testing.T) {
 // registered to enqueue it on.
 func TestClientRequeueNoController(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	err = client.Requeue(ctx, obj.ID)
+	err := client.Requeue(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
 }
 
@@ -2394,9 +2319,8 @@ func TestClientRequeue(t *testing.T) {
 // rather than ErrNotFound.
 func TestClientGetScheduleUnknownID(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2409,9 +2333,8 @@ func TestClientGetScheduleUnknownID(t *testing.T) {
 // the pending delayed reconcile's fire time in NextRequeueAt.
 func TestClientGetScheduleScheduled(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2432,9 +2355,8 @@ func TestClientGetScheduleScheduled(t *testing.T) {
 // Schedule (and no error) when nothing is scheduled for the id.
 func TestClientGetScheduleUnscheduled(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2453,8 +2375,7 @@ func TestClientGetScheduleUnscheduled(t *testing.T) {
 // degrading gracefully rather than erroring like the SchedulesWatch live stream.
 func TestClientGetScheduleNoController(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2470,9 +2391,8 @@ func TestClientGetScheduleNoController(t *testing.T) {
 func TestClientWatchScheduleSnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2497,9 +2417,8 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 func TestClientWatchScheduleLive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t), fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2540,13 +2459,12 @@ func TestClientWatchScheduleLive(t *testing.T) {
 func TestClientWatchScheduleNoController(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	_, err = client.SchedulesWatch(ctx, obj.ID)
+	_, err := client.SchedulesWatch(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController)
 }
 
@@ -2570,9 +2488,8 @@ func (eventErrStore) EventsSweep(context.Context, int, time.Duration) (int, erro
 // propagates to the caller.
 func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(eventErrStore{newClientTestStore(t)})
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, eventErrStore{newClientTestStore(t)})
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2592,8 +2509,7 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 func TestClientListEventsEmpty(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
@@ -2608,8 +2524,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 func TestEventsConnectionPanelTimeline(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2674,11 +2589,10 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 func TestClientGetLoadsEvents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
-	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	plain, err := client.Get(ctx, obj.ID)
@@ -2699,13 +2613,12 @@ func TestClientGetLoadsEvents(t *testing.T) {
 func TestClientListLoadsEvents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
-	_, err = store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	_, err := store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
 	_, err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
 	require.NoError(t, err)
@@ -2728,8 +2641,7 @@ func TestClientListLoadsEvents(t *testing.T) {
 func TestClientListEvents(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
@@ -2759,12 +2671,11 @@ func TestClientListEvents(t *testing.T) {
 func TestClientGetLatestEvent(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	got, ok, err := client.EventsGetLatest(ctx, obj.ID, "connection")
@@ -2783,9 +2694,8 @@ func TestClientWatchEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2845,8 +2755,7 @@ func TestEventFromRaw(t *testing.T) {
 // set, letting a caller read and delete by name but forcing an id to write.
 func TestClientUpdateIsIDKeyedWithByNameSibling(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
 
@@ -2865,11 +2774,10 @@ func TestClientUpdateIsIDKeyedWithByNameSibling(t *testing.T) {
 // nothing to write the spec onto — so Update reports absence both ways.
 func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	_, err = client.UpdateByName(ctx, "no-such-name", cSpec{Val: "v1"})
+	_, err := client.UpdateByName(ctx, "no-such-name", cSpec{Val: "v1"})
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -2878,13 +2786,12 @@ func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {
 func TestClientUpdateIsKindScoped(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
 	w := mustCreate(t, ctx, widgets, "shared", cSpec{Val: "widget"})
 
-	_, err = gadgets.UpdateByName(ctx, "shared", cSpec{Val: "gadget"})
+	_, err := gadgets.UpdateByName(ctx, "shared", cSpec{Val: "gadget"})
 	require.ErrorIs(t, err, ErrNotFound, "another kind's row holding the same name is not this client's to write")
 
 	unchanged, err := widgets.Get(ctx, w.ID)
@@ -2904,8 +2811,7 @@ func TestClientUpdateIsKindScoped(t *testing.T) {
 // either mutator would pass everything else in the suite.
 func TestClientNameKeyedWritesFollowTheNameAcrossARecreate(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	first := mustCreate(t, ctx, client, "prod", cSpec{Val: "first"})
@@ -2965,13 +2871,12 @@ func (s *resolveProbeStore) ObjectsGetByName(ctx context.Context, gk GroupKind, 
 func TestClientUpdateDoesNotResolveTheNameSeparately(t *testing.T) {
 	ctx := context.Background()
 	probe := &resolveProbeStore{Store: newClientTestStore(t)}
-	bh, err := New(probe)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, probe)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
 	probe.resolved.Store(false)
 
-	_, err = client.UpdateByName(ctx, "prod", cSpec{Val: "v2"})
+	_, err := client.UpdateByName(ctx, "prod", cSpec{Val: "v2"})
 	require.NoError(t, err)
 
 	assert.False(t, probe.resolved.Load(),
@@ -2985,8 +2890,7 @@ func TestClientUpdateDoesNotResolveTheNameSeparately(t *testing.T) {
 // far likelier than luck running out.
 func TestGenerateNameRetryLoopSurvivesACollision(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// Something already holds the name the generator is about to produce.
@@ -3023,8 +2927,7 @@ func TestGenerateNameRetryLoopSurvivesACollision(t *testing.T) {
 // The README/godoc example, compiled so it cannot drift into not building.
 func TestGenerateNameDocExampleCompiles(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj, err := client.Create(ctx, GenerateName("cache"), cSpec{Val: "v"})
@@ -3094,8 +2997,7 @@ func TestGenerateNamePanicsRatherThanReturningTheNilUUID(t *testing.T) {
 // the object, not that some pass later found it.
 func specWriteFixture(t *testing.T) (Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
 	t.Helper()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)
@@ -3205,8 +3107,7 @@ func TestSpecWriteEnqueuesNothingOnRollback(t *testing.T) {
 // nothing and the write succeeds, rather than erroring or panicking.
 func TestSpecWriteOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	clientOnly := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "NoController"})
 
 	obj, err := clientOnly.Create(ctx, uniqueName(), cSpec{Val: "a"})
@@ -3282,10 +3183,9 @@ func TestFailingRespecControllerKeepsItsBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withoutGCSweeper())
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), withoutGCSweeper())
 	ctrl := &respecController{first: newSignal(), hot: newSignal()}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	ctrl.client = client

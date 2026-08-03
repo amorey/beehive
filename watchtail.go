@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -266,7 +267,7 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	changes, err := t.collect(ctx, page)
+	changes, err := collectChanges(ctx, t.bh, t.gk, page)
 	if err != nil {
 		return 0, err
 	}
@@ -279,9 +280,10 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 	return len(page), nil
 }
 
-// collect coalesces a log page to the last entry per object and reads the
-// current state of everything still live, in one batch.
-func (t *objectTailer) collect(ctx context.Context, page []ObjectWrite) ([]rawChange, error) {
+// collectChanges coalesces a log page to the last entry per object and reads the
+// current state of everything still live, in one batch. Shared by the tailer and
+// by a resume's replay.
+func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []ObjectWrite) ([]rawChange, error) {
 	// The page arrives ascending and resource_version is the log's primary key,
 	// so keeping the entry that matches each id's highest version preserves write
 	// order without a sort.
@@ -312,7 +314,7 @@ func (t *objectTailer) collect(ctx context.Context, page []ObjectWrite) ([]rawCh
 			live = append(live, w.ID)
 		}
 	}
-	rows, err := t.bh.store.ObjectsListByIDs(ctx, t.gk, live)
+	rows, err := bh.store.ObjectsListByIDs(ctx, gk, live)
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +336,8 @@ func (t *objectTailer) collect(ctx context.Context, page []ObjectWrite) ([]rawCh
 		if raw == nil {
 			// A delete entry with no row image. The store contract forbids this,
 			// but Store is a public extension point.
-			t.bh.log().Warn("watch tail dropped a change", "kind", t.gk.Kind, "id", w.ID, "err", errNoRowImage)
+			bh.log().Warn("beehive: skipping undecodable object",
+				"op", "Watch", "group", gk.Group, "kind", gk.Kind, "id", w.ID, "err", errNoRowImage)
 			continue
 		}
 		op := w.Op
@@ -349,4 +352,257 @@ func (t *objectTailer) collect(ctx context.Context, page []ObjectWrite) ([]rawCh
 		})
 	}
 	return changes, nil
+}
+
+// tailStream is a watch on the shared tail: it registers a fan-out receiver,
+// takes its own snapshot (or replays a resume's gap), and then delivers what the
+// tailer publishes above that position.
+//
+// Registration comes BEFORE the snapshot — conflate has no replay, so a change
+// published in between must already have a receiver to land in. The floor is
+// what makes that safe: resource_version is one log-wide sequence and the
+// snapshot is a consistent cut at it, so "at or below the floor" means "already
+// in the snapshot", for every key.
+func (c *clientImpl[Spec, Status]) tailStream(
+	ctx context.Context,
+	cfg watchConfig,
+	only *ObjectID,
+) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+	var empty ObjectListSnapshot[Spec, Status]
+	tailer, err := c.bh.tailerFor(ctx, c.gk)
+	if err != nil {
+		return empty, nil, fmt.Errorf("beehive: watch on %s/%s: %w", c.gk.Group, c.gk.Kind, err)
+	}
+
+	var opts []conflate.ReceiverOption[ObjectID, rawChange]
+	if only != nil {
+		// Bounds this subscriber's memory to one key.
+		opts = append(opts, tailer.hub.WithKeyFilter(func(k ObjectID) bool { return k == *only }))
+	}
+	rx := tailer.hub.Receiver(opts...)
+
+	mig := c.bh.migratorFor(c.gk) // invariant for the stream's lifetime
+
+	var snap ObjectListSnapshot[Spec, Status]
+	// floor is what the caller already holds; deliveries at or below it are
+	// dropped. A resume raises it as the replay advances.
+	var floor int64
+	if cfg.resumeFrom != nil {
+		// A resume reads no state. It only proves the position is still inside
+		// the log, which is the one failure the caller can act on; the gap
+		// itself is replayed on the stream's goroutine.
+		if err := c.resumable(ctx, *cfg.resumeFrom); err != nil {
+			rx.Close()
+			return empty, nil, err
+		}
+		snap.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
+	} else {
+		raws, at, err := c.snapshot(ctx, only)
+		if err != nil {
+			rx.Close()
+			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+				c.gk.Group, c.gk.Kind, err)
+		}
+		snap.ResourceVersion, floor = at, at
+		snap.Objects = c.decodeList(raws, "Watch")
+		if err := c.loadListRelated(ctx, snap.Objects, cfg.loads); err != nil {
+			rx.Close()
+			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+				c.gk.Group, c.gk.Kind, err)
+		}
+	}
+
+	out := make(chan ObjectChange[Spec, Status])
+	go func() {
+		defer close(out)
+		defer rx.Close()
+		if cfg.resumeFrom != nil {
+			at, ok := c.replay(ctx, mig, cfg, only, floor, out)
+			if !ok {
+				return
+			}
+			floor = at
+		}
+		c.consume(ctx, tailer, rx, mig, cfg, floor, out)
+	}()
+	return snap, out, nil
+}
+
+// consume delivers what the tailer publishes above floor until ctx ends or the
+// fan-out closes.
+func (c *clientImpl[Spec, Status]) consume(
+	ctx context.Context,
+	tailer *objectTailer,
+	rx *conflate.Receiver[ObjectID, rawChange],
+	mig Migrator,
+	cfg watchConfig,
+	floor int64,
+	out chan<- ObjectChange[Spec, Status],
+) {
+	for {
+		ev, err := rx.RecvContext(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// The fan-out closed. A tailer that ended below the retention
+			// horizon cannot continue truthfully, and says so; one that ended
+			// with the beehive just closes the stream.
+			if failure := tailer.failure(); failure != nil {
+				sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: failure})
+			}
+			return
+		}
+		// Drain what is already pending before loading relations, so a burst
+		// costs one relation query rather than one per object.
+		batch := []rawChange{ev.Value}
+		for {
+			next, err := rx.TryRecv()
+			if err != nil {
+				break
+			}
+			batch = append(batch, next.Value)
+		}
+		changes, ok := c.decodeBatch(ctx, batch, mig, cfg, floor)
+		if !ok {
+			return // ctx ended while retrying a failed relation load
+		}
+		for _, ch := range changes {
+			if !sendOrDone(ctx, out, ch) {
+				return
+			}
+		}
+	}
+}
+
+// decodeBatch is decodeChanges with the relation load retried rather than
+// skipped: the tailer's cursor has already moved past these entries, so there is
+// no later tick that would bring them back. It reports false only when ctx ended.
+func (c *clientImpl[Spec, Status]) decodeBatch(
+	ctx context.Context,
+	batch []rawChange,
+	mig Migrator,
+	cfg watchConfig,
+	floor int64,
+) ([]ObjectChange[Spec, Status], bool) {
+	retry := watchRetryBase
+	for {
+		changes, err := c.decodeChanges(ctx, batch, mig, cfg, floor)
+		if err == nil {
+			return changes, true
+		}
+		c.bh.log().WarnContext(ctx, "beehive: watch relation load failed; retrying",
+			"group", c.gk.Group, "kind", c.gk.Kind, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(min(retry, c.bh.watchFloorInterval)):
+		}
+		retry *= 2
+	}
+}
+
+// decodeChanges turns raw changes into typed ones, dropping what the caller's
+// snapshot already carried and quarantining what will not decode.
+func (c *clientImpl[Spec, Status]) decodeChanges(
+	ctx context.Context,
+	batch []rawChange,
+	mig Migrator,
+	cfg watchConfig,
+	floor int64,
+) ([]ObjectChange[Spec, Status], error) {
+	changes := make([]ObjectChange[Spec, Status], 0, len(batch))
+	// Deleted objects have no relations to load: the edges went with the row.
+	loaded := make([]*Object[Spec, Status], 0, len(batch))
+	for _, raw := range batch {
+		if raw.ResourceVersion <= floor {
+			continue
+		}
+		obj, err := rawToTyped[Spec, Status](raw.Object, mig)
+		if err != nil {
+			// Quarantine: one bad row must not kill a live watcher.
+			c.warnUndecodable("Watch", raw.ID, err)
+			continue
+		}
+		changes = append(changes, ObjectChange[Spec, Status]{
+			Type:            changeType(raw.Op),
+			ResourceVersion: raw.ResourceVersion,
+			Object:          obj,
+		})
+		if raw.Op != WriteDelete {
+			loaded = append(loaded, obj)
+		}
+	}
+	if err := c.loadListRelated(ctx, loaded, cfg.loads); err != nil {
+		return nil, err
+	}
+	return changes, nil
+}
+
+// replay delivers the gap between a resume's position and the tail, in pages —
+// with a day of retention the gap can far exceed one page. It returns the
+// position reached, or false when the stream is over.
+func (c *clientImpl[Spec, Status]) replay(
+	ctx context.Context,
+	mig Migrator,
+	cfg watchConfig,
+	only *ObjectID,
+	from int64,
+	out chan<- ObjectChange[Spec, Status],
+) (int64, bool) {
+	cursor := from
+	retry := watchRetryBase
+	for {
+		page, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, cursor, tailPageCap)
+		if err != nil {
+			// A transient read costs a retry, not the stream — the cursor has
+			// not moved, so nothing is lost.
+			if ctx.Err() != nil {
+				return 0, false
+			}
+			c.bh.log().WarnContext(ctx, "beehive: watch resume read failed; retrying",
+				"group", c.gk.Group, "kind", c.gk.Kind, "err", err)
+			select {
+			case <-ctx.Done():
+				return 0, false
+			case <-time.After(min(retry, c.bh.watchFloorInterval)):
+			}
+			retry *= 2
+			continue
+		}
+		retry = watchRetryBase
+		// Strictly <: a cursor sitting exactly on the horizon has lost nothing.
+		// Retention can overtake a replay that is still paging.
+		if cursor < trimmedThrough {
+			sendOrDone(ctx, out, ObjectChange[Spec, Status]{
+				Type: Failed,
+				Err: fmt.Errorf("%w: %s/%s trimmed through %d, resume was at %d",
+					ErrWatchTooOld, c.gk.Group, c.gk.Kind, trimmedThrough, cursor),
+			})
+			return 0, false
+		}
+		if len(page) == 0 {
+			return cursor, true
+		}
+		raws, err := collectChanges(ctx, c.bh, c.gk, page)
+		if err != nil {
+			continue // same retry path as the listing above
+		}
+		if only != nil {
+			raws = slices.DeleteFunc(raws, func(r rawChange) bool { return r.ID != *only })
+		}
+		changes, ok := c.decodeBatch(ctx, raws, mig, cfg, cursor)
+		if !ok {
+			return 0, false
+		}
+		for _, ch := range changes {
+			if !sendOrDone(ctx, out, ch) {
+				return 0, false
+			}
+		}
+		cursor = page[len(page)-1].ResourceVersion
+		if len(page) < tailPageCap {
+			return cursor, true
+		}
+	}
 }

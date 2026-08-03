@@ -51,9 +51,8 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 
 	store := &flakyListStore{Store: newClientTestStore(t)}
 	logger, buf := captureLogger(slog.LevelWarn)
-	bh, err := New(store, fast(WithLogger(logger))...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store, fast(WithLogger(logger))...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -73,7 +72,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	ev := recv(t, ch)
 	assert.Equal(t, Modified, ev.Type, "the stream survives the failed polls and reports the change")
 	assert.Equal(t, "b", ev.Object.Spec.Val)
-	assert.Contains(t, buf.String(), "watch poll failed", "the skipped polls are reported")
+	assert.Contains(t, buf.String(), "watch tail step failed", "the skipped reads are reported")
 }
 
 // An object that has not changed since it was reported emits nothing. This is
@@ -85,9 +84,8 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 	defer cancel()
 
 	store := newClientTestStore(t)
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -117,9 +115,8 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 	defer cancel()
 
 	store := newClientTestStore(t)
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -146,9 +143,8 @@ func TestWatchSingleObjectIsKindScoped(t *testing.T) {
 	defer cancel()
 
 	store := newClientTestStore(t)
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	other := GroupKind{Kind: "Other"}
 	_, err = Register(bh, other, &noopController[cSpec, cStatus]{})
@@ -385,8 +381,7 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 		byIDs:        make(chan []ObjectID, 256),
 		tailed:       make(chan struct{}, 256),
 	}
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, fast()...)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
@@ -455,7 +450,7 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 	assert.Equal(t, "b", recv(t, ch).Object.Spec.Val)
-	assert.Contains(t, buf.String(), "watch poll failed")
+	assert.Contains(t, buf.String(), "watch tail step failed")
 }
 
 // A watch over an empty kind reports nothing and reads almost nothing: with no
@@ -836,9 +831,8 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Hour))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -938,8 +932,7 @@ func TestWatchPollFallsBackToTheDefault(t *testing.T) {
 	assert.Equal(t, defaultWatchPollInterval, (&Beehive{}).watchPoll(),
 		"an unset interval reads as the default rather than as disabled")
 
-	bh, err := New(&fakeStore{}, withWatchPollInterval(fastTick))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, withWatchPollInterval(fastTick))
 	assert.Equal(t, fastTick, bh.watchPoll(), "a configured interval is used as given")
 }
 
@@ -973,9 +966,8 @@ func TestSendOrDoneReportsACancelledSend(t *testing.T) {
 // is taken out of the picture.
 func pushOnlyClient(t *testing.T) (context.Context, *Beehive, Client[cSpec, cStatus], *reconciler) {
 	t.Helper()
-	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Hour))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)
 	require.True(t, ok)
@@ -1122,9 +1114,8 @@ func assertQuiet(t *testing.T, ch <-chan Schedule, msg string) {
 // poll interval is short enough that a retained poll would have ticked many
 // times.
 func TestScheduleStreamMakesNoPeriodicRead(t *testing.T) {
-	bh, err := New(newClientTestStore(t), fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -1264,9 +1255,8 @@ func TestScheduleStreamNilQueueReportsNoController(t *testing.T) {
 func TestWatchListReturnsASnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Millisecond))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Millisecond))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1354,9 +1344,8 @@ func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
 func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t), withWatchPollInterval(time.Hour))
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Hour))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "first"})
@@ -1515,8 +1504,7 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 func TestWatchNeedsNoController(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t), fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
 	clientOnly := GroupKind{Group: "acme.com", Kind: "Unregistered"}
 	client := NewClient[cSpec, cStatus](bh, clientOnly)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -1593,11 +1581,10 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh, err := New(&imagelessStore{newClientTestStore(t)}, fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &imagelessStore{newClientTestStore(t)}, fast()...)
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	doomed := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "doomed"})
@@ -1642,9 +1629,8 @@ func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
 	defer cancel()
 	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
 	store.broken.Store(true)
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -1710,9 +1696,8 @@ func (s *emptyPageStore) ObjectWritesListSince(context.Context, GroupKind, int64
 func TestAnEmptyPageAboveTheCursorIsQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(&emptyPageStore{newClientTestStore(t)}, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, &emptyPageStore{newClientTestStore(t)}, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1745,9 +1730,8 @@ func TestAVanishedObjectIsSkipped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := &vanishingStore{Store: newClientTestStore(t), read: make(chan struct{}, 256)}
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, store, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})

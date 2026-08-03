@@ -30,8 +30,7 @@ import (
 func TestControllerClientDeleteFinalizer(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -104,8 +103,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 func TestControllerClientUpdateStatus(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -137,8 +135,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t), fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -181,8 +178,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 // with the nested ControllerClient writes joining the one transaction.
 func TestControllerClientWithin(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -190,7 +186,7 @@ func TestControllerClientWithin(t *testing.T) {
 
 	// Rollback: an error from fn discards every write it made.
 	sentinel := errors.New("boom")
-	err = cc.Within(ctx, func(ctx context.Context) error {
+	err := cc.Within(ctx, func(ctx context.Context) error {
 		if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "rolled-back"}); err != nil {
 			return err
 		}
@@ -219,8 +215,7 @@ func TestControllerClientWithin(t *testing.T) {
 // Detail; the run reads back with the mapped fields and a decodable payload.
 func TestControllerClientAddEvent(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -247,11 +242,10 @@ func TestControllerClientAddEvent(t *testing.T) {
 // EventsAdd surfaces a Detail that cannot be JSON-marshaled, before touching
 // the store.
 func TestControllerClientAddEventMarshalError(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 
-	err = cc.EventsAdd(context.Background(), 1, EventSpec{Detail: make(chan int)})
+	err := cc.EventsAdd(context.Background(), 1, EventSpec{Detail: make(chan int)})
 	assert.Error(t, err, "an unmarshalable Detail fails the write")
 }
 
@@ -259,14 +253,13 @@ func TestControllerClientAddEventMarshalError(t *testing.T) {
 // events on an object of another kind.
 func TestControllerClientAddEventWrongKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	other := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Other"}}
-	err = other.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
+	err := other.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
 	assert.ErrorIs(t, err, ErrWrongKind)
 }
 
@@ -274,15 +267,14 @@ func TestControllerClientAddEventWrongKind(t *testing.T) {
 // errors is rolled back with the rest.
 func TestControllerClientAddEventWithinRollback(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	sentinel := errors.New("boom")
-	err = cc.Within(ctx, func(ctx context.Context) error {
+	err := cc.Within(ctx, func(ctx context.Context) error {
 		if err := cc.EventsAdd(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
 			return err
 		}
@@ -298,8 +290,7 @@ func TestControllerClientAddEventWithinRollback(t *testing.T) {
 func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -324,8 +315,7 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -359,8 +349,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 func TestAddDependencyAcceptsCycle(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	gk := GroupKind{Kind: "Widget"}
 	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
@@ -408,8 +397,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 	t.Helper()
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	f := &declareFixture{
 		bh:       bh,
@@ -417,7 +405,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 		targetGK: GroupKind{Kind: "Target"},
 		depGK:    GroupKind{Kind: "Dependent"},
 	}
-	_, err = Register(bh, f.depGK, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, f.depGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	f.cc, err = Register(bh, f.targetGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -504,8 +492,7 @@ type sameKindFixture struct {
 func newSameKindFixture(t *testing.T) *sameKindFixture {
 	t.Helper()
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	gk := GroupKind{Kind: "Widget"}
 	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -573,8 +560,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	ctx := context.Background()
 	real := newClientTestStore(t)
 
-	bh, err := New(real)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, real)
 	gk := GroupKind{Kind: "Widget"}
 	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithFullPassInterval(0))
 	require.NoError(t, err)
@@ -703,8 +689,7 @@ func TestAddDependencyEnqueuesNothingOnRollback(t *testing.T) {
 func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	targetGK := GroupKind{Kind: "Target"}
 	cc, err := Register(bh, targetGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -757,11 +742,10 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withoutGCSweeper())
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), withoutGCSweeper())
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &redeclareController{first: newSignal(), hot: newSignal()}
-	_, err = Register(bh, gk, ctrl)
+	_, err := Register(bh, gk, ctrl)
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
 
@@ -840,8 +824,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 func TestControllerClientHasIncomingEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -869,8 +852,7 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 // rows. DependenciesAdd/EdgesHasIncoming are intentionally cross-kind and not guarded.
 func TestControllerClientWritesScopedToKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
 	require.NoError(t, err)
@@ -912,10 +894,9 @@ func (s *failEdgesHasIncomingStore) EdgesHasIncoming(context.Context, ObjectID) 
 }
 
 func TestControllerClientHasIncomingRefsStoreError(t *testing.T) {
-	bh, err := New(&failEdgesHasIncomingStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failEdgesHasIncomingStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	_, err = cc.EdgesHasIncoming(context.Background(), 1)
+	_, err := cc.EdgesHasIncoming(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -929,10 +910,9 @@ func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relati
 }
 
 func TestControllerClientAddDependencyStoreError(t *testing.T) {
-	bh, err := New(&failEdgesAddStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failEdgesAddStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.DependenciesAdd(context.Background(), 1, 2)
+	err := cc.DependenciesAdd(context.Background(), 1, 2)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -965,18 +945,16 @@ type errStatusMarshaler struct{}
 func (errStatusMarshaler) MarshalJSON() ([]byte, error) { return nil, errBoom }
 
 func TestControllerClientUpdateStatusMarshalError(t *testing.T) {
-	bh, err := New(&kindTStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &kindTStore{})
 	cc := &controllerClientImpl[errStatusMarshaler]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
+	err := cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
 	require.Error(t, err)
 }
 
 func TestControllerClientUpdateStatusStoreError(t *testing.T) {
-	bh, err := New(&failUpdateStatusStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failUpdateStatusStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
+	err := cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
 	require.Error(t, err)
 }
 
@@ -992,18 +970,16 @@ func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, 
 // TestControllerClientDeleteDependencyDeleteRefError covers the EdgesDelete failure
 // branch: the edge removal itself fails, so the whole DependenciesDelete errors.
 func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
-	bh, err := New(&failEdgesDeleteStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failEdgesDeleteStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.DependenciesDelete(context.Background(), 1, 2)
+	err := cc.DependenciesDelete(context.Background(), 1, 2)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestControllerClientReadEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 

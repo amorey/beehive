@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/conflate"
@@ -36,8 +37,7 @@ func TestWakeHubPublishesOnCreate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	rx := bh.wakes.Watch(clientTestGK)
 	defer rx.Close()
 
@@ -310,8 +310,7 @@ func TestTailerLosesNoWriteAtStartup(t *testing.T) {
 	defer cancel()
 
 	store := &writeDuringMaxVersionStore{Store: newClientTestStore(t)}
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	var raced ObjectID
@@ -346,8 +345,7 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	const burst = tailPageCap + 88
 
 	store := &countingTailStore{Store: newClientTestStore(t)}
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	_, rx := startTailer(t, bh, clientTestGK)
 	gateReadsAtStart := store.gateReads.Load()
@@ -493,8 +491,7 @@ func TestTailerFloorTickPicksUpAForeignWrite(t *testing.T) {
 	defer cancel()
 
 	store := newClientTestStore(t)
-	bh, err := New(store, withWatchFloorInterval(fastTick))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 	_, rx := startTailer(t, bh, clientTestGK)
 
 	foreign, err := New(store)
@@ -513,8 +510,7 @@ func TestTailerRetriesAfterAFailedStep(t *testing.T) {
 	defer cancel()
 
 	store := &flakyListStore{Store: newClientTestStore(t)}
-	bh, err := New(store, withWatchFloorInterval(fastTick))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 	_, rx := startTailer(t, bh, clientTestGK)
 
 	store.failures.Store(1)
@@ -534,8 +530,7 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 	defer cancel()
 
 	store := &flakyListStore{Store: newClientTestStore(t)}
-	bh, err := New(store, withWatchFloorInterval(fastTick))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// Every step fails while the log grows, so the cursor stays where it began.
@@ -545,7 +540,7 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 		mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 	}
 	// Retention overtakes the cursor, then the store recovers.
-	_, err = store.ObjectWritesSweep(ctx, 1, 0)
+	_, err := store.ObjectWritesSweep(ctx, 1, 0)
 	require.NoError(t, err)
 	store.failures.Store(0)
 
@@ -571,8 +566,7 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	assert.Empty(t, bh.tailers, "a tailer started before anything watched")
 
@@ -643,11 +637,10 @@ type writeWorld struct {
 
 func newWriteWorld(t *testing.T) *writeWorld {
 	t.Helper()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 	// Registered but never started: WithFinalizers refuses a kind no controller
 	// in this process can clear, and nothing here needs a reconcile loop.
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return &writeWorld{
 		bh:     bh,
@@ -661,6 +654,62 @@ func newWriteWorld(t *testing.T) *writeWorld {
 func drainWakes(rx *watch.Receiver[GroupKind, int64]) {
 	for {
 		if _, err := rx.TryRecv(); err != nil {
+			return
+		}
+	}
+}
+
+// The public list watch delivers on the commit's wake, with both the old poll
+// interval and the floor set past the test's patience.
+func TestWatchListDeliversWithoutPolling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	snap, ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	require.Empty(t, snap.Objects)
+
+	obj := mustCreate(t, ctx, client, "prompt", cSpec{Val: "a"})
+	ev := recv(t, ch)
+	assert.Equal(t, Added, ev.Type)
+	assert.Equal(t, obj.ID, ev.Object.ID)
+	assert.Equal(t, obj.ResourceVersion, ev.ResourceVersion)
+}
+
+// The delete of an object the snapshot carried is always delivered, even when
+// the tailer published its create before that snapshot and this subscriber has
+// read nothing. Coalescing the pair away would leave this caller holding a row
+// that no longer exists, with no correction coming.
+func TestWatchSeesDeleteOfSnapshotObject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// A first watch starts the kind's tailer, so the create below is published
+	// into the fan-out before the watch under test takes its snapshot.
+	_, _, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, "doomed", cSpec{Val: "a"})
+
+	snap, ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	require.Len(t, snap.Objects, 1, "the snapshot holds the object")
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	deleted, err := bh.gcCollect(ctx, obj.ID)
+	require.NoError(t, err)
+	require.True(t, deleted)
+
+	for {
+		ev := recv(t, ch)
+		if ev.Type == Deleted {
+			assert.Equal(t, obj.ID, ev.Object.ID)
 			return
 		}
 	}

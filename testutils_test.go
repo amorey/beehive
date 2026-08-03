@@ -209,6 +209,21 @@ func fast(opts ...Option) []Option {
 	}, opts...)
 }
 
+// newTestBeehive is New plus the teardown every test owes a Beehive: the watch
+// tailers come up in New and end in stop, so a test that watches and never stops
+// leaks their goroutines into the next one.
+func newTestBeehive(t *testing.T, store Store, opts ...Option) *Beehive {
+	t.Helper()
+	bh, err := New(store, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+		defer cancel()
+		assert.NoError(t, bh.stop(ctx))
+	})
+	return bh
+}
+
 // mustCreate creates one object and fails the test if the create errors — the
 // shape of the great majority of test creates, which only want a row to exist
 // before they assert on something else.

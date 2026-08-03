@@ -121,8 +121,7 @@ func TestSweepFreePages(t *testing.T) {
 // its own.
 func TestGCSweeperDrainsFreePages(t *testing.T) {
 	store := &freePagesStore{Store: &fakeStore{}, called: make(chan int, 8)}
-	bh, err := New(store, WithGCInterval(time.Millisecond))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, WithGCInterval(time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -133,8 +132,7 @@ func TestGCSweeperDrainsFreePages(t *testing.T) {
 }
 
 func TestNewAppliesDefaults(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 	// Literals, not the constants: comparing a default to its own constant passes
 	// whatever the value is, so it would not notice a default changing. These four
 	// are the contract — cheap owed-work drain and GC on, both object-count-scaled
@@ -152,11 +150,10 @@ func TestNewPropagatesOptionError(t *testing.T) {
 }
 
 func TestRegisterStoresReconciler(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	r, ok := bh.reconcilers[gk]
@@ -168,24 +165,22 @@ func TestRegisterStoresReconciler(t *testing.T) {
 }
 
 func TestWithMigratorRegisters(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
 	mig := &fakeMigrator{specVersion: 2, statusVersion: 1}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
 	require.NoError(t, err)
 
 	assert.Same(t, mig, bh.migratorFor(gk), "the migrator passed to Register is installed for the kind")
 }
 
 func TestMigratorForReturnsNilWhenUnset(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	// Registered without WithMigrator.
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	assert.Nil(t, bh.migratorFor(gk), "a kind registered without a migrator has none")
@@ -193,19 +188,17 @@ func TestMigratorForReturnsNilWhenUnset(t *testing.T) {
 }
 
 func TestRegisterRejectsDuplicate(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.Error(t, err)
 }
 
 func TestRegisterRejectedAfterStart(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	defer stop(context.Background())
@@ -216,12 +209,11 @@ func TestRegisterRejectedAfterStart(t *testing.T) {
 
 func TestRegisterPerControllerOverride(t *testing.T) {
 	// Global default set at New; one controller overrides it, another inherits.
-	bh, err := New(&fakeStore{}, WithFullPassInterval(10*time.Second))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(10*time.Second))
 	assert.Equal(t, 10*time.Second, bh.fullPassInterval)
 
 	overridden := GroupKind{Kind: "Overridden"}
-	_, err = Register(bh, overridden, &noopController[tSpec, tStatus]{},
+	_, err := Register(bh, overridden, &noopController[tSpec, tStatus]{},
 		WithFullPassInterval(2*time.Second), WithMaxRetryInterval(7*time.Second))
 	require.NoError(t, err)
 
@@ -237,10 +229,9 @@ func TestRegisterPerControllerOverride(t *testing.T) {
 
 func TestStartStopLifecycle(t *testing.T) {
 	// Disable the full pass so the reconcile loop just blocks on ctx until Stop.
-	bh, err := New(&fakeStore{}, WithFullPassInterval(0))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -252,8 +243,7 @@ func TestStartStopLifecycle(t *testing.T) {
 }
 
 func TestStartRejectsSecondStart(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -263,10 +253,9 @@ func TestStartRejectsSecondStart(t *testing.T) {
 }
 
 func TestStopWithoutStartIsNoOp(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	// never started: must not panic, and reports no error.
@@ -274,10 +263,9 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 }
 
 func TestStopReturnsWithExpiredContext(t *testing.T) {
-	bh, err := New(&fakeStore{}, WithFullPassInterval(0))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -296,10 +284,9 @@ func TestStopReturnsWithExpiredContext(t *testing.T) {
 // Start: an already-cancelled start context makes Start bail before launching
 // the reconcile loops, returning an error and no stop function.
 func TestStartAbortsOnCancelledContext(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,9 +299,8 @@ func TestStartAbortsOnCancelledContext(t *testing.T) {
 }
 
 func TestRegisterPropagatesOptionError(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
+	bh := newTestBeehive(t, &fakeStore{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -323,8 +309,7 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
 	store := &listProbeStore{Store: &fakeStore{}, gcSwept: make(chan struct{}, 8)}
-	bh, err := New(store, WithGCInterval(time.Millisecond))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, WithGCInterval(time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
