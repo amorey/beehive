@@ -2589,3 +2589,70 @@ func TestWatchDeliversUnderSustainedWrites(t *testing.T) {
 		}
 	}
 }
+
+// failingPositionStore fails the tail's position read once armed, and counts the
+// attempts, so a test can tell a backoff from a spin. Armed after the tailer is
+// built, since newObjectTailer reads the position too.
+type failingPositionStore struct {
+	Store
+	armed    atomic.Bool
+	attempts atomic.Int64
+	tried    chan struct{}
+}
+
+func (s *failingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if !s.armed.Load() {
+		return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	}
+	s.attempts.Add(1)
+	select {
+	case s.tried <- struct{}{}:
+	default:
+	}
+	return 0, errBoom
+}
+
+// A commit wake must not void the retry backoff. A wake carries no information
+// the drain needs, and a commit landing during a failed drain refills the wake
+// slot — so a tailer that honoured one would re-read a degraded store as fast
+// as it could fail, for as long as anything kept writing.
+//
+// The wakes are sent straight to the hub rather than written: this is about the
+// tailer's loop, and a real write would need the store the test is failing.
+func TestTailBackoffSurvivesCommitWakes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &failingPositionStore{Store: newClientTestStore(t), tried: make(chan struct{}, 1)}
+	bh := newTestBeehive(t, store)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, "w1", cSpec{})
+
+	_, ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	go func() {
+		for range ch { // the stream stays open across a failed read
+		}
+	}()
+
+	store.armed.Store(true)
+	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
+
+	// The first attempt puts the tailer in backoff; everything after is the
+	// window under test.
+	select {
+	case <-store.tried:
+	case <-time.After(testTimeout):
+		t.Fatal("the tailer never read the log position")
+	}
+	settled := store.attempts.Load()
+
+	// Far more wakes than watchRetryBase (100ms) could ever admit attempts for:
+	// sending them costs microseconds, so a further attempt means the backoff
+	// was bypassed rather than that it elapsed.
+	for range 500 {
+		require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
+	}
+	assert.LessOrEqual(t, store.attempts.Load()-settled, int64(1),
+		"a commit wake bypassed the retry backoff")
+}

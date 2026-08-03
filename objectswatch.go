@@ -347,6 +347,13 @@ func (t *objectTailer) run() {
 	defer timer.Stop()
 
 	retry := driver.Backoff{Base: watchRetryBase, Max: floor}
+	// backingOff drops commit wakes until the retry timer fires. A wake carries
+	// no information — the drain reads its position from the store — so dropping
+	// one loses nothing, and the timer reads the log either way. Honouring one
+	// would void the backoff exactly when it is needed: a commit landing during
+	// a failed drain refills the wake slot, so a live writer would keep a
+	// degraded store re-reading as fast as it can fail.
+	backingOff := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -354,6 +361,10 @@ func (t *objectTailer) run() {
 		case _, ok := <-written:
 			if !ok {
 				return // the beehive stopped
+			}
+			// Consumed rather than ignored, so the closed arm above stays live.
+			if backingOff {
+				continue
 			}
 		case <-timer.C:
 		}
@@ -372,8 +383,10 @@ func (t *objectTailer) run() {
 			}
 			t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
 			next = retry.Next()
+			backingOff = true
 		} else {
 			retry.Reset()
+			backingOff = false
 		}
 		timer.Stop()
 		timer.Reset(next)

@@ -225,6 +225,13 @@ missed by both.
 A failed step logs and backs off (bounded, capped at the floor interval)
 rather than spinning; the cursor does not advance, so nothing is lost.
 
+**The commit wake is suppressed while the tailer backs off**, or the backoff
+is not one. A wake carries no information the drain needs, and a commit that
+lands *during* a failed drain refills the wake slot — so a tailer that honoured
+it would re-read a degraded store as fast as it could fail, for as long as
+anything kept writing. Dropping a wake loses nothing: the retry timer reads the
+log either way.
+
 The tailer resolves nothing through `bh.mu` while starting or stepping. It has
 no reason to — decode moved to the subscribers, so it needs neither
 `migratorFor` (`beehive.go:381`) nor `reconcilerFor` (`:388`), and both take
