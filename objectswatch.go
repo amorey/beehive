@@ -294,7 +294,7 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 		bh:         bh,
 		gk:         gk,
 		hub:        conflate.New[ObjectID](mergeRawChange),
-		kindWrites: bh.kindWrites.Watch(gk),
+		kindWrites: bh.kindWriteHub.Watch(gk),
 	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)

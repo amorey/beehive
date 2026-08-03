@@ -977,7 +977,7 @@ func TestKindWriteHubPublishesOnCreate(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t))
-	rx := bh.kindWrites.Watch(clientTestGK)
+	rx := bh.kindWriteHub.Watch(clientTestGK)
 	defer rx.Close()
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1104,7 +1104,7 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			defer cancel()
 
 			w := newWriteWorld(t)
-			rx := w.bh.kindWrites.Watch(clientTestGK)
+			rx := w.bh.kindWriteHub.Watch(clientTestGK)
 			defer rx.Close()
 
 			var id ObjectID
@@ -1138,9 +1138,9 @@ func TestKindWriteHubPublishesPerCascadedKind(t *testing.T) {
 	mustCreate(t, ctx, NewClient[cSpec, cStatus](w.bh, gkChildB), "b", cSpec{}, WithOwner(owner.ID))
 	require.NoError(t, w.client.Delete(ctx, owner.ID))
 
-	rxA := w.bh.kindWrites.Watch(gkChildA)
+	rxA := w.bh.kindWriteHub.Watch(gkChildA)
 	defer rxA.Close()
-	rxB := w.bh.kindWrites.Watch(gkChildB)
+	rxB := w.bh.kindWriteHub.Watch(gkChildB)
 	defer rxB.Close()
 
 	_, err := w.bh.gcCollect(ctx, owner.ID)
@@ -1159,7 +1159,7 @@ func TestKindWriteHubSilentOnRollback(t *testing.T) {
 	defer cancel()
 
 	w := newWriteWorld(t)
-	rx := w.bh.kindWrites.Watch(clientTestGK)
+	rx := w.bh.kindWriteHub.Watch(clientTestGK)
 	defer rx.Close()
 
 	err := w.bh.store.Within(ctx, func(ctx context.Context) error {
@@ -1184,7 +1184,7 @@ func TestKindWriteHubClosesOnStop(t *testing.T) {
 		require.NoError(t, err)
 		stop, err := bh.Start(ctx)
 		require.NoError(t, err)
-		rx := bh.kindWrites.Watch(clientTestGK)
+		rx := bh.kindWriteHub.Watch(clientTestGK)
 		defer rx.Close()
 
 		require.NoError(t, stop(ctx))
@@ -1195,7 +1195,7 @@ func TestKindWriteHubClosesOnStop(t *testing.T) {
 	t.Run("never started", func(t *testing.T) {
 		bh, err := New(newClientTestStore(t))
 		require.NoError(t, err)
-		rx := bh.kindWrites.Watch(clientTestGK)
+		rx := bh.kindWriteHub.Watch(clientTestGK)
 		defer rx.Close()
 
 		require.NoError(t, bh.stop(ctx))
@@ -1303,7 +1303,7 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
-	require.NoError(t, bh.kindWrites.Send(clientTestGK))
+	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
 
 	seen := make(map[ObjectID]bool, burst)
 	for len(seen) < burst {
@@ -1780,7 +1780,7 @@ func TestTailerEndsWhenTheKindWriteHubCloses(t *testing.T) {
 		tailer.run()
 	}()
 
-	bh.kindWrites.Close()
+	bh.kindWriteHub.Close()
 	select {
 	case <-done:
 	case <-time.After(testTimeout):
