@@ -141,6 +141,30 @@ leave the change in the log and try again next tick; the tailer's cursor has
 already moved past it, so the subscriber retries the load on the batch it
 holds.
 
+### Tailer lifetime
+
+A tailer runs from its kind's first watch to its last. `tailerFor` hands back a
+tailer with a **subscriber lease** taken on it and every caller owes one
+`release`; the last release cancels the tailer's context and removes it from
+the registry. The tailer's context is its own, not the beehive's, which is what
+lets a watch on a `Beehive` that was never `Start`ed end with its caller —
+`stop` is reachable only through the closure `Start` returns.
+
+The alternative was to run every tailer until `stop`. It is simpler by one
+counter and avoids a teardown race, but it makes tailer lifetime process-global:
+an application watching 50 kinds once holds 50 goroutines and 50 reads per floor
+interval forever, and an unstarted `Beehive` has no way to stop any of them.
+
+**The teardown race is closed by moving the count only under `tailMu`**, the
+same lock the registry moves under, so "registered" and "has subscribers" are
+one condition and change together. A watch arriving during a teardown either
+takes the lock first, and joins a tailer that is still registered, or takes it
+after, and finds the entry gone and starts a fresh one. There is no window in
+which a caller can join a tailer that is about to be cancelled. Release
+compares identity rather than presence, because a tailer that reset below the
+horizon was already replaced in the registry and its last subscriber must not
+evict the successor.
+
 ### The tailer's own ErrWatchTooOld
 
 The cursor is shared, so a cursor below the retention horizon is not one
@@ -165,11 +189,14 @@ to hand the error to.
   below the horizon, and the tailer's reset.
 - **`LagPolicy` is gone.** Conflate has no backlog to bound, so `LagFail` had
   nothing to fail on and `LagBlock` became the behavior, with better isolation.
-- **A tailer outlives its last subscriber.** An application watching 50 kinds
-  once holds 50 goroutines and 50 reads per floor interval for the process's
-  life. That is the accepted trade against restart churn and a teardown race.
-  Idle teardown stays available if a kind count ever makes it worth it.
+- **A tailer's life is its subscribers'.** A kind watched once costs nothing
+  after that watch ends, and a watch on a `Beehive` that was never `Start`ed
+  ends with its own context — the caller needs no handle on the control plane
+  to stop it. The cost is the teardown race, resolved under `tailMu`; see
+  "Tailer lifetime".
 - **Memory moved** from one shared page per tick to N receivers × undelivered
   keys × one row image. Bounded by undelivered keys, not by total writes.
 - **The watch machinery comes up in `New`, not `Start`**, because watches
-  always worked on an unstarted `Beehive`. `stop` tears it down either way.
+  always worked on an unstarted `Beehive`. `stop` closes the wake hub, which
+  ends every tailer whose subscribers are still reading; the rest end
+  themselves.

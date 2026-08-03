@@ -108,17 +108,14 @@ type Beehive struct {
 	// order preserves registration order so Start launches loops deterministically.
 	order []*reconciler
 	waker *waker
-	// wakes wakes a kind's tailer when the kind changes; the tailers run under
-	// tailCtx. Both come from New, not Start: watches work on a Beehive that
-	// never ran, and stop tears them down either way.
-	wakes      wakeHub
-	tailCtx    context.Context
-	tailCancel context.CancelFunc
-	// tailers is one shared reader per watched kind, started lazily. Guarded by
-	// tailMu — never bh.mu; see tailerFor.
+	// wakes wakes a kind's tailer when the kind changes. From New, not Start:
+	// watches work on a Beehive that never ran.
+	wakes wakeHub
+	// tailers is one shared reader per watched kind, started on the kind's first
+	// watch and ended by its last. A tailer is here exactly while it has
+	// subscribers. Guarded by tailMu — never bh.mu; see tailerFor.
 	tailMu  sync.Mutex
 	tailers map[GroupKind]*objectTailer
-	tailWG  sync.WaitGroup
 	state   beehiveState
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
@@ -275,13 +272,17 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 
 // stop cancels the reconcile loops and waits for them to drain, bounded by ctx.
 // It returns non-nil only when the drain hit ctx's deadline. No-op for the
-// reconcile loops if not running — but the watch machinery comes up in New
-// rather than Start, so it is torn down either way.
+// reconcile loops if not running.
 func (bh *Beehive) stop(ctx context.Context) error {
+	// The wake hub comes from New, not Start, so closing it ends the tailers of
+	// a Beehive that never ran too — no special case for that below. Deferred so
+	// a stream whose caller is still reading sees what the draining reconcile
+	// loops write; a tailer whose subscribers have all left is already gone.
+	defer bh.wakes.Close()
+
 	bh.mu.Lock()
 	if bh.state != beehiveRunning {
 		bh.mu.Unlock()
-		bh.stopWatchTail()
 		return nil
 	}
 	// Release bh.mu before waiting on wg: the waker (counted in wg) takes bh.mu
@@ -303,10 +304,9 @@ func (bh *Beehive) stop(ctx context.Context) error {
 		drainErr = ctx.Err()
 	}
 
-	// The watch tailers are not counted in wg — they come up in New rather than
-	// Start — so they are cancelled and drained here. SchedulesWatch streams
+	// The watch tailers are not counted in wg: each ends with its own last
+	// subscriber, or with the deferred close above. SchedulesWatch streams
 	// report the work queue instead and end here, after their final value.
-	bh.stopWatchTail()
 	bh.log().Info("control plane stopped")
 	return drainErr
 }
@@ -329,7 +329,6 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		migrators:               make(map[GroupKind]Migrator),
 		wakes:                   newWakeHub(),
 	}
-	bh.tailCtx, bh.tailCancel = context.WithCancel(context.Background())
 	cursors, _ := s.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
 	for _, o := range opts {
@@ -427,17 +426,6 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 			r.requeueNow(ref.ID)
 		}
 	})
-}
-
-// stopWatchTail ends the watch machinery: tailers see their context cancelled,
-// a tailer blocked on a wake sees the sender closed, and every subscriber then
-// sees its fan-out close. Never called under bh.mu — it waits on the tailers.
-func (bh *Beehive) stopWatchTail() {
-	if bh.tailCancel != nil {
-		bh.tailCancel()
-	}
-	bh.wakes.Close()
-	bh.tailWG.Wait()
 }
 
 // signalObjectWritten wakes gk's tailer once a write to gk commits.

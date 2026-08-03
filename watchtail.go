@@ -69,9 +69,10 @@ func (h wakeHub) Close() {
 	}
 }
 
-// tailerFor returns the kind's tailer, starting one on the kind's first watch.
-// A tailer that ended (trimmed cursor, or the beehive stopped) is replaced, so
-// a caller never joins a closed fan-out.
+// tailerFor returns the kind's tailer with a subscriber lease held on it,
+// starting one on the kind's first watch. Every caller owes exactly one
+// release. A tailer that ended (trimmed cursor, or the beehive stopped) is
+// replaced, so a caller never joins a closed fan-out.
 //
 // Guarded by tailMu, never bh.mu: bh.mu is not reentrant, and migratorFor and
 // reconcilerFor take it. The store read that builds a tailer runs outside the
@@ -80,6 +81,7 @@ func (h wakeHub) Close() {
 func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, error) {
 	bh.tailMu.Lock()
 	if t, ok := bh.tailers[gk]; ok && t.failure() == nil {
+		t.refs++
 		bh.tailMu.Unlock()
 		return t, nil
 	}
@@ -93,17 +95,42 @@ func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, 
 	bh.tailMu.Lock()
 	defer bh.tailMu.Unlock()
 	if live, ok := bh.tailers[gk]; ok && live.failure() == nil {
+		live.refs++
 		t.close()
 		return live, nil
 	}
 	if bh.tailers == nil {
 		bh.tailers = make(map[GroupKind]*objectTailer)
 	}
+	t.refs = 1
 	bh.tailers[gk] = t
-	// After stop, tailCtx is already cancelled: the tailer closes its fan-out
-	// at once, which ends the watch that asked for it.
-	bh.tailWG.Go(func() { t.run(bh.tailCtx) })
+	// After stop the wake hub is closed, so the tailer closes its fan-out at
+	// once, which ends the watch that asked for it.
+	go t.run()
 	return t, nil
+}
+
+// release drops one subscriber's lease, ending the tailer when the last one
+// goes: a kind watched once must not cost a goroutine and a floor tick for the
+// rest of the process's life.
+//
+// The count moves only under tailMu, which is what closes the teardown race:
+// a watch arriving during a teardown either takes the lock first and joins a
+// tailer that is still registered, or takes it after and finds the map entry
+// gone, and starts a fresh one.
+func (t *objectTailer) release() {
+	t.bh.tailMu.Lock()
+	defer t.bh.tailMu.Unlock()
+	t.refs--
+	if t.refs > 0 {
+		return
+	}
+	// Identity, not presence: a failed tailer was already replaced in the map,
+	// and its last subscriber must not evict the successor.
+	if t.bh.tailers[t.gk] == t {
+		delete(t.bh.tailers, t.gk)
+	}
+	t.cancel()
 }
 
 // horizonErr returns ErrWatchTooOld when retention has trimmed the log past
@@ -160,6 +187,13 @@ type objectTailer struct {
 	gk    GroupKind
 	hub   *conflate.Hub[ObjectID, rawChange]
 	wakes *watch.Receiver[GroupKind, int64]
+	// ctx is run's, cancelled when the last subscriber leaves. Held here
+	// because the goroutine outlives the call that started it.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// refs counts live subscribers. Guarded by bh.tailMu, which is also what
+	// makes "in bh.tailers" and "refs > 0" the same condition.
+	refs int
 	// cursor is only touched by run.
 	cursor int64
 	// failed records why the fan-out closed, for subscribers to report. Written
@@ -178,6 +212,7 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 		hub:   conflate.New[ObjectID](mergeRawChange),
 		wakes: bh.wakes.Watch(gk),
 	}
+	t.ctx, t.cancel = context.WithCancel(context.Background())
 	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)
 	if err != nil {
 		t.close()
@@ -187,8 +222,10 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 	return t, nil
 }
 
-// close releases the tailer's hub and wake receiver.
+// close ends the tailer and releases its hub and wake receiver. Idempotent, and
+// safe on one that never ran.
 func (t *objectTailer) close() {
+	t.cancel()
 	t.wakes.Close()
 	t.hub.Sender().Close()
 }
@@ -217,12 +254,13 @@ func (t *objectTailer) failure() error {
 	return nil
 }
 
-// run tails the kind's log until ctx ends. A commit wakes it; the floor timer
-// covers what a wake cannot. Entries at or below the starting cursor belong to
-// the subscribers' snapshots, not to the tail.
-func (t *objectTailer) run(ctx context.Context) {
+// run tails the kind's log until the last subscriber leaves. A commit wakes it;
+// the floor timer covers what a wake cannot. Entries at or below the starting
+// cursor belong to the subscribers' snapshots, not to the tail.
+func (t *objectTailer) run() {
 	defer t.close()
 
+	ctx := t.ctx
 	wakes := t.wakes.Chan()
 	floor := t.bh.watchFloor()
 	timer := time.NewTimer(floor)
@@ -415,6 +453,9 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		opts = append(opts, tailer.hub.WithKeyFilter(func(k ObjectID) bool { return k == *only }))
 	}
 	rx := tailer.hub.Receiver(opts...)
+	// Owed by every path that returns without a stream: the receiver holds a key
+	// in the fan-out, and the lease holds the tailer open.
+	abandon := func() { rx.Close(); tailer.release() }
 
 	mig := c.bh.migratorFor(c.gk) // invariant for the stream's lifetime
 
@@ -427,21 +468,21 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		// inside the log — the one failure the caller can act on. The gap
 		// itself is replayed on the stream's goroutine.
 		if err := c.resumable(ctx, *cfg.resumeFrom); err != nil {
-			rx.Close()
+			abandon()
 			return empty, nil, err
 		}
 		snap.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
 	} else {
 		raws, at, err := c.snapshot(ctx, only)
 		if err != nil {
-			rx.Close()
+			abandon()
 			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
 		snap.ResourceVersion, floor = at, at
 		snap.Objects = c.decodeList(raws, "Watch")
 		if err := c.loadListRelated(ctx, snap.Objects, cfg.loads); err != nil {
-			rx.Close()
+			abandon()
 			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
@@ -449,7 +490,10 @@ func (c *clientImpl[Spec, Status]) tailStream(
 
 	out := make(chan ObjectChange[Spec, Status])
 	go func() {
+		// LIFO: the receiver leaves the fan-out, then the lease goes, then the
+		// caller sees the stream end.
 		defer close(out)
+		defer tailer.release()
 		defer rx.Close()
 		if cfg.resumeFrom != nil {
 			at, ok := c.replay(ctx, mig, cfg, only, floor, out)

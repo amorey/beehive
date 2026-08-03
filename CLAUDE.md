@@ -91,8 +91,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `Added` may repeat for a snapshot object and cross-object write order is not a
   contract. Nothing is dropped in the merge. A cursor **below** the horizon
   (strictly: equality has lost nothing) ends *every* subscriber with
-  `ErrWatchTooOld` and resets the tailer. `EventsWatch` still polls and diffs,
-  gated on `EventsMaxVersion`.
+  `ErrWatchTooOld` and resets the tailer. **A tailer runs from its kind's first
+  watch to its last**: `tailerFor` hands back a subscriber lease and every
+  caller owes one `release`, with the count moving only under `tailMu` — the
+  same lock the registry moves under, which is what closes the teardown race.
+  `EventsWatch` still polls and diffs, gated on `EventsMaxVersion`.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md)
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.

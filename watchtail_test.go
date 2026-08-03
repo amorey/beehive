@@ -661,6 +661,68 @@ func TestTailerStepStopsWhenTheFanOutIsClosed(t *testing.T) {
 	assert.Equal(t, at, tailer.cursor, "a step that could not publish must not advance")
 }
 
+// A tailer lives exactly as long as its subscribers. The last watch to end takes
+// it down, so a kind watched once does not cost a goroutine and a floor-tick
+// read for the rest of the process's life.
+func TestTailerEndsWithItsLastSubscriber(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	firstCtx, endFirst := context.WithCancel(ctx)
+	_, first, err := client.WatchList(firstCtx)
+	require.NoError(t, err)
+	secondCtx, endSecond := context.WithCancel(ctx)
+	_, second, err := client.WatchList(secondCtx)
+	require.NoError(t, err)
+	require.Equal(t, 1, tailerCount(bh), "two watches on one kind share one tailer")
+
+	// The stream closes after its lease is released, so draining it is the
+	// signal that the release has happened — no sleep needed.
+	endFirst()
+	for range first { // draining is the signal: the stream closes after its release
+	}
+	assert.Equal(t, 1, tailerCount(bh), "a tailer with a subscriber left must stay")
+
+	endSecond()
+	for range second { // same signal
+	}
+	assert.Zero(t, tailerCount(bh), "the last subscriber left its tailer running")
+
+	// And the kind is watchable again: the teardown left nothing dead behind for
+	// the next watch to join.
+	_, third, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, "after-teardown", cSpec{})
+	assert.Equal(t, obj.ID, recv(t, third).Object.ID)
+}
+
+// A watch on a Beehive that was never Started ends with its caller. Nothing else
+// can end it: stop is only reachable through the closure Start returns, so
+// before the tailer's life was its subscribers' there was no way to stop these
+// at all. TestMain's leak check is the other half of this assertion.
+func TestWatchOnAnUnstartedBeehiveEndsWithItsCaller(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	watchCtx, endWatch := context.WithCancel(ctx)
+	_, ch, err := client.WatchList(watchCtx)
+	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, "unstarted", cSpec{})
+	require.Equal(t, obj.ID, recv(t, ch).Object.ID)
+
+	endWatch()
+	for range ch { // draining is the signal: the stream closes after its release
+	}
+	assert.Zero(t, tailerCount(bh), "nothing but the caller's context could have ended this")
+}
+
 // Tailers are lazy, one per kind, and end with the beehive — started or not.
 func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -668,7 +730,7 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 
 	bh := newTestBeehive(t, newClientTestStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	assert.Empty(t, bh.tailers, "a tailer started before anything watched")
+	assert.Zero(t, tailerCount(bh), "a tailer started before anything watched")
 
 	// Concurrent first watches settle on one tailer for the kind.
 	const racers = 8
@@ -682,10 +744,16 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 		})
 	}
 	wg.Wait()
+	// Every tailerFor owes a release; these are held to the end of the test.
+	defer func() {
+		for _, tailer := range got {
+			tailer.release()
+		}
+	}()
 	for _, tailer := range got {
 		assert.Same(t, got[0], tailer)
 	}
-	assert.Len(t, bh.tailers, 1)
+	assert.Equal(t, 1, tailerCount(bh))
 
 	// It runs on a beehive that was never started.
 	rx := got[0].hub.Receiver()
@@ -702,6 +770,7 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 	// A watch opened after stop gets a stream that is already over.
 	after, err := bh.tailerFor(ctx, clientTestGK)
 	require.NoError(t, err)
+	defer after.release()
 	rxAfter := after.hub.Receiver()
 	defer rxAfter.Close()
 	_, err = rxAfter.RecvContext(ctx)
@@ -721,10 +790,10 @@ func TestTailerEndsWhenTheWakeHubCloses(t *testing.T) {
 	require.NoError(t, err)
 
 	done := make(chan struct{})
-	// Not the test's ctx: a context that outlives the hub is the point.
+	// Nothing cancels the tailer here: outliving its own context is the point.
 	go func() {
 		defer close(done)
-		tailer.run(context.Background())
+		tailer.run()
 	}()
 
 	bh.wakes.Close()
@@ -774,9 +843,10 @@ func TestTailerForDiscardsTheLoserOfAStartRace(t *testing.T) {
 
 	loser, err := bh.tailerFor(ctx, clientTestGK)
 	require.NoError(t, err)
+	defer func() { winner.release(); loser.release() }()
 	require.NotNil(t, winner)
 	assert.Same(t, winner, loser, "the loser returned its own tailer instead of the live one")
-	assert.Len(t, bh.tailers, 1, "the discarded tailer stayed registered")
+	assert.Equal(t, 1, tailerCount(bh), "the discarded tailer stayed registered")
 
 	// And what it handed back is live, not the closed one it built.
 	rx := loser.hub.Receiver()
@@ -797,11 +867,11 @@ func startTailer(t *testing.T, bh *Beehive, gk GroupKind) (*objectTailer, *confl
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		tailer.run(bh.tailCtx)
+		tailer.run()
 	}()
 	t.Cleanup(func() {
 		rx.Close()
-		bh.tailCancel()
+		tailer.close()
 		<-done
 	})
 	return tailer, rx
@@ -910,7 +980,7 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 	assert.Equal(t, obj.ID, rawEv.Object.ID)
 	assert.JSONEq(t, `{"Val":"a"}`, string(rawEv.Object.Spec))
 
-	assert.Len(t, bh.tailers, 1, "the kind is read by one tailer")
+	assert.Equal(t, 1, tailerCount(bh), "the kind is read by one tailer")
 	assert.Equal(t, int64(1), store.positionReads.Load()-positionReadsAtStart,
 		"one write costs one position read, not one per subscriber")
 }
@@ -931,7 +1001,7 @@ func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, snap.Object)
 	require.Equal(t, mine.ID, snap.Object.ID)
-	require.Len(t, bh.tailers, 1, "a single-object watch joins the kind's tailer")
+	require.Equal(t, 1, tailerCount(bh), "a single-object watch joins the kind's tailer")
 
 	// The other object is written first; only the watched one may arrive.
 	_, err = client.Update(ctx, other.ID, cSpec{Val: "b"})
@@ -1142,7 +1212,7 @@ func TestWatchGoroutinesDrainOnStop(t *testing.T) {
 		require.NoError(t, err)
 		streams = append(streams, list, single)
 	}
-	require.Len(t, bh.tailers, 3)
+	require.Equal(t, 3, tailerCount(bh))
 
 	require.NoError(t, bh.stop(ctx))
 	for i, ch := range streams {

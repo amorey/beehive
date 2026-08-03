@@ -544,23 +544,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   to the child — which would make the logged value correct by construction, and
   would also fix `DependentsList`/`DependenciesList`, which have the same hole.
 
-- **A watch tailer outlives its last subscriber, and only `stop` ends it** — the
-  [shared-tail ADR](adr/2026-08-03-watch-shared-tail.md) takes this deliberately:
-  refcounting subscribers means resolving a teardown race, for a saving that only
-  matters to a process that watches many kinds briefly. It leaves two loose ends.
-  An application that watches 50 kinds once holds 50 goroutines and 50 reads per
-  floor interval for the process's life. And a `Beehive` that was never `Start`ed
-  has no public way to stop them at all, because `stop` is only reachable through
-  the closure `Start` returns — before the shared tail, such a watch ended with
-  its own context and nothing outlived it.
-
-  The fix is idle teardown: count receivers in `tailerFor`, cancel the tailer
-  when the last one closes. That also removes `tailCtx`/`tailWG`/`stopWatchTail`
-  and the `newTestBeehive` cleanup the tests now need. Revisit when a caller
-  either watches many short-lived kinds or runs a `Beehive` without `Start`; the
-  measurement is idle goroutines and floor-tick reads per watched-then-dropped
-  kind.
-
 - **`EventsWatch` did not follow the object watches onto the write log** — so
   two watch surfaces on the same `Client` now behave differently for reasons a
   caller cannot see. Object watches return a snapshot plus a stream, resume

@@ -219,19 +219,22 @@ func drainRecv[E any, R interface{ TryRecv() (E, error) }](rx R) {
 	}
 }
 
-// newTestBeehive is New plus the teardown every test owes a Beehive: the watch
-// tailers come up in New and end in stop, so a test that watches and never
-// stops would leak tailer goroutines into the next test.
+// newTestBeehive is New with the test's own error handling. A watch tailer ends
+// with its last subscriber, so a test that watches owes no teardown here — the
+// watch's own context is what ends it.
 func newTestBeehive(t *testing.T, store Store, opts ...Option) *Beehive {
 	t.Helper()
 	bh, err := New(store, opts...)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-		defer cancel()
-		assert.NoError(t, bh.stop(ctx))
-	})
 	return bh
+}
+
+// tailerCount reads the live tailer count under the lock the refcount moves
+// under, since a subscriber releases its lease on its own goroutine.
+func tailerCount(bh *Beehive) int {
+	bh.tailMu.Lock()
+	defer bh.tailMu.Unlock()
+	return len(bh.tailers)
 }
 
 // mustCreate creates one object and fails the test if the create errors — the
