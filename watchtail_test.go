@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -521,6 +522,47 @@ func TestTailerRetriesAfterAFailedStep(t *testing.T) {
 
 	ev, err := rx.RecvContext(ctx)
 	require.NoError(t, err, "the tailer never retried the failed step")
+	assert.Equal(t, obj.ID, ev.Key)
+}
+
+// The cursor is shared, so a cursor below the retention horizon is not one
+// subscriber's problem: every subscriber ends and resubscribes onto a fresh
+// snapshot. Advancing the cursor instead would silently drop changes for all of
+// them.
+func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &flakyListStore{Store: newClientTestStore(t)}
+	bh, err := New(store, withWatchFloorInterval(fastTick))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// Every step fails while the log grows, so the cursor stays where it began.
+	store.failures.Store(math.MaxInt64)
+	tailer, rx := startTailer(t, bh, clientTestGK)
+	for i := range 3 {
+		mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
+	}
+	// Retention overtakes the cursor, then the store recovers.
+	_, err = store.ObjectWritesSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	store.failures.Store(0)
+
+	for {
+		_, err = rx.RecvContext(ctx)
+		if err != nil {
+			break
+		}
+	}
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.ErrorIs(t, tailer.failure(), ErrWatchTooOld)
+
+	// A tailer started now is above the horizon and works.
+	_, fresh := startTailer(t, bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, "after-reset", cSpec{})
+	ev, err := fresh.RecvContext(ctx)
+	require.NoError(t, err)
 	assert.Equal(t, obj.ID, ev.Key)
 }
 

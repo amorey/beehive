@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -84,11 +85,15 @@ type rawChange struct {
 // gate, log page and batched read once, and fans the result out to every watch
 // on the kind. One goroutine per kind, not per watch.
 type objectTailer struct {
-	bh     *Beehive
-	gk     GroupKind
-	hub    *conflate.Hub[ObjectID, rawChange]
-	wakes  *watch.Receiver[GroupKind, int64]
+	bh    *Beehive
+	gk    GroupKind
+	hub   *conflate.Hub[ObjectID, rawChange]
+	wakes *watch.Receiver[GroupKind, int64]
+	// cursor is the tailer's alone; only run touches it.
 	cursor int64
+	// failed records why the fan-out closed, for subscribers to report. Written
+	// before the sender closes, read after.
+	failed atomic.Pointer[error]
 }
 
 // newObjectTailer registers the wake receiver BEFORE reading the starting
@@ -136,6 +141,14 @@ func mergeRawChange(prev, next rawChange) (rawChange, bool) {
 	return next, true
 }
 
+// failure returns why the tailer ended, or nil when it ended with the beehive.
+func (t *objectTailer) failure() error {
+	if err := t.failed.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
 // run tails the kind's log until ctx ends, waking on a commit rather than a
 // tick. Everything at or below the starting cursor is a subscriber's snapshot
 // to report, not the tail's.
@@ -161,6 +174,16 @@ func (t *objectTailer) run(ctx context.Context) {
 
 		next := floor
 		if err := t.drain(ctx); err != nil {
+			// The cursor is shared, so a trimmed cursor ends every subscriber
+			// rather than one: advancing past the horizon would drop changes for
+			// all of them silently, and a shared reader has no one subscriber to
+			// hand the error to. The next watch starts a fresh tailer.
+			if errors.Is(err, ErrWatchTooOld) {
+				t.bh.log().Warn("watch tail fell below the retention horizon; ending its subscribers",
+					"kind", t.gk.Kind, "err", err)
+				t.failed.Store(&err)
+				return
+			}
 			t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
 			// Bounded backoff, capped at the floor: a transient failure recovers
 			// sooner than a floor tick, a persistent one costs no more.
