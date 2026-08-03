@@ -1,7 +1,7 @@
 # Every driver is a periodic scan of the store, on its own cadence
 
-- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `watchpoll.go`, `gc.go`, `options.go`.
-- **Date:** 2026-07-28
+- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `objectswatch.go`, `eventswatch.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md).
+- **Date:** 2026-07-28; watch tail amended 2026-08-03
 
 This record is the *why*. For the case-by-case map of what each driver actually
 covers — every trigger, where it is recorded, which driver finds it, whether it
@@ -34,6 +34,14 @@ rather than asserted at each site. Every driver in the table below fails the fir
 test by construction, because a second process can always write to the store. See
 [the schedule-watch ADR](2026-07-27-schedule-watch.md).
 
+**A wake in front of a scan is a weaker claim, and the watch tail has one.**
+A commit publishes its kind to a process-local hub, so a local write reaches
+subscribers without waiting for a tick. That hub sees only this process's
+writers, which is exactly why the scan stays: the floor tick covers a second
+process over the same file, a failed read, and a retention trim. The tail is a
+driver with a wake, not an exception to the rule.
+→ [ADR](2026-08-03-watch-shared-tail.md).
+
 | Driver | What it scans | Paced by | Default |
 | --- | --- | --- | --- |
 | Owed pass | unsettled specs, `reconcile_owed` | `withOwedPassInterval` (per-kind, unexported) | 30s |
@@ -41,15 +49,17 @@ test by construction, because a second process can always write to the store. Se
 | GC sweeper | `deletion_requested_at`, event retention, then free pages | `WithGCInterval` (global) | 30s |
 | Dependency waker | `resource_version` above a scan watermark | `withDependencyWakeInterval` (global, unexported) | 1s |
 | Stale dependents | targets above each dependent's watermark | `withStaleDependentsInterval` (global, unexported) | 60s |
-| Client watch | current state, diffed against last reported | `withWatchPollInterval` (global, unexported) | 1s |
+| Client watch | the kind's write log, above one shared cursor | `withWatchFloorInterval` (global, unexported), plus a commit wake | 30s |
+| Event watch | one object's event log, diffed against last reported | `withWatchPollInterval` (global, unexported) | 1s |
 
 They are separate cadences because they are separate jobs with sharply different
 cost curves, and one interval governing several would mean tuning any of them moves
-the rest. All six share two loop shapes in `internal/driver`: `driver.Run` (one cadence
-with an eager first pass — the GC sweeper, the waker, the stale-dependents pass,
-each watch) and `driver.TickerChan`
+the rest. They share two loop shapes in `internal/driver`: `driver.Run` (one cadence with
+an eager first pass — the GC sweeper, the waker, the stale-dependents pass, each
+event watch) and `driver.TickerChan`
 (a nil channel for a disabled cadence, for the reconciler's select over the owed
-*and* full passes). Keeping them together is what makes "a non-positive interval
+*and* full passes). The object tailer is the one loop outside them: it selects
+over its wake, its floor timer and its context, so neither shape fits. Keeping them together is what makes "a non-positive interval
 disables this driver" one answer rather than one per driver.
 
 ### The stale-dependents pass re-derives what the waker may have missed
@@ -142,21 +152,17 @@ kind wakers are the defect, not the alternative. If it ever bites, the shape is 
 small pool of drain goroutines partitioned by target id; unbuilt, and not worth the
 concurrency until a workload shows the stall.
 
-### Client watches poll and diff
+### The object watches share one tailer per kind
 
-The two object watches — `Watch` and `WatchList` — hold the
-`resource_version` of what they last reported and emit the difference: absent then
-present is `Added`, a moved version is `Modified`, present then absent is `Deleted`.
+`Watch` and `WatchList` no longer scan for themselves. One tailer per kind owns
+the kind's write-log cursor, and every watch on that kind subscribes to its
+fan-out, so reads scale with watched kinds rather than with watch count. A quiet
+tick is one read of the kind's log position; a busy one reads the entries above
+the cursor and then one batched read of current state. A commit wakes the
+tailer, so latency comes from the wake and the floor only bounds what a wake
+cannot reach. → [ADR](2026-08-03-watch-shared-tail.md).
 
-Most ticks pay nothing for that. `resource_version` is store-wide, so an unmoved
-cursor proves no row was created or modified anywhere, and the only thing it cannot
-see is a delete — a removed row draws no version. The steady-state poll is one
-scalar read plus one blob-free id listing, and the blob-bearing listing is paid only
-when the cursor moved or the id set shrank. A list watch does retain the decoded
-body of each object it has reported, for the tombstone a later delete needs; that is
-its memory cost.
-
-The other two watches share the interval and nothing else, so read the paragraph
+The other watches share nothing with it, so read the paragraph
 above as being about the object watches alone. `EventsWatch` also compares
 `resource_version`, but per run rather than per object, and its gate is **one number
 and no second read**: `EventsMaxVersion(ctx, id)`, the high-water mark of that one
@@ -190,16 +196,20 @@ process.
 `New`, kept so a `Beehive` assembled field-by-field (the `withoutGCSweeper()` test
 helper) has no sweeper instead of panicking in `NewTicker`.
 
-`withWatchPollInterval` is mandatory for a different reason: it is not a backstop but
-the delivery mechanism, and a watch that never polls is a stream that never emits —
-there is nothing such a value could mean.
+`withWatchPollInterval` is mandatory for a different reason: for `EventsWatch` it
+is not a backstop but the delivery mechanism, and a watch that never polls is a
+stream that never emits — there is nothing such a value could mean.
+`withWatchFloorInterval` is mandatory because it is the object tail's backstop in
+the ordinary sense: without it, a write whose wake this process never sees would
+leave subscribers stale for good.
 
 ## Only two cadences are public
 
 `WithFullPassInterval` and `WithGCInterval` are exported. The owed pass, the
-dependency waker, the stale-dependents pass and the watch poll keep their options
-unexported — `withOwedPassInterval`, `withDependencyWakeInterval`,
-`withStaleDependentsInterval`, `withWatchPollInterval` — reachable from the package's
+dependency waker, the stale-dependents pass, the watch tail and the event poll
+keep their options unexported — `withOwedPassInterval`,
+`withDependencyWakeInterval`, `withStaleDependentsInterval`,
+`withWatchFloorInterval`, `withWatchPollInterval` — reachable from the package's
 own tests and nowhere else.
 
 The split is not "cheap versus expensive"; it is **which cadences a caller has a

@@ -244,8 +244,7 @@ func TestDependencyRequeue(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Close() })
 
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, fast()...)
 
 	gk := GroupKind{Kind: "Widget"}
 	reconciled := make(chan *Object[tSpec, tStatus], 16)
@@ -356,8 +355,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
 
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, fast()...)
 
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &dependentController{observed: make(chan bool, 8)}
@@ -453,8 +451,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// than the one under test. Pushing it past the test's own timeout leaves the
 	// EdgesAdd stamp as the only thing that can requeue the dependent, which is what
 	// this is about.
-	bh, err := New(store, fast(withStaleDependentsInterval(time.Hour))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, fast(withStaleDependentsInterval(time.Hour))...)
 
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &dependentController{observed: make(chan bool, 8)}
@@ -629,13 +626,12 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store, fast()...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, fast()...)
 
 	gk := GroupKind{Kind: "Widget"}
 	reconciled := make(chan ObjectID, 8)
 	// Full pass off: an arriving pass must be the write's own wake, not a tick.
-	_, err = Register(bh, gk, &idCapture{ch: reconciled},
+	_, err := Register(bh, gk, &idCapture{ch: reconciled},
 		WithFullPassInterval(0), WithConcurrency(1))
 	require.NoError(t, err)
 
@@ -740,8 +736,7 @@ func TestSelfDrivenRecovery(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	bh, err := New(store, withOwedPassInterval(0), WithFullPassInterval(0))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withOwedPassInterval(0), WithFullPassInterval(0))
 	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
 	_, err = Register(bh, gk, ctrl, WithStartupFullPass(false))
 	require.NoError(t, err)
@@ -1348,8 +1343,7 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "Widget"}
 
 	// Inject an undecodable row directly (a valid create can always decode), then
@@ -1412,6 +1406,45 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 	_, err := tc.reconcile(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom, "a failed collect on a poison deleting row must surface for retry")
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
+}
+
+// deletingCollectErrorStore hands back a deletion-pending row that decodes, so
+// the reconcile itself runs and the collect that follows it is what fails.
+type deletingCollectErrorStore struct {
+	fakeStore
+}
+
+func (s *deletingCollectErrorStore) ObjectsGetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
+	deletedAt := time.Unix(1, 0)
+	return reconcileLoadOf(&RawObject{
+		ID: 1, Kind: "Widget", Spec: []byte(`{}`), DeletionRequestedAt: &deletedAt,
+	}, nil)
+}
+
+func (s *deletingCollectErrorStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
+	return nil, errBoom
+}
+
+// A collect that fails after a successful reconcile surfaces for retry, and
+// carries the controller's Result with it: the writes the pass committed stand,
+// so its RequeueAfter is still the right schedule to go back on.
+func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) {
+	bh := &Beehive{store: &deletingCollectErrorStore{}}
+	var called bool
+	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		called = true
+		return Result{RequeueAfter: time.Minute}, nil
+	}}
+	tc := &typedController[cSpec, cStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
+	}
+
+	result, err := tc.reconcile(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom, "a failed collect must surface so the pass is retried")
+	assert.True(t, called, "the row decoded, so the controller ran; only the collect failed")
+	assert.Equal(t, time.Minute, result.RequeueAfter, "the controller's schedule survives a failed collect")
 }
 
 // getObjectErrorStore returns an error from ObjectsGet to exercise path A in
@@ -1901,11 +1934,10 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &statusSettingController{reconciled: newSignal()}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1927,14 +1959,13 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &specEchoController{
 		firstDone:  newSignal(),
 		secondDone: newSignal(),
 	}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1962,14 +1993,13 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &deletionTrackingController{
 		reconciled: newSignal(),
 		deleted:    newSignal(),
 	}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1994,8 +2024,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &funcController{
 		signal: newSignal(),
@@ -2004,7 +2033,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 			return Result{}, errBoom
 		},
 	}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2040,11 +2069,10 @@ func (c *conditionSettingController) Reconcile(ctx context.Context, client Contr
 func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &conditionSettingController{reconciled: newSignal()}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2076,8 +2104,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	ctx := context.Background()
 
-	bh, err := New(newClientTestStore(t), fast(WithFullPassInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &funcController{
 		signal: newSignal(),
@@ -2086,7 +2113,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 			return Result{}, errBoom
 		},
 	}
-	_, err = Register(bh, clientTestGK, ctrl)
+	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2114,8 +2141,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
-	bh, err := New(store, WithFullPassInterval(0))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
 
 	ctrl := &statusSettingController{reconciled: newSignal()}
 	_, err = Register(bh, clientTestGK, ctrl)
@@ -2324,8 +2350,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 
 	ch := make(chan ObjectID, 4)
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
-	bh, err := New(store, withOwedPassInterval(0), withoutGCSweeper(), WithLogger(logger))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withOwedPassInterval(0), withoutGCSweeper(), WithLogger(logger))
 	opts = append(opts, WithStartupFullPass(false))
 	_, err = Register(bh, gk, &recordingController{reconciled: ch}, opts...)
 	require.NoError(t, err)
@@ -2406,8 +2431,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 
 	reconciled := make(chan ObjectID, 8)
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
-	bh, err := New(store, withOwedPassInterval(0), WithFullPassInterval(0), withoutGCSweeper(), WithLogger(logger))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withOwedPassInterval(0), WithFullPassInterval(0), withoutGCSweeper(), WithLogger(logger))
 	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
 	require.NoError(t, err)
 
@@ -2544,10 +2568,9 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, chan *Object[tSp
 
 	// The dependency waker is the only driver under test here, so it runs fast
 	// while everything else is pushed out of the way.
-	bh, err := New(store, WithGCInterval(time.Hour), withDependencyWakeInterval(fastTick))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, WithGCInterval(time.Hour), withDependencyWakeInterval(fastTick))
 	reconciled := make(chan *Object[tSpec, tStatus], 16)
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{ch: reconciled},
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{ch: reconciled},
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
 		WithStartupFullPass(false))

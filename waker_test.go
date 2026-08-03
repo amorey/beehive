@@ -33,8 +33,7 @@ import (
 // connection every writer shares.
 func TestStartWithNoControllersSkipsWaker(t *testing.T) {
 	store := &replayStore{rows: replayRows(1)}
-	bh, err := New(store, withDependencyWakeInterval(fastTick))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, withDependencyWakeInterval(fastTick))
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -697,8 +696,7 @@ func TestNewGivesTheWakerTheStoresCursorCapability(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	require.NotNil(t, bh.waker.cursors, "the sqlite store persists cursors, so the waker must have them")
 
 	// And the wiring carries all the way through a real seed and back.
@@ -733,11 +731,10 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 		watermarkSet: make(chan struct{}, 1),
 	}
 	// The waker off, so only re-derivation can reach the dependent.
-	bh, err := New(probe, fast(withDependencyWakeInterval(0))...)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, probe, fast(withDependencyWakeInterval(0))...)
 
 	reconciled := make(chan ObjectID, 8)
-	_, err = Register(bh, clientTestGK, &settlingCapture{ch: reconciled}, WithFullPassInterval(0))
+	_, err := Register(bh, clientTestGK, &settlingCapture{ch: reconciled}, WithFullPassInterval(0))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -773,9 +770,8 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 		Store:       newClientTestStore(t),
 		staleListed: make(chan struct{}, 1),
 	}
-	bh, err := New(probe, fast()...)
-	require.NoError(t, err)
-	_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	bh := newTestBeehive(t, probe, fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)

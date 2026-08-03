@@ -19,8 +19,14 @@ import "context"
 // gcCollect advances garbage collection for one object, in its own transaction.
 // It is a no-op unless the object is finalizing. For a finalizing object it
 // cascades deletion to owned children, then removes the row once no finalizers
-// and no incoming edges remain. Nothing is woken: every row it touches is
-// deletion-pending and the sweeper's next tick finds it.
+// and no incoming edges remain.
+//
+// No reconcile is woken: every row it touches is deletion-pending, and the
+// sweeper's next tick finds it. Watches are a different matter and are woken —
+// both the cascade's marks and the physical delete are the last the log will
+// say about those rows, so a subscriber that missed them would wait out a floor
+// tick for a change nothing else will report. The cascade wakes once per child
+// kind, since it is cross-kind.
 func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
 		obj, err := bh.store.ObjectsGetMeta(ctx, id)
@@ -32,8 +38,19 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Mark owned children for deletion; the mark puts them in the sweeper's listing.
-		if _, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id); err != nil {
+		// The children span kinds, so wake each child's own kind — deduped per
+		// kind: a wide cascade would otherwise queue one commit hook per row
+		// for wakes that coalesce anyway.
+		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
+		if err != nil {
 			return err
+		}
+		woken := make(map[GroupKind]bool, len(children))
+		for _, ch := range children {
+			if gk := ch.GroupKind(); !woken[gk] {
+				woken[gk] = true
+				bh.signalKindWritten(ctx, gk)
+			}
 		}
 
 		// The controller hasn't finished cleanup.
@@ -61,6 +78,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
 			return err
 		}
+		bh.signalKindWritten(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind})
 		deleted = true
 		return nil
 	})

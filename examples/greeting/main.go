@@ -118,7 +118,12 @@ func stopBeehive(stop func(context.Context) error) {
 // waitForConvergence drains watchCh until it sees a status-bearing event for id.
 func waitForConvergence(id int64, watchCh <-chan beehive.ObjectChange[GreetingSpec, GreetingStatus]) {
 	for evt := range watchCh {
-		if evt.Object.ID != id || evt.Object.Status == nil {
+		// Object is nil on Failed, and on a Deleted whose row image no longer
+		// decodes; evt.ID identifies the object either way.
+		if evt.Type == beehive.Failed {
+			log.Fatalf("watch ended: %v", evt.Err)
+		}
+		if evt.ID != id || evt.Object == nil || evt.Object.Status == nil {
 			continue
 		}
 		fmt.Printf("converged: %s\n", evt.Object.Status.Message)

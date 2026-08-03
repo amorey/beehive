@@ -191,7 +191,12 @@ func stopBeehive(stop func(context.Context) error) {
 // condition reports True.
 func waitForReady(id int64, watchCh <-chan beehive.ObjectChange[ServerSpec, ServerStatus]) {
 	for evt := range watchCh {
-		if evt.Object.ID != id {
+		// Object is nil on Failed, and on a Deleted whose row image no longer
+		// decodes; evt.ID identifies the object either way.
+		if evt.Type == beehive.Failed {
+			log.Fatalf("watch ended: %v", evt.Err)
+		}
+		if evt.ID != id || evt.Object == nil {
 			continue
 		}
 		printConditions(evt.Object)

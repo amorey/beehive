@@ -1,7 +1,7 @@
 # The schedule watch is an in-memory gauge, not a store stream
 
 - **Status:** Accepted — implemented in `workqueue.go` (the gauge and its hub),
-  `watchpoll.go`, `client.go`. **The gauge stays memory. The
+  `scheduleswatch.go`, `client.go`. **The gauge stays memory. The
   delivery changed: it is pushed, and it has no poll.** See "Superseded: the
   poll" below.
 - **Date:** 2026-07-27 (recorded retroactively); delivery amended 2026-08-01

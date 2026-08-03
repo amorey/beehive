@@ -63,3 +63,63 @@ func TestRunDoesNothingWhenDisabled(t *testing.T) {
 	})
 	assert.Zero(t, calls, "a non-positive interval runs no step at all")
 }
+
+// A cancelled wait returns at once and reports that the delay never elapsed.
+// Delays are capped at a driver's floor cadence, so a Wait that slept its full
+// interval would hold shutdown for that long in every retrying loop.
+func TestBackoffWaitReportsACancelledWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	b := Backoff{Base: testTimeout, Max: testTimeout}
+	done := make(chan bool, 1)
+	go func() { done <- b.Wait(ctx) }()
+
+	select {
+	case elapsed := <-done:
+		assert.False(t, elapsed, "a cancelled wait must not report its delay as elapsed")
+	case <-time.After(testTimeout):
+		t.Fatal("Wait slept its full delay instead of returning on cancellation")
+	}
+}
+
+// A prolonged outage must not walk the delay off the end of time.Duration.
+// Doubling past Max overflows cur to a negative, which Next reads as
+// uninitialized and answers with Base — dropping a failing driver back to its
+// shortest retry part way through the outage, and doing it again every time the
+// ladder climbs back. 37 doublings of a 100ms base is roughly 15 minutes at the
+// cap, so this is reachable rather than theoretical.
+func TestBackoffSaturatesRatherThanOverflowing(t *testing.T) {
+	const maxDelay = 30 * time.Second
+	b := Backoff{Base: 100 * time.Millisecond, Max: maxDelay}
+
+	var prev time.Duration
+	for i := range 200 { // well past the 37 that overflow
+		d := b.Next()
+		assert.Positive(t, d, "call %d", i+1)
+		assert.LessOrEqual(t, d, maxDelay, "call %d", i+1)
+		assert.GreaterOrEqual(t, d, prev, "call %d went backwards", i+1)
+		prev = d
+	}
+	assert.Equal(t, maxDelay, b.Next(), "saturated at Max")
+
+	// Reset still returns the ladder to the bottom, saturation notwithstanding.
+	b.Reset()
+	assert.Equal(t, 100*time.Millisecond, b.Next())
+}
+
+// The ladder below Max is unchanged by saturation: it doubles from Base and the
+// last step before the cap is the one that overshoots it.
+func TestBackoffDoublesUpToMax(t *testing.T) {
+	b := Backoff{Base: 100 * time.Millisecond, Max: 30 * time.Second}
+	var got []time.Duration
+	for range 11 {
+		got = append(got, b.Next())
+	}
+	assert.Equal(t, []time.Duration{
+		100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond,
+		800 * time.Millisecond, 1600 * time.Millisecond, 3200 * time.Millisecond,
+		6400 * time.Millisecond, 12800 * time.Millisecond, 25600 * time.Millisecond,
+		30 * time.Second, 30 * time.Second,
+	}, got)
+}

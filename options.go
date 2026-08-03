@@ -291,10 +291,10 @@ func withStaleDependentsInterval(d time.Duration) Option {
 	}
 }
 
-// withWatchPollInterval sets how often the store-backed Client watches
-// (Watch, WatchList, EventsWatch) poll. Global and meaningful
-// only at New; SchedulesWatch is not governed by it (that stream takes no
-// tick). Unexported: watch latency and resolution are part of the streams'
+// withWatchPollInterval sets how often EventsWatch polls. Global and
+// meaningful only at New; the object watches subscribe to their kind's tail
+// instead (see withWatchFloorInterval), and SchedulesWatch takes no tick at
+// all. Unexported: watch latency and resolution are part of the stream's
 // documented contract. It is both the latency a subscriber sees and the
 // resolution — changes within one interval coalesce, and an object created and
 // deleted inside one is never reported. Cannot be disabled: d <= 0 is rejected
@@ -307,6 +307,24 @@ func withWatchPollInterval(d time.Duration) Option {
 		}
 		if t, ok := target.(*Beehive); ok {
 			t.watchPollInterval = d
+		}
+		return nil
+	}
+}
+
+// withWatchFloorInterval sets how often a kind's tailer reads the log without
+// a wake. The wake covers this process's own writes; the floor covers what a
+// wake cannot — a writer in another process, a failed step, a retention trim.
+// Global and meaningful only at New, unexported for the same reason as
+// withWatchPollInterval. Cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption.
+func withWatchFloorInterval(d time.Duration) Option {
+	return func(target any) error {
+		if d <= 0 {
+			return fmt.Errorf("%w: withWatchFloorInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.watchFloorInterval = d
 		}
 		return nil
 	}

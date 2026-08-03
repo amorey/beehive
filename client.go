@@ -36,10 +36,19 @@ var ErrNoController = errors.New("beehive: no controller registered for kind")
 // snapshot.
 var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
 
-// ErrWatchLagged ends a watch whose subscriber fell behind its configured buffer
-// under LagFail. Reported on a Failed change, so a stalled consumer is told
-// rather than silently served stale changes forever.
-var ErrWatchLagged = errors.New("beehive: watch subscriber fell behind")
+// ErrWatchTooNew ends a resume whose position is above everything the kind's
+// log has held, which means the position did not come from this store — a
+// restored backup or a swapped file restarts the sequence. Reported on a Failed
+// change like ErrWatchTooOld, and answered the same way: subscribe again
+// without WithResumeFrom. Unreported, such a stream says "caught up" and then
+// drops every change until the sequence climbs past the position.
+var ErrWatchTooNew = errors.New("beehive: watch resumes above the write log's head")
+
+// ErrStopped ends a watch whose Beehive has stopped, reported on a Failed
+// change like ErrWatchTooOld. It is what separates shutdown from the caller
+// cancelling: resubscribing answers ErrWatchTooOld and cannot answer this one,
+// since a stopped Beehive does not start again.
+var ErrStopped = errors.New("beehive: the beehive has stopped")
 
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
 // objects have no natural name:
@@ -106,14 +115,25 @@ type ObjectListSnapshot[Spec, Status any] struct {
 }
 
 // ObjectChange reports a change to a watched object. On a Deleted change,
-// Object carries the row's final state. On a Failed change, Object is nil and
-// Err is non-nil: the stream is over, and a Failed change is always the last
-// value before the channel closes. A channel that closes with no Failed change
-// ended because the caller's context did.
+// Object carries the row's final state, or is nil when that state could not be
+// decoded — the removal is reported either way, because nothing later in the
+// log mentions a deleted id. On a Failed change, Object is nil and Err is
+// non-nil: the stream is over, and a Failed change is always the last value
+// before the channel closes — ErrWatchTooOld for a stream that fell behind
+// retention, ErrWatchTooNew for a resume position this store never issued,
+// ErrStopped for a Beehive that stopped. A channel that closes with
+// no Failed change ended because the caller's context did, so a supervisor may
+// treat that alone as its own cancellation.
 type ObjectChange[Spec, Status any] struct {
-	Type   ChangeType
-	Object *Object[Spec, Status]
-	Err    error
+	Type ChangeType
+	// ID is the object this change is about, set whether or not Object is. Zero
+	// on a Failed change.
+	ID ObjectID
+	// ResourceVersion is the log position this change was reported at, and what
+	// WithResumeFrom takes to continue from here. Zero on a Failed change.
+	ResourceVersion int64
+	Object          *Object[Spec, Status]
+	Err             error
 }
 
 // Client is the user-facing API for a single resource kind: creating, reading,
@@ -249,9 +269,10 @@ type Client[Spec, Status any] interface {
 	// above it: no overlap, no gap. A failed snapshot read is returned rather
 	// than handed back as a stream whose guarantee is void.
 	//
-	// Everything after is polled, which bounds latency and collapses changes
-	// within one interval. A watch cannot be opened inside a transaction (the
-	// read would deadlock on the single connection).
+	// Everything after comes from the kind's shared tailer: a commit wakes it,
+	// and a floor tick covers what a wake cannot. Delivery is latest-per-object,
+	// so changes to one object collapse. A watch cannot be opened inside a
+	// transaction (the read would deadlock on the single connection).
 	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 }
@@ -375,6 +396,7 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawOb
 	}
 	// A create always changes the object: there was nothing before it.
 	c.signalSpecWritten(ctx, raw.ID)
+	c.bh.signalKindWritten(ctx, c.gk)
 }
 
 // signalSpecWritten enqueues id's own reconcile once the write that changed its
@@ -489,6 +511,7 @@ func (c *clientImpl[Spec, Status]) update(
 		}
 		if changed {
 			c.signalSpecWritten(ctx, raw.ID)
+			c.bh.signalKindWritten(ctx, c.gk)
 		}
 		return nil
 	})
@@ -721,6 +744,35 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 	return nil
 }
 
+// sendOrDone delivers v unless ctx is cancelled first, and reports whether it
+// landed. Cancellation is checked first, on its own: once a reader parks on
+// out, both select arms are ready and Go picks at random — a subscriber that
+// gave up must not be handed one more value.
+func sendOrDone[V any](ctx context.Context, out chan<- V, v V) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	select {
+	case out <- v:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// pollFailed logs a failed poll and says whether to keep going: a transient
+// store error costs one tick, not the stream; a cancelled context is shutdown.
+func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, err error, args ...any) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	c.bh.log().WarnContext(ctx, "beehive: "+what+" poll failed; retrying on the next tick",
+		append([]any{"group", c.gk.Group, "kind", c.gk.Kind, "err", err}, args...)...)
+	return true
+}
+
 // The four lazy ref lookups read their edge query directly, with no scopedGet
 // kind guard: that guard was a second, blob-bearing read on a hot path. The
 // trade: a foreign id reads that kind's edges and a missing id reads empty —
@@ -795,9 +847,12 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// DeletionRequestsCreate bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
-	_, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	marked, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
+	}
+	if marked {
+		c.bh.signalKindWritten(ctx, c.gk)
 	}
 	// Nothing is scheduled: the mark is the signal, and the GC tick is
 	// guaranteed (WithGCInterval refuses to be disabled).
@@ -812,11 +867,15 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	if _, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name); err != nil {
+	marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
 		return err
+	}
+	if marked {
+		c.bh.signalKindWritten(ctx, c.gk)
 	}
 	return nil
 }

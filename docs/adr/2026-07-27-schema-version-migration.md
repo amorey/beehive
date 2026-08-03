@@ -57,7 +57,7 @@ so a kind can't be migrated on one path but not the other.
 ### Quarantine
 
 A failed conversion, a downgrade and a failed `json.Unmarshal` after conversion are
-all decode failures. `List` and the watch polls in `watchpoll.go` log the bad row and
+all decode failures. `List` and the watch reads in `objectswatch.go` log the bad row and
 skip it rather than failing the whole list or ending the stream. `Get` and
 `GetByName` still return the error.
 

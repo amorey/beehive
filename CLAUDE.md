@@ -31,6 +31,11 @@ go run ./examples/greeting/main.go   # the end-to-end smoke target
 go run ./examples/events/main.go     # Events API demo: a connection-health panel
 go test ./...
 go test -run TestName ./  # single test
+
+# Benchmarks live in *_bench_test.go and never run under `go test`; -bench opts
+# them in, and -run '^$' keeps the tests from running alongside them.
+go test -run '^$' -bench . -benchtime 2000x -count 3 ./
+go test -run '^$' -bench . -benchtime 1x ./   # smoke: compiles and runs each once
 ```
 
 ## Architecture
@@ -38,15 +43,17 @@ go test -run TestName ./  # single test
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.
 
 - **Nothing store-backed is pushed; every driver over the store is a periodic
-  scan** (`internal/driver`). Six drivers: the owed pass (unsettled specs plus
+  scan** (`internal/driver`). Seven drivers: the owed pass (unsettled specs plus
   `reconcile_owed`, per-kind, 30s), the full pass (`WithFullPassInterval`, off by
   default), the GC sweeper (`WithGCInterval`, **cannot be disabled**), the
   dependency waker (write log, 1s), the stale-dependents pass (60s, **cannot be
-  disabled**) and the watch poll (1s). Only `WithFullPassInterval` and
-  `WithGCInterval` are public; the other cadences are unexported options only
-  tests reach, and `Client.Requeue` is the public way to beat one. **No reconcile
-  may depend on either full pass** — both scale with the object count. The
-  schedule watch is the one push exception (see below).
+  disabled**), the object watch tail (`withWatchFloorInterval`, 30s, with a
+  commit wake in front) and the event watch poll (1s). Only
+  `WithFullPassInterval` and `WithGCInterval` are public; the other cadences are
+  unexported options only tests reach, and `Client.Requeue` is the public way to
+  beat one. **No reconcile may depend on either full pass** — both scale with the
+  object count. The schedule watch is the one push exception (see below); the
+  watch tail's wake is not one, because the floor tick stays.
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
@@ -74,14 +81,37 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   unlike the event log, because entries land at reconcile rate; what it trims is
   recorded per kind in `object_writes_horizon`, and that horizon is the resume
   boundary. → [ADR](docs/adr/2026-08-02-object-write-log.md)
-- **Client watches return a snapshot and tail that log** (`watchpoll.go`). A
-  quiet tick costs one read of the kind's log position
-  (`ObjectWritesMaxVersion`, which folds in the horizon so it only rises — gate
-  on `>`, not `!=`); a busy one reads the entries above the cursor and then one
-  batched `ObjectsListByIDs`. Entries coalesce per object and deliver in write
-  order. A cursor **below** the horizon (strictly: equality has lost nothing)
-  ends the stream with `ErrWatchTooOld`. `EventsWatch` still polls and diffs,
+- **Client watches return a snapshot and subscribe to their kind's shared
+  tailer** (`objectswatch.go`). One tailer per kind owns the cursor, so reads scale
+  with watched kinds, not watch count: a quiet read costs one
+  `ObjectWritesMaxVersion` (which folds in the horizon so it only rises — gate on
+  `>`, not `!=`), a busy one reads the entries above the cursor and then one
+  batched `ObjectsListByIDs`, draining until a page comes back short. A commit
+  wakes it (`signalKindWritten`, `AfterCommit`); the emit table is derived from
+  the store's write-log call sites, **not** from the public verbs — conditions
+  reach the log through `bumpObject`, and the owner cascade is routed by the refs
+  it returns. The fan-out is non-generic (`rawChange`) because two clients may
+  watch one kind with different type parameters; each subscriber decodes and
+  drops what its own snapshot already held. Delivery is latest-per-object, so an
+  `Added` may repeat for a snapshot object. **A batch is delivered ascending by
+  resource version** (`drainPending`), and that is load-bearing rather than
+  tidiness: a caller checkpoints a delivered change's version and resumes above
+  it, so a version delivered after a higher one would be skipped for good. The
+  merge coalesces in place, which leaves a re-written object at its original
+  queue position carrying a newer version — the one way the drain sees them out
+  of order. The batch's membership is one `TryRecvAll` cut, not a `TryRecv`
+  loop: everything pending as of one instant, so a later batch cannot carry a
+  lower version. Nothing is dropped in the merge. A cursor **below** the horizon
+  (strictly: equality has lost nothing) ends *every* subscriber with
+  `ErrWatchTooOld` and resets the tailer. **A tailer runs from its kind's first
+  watch to its last**: `tailerFor` hands back a subscriber lease and every
+  caller owes one `release`, with the count and the build both under `tailMu` —
+  the same lock the registry moves under, which is what closes the teardown
+  race. Presence in the registry is not health: a tailer that reset stays there
+  until its subscribers release, so `tailerFor` checks both or a resubscribe
+  rejoins the tailer that just failed. `EventsWatch` still polls and diffs,
   gated on `EventsMaxVersion`.
+  → [ADR](docs/adr/2026-08-03-watch-shared-tail.md)
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on
@@ -156,12 +186,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   category), extended when `(type, reason)` matches. Reads live on `Client`;
   retention runs in the GC sweeper. "Event" means this log and nothing else.
   → [ADR](docs/adr/2026-07-27-events-api.md)
-- **The schedule watch is an in-memory gauge and the one watch that does not
-  poll**: the `workQueue` publishes each move of its `gauge` to a `gobus/watch`
+- **The schedule watch is an in-memory gauge and the one watch with no tick at
+  all**: the `workQueue` publishes each move of its `gauge` to a `gobus/watch`
   hub. Sound only because the queue is unexported and process-local and the
   gauge reports every move from one type — give `workQueue` a second writer and
-  the poll has to come back. Streams end when the beehive stops, after the final
-  value. → [ADR](docs/adr/2026-07-27-schedule-watch.md)
+  the poll has to come back. (The object tail also has a wake, but it keeps a
+  floor tick, so it is a driver rather than an exception.) Streams end when the
+  beehive stops, after the final value.
+  → [ADR](docs/adr/2026-07-27-schedule-watch.md)
 
 ## Conventions
 
@@ -177,7 +209,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Whitebox tests**: tests go in `package beehive`, so they reach unexported
   machinery.
 - **Test files mirror source files, not features.** Shared helpers and fakes go
-  in `testutils_test.go`.
+  in `testutils_test.go`. Benchmarks mirror the same way but in
+  `<source>_bench_test.go`, so a semantics file never carries a load harness.
+  No build tag: `go test` already skips benchmarks, and a tag only hides them
+  from `go vet` until they stop compiling.
 - **Assertions use `stretchr/testify`**: `require` for preconditions, `assert`
   for independent checks.
 - **Synchronize on signals, never on sleeps.** The only use of `time` is a

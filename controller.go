@@ -87,26 +87,42 @@ type controllerClientImpl[Status any] struct {
 // Each mutator self-wraps in Within, joining the controller's own Within when
 // nested.
 
+// wakeAfter returns a store write's error, waking the kind's watches when the
+// write succeeded. Every mutator here that appends to the object write log ends
+// with it: forgetting the wake costs a floor tick of staleness rather than a
+// failure, so nothing else would catch it.
+//
+// EventsAdd is the one that does not, and must not: an event bumps no
+// resource_version, so it appends no entry for a watch to read.
+func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error) error {
+	if err != nil {
+		return err
+	}
+	c.bh.signalKindWritten(ctx, c.gk)
+	return nil
+}
+
 func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
 	b, err := json.Marshal(status)
 	if err != nil {
 		return err
 	}
-	return c.bh.store.ObjectsUpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
+	return c.wakeAfter(ctx, c.bh.store.ObjectsUpdateStatus(
+		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
 func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error {
-	return c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
+	return c.wakeAfter(ctx, c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
 		Reason:   condition.Reason,
 		Message:  condition.Message,
 		Liveness: condition.Liveness,
-	})
+	}))
 }
 
 func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error {
-	return c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType)
+	return c.wakeAfter(ctx, c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType))
 }
 
 func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error {
@@ -128,7 +144,7 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 }
 
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
-	return c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
+	return c.wakeAfter(ctx, c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer))
 }
 
 // DependenciesAdd is one store call, not a composition: the edge and the durable

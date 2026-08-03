@@ -16,6 +16,8 @@ package beehive
 
 import (
 	"context"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,8 +123,7 @@ func TestSweepFreePages(t *testing.T) {
 // its own.
 func TestGCSweeperDrainsFreePages(t *testing.T) {
 	store := &freePagesStore{Store: &fakeStore{}, called: make(chan int, 8)}
-	bh, err := New(store, WithGCInterval(time.Millisecond))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, WithGCInterval(time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -133,8 +134,7 @@ func TestGCSweeperDrainsFreePages(t *testing.T) {
 }
 
 func TestNewAppliesDefaults(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 	// Literals, not the constants: comparing a default to its own constant passes
 	// whatever the value is, so it would not notice a default changing. These four
 	// are the contract — cheap owed-work drain and GC on, both object-count-scaled
@@ -152,11 +152,10 @@ func TestNewPropagatesOptionError(t *testing.T) {
 }
 
 func TestRegisterStoresReconciler(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	r, ok := bh.reconcilers[gk]
@@ -168,24 +167,22 @@ func TestRegisterStoresReconciler(t *testing.T) {
 }
 
 func TestWithMigratorRegisters(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
 	mig := &fakeMigrator{specVersion: 2, statusVersion: 1}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
 	require.NoError(t, err)
 
 	assert.Same(t, mig, bh.migratorFor(gk), "the migrator passed to Register is installed for the kind")
 }
 
 func TestMigratorForReturnsNilWhenUnset(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	// Registered without WithMigrator.
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	assert.Nil(t, bh.migratorFor(gk), "a kind registered without a migrator has none")
@@ -193,19 +190,17 @@ func TestMigratorForReturnsNilWhenUnset(t *testing.T) {
 }
 
 func TestRegisterRejectsDuplicate(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.Error(t, err)
 }
 
 func TestRegisterRejectedAfterStart(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
 	defer stop(context.Background())
@@ -216,12 +211,11 @@ func TestRegisterRejectedAfterStart(t *testing.T) {
 
 func TestRegisterPerControllerOverride(t *testing.T) {
 	// Global default set at New; one controller overrides it, another inherits.
-	bh, err := New(&fakeStore{}, WithFullPassInterval(10*time.Second))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(10*time.Second))
 	assert.Equal(t, 10*time.Second, bh.fullPassInterval)
 
 	overridden := GroupKind{Kind: "Overridden"}
-	_, err = Register(bh, overridden, &noopController[tSpec, tStatus]{},
+	_, err := Register(bh, overridden, &noopController[tSpec, tStatus]{},
 		WithFullPassInterval(2*time.Second), WithMaxRetryInterval(7*time.Second))
 	require.NoError(t, err)
 
@@ -237,10 +231,9 @@ func TestRegisterPerControllerOverride(t *testing.T) {
 
 func TestStartStopLifecycle(t *testing.T) {
 	// Disable the full pass so the reconcile loop just blocks on ctx until Stop.
-	bh, err := New(&fakeStore{}, WithFullPassInterval(0))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -252,8 +245,7 @@ func TestStartStopLifecycle(t *testing.T) {
 }
 
 func TestStartRejectsSecondStart(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -263,10 +255,9 @@ func TestStartRejectsSecondStart(t *testing.T) {
 }
 
 func TestStopWithoutStartIsNoOp(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	// never started: must not panic, and reports no error.
@@ -274,10 +265,9 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 }
 
 func TestStopReturnsWithExpiredContext(t *testing.T) {
-	bh, err := New(&fakeStore{}, WithFullPassInterval(0))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -296,10 +286,9 @@ func TestStopReturnsWithExpiredContext(t *testing.T) {
 // Start: an already-cancelled start context makes Start bail before launching
 // the reconcile loops, returning an error and no stop function.
 func TestStartAbortsOnCancelledContext(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &fakeStore{})
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,9 +301,8 @@ func TestStartAbortsOnCancelledContext(t *testing.T) {
 }
 
 func TestRegisterPropagatesOptionError(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
+	bh := newTestBeehive(t, &fakeStore{})
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -323,8 +311,7 @@ func TestRegisterPropagatesOptionError(t *testing.T) {
 // second signal proves the ticker.C arm ran.
 func TestRunGCSweeperTicks(t *testing.T) {
 	store := &listProbeStore{Store: &fakeStore{}, gcSwept: make(chan struct{}, 8)}
-	bh, err := New(store, WithGCInterval(time.Millisecond))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store, WithGCInterval(time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -381,4 +368,81 @@ func TestSweepWriteLogRetention(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, page, 2)
 	})
+}
+
+// A second stop must not tear the watches down while the first is still
+// draining. state flips to stopped before the drain begins, so a call that finds
+// it — a retry after a drain timeout, a signal handler racing the first — is not
+// the one that owns the teardown: it returns without closing the wake hub, which
+// is what leaves every stream open for the writes the draining loops still owe.
+func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	stopFirst, err := bh.Start(ctx)
+	require.NoError(t, err)
+	mustCreate(t, ctx, client, "held", cSpec{})
+	<-ctrl.entered // the drain now has something to wait for
+
+	_, stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- stopFirst(ctx) }()
+
+	// stop takes ownership under bh.mu before it drains, so wait for that rather
+	// than racing it. A spin on observable state, not a sleep: it waits for the
+	// condition however long the scheduler takes to get there.
+	for deadline := time.Now().Add(testTimeout); ; runtime.Gosched() {
+		bh.mu.Lock()
+		owned := bh.state == beehiveStopped
+		bh.mu.Unlock()
+		if owned {
+			break
+		}
+		require.False(t, time.Now().After(deadline), "the first stop never took ownership")
+	}
+
+	// The second call must return without touching the wake hub. A live write
+	// arriving on the stream afterwards is the proof: a closed hub would have
+	// ended it instead.
+	require.NoError(t, bh.stop(ctx))
+	obj := mustCreate(t, ctx, client, "after-second-stop", cSpec{})
+	for {
+		ev := recv(t, stream)
+		require.NotEqual(t, Failed, ev.Type, "the second stop ended the stream: %v", ev.Err)
+		if ev.Object != nil && ev.Object.ID == obj.ID {
+			break
+		}
+	}
+
+	close(ctrl.release)
+	require.NoError(t, <-firstDone)
+	for range stream { // the first stop's close ends it, once its drain is done
+	}
+}
+
+// blockingController holds a reconcile loop open until release is closed, so a
+// test can keep a drain from finishing. It reports entering, since a drain only
+// blocks once a reconcile is actually in flight, and it does not watch ctx —
+// stop cancels that, which is exactly what must not end the wait.
+type blockingController[Spec, Status any] struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingController[Spec, Status]) Reconcile(context.Context, ControllerClient[Status], *Object[Spec, Status]) (Result, error) {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return Result{}, nil
 }

@@ -51,6 +51,11 @@ const (
 	defaultStaleDependentsInterval = 60 * time.Second
 	// The client's watch surface polls, so this is the latency a subscriber sees.
 	defaultWatchPollInterval = 1 * time.Second
+	// The watch tail reads on a commit wake, so this floor is not the latency
+	// of a local write — it bounds staleness for what a wake cannot cover.
+	defaultWatchFloorInterval = 30 * time.Second
+	// The first retry after a failed tail step; it doubles up to the floor.
+	watchRetryBase = 100 * time.Millisecond
 )
 
 type beehiveState uint8
@@ -76,6 +81,7 @@ type Beehive struct {
 	wakeInterval            time.Duration
 	staleDependentsInterval time.Duration
 	watchPollInterval       time.Duration
+	watchFloorInterval      time.Duration
 	concurrency             int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper. Zero on both
 	// disables the sweep.
@@ -100,8 +106,19 @@ type Beehive struct {
 	// reconciler) resolve through.
 	migrators map[GroupKind]Migrator
 	// order preserves registration order so Start launches loops deterministically.
-	order  []*reconciler
-	waker  *waker
+	order []*reconciler
+
+	waker *waker
+
+	// kindWriteHub is a message hub for GroupKind-scoped writes
+	kindWriteHub kindWriteHub
+
+	// tailers is one shared reader per watched kind, started on the kind's first
+	// watch and ended by its last. A tailer is here exactly while it has
+	// subscribers. Guarded by tailMu — never bh.mu; see tailerFor.
+	tailMu  sync.Mutex
+	tailers map[GroupKind]*objectTailer
+
 	state  beehiveState
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -257,36 +274,58 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 }
 
 // stop cancels the reconcile loops and waits for them to drain, bounded by ctx.
-// It returns non-nil only when the drain hit ctx's deadline. No-op if not
-// running.
+// It returns non-nil only when the drain hit ctx's deadline. No-op for the
+// reconcile loops if not running.
 func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Lock()
-	if bh.state != beehiveRunning {
+	// beehiveStopped means another call owns the teardown. Returning without
+	// closing the wake hub is the point: that call may still be draining, and
+	// closing here would end every watch before it sees what the draining loops
+	// write. A never-started Beehive falls through — it has no loops to drain,
+	// but it can have tailers, and this is what ends them.
+	if bh.state == beehiveStopped {
 		bh.mu.Unlock()
 		return nil
 	}
-	// Release bh.mu before waiting on wg: the waker (counted in wg) takes bh.mu
-	// to resolve reconcilers, so holding it across wg.Wait would deadlock.
+	running := bh.state == beehiveRunning
 	bh.state = beehiveStopped
-	bh.cancel()
-	bh.log().Info("control plane stopping")
+	if running {
+		// Release bh.mu before waiting on wg: the waker (counted in wg) takes
+		// bh.mu to resolve reconcilers, so holding it across wg.Wait would
+		// deadlock.
+		bh.cancel()
+		bh.log().Info("control plane stopping")
+	}
 	bh.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		bh.wg.Wait()
-		close(done)
-	}()
 	var drainErr error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		drainErr = ctx.Err()
+	if running {
+		done := make(chan struct{})
+		go func() {
+			bh.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			drainErr = ctx.Err()
+		}
 	}
 
-	// The store-backed client watches poll the store and are not counted in wg:
-	// each ends when its own context is cancelled. SchedulesWatch streams report
-	// the work queue instead and end here, after their final value.
+	// After the drain, so a stream whose caller is still reading sees what the
+	// draining reconcile loops wrote. That ordering is what the drain buys, and
+	// a drain that hit ctx's deadline does not buy it — the loops are still
+	// running, and the tailers are torn down anyway rather than leaked.
+	//
+	// This races a client write's AfterCommit wake, which watch.Sender.Close
+	// allows: the racing send either publishes or answers ErrClosed, never both
+	// and never partially. Which one wins is unspecified and nothing here needs
+	// it pinned, since every stream is ending.
+	bh.kindWriteHub.Close()
+
+	// The watch tailers are not counted in wg: each ends with its own last
+	// subscriber, or with the hub close above. SchedulesWatch streams
+	// report the work queue instead and end here, after their final value.
 	bh.log().Info("control plane stopped")
 	return drainErr
 }
@@ -303,9 +342,11 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeInterval:            defaultWakeInterval,
 		watchPollInterval:       defaultWatchPollInterval,
+		watchFloorInterval:      defaultWatchFloorInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),
+		kindWriteHub:            newKindWriteHub(),
 	}
 	cursors, _ := s.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
@@ -403,6 +444,20 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {
 			r.requeueNow(ref.ID)
 		}
+	})
+}
+
+// signalKindWritten wakes gk's tailer once a write to gk commits. The signal is
+// the kind, never the object: the tailer holds one cursor for the kind and reads
+// the log to learn what moved, so it carries no id and a burst of writes to one
+// kind collapses into one. AfterCommit for the same reasons as
+// signalRequeue: a rollback publishes nothing, and the wake cannot arrive before
+// the row is readable. Callers check that the write changed something only where
+// the store already reports it — an extra wake costs one position read, a missed
+// one costs up to a floor tick of staleness.
+func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		_ = bh.kindWriteHub.Send(gk) // ErrClosed after stop; nothing is left to wake
 	})
 }
 
