@@ -1408,6 +1408,45 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
 
+// deletingCollectErrorStore hands back a deletion-pending row that decodes, so
+// the reconcile itself runs and the collect that follows it is what fails.
+type deletingCollectErrorStore struct {
+	fakeStore
+}
+
+func (s *deletingCollectErrorStore) ObjectsGetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
+	deletedAt := time.Unix(1, 0)
+	return reconcileLoadOf(&RawObject{
+		ID: 1, Kind: "Widget", Spec: []byte(`{}`), DeletionRequestedAt: &deletedAt,
+	}, nil)
+}
+
+func (s *deletingCollectErrorStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
+	return nil, errBoom
+}
+
+// A collect that fails after a successful reconcile surfaces for retry, and
+// carries the controller's Result with it: the writes the pass committed stand,
+// so its RequeueAfter is still the right schedule to go back on.
+func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) {
+	bh := &Beehive{store: &deletingCollectErrorStore{}}
+	var called bool
+	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		called = true
+		return Result{RequeueAfter: time.Minute}, nil
+	}}
+	tc := &typedController[cSpec, cStatus]{
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
+	}
+
+	result, err := tc.reconcile(context.Background(), 1)
+	require.ErrorIs(t, err, errBoom, "a failed collect must surface so the pass is retried")
+	assert.True(t, called, "the row decoded, so the controller ran; only the collect failed")
+	assert.Equal(t, time.Minute, result.RequeueAfter, "the controller's schedule survives a failed collect")
+}
+
 // getObjectErrorStore returns an error from ObjectsGet to exercise path A in
 // typedController.reconcile (the ObjectsGet error before rawToTyped). Within is
 // inherited from fakeStore (inline passthrough).

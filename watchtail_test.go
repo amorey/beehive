@@ -606,6 +606,38 @@ func TestTailerStepToleratesAGateAheadOfTheLog(t *testing.T) {
 	assert.Zero(t, tailer.cursor, "a step that found nothing must not advance")
 }
 
+// failGateStore fails the log-position read once the tailer has built itself on
+// a successful one.
+type failGateStore struct {
+	Store
+	built atomic.Bool
+}
+
+func (s *failGateStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if s.built.Swap(true) {
+		return 0, errBoom
+	}
+	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+}
+
+// A failed gate read costs the step and nothing else: the cursor stays where it
+// was, so the entries this step never saw are still above it for the retry.
+func TestTailerStepReportsAFailedGateRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, &failGateStore{Store: newClientTestStore(t)}, withWatchFloorInterval(time.Hour))
+	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
+	require.NoError(t, err)
+	defer tailer.close()
+
+	at := tailer.cursor
+	n, err := tailer.step(ctx)
+	assert.ErrorIs(t, err, errBoom)
+	assert.Zero(t, n)
+	assert.Equal(t, at, tailer.cursor, "a failed step must not advance the cursor")
+}
+
 // A step that finds its fan-out closed stops publishing and reports no error:
 // the beehive is stopping, and a cursor left where it was is the next tailer's
 // to read.
@@ -674,6 +706,85 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 	defer rxAfter.Close()
 	_, err = rxAfter.RecvContext(ctx)
 	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+// A closed wake hub ends the tailer on its own. Stop closes the hub and cancels
+// the context together, so which arm of the select wins there is a coin toss —
+// this one leaves the context live, which is the only way to pin that a tailer
+// does not sit forever on a channel nobody will feed again.
+func TestTailerEndsWhenTheWakeHubCloses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	// Not the test's ctx: a context that outlives the hub is the point.
+	go func() {
+		defer close(done)
+		tailer.run(context.Background())
+	}()
+
+	bh.wakes.Close()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("the tailer outlived its wake hub")
+	}
+}
+
+// buildRaceStore runs a hook inside the store read newObjectTailer makes, which
+// is the window tailerFor holds no lock across — the one a rival start can win.
+type buildRaceStore struct {
+	Store
+	// Not a sync.Once: the hook re-enters this method, and a second Do from the
+	// same goroutine blocks on the first rather than skipping it.
+	fired atomic.Bool
+	hook  func()
+}
+
+func (s *buildRaceStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if s.hook != nil && s.fired.CompareAndSwap(false, true) {
+		s.hook()
+	}
+	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+}
+
+// The loser of a start race hands back the live tailer and discards its own, so
+// a kind never ends up with two readers of one cursor. Driven through the build
+// window rather than by racing goroutines: the losing branch needs a rival to
+// win between the two lock holds, which real parallelism produces only sometimes
+// and GOMAXPROCS=1 — how CI runs — never.
+func TestTailerForDiscardsTheLoserOfAStartRace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &buildRaceStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+
+	var winner *objectTailer
+	store.hook = func() {
+		// Reentrant on purpose, and safe: tailerFor holds no lock here.
+		var err error
+		winner, err = bh.tailerFor(ctx, clientTestGK)
+		require.NoError(t, err)
+	}
+
+	loser, err := bh.tailerFor(ctx, clientTestGK)
+	require.NoError(t, err)
+	require.NotNil(t, winner)
+	assert.Same(t, winner, loser, "the loser returned its own tailer instead of the live one")
+	assert.Len(t, bh.tailers, 1, "the discarded tailer stayed registered")
+
+	// And what it handed back is live, not the closed one it built.
+	rx := loser.hub.Receiver()
+	defer rx.Close()
+	obj := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "raced", cSpec{})
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, ev.Key)
 }
 
 // startTailer runs one tailer with a receiver attached, and tears both down with
