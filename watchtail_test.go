@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -475,6 +476,23 @@ func TestTailerMergeTable(t *testing.T) {
 	}
 }
 
+// A send the pending slot already covers keeps the pending value, and its queue
+// position with it. Driven directly: the tailer cannot send a key out of order —
+// one goroutine, a strictly advancing cursor, sequential state read-backs — so
+// this guard is defense in depth against a second producer that does not exist
+// yet, and only the merge can be asked whether it holds.
+func TestMergeRawChangeKeepsThePendingValueOnAStaleSend(t *testing.T) {
+	pending := rawChange{ID: 7, Op: WriteUpdate, ResourceVersion: 9}
+
+	for _, rv := range []int64{8, 9} {
+		t.Run(fmt.Sprintf("rv=%d", rv), func(t *testing.T) {
+			got, keep := mergeRawChange(pending, rawChange{ID: 7, Op: WriteDelete, ResourceVersion: rv})
+			assert.True(t, keep, "nothing annihilates")
+			assert.Equal(t, pending, got, "a stale send must not overwrite a newer pending value")
+		})
+	}
+}
+
 // A writer this process shares no memory with publishes no wake, so the floor
 // tick is what makes its write visible. Same store, second Beehive.
 func TestTailerFloorTickPicksUpAForeignWrite(t *testing.T) {
@@ -550,6 +568,62 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 	ev, err := fresh.RecvContext(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, obj.ID, ev.Key)
+}
+
+// gateAheadStore reports a log position no listing backs — the shape of a Store
+// that folds a wider counter into the gate, or that trims between the two reads.
+type gateAheadStore struct {
+	Store
+	ahead int64
+}
+
+func (s *gateAheadStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return at + s.ahead, err
+}
+
+// A gate above the cursor that no entry backs costs one empty listing, not an
+// index into an empty page. Store is a public extension point, so the two reads
+// agreeing is a contract the tail cannot assume.
+func TestTailerStepToleratesAGateAheadOfTheLog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, &gateAheadStore{Store: newClientTestStore(t), ahead: 1000})
+	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
+	require.NoError(t, err)
+	defer tailer.close()
+
+	// Below the gate the empty log now reports, and above the horizon.
+	tailer.cursor = 0
+
+	n, err := tailer.step(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, n)
+	assert.Zero(t, tailer.cursor, "a step that found nothing must not advance")
+}
+
+// A step that finds its fan-out closed stops publishing and reports no error:
+// the beehive is stopping, and a cursor left where it was is the next tailer's
+// to read.
+func TestTailerStepStopsWhenTheFanOutIsClosed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t))
+	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
+	require.NoError(t, err)
+	defer tailer.close()
+
+	// Written after the tailer read its cursor, so the step has a page to publish.
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "unpublishable", cSpec{})
+	at := tailer.cursor
+	tailer.hub.Sender().Close()
+
+	n, err := tailer.step(ctx)
+	assert.NoError(t, err, "a closed fan-out is shutdown, not a failure to retry")
+	assert.Zero(t, n)
+	assert.Equal(t, at, tailer.cursor, "a step that could not publish must not advance")
 }
 
 // Tailers are lazy, one per kind, and end with the beehive — started or not.
@@ -961,5 +1035,366 @@ func TestWatchGoroutinesDrainOnStop(t *testing.T) {
 		for range ch { // drains whatever was in flight, then ends
 		}
 		assert.NotPanics(t, func() { <-ch }, "stream %d is closed", i)
+	}
+}
+
+// failingLoadStore fails every batched relation read, and reports when it first
+// did so a test can act on the retry rather than wait for it.
+type failingLoadStore struct {
+	Store
+	once  sync.Once
+	tried chan struct{}
+}
+
+func (s *failingLoadStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
+	s.once.Do(func() { close(s.tried) })
+	return nil, errBoom
+}
+
+// A failed relation load is retried, not skipped: the entries it covers are
+// already behind the cursor, so no later read brings them back and a skip is a
+// change the subscriber never hears about. The ladder ends with the caller's
+// context — on the live path and on a resume's replay, which decode their
+// batches the same way.
+func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		resume bool
+	}{
+		{name: "live"},
+		{name: "resume", resume: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			store := &failingLoadStore{Store: newClientTestStore(t), tried: make(chan struct{})}
+			bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+			var ch <-chan ObjectChange[cSpec, cStatus]
+			var err error
+			if tc.resume {
+				at, mErr := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+				require.NoError(t, mErr)
+				mustCreate(t, ctx, client, "gapped", cSpec{})
+				_, ch, err = client.WatchList(ctx, WithResumeFrom(at), WithLoads(LoadOwner()))
+				require.NoError(t, err)
+			} else {
+				_, ch, err = client.WatchList(ctx, WithLoads(LoadOwner()))
+				require.NoError(t, err)
+				mustCreate(t, ctx, client, "live", cSpec{})
+			}
+
+			<-store.tried // on the ladder, and nothing delivered without its relations
+			cancel()
+			for range ch { // the stream ends rather than parking on a send
+			}
+		})
+	}
+}
+
+// resumeListStore intercepts the replay's paged read of the gap above from. The
+// resume check reads one entry and the kind's tailer starts above the gap, so
+// neither collides with it.
+type resumeListStore struct {
+	Store
+	from int64
+	// fail fails the next replay read; failAll fails every one of them.
+	fail    atomic.Bool
+	failAll atomic.Bool
+	trim    atomic.Bool
+	// tried and served report the first failed and the first successful replay
+	// read, so a test acts on the read rather than waiting for it.
+	tried, served         chan struct{}
+	triedOnce, servedOnce sync.Once
+}
+
+func newResumeListStore(t *testing.T) *resumeListStore {
+	t.Helper()
+	return &resumeListStore{
+		Store:  newClientTestStore(t),
+		tried:  make(chan struct{}),
+		served: make(chan struct{}),
+	}
+}
+
+func (s *resumeListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	replay := afterRV == s.from && limit == tailPageCap
+	if replay && (s.failAll.Load() || s.fail.CompareAndSwap(true, false)) {
+		s.triedOnce.Do(func() { close(s.tried) })
+		return nil, 0, errBoom
+	}
+	page, trimmedThrough, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	if replay {
+		s.servedOnce.Do(func() { close(s.served) })
+		if s.trim.Load() {
+			trimmedThrough = afterRV + 1 // retention overtook the replay mid-page
+		}
+	}
+	return page, trimmedThrough, err
+}
+
+// A transient read costs the replay a retry, not the stream: the cursor has not
+// moved, so the gap is still there to read.
+func TestWatchResumeRetriesAFailedGapRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := newResumeListStore(t)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+	store.from = at
+	missed := mustCreate(t, ctx, client, "missed", cSpec{})
+	store.fail.Store(true)
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, missed.ID, ev.Object.ID, "the gap was dropped instead of retried")
+	assert.False(t, store.fail.Load(), "the test never exercised the failure it set up")
+}
+
+// Retention can overtake a replay that is still paging. The subscriber is told,
+// because a stream that silently skipped the trimmed entries would look like one
+// that had caught up.
+func TestWatchResumeEndsWhenRetentionOvertakesIt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := newResumeListStore(t)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+	store.from = at
+	mustCreate(t, ctx, client, "trimmed", cSpec{})
+	store.trim.Store(true)
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err, "the resume check reads its own entry and still passes")
+
+	ev := recv(t, ch)
+	assert.Equal(t, Failed, ev.Type)
+	assert.ErrorIs(t, ev.Err, ErrWatchTooOld)
+	_, ok := <-ch
+	assert.False(t, ok, "a Failed change is the last value before the channel closes")
+}
+
+// failListByIDsStore fails the next batched state read, or every one of them,
+// and reports the first failure.
+type failListByIDsStore struct {
+	Store
+	fail      atomic.Bool
+	failAll   atomic.Bool
+	tried     chan struct{}
+	triedOnce sync.Once
+}
+
+func newFailListByIDsStore(t *testing.T) *failListByIDsStore {
+	t.Helper()
+	return &failListByIDsStore{Store: newClientTestStore(t), tried: make(chan struct{})}
+}
+
+func (s *failListByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+	if s.failAll.Load() || s.fail.CompareAndSwap(true, false) {
+		s.triedOnce.Do(func() { close(s.tried) })
+		return nil, errBoom
+	}
+	return s.Store.ObjectsListByIDs(ctx, gk, ids)
+}
+
+// The state read behind a replayed page is retried on the same ladder as the
+// page itself, and for the same reason.
+func TestWatchResumeRetriesAFailedStateRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := newFailListByIDsStore(t)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+	missed := mustCreate(t, ctx, client, "missed", cSpec{})
+	// Set last: the tailer this watch starts reads no state of its own, so the
+	// replay's read is the first.
+	store.fail.Store(true)
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, missed.ID, ev.Object.ID)
+	assert.False(t, store.fail.Load(), "the test never exercised the failure it set up")
+}
+
+// A resume with nothing above it replays an empty gap and goes live at once.
+func TestWatchResumeWithNoGapGoesLiveAtOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := newResumeListStore(t)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+	store.from = at
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	// The write waits for the gap read, which would otherwise be the one that
+	// returns it — an empty gap is the case under test.
+	<-store.served
+	live := mustCreate(t, ctx, client, "live", cSpec{})
+	ev := recv(t, ch)
+	assert.Equal(t, live.ID, ev.Object.ID)
+}
+
+// A single-object resume filters the page before the state read, not after: the
+// replay of a busy gap costs one object's read rather than the whole page's.
+func TestWatchSingleObjectResumeReplaysOnlyItsID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &countingLoadByIDsStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+
+	_, err = client.Update(ctx, mine.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	for i := range 3 {
+		mustCreate(t, ctx, client, fmt.Sprintf("other-%d", i), cSpec{})
+	}
+
+	_, ch, err := client.Watch(ctx, mine.ID, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, mine.ID, ev.Object.ID)
+	assert.Equal(t, "b", ev.Object.Spec.Val, "current state, not the version at the resume position")
+	assert.Equal(t, []int{1}, store.batchSizes(), "the replay read back the whole page")
+
+	// And the ids it filtered out stay out, rather than arriving late.
+	_, err = client.Update(ctx, mine.ID, cSpec{Val: "c"})
+	require.NoError(t, err)
+	ev = recv(t, ch)
+	assert.Equal(t, mine.ID, ev.Object.ID)
+}
+
+// countingLoadByIDsStore records the size of every batched state read.
+type countingLoadByIDsStore struct {
+	Store
+	mu    sync.Mutex
+	sizes []int
+}
+
+func (s *countingLoadByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+	s.mu.Lock()
+	s.sizes = append(s.sizes, len(ids))
+	s.mu.Unlock()
+	return s.Store.ObjectsListByIDs(ctx, gk, ids)
+}
+
+func (s *countingLoadByIDsStore) batchSizes() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.sizes)
+}
+
+// A replay delivers on the subscriber's own goroutine, so a caller that gives up
+// mid-gap ends the stream there rather than leaving it parked on a send nobody
+// will take.
+func TestWatchResumeStopsDeliveringWhenTheCallerGivesUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+	for i := range 2 {
+		mustCreate(t, ctx, client, fmt.Sprintf("gap-%d", i), cSpec{})
+	}
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	recv(t, ch) // the first of the gap; the second is now blocked on the send
+	cancel()
+	for range ch { // the stream ends rather than parking on a send
+	}
+}
+
+// A replay that cannot read gives up with the caller rather than on its own:
+// each failure costs a rung of the ladder, and the ladder ends when the context
+// does. Both reads behind a replayed page answer to it.
+func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// failAll arms the store to fail one of the replay's two reads forever,
+		// and returns the channel that reports the first failure.
+		failAll  func(*resumeListStore, *failListByIDsStore) chan struct{}
+		newStore func(*testing.T) (Store, *resumeListStore, *failListByIDsStore)
+	}{
+		{
+			name: "gap read",
+			newStore: func(t *testing.T) (Store, *resumeListStore, *failListByIDsStore) {
+				s := newResumeListStore(t)
+				return s, s, nil
+			},
+			failAll: func(gap *resumeListStore, _ *failListByIDsStore) chan struct{} {
+				gap.failAll.Store(true)
+				return gap.tried
+			},
+		},
+		{
+			name: "state read",
+			newStore: func(t *testing.T) (Store, *resumeListStore, *failListByIDsStore) {
+				s := newFailListByIDsStore(t)
+				return s, nil, s
+			},
+			failAll: func(_ *resumeListStore, state *failListByIDsStore) chan struct{} {
+				state.failAll.Store(true)
+				return state.tried
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			store, gap, state := tc.newStore(t)
+			bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+			at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+			require.NoError(t, err)
+			if gap != nil {
+				gap.from = at
+			}
+			mustCreate(t, ctx, client, "gapped", cSpec{})
+
+			tried := tc.failAll(gap, state)
+			_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+			require.NoError(t, err, "the resume check reads one entry and still passes")
+
+			<-tried // on the ladder, with the gap still unread
+			cancel()
+			for range ch { // the stream ends rather than parking on a send
+			}
+		})
 	}
 }

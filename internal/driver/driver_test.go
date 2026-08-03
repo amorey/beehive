@@ -63,3 +63,22 @@ func TestRunDoesNothingWhenDisabled(t *testing.T) {
 	})
 	assert.Zero(t, calls, "a non-positive interval runs no step at all")
 }
+
+// A cancelled wait returns at once and reports that the rung never elapsed. The
+// rungs are capped at a driver's floor cadence, so a Wait that slept out its
+// interval would hold shutdown for that long on every retrying loop.
+func TestBackoffWaitReportsACancelledWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	b := Backoff{Base: testTimeout, Max: testTimeout}
+	done := make(chan bool, 1)
+	go func() { done <- b.Wait(ctx) }()
+
+	select {
+	case elapsed := <-done:
+		assert.False(t, elapsed, "a cancelled wait must not report its rung as elapsed")
+	case <-time.After(testTimeout):
+		t.Fatal("Wait slept out its rung instead of returning on cancellation")
+	}
+}

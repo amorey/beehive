@@ -189,6 +189,29 @@ func TestWatchPollIntervalRejectsNonPositive(t *testing.T) {
 	}
 }
 
+// TestWatchFloorIntervalRejectsNonPositive pins the tail's floor cadence. The
+// wake carries freshness, so a disabled floor would still deliver this process's
+// own writes — and silently drop what only the floor covers: a second writer over
+// the store, a step that failed, a retention trim.
+func TestWatchFloorIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{watchFloorInterval: time.Minute}
+			err := withWatchFloorInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "withWatchFloorInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.watchFloorInterval, "a rejected option must not have written")
+
+			// Checked before the target switch, like the two above it.
+			require.ErrorIs(t, withWatchFloorInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, withWatchFloorInterval(d)("unrelated"), ErrInvalidOption)
+
+			_, err = New(&fakeStore{}, withWatchFloorInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
+}
+
 // TestStaleDependentsIntervalRejectsNonPositive pins the third mandatory
 // interval, and the one with the strongest claim to be mandatory: the
 // stale-dependents pass is what makes a dependency wake a guarantee rather than a
