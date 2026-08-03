@@ -3100,6 +3100,50 @@ func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
 	assert.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
 }
 
+// TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
+// The stale-dependents pass enqueues in memory, and a restart loses that; the
+// stamp is what survives.
+func TestReconcileOwedStampRecordsFindings(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+
+	require.NoError(t, store.ReconcileOwedStamp(ctx, nil), "no refs writes nothing")
+
+	refs := []beehive.ObjectRef{
+		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
+	}
+	require.NoError(t, store.ReconcileOwedStamp(ctx, refs))
+	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID))
+	assert.Equal(t, int64(1), reconcileOwed(t, store, b.ID))
+
+	// Two sweeps that both found the dependent owe two wakes. One pass drains
+	// both, because the decrement subtracts the count it observed.
+	require.NoError(t, store.ReconcileOwedStamp(ctx, refs[:1]))
+	assert.Equal(t, int64(2), reconcileOwed(t, store, a.ID))
+}
+
+// TestReconcileOwedStampSkipsVanishedRows: a dependent can be collected between
+// the listing that found it and the stamp. There is nothing left to owe a wake
+// to, which is not a fault.
+func TestReconcileOwedStampSkipsVanishedRows(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
+
+	err := store.ReconcileOwedStamp(ctx, []beehive.ObjectRef{
+		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), reconcileOwed(t, store, b.ID), "the surviving ref is still stamped")
+}
+
 func TestReconcileOwedQueryErrors(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()

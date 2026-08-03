@@ -891,12 +891,31 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 	return scanIDs(rows)
 }
 
+// ReconcileOwedStamp stamps a page of findings in one statement (contract on
+// storeapi.Store). One UPDATE over an id list, not one per row: the stale
+// pass stamps a whole page at a time.
+//
+// A missing id matches no row, which is how vanished dependents are skipped.
+func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.ObjectRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	args := make([]any, len(refs))
+	for i, ref := range refs {
+		args[i] = ref.ID
+	}
+	_, err := s.conn(ctx).ExecContext(ctx,
+		`UPDATE objects SET reconcile_owed = reconcile_owed + 1
+		  WHERE id IN (`+placeholders(len(refs))+`)`, args...)
+	return err
+}
+
 // ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs
 // on the owed-wake count; the decrement floors at 0 (contract on storeapi.Store).
 //
 // The increment is deliberately not on that interface: production wakes come
-// from EdgesAdd, whose stamp must be indivisible from the edge insert. It stays
-// here so tests can seed a count.
+// from EdgesAdd, whose stamp must be indivisible from the edge insert, and from
+// ReconcileOwedStamp. It stays here so tests can seed a count.
 func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)

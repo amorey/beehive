@@ -362,6 +362,12 @@ func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID
 func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	panic("not implemented: fakeStore.ReconcileOwedDecrement")
 }
+
+// ReconcileOwedStamp answers nil like the listings above it: the stale-dependents
+// driver stamps what it finds, so a panic would break every Start.
+func (s *fakeStore) ReconcileOwedStamp(context.Context, []storeapi.ObjectRef) error {
+	return nil
+}
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }

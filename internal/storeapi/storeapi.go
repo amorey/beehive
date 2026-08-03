@@ -486,9 +486,15 @@ type Store interface {
 	// ordered by id — the inverse of EdgesListIncoming.
 	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
-	// There is deliberately no standalone reconcile_owed increment: EdgesAdd
-	// produces stamps (atomically with the edge) and ReconcileOwedDecrement
-	// consumes them. Add one only when a producer other than EdgesAdd exists.
+	// ReconcileOwedStamp increments reconcile_owed for each ref, so a finding
+	// outlives the in-memory queue it was also enqueued on. An id that is gone
+	// is skipped rather than reported: a dependent can be collected between the
+	// listing that found it and this write. Empty refs writes nothing. Bumps no
+	// resource_version.
+	//
+	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
+	// store's own listing, which spans every registered kind in one page.
+	ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error
 
 	// ReconcileOwedDecrement subtracts observed from id's reconcile_owed,
 	// floored at 0. Callers pass the count they loaded, not 1: one pass
