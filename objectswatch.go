@@ -745,9 +745,15 @@ func drainPending(first rawChange, rx *conflate.Receiver[ObjectID, rawChange]) [
 	return batch
 }
 
-// decodeBatch is decodeChanges with the relation load retried instead of
-// skipped: the tailer's cursor has already moved past these entries, so no
-// later read brings them back. It reports false only when ctx ended.
+// decodeBatch decodes the batch and loads its relations, retrying the load
+// instead of skipping it: the tailer's cursor has already moved past these
+// entries, so no later read brings them back. It reports false only when ctx
+// ended.
+//
+// Only the load is retried. Decoding is pure and cannot fail the call, so
+// repeating it would re-unmarshal and re-migrate a whole page — up to
+// tailPageCap objects — on every backoff step, and re-log every quarantined row
+// with it.
 func (c *clientImpl[Spec, Status]) decodeBatch(
 	ctx context.Context,
 	batch []rawChange,
@@ -755,9 +761,10 @@ func (c *clientImpl[Spec, Status]) decodeBatch(
 	cfg watchConfig,
 	floor int64,
 ) ([]ObjectChange[Spec, Status], bool) {
+	changes, loaded := c.decodeChanges(batch, mig, cfg, floor)
 	retry := c.bh.watchBackoff()
 	for {
-		changes, err := c.decodeChanges(ctx, batch, mig, cfg, floor)
+		err := c.loadListRelated(ctx, loaded, cfg.loads)
 		if err == nil {
 			return changes, true
 		}
@@ -768,14 +775,16 @@ func (c *clientImpl[Spec, Status]) decodeBatch(
 }
 
 // decodeChanges turns raw changes into typed ones, dropping entries the
-// caller's snapshot already covered and skipping rows that do not decode.
+// caller's snapshot already covered and skipping rows that do not decode. It
+// cannot fail — an undecodable row is quarantined, never reported — so it takes
+// no context and returns none. loaded is the subset whose relations the caller
+// still has to read.
 func (c *clientImpl[Spec, Status]) decodeChanges(
-	ctx context.Context,
 	batch []rawChange,
 	mig Migrator,
 	cfg watchConfig,
 	floor int64,
-) ([]ObjectChange[Spec, Status], error) {
+) ([]ObjectChange[Spec, Status], []*Object[Spec, Status]) {
 	changes := make([]ObjectChange[Spec, Status], 0, len(batch))
 	// Deleted objects have no relations to load: the edges went with the row.
 	var loaded []*Object[Spec, Status]
@@ -806,10 +815,7 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 			loaded = append(loaded, obj)
 		}
 	}
-	if err := c.loadListRelated(ctx, loaded, cfg.loads); err != nil {
-		return nil, err
-	}
-	return changes, nil
+	return changes, loaded
 }
 
 // replay delivers the gap between a resume's position and the tail, in pages —

@@ -3193,3 +3193,63 @@ func TestResumeHeadCheckRetryEndsWithTheCaller(t *testing.T) {
 		require.NotEqual(t, Failed, got.Type, "a cancelled caller gets a silent close")
 	}
 }
+
+// countingLoadFailStore fails the batched relation read a fixed number of times
+// and then succeeds, so a test can watch the retry loop go round and finish.
+type countingLoadFailStore struct {
+	Store
+	failuresLeft atomic.Int64
+}
+
+func (s *countingLoadFailStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+	if s.failuresLeft.Add(-1) >= 0 {
+		return nil, errBoom
+	}
+	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+}
+
+// Only the relation load is retried. Decoding is pure and cannot fail the call,
+// so a batch that repeated it would re-unmarshal and re-migrate every object in
+// the page — up to tailPageCap of them — on each backoff step, and re-log every
+// quarantined row with it.
+func TestWatchLoadRetryDecodesOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	var decodes atomic.Int64
+	mig := &fakeMigrator{
+		specVersion: 1,
+		convertSpec: func(_ int, raw json.RawMessage) (json.RawMessage, error) {
+			decodes.Add(1)
+			return raw, nil
+		},
+	}
+
+	const failures = 2
+	store := &countingLoadFailStore{Store: newClientTestStore(t)}
+	store.failuresLeft.Store(failures)
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, WithMigrator(mig))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	// Watch first: an object created before this is in the snapshot, which
+	// decodes on its own path.
+	_, ch, err := client.WatchList(ctx, WithLoads(LoadOwner()))
+	require.NoError(t, err)
+	decodes.Store(0)
+
+	// Written through the store, so the row carries no schema version and the
+	// migrator has something to convert. A Create would stamp the current one.
+	spec, err := json.Marshal(cSpec{Val: "a"})
+	require.NoError(t, err)
+	obj, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: "w1", Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
+
+	ev := recv(t, ch)
+	require.Equal(t, obj.ID, ev.ID)
+
+	assert.Zero(t, store.failuresLeft.Load()+1, "the load did not exhaust its failures")
+	assert.Equal(t, int64(1), decodes.Load(), "the batch was decoded once per attempt")
+}
