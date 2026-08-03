@@ -656,22 +656,66 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		defer close(out)
 		defer tailer.release()
 		defer rx.Close()
+
+		// work ends when the caller's ctx does or when the tailer stops. Every
+		// read and retry below runs under it: they retry a failing store until
+		// their context ends, so on the caller's ctx alone a store that keeps
+		// failing past stop would hold this goroutine — and its lease — forever,
+		// and the stream would never report ErrStopped. The lease is what makes
+		// tailer.ctx unambiguous here: no other subscriber can end the tailer
+		// while this one holds it, so a cancel means the tailer itself stopped.
+		work, stopWork := mergeDone(ctx, tailer.ctx)
+		defer stopWork()
+
+		// One place sends the terminal Failed change; see endStream.
 		if cfg.resumeFrom != nil {
-			at, ok := c.replay(ctx, mig, cfg, only, floor, out)
+			at, fail, ok := c.replay(work, mig, cfg, only, floor, out)
 			if !ok {
+				c.endStream(ctx, tailer, fail, out)
 				return
 			}
 			floor = at
 		}
-		c.consume(ctx, tailer, rx, mig, cfg, floor, out)
+		c.consume(ctx, work, tailer, rx, mig, cfg, floor, out)
 	}()
 	return snap, out, nil
 }
 
-// consume delivers what the tailer publishes above floor until ctx ends or the
-// fan-out closes.
+// mergeDone returns a context that ends when either parent does. The returned
+// func must be called to release the watch on second.
+func mergeDone(first, second context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(first)
+	stop := context.AfterFunc(second, cancel)
+	return ctx, func() { stop(); cancel() }
+}
+
+// endStream sends the one Failed change a stream is allowed, or nothing when
+// the caller's own context ended — a silent close is how that case is reported,
+// so a supervisor can tell its own cancellation from everything else. fail is
+// what the subscriber discovered itself; absent that, the tailer says why.
+func (c *clientImpl[Spec, Status]) endStream(
+	ctx context.Context,
+	tailer *objectTailer,
+	fail error,
+	out chan<- ObjectChange[Spec, Status],
+) {
+	if ctx.Err() != nil {
+		return
+	}
+	if fail == nil {
+		fail = tailer.failure()
+	}
+	if fail != nil {
+		sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: fail})
+	}
+}
+
+// consume delivers what the tailer publishes above floor until the fan-out
+// closes or work ends. ctx is the caller's, for reporting; work also ends when
+// the tailer does, so a retry cannot outlive it.
 func (c *clientImpl[Spec, Status]) consume(
 	ctx context.Context,
+	work context.Context,
 	tailer *objectTailer,
 	rx *conflate.Receiver[ObjectID, rawChange],
 	mig Migrator,
@@ -680,22 +724,17 @@ func (c *clientImpl[Spec, Status]) consume(
 	out chan<- ObjectChange[Spec, Status],
 ) {
 	for {
-		ev, err := rx.RecvContext(ctx)
+		ev, err := rx.RecvContext(work)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			// The fan-out closed. A tailer that fell below the retention
-			// horizon reports the failure; one that ended with the beehive
-			// just closes the stream.
-			if failure := tailer.failure(); failure != nil {
-				sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: failure})
-			}
+			// Either the fan-out closed or work ended. Both resolve the same
+			// way: the tailer says why unless the caller cancelled.
+			c.endStream(ctx, tailer, nil, out)
 			return
 		}
-		changes, ok := c.decodeBatch(ctx, drainPending(ev.Value, rx), mig, cfg, floor)
+		changes, ok := c.decodeBatch(work, drainPending(ev.Value, rx), mig, cfg, floor)
 		if !ok {
-			return // ctx ended while retrying a failed relation load
+			c.endStream(ctx, tailer, nil, out) // the tailer stopped under a retry
+			return
 		}
 		for _, ch := range changes {
 			if !sendOrDone(ctx, out, ch) {
@@ -802,7 +841,9 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 
 // replay delivers the gap between a resume's position and the tail, in pages —
 // with a day of retention the gap can be far more than one page. It returns
-// the position reached, or false when the stream is over.
+// the position reached, or ok false with the failure to report — nil when there
+// is nothing to report beyond whatever the tailer says. One place sends the
+// Failed change, so a replay that ends as the tailer does cannot send two.
 func (c *clientImpl[Spec, Status]) replay(
 	ctx context.Context,
 	mig Migrator,
@@ -810,7 +851,7 @@ func (c *clientImpl[Spec, Status]) replay(
 	only *ObjectID,
 	from int64,
 	out chan<- ObjectChange[Spec, Status],
-) (int64, bool) {
+) (int64, error, bool) {
 	cursor := from
 	retry := c.bh.watchBackoff()
 	for {
@@ -819,17 +860,16 @@ func (c *clientImpl[Spec, Status]) replay(
 			// A failed read costs a retry, not the stream: the cursor has not
 			// moved, so nothing is lost.
 			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
-				return 0, false
+				return 0, nil, false
 			}
 			continue
 		}
 		// Retention can overtake a replay that is still paging.
 		if err := horizonErr(c.gk, "the resume", cursor, trimmedThrough); err != nil {
-			sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: err})
-			return 0, false
+			return 0, err, false
 		}
 		if len(page) == 0 {
-			return cursor, true
+			return cursor, nil, true
 		}
 		next := page[len(page)-1].ResourceVersion
 		full := len(page) == tailPageCap
@@ -841,23 +881,23 @@ func (c *clientImpl[Spec, Status]) replay(
 		raws, err := collectChanges(ctx, c.bh, c.gk, page)
 		if err != nil {
 			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
-				return 0, false
+				return 0, nil, false
 			}
 			continue
 		}
 		retry.Reset()
 		changes, ok := c.decodeBatch(ctx, raws, mig, cfg, cursor)
 		if !ok {
-			return 0, false
+			return 0, nil, false
 		}
 		for _, ch := range changes {
 			if !sendOrDone(ctx, out, ch) {
-				return 0, false
+				return 0, nil, false
 			}
 		}
 		cursor = next
 		if !full {
-			return cursor, true
+			return cursor, nil, true
 		}
 	}
 }

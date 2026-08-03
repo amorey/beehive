@@ -2850,3 +2850,107 @@ func TestCoalesceOp(t *testing.T) {
 		assert.Equal(t, tc.want, coalesceOp(tc.began, tc.ended), "%v then %v", tc.began, tc.ended)
 	}
 }
+
+// failAfterArmStore fails one subscriber-side read once armed, and reports the
+// first failure so a test can act on it. Scoped to one method so the tailer's
+// own reads keep working — the point is a subscriber stuck retrying, not a
+// tailer stuck retrying.
+type failAfterArmStore struct {
+	Store
+	failEdges  bool // the relation load a WithLoads batch runs
+	failWrites bool // the log read a resume replay pages through
+	armed      atomic.Bool
+	once       sync.Once
+	tried      chan struct{}
+}
+
+func (s *failAfterArmStore) hit() bool {
+	if !s.armed.Load() {
+		return false
+	}
+	s.once.Do(func() { close(s.tried) })
+	return true
+}
+
+func (s *failAfterArmStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+	if s.failEdges && s.hit() {
+		return nil, errBoom
+	}
+	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+}
+
+func (s *failAfterArmStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	if s.failWrites && s.hit() {
+		return nil, 0, errBoom
+	}
+	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+}
+
+// A subscriber retrying a failed read must observe the tailer ending, not only
+// its caller's context. Both retry loops here — the relation load and the resume
+// replay — retry until their context ends, so on the caller's context alone a
+// store that keeps failing past Stop holds the goroutine and its tailer lease
+// forever, and the stream never reports ErrStopped, never closes, and never
+// releases.
+func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
+	cases := []struct {
+		name  string
+		store func(inner Store) *failAfterArmStore
+		opts  []WatchOption
+		// drive produces the work the subscriber then fails to finish.
+		drive func(t *testing.T, ctx context.Context, c Client[cSpec, cStatus])
+	}{
+		{
+			name: "relation load",
+			store: func(inner Store) *failAfterArmStore {
+				return &failAfterArmStore{Store: inner, failEdges: true, tried: make(chan struct{})}
+			},
+			opts: []WatchOption{WithLoads(LoadOwner())},
+			drive: func(t *testing.T, ctx context.Context, c Client[cSpec, cStatus]) {
+				mustCreate(t, ctx, c, "after", cSpec{})
+			},
+		},
+		{
+			name: "resume replay",
+			store: func(inner Store) *failAfterArmStore {
+				return &failAfterArmStore{Store: inner, failWrites: true, tried: make(chan struct{})}
+			},
+			opts:  []WatchOption{WithResumeFrom(1)},
+			drive: func(*testing.T, context.Context, Client[cSpec, cStatus]) {},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+			defer cancel()
+
+			store := tc.store(newClientTestStore(t))
+			bh, err := New(store, withWatchFloorInterval(time.Hour))
+			require.NoError(t, err)
+			client := NewClient[cSpec, cStatus](bh, clientTestGK)
+			mustCreate(t, ctx, client, "w1", cSpec{})
+
+			_, ch, err := client.WatchList(ctx, tc.opts...)
+			require.NoError(t, err)
+
+			store.armed.Store(true)
+			tc.drive(t, ctx, client)
+			select { // the subscriber is inside a retry loop
+			case <-store.tried:
+			case <-ctx.Done():
+				t.Fatal("the watch never reached a failing read")
+			}
+
+			// The caller's context stays live throughout: this is about the
+			// tailer ending, not about cancellation.
+			require.NoError(t, bh.stop(ctx))
+
+			var last ObjectChange[cSpec, cStatus]
+			for got := range ch {
+				last = got
+			}
+			assert.Equal(t, Failed, last.Type, "the stream never reported why it ended")
+			assert.ErrorIs(t, last.Err, ErrStopped)
+		})
+	}
+}
