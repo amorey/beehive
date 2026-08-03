@@ -277,45 +277,54 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 // It returns non-nil only when the drain hit ctx's deadline. No-op for the
 // reconcile loops if not running.
 func (bh *Beehive) stop(ctx context.Context) error {
-	// The wake hub comes from New, not Start, so closing it ends the tailers of
-	// a Beehive that never ran too — no special case for that below. Deferred so
-	// a stream whose caller is still reading sees what the draining reconcile
-	// loops write; a tailer whose subscribers have all left is already gone.
+	bh.mu.Lock()
+	// beehiveStopped means another call owns the teardown. Returning without
+	// closing the wake hub is the point: that call may still be draining, and
+	// closing here would end every watch before it sees what the draining loops
+	// write. A never-started Beehive falls through — it has no loops to drain,
+	// but it can have tailers, and this is what ends them.
+	if bh.state == beehiveStopped {
+		bh.mu.Unlock()
+		return nil
+	}
+	running := bh.state == beehiveRunning
+	bh.state = beehiveStopped
+	if running {
+		// Release bh.mu before waiting on wg: the waker (counted in wg) takes
+		// bh.mu to resolve reconcilers, so holding it across wg.Wait would
+		// deadlock.
+		bh.cancel()
+		bh.log().Info("control plane stopping")
+	}
+	bh.mu.Unlock()
+
+	var drainErr error
+	if running {
+		done := make(chan struct{})
+		go func() {
+			bh.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			drainErr = ctx.Err()
+		}
+	}
+
+	// After the drain, so a stream whose caller is still reading sees what the
+	// draining reconcile loops wrote. That ordering is what the drain buys, and
+	// a drain that hit ctx's deadline does not buy it — the loops are still
+	// running, and the tailers are torn down anyway rather than leaked.
 	//
 	// This races a client write's AfterCommit wake, which watch.Sender.Close
 	// allows: the racing send either publishes or answers ErrClosed, never both
 	// and never partially. Which one wins is unspecified and nothing here needs
-	// it pinned — every stream is ending anyway. The reconcile loops are a
-	// different matter, and the defer is what orders them: they have drained
-	// before this runs.
-	defer bh.kindWriteHub.Close()
-
-	bh.mu.Lock()
-	if bh.state != beehiveRunning {
-		bh.mu.Unlock()
-		return nil
-	}
-	// Release bh.mu before waiting on wg: the waker (counted in wg) takes bh.mu
-	// to resolve reconcilers, so holding it across wg.Wait would deadlock.
-	bh.state = beehiveStopped
-	bh.cancel()
-	bh.log().Info("control plane stopping")
-	bh.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		bh.wg.Wait()
-		close(done)
-	}()
-	var drainErr error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		drainErr = ctx.Err()
-	}
+	// it pinned, since every stream is ending.
+	bh.kindWriteHub.Close()
 
 	// The watch tailers are not counted in wg: each ends with its own last
-	// subscriber, or with the deferred close above. SchedulesWatch streams
+	// subscriber, or with the hub close above. SchedulesWatch streams
 	// report the work queue instead and end here, after their final value.
 	bh.log().Info("control plane stopped")
 	return drainErr

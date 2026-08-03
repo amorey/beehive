@@ -16,6 +16,8 @@ package beehive
 
 import (
 	"context"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -366,4 +368,81 @@ func TestSweepWriteLogRetention(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, page, 2)
 	})
+}
+
+// A second stop must not tear the watches down while the first is still
+// draining. state flips to stopped before the drain, so a retry after a drain
+// timeout — or a signal handler racing the first call — used to take the early
+// return and close the wake hub straight away, ending every stream before the
+// loops it was still waiting for had written.
+func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	stopFirst, err := bh.Start(ctx)
+	require.NoError(t, err)
+	mustCreate(t, ctx, client, "held", cSpec{})
+	<-ctrl.entered // the drain now has something to wait for
+
+	_, stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- stopFirst(ctx) }()
+
+	// stop takes ownership under bh.mu before it drains, so wait for that rather
+	// than racing it. A spin on observable state, not a sleep: it waits for the
+	// condition however long the scheduler takes to get there.
+	for deadline := time.Now().Add(testTimeout); ; runtime.Gosched() {
+		bh.mu.Lock()
+		owned := bh.state == beehiveStopped
+		bh.mu.Unlock()
+		if owned {
+			break
+		}
+		require.False(t, time.Now().After(deadline), "the first stop never took ownership")
+	}
+
+	// The second call must return without touching the wake hub. A live write
+	// arriving on the stream afterwards is the proof: a closed hub would have
+	// ended it instead.
+	require.NoError(t, bh.stop(ctx))
+	obj := mustCreate(t, ctx, client, "after-second-stop", cSpec{})
+	for {
+		ev := recv(t, stream)
+		require.NotEqual(t, Failed, ev.Type, "the second stop ended the stream: %v", ev.Err)
+		if ev.Object != nil && ev.Object.ID == obj.ID {
+			break
+		}
+	}
+
+	close(ctrl.release)
+	require.NoError(t, <-firstDone)
+	for range stream { // the first stop's close ends it, once its drain is done
+	}
+}
+
+// blockingController holds a reconcile loop open until release is closed, so a
+// test can keep a drain from finishing. It reports entering, since a drain only
+// blocks once a reconcile is actually in flight, and it does not watch ctx —
+// stop cancels that, which is exactly what must not end the wait.
+type blockingController[Spec, Status any] struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingController[Spec, Status]) Reconcile(context.Context, ControllerClient[Status], *Object[Spec, Status]) (Result, error) {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return Result{}, nil
 }
