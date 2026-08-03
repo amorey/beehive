@@ -307,10 +307,19 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 	waitClosed(t, closedWhenDrained(ch), "the stream to close on cancellation")
 }
 
-// A row that never decoded has no body to tombstone, so its removal is silent. The
-// alternative would be a Deleted change carrying a zero-valued object the
-// subscriber was never shown in the first place.
-func TestWatchDoesNotTombstoneARowItCouldNeverDecode(t *testing.T) {
+// A removal is reported even when the row image will not decode, with a nil
+// Object and the id.
+//
+// This was once silent, on the ground that a subscriber never shown the object
+// should not be told it went away. That reasoning only covers a row that never
+// decoded. A row can also decode for a while and then stop — a peer writes it at
+// a schema version this binary cannot read, or the blob is corrupted — and there
+// the subscriber does hold it. A physical delete is the last thing the log will
+// ever say about an id, and ids are never reused, so a dropped Deleted strands
+// that object in every mirror for good, where a redundant one is a no-op for any
+// consumer keyed by id. The tailer cannot tell the two cases apart, and this
+// codebase resolves that the same way everywhere else: redundant beats missing.
+func TestWatchReportsRemovalOfARowItCouldNeverDecode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -332,7 +341,12 @@ func TestWatchDoesNotTombstoneARowItCouldNeverDecode(t *testing.T) {
 	good := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "good"})
 
 	ev := recv(t, ch)
-	assert.Equal(t, Added, ev.Type, "the poison row's removal produced no tombstone")
+	require.Equal(t, Deleted, ev.Type, "the removal went unreported")
+	assert.Equal(t, poison.ID, ev.ID, "the id is what a mirror needs to drop it")
+	assert.Nil(t, ev.Object, "there is no decodable state to carry")
+
+	ev = recv(t, ch)
+	assert.Equal(t, Added, ev.Type)
 	assert.Equal(t, good.ID, ev.Object.ID)
 }
 

@@ -715,10 +715,18 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 		if err != nil {
 			// Quarantine: one bad row must not kill a live watcher.
 			c.warnUndecodable("Watch", raw.ID, err)
-			continue
+			// A create or update is repaired by the next write to the row. A
+			// physical delete is the last thing the log will ever say about this
+			// id — ids are never reused — so dropping it strands the object in
+			// every mirror for good. Report the removal without the state.
+			if raw.Op != WriteDelete {
+				continue
+			}
+			obj = nil
 		}
 		changes = append(changes, ObjectChange[Spec, Status]{
 			Type:            changeType(raw.Op),
+			ID:              raw.ID,
 			ResourceVersion: raw.ResourceVersion,
 			Object:          obj,
 		})

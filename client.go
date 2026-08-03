@@ -101,12 +101,17 @@ type ObjectListSnapshot[Spec, Status any] struct {
 }
 
 // ObjectChange reports a change to a watched object. On a Deleted change,
-// Object carries the row's final state. On a Failed change, Object is nil and
-// Err is non-nil: the stream is over, and a Failed change is always the last
-// value before the channel closes. A channel that closes with no Failed change
-// ended because the caller's context did.
+// Object carries the row's final state, or is nil when that state could not be
+// decoded — the removal is reported either way, because nothing later in the
+// log mentions a deleted id. On a Failed change, Object is nil and Err is
+// non-nil: the stream is over, and a Failed change is always the last value
+// before the channel closes. A channel that closes with no Failed change ended
+// because the caller's context did.
 type ObjectChange[Spec, Status any] struct {
 	Type ChangeType
+	// ID is the object this change is about, set whether or not Object is. Zero
+	// on a Failed change.
+	ID ObjectID
 	// ResourceVersion is the log position this change was reported at, and what
 	// WithResumeFrom takes to continue from here. Zero on a Failed change.
 	ResourceVersion int64
