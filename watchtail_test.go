@@ -821,3 +821,61 @@ func (s *countingLoadStore) EdgesGroupOutgoingByID(ctx context.Context, ids []Ob
 	s.relationReads.Add(1)
 	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
 }
+
+// A resume replays the log gap before going live, and pages it: with a day of
+// retention the gap can far exceed one page.
+func TestWatchResumeReplaysGapThenGoesLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	snap, _, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	missed := mustCreate(t, ctx, client, "missed", cSpec{Val: "a"})
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(snap.ResourceVersion))
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Added, ev.Type, "the gap comes from the log")
+	assert.Equal(t, missed.ID, ev.Object.ID)
+
+	live := mustCreate(t, ctx, client, "live", cSpec{Val: "b"})
+	ev = recv(t, ch)
+	assert.Equal(t, live.ID, ev.Object.ID, "no duplicate across the seam")
+}
+
+// The gap is read in pages, so one larger than tailPageCap replays whole.
+func TestWatchResumeReplaysBeyondOnePage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	const gap = tailPageCap + 40
+
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	snap, _, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	require.NoError(t, bh.store.Within(ctx, func(ctx context.Context) error {
+		for i := range gap {
+			if _, err := client.Create(ctx, fmt.Sprintf("gap-%d", i), cSpec{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(snap.ResourceVersion))
+	require.NoError(t, err)
+
+	seen := make(map[ObjectID]bool, gap)
+	for len(seen) < gap {
+		seen[recv(t, ch).Object.ID] = true
+	}
+}
