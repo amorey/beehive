@@ -33,7 +33,7 @@ import (
 // WatchOption configures one watch call. A distinct type from Option: these are
 // meaningful only here, and dispatching them on a Beehive or a controller would
 // silently accept nonsense.
-type WatchOption func(*watchConfig) error
+type WatchOption func(*watchConfig)
 
 type watchConfig struct {
 	// resumeFrom is the position to stream above, or nil to take a snapshot.
@@ -46,30 +46,22 @@ type watchConfig struct {
 // ErrWatchTooOld when retention has already removed entries above rv, which the
 // caller answers by subscribing again without this option.
 func WithResumeFrom(rv int64) WatchOption {
-	return func(c *watchConfig) error {
-		c.resumeFrom = &rv
-		return nil
-	}
+	return func(c *watchConfig) { c.resumeFrom = &rv }
 }
 
 // WithLoads eager-loads the same secondary lookups List takes, on the snapshot
 // and on every delivered batch. Batched per batch, not per object, so a watch
 // does not become an N+1.
 func WithLoads(loads ...LoadOption) WatchOption {
-	return func(c *watchConfig) error {
-		c.loads = resolveLoads(loads)
-		return nil
-	}
+	return func(c *watchConfig) { c.loads = resolveLoads(loads) }
 }
 
-func resolveWatch(opts []WatchOption) (watchConfig, error) {
+func resolveWatch(opts []WatchOption) watchConfig {
 	var cfg watchConfig
 	for _, opt := range opts {
-		if err := opt(&cfg); err != nil {
-			return watchConfig{}, err
-		}
+		opt(&cfg)
 	}
-	return cfg, nil
+	return cfg
 }
 
 // watchPoll returns the poll interval; the fallback covers only a Beehive built
@@ -79,6 +71,15 @@ func (bh *Beehive) watchPoll() time.Duration {
 		return defaultWatchPollInterval
 	}
 	return bh.watchPollInterval
+}
+
+// watchFloor is watchPoll for the object tail's floor cadence, and exists for
+// the same reason: a zero here would make the tailer's timer fire in a loop.
+func (bh *Beehive) watchFloor() time.Duration {
+	if bh.watchFloorInterval <= 0 {
+		return defaultWatchFloorInterval
+	}
+	return bh.watchFloorInterval
 }
 
 // sendOrDone delivers v unless ctx is cancelled first, and reports whether it
@@ -113,11 +114,7 @@ func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, 
 // WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	cfg, err := resolveWatch(opts)
-	if err != nil {
-		return ObjectListSnapshot[Spec, Status]{}, nil, err
-	}
-	return c.tailStream(ctx, cfg, nil)
+	return c.tailStream(ctx, resolveWatch(opts), nil)
 }
 
 // Watch streams changes to the single object id: an id that does not exist yet
@@ -126,11 +123,7 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	// The tail is the kind's: the log carries no index under object_id, so a
 	// single-object watch joins what its kind already reads and filters the
 	// fan-out down to its own key.
-	cfg, err := resolveWatch(opts)
-	if err != nil {
-		return ObjectSnapshot[Spec, Status]{}, nil, err
-	}
-	list, ch, err := c.tailStream(ctx, cfg, &id)
+	list, ch, err := c.tailStream(ctx, resolveWatch(opts), &id)
 	if err != nil {
 		return ObjectSnapshot[Spec, Status]{}, nil, err
 	}
@@ -149,11 +142,7 @@ func (c *clientImpl[Spec, Status]) resumable(ctx context.Context, rv int64) erro
 		return fmt.Errorf("beehive: watch on %s/%s: resume check failed: %w",
 			c.gk.Group, c.gk.Kind, err)
 	}
-	if rv < trimmedThrough {
-		return fmt.Errorf("%w: %s/%s trimmed through %d, resume asked for %d",
-			ErrWatchTooOld, c.gk.Group, c.gk.Kind, trimmedThrough, rv)
-	}
-	return nil
+	return horizonErr(c.gk, "the resume", rv, trimmedThrough)
 }
 
 // snapshot reads the watch's starting state: one object, or the whole kind.

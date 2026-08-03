@@ -1,6 +1,6 @@
 # Events API: an append-only, contiguous-run aggregated log
 
-- **Status:** Accepted — implemented in `sqlite/store.go`, `watchpoll.go`,
+- **Status:** Accepted — implemented in `sqlite/store.go`, `watch.go`,
   `client.go`, `controller.go`, `sqlite/migrations/0001_init.sql`.
 - **Date:** 2026-07-27 (recorded retroactively)
 

@@ -1,6 +1,6 @@
 # One tailer per kind, woken by the commit path, above a floor tick
 
-- **Status:** Accepted — implemented in `watchtail.go`, `watchpoll.go`,
+- **Status:** Accepted — implemented in `watchtail.go`, `watch.go`,
   `beehive.go`, `client.go`, `controller.go`, `gc.go`.
 - **Date:** 2026-08-03
 
@@ -60,7 +60,17 @@ verb-derived table misses:
   write conditions constantly.
 - The owner cascade. `DeletionRequestsCreateFromOwner` marks children across
   several kinds in one call, so the wake is routed by the refs it returns —
-  as the new-edge enqueue routes by `EdgesAddResult.From`.
+  as the new-edge enqueue routes by `EdgesAddResult.From`, and deduped by kind
+  so a wide cascade queues one commit hook per kind rather than per row.
+
+The alternative is deeper: an optional `ObjectWritesNotifier` on `Store`, probed
+the way `DriverCursorer` and `FreePagesReleaser` are, called from the three
+helpers themselves. That would make the publish impossible to forget for the
+bundled store, and the floor tick is already the right degradation for a store
+that does not implement it. It is not taken here because it puts a watch concern
+into the store contract for a guarantee the floor tick already provides, and
+because `ObjectsDelete(ctx, id)` carries no `GroupKind`, so one site would stay
+manual either way. Revisit if the table test ever fails to catch a new verb.
 
 ### Why the tick stays, at 30s
 

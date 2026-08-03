@@ -55,3 +55,36 @@ func TickerChan(d time.Duration) (<-chan time.Time, func()) {
 	t := time.NewTicker(d)
 	return t.C, t.Stop
 }
+
+// Backoff is the retry ladder a wake-driven driver uses when a step fails: it
+// doubles from Base and is capped at Max, which is the driver's own floor
+// cadence. The zero value is unusable — Base must be positive.
+type Backoff struct {
+	Base time.Duration
+	Max  time.Duration
+	cur  time.Duration
+}
+
+// Wait blocks for the next rung and reports whether it elapsed; false means ctx
+// ended. It advances the ladder, so a caller that succeeds must Reset.
+func (b *Backoff) Wait(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(b.Next()):
+		return true
+	}
+}
+
+// Next returns the next rung and advances the ladder.
+func (b *Backoff) Next() time.Duration {
+	if b.cur <= 0 {
+		b.cur = b.Base
+	}
+	d := min(b.cur, b.Max)
+	b.cur *= 2
+	return d
+}
+
+// Reset returns the ladder to Base, after a step that worked.
+func (b *Backoff) Reset() { b.cur = b.Base }

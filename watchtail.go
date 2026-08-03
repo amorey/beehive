@@ -22,19 +22,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
 )
 
 // wakeHub tells a kind's tailer that the kind moved. Keyed by GroupKind and
 // latest-value: a burst coalesces into one pending wake, and a publish that
-// lands mid-read waits in the slot. Close closes the sender, never the hub —
-// scheduleHub's rule.
-//
-// The value is a process-local tick, not the write's resource version: most
-// store writes return no version (see the write-shapes ADR), and the tailer
-// reads its own cursor from the store anyway. All the value has to do is rise,
-// so Accept can drop a publish the hub has already superseded.
+// lands mid-read waits in the slot. The value is a process-local tick, not a
+// resource version — it only has to rise. Close closes the sender, never the
+// hub — scheduleHub's rule. See docs/adr/2026-08-03-watch-shared-tail.md.
 type wakeHub struct {
 	hub *watch.Hub[GroupKind, int64]
 	seq *atomic.Int64
@@ -75,18 +72,28 @@ func (h wakeHub) Close() {
 // that ended (a trimmed cursor, or the beehive stopping) is replaced, so a
 // caller never joins a dead fan-out.
 //
-// Guarded by tailMu, not bh.mu: bh.mu is not reentrant and the resolvers under
-// it (migratorFor, reconcilerFor) take it, and the store read below would hold
-// it for the duration of a query.
+// Guarded by tailMu, never bh.mu: bh.mu is not reentrant and the resolvers under
+// it (migratorFor, reconcilerFor) take it. The store read that builds a tailer
+// stays outside the lock, so a first watch on one kind does not queue behind
+// another kind's query; the loser of a race discards its tailer.
 func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, error) {
 	bh.tailMu.Lock()
-	defer bh.tailMu.Unlock()
 	if t, ok := bh.tailers[gk]; ok && t.failure() == nil {
+		bh.tailMu.Unlock()
 		return t, nil
 	}
+	bh.tailMu.Unlock()
+
 	t, err := newObjectTailer(ctx, bh, gk)
 	if err != nil {
 		return nil, err
+	}
+
+	bh.tailMu.Lock()
+	defer bh.tailMu.Unlock()
+	if live, ok := bh.tailers[gk]; ok && live.failure() == nil {
+		t.close()
+		return live, nil
 	}
 	if bh.tailers == nil {
 		bh.tailers = make(map[GroupKind]*objectTailer)
@@ -96,6 +103,17 @@ func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, 
 	// fan-out at once, which is what ends the watch that asked for it.
 	bh.tailWG.Go(func() { t.run(bh.tailCtx) })
 	return t, nil
+}
+
+// horizonErr reports a cursor the write log has already trimmed past, or nil.
+// Strictly <: a cursor sitting exactly on the horizon has lost nothing, and a
+// kind that stops writing converges onto exactly that.
+func horizonErr(gk GroupKind, what string, cursor, trimmedThrough int64) error {
+	if cursor >= trimmedThrough {
+		return nil
+	}
+	return fmt.Errorf("%w: %s/%s trimmed through %d, %s was at %d",
+		ErrWatchTooOld, gk.Group, gk.Kind, trimmedThrough, what, cursor)
 }
 
 // errNoRowImage reports a delete entry the store returned without the row image
@@ -123,8 +141,8 @@ func changeType(op WriteOp) ChangeType {
 }
 
 // rawChange is what the tailer fans out: one object's newest log entry plus the
-// state to report it with. Undecoded on purpose — two clients may watch one kind
-// with different type parameters, so decode belongs to each subscriber.
+// state to report it with. Undecoded — two clients may watch one kind with
+// different type parameters, so decode belongs to each subscriber.
 type rawChange struct {
 	ID              ObjectID
 	Op              WriteOp
@@ -149,9 +167,9 @@ type objectTailer struct {
 }
 
 // newObjectTailer registers the wake receiver BEFORE reading the starting
-// cursor — a write landing between the two would otherwise be lost to both —
-// and reads the cursor before returning, so a subscriber that snapshots after
-// this call cannot fall into the gap either.
+// cursor: a write landing between the two would otherwise be lost to both. The
+// cursor is read before returning, so a subscriber that snapshots after this
+// call cannot fall into the gap either.
 func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTailer, error) {
 	t := &objectTailer{
 		bh:    bh,
@@ -175,14 +193,10 @@ func (t *objectTailer) close() {
 }
 
 // mergeRawChange resolves two undelivered changes for one object into one:
-// newest wins, and a run the subscriber has not seen the start of still reports
-// as a create.
-//
-// Nothing is ever dropped. Annihilating an unread create/delete pair looks safe
-// and is not: the pending slot is hub-wide while a snapshot is per subscriber,
-// so a subscriber that snapshotted between the two would hold the object forever
-// with no delete coming. A delete for a key a consumer never saw is a no-op at
-// any cache.
+// newest wins, and a run whose start the subscriber has not seen still reports
+// as a create. It never drops a pair — the pending slot is hub-wide while a
+// snapshot is per subscriber, so annihilating an unread create/delete would
+// strand the object at a subscriber that snapshotted between the two.
 func mergeRawChange(prev, next rawChange) (rawChange, bool) {
 	if next.ResourceVersion <= prev.ResourceVersion {
 		return prev, true // a send the pending value already covers
@@ -208,11 +222,11 @@ func (t *objectTailer) run(ctx context.Context) {
 	defer t.close()
 
 	wakes := t.wakes.Chan()
-	floor := t.bh.watchFloorInterval
+	floor := t.bh.watchFloor()
 	timer := time.NewTimer(floor)
 	defer timer.Stop()
 
-	retry := watchRetryBase
+	retry := driver.Backoff{Base: watchRetryBase, Max: floor}
 	for {
 		select {
 		case <-ctx.Done():
@@ -237,22 +251,18 @@ func (t *objectTailer) run(ctx context.Context) {
 				return
 			}
 			t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
-			// Bounded backoff, capped at the floor: a transient failure recovers
-			// sooner than a floor tick, a persistent one costs no more.
-			next = min(retry, floor)
-			retry *= 2
+			next = retry.Next()
 		} else {
-			retry = watchRetryBase
+			retry.Reset()
 		}
 		timer.Stop()
 		timer.Reset(next)
 	}
 }
 
-// drain reads pages until one comes back short. A burst coalesces into one wake,
-// so a tailer that read a single page per wake would strand the remainder until
-// some later write. A short page means the log is drained — exactly, and without
-// the second position read that asking the store again would cost.
+// drain reads pages until one comes back short, so a burst that coalesced into
+// one wake is not left half-read. Short page, not a second position read: the
+// page length answers it exactly and step already paid for the gate.
 func (t *objectTailer) drain(ctx context.Context) error {
 	for {
 		n, err := t.step(ctx)
@@ -282,10 +292,8 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Strictly <: a cursor sitting exactly on the horizon has lost nothing.
-	if t.cursor < trimmedThrough {
-		return 0, fmt.Errorf("%w: %s/%s trimmed through %d, tail was at %d",
-			ErrWatchTooOld, t.gk.Group, t.gk.Kind, trimmedThrough, t.cursor)
+	if err := horizonErr(t.gk, "the tail", t.cursor, trimmedThrough); err != nil {
+		return 0, err
 	}
 	if len(page) == 0 {
 		return 0, nil
@@ -379,14 +387,13 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 }
 
 // tailStream is a watch on the shared tail: it registers a fan-out receiver,
-// takes its own snapshot (or replays a resume's gap), and then delivers what the
+// takes its own snapshot (or replays a resume's gap), and delivers what the
 // tailer publishes above that position.
 //
 // Registration comes BEFORE the snapshot — conflate has no replay, so a change
-// published in between must already have a receiver to land in. The floor is
-// what makes that safe: resource_version is one log-wide sequence and the
-// snapshot is a consistent cut at it, so "at or below the floor" means "already
-// in the snapshot", for every key.
+// published in between must already have a receiver to land in. Dropping at or
+// below the snapshot's position is what makes that safe: resource_version is one
+// log-wide sequence and the snapshot is a consistent cut at it.
 func (c *clientImpl[Spec, Status]) tailStream(
 	ctx context.Context,
 	cfg watchConfig,
@@ -500,8 +507,8 @@ func (c *clientImpl[Spec, Status]) consume(
 }
 
 // decodeBatch is decodeChanges with the relation load retried rather than
-// skipped: the tailer's cursor has already moved past these entries, so there is
-// no later tick that would bring them back. It reports false only when ctx ended.
+// skipped: the cursor has already moved past these entries, so no later read
+// brings them back. It reports false only when ctx ended.
 func (c *clientImpl[Spec, Status]) decodeBatch(
 	ctx context.Context,
 	batch []rawChange,
@@ -509,20 +516,15 @@ func (c *clientImpl[Spec, Status]) decodeBatch(
 	cfg watchConfig,
 	floor int64,
 ) ([]ObjectChange[Spec, Status], bool) {
-	retry := watchRetryBase
+	retry := driver.Backoff{Base: watchRetryBase, Max: c.bh.watchFloor()}
 	for {
 		changes, err := c.decodeChanges(ctx, batch, mig, cfg, floor)
 		if err == nil {
 			return changes, true
 		}
-		c.bh.log().WarnContext(ctx, "beehive: watch relation load failed; retrying",
-			"group", c.gk.Group, "kind", c.gk.Kind, "err", err)
-		select {
-		case <-ctx.Done():
+		if !c.pollFailed(ctx, "watch relation load", err) || !retry.Wait(ctx) {
 			return nil, false
-		case <-time.After(min(retry, c.bh.watchFloorInterval)):
 		}
-		retry *= 2
 	}
 }
 
@@ -537,7 +539,7 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 ) ([]ObjectChange[Spec, Status], error) {
 	changes := make([]ObjectChange[Spec, Status], 0, len(batch))
 	// Deleted objects have no relations to load: the edges went with the row.
-	loaded := make([]*Object[Spec, Status], 0, len(batch))
+	var loaded []*Object[Spec, Status]
 	for _, raw := range batch {
 		if raw.ResourceVersion <= floor {
 			continue
@@ -553,7 +555,7 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 			ResourceVersion: raw.ResourceVersion,
 			Object:          obj,
 		})
-		if raw.Op != WriteDelete {
+		if raw.Op != WriteDelete && cfg.loads != 0 {
 			loaded = append(loaded, obj)
 		}
 	}
@@ -575,46 +577,40 @@ func (c *clientImpl[Spec, Status]) replay(
 	out chan<- ObjectChange[Spec, Status],
 ) (int64, bool) {
 	cursor := from
-	retry := watchRetryBase
+	retry := driver.Backoff{Base: watchRetryBase, Max: c.bh.watchFloor()}
 	for {
 		page, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, cursor, tailPageCap)
 		if err != nil {
-			// A transient read costs a retry, not the stream — the cursor has
-			// not moved, so nothing is lost.
-			if ctx.Err() != nil {
+			// A transient read costs a retry, not the stream: the cursor has not
+			// moved, so nothing is lost.
+			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
 				return 0, false
 			}
-			c.bh.log().WarnContext(ctx, "beehive: watch resume read failed; retrying",
-				"group", c.gk.Group, "kind", c.gk.Kind, "err", err)
-			select {
-			case <-ctx.Done():
-				return 0, false
-			case <-time.After(min(retry, c.bh.watchFloorInterval)):
-			}
-			retry *= 2
 			continue
 		}
-		retry = watchRetryBase
-		// Strictly <: a cursor sitting exactly on the horizon has lost nothing.
 		// Retention can overtake a replay that is still paging.
-		if cursor < trimmedThrough {
-			sendOrDone(ctx, out, ObjectChange[Spec, Status]{
-				Type: Failed,
-				Err: fmt.Errorf("%w: %s/%s trimmed through %d, resume was at %d",
-					ErrWatchTooOld, c.gk.Group, c.gk.Kind, trimmedThrough, cursor),
-			})
+		if err := horizonErr(c.gk, "the resume", cursor, trimmedThrough); err != nil {
+			sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: err})
 			return 0, false
 		}
 		if len(page) == 0 {
 			return cursor, true
 		}
+		next := page[len(page)-1].ResourceVersion
+		full := len(page) == tailPageCap
+		if only != nil {
+			// Before the read, not after: collectChanges would otherwise read
+			// back every object in the page to deliver at most one.
+			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *only })
+		}
 		raws, err := collectChanges(ctx, c.bh, c.gk, page)
 		if err != nil {
-			continue // same retry path as the listing above
+			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
+				return 0, false
+			}
+			continue
 		}
-		if only != nil {
-			raws = slices.DeleteFunc(raws, func(r rawChange) bool { return r.ID != *only })
-		}
+		retry.Reset()
 		changes, ok := c.decodeBatch(ctx, raws, mig, cfg, cursor)
 		if !ok {
 			return 0, false
@@ -624,8 +620,8 @@ func (c *clientImpl[Spec, Status]) replay(
 				return 0, false
 			}
 		}
-		cursor = page[len(page)-1].ResourceVersion
-		if len(page) < tailPageCap {
+		cursor = next
+		if !full {
 			return cursor, true
 		}
 	}

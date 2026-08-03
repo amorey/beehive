@@ -1,7 +1,7 @@
 # Object writes go to an append-only log, and watches tail it
 
 - **Status:** Accepted — implemented in `sqlite/migrations/0001_init.sql`,
-  `sqlite/store.go`, `watchpoll.go`, `client.go`, `beehive.go`, `options.go`,
+  `sqlite/store.go`, `watch.go`, `client.go`, `beehive.go`, `options.go`,
   `waker.go`.
 - **Date:** 2026-08-02
 

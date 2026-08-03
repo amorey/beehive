@@ -26,7 +26,6 @@ import (
 
 	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/conflate"
-	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -171,7 +170,7 @@ func TestWakeHubPublishesOnEveryWrite(t *testing.T) {
 			if tc.setup != nil {
 				id = tc.setup(t, ctx, w)
 			}
-			drainWakes(rx)
+			drainRecv(rx)
 
 			tc.write(t, ctx, w, id)
 			ev, err := rx.RecvContext(ctx)
@@ -450,7 +449,7 @@ func TestTailerMergeTable(t *testing.T) {
 			_, err := stepped.RecvContext(ctx)
 			require.NoError(t, err)
 			if tc.observed {
-				drainConflate(pending)
+				drainRecv(pending)
 			}
 
 			for _, write := range []func(*testing.T, context.Context, *writeWorld, ObjectID){tc.first, tc.second} {
@@ -473,14 +472,6 @@ func TestTailerMergeTable(t *testing.T) {
 			_, err = pending.TryRecv()
 			assert.ErrorIs(t, err, gobus.ErrEmpty)
 		})
-	}
-}
-
-func drainConflate(rx *conflate.Receiver[ObjectID, rawChange]) {
-	for {
-		if _, err := rx.TryRecv(); err != nil {
-			return
-		}
 	}
 }
 
@@ -646,16 +637,6 @@ func newWriteWorld(t *testing.T) *writeWorld {
 		bh:     bh,
 		client: NewClient[cSpec, cStatus](bh, clientTestGK),
 		ctrl:   &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
-	}
-}
-
-// drainWakes discards whatever the receiver is holding, so the next Recv proves
-// a wake published after the drain.
-func drainWakes(rx *watch.Receiver[GroupKind, int64]) {
-	for {
-		if _, err := rx.TryRecv(); err != nil {
-			return
-		}
 	}
 }
 

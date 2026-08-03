@@ -209,6 +209,16 @@ func fast(opts ...Option) []Option {
 	}, opts...)
 }
 
+// drainRecv discards whatever a bus receiver is holding, so the next Recv proves
+// something published after the drain.
+func drainRecv[E any, R interface{ TryRecv() (E, error) }](rx R) {
+	for {
+		if _, err := rx.TryRecv(); err != nil {
+			return
+		}
+	}
+}
+
 // newTestBeehive is New plus the teardown every test owes a Beehive: the watch
 // tailers come up in New and end in stop, so a test that watches and never stops
 // leaks their goroutines into the next one.
