@@ -15,6 +15,7 @@
 package beehive
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -608,17 +609,7 @@ func (c *clientImpl[Spec, Status]) consume(
 			}
 			return
 		}
-		// Drain what is already pending before loading relations, so a burst
-		// costs one relation query rather than one per object.
-		batch := []rawChange{ev.Value}
-		for {
-			next, err := rx.TryRecv()
-			if err != nil {
-				break
-			}
-			batch = append(batch, next.Value)
-		}
-		changes, ok := c.decodeBatch(ctx, batch, mig, cfg, floor)
+		changes, ok := c.decodeBatch(ctx, drainPending(ev.Value, rx), mig, cfg, floor)
 		if !ok {
 			return // ctx ended while retrying a failed relation load
 		}
@@ -628,6 +619,30 @@ func (c *clientImpl[Spec, Status]) consume(
 			}
 		}
 	}
+}
+
+// drainPending takes first plus everything already queued behind it, so a burst
+// costs one relation query rather than one per object.
+//
+// Ascending by resource version, and that is a correctness requirement rather
+// than tidiness: a caller checkpoints the version on a delivered change and
+// resumes above it, so a version delivered after a higher one would be skipped
+// for good. The fan-out coalesces in place, leaving a re-written object at its
+// original queue position carrying a newer version — the one way the drain sees
+// them out of order.
+func drainPending(first rawChange, rx *conflate.Receiver[ObjectID, rawChange]) []rawChange {
+	batch := []rawChange{first}
+	for {
+		next, err := rx.TryRecv()
+		if err != nil {
+			break
+		}
+		batch = append(batch, next.Value)
+	}
+	slices.SortFunc(batch, func(a, b rawChange) int {
+		return cmp.Compare(a.ResourceVersion, b.ResourceVersion)
+	})
+	return batch
 }
 
 // decodeBatch is decodeChanges with the relation load retried instead of

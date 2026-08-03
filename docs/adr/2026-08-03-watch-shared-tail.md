@@ -206,10 +206,21 @@ to hand the error to.
 - **A lone single-object watch gets slower.** The key filter runs on the
   fan-out, not before the read, so it pays for its kind's whole write volume.
   The sharing pays off above roughly two subscribers per kind.
-- **Ordering weakened**, from "changes arrive in write order" to "each object's
-  latest state arrives once, newest wins; an `Added` may repeat for an object
-  the snapshot already carried". Order across objects was never load-bearing:
-  beehive is level-triggered and a subscriber acts on current state per object.
+- **Ordering weakened per object**, from "changes arrive in write order" to
+  "each object's latest state arrives once, newest wins; an `Added` may repeat
+  for an object the snapshot already carried".
+
+  **Order across objects is not weakened, and the first cut of this design was
+  wrong to say it was.** A batch is sorted ascending by resource version before
+  delivery (`drainPending`). The reasoning that dropped it — beehive is
+  level-triggered, so a subscriber acts on current state per object — holds for
+  a subscriber that stays connected and does not hold for one that resumes.
+  `ObjectChange.ResourceVersion` is documented as a resume position, so a
+  descending pair lets a caller checkpoint the higher version and lose the lower
+  change for good: the replay reads above the checkpoint and the live floor
+  drops anything at or below it. The fan-out produces such a pair whenever a
+  re-written object coalesces in place, keeping its original queue position
+  while carrying a newer version.
 - **`ErrWatchTooOld` narrowed.** A slow subscriber coalesces and can no longer
   fall behind the horizon, so the sentinel now has two producers: a resume
   below the horizon, and the tailer's reset.

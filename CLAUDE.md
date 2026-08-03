@@ -93,8 +93,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   it returns. The fan-out is non-generic (`rawChange`) because two clients may
   watch one kind with different type parameters; each subscriber decodes and
   drops what its own snapshot already held. Delivery is latest-per-object, so an
-  `Added` may repeat for a snapshot object and cross-object write order is not a
-  contract. Nothing is dropped in the merge. A cursor **below** the horizon
+  `Added` may repeat for a snapshot object. **A batch is delivered ascending by
+  resource version** (`drainPending`), and that is load-bearing rather than
+  tidiness: a caller checkpoints a delivered change's version and resumes above
+  it, so a version delivered after a higher one would be skipped for good. The
+  merge coalesces in place, which leaves a re-written object at its original
+  queue position carrying a newer version — the one way the drain sees them out
+  of order. Nothing is dropped in the merge. A cursor **below** the horizon
   (strictly: equality has lost nothing) ends *every* subscriber with
   `ErrWatchTooOld` and resets the tailer. **A tailer runs from its kind's first
   watch to its last**: `tailerFor` hands back a subscriber lease and every

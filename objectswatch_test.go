@@ -2512,3 +2512,31 @@ func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 		})
 	}
 }
+
+// A caller checkpoints the resource version on a delivered change and resumes
+// above it, so the drain must never hand back a lower version after a higher
+// one — the lower one would be skipped for good. The fan-out coalesces in
+// place, so A's re-write keeps A's original queue position while carrying the
+// newer version, which is the one way the drain sees them out of order.
+func TestDrainPendingIsAscendingByResourceVersion(t *testing.T) {
+	hub := conflate.New[ObjectID](mergeRawChange)
+	defer hub.Close()
+	rx := hub.Receiver()
+	defer rx.Close()
+	tx := hub.Sender()
+
+	a, b := ObjectID(1), ObjectID(2)
+	require.NoError(t, tx.Send(a, rawChange{ID: a, Op: WriteUpdate, ResourceVersion: 10}))
+	require.NoError(t, tx.Send(b, rawChange{ID: b, Op: WriteUpdate, ResourceVersion: 11}))
+	require.NoError(t, tx.Send(a, rawChange{ID: a, Op: WriteUpdate, ResourceVersion: 12}))
+
+	first, err := rx.Recv()
+	require.NoError(t, err)
+
+	var got []int64
+	for _, ch := range drainPending(first.Value, rx) {
+		got = append(got, ch.ResourceVersion)
+	}
+	// A@10 coalesced into A@12, so two changes remain: B's older one first.
+	assert.Equal(t, []int64{11, 12}, got)
+}
