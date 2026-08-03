@@ -129,46 +129,22 @@ func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID)
 // one slot per receiver: a burst of commits collapses into one pending signal,
 // and a publish that lands mid-read waits in the slot. The signal carries no
 // value — the tailer reads its position from the store — so no Accept gate is
-// set and every send is taken. Close closes the sender, never the hub
-// (scheduleHub's rule) — and that is what makes stop's close safe against a
-// client write's wake: watch.Sender.Close allows a concurrent send, watch.Hub
-// .Close does not.
+// set and every send is taken. Close, and the zero value, come from watchHub.
 // See docs/adr/2026-08-03-watch-shared-tail.md.
 type kindWriteHub struct {
-	hub *watch.Hub[GroupKind, struct{}]
+	watchHub[GroupKind, struct{}]
 }
 
 func newKindWriteHub() kindWriteHub {
-	return kindWriteHub{hub: watch.New[GroupKind, struct{}]()}
+	return kindWriteHub{watchHub[GroupKind, struct{}]{hub: watch.New[GroupKind, struct{}]()}}
 }
 
-// Send is a no-op on the zero hub, which a Beehive built without New has —
-// the same rule bh.log() applies to an unresolved logger.
-func (h kindWriteHub) Send(gk GroupKind) error {
-	if h.hub == nil {
-		return nil
-	}
-	return h.hub.Sender().Send(gk, struct{}{})
-}
+func (h kindWriteHub) Send(gk GroupKind) error { return h.send(gk, struct{}{}) }
 
 // Watch registers a receiver for gk. Registration is the baseline and the bus
 // never delivers it back, so a receiver reads only writes that follow it.
-//
-// ok is false on the zero hub. Unlike Send and Close this cannot no-op: a
-// receiver has to be tied to a hub, so there is nothing to hand back. The
-// caller turns that into an error rather than a nil dereference.
 func (h kindWriteHub) Watch(gk GroupKind) (*watch.Receiver[GroupKind, struct{}], bool) {
-	if h.hub == nil {
-		return nil, false
-	}
-	return h.hub.Watch(gk, struct{}{}), true
-}
-
-// Close is a no-op on the zero hub; see Send.
-func (h kindWriteHub) Close() {
-	if h.hub != nil {
-		h.hub.Sender().Close()
-	}
+	return h.watch(gk, struct{}{})
 }
 
 // tailerFor returns the kind's tailer with a subscriber lease held on it,

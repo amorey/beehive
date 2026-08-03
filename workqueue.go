@@ -399,20 +399,20 @@ type scheduleBus interface {
 // scheduleHub adapts gobus/watch — a keyed latest-value state bus, which fits a
 // stream that reports a value rather than a change — to scheduleBus. One hub
 // per queue: a process-wide hub would carry the kind through every operation
-// and widen the bus lock to the whole process. Close closes the sender, never
-// the hub: Hub.Close is a hard tear-down with no drain, and a receiver could
-// lose the last value on a timing race.
+// and widen the bus lock to the whole process. Close, and the close discipline
+// behind it, come from watchHub.
 type scheduleHub struct {
-	hub *watch.Hub[ObjectID, gaugeValue]
+	watchHub[ObjectID, gaugeValue]
 }
 
-func (h scheduleHub) Send(id ObjectID, s gaugeValue) error { return h.hub.Sender().Send(id, s) }
+func (h scheduleHub) Send(id ObjectID, s gaugeValue) error { return h.send(id, s) }
 
+// The queue always builds its hub, so the zero-hub case watchHub reports cannot
+// arise here and scheduleBus need not carry it.
 func (h scheduleHub) Watch(id ObjectID, initial gaugeValue) *watch.Receiver[ObjectID, gaugeValue] {
-	return h.hub.Watch(id, initial)
+	rx, _ := h.watch(id, initial)
+	return rx
 }
-
-func (h scheduleHub) Close() { h.hub.Sender().Close() }
 
 // newScheduleHub builds the hub with the Accept rule that makes a reordered
 // publish safe: compare the queue's own Seq instead of trusting arrival order.
@@ -420,9 +420,9 @@ func (h scheduleHub) Close() { h.hub.Sender().Close() }
 // calls Watch under the queue lock, so an Accept that took the queue lock would
 // deadlock.
 func newScheduleHub() scheduleHub {
-	return scheduleHub{hub: watch.New[ObjectID](watch.WithAccept(
+	return scheduleHub{watchHub[ObjectID, gaugeValue]{hub: watch.New[ObjectID](watch.WithAccept(
 		func(prev, next gaugeValue) bool { return next.Seq > prev.Seq },
-	))}
+	))}}
 }
 
 // watchSchedule registers a receiver for id and seeds it with id's current
