@@ -303,11 +303,16 @@ func (bh *Beehive) staleDependentsRun(ctx context.Context) {
 	})
 }
 
-// staleDependentsSweep pages the staleness listing to exhaustion and enqueues
-// each dependent under its own kind. To exhaustion, unlike the waker's scan, so
-// the startup step enqueues everything stale — the first start after this
+// staleDependentsSweep pages the staleness listing to exhaustion, stamping and
+// enqueuing each dependent under its own kind. To exhaustion, unlike the waker's
+// scan, so the startup step covers everything stale — the first start after this
 // mechanism lands finds the whole graph stale at once, a one-time herd. A
 // failed page abandons the sweep; the next tick re-derives the same set.
+//
+// The stamp is the guarantee and the enqueue is the prompt half: an enqueue is
+// in memory and a restart loses it, where the stamp is drained by the owed pass.
+// Stamp first, so a crash between the two costs a spare reconcile rather than a
+// lost one.
 func (bh *Beehive) staleDependentsSweep(ctx context.Context, kinds []GroupKind) {
 	enqueue := bh.enqueuerForPage()
 	var after ObjectID
@@ -322,6 +327,14 @@ func (bh *Beehive) staleDependentsSweep(ctx context.Context, kinds []GroupKind) 
 			return
 		}
 		if len(page) == 0 {
+			return
+		}
+		if err := bh.store.ReconcileOwedStamp(ctx, page); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			bh.log().WarnContext(ctx, "stamping stale dependents failed; the next pass re-derives them",
+				"afterID", after, "err", err)
 			return
 		}
 		for _, d := range page {

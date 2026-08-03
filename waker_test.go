@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -794,6 +795,44 @@ type staleListErrorStore struct {
 func (s *staleListErrorStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]ObjectRef, error) {
 	s.calls.Add(1)
 	return nil, errBoom
+}
+
+// stampProbeStore serves one page of stale dependents, then nothing, and records
+// what the sweep stamped.
+type stampProbeStore struct {
+	fakeStore
+	page    []ObjectRef
+	served  bool
+	stamped [][]ObjectRef
+}
+
+func (s *stampProbeStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]ObjectRef, error) {
+	if s.served {
+		return nil, nil
+	}
+	s.served = true
+	return s.page, nil
+}
+
+func (s *stampProbeStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef) error {
+	s.stamped = append(s.stamped, slices.Clone(refs))
+	return nil
+}
+
+// TestStaleDependentsSweepStampsWhatItFinds pins the durable half of a finding.
+// The enqueue lives in memory and a restart loses it; the stamp is what the owed
+// pass drains afterwards. One call per page, not per row.
+func TestStaleDependentsSweepStampsWhatItFinds(t *testing.T) {
+	page := []ObjectRef{
+		{ID: 1, Group: clientTestGK.Group, Kind: clientTestGK.Kind},
+		{ID: 2, Group: clientTestGK.Group, Kind: clientTestGK.Kind},
+	}
+	store := &stampProbeStore{page: page}
+	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
+
+	bh.staleDependentsSweep(context.Background(), []GroupKind{clientTestGK})
+
+	assert.Equal(t, [][]ObjectRef{page}, store.stamped)
 }
 
 // TestStaleDependentsSweepWarnsAndRetriesOnListFailure pins the failure contract:
