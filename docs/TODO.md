@@ -99,6 +99,46 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   test is where it has to be pinned. The measurements above came from a
   throwaway benchmark; rebuild it before changing anything here.
 
+- **An edge write is invisible to every cursor in the system, and the fix is one
+  counter rather than a log** — known, not fixed, and recorded here mostly to
+  settle the question it keeps raising: whether `edges` writes belong in
+  `object_writes`. They do not.
+
+  `EdgesAdd` and `EdgesDelete` bump no `resource_version` and append no write-log
+  entry, because a ref is not a field of the object. So no log cursor can see a
+  new edge, a dropped one, or the `dependency_watermarks` clear that rides a new
+  one. Two places pay for it: an idle gate on the stale-dependents sweep cannot
+  be justified from the write log alone, and a deletion unblocked by
+  `DependenciesDelete` waits for the next GC tick with nothing able to signal it
+  (case 9 in [`reconcile-triggers.md`](reconcile-triggers.md)).
+
+  **Recording edges in `object_writes` is the wrong fix, on four counts.**
+  `edges.from_id` is `ON DELETE CASCADE`, so collecting an object removes its
+  outgoing edges inside SQLite with no Go code on the path — a faithful log would
+  need a trigger, or would under-record exactly the case a log exists to make
+  recoverable. The tail emits one change per entry, so an edge add would deliver a
+  `Modified` to every subscriber of the dependent's kind for an object whose spec,
+  status and conditions are identical, and whose refs are not even in the
+  delivered object unless the caller asked for them. Retention is bounded and the
+  horizon moves, so an entry could never replace `EdgesAdd`'s `reconcile_owed`
+  stamp — it would be a second, weaker record of the same fact. And it would cost
+  a `resource_version` and an append for each edge write, on a path that is free
+  today, which a controller re-declaring its edge set every pass pays per pass.
+
+  **One monotonic counter covers what actually needs covering.** The only
+  consumer that needs "did the edge set move" is the stale-dependents pass, and it
+  needs one bit, not a stream: an epoch bumped by `EdgesAdd` and `EdgesDelete`,
+  shaped like `driver_cursors`. An idle gate reading `(ObjectWritesMaxVersionAll,
+  edgesEpoch)` unchanged → skip is then sound outright, rather than resting on the
+  argument that the watermark clear is backstopped by the stamp. No retention, no
+  watch noise, and the cascade needs no trigger, because a cascade that removes
+  edges also collects an object and that already appends.
+
+  Deferred with the gate itself: the sweep it would skip is 190 ms at 250,000
+  edges, so the saving is real only for an idle store, and the item above is the
+  one that matters at scale. Do this one first if the gate is ever wanted, since
+  the counter is what makes it correct rather than merely defensible.
+
 - **A dependency cycle of length ≥ 2 reconciles forever** — known, not fixed. The
   self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`, so an object
   that depends on itself does not re-queue itself. Two objects that depend on each
@@ -231,6 +271,40 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   after a long outage is seen to starve the reconcile loops. Tripwire:
   `TestWakerResumesAnEnormousBacklog` pins that a far-behind cursor is resumed today,
   which is exactly what such a bound would change.
+
+- **The waker cannot tell that retention trimmed the log out from under its
+  cursor** — known, not fixed, and latency rather than divergence. The per-kind
+  read reports the boundary: `ObjectWritesListSince` returns `trimmedThrough`,
+  and `ObjectWritesMaxVersion` folds the horizon in, which is how a watch tail
+  detects a cursor below it and ends its subscribers with `ErrWatchTooOld`. The
+  store-wide pair does neither. `ObjectWritesListSinceAll` returns entries and an
+  error, and `ObjectWritesMaxVersionAll` reads a bare `MAX(resource_version)` off
+  `object_writes` with no reference to `object_writes_horizon`.
+
+  So a waker that resumes a cursor below the horizon — a stored cursor older than
+  the write log's retention, 24h by default, after a downtime longer than that —
+  scans from that cursor and gets whatever survived the trim. `resumeWatermark`
+  clamps against `max`, which does not move down when retention trims the tail, so
+  the clamp cannot see it either. The entries between the cursor and the horizon
+  are silently skipped, and every dependent they would have woken is skipped with
+  them.
+
+  **Correctness is intact and that is why this is deferred:** those dependents are
+  found by the stale-dependents pass, which re-derives staleness from
+  `dependency_watermarks` and records nothing the trim could remove. The cost is
+  up to one `staleDependentsInterval` of latency, on a path that only opens after
+  a downtime exceeding the write log's retention.
+
+  **The fix is to surface the horizon on the store-wide reads** and have `seed`
+  compare its resume point against it, as `objectTailer` does per kind. The waker
+  cannot answer a gap the way a tailer does — there are no subscribers to end, and
+  restarting from `max` is what it already does without a cursor — so the useful
+  behaviour is to log the skipped span and force one stale-dependents sweep rather
+  than wait for its tick. Not done because it widens `storeapi.Store` for a case
+  no deployment has hit, and because the same reasoning that makes the gap benign
+  makes the forced sweep an optimisation. Revisit when the store-wide reads are
+  next touched, or if a long outage is seen to leave dependents stale for a
+  minute after restart.
 
 - **A `RequeueAfter` chain does not survive a restart** — known, not fixed. The
   dependency-wake half is closed: staleness is re-derived from
