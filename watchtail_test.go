@@ -714,3 +714,34 @@ func TestWatchSeesDeleteOfSnapshotObject(t *testing.T) {
 		}
 	}
 }
+
+// NewClient is free-form, so two clients with different type parameters over one
+// kind are legal. They share the tailer — which is why it fans out raw rows and
+// leaves decode to each subscriber; a typed fan-out would panic on one of them.
+func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &countingTailStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	typed := NewClient[cSpec, cStatus](bh, clientTestGK)
+	raw := NewClient[json.RawMessage, json.RawMessage](bh, clientTestGK)
+
+	_, typedCh, err := typed.WatchList(ctx)
+	require.NoError(t, err)
+	_, rawCh, err := raw.WatchList(ctx)
+	require.NoError(t, err)
+	gateReadsAtStart := store.gateReads.Load()
+
+	obj := mustCreate(t, ctx, typed, "shared", cSpec{Val: "a"})
+
+	ev := recv(t, typedCh)
+	assert.Equal(t, "a", ev.Object.Spec.Val)
+	rawEv := recv(t, rawCh)
+	assert.Equal(t, obj.ID, rawEv.Object.ID)
+	assert.JSONEq(t, `{"Val":"a"}`, string(rawEv.Object.Spec))
+
+	assert.Len(t, bh.tailers, 1, "the kind is read by one tailer")
+	assert.Equal(t, int64(1), store.gateReads.Load()-gateReadsAtStart,
+		"one write costs one gate read, not one per subscriber")
+}
