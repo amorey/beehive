@@ -82,7 +82,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ObjectWritesMaxVersion` (which folds in the horizon so it only rises — gate on
   `>`, not `!=`), a busy one reads the entries above the cursor and then one
   batched `ObjectsListByIDs`, draining until a page comes back short. A commit
-  wakes it (`signalObjectWritten`, `AfterCommit`); the emit table is derived from
+  wakes it (`signalKindWritten`, `AfterCommit`); the emit table is derived from
   the store's write-log call sites, **not** from the public verbs — conditions
   reach the log through `bumpObject`, and the owner cascade is routed by the refs
   it returns. The fan-out is non-generic (`rawChange`) because two clients may

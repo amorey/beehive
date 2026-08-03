@@ -43,7 +43,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		for _, ch := range children {
 			if gk := ch.GroupKind(); !woken[gk] {
 				woken[gk] = true
-				bh.signalObjectWritten(ctx, gk)
+				bh.signalKindWritten(ctx, gk)
 			}
 		}
 
@@ -72,7 +72,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
 			return err
 		}
-		bh.signalObjectWritten(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind})
+		bh.signalKindWritten(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind})
 		deleted = true
 		return nil
 	})

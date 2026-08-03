@@ -373,7 +373,7 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawOb
 	}
 	// A create always changes the object: there was nothing before it.
 	c.signalSpecWritten(ctx, raw.ID)
-	c.bh.signalObjectWritten(ctx, c.gk)
+	c.bh.signalKindWritten(ctx, c.gk)
 }
 
 // signalSpecWritten enqueues id's own reconcile once the write that changed its
@@ -488,7 +488,7 @@ func (c *clientImpl[Spec, Status]) update(
 		}
 		if changed {
 			c.signalSpecWritten(ctx, raw.ID)
-			c.bh.signalObjectWritten(ctx, c.gk)
+			c.bh.signalKindWritten(ctx, c.gk)
 		}
 		return nil
 	})
@@ -829,7 +829,7 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 		return err
 	}
 	if marked {
-		c.bh.signalObjectWritten(ctx, c.gk)
+		c.bh.signalKindWritten(ctx, c.gk)
 	}
 	// Nothing is scheduled: the mark is the signal, and the GC tick is
 	// guaranteed (WithGCInterval refuses to be disabled).
@@ -852,7 +852,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 		return err
 	}
 	if marked {
-		c.bh.signalObjectWritten(ctx, c.gk)
+		c.bh.signalKindWritten(ctx, c.gk)
 	}
 	return nil
 }

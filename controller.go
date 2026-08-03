@@ -95,7 +95,7 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err := c.bh.store.ObjectsUpdateStatus(ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))); err != nil {
 		return err
 	}
-	c.bh.signalObjectWritten(ctx, c.gk)
+	c.bh.signalKindWritten(ctx, c.gk)
 	return nil
 }
 
@@ -109,7 +109,7 @@ func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id Obj
 	}); err != nil {
 		return err
 	}
-	c.bh.signalObjectWritten(ctx, c.gk)
+	c.bh.signalKindWritten(ctx, c.gk)
 	return nil
 }
 
@@ -117,7 +117,7 @@ func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id 
 	if err := c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType); err != nil {
 		return err
 	}
-	c.bh.signalObjectWritten(ctx, c.gk)
+	c.bh.signalKindWritten(ctx, c.gk)
 	return nil
 }
 
@@ -143,7 +143,7 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 	if err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer); err != nil {
 		return err
 	}
-	c.bh.signalObjectWritten(ctx, c.gk)
+	c.bh.signalKindWritten(ctx, c.gk)
 	return nil
 }
 

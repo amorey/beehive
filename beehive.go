@@ -428,13 +428,15 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 	})
 }
 
-// signalObjectWritten wakes gk's tailer once a write to gk commits.
-// AfterCommit for the same reasons as signalRequeue: a rollback publishes
-// nothing, and the wake cannot arrive before the row is readable. Callers
-// check that the write changed something only where the store already reports
-// it — an extra wake costs one position read, a missed one costs up to a
-// floor tick of staleness.
-func (bh *Beehive) signalObjectWritten(ctx context.Context, gk GroupKind) {
+// signalKindWritten wakes gk's tailer once a write to gk commits. The signal is
+// the kind, never the object: the tailer holds one cursor for the kind and reads
+// the log to learn what moved, so a wake carries no id and a burst of writes to
+// one kind collapses into one. AfterCommit for the same reasons as
+// signalRequeue: a rollback publishes nothing, and the wake cannot arrive before
+// the row is readable. Callers check that the write changed something only where
+// the store already reports it — an extra wake costs one position read, a missed
+// one costs up to a floor tick of staleness.
+func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		_ = bh.wakes.Send(gk) // ErrClosed after stop; nothing is left to wake
 	})
