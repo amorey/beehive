@@ -281,6 +281,10 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// a Beehive that never ran too — no special case for that below. Deferred so
 	// a stream whose caller is still reading sees what the draining reconcile
 	// loops write; a tailer whose subscribers have all left is already gone.
+	//
+	// This can race a client write's AfterCommit wake, which gobus's Sender.Close
+	// tells callers not to do. Safe as gobus is built, and pinned by
+	// TestStopToleratesConcurrentCommitWakes; see docs/TODO.md.
 	defer bh.kindWriteHub.Close()
 
 	bh.mu.Lock()

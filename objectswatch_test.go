@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -2788,4 +2789,44 @@ func TestTailerBuildDoesNotStallOtherKinds(t *testing.T) {
 
 	close(store.release)
 	require.NoError(t, <-built)
+}
+
+// gobus's Sender.Close says not to call it concurrently with an active Send
+// from another goroutine, and beehive does exactly that: a client write's
+// AfterCommit hook sends the wake, and nothing fences application writes
+// against Stop. It is safe as gobus is built — Close holds the hub mutex for
+// its whole body and the only lock-free step in Send is an atomic the Close
+// poisons — so a racing Send answers ErrClosed rather than tearing.
+//
+// This pins that, and -race is most of the point of it: it is what would catch
+// a gobus upgrade that started acting on the stated precondition. See the TODO
+// entry for the upstream question.
+func TestStopToleratesConcurrentCommitWakes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	require.NoError(t, err)
+
+	var senders sync.WaitGroup
+	bad := make(chan error, 16)
+	for range 8 {
+		senders.Go(func() {
+			for range 500 {
+				if err := bh.kindWriteHub.Send(clientTestGK); err != nil {
+					if !errors.Is(err, gobus.ErrClosed) {
+						bad <- err
+					}
+					return // ErrClosed is terminal; the hub does not reopen
+				}
+			}
+		})
+	}
+
+	require.NoError(t, bh.stop(ctx))
+	senders.Wait()
+	close(bad)
+	for err := range bad {
+		t.Errorf("a wake racing stop answered %v, want nil or ErrClosed", err)
+	}
 }

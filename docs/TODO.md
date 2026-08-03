@@ -485,6 +485,41 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   one database file. Revisit before the first real `Migrator` consumer ships a v2, or
   the first time a rollback across a schema bump has to be supported.
 
+- **`stop` closes the wake hub's sender while a client write may be sending on
+  it, which gobus tells callers not to do** — known, safe as gobus is built, and
+  deferred because every fix costs more than the exposure. `watch.Sender.Close`
+  says "Do not call it concurrently with an active Send from another goroutine"
+  (gobus v0.5.0 `watch/watch.go:315`). `stop` closes it on a defer
+  (`beehive.go:284`) and nothing fences application writes against `Stop`, so a
+  `Create` committing on another goroutine runs `signalKindWritten`'s
+  `AfterCommit` hook straight into that window.
+
+  **Why it is safe today.** `Close` holds `s.mu` for its whole body, and the only
+  lock-free step in `Send` is an atomic `live.Idle()` check that `Close` poisons
+  atomically. The two therefore serialize: a racing `Send` either publishes
+  before the close or answers `ErrClosed` after it. Nothing tears, and
+  `TestStopToleratesConcurrentCommitWakes` pins it under `-race`.
+
+  **Why that is not enough on its own.** It rests on gobus's implementation
+  rather than its contract, so a gobus release that acted on the stated
+  precondition — a lock-free fast path in `Close`, say — would break shutdown
+  silently rather than at compile time.
+
+  **Three ways out, in order of preference.** Ask gobus to promise what it
+  already does: `watch`'s `Send` never parks, which is the same reason
+  `gochan/broadcast` documents its sender as safe to share, so the precondition
+  looks inherited rather than required. Failing that, replace the close with
+  per-tailer context cancellation under `tailMu` plus a stopped flag `tailerFor`
+  checks — which is a real refactor, and would have to keep `ErrStopped` working
+  for a tailer built after `stop`. Fencing the close behind the write path is
+  the one to avoid: it puts a synchronization point on every commit to close a
+  window nothing has been shown to fall into.
+
+  Revisit on any gobus upgrade that touches `watch`'s close path. Tripwire: the
+  test above, which is a race detector harness rather than an assertion — it
+  passes vacuously if the send loop stops early, so check it still drives sends
+  through the close before trusting it.
+
 - **Reads and writes share one connection, so a live watch slows the write path** —
   known, not fixed, and deferred on the safety property it trades away rather than
   on the size of the win. `OpenPool` sets `journal_mode(WAL)`, which lets one writer
