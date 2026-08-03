@@ -485,6 +485,67 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   one database file. Revisit before the first real `Migrator` consumer ships a v2, or
   the first time a rollback across a schema bump has to be supported.
 
+- **Reads and writes share one connection, so a live watch slows the write path** —
+  known, not fixed, and deferred on the safety property it trades away rather than
+  on the size of the win. `OpenPool` sets `journal_mode(WAL)`, which lets one writer
+  and many readers run at the same time. Then `sqlite.Open` passes `maxConns = 1`, so
+  every read queues behind every write in Go's pool and that concurrency is unused.
+  The limit is `database/sql`, not SQLite.
+
+  **Measured cost.** `BenchmarkWritesUnderWatch` (`objectswatch_bench_test.go`), on
+  disk, beehive not started so no driver competes:
+
+  | Watches | ns/op | p50 | p99 |
+  | --- | --- | --- | --- |
+  | none | 172,000 | 151 µs | 465 µs |
+  | 1 kind, 1 watch | 215,000 | 190 µs | 550 µs |
+  | 1 kind, 64 watches | 223,000 | 197 µs | 715 µs |
+  | 16 kinds, 1 watch each | 326,000 | 271 µs | 995 µs |
+
+  One watch costs about a quarter of write throughput. Watch *count* is free, which
+  is the shared tailer working as designed. Watched *kinds* is the axis that costs:
+  the writes round-robin, so each tailer wakes with nothing to coalesce and 16 drains
+  contend for the one connection. That row is the worst case by construction — real
+  traffic bursts per kind and collapses more. Absolute numbers are machine-specific;
+  the deltas are the finding.
+
+  **The fix is two pools, not a larger one.** Raising `maxConns` alone breaks writes:
+  the DSN sets `_txlock=immediate`, so concurrent `Within` calls would collide at the
+  SQLite level and take `SQLITE_BUSY` with a 5s `busy_timeout` behind it, where today
+  they queue in Go. Instead keep a write pool of 1 and add a read pool of N with
+  `_pragma=query_only(true)` — `mode=ro` is worse, because a read-only connection
+  cannot recover the `-wal`/`-shm` files. `s.conn(ctx)` is already the single place
+  connection selection happens, so the change is a sibling `s.read(ctx)` returning
+  the read pool, plus moving the read-only methods onto it.
+
+  **What makes this more than a refactor.** Today a read issued outside the
+  transaction while inside one deadlocks: it waits for the connection the
+  transaction holds. That is loud and deterministic, and it is stated as a
+  caller-facing rule in `Client.Watch`'s godoc. With a read pool the same mistake
+  becomes a *silent stale read* on a second snapshot. `s.read(ctx)` must return the
+  transaction whenever one is present, and that invariant is the whole defence.
+
+  The tests would not exercise the new path. `OpenMemory` uses `file::memory:`, which
+  is per-connection, so a second pool there is a different and empty database. The
+  read pool has to fall back to the write pool in memory, which means the suite keeps
+  today's semantics and only on-disk runs cover the split.
+
+  **Several components budget their work against one connection**, and their
+  reasoning would have to be re-read rather than assumed: the waker's page budget
+  exists so a resume "cannot monopolise the single connection" (`waker.go:72`, `:76`,
+  `:240`), the tailer reads "one after another on the single connection"
+  (`objectswatch.go:462`), and `workqueue.go:421` reasons about a deadlock on it.
+  This also changes the premise of the page-cache item below, which discounts a
+  larger cache because "the store is one connection, so a larger cache is not shared
+  across concurrent readers the way the advice assumes".
+
+  Revisit when a deployment is write-bound with watches attached, or when the driver
+  count grows enough that read contention shows up without any watch at all. Tripwire:
+  `BenchmarkWritesUnderWatch` is the measurement, and its `no-watcher` row is the
+  baseline the split should move the others toward. There is no test pinning the
+  in-transaction deadlock — it would hang rather than fail — so a `s.read(ctx)` that
+  forgets the transaction case would pass the suite today.
+
 - **The page cache and `mmap_size` are untuned, and it is unclear whether tuning them
   buys anything here** — known, not fixed. `OpenPool` sets five pragmas and leaves
   SQLite's stock ~2MB cache and disabled memory mapping alone.
