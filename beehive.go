@@ -282,9 +282,12 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// a stream whose caller is still reading sees what the draining reconcile
 	// loops write; a tailer whose subscribers have all left is already gone.
 	//
-	// This can race a client write's AfterCommit wake, which gobus's Sender.Close
-	// tells callers not to do. Safe as gobus is built, and pinned by
-	// TestStopToleratesConcurrentCommitWakes; see docs/TODO.md.
+	// This races a client write's AfterCommit wake, which watch.Sender.Close
+	// allows: the racing send either publishes or answers ErrClosed, never both
+	// and never partially. Which one wins is unspecified and nothing here needs
+	// it pinned — every stream is ending anyway. The reconcile loops are a
+	// different matter, and the defer is what orders them: they have drained
+	// before this runs.
 	defer bh.kindWriteHub.Close()
 
 	bh.mu.Lock()

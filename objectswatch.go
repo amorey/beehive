@@ -128,7 +128,9 @@ func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID)
 // and a publish that lands mid-read waits in the slot. The signal carries no
 // value — the tailer reads its position from the store — so no Accept gate is
 // set and every send is taken. Close closes the sender, never the hub
-// (scheduleHub's rule).
+// (scheduleHub's rule) — and that is what makes stop's close safe against a
+// client write's wake: watch.Sender.Close allows a concurrent send, watch.Hub
+// .Close does not.
 // See docs/adr/2026-08-03-watch-shared-tail.md.
 type kindWriteHub struct {
 	hub *watch.Hub[GroupKind, struct{}]

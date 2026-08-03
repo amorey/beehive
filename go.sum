@@ -1,5 +1,5 @@
-github.com/amorey/gobus v0.5.0 h1:Cg40nY85tYq4r6zQo9o8SZNJgiEMiN8pWBTUjCgVgAY=
-github.com/amorey/gobus v0.5.0/go.mod h1:fwUvrpmOKEiCjEKkGGmkOL9mLIyqDKIil2xpvc9NdWA=
+github.com/amorey/gobus v0.5.1 h1:XIRFK6uikuclgqcQwR5kr1hhSrZZtcaXplCByGa9OvY=
+github.com/amorey/gobus v0.5.1/go.mod h1:fwUvrpmOKEiCjEKkGGmkOL9mLIyqDKIil2xpvc9NdWA=
 github.com/amorey/gochan v0.2.0 h1:/U76z9dZdrMbQRUDjl1AIOkFd5RH8DvAxPdFWQoBe1U=
 github.com/amorey/gochan v0.2.0/go.mod h1:7ZgZK6RFPTXozOPMs/Cc7V69D8TqJm3GdIL0JwRGgI4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
