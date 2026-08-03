@@ -474,7 +474,22 @@ func (t *objectTailer) run() {
 // one wake is read in full. The page length is the stop test: it says exactly
 // when the log is drained, and a second position read would cost an extra
 // query for the same answer.
+//
+// The position check is that read, and it runs once here rather than once per
+// page. It is the quiet-wake gate — a wake with nothing behind it costs one
+// scalar query and no listing — but a full page is already proof there is more,
+// so paying it per page would buy an answer the page length just gave, on the
+// store's single connection.
 func (t *objectTailer) drain(ctx context.Context) error {
+	at, err := t.bh.store.ObjectWritesMaxVersion(ctx, t.gk)
+	if err != nil {
+		return err
+	}
+	// The position includes the retention horizon, so it only rises: test with
+	// >, and an unmoved position means nothing was written.
+	if at <= t.cursor {
+		return nil
+	}
 	for {
 		n, err := t.step(ctx)
 		if err != nil {
@@ -487,18 +502,8 @@ func (t *objectTailer) drain(ctx context.Context) error {
 }
 
 // step reads one page of the kind's log above the cursor, publishes what it
-// found, and returns the page length. The position check up front makes a
-// quiet wake cost one scalar read.
+// found, and returns the page length. Its caller gates it; see drain.
 func (t *objectTailer) step(ctx context.Context) (int, error) {
-	at, err := t.bh.store.ObjectWritesMaxVersion(ctx, t.gk)
-	if err != nil {
-		return 0, err
-	}
-	// The position includes the retention horizon, so it only rises: test with
-	// >, and an unmoved position means nothing was written.
-	if at <= t.cursor {
-		return 0, nil
-	}
 	page, trimmedThrough, err := t.bh.store.ObjectWritesListSince(ctx, t.gk, t.cursor, tailPageCap)
 	if err != nil {
 		return 0, err

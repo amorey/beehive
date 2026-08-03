@@ -1326,8 +1326,9 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 		require.NoError(t, err, "burst stalled after %d of %d", len(seen), burst)
 		seen[ev.Key] = true
 	}
-	// Two pages, so two steps, so two position reads.
-	assert.Equal(t, int64(2), store.positionReads.Load()-positionReadsAtStart)
+	// One drain, so one position read, however many pages it takes: the gate
+	// answers "is there anything?", and a full page answers "is there more?".
+	assert.Equal(t, int64(1), store.positionReads.Load()-positionReadsAtStart)
 }
 
 // Two unread changes for one object coalesce by the merge table. Nothing is
@@ -1554,10 +1555,9 @@ func TestTailerStepToleratesAGateAheadOfTheLog(t *testing.T) {
 	// Below the gate the empty log now reports, and above the horizon.
 	tailer.cursor = 0
 
-	n, err := tailer.step(ctx)
-	require.NoError(t, err)
-	assert.Zero(t, n)
-	assert.Zero(t, tailer.cursor, "a step that found nothing must not advance")
+	// Through drain, which is where the gate lives.
+	require.NoError(t, tailer.drain(ctx))
+	assert.Zero(t, tailer.cursor, "a drain that found nothing must not advance")
 }
 
 // failGateStore fails the log-position read once the tailer has built itself on
@@ -1586,10 +1586,8 @@ func TestTailerStepReportsAFailedGateRead(t *testing.T) {
 	defer tailer.close()
 
 	at := tailer.cursor
-	n, err := tailer.step(ctx)
-	assert.ErrorIs(t, err, errBoom)
-	assert.Zero(t, n)
-	assert.Equal(t, at, tailer.cursor, "a failed step must not advance the cursor")
+	assert.ErrorIs(t, tailer.drain(ctx), errBoom)
+	assert.Equal(t, at, tailer.cursor, "a failed gate must not advance the cursor")
 }
 
 // A step that finds its fan-out closed stops publishing and reports no error:
