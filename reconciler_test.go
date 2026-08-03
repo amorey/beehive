@@ -2930,6 +2930,29 @@ func TestReconcileSkipsDependencyWatermarkWithoutDependencies(t *testing.T) {
 	assert.Equal(t, []ObjectID{h.dep}, probe.sets, "a dependent does record one")
 }
 
+// TestReconcileStampsOwedWhenTheWatermarkWriteFails pins the durable record a
+// failed watermark write has to leave. Re-deriving the object was enough while
+// the stale pass scanned everything; a cursor-bound pass re-derives nothing for a
+// target that has gone quiet, so the failure must record its own owed wake.
+func TestReconcileStampsOwedWhenTheWatermarkWriteFails(t *testing.T) {
+	ctx := context.Background()
+	var probe *watermarkProbeStore
+	h := newWatermarkHarness(t, func(s Store) Store {
+		probe = &watermarkProbeStore{Store: s, err: errBoom}
+		return probe
+	})
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err, "the reconcile itself succeeded; only the bookkeeping failed")
+
+	raw, err := h.store.ObjectsGet(ctx, h.dep)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, raw.ReconcileOwed, "the lost watermark is owed a pass")
+}
+
 // TestReconcileRecordsCursorFromTheLoad pins where the cursor comes from. A
 // target that moves *during* the pass was not observed by it, so the dependent
 // must stay stale: recording a cursor sampled after the controller's reads would
