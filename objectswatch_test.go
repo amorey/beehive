@@ -2830,3 +2830,23 @@ func TestStopToleratesConcurrentCommitWakes(t *testing.T) {
 		t.Errorf("a wake racing stop answered %v, want nil or ErrClosed", err)
 	}
 }
+
+// The promotion rule has one statement and two callers, so pin the rule itself
+// rather than only its two uses. A run that began with a create reports as a
+// create, unless it ends in a delete — the object was never in the subscriber's
+// snapshot, so Modified would name an id the cache does not hold.
+func TestCoalesceOp(t *testing.T) {
+	cases := []struct {
+		began, ended, want WriteOp
+	}{
+		{WriteCreate, WriteUpdate, WriteCreate},
+		{WriteCreate, WriteCreate, WriteCreate},
+		{WriteCreate, WriteDelete, WriteDelete},
+		{WriteUpdate, WriteUpdate, WriteUpdate},
+		{WriteUpdate, WriteDelete, WriteDelete},
+		{WriteDelete, WriteUpdate, WriteUpdate},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, coalesceOp(tc.began, tc.ended), "%v then %v", tc.began, tc.ended)
+	}
+}

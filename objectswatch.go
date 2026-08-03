@@ -362,10 +362,26 @@ func mergeRawChange(prev, next rawChange) (rawChange, bool) {
 	if next.ResourceVersion <= prev.ResourceVersion {
 		return prev, true // stale send: the pending value is already newer
 	}
-	if prev.Op == WriteCreate && next.Op != WriteDelete {
-		next.Op = WriteCreate
-	}
+	next.Op = coalesceOp(prev.Op, next.Op)
 	return next, true
+}
+
+// coalesceOp folds a run of writes to one object into the op to report: a run
+// that began with a create still reports as a create, unless it ends in a
+// delete. Create-then-update coalesces to a WriteUpdate on its own, but the
+// object was not in the subscriber's snapshot, so reporting Modified would give
+// a cache a change for an id it does not hold.
+//
+// Stated here because runs fold in two places, and which one applies is a
+// matter of timing: writes inside one log page fold in collectChanges, writes
+// spanning two wakes fold in the fan-out's mergeRawChange. Two copies of this
+// rule would diverge only under a particular interleaving, handing one
+// subscriber Added and another Modified for the same run.
+func coalesceOp(began, ended WriteOp) WriteOp {
+	if began == WriteCreate && ended != WriteDelete {
+		return WriteCreate
+	}
+	return ended
 }
 
 // failure returns why the tailer ended, or nil when it ended with the beehive.
@@ -502,15 +518,14 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 	// key, so keeping each id's highest-version entry preserves write order
 	// without a sort.
 	last := make(map[ObjectID]int64, len(page))
-	// created marks runs that began with a create. Create-then-update
-	// coalesces to a WriteUpdate, but the object was not in the subscriber's
-	// snapshot, so reporting Modified would give a cache a change for an id it
-	// does not hold.
-	created := make(map[ObjectID]bool, len(page))
+	// first is where each id's run in this page begins, which is what decides
+	// the op to report; see coalesceOp. An id is created once and never reused,
+	// so a create can only be the run's first entry.
+	first := make(map[ObjectID]WriteOp, len(page))
 	for _, w := range page {
 		last[w.ID] = w.ResourceVersion
-		if w.Op == WriteCreate {
-			created[w.ID] = true
+		if _, seen := first[w.ID]; !seen {
+			first[w.ID] = w.Op
 		}
 	}
 	order := make([]ObjectWrite, 0, len(last))
@@ -554,10 +569,7 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 				"op", "Watch", "group", gk.Group, "kind", gk.Kind, "id", w.ID, "err", errNoRowImage)
 			continue
 		}
-		op := w.Op
-		if op == WriteUpdate && created[w.ID] {
-			op = WriteCreate
-		}
+		op := coalesceOp(first[w.ID], w.Op)
 		changes = append(changes, rawChange{
 			ID:              w.ID,
 			Op:              op,
