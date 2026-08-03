@@ -38,21 +38,7 @@ type watchConfig struct {
 	// resumeFrom is the position to stream above, or nil to take a snapshot.
 	resumeFrom *int64
 	loads      LoadSet
-	lag        LagPolicy
-	lagDepth   int
 }
-
-// LagPolicy is what a stream does when its subscriber does not keep up.
-type LagPolicy int
-
-const (
-	// LagBlock waits for the subscriber. No change is ever dropped, and a
-	// subscriber that stops reading stalls its own stream and nothing else.
-	LagBlock LagPolicy = iota
-	// LagFail buffers a positive number of changes and then ends the stream with
-	// ErrWatchLagged, so a stalled consumer is told rather than served.
-	LagFail
-)
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
 // returned snapshot holds no objects and carries rv back. Fails with
@@ -64,35 +50,6 @@ func WithResumeFrom(rv int64) WatchOption {
 		return nil
 	}
 }
-
-// WithLagPolicy sets what happens when the subscriber does not keep up. Under
-// LagFail the stream buffers depth changes and then ends with ErrWatchLagged;
-// depth is ignored under LagBlock, the default, and must be positive under
-// LagFail — a non-positive one fails with ErrInvalidOption rather than
-// producing a stream that reports itself lagged at once.
-func WithLagPolicy(p LagPolicy, depth int) WatchOption {
-	return func(c *watchConfig) error {
-		// The policy first: an unrecognised one matches neither branch that reads
-		// it, so it would quietly deliver a blocking stream to a caller who asked
-		// for a failing one.
-		if p != LagBlock && p != LagFail {
-			return fmt.Errorf("%w: WithLagPolicy got an unknown policy %d", ErrInvalidOption, p)
-		}
-		if p == LagFail && (depth <= 0 || depth > maxLagDepth) {
-			return fmt.Errorf("%w: WithLagPolicy needs a depth in [1, %d] under LagFail, got %d",
-				ErrInvalidOption, maxLagDepth, depth)
-		}
-		c.lag, c.lagDepth = p, depth
-		return nil
-	}
-}
-
-// maxLagDepth is the largest LagFail buffer. The ceiling exists because the
-// buffer becomes a channel capacity of depth+1: maxInt overflows that to
-// negative and panics in make, and anything near it is an allocation no watch
-// has a use for — one tick delivers at most tailPageCap changes, so a buffer
-// this size is already a subscriber that will never catch up.
-const maxLagDepth = 1 << 20
 
 // WithLoads eager-loads the same secondary lookups List takes, on the snapshot
 // and on every delivered batch. Batched per batch, not per object, so a watch
@@ -239,14 +196,7 @@ func (c *clientImpl[Spec, Status]) objectStream(
 	}
 	at := snap.ResourceVersion
 
-	// One slot beyond the buffer is reserved for the terminal change: without it
-	// the send that reports the lag would block on exactly the subscriber that
-	// stopped reading.
-	capacity := 0
-	if cfg.lag == LagFail {
-		capacity = cfg.lagDepth + 1
-	}
-	out := make(chan ObjectChange[Spec, Status], capacity)
+	out := make(chan ObjectChange[Spec, Status])
 	go func() {
 		defer close(out)
 		// Seeded from the snapshot: the stream starts where the listing ended, so
@@ -264,16 +214,6 @@ func (c *clientImpl[Spec, Status]) objectStream(
 				return c.pollFailed(ctx, "watch", err)
 			}
 			for _, ch := range changes {
-				// Only the reserved slot is left, so this subscriber is behind by
-				// the whole buffer.
-				if cfg.lag == LagFail && len(out) >= cfg.lagDepth {
-					sendOrDone(ctx, out, ObjectChange[Spec, Status]{
-						Type: Failed,
-						Err: fmt.Errorf("%w: %s/%s subscriber is behind by %d changes",
-							ErrWatchLagged, c.gk.Group, c.gk.Kind, cfg.lagDepth),
-					})
-					return false
-				}
 				if !sendOrDone(ctx, out, ch) {
 					return false
 				}

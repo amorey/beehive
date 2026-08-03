@@ -17,7 +17,6 @@ package beehive
 import (
 	"context"
 	"log/slog"
-	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1510,51 +1509,6 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 	assert.Equal(t, owner.ID, got.ID)
 }
 
-// A subscriber that stops reading can be failed instead of blocking the tail.
-// Resuming from 0 puts every create in one batch, so the batch is bigger than the
-// buffer and the policy fires without anyone having to be slow on a clock.
-func TestLagFailEndsAStalledSubscriber(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, _, client, _ := watchFixture(t)
-	for range 3 {
-		mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	}
-
-	_, ch, err := client.WatchList(ctx,
-		WithResumeFrom(0), WithLagPolicy(LagFail, 1))
-	require.NoError(t, err)
-
-	var got []ObjectChange[cSpec, cStatus]
-	for ev := range ch {
-		got = append(got, ev)
-	}
-
-	require.NotEmpty(t, got)
-	last := got[len(got)-1]
-	assert.Equal(t, Failed, last.Type, "the stream ends rather than waiting forever")
-	assert.ErrorIs(t, last.Err, ErrWatchLagged)
-	assert.Less(t, len(got), 4, "it stopped short of the whole batch")
-}
-
-// The default keeps today's behaviour: the tail blocks until the subscriber
-// reads, and no change is ever dropped.
-func TestLagBlockIsTheDefault(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, _, client, _ := watchFixture(t)
-	for range 3 {
-		mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	}
-
-	_, ch, err := client.WatchList(ctx, WithResumeFrom(0))
-	require.NoError(t, err)
-
-	for range 3 {
-		assert.Equal(t, Added, recv(t, ch).Type)
-	}
-}
-
 // The tail needs no reconciler, so a kind nobody registered a controller for can
 // still be watched. SchedulesWatch keeps its ErrNoController: a schedule is a
 // reconciler's state, and a client-only kind has none.
@@ -1616,38 +1570,6 @@ func TestCoalescedCreateThenDeleteReportsDeleted(t *testing.T) {
 	ev := recv(t, ch)
 	assert.Equal(t, Deleted, ev.Type)
 	assert.Equal(t, obj.ID, ev.Object.ID)
-}
-
-// A LagFail depth is public input, so an invalid one is an option error rather
-// than a panic in make() or a stream that reports itself lagged immediately.
-func TestLagFailRejectsANonPositiveDepth(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, _, client, _ := watchFixture(t)
-
-	// Both ends: a non-positive depth, and one that cannot become a channel
-	// capacity — maxInt overflows the reserved slot to negative, and anything
-	// past the ceiling is an allocation no watch buffer has a use for.
-	for _, depth := range []int{0, -1, -2, math.MaxInt, math.MaxInt - 1, maxLagDepth + 1} {
-		_, ch, err := client.WatchList(ctx, WithLagPolicy(LagFail, depth))
-		require.ErrorIs(t, err, ErrInvalidOption, "depth %d", depth)
-		assert.Nil(t, ch)
-	}
-
-	// An unrecognised policy is refused too. Accepting it would set a value
-	// matching neither branch downstream, so a caller asking for a failing
-	// stream would silently get an unbounded blocking one.
-	_, ch, err := client.WatchList(ctx, WithLagPolicy(LagPolicy(2), 5))
-	require.ErrorIs(t, err, ErrInvalidOption)
-	assert.Nil(t, ch)
-
-	// The ceiling itself is accepted.
-	_, _, err = client.WatchList(ctx, WithLagPolicy(LagFail, maxLagDepth))
-	require.NoError(t, err)
-
-	// LagBlock ignores depth, as documented.
-	_, _, err = client.WatchList(ctx, WithLagPolicy(LagBlock, math.MaxInt))
-	require.NoError(t, err)
 }
 
 // imagelessStore strips the row image off every delete entry, standing in for a
@@ -1753,18 +1675,6 @@ func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
 	_, ok, err := ev.Object.Owner()
 	require.NoError(t, err, "and it carries the relation that was asked for")
 	assert.False(t, ok, "this object has no owner")
-}
-
-// A watch option is validated on both entry points, not only the list watch.
-func TestWatchValidatesItsOptions(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, _, client, _ := watchFixture(t)
-
-	_, ch, err := client.Watch(ctx, 1, WithLagPolicy(LagFail, 0))
-
-	require.ErrorIs(t, err, ErrInvalidOption)
-	assert.Nil(t, ch)
 }
 
 // A resume checks the horizon before returning a stream, so a store that cannot
