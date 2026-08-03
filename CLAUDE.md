@@ -77,7 +77,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   recorded per kind in `object_writes_horizon`, and that horizon is the resume
   boundary. → [ADR](docs/adr/2026-08-02-object-write-log.md)
 - **Client watches return a snapshot and subscribe to their kind's shared
-  tailer** (`watchtail.go`). One tailer per kind owns the cursor, so reads scale
+  tailer** (`objectswatch.go`). One tailer per kind owns the cursor, so reads scale
   with watched kinds, not watch count: a quiet read costs one
   `ObjectWritesMaxVersion` (which folds in the horizon so it only rises — gate on
   `>`, not `!=`), a busy one reads the entries above the cursor and then one

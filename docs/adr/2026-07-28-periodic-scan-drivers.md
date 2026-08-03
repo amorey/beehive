@@ -1,6 +1,6 @@
 # Every driver is a periodic scan of the store, on its own cadence
 
-- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `watch.go`, `watchtail.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md).
+- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `watch.go`, `objectswatch.go`, `eventswatch.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md).
 - **Date:** 2026-07-28; watch tail amended 2026-08-03
 
 This record is the *why*. For the case-by-case map of what each driver actually

@@ -1071,3 +1071,167 @@ func uniqueName() string {
 }
 
 var nameSeq atomic.Int64
+
+// pollProbeStore signals each time the watch surface reads, so a test can wait for
+// a poll it expects rather than assuming one has happened. Errors are injected per
+// call site, which is what lets a test drive one failure branch at a time.
+type pollProbeStore struct {
+	Store
+	// polled fires once per object-watch tick. It hangs off the store-wide cursor
+	// read because that is the one call every tick makes: the write-log probe and the
+	// listings past it are exactly what a quiet tick skips.
+	polled chan struct{}
+	// listed fires after a listing returns, so a test can cancel knowing the read
+	// already succeeded and the goroutine is on its way to the send.
+	listed chan struct{}
+	// eventsListed is the event watch's equivalent of listed; metaRead, eventsMarked
+	// and eventsFailed cover the reads a tick makes before it gets there. A quiet
+	// tick stops at eventsMarked, which is what makes it the event watch's clock.
+	eventsListed chan struct{}
+	eventsMarked chan struct{}
+	metaRead     chan struct{}
+	eventsFailed chan struct{}
+	// byIDs records the id batches the tail read, so a test can assert it read
+	// what changed rather than the whole kind.
+	byIDs chan []ObjectID
+	// tailed fires after the tail's own listing of the write log returns.
+	tailed chan struct{}
+	// forceTrimmed overrides the horizon the tail's listing reports, so a test
+	// can sit exactly on the boundary without staging real retention.
+	forceTrimmed atomic.Int64
+	listErr      atomic.Bool
+	listIDsErr   atomic.Bool
+	getErr       atomic.Bool
+	eventsErr    atomic.Bool
+	markErr      atomic.Bool
+	metaErr      atomic.Bool
+}
+
+func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+	probeSignal(s.polled)
+	return at, err
+}
+
+// The snapshot reads are the watch's first read, so they carry the same failure
+// injection and the same signal as the listing they replaced.
+func (s *pollProbeStore) ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
+	if s.listErr.Load() {
+		return nil, 0, errBoom
+	}
+	out, at, err := s.Store.ObjectWritesSnapshot(ctx, gk)
+	probeSignal(s.listed)
+	return out, at, err
+}
+
+func (s *pollProbeStore) ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
+	if s.getErr.Load() {
+		return nil, 0, errBoom
+	}
+	return s.Store.ObjectWritesSnapshotByID(ctx, gk, id)
+}
+
+// ObjectWritesListSince is the tail's own listing: it carries listErr and signals
+// after the read, which is the seam the cancellation tests need — past it the only
+// thing left that can observe a cancelled context is the send itself.
+func (s *pollProbeStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	if s.listErr.Load() {
+		return nil, 0, errBoom
+	}
+	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	if forced := s.forceTrimmed.Load(); forced > 0 {
+		trimmed = forced
+	}
+	probeSignal(s.tailed)
+	return page, trimmed, err
+}
+
+// ObjectsList signals *after* the read returns.
+func (s *pollProbeStore) ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+	if s.listErr.Load() {
+		return nil, errBoom
+	}
+	out, err := s.Store.ObjectsList(ctx, gk)
+	probeSignal(s.listed)
+	return out, err
+}
+
+func (s *pollProbeStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+	if s.getErr.Load() {
+		return nil, errBoom
+	}
+	out, err := s.Store.ObjectsListByIDs(ctx, gk, ids)
+	select {
+	case s.byIDs <- ids:
+	default:
+	}
+	return out, err
+}
+
+func (s *pollProbeStore) ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if s.listIDsErr.Load() {
+		return nil, errBoom
+	}
+	return s.Store.ObjectsListIDs(ctx, gk)
+}
+
+func (s *pollProbeStore) ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error) {
+	if s.getErr.Load() {
+		return nil, errBoom
+	}
+	return s.Store.ObjectsGet(ctx, id)
+}
+
+// ObjectsGetMeta is the event watch's per-tick read, so it signals on every call —
+// error or not — which is what a test waiting out a failing phase needs.
+func (s *pollProbeStore) ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawObject, error) {
+	defer probeSignal(s.metaRead)
+	if s.metaErr.Load() {
+		return nil, errBoom
+	}
+	return s.Store.ObjectsGetMeta(ctx, id)
+}
+
+// EventsMaxVersion is the event watch's gate read, so it signals on every call —
+// error or not — the way ObjectsGetMeta does. It is the only store read a quiet
+// tick makes, so a test counting it is counting ticks.
+func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+	defer probeSignal(s.eventsMarked)
+	if s.markErr.Load() {
+		return 0, errBoom
+	}
+	return s.Store.EventsMaxVersion(ctx, id)
+}
+
+func (s *pollProbeStore) EventsList(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, error) {
+	if s.eventsErr.Load() {
+		probeSignal(s.eventsFailed)
+		return nil, errBoom
+	}
+	out, err := s.Store.EventsList(ctx, id, q)
+	probeSignal(s.eventsListed)
+	return out, err
+}
+
+// watchFixture wires a Beehive with one registered kind over a probe store — the
+// shape all three watch surfaces' tests need, which is why it lives here rather
+// than with any one of them. The ControllerClient comes back because the event
+// watches need something that can write to a log.
+func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
+	t.Helper()
+	store := &pollProbeStore{
+		Store:        newClientTestStore(t),
+		polled:       make(chan struct{}, 256),
+		listed:       make(chan struct{}, 256),
+		eventsListed: make(chan struct{}, 256),
+		eventsMarked: make(chan struct{}, 256),
+		metaRead:     make(chan struct{}, 256),
+		eventsFailed: make(chan struct{}, 256),
+		byIDs:        make(chan []ObjectID, 256),
+		tailed:       make(chan struct{}, 256),
+	}
+	bh := newTestBeehive(t, store, fast()...)
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
+}

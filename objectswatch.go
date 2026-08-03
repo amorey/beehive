@@ -27,6 +27,90 @@ import (
 	"github.com/amorey/gobus/watch"
 )
 
+// This file is the object watch, both halves of it. One tailer per kind owns
+// the kind's cursor, reads the write log when a commit wakes it, and fans raw
+// changes out over a conflate hub; each watch is a subscriber that decodes for
+// itself and drops what its own snapshot already held. The two halves live
+// together because the invariants span them — the merge table is written
+// against a hub-wide pending slot meeting a per-subscriber floor.
+// See docs/adr/2026-08-03-watch-shared-tail.md.
+
+// WatchOption configures one watch call. A distinct type from Option: these are
+// meaningful only here, and dispatching them on a Beehive or a controller would
+// silently accept nonsense.
+type WatchOption func(*watchConfig)
+
+type watchConfig struct {
+	// resumeFrom is the position to stream above, or nil to take a snapshot.
+	resumeFrom *int64
+	loads      LoadSet
+}
+
+// WithResumeFrom streams the changes above rv instead of taking a snapshot. The
+// returned snapshot holds no objects and carries rv back. A position retention
+// has already passed ends the stream with a Failed change carrying
+// ErrWatchTooOld — the same way a live stream reports it — which the caller
+// answers by subscribing again without this option.
+func WithResumeFrom(rv int64) WatchOption {
+	return func(c *watchConfig) { c.resumeFrom = &rv }
+}
+
+// WithLoads eager-loads the same secondary lookups List takes, on the snapshot
+// and on every delivered batch. Batched per batch, not per object, so a watch
+// does not become an N+1.
+func WithLoads(loads ...LoadOption) WatchOption {
+	return func(c *watchConfig) { c.loads = resolveLoads(loads) }
+}
+
+func resolveWatch(opts []WatchOption) watchConfig {
+	var cfg watchConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// watchFloor returns the object tail's floor interval, with a fallback for the
+// same reason as watchPoll: a zero would make the tailer's timer fire in a
+// loop.
+func (bh *Beehive) watchFloor() time.Duration {
+	if bh.watchFloorInterval <= 0 {
+		return defaultWatchFloorInterval
+	}
+	return bh.watchFloorInterval
+}
+
+// WatchList streams changes to every object of this client's kind. See
+// the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+	return c.tailStream(ctx, resolveWatch(opts), nil)
+}
+
+// Watch streams changes to the single object id: an id that does not exist yet
+// streams nothing until created, and its removal reads as a Deleted.
+func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+	// The tail is shared per kind — the log has no index on object_id — so a
+	// single-object watch joins the kind's reader and filters the fan-out down
+	// to its own id.
+	list, ch, err := c.tailStream(ctx, resolveWatch(opts), &id)
+	if err != nil {
+		return ObjectSnapshot[Spec, Status]{}, nil, err
+	}
+	snap := ObjectSnapshot[Spec, Status]{ResourceVersion: list.ResourceVersion}
+	if len(list.Objects) > 0 {
+		snap.Object = list.Objects[0]
+	}
+	return snap, ch, nil
+}
+
+// snapshot reads the watch's starting state: one object, or the whole kind.
+func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID) ([]*RawObject, int64, error) {
+	if only != nil {
+		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *only)
+	}
+	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
+}
+
 // wakeHub wakes a kind's tailer when the kind changes. Keyed by GroupKind,
 // latest value only: a burst of commits collapses into one pending wake, and a
 // publish that lands mid-read waits in the slot. The value is a process-local
