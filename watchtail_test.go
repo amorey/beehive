@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -346,20 +347,23 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	store := &countingTailStore{Store: newClientTestStore(t)}
 	bh, err := New(store)
 	require.NoError(t, err)
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, rx := startTailer(t, bh, clientTestGK)
 	gateReadsAtStart := store.gateReads.Load()
 
-	// One transaction: every write commits together, so the burst is one wake.
-	require.NoError(t, bh.store.Within(ctx, func(ctx context.Context) error {
-		for i := range burst {
-			if _, err := client.Create(ctx, fmt.Sprintf("burst-%d", i), cSpec{}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}))
+	// Written past the client so the burst carries no wakes of its own, then
+	// woken once: a burst coalesces to one wake anyway, and this makes the read
+	// count the tailer's rather than the interleaving's.
+	spec, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	for i := range burst {
+		_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+			Name: fmt.Sprintf("burst-%d", i),
+			Spec: spec,
+		})
+		require.NoError(t, err)
+	}
+	require.NoError(t, bh.wakes.Send(clientTestGK))
 
 	seen := make(map[ObjectID]bool, burst)
 	for len(seen) < burst {
@@ -369,6 +373,116 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	}
 	// Two pages, so two steps, so two gate reads.
 	assert.Equal(t, int64(2), store.gateReads.Load()-gateReadsAtStart)
+}
+
+// Two changes for one object that a subscriber has not read yet coalesce by the
+// merge table. Nothing annihilates: the pending slot is hub-wide but a
+// subscriber's snapshot is its own, so dropping a create/delete pair would leave
+// a subscriber that snapshotted between them holding a deleted object forever.
+func TestTailerMergeTable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	update := func(val string) func(*testing.T, context.Context, *writeWorld, ObjectID) {
+		return func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
+			_, err := w.client.Update(ctx, id, cSpec{Val: val})
+			require.NoError(t, err)
+		}
+	}
+	softDelete := func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
+		require.NoError(t, w.client.Delete(ctx, id))
+	}
+	collect := func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
+		deleted, err := w.bh.gcCollect(ctx, id)
+		require.NoError(t, err)
+		require.True(t, deleted)
+	}
+
+	cases := []struct {
+		name string
+		// observed drains the create, so the pending slot starts empty and the
+		// object is one the subscriber already holds.
+		observed bool
+		// Each write is one log entry, and the tailer publishes between them, so
+		// the pair merges in the pending slot rather than inside one page.
+		first, second func(*testing.T, context.Context, *writeWorld, ObjectID)
+		wantOp        WriteOp
+		wantVal       string
+	}{
+		{
+			name:    "unobserved create then update reports the create with the newest state",
+			second:  update("b"),
+			wantOp:  WriteCreate,
+			wantVal: "b",
+		},
+		{
+			name:     "update then update reports the last",
+			observed: true,
+			first:    update("b"),
+			second:   update("c"),
+			wantOp:   WriteUpdate,
+			wantVal:  "c",
+		},
+		{
+			name:     "update then delete reports the delete",
+			observed: true,
+			first:    softDelete,
+			second:   collect,
+			wantOp:   WriteDelete,
+		},
+		{
+			name:   "unobserved create then delete still reports the delete",
+			first:  softDelete,
+			second: collect,
+			wantOp: WriteDelete,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWriteWorld(t)
+			tailer, pending := startTailer(t, w.bh, clientTestGK)
+			// A second receiver, read after every write, is how the test knows
+			// the tailer published — pending must stay unread to merge.
+			stepped := tailer.hub.Receiver()
+			defer stepped.Close()
+
+			id := mustCreate(t, ctx, w.client, "merged", cSpec{Val: "a"}).ID
+			_, err := stepped.RecvContext(ctx)
+			require.NoError(t, err)
+			if tc.observed {
+				drainConflate(pending)
+			}
+
+			for _, write := range []func(*testing.T, context.Context, *writeWorld, ObjectID){tc.first, tc.second} {
+				if write == nil {
+					continue
+				}
+				write(t, ctx, w, id)
+				_, err = stepped.RecvContext(ctx)
+				require.NoError(t, err)
+			}
+
+			ev, err := pending.RecvContext(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, id, ev.Key)
+			assert.Equal(t, tc.wantOp, ev.Value.Op)
+			if tc.wantVal != "" {
+				assert.Contains(t, string(ev.Value.Object.Spec), tc.wantVal)
+			}
+			// One slot per object: the merge left no second delivery behind.
+			_, err = pending.TryRecv()
+			assert.ErrorIs(t, err, gobus.ErrEmpty)
+		})
+	}
+}
+
+func drainConflate(rx *conflate.Receiver[ObjectID, rawChange]) {
+	for {
+		if _, err := rx.TryRecv(); err != nil {
+			return
+		}
+	}
 }
 
 // startTailer runs one tailer with a receiver attached, and tears both down with

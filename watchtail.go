@@ -116,8 +116,22 @@ func (t *objectTailer) close() {
 	t.hub.Sender().Close()
 }
 
-// mergeRawChange resolves two undelivered changes for one object into one.
+// mergeRawChange resolves two undelivered changes for one object into one:
+// newest wins, and a run the subscriber has not seen the start of still reports
+// as a create.
+//
+// Nothing is ever dropped. Annihilating an unread create/delete pair looks safe
+// and is not: the pending slot is hub-wide while a snapshot is per subscriber,
+// so a subscriber that snapshotted between the two would hold the object forever
+// with no delete coming. A delete for a key a consumer never saw is a no-op at
+// any cache.
 func mergeRawChange(prev, next rawChange) (rawChange, bool) {
+	if next.ResourceVersion <= prev.ResourceVersion {
+		return prev, true // a send the pending value already covers
+	}
+	if prev.Op == WriteCreate && next.Op != WriteDelete {
+		next.Op = WriteCreate
+	}
 	return next, true
 }
 
