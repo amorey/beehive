@@ -891,6 +891,16 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 	return scanIDs(rows)
 }
 
+// ResourceVersionsMaxIssued reads the sequence itself (contract on
+// storeapi.Store), which is why retention cannot lower it. One row, always
+// present: the migration seeds it.
+func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, error) {
+	var rv int64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
+	return rv, err
+}
+
 // ReconcileOwedStamp stamps a page of findings in one statement (contract on
 // storeapi.Store). One UPDATE over an id list, not one per row: the stale
 // pass stamps a whole page at a time.

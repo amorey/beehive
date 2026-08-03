@@ -486,6 +486,16 @@ type Store interface {
 	// ordered by id — the inverse of EdgesListIncoming.
 	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
+	// ResourceVersionsMaxIssued returns the highest resource version the store
+	// has issued. It reads the sequence, not any table, so it never falls —
+	// unlike ObjectWritesMaxVersionAll, which retention lowers. Use it wherever
+	// a stored position is compared against "now".
+	//
+	// It also moves for an event write, which no object cursor can be shown. A
+	// caller that scans must not treat it as a log position; a caller that only
+	// asks "could anything have changed" is safe, and pays a spare pass.
+	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
+
 	// ReconcileOwedStamp increments reconcile_owed for each ref, so a finding
 	// outlives the in-memory queue it was also enqueued on. An id that is gone
 	// is skipped rather than reported: a dependent can be collected between the

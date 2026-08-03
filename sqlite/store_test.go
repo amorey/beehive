@@ -3144,6 +3144,35 @@ func TestReconcileOwedStampSkipsVanishedRows(t *testing.T) {
 	assert.Equal(t, int64(1), reconcileOwed(t, store, b.ID), "the surviving ref is still stamped")
 }
 
+// TestResourceVersionsMaxIssuedNeverFalls pins the difference from
+// ObjectWritesMaxVersionAll, which reads a table retention trims. A cursor that
+// falls would compare wrongly against a stored position, so the stale pass reads
+// the sequence instead.
+func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	newRefObject(t, store)
+
+	issued, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	require.Positive(t, issued, "a create takes a version")
+
+	// Age the log out from under the sweep, which is what an idle store past its
+	// retention window sees.
+	_, err = store.db.ExecContext(ctx, `UPDATE object_writes SET written_at = 0`)
+	require.NoError(t, err)
+	_, err = store.ObjectWritesSweep(ctx, 0, time.Hour)
+	require.NoError(t, err)
+
+	logged, err := store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	require.Zero(t, logged, "the log is empty, so its max is back to 0")
+
+	after, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, issued, after, "the sequence is unmoved by retention")
+}
+
 func TestReconcileOwedQueryErrors(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()

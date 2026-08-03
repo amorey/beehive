@@ -368,6 +368,12 @@ func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID,
 func (s *fakeStore) ReconcileOwedStamp(context.Context, []storeapi.ObjectRef) error {
 	return nil
 }
+
+// ResourceVersionsMaxIssued answers 0: the stale-dependents driver reads it every
+// tick, so a panic would break every Start.
+func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return 0, nil
+}
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }
