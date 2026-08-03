@@ -2954,3 +2954,35 @@ func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
 		})
 	}
 }
+
+// A create or update that will not decode is dropped and the stream carries on.
+// Unlike a delete it needs no tombstone: the row is still there, so the next
+// write to it repairs whatever a mirror holds, and reporting a change with no
+// state would say less than saying nothing.
+//
+// The watch starts before the poison row, which is what puts the row on the tail
+// rather than in the snapshot — decodeList quarantines the snapshot's copy, and
+// this is decodeChanges' arm of the same rule.
+func TestWatchQuarantinesAnUndecodableWriteOnTheTail(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, _ := watchFixture(t)
+	_, ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Name: uniqueName(),
+		Spec: []byte(`not json`),
+	})
+	require.NoError(t, err)
+
+	// A decodable object is the barrier: it cannot arrive before the batch that
+	// dropped the poison row, so receiving it first proves nothing was sent for
+	// that row.
+	good := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "good"})
+
+	ev := recv(t, ch)
+	assert.Equal(t, Added, ev.Type)
+	assert.Equal(t, good.ID, ev.Object.ID, "the undecodable write reached the stream")
+}
