@@ -114,9 +114,14 @@ type Beehive struct {
 	wakes      wakeHub
 	tailCtx    context.Context
 	tailCancel context.CancelFunc
-	state      beehiveState
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	// tailers is one shared reader per watched kind, started lazily. Guarded by
+	// tailMu — never bh.mu; see tailerFor.
+	tailMu  sync.Mutex
+	tailers map[GroupKind]*objectTailer
+	tailWG  sync.WaitGroup
+	state   beehiveState
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 // log returns a non-nil logger; Stop and tests can run before Start resolves it.
@@ -274,9 +279,9 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 // rather than Start, so it is torn down either way.
 func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Lock()
-	bh.stopWatchTail()
 	if bh.state != beehiveRunning {
 		bh.mu.Unlock()
+		bh.stopWatchTail()
 		return nil
 	}
 	// Release bh.mu before waiting on wg: the waker (counted in wg) takes bh.mu
@@ -298,9 +303,10 @@ func (bh *Beehive) stop(ctx context.Context) error {
 		drainErr = ctx.Err()
 	}
 
-	// The store-backed client watches poll the store and are not counted in wg:
-	// each ends when its own context is cancelled. SchedulesWatch streams report
-	// the work queue instead and end here, after their final value.
+	// The watch tailers are not counted in wg — they come up in New rather than
+	// Start — so they are cancelled and drained here. SchedulesWatch streams
+	// report the work queue instead and end here, after their final value.
+	bh.stopWatchTail()
 	bh.log().Info("control plane stopped")
 	return drainErr
 }
@@ -424,12 +430,14 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 }
 
 // stopWatchTail ends the watch machinery: tailers see their context cancelled,
-// and a tailer blocked on a wake sees the sender closed. Called under bh.mu.
+// a tailer blocked on a wake sees the sender closed, and every subscriber then
+// sees its fan-out close. Never called under bh.mu — it waits on the tailers.
 func (bh *Beehive) stopWatchTail() {
 	if bh.tailCancel != nil {
 		bh.tailCancel()
 	}
 	bh.wakes.Close()
+	bh.tailWG.Wait()
 }
 
 // signalObjectWritten wakes gk's tailer once a write to gk commits. AfterCommit

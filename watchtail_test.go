@@ -566,6 +566,54 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 	assert.Equal(t, obj.ID, ev.Key)
 }
 
+// Tailers are lazy, one per kind, and end with the beehive — started or not.
+func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	assert.Empty(t, bh.tailers, "a tailer started before anything watched")
+
+	// Concurrent first watches settle on one tailer for the kind.
+	const racers = 8
+	got := make([]*objectTailer, racers)
+	var wg sync.WaitGroup
+	for i := range racers {
+		wg.Go(func() {
+			tailer, err := bh.tailerFor(ctx, clientTestGK)
+			assert.NoError(t, err)
+			got[i] = tailer
+		})
+	}
+	wg.Wait()
+	for _, tailer := range got {
+		assert.Same(t, got[0], tailer)
+	}
+	assert.Len(t, bh.tailers, 1)
+
+	// It runs on a beehive that was never started.
+	rx := got[0].hub.Receiver()
+	defer rx.Close()
+	obj := mustCreate(t, ctx, client, "unstarted", cSpec{})
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, obj.ID, ev.Key)
+
+	require.NoError(t, bh.stop(ctx))
+	_, err = rx.RecvContext(ctx)
+	assert.ErrorIs(t, err, gobus.ErrClosed, "stop left a subscriber hanging")
+
+	// A watch opened after stop gets a stream that is already over.
+	after, err := bh.tailerFor(ctx, clientTestGK)
+	require.NoError(t, err)
+	rxAfter := after.hub.Receiver()
+	defer rxAfter.Close()
+	_, err = rxAfter.RecvContext(ctx)
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
 // startTailer runs one tailer with a receiver attached, and tears both down with
 // the test.
 func startTailer(t *testing.T, bh *Beehive, gk GroupKind) (*objectTailer, *conflate.Receiver[ObjectID, rawChange]) {

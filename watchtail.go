@@ -70,6 +70,33 @@ func (h wakeHub) Close() {
 	}
 }
 
+// tailerFor returns the kind's tailer, starting one on the first watch. A tailer
+// that ended (a trimmed cursor, or the beehive stopping) is replaced, so a
+// caller never joins a dead fan-out.
+//
+// Guarded by tailMu, not bh.mu: bh.mu is not reentrant and the resolvers under
+// it (migratorFor, reconcilerFor) take it, and the store read below would hold
+// it for the duration of a query.
+func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, error) {
+	bh.tailMu.Lock()
+	defer bh.tailMu.Unlock()
+	if t, ok := bh.tailers[gk]; ok && t.failure() == nil {
+		return t, nil
+	}
+	t, err := newObjectTailer(ctx, bh, gk)
+	if err != nil {
+		return nil, err
+	}
+	if bh.tailers == nil {
+		bh.tailers = make(map[GroupKind]*objectTailer)
+	}
+	bh.tailers[gk] = t
+	// A tailer started after stop finds tailCtx already cancelled and closes its
+	// fan-out at once, which is what ends the watch that asked for it.
+	bh.tailWG.Go(func() { t.run(bh.tailCtx) })
+	return t, nil
+}
+
 // rawChange is what the tailer fans out: one object's newest log entry plus the
 // state to report it with. Undecoded on purpose — two clients may watch one kind
 // with different type parameters, so decode belongs to each subscriber.
