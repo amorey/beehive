@@ -107,20 +107,21 @@ type Beehive struct {
 	migrators map[GroupKind]Migrator
 	// order preserves registration order so Start launches loops deterministically.
 	order []*reconciler
+
 	waker *waker
-	// kindWriteHub tells a kind's tailer that the kind moved. Nothing to do with
-	// waker/wakeInterval above, which drive reconciles: this one only ever
-	// reaches a watch. From New, not Start: watches work on a Beehive that
-	// never ran.
+
+	// kindWriteHub is a message hub for GroupKind-scoped writes
 	kindWriteHub kindWriteHub
+
 	// tailers is one shared reader per watched kind, started on the kind's first
 	// watch and ended by its last. A tailer is here exactly while it has
 	// subscribers. Guarded by tailMu — never bh.mu; see tailerFor.
 	tailMu  sync.Mutex
 	tailers map[GroupKind]*objectTailer
-	state   beehiveState
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+
+	state  beehiveState
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // log returns a non-nil logger; Stop and tests can run before Start resolves it.
