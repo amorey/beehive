@@ -630,6 +630,14 @@ func (c *clientImpl[Spec, Status]) consume(
 // for good. The fan-out coalesces in place, leaving a re-written object at its
 // original queue position carrying a newer version — the one way the drain sees
 // them out of order.
+//
+// The loop is unbounded and must stay that way. It ends because the producer is
+// store-bound: the tailer publishes at most tailPageCap entries, then has to
+// read the store again before it can publish more, and a pop costs orders of
+// magnitude less than that read. A cap would not be a safe substitute — it
+// would take part of a pending set and leave the rest, which delivers exactly
+// the inversion above. A sound bound needs conflate to hand back everything
+// pending in one call.
 func drainPending(first rawChange, rx *conflate.Receiver[ObjectID, rawChange]) []rawChange {
 	batch := []rawChange{first}
 	for {

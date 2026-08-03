@@ -2540,3 +2540,52 @@ func TestDrainPendingIsAscendingByResourceVersion(t *testing.T) {
 	// A@10 coalesced into A@12, so two changes remain: B's older one first.
 	assert.Equal(t, []int64{11, 12}, got)
 }
+
+// A producer that never stops writing must not hold a subscriber inside
+// drainPending: the loop exits on an empty receiver, and the tailer can only
+// refill that receiver after a store read. Nothing else here exercises a
+// producer that replenishes *during* a drain. Starvation shows up as the
+// failsafe timeout rather than as a wrong value.
+func TestWatchDeliversUnderSustainedWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	const objects = 8
+	ids := make([]ObjectID, objects)
+	for i := range ids {
+		ids[i] = mustCreate(t, ctx, client, fmt.Sprintf("w%d", i), cSpec{}).ID
+	}
+
+	_, stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	writes, stopWrites := context.WithCancel(ctx)
+	var writer sync.WaitGroup
+	// LIFO: stopWrites runs first, so the wait below is not the thing that ends
+	// the writer.
+	defer writer.Wait()
+	defer stopWrites()
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		// Errors are the context ending mid-write, which is how the test stops it.
+		for i := 0; writes.Err() == nil; i++ {
+			_, _ = client.Update(writes, ids[i%objects], cSpec{Val: fmt.Sprint(i)})
+		}
+	}()
+
+	const want = 50
+	for got := 0; got < want; {
+		select {
+		case ch, ok := <-stream:
+			require.True(t, ok, "the stream ended after %d changes", got)
+			require.NotEqual(t, Failed, ch.Type, "%v", ch.Err)
+			got++
+		case <-ctx.Done():
+			t.Fatalf("delivered %d of %d changes before the failsafe", got, want)
+		}
+	}
+}
