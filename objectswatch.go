@@ -81,6 +81,17 @@ func (bh *Beehive) watchFloor() time.Duration {
 	return bh.watchFloorInterval
 }
 
+// watchBackoff is the retry ladder every watch path climbs after a failed read:
+// the tailer's, and a subscriber's own relation load and resume replay. Capped
+// at the floor interval, which is what a healthy quiet kind already costs, so a
+// failing read settles at a cadence the store is sized for.
+//
+// One statement, three callers: a tailer and its own subscribers backing off on
+// different curves would be a tuning accident, not a decision.
+func (bh *Beehive) watchBackoff() driver.Backoff {
+	return driver.Backoff{Base: watchRetryBase, Max: bh.watchFloor()}
+}
+
 // WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
@@ -404,7 +415,7 @@ func (t *objectTailer) run() {
 	timer := time.NewTimer(floor)
 	defer timer.Stop()
 
-	retry := driver.Backoff{Base: watchRetryBase, Max: floor}
+	retry := t.bh.watchBackoff()
 	// backingOff drops commit wakes until the retry timer fires. A wake carries
 	// no information — the drain reads its position from the store — so dropping
 	// one loses nothing, and the timer reads the log either way. Honouring one
@@ -732,7 +743,7 @@ func (c *clientImpl[Spec, Status]) decodeBatch(
 	cfg watchConfig,
 	floor int64,
 ) ([]ObjectChange[Spec, Status], bool) {
-	retry := driver.Backoff{Base: watchRetryBase, Max: c.bh.watchFloor()}
+	retry := c.bh.watchBackoff()
 	for {
 		changes, err := c.decodeChanges(ctx, batch, mig, cfg, floor)
 		if err == nil {
@@ -801,7 +812,7 @@ func (c *clientImpl[Spec, Status]) replay(
 	out chan<- ObjectChange[Spec, Status],
 ) (int64, bool) {
 	cursor := from
-	retry := driver.Backoff{Base: watchRetryBase, Max: c.bh.watchFloor()}
+	retry := c.bh.watchBackoff()
 	for {
 		page, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, cursor, tailPageCap)
 		if err != nil {
