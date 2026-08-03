@@ -207,24 +207,32 @@ func watchCascade(
 	for !clusterRemoved || cachesRemoved < numCaches {
 		select {
 		case ev := <-clusterCh:
-			o := ev.Object
+			// Object is nil on Failed, and on a Deleted whose row image no
+			// longer decodes; ev.ID identifies the object either way.
+			if ev.Type == beehive.Failed {
+				log.Fatalf("cluster watch ended: %v", ev.Err)
+			}
 			if ev.Type == beehive.Deleted {
-				fmt.Printf("Cluster %d: removed\n", o.ID)
+				fmt.Printf("Cluster %d: removed\n", ev.ID)
 				clusterRemoved = true
 				continue
 			}
+			o := ev.Object
 			if !deleted && o.Status != nil && o.Status.Connected && !connected {
 				connected = true
 				fmt.Printf("Cluster %d: connected to %s\n", o.ID, o.Spec.Endpoint)
 				deleteWhenReady()
 			}
 		case ev := <-cacheCh:
-			o := ev.Object
+			if ev.Type == beehive.Failed {
+				log.Fatalf("cache watch ended: %v", ev.Err)
+			}
 			if ev.Type == beehive.Deleted {
-				fmt.Printf("ClusterCache %d: removed\n", o.ID)
+				fmt.Printf("ClusterCache %d: removed\n", ev.ID)
 				cachesRemoved++
 				continue
 			}
+			o := ev.Object
 			if !deleted && o.Status != nil && o.Status.Entries > 0 && !warmed[o.ID] {
 				warmed[o.ID] = true
 				fmt.Printf("ClusterCache %d: warmed (%d entries)\n", o.ID, o.Status.Entries)
