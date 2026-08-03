@@ -2986,3 +2986,63 @@ func TestWatchQuarantinesAnUndecodableWriteOnTheTail(t *testing.T) {
 	assert.Equal(t, Added, ev.Type)
 	assert.Equal(t, good.ID, ev.Object.ID, "the undecodable write reached the stream")
 }
+
+// blockFirstPositionStore parks the first position read for one kind until
+// released, so a test can hold one tailer build open while another finishes.
+type blockFirstPositionStore struct {
+	Store
+	gk      GroupKind
+	blocks  atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockFirstPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if gk == s.gk && s.blocks.CompareAndSwap(true, false) {
+		close(s.entered)
+		<-s.release
+	}
+	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+}
+
+// The build runs outside tailMu, so two first watches on one kind can both
+// reach it. The one that registers first wins; the other discards the tailer it
+// built and joins, leaving the kind with exactly one.
+//
+// Sequenced rather than raced: the concurrent-racers test reaches this path only
+// when the scheduler cooperates, and under GOMAXPROCS=1 it never does.
+func TestConcurrentTailerBuildsSettleOnOne(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &blockFirstPositionStore{
+		Store:   newClientTestStore(t),
+		gk:      clientTestGK,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	store.blocks.Store(true)
+	bh := newTestBeehive(t, store)
+
+	loser := make(chan *objectTailer, 1)
+	go func() {
+		got, err := bh.tailerFor(ctx, clientTestGK)
+		assert.NoError(t, err)
+		loser <- got
+	}()
+	<-store.entered // parked in its cursor read, having already missed the registry
+
+	// This build's read does not park, so it registers while the other waits.
+	winner, err := bh.tailerFor(ctx, clientTestGK)
+	require.NoError(t, err)
+	close(store.release)
+
+	joined := <-loser
+	assert.Same(t, winner, joined, "the losing build did not join the winner")
+	assert.Equal(t, 1, tailerCount(bh))
+
+	// Both calls owed a lease, the discarded build owed none.
+	winner.release()
+	joined.release()
+	assert.Zero(t, tailerCount(bh))
+}
