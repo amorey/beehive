@@ -138,8 +138,15 @@ func (h kindWriteHub) Send(gk GroupKind) error {
 
 // Watch registers a receiver for gk. Registration is the baseline and the bus
 // never delivers it back, so a receiver reads only writes that follow it.
-func (h kindWriteHub) Watch(gk GroupKind) *watch.Receiver[GroupKind, struct{}] {
-	return h.hub.Watch(gk, struct{}{})
+//
+// ok is false on the zero hub. Unlike Send and Close this cannot no-op: a
+// receiver has to be tied to a hub, so there is nothing to hand back. The
+// caller turns that into an error rather than a nil dereference.
+func (h kindWriteHub) Watch(gk GroupKind) (*watch.Receiver[GroupKind, struct{}], bool) {
+	if h.hub == nil {
+		return nil, false
+	}
+	return h.hub.Watch(gk, struct{}{}), true
 }
 
 // Close is a no-op on the zero hub; see Send.
@@ -286,11 +293,15 @@ type objectTailer struct {
 // The cursor is read before returning, so a subscriber that snapshots after
 // this call cannot fall into the gap either.
 func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTailer, error) {
+	written, ok := bh.kindWriteHub.Watch(gk)
+	if !ok {
+		return nil, errors.New("beehive: a watch needs a Beehive built by New")
+	}
 	t := &objectTailer{
 		bh:         bh,
 		gk:         gk,
 		hub:        conflate.New[ObjectID](mergeRawChange),
-		kindWrites: bh.kindWriteHub.Watch(gk),
+		kindWrites: written,
 	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)

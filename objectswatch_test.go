@@ -977,7 +977,7 @@ func TestKindWriteHubPublishesOnCreate(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t))
-	rx := bh.kindWriteHub.Watch(clientTestGK)
+	rx, _ := bh.kindWriteHub.Watch(clientTestGK)
 	defer rx.Close()
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1104,7 +1104,7 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			defer cancel()
 
 			w := newWriteWorld(t)
-			rx := w.bh.kindWriteHub.Watch(clientTestGK)
+			rx, _ := w.bh.kindWriteHub.Watch(clientTestGK)
 			defer rx.Close()
 
 			var id ObjectID
@@ -1138,9 +1138,9 @@ func TestKindWriteHubPublishesPerCascadedKind(t *testing.T) {
 	mustCreate(t, ctx, NewClient[cSpec, cStatus](w.bh, gkChildB), "b", cSpec{}, WithOwner(owner.ID))
 	require.NoError(t, w.client.Delete(ctx, owner.ID))
 
-	rxA := w.bh.kindWriteHub.Watch(gkChildA)
+	rxA, _ := w.bh.kindWriteHub.Watch(gkChildA)
 	defer rxA.Close()
-	rxB := w.bh.kindWriteHub.Watch(gkChildB)
+	rxB, _ := w.bh.kindWriteHub.Watch(gkChildB)
 	defer rxB.Close()
 
 	_, err := w.bh.gcCollect(ctx, owner.ID)
@@ -1159,7 +1159,7 @@ func TestKindWriteHubSilentOnRollback(t *testing.T) {
 	defer cancel()
 
 	w := newWriteWorld(t)
-	rx := w.bh.kindWriteHub.Watch(clientTestGK)
+	rx, _ := w.bh.kindWriteHub.Watch(clientTestGK)
 	defer rx.Close()
 
 	err := w.bh.store.Within(ctx, func(ctx context.Context) error {
@@ -1184,7 +1184,7 @@ func TestKindWriteHubClosesOnStop(t *testing.T) {
 		require.NoError(t, err)
 		stop, err := bh.Start(ctx)
 		require.NoError(t, err)
-		rx := bh.kindWriteHub.Watch(clientTestGK)
+		rx, _ := bh.kindWriteHub.Watch(clientTestGK)
 		defer rx.Close()
 
 		require.NoError(t, stop(ctx))
@@ -1195,7 +1195,7 @@ func TestKindWriteHubClosesOnStop(t *testing.T) {
 	t.Run("never started", func(t *testing.T) {
 		bh, err := New(newClientTestStore(t))
 		require.NoError(t, err)
-		rx := bh.kindWriteHub.Watch(clientTestGK)
+		rx, _ := bh.kindWriteHub.Watch(clientTestGK)
 		defer rx.Close()
 
 		require.NoError(t, bh.stop(ctx))
@@ -2655,4 +2655,21 @@ func TestTailBackoffSurvivesCommitWakes(t *testing.T) {
 	}
 	assert.LessOrEqual(t, store.attempts.Load()-settled, int64(1),
 		"a commit wake bypassed the retry backoff")
+}
+
+// Send and Close no-op on the zero wake hub, which a Beehive built field by
+// field has. Watch cannot: a receiver has to be tied to a hub. It reports that
+// rather than dereferencing nil, so the watch fails where the tailer is built.
+func TestWatchOnABeehiveNotBuiltByNewFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh := &Beehive{store: newClientTestStore(t)}
+	// The siblings still tolerate it, which is what makes Watch the odd one.
+	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
+	require.NotPanics(t, bh.kindWriteHub.Close)
+
+	_, _, err := NewClient[cSpec, cStatus](bh, clientTestGK).WatchList(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "built by New")
 }
