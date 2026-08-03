@@ -93,9 +93,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (strictly: equality has lost nothing) ends *every* subscriber with
   `ErrWatchTooOld` and resets the tailer. **A tailer runs from its kind's first
   watch to its last**: `tailerFor` hands back a subscriber lease and every
-  caller owes one `release`, with the count moving only under `tailMu` — the
-  same lock the registry moves under, which is what closes the teardown race.
-  `EventsWatch` still polls and diffs, gated on `EventsMaxVersion`.
+  caller owes one `release`, with the count and the build both under `tailMu` —
+  the same lock the registry moves under, which is what closes the teardown
+  race. Presence in the registry is not health: a tailer that reset stays there
+  until its subscribers release, so `tailerFor` checks both or a resubscribe
+  rejoins the tailer that just failed. `EventsWatch` still polls and diffs,
+  gated on `EventsMaxVersion`.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md)
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.

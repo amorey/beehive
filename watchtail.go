@@ -71,38 +71,38 @@ func (h wakeHub) Close() {
 
 // tailerFor returns the kind's tailer with a subscriber lease held on it,
 // starting one on the kind's first watch. Every caller owes exactly one
-// release. A tailer that ended (trimmed cursor, or the beehive stopped) is
-// replaced, so a caller never joins a closed fan-out.
+// release.
 //
 // Guarded by tailMu, never bh.mu: bh.mu is not reentrant, and migratorFor and
-// reconcilerFor take it. The store read that builds a tailer runs outside the
-// lock so a first watch on one kind does not wait behind another kind's query;
-// when two callers race, the loser discards its tailer.
+// reconcilerFor take it. The lock is held across the build, cursor read
+// included. That read happens once per kind per process, and building outside
+// the lock buys that one latency at the price of a second registry check and a
+// discard path for the race it opens. It cannot move into run either: the
+// cursor has to be read before this returns, or a subscriber's snapshot could
+// fall into the gap below it.
+//
+// The health check is not redundant with the registry. A tailer that ended
+// below the horizon stays registered until the last subscriber holding a lease
+// on it releases, and this is what stops a resubscribe from rejoining the
+// tailer that just told it ErrWatchTooOld.
 func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, error) {
 	bh.tailMu.Lock()
+	defer bh.tailMu.Unlock()
 	if t, ok := bh.tailers[gk]; ok && t.failure() == nil {
 		t.refs++
-		bh.tailMu.Unlock()
 		return t, nil
 	}
-	bh.tailMu.Unlock()
 
 	t, err := newObjectTailer(ctx, bh, gk)
 	if err != nil {
 		return nil, err
 	}
-
-	bh.tailMu.Lock()
-	defer bh.tailMu.Unlock()
-	if live, ok := bh.tailers[gk]; ok && live.failure() == nil {
-		live.refs++
-		t.close()
-		return live, nil
-	}
 	if bh.tailers == nil {
 		bh.tailers = make(map[GroupKind]*objectTailer)
 	}
 	t.refs = 1
+	// Overwrites a tailer that ended below the horizon; release compares
+	// identity, so its subscribers cannot evict this one on their way out.
 	bh.tailers[gk] = t
 	// After stop the wake hub is closed, so the tailer closes its fan-out at
 	// once, which ends the watch that asked for it.

@@ -165,6 +165,22 @@ compares identity rather than presence, because a tailer that reset below the
 horizon was already replaced in the registry and its last subscriber must not
 evict the successor.
 
+`tailerFor` holds `tailMu` across the build, cursor read included. Building
+outside the lock spares one kind's first watch from waiting behind another
+kind's cursor read — a read that happens once per kind per process — and costs
+a second registry check and a discard path for the loser of the race it opens.
+The read cannot move into `run` instead: the cursor has to be read before
+`tailerFor` returns, or a subscriber that snapshots in between falls into the
+gap below it.
+
+The registry alone cannot answer "is there a tailer to join". A tailer that
+ended below the horizon stays registered while its subscribers hold leases —
+they release when they see the failure, which is after they read it — so
+`tailerFor` checks health as well as presence. Without that check the
+resubscribe an `ErrWatchTooOld` asks for can rejoin the tailer that just
+failed and be told the same thing again, which is the recovery path failing
+on itself.
+
 ### The tailer's own ErrWatchTooOld
 
 The cursor is shared, so a cursor below the retention horizon is not one
