@@ -953,3 +953,32 @@ func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	assert.Equal(t, first.ID, changes[1].ID)
 	assert.Contains(t, string(changes[1].Object.Spec), "first3", "current state, not a superseded one")
 }
+
+// Stop drains every watch: each stream closes, and no tailer goroutine outlives
+// the beehive that started it.
+func TestWatchGoroutinesDrainOnStop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	require.NoError(t, err)
+
+	var streams []<-chan ObjectChange[cSpec, cStatus]
+	for _, kind := range []string{"A", "B", "C"} {
+		client := NewClient[cSpec, cStatus](bh, GroupKind{Kind: kind})
+		_, list, err := client.WatchList(ctx)
+		require.NoError(t, err)
+		obj := mustCreate(t, ctx, client, "one", cSpec{})
+		_, single, err := client.Watch(ctx, obj.ID)
+		require.NoError(t, err)
+		streams = append(streams, list, single)
+	}
+	require.Len(t, bh.tailers, 3)
+
+	require.NoError(t, bh.stop(ctx))
+	for i, ch := range streams {
+		for range ch { // drains whatever was in flight, then ends
+		}
+		assert.NotPanics(t, func() { <-ch }, "stream %d is closed", i)
+	}
+}
