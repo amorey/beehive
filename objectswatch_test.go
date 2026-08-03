@@ -985,7 +985,7 @@ func TestKindWriteHubPublishesOnCreate(t *testing.T) {
 
 	ev, err := rx.RecvContext(ctx)
 	require.NoError(t, err)
-	assert.Greater(t, ev.Value, int64(0))
+	assert.Equal(t, clientTestGK, ev.Key)
 }
 
 // Every path that appends an object_writes entry wakes the kind. The rows are
@@ -1116,7 +1116,7 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			tc.write(t, ctx, w, id)
 			ev, err := rx.RecvContext(ctx)
 			require.NoError(t, err, "write published no wake")
-			assert.Greater(t, ev.Value, int64(0))
+			assert.Equal(t, clientTestGK, ev.Key)
 		})
 	}
 }

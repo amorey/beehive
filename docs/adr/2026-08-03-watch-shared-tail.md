@@ -24,12 +24,15 @@ with a slow floor tick behind the wake.**
 
 - **Commit → tailer** (`gobus/watch`, keyed by `GroupKind`). Every beehive-layer
   write publishes through `Store.AfterCommit`, so a rollback publishes nothing
-  and a wake never arrives before the row is readable. The value is a
-  process-local counter, **not** the write's resource version: most store writes
-  return no version (see the [write-shapes ADR](2026-07-30-store-write-shapes.md)),
-  and the tailer reads its own cursor from the store. The value only needs to
-  rise, so `Accept: next > prev` drops superseded publishes and a burst
-  collapses into one pending wake.
+  and a wake never arrives before the row is readable. The signal carries no
+  value — **not** even the write's resource version: most store writes return no
+  version (see the [write-shapes ADR](2026-07-30-store-write-shapes.md)), and the
+  tailer reads its own cursor from the store. So the hub is
+  `watch.Hub[GroupKind, struct{}]` with no `Accept` gate, and a burst collapses
+  into one pending wake because a receiver holds one slot, not a queue.
+  `gobus/watch` is a state bus and this is a signal; the fit is close enough
+  (keyed, coalescing, one receiver per kind) that a bus of its own has to earn a
+  second caller first.
 - **Tailer → subscribers** (`gobus/conflate`, keyed by `ObjectID`). A slow
   subscriber coalesces per object and never blocks the tailer or the other
   subscribers.

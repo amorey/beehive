@@ -112,23 +112,18 @@ func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID)
 }
 
 // kindWriteHub tells a kind's tailer that the kind moved. Keyed by GroupKind,
-// latest value only: a burst of commits collapses into one pending signal, and
-// a publish that lands mid-read waits in the slot. The value is a process-local
-// counter, not a resource version — it only needs to rise. Close closes the
-// sender, never the hub (scheduleHub's rule).
+// one slot per receiver: a burst of commits collapses into one pending signal,
+// and a publish that lands mid-read waits in the slot. The signal carries no
+// value — the tailer reads its position from the store — so no Accept gate is
+// set and every send is taken. Close closes the sender, never the hub
+// (scheduleHub's rule).
 // See docs/adr/2026-08-03-watch-shared-tail.md.
 type kindWriteHub struct {
-	hub *watch.Hub[GroupKind, int64]
-	seq *atomic.Int64
+	hub *watch.Hub[GroupKind, struct{}]
 }
 
 func newKindWriteHub() kindWriteHub {
-	return kindWriteHub{
-		hub: watch.New[GroupKind](watch.WithAccept(
-			func(prev, next int64) bool { return next > prev },
-		)),
-		seq: new(atomic.Int64),
-	}
+	return kindWriteHub{hub: watch.New[GroupKind, struct{}]()}
 }
 
 // Send is a no-op on the zero hub, which a Beehive built without New has —
@@ -137,13 +132,13 @@ func (h kindWriteHub) Send(gk GroupKind) error {
 	if h.hub == nil {
 		return nil
 	}
-	return h.hub.Sender().Send(gk, h.seq.Add(1))
+	return h.hub.Sender().Send(gk, struct{}{})
 }
 
-// Watch registers a receiver for gk. The seed is zero because the tailer reads
-// its starting cursor from the store, not from the hub.
-func (h kindWriteHub) Watch(gk GroupKind) *watch.Receiver[GroupKind, int64] {
-	return h.hub.Watch(gk, 0)
+// Watch registers a receiver for gk. Registration is the baseline and the bus
+// never delivers it back, so a receiver reads only writes that follow it.
+func (h kindWriteHub) Watch(gk GroupKind) *watch.Receiver[GroupKind, struct{}] {
+	return h.hub.Watch(gk, struct{}{})
 }
 
 // Close is a no-op on the zero hub; see Send.
@@ -270,7 +265,7 @@ type objectTailer struct {
 	bh         *Beehive
 	gk         GroupKind
 	hub        *conflate.Hub[ObjectID, rawChange]
-	kindWrites *watch.Receiver[GroupKind, int64]
+	kindWrites *watch.Receiver[GroupKind, struct{}]
 	// ctx is run's, cancelled when the last subscriber leaves. Held here
 	// because the goroutine outlives the call that started it.
 	ctx    context.Context
