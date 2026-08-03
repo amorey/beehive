@@ -247,9 +247,10 @@ type Client[Spec, Status any] interface {
 	// above it: no overlap, no gap. A failed snapshot read is returned rather
 	// than handed back as a stream whose guarantee is void.
 	//
-	// Everything after is polled, which bounds latency and collapses changes
-	// within one interval. A watch cannot be opened inside a transaction (the
-	// read would deadlock on the single connection).
+	// Everything after comes from the kind's shared tailer: a commit wakes it,
+	// and a floor tick covers what a wake cannot. Delivery is latest-per-object,
+	// so changes to one object collapse. A watch cannot be opened inside a
+	// transaction (the read would deadlock on the single connection).
 	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 	WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 }
