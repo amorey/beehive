@@ -119,18 +119,17 @@ func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchO
 	return c.tailStream(ctx, cfg, nil)
 }
 
-// Watch streams changes to the single object id, polling a one-row
-// listing: an id that does not exist yet streams nothing until created, and its
-// removal reads as a Deleted.
+// Watch streams changes to the single object id: an id that does not exist yet
+// streams nothing until created, and its removal reads as a Deleted.
 func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// The tail is the kind's: the log carries no index under object_id, so a
-	// single-object watch scans what its kind writes. It reads and decodes only
-	// its own object, though — the filter runs before the batched read.
+	// single-object watch joins what its kind already reads and filters the
+	// fan-out down to its own key.
 	cfg, err := resolveWatch(opts)
 	if err != nil {
 		return ObjectSnapshot[Spec, Status]{}, nil, err
 	}
-	list, ch, err := c.objectStream(ctx, cfg, &id)
+	list, ch, err := c.tailStream(ctx, cfg, &id)
 	if err != nil {
 		return ObjectSnapshot[Spec, Status]{}, nil, err
 	}

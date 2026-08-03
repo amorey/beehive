@@ -745,3 +745,32 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 	assert.Equal(t, int64(1), store.gateReads.Load()-gateReadsAtStart,
 		"one write costs one gate read, not one per subscriber")
 }
+
+// A single-object watch joins the kind's tailer through a key filter, so its
+// memory is one key even though the tailer reads the whole kind.
+func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
+	other := mustCreate(t, ctx, client, "other", cSpec{Val: "a"})
+
+	snap, ch, err := client.Watch(ctx, mine.ID)
+	require.NoError(t, err)
+	require.NotNil(t, snap.Object)
+	require.Equal(t, mine.ID, snap.Object.ID)
+	require.Len(t, bh.tailers, 1, "a single-object watch joins the kind's tailer")
+
+	// The other object is written first; only the watched one may arrive.
+	_, err = client.Update(ctx, other.ID, cSpec{Val: "b"})
+	require.NoError(t, err)
+	_, err = client.Update(ctx, mine.ID, cSpec{Val: "c"})
+	require.NoError(t, err)
+
+	ev := recv(t, ch)
+	assert.Equal(t, mine.ID, ev.Object.ID)
+	assert.Equal(t, "c", ev.Object.Spec.Val)
+}

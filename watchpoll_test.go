@@ -417,7 +417,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	ev := recv(t, ch)
 	assert.Equal(t, Modified, ev.Type)
 	assert.Equal(t, "b", ev.Object.Spec.Val)
-	assert.Contains(t, buf.String(), "watch poll failed", "the skipped poll is reported")
+	assert.Contains(t, buf.String(), "watch tail step failed", "the skipped read is reported")
 }
 
 // The cheap half of the poll can fail too. It runs only when the write cursor has
@@ -804,16 +804,12 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	assert.Equal(t, watched.ID, ev.Object.ID)
 	assert.Equal(t, "watched", ev.Object.Spec.Val, "the row image carries the final state")
 
-	// The filter runs before the batched read, so the other object's write was
-	// never read back or decoded.
-	for {
-		select {
-		case ids := <-store.byIDs:
-			assert.NotContains(t, ids, newer.ID, "a single-object watch reads only its own object")
-			continue
-		default:
-		}
-		break
+	// The other object's write is read by the kind's shared tailer — the filter
+	// is on the fan-out, not on the read — but it is never delivered here.
+	select {
+	case ev := <-ch:
+		t.Fatalf("a single-object watch delivered another object: %+v", ev)
+	default:
 	}
 }
 
