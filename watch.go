@@ -42,9 +42,10 @@ type watchConfig struct {
 }
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
-// returned snapshot holds no objects and carries rv back. Fails with
-// ErrWatchTooOld when retention has already removed entries above rv, which the
-// caller answers by subscribing again without this option.
+// returned snapshot holds no objects and carries rv back. A position retention
+// has already passed ends the stream with a Failed change carrying
+// ErrWatchTooOld — the same way a live stream reports it — which the caller
+// answers by subscribing again without this option.
 func WithResumeFrom(rv int64) WatchOption {
 	return func(c *watchConfig) { c.resumeFrom = &rv }
 }
@@ -133,17 +134,6 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 		snap.Object = list.Objects[0]
 	}
 	return snap, ch, nil
-}
-
-// resumable reports whether a stream may start above rv, reading the horizon the
-// tail's own listing reports.
-func (c *clientImpl[Spec, Status]) resumable(ctx context.Context, rv int64) error {
-	_, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, rv, 1)
-	if err != nil {
-		return fmt.Errorf("beehive: watch on %s/%s: resume check failed: %w",
-			c.gk.Group, c.gk.Kind, err)
-	}
-	return horizonErr(c.gk, "the resume", rv, trimmedThrough)
 }
 
 // snapshot reads the watch's starting state: one object, or the whole kind.

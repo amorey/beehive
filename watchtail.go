@@ -464,13 +464,10 @@ func (c *clientImpl[Spec, Status]) tailStream(
 	// dropped. A resume raises it as the replay advances.
 	var floor int64
 	if cfg.resumeFrom != nil {
-		// A resume reads no state here. It only checks the position is still
-		// inside the log — the one failure the caller can act on. The gap
-		// itself is replayed on the stream's goroutine.
-		if err := c.resumable(ctx, *cfg.resumeFrom); err != nil {
-			abandon()
-			return empty, nil, err
-		}
+		// A resume reads nothing here: the caller supplies the position, and the
+		// replay checks the horizon on every page it reads anyway. Probing it
+		// once more first would cost a round trip to answer the same question a
+		// moment earlier, in a second place the caller has to handle.
 		snap.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
 	} else {
 		raws, at, err := c.snapshot(ctx, only)

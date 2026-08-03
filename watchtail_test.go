@@ -1271,8 +1271,7 @@ func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
 }
 
 // resumeListStore intercepts the replay's paged read of the gap above from. The
-// resume check reads one entry and the kind's tailer starts above the gap, so
-// neither collides with it.
+// kind's tailer starts above the gap, so its own reads never collide with it.
 type resumeListStore struct {
 	Store
 	from int64
@@ -1353,7 +1352,7 @@ func TestWatchResumeEndsWhenRetentionOvertakesIt(t *testing.T) {
 	store.trim.Store(true)
 
 	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
-	require.NoError(t, err, "the resume check reads its own entry and still passes")
+	require.NoError(t, err, "a resume reads nothing on the caller's goroutine")
 
 	ev := recv(t, ch)
 	assert.Equal(t, Failed, ev.Type)
@@ -1565,7 +1564,7 @@ func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 
 			tried := tc.failAll(gap, state)
 			_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
-			require.NoError(t, err, "the resume check reads one entry and still passes")
+			require.NoError(t, err, "a resume reads nothing on the caller's goroutine")
 
 			<-tried // retry in progress, with the gap still unread
 			cancel()

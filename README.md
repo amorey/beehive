@@ -548,12 +548,12 @@ Both **share one reader per kind.** However many watches a kind has, one tailer 
 
 **`Deleted` means collected, not requested.** Deleting an object sets `DeletionRequestedAt` and leaves the row live and readable, so you get a `Modified` with that field set. `Deleted` follows only when the GC sweeper physically removes the row — after its finalizers clear, which is controller-defined and unbounded, and after nothing references it any more. So: key on `DeletionRequestedAt != nil` to stop using an object, and on `Deleted` to evict it from a cache.
 
-A failed read is logged and retried rather than fatal, so the stream survives a transient store error. One failure is terminal: if retention trims log entries the tail had not read, every watch on that kind gets a `Failed` change carrying `ErrWatchTooOld` and closes, because it cannot continue truthfully. Subscribe again for a fresh snapshot.
+A failed read is logged and retried rather than fatal, so the stream survives a transient store error. One failure is terminal: if retention trims log entries the tail had not read, every watch on that kind gets a `Failed` change carrying `ErrWatchTooOld` and closes, because it cannot continue truthfully. Subscribe again for a fresh snapshot. A `WithResumeFrom` position that retention has already passed arrives the same way, on the stream rather than as an error from the call — so `ErrWatchTooOld` has one place to be handled, not two.
 
 `WatchOption`s tune the rest:
 
 ```go
-WithResumeFrom(rv int64)       // stream above rv instead of taking a snapshot; ErrWatchTooOld if it was trimmed
+WithResumeFrom(rv int64)       // stream above rv instead of taking a snapshot; a trimmed rv fails the stream, not the call
 WithLoads(loads ...LoadOption) // the same eager relations List takes, batched per delivery
 ```
 

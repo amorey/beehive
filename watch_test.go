@@ -1422,10 +1422,10 @@ func TestWithResumeFromSkipsTheSnapshot(t *testing.T) {
 	}
 }
 
-// A resume below the horizon is refused by the call, not by the stream: there is
-// no honest stream to hand back, so the caller learns it must resync now rather
-// than after subscribing.
-func TestResumeBelowTheHorizonIsRefused(t *testing.T) {
+// A resume below the horizon ends the stream rather than the call. It is the
+// same failure a live stream reports for the same reason, so a caller handles
+// ErrWatchTooOld in one place instead of two.
+func TestResumeBelowTheHorizonEndsTheStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store, _, client, _ := watchFixture(t)
@@ -1433,9 +1433,13 @@ func TestResumeBelowTheHorizonIsRefused(t *testing.T) {
 	store.forceTrimmed.Store(obj.ResourceVersion + 10)
 
 	_, ch, err := client.WatchList(ctx, WithResumeFrom(obj.ResourceVersion))
+	require.NoError(t, err, "the position is the caller's; the call reads nothing to check it")
 
-	require.ErrorIs(t, err, ErrWatchTooOld)
-	assert.Nil(t, ch, "no stream, because none could be truthful")
+	ev := recv(t, ch)
+	assert.Equal(t, Failed, ev.Type)
+	assert.ErrorIs(t, ev.Err, ErrWatchTooOld)
+	_, ok := <-ch
+	assert.False(t, ok, "a Failed change is the last value before the channel closes")
 }
 
 // A watch can carry the same eager relations List does, batched per delivery so
@@ -1633,21 +1637,6 @@ func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
 	_, ok, err := ev.Object.Owner()
 	require.NoError(t, err, "and it carries the relation that was asked for")
 	assert.False(t, ok, "this object has no owner")
-}
-
-// A resume checks the horizon before returning a stream, so a store that cannot
-// answer fails the call rather than handing back a stream of unknown standing.
-func TestResumeSurfacesAFailedHorizonCheck(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	store, _, client, _ := watchFixture(t)
-	store.listErr.Store(true)
-
-	_, ch, err := client.WatchList(ctx, WithResumeFrom(0))
-
-	require.ErrorIs(t, err, errBoom)
-	assert.Nil(t, ch)
-	assert.Contains(t, err.Error(), "resume check failed")
 }
 
 // emptyPageStore reports a position above the cursor but hands back no entries,

@@ -132,9 +132,16 @@ is a consistent cut at it, so "at or below the floor" means "already in the
 snapshot" for every key. `ObjectChange` now carries that `ResourceVersion`,
 which is also what makes `WithResumeFrom` usable.
 
-A resume checks that its position is still inside the log on the caller's
-goroutine, then replays the gap in pages on the stream's goroutine: with a day
-of retention the gap can be far more than one page.
+A resume replays the gap in pages on the stream's goroutine: with a day of
+retention the gap can be far more than one page. It reads nothing on the
+caller's goroutine — the position is the caller's, and the replay checks the
+horizon on every page it reads anyway, so a probe first would cost a round trip
+to answer the same question a moment earlier. A position retention has passed
+therefore ends the stream rather than the call, which is also the only way a
+live stream can report it: `ErrWatchTooOld` has one place to be handled. The
+cost is that a store too broken to answer no longer fails a resume
+synchronously — the replay retries it, bounded by the caller's context, as it
+does for every other read after a subscribe.
 
 A relation load that fails is retried rather than skipped. The old poll could
 leave the change in the log and try again next tick; the tailer's cursor has
