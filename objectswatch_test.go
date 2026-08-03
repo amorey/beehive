@@ -3044,3 +3044,136 @@ func TestConcurrentTailerBuildsSettleOnOne(t *testing.T) {
 	joined.release()
 	assert.Zero(t, tailerCount(bh))
 }
+
+// A resume position above the log's head did not come from this store — a
+// restored backup or a swapped file restarts the sequence. It has to be
+// reported: the replay reads an empty page, calls itself caught up, and then
+// floor sits above every change the stream would deliver, so the subscriber
+// receives nothing at all and is told nothing.
+func TestResumeAboveTheLogHeadFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, "w1", cSpec{})
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(1<<40))
+	require.NoError(t, err, "the position arrives on the stream, not from the call")
+
+	var last ObjectChange[cSpec, cStatus]
+	for got := range ch {
+		last = got
+	}
+	require.Equal(t, Failed, last.Type)
+	assert.ErrorIs(t, last.Err, ErrWatchTooNew)
+
+	// A position exactly at the head is caught up, not ahead: it is what a
+	// subscriber that read every entry checkpoints.
+	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+	snap, live, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err)
+	assert.Equal(t, at, snap.ResourceVersion)
+	obj := mustCreate(t, ctx, client, "w2", cSpec{})
+	ev := recv(t, live)
+	assert.Equal(t, obj.ID, ev.ID, "a resume at the head must still stream")
+}
+
+// failHeadCheckStore fails the replay's head check exactly once, and nothing
+// else. An empty page is what puts the replay there, so arming on one targets
+// that read without counting calls no test should have to know the order of.
+type failHeadCheckStore struct {
+	Store
+	always bool // keep failing it, rather than only the first
+	armed  atomic.Bool
+	spent  atomic.Bool
+	once   sync.Once
+	failed chan struct{} // closed once the head check has been failed
+}
+
+func (s *failHeadCheckStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	page, trimmedThrough, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	if err == nil && len(page) == 0 && (s.always || !s.spent.Load()) {
+		s.armed.Store(true) // the head check is the next position read
+	}
+	return page, trimmedThrough, err
+}
+
+func (s *failHeadCheckStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if s.armed.CompareAndSwap(true, false) {
+		s.spent.Store(true)
+		s.once.Do(func() { close(s.failed) })
+		return 0, errBoom
+	}
+	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+}
+
+// The read that tells "caught up" from "resumed past the head" can fail, and a
+// failed read is a retry rather than the stream: it decides nothing on its own,
+// so guessing either way would either end a good stream or keep the silent-drop
+// one this check exists to catch.
+func TestResumeRetriesAFailedHeadCheck(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &failHeadCheckStore{Store: newClientTestStore(t), failed: make(chan struct{})}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, "w1", cSpec{})
+
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+
+	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	// Write only once the head check has failed: a write landing first gives the
+	// replay a page to read, and it never reaches the empty-page branch at all.
+	select {
+	case <-store.failed:
+	case <-ctx.Done():
+		t.Fatal("the replay never ran its head check")
+	}
+
+	// The retry succeeds, so the resume completes and the stream goes live.
+	obj := mustCreate(t, ctx, client, "w2", cSpec{})
+	ev := recv(t, ch)
+	assert.Equal(t, obj.ID, ev.ID)
+	assert.True(t, store.spent.Load(), "the head check never failed")
+}
+
+// A head check that never succeeds ends with the caller, not on its own: the
+// read decides nothing, so giving up on it would be guessing, and the retry has
+// to be bounded by the same context everything else in the stream is.
+func TestResumeHeadCheckRetryEndsWithTheCaller(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &failHeadCheckStore{
+		Store:  newClientTestStore(t),
+		always: true,
+		failed: make(chan struct{}),
+	}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, "w1", cSpec{})
+
+	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	require.NoError(t, err)
+
+	watchCtx, endWatch := context.WithCancel(ctx)
+	_, ch, err := client.WatchList(watchCtx, WithResumeFrom(at))
+	require.NoError(t, err)
+
+	select {
+	case <-store.failed:
+	case <-ctx.Done():
+		t.Fatal("the replay never ran its head check")
+	}
+	endWatch()
+
+	for got := range ch {
+		require.NotEqual(t, Failed, got.Type, "a cancelled caller gets a silent close")
+	}
+}

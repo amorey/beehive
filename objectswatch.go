@@ -51,7 +51,9 @@ type watchConfig struct {
 // returned snapshot holds no objects and carries rv back. A position retention
 // has already passed ends the stream with a Failed change carrying
 // ErrWatchTooOld — the same way a live stream reports it — which the caller
-// answers by subscribing again without this option.
+// answers by subscribing again without this option. A position above the log's
+// head arrives the same way with ErrWatchTooNew: it did not come from this
+// store, so no retention window would have kept it.
 func WithResumeFrom(rv int64) WatchOption {
 	return func(c *watchConfig) { c.resumeFrom = &rv }
 }
@@ -876,6 +878,23 @@ func (c *clientImpl[Spec, Status]) replay(
 			return 0, err, false
 		}
 		if len(page) == 0 {
+			// Caught up — or resuming above everything this kind's log has held,
+			// which means the position did not come from this store. An empty
+			// page cannot tell those apart, and one scalar read can: unreported,
+			// the second holds floor above every later change and drops them all
+			// silently. Only a resume at or beyond the head gets this far, so no
+			// replay with real work to do pays for it.
+			at, err := c.bh.store.ObjectWritesMaxVersion(ctx, c.gk)
+			if err != nil {
+				if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
+					return 0, nil, false
+				}
+				continue
+			}
+			if cursor > at {
+				return 0, fmt.Errorf("%w: %s/%s resumed at %d, past the log's %d",
+					ErrWatchTooNew, c.gk.Group, c.gk.Kind, cursor, at), false
+			}
 			return cursor, nil, true
 		}
 		next := page[len(page)-1].ResourceVersion
