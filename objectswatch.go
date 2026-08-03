@@ -161,28 +161,39 @@ func (h kindWriteHub) Close() {
 // release.
 //
 // Guarded by tailMu, never bh.mu: bh.mu is not reentrant, and migratorFor and
-// reconcilerFor take it. The lock is held across the build, cursor read
-// included. That read happens once per kind per process, and building outside
-// the lock buys that one latency at the price of a second registry check and a
-// discard path for the race it opens. It cannot move into run either: the
-// cursor has to be read before this returns, or a subscriber's snapshot could
-// fall into the gap below it.
+// reconcilerFor take it.
+//
+// **The build runs outside tailMu**, and the second registry check below is the
+// price of that. tailMu is process-global while the cursor read parks on the
+// store's single connection, so holding one across the other lets a slow
+// transaction stall every kind's setup — and every release, which is what
+// closes a cancelled watch's channel (tailStream's defers close the stream
+// after the lease goes). That is a three-party deadlock as soon as the
+// transaction's own goroutine waits on such a channel. The cursor still has to
+// be read before this returns, or a subscriber's snapshot could fall into the
+// gap below it, so the read cannot move into run either.
 //
 // The health check is not redundant with the registry. A tailer that ended
 // below the horizon stays registered until the last subscriber holding a lease
 // on it releases, and this is what stops a resubscribe from rejoining the
 // tailer that just told it ErrWatchTooOld.
 func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, error) {
-	bh.tailMu.Lock()
-	defer bh.tailMu.Unlock()
-	if t, ok := bh.tailers[gk]; ok && t.failure() == nil {
-		t.refs++
+	if t, ok := bh.joinTailer(gk); ok {
 		return t, nil
 	}
 
 	t, err := newObjectTailer(ctx, bh, gk)
 	if err != nil {
 		return nil, err
+	}
+
+	bh.tailMu.Lock()
+	// Another goroutine may have registered one for this kind while this build
+	// was reading. Joining it and discarding ours keeps one tailer per kind.
+	if winner, ok := joinLocked(bh.tailers, gk); ok {
+		bh.tailMu.Unlock()
+		t.close() // never registered and never ran: no lease to give back
+		return winner, nil
 	}
 	if bh.tailers == nil {
 		bh.tailers = make(map[GroupKind]*objectTailer)
@@ -191,10 +202,30 @@ func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, 
 	// Overwrites a tailer that ended below the horizon; release compares
 	// identity, so its subscribers cannot evict this one on their way out.
 	bh.tailers[gk] = t
+	bh.tailMu.Unlock()
+
 	// After stop the wake hub is closed, so the tailer closes its fan-out at
 	// once, which ends the watch that asked for it.
 	go t.run()
 	return t, nil
+}
+
+// joinTailer takes a lease on the kind's registered tailer, if it has a healthy
+// one.
+func (bh *Beehive) joinTailer(gk GroupKind) (*objectTailer, bool) {
+	bh.tailMu.Lock()
+	defer bh.tailMu.Unlock()
+	return joinLocked(bh.tailers, gk)
+}
+
+// joinLocked is joinTailer's body, for the caller that already holds tailMu.
+func joinLocked(tailers map[GroupKind]*objectTailer, gk GroupKind) (*objectTailer, bool) {
+	t, ok := tailers[gk]
+	if !ok || t.failure() != nil {
+		return nil, false
+	}
+	t.refs++
+	return t, true
 }
 
 // release drops one subscriber's lease, ending the tailer when the last one

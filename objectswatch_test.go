@@ -2722,3 +2722,70 @@ func TestWatchEndsWithErrStoppedOnStop(t *testing.T) {
 	assert.Equal(t, Failed, last.Type, "a watch opened after stop closed silently")
 	assert.ErrorIs(t, last.Err, ErrStopped)
 }
+
+// blockingPositionStore parks one kind's position read until released, so a
+// test can hold a tailer build open while it exercises other kinds.
+type blockingPositionStore struct {
+	Store
+	gk      GroupKind
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if gk == s.gk {
+		s.once.Do(func() { close(s.entered) })
+		<-s.release
+	}
+	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+}
+
+// Building a tailer must not hold tailMu, which is process-global, across the
+// cursor read, which parks on the store's single connection. Holding one across
+// the other lets one slow transaction stall every kind's watch setup — and every
+// release, which is what closes a cancelled watch's channel. A transaction whose
+// own goroutine waits on such a channel then deadlocks outright.
+func TestTailerBuildDoesNotStallOtherKinds(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	slowKind := GroupKind{Kind: "Slow"}
+	store := &blockingPositionStore{
+		Store:   newClientTestStore(t),
+		gk:      slowKind,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	bh := newTestBeehive(t, store)
+
+	held, err := bh.tailerFor(ctx, clientTestGK)
+	require.NoError(t, err)
+
+	built := make(chan error, 1)
+	go func() {
+		slow, err := bh.tailerFor(ctx, slowKind)
+		if err == nil {
+			slow.release()
+		}
+		built <- err
+	}()
+	<-store.entered // the build is parked inside the store read
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		again, err := bh.tailerFor(ctx, clientTestGK)
+		assert.NoError(t, err, "an unrelated kind could not join its tailer")
+		again.release()
+		held.release() // the teardown a cancelled watch runs before closing out
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("a tailer build held tailMu across the store read")
+	}
+
+	close(store.release)
+	require.NoError(t, <-built)
+}
