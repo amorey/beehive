@@ -57,7 +57,7 @@ for another.
 With the tick slow, a write path that forgets to publish is a write subscribers
 see late. The list of publish sites is derived from the store's three write-log
 helpers (`appendWriteLog`, `recordObjectWrite`, `appendWriteLogDelete`), never
-from the public verbs, and `TestWakeHubPublishesOnEveryWrite` is the guard. A
+from the public verbs, and `TestKindWriteHubPublishesOnEveryWrite` is the guard. A
 table derived from the verbs would miss two rows:
 
 - `bumpObject`, reached by `ConditionsSet` and `ConditionsDelete`. Controllers
