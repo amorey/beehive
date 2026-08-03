@@ -98,6 +98,30 @@ func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, 
 	return t, nil
 }
 
+// errNoRowImage reports a delete entry the store returned without the row image
+// a Deleted change is built from.
+var errNoRowImage = errors.New("beehive: delete log entry carries no row image")
+
+// tailPageCap bounds one read of the log, which is what keeps a burst from being
+// unbounded. A fuller page than this is drained by the next step, not deferred.
+const tailPageCap = 512
+
+// changeType maps one log entry to what a subscriber is told. The soft delete is
+// a WriteUpdate, so a finalizing object reports Modified — Deleted means the row
+// is gone. A coalesced run promotes Modified to Added when the run began with a
+// create; a run ending in a delete stays Deleted either way, since the row is
+// gone and the entry carries the state to report.
+func changeType(op WriteOp) ChangeType {
+	switch op {
+	case WriteCreate:
+		return Added
+	case WriteDelete:
+		return Deleted
+	default:
+		return Modified
+	}
+}
+
 // rawChange is what the tailer fans out: one object's newest log entry plus the
 // state to report it with. Undecoded on purpose — two clients may watch one kind
 // with different type parameters, so decode belongs to each subscriber.

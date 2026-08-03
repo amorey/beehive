@@ -1334,40 +1334,6 @@ func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
 	assert.Len(t, ev.Object.Conditions, 1, "the image carries what cascaded away")
 }
 
-// Delivery stays level-triggered: several writes inside one interval collapse to
-// one change carrying current state, and a batch arrives in write order rather
-// than the id order the batched read returns.
-func TestBatchCoalescesToCurrentStateInWriteOrder(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Hour))
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "first"})
-	second := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "second"})
-
-	_, _, err = client.WatchList(ctx)
-	require.NoError(t, err)
-
-	// The lower id is written last, so id order and write order disagree.
-	_, err = client.Update(ctx, second.ID, cSpec{Val: "second2"})
-	require.NoError(t, err)
-	_, err = client.Update(ctx, first.ID, cSpec{Val: "first2"})
-	require.NoError(t, err)
-	_, err = client.Update(ctx, first.ID, cSpec{Val: "first3"})
-	require.NoError(t, err)
-
-	c := client.(*clientImpl[cSpec, cStatus])
-	changes, err := c.poll(ctx, c.bh.migratorFor(c.gk), LoadSet(0), nil, new(int64))
-	require.NoError(t, err)
-
-	require.Len(t, changes, 2, "three writes to two objects collapse to two changes")
-	assert.Equal(t, second.ID, changes[0].Object.ID, "write order, not id order")
-	assert.Equal(t, first.ID, changes[1].Object.ID)
-	assert.Equal(t, "first3", changes[1].Object.Spec.Val, "current state, not a superseded one")
-}
-
 // Retention can trim past a live stream's cursor between ticks, and a tail that
 // just read an empty page would skip those changes silently — the exact failure
 // ErrWatchTooOld exists to prevent. The check rides the same read as the page.

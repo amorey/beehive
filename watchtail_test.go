@@ -923,3 +923,33 @@ func TestTailerQueryCountConstantInSubscribers(t *testing.T) {
 	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Other"}), "elsewhere", cSpec{})
 	assert.Equal(t, at, store.gateReads.Load(), "a quiet kind reads nothing")
 }
+
+// One page collapses to the last entry per object, carrying current state, in
+// write order rather than the id order the batched read returns.
+func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first := mustCreate(t, ctx, client, "first", cSpec{Val: "first"})
+	second := mustCreate(t, ctx, client, "second", cSpec{Val: "second"})
+
+	// The lower id is written last, so id order and write order disagree.
+	_, err := client.Update(ctx, second.ID, cSpec{Val: "second2"})
+	require.NoError(t, err)
+	_, err = client.Update(ctx, first.ID, cSpec{Val: "first2"})
+	require.NoError(t, err)
+	_, err = client.Update(ctx, first.ID, cSpec{Val: "first3"})
+	require.NoError(t, err)
+
+	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	require.NoError(t, err)
+	changes, err := collectChanges(ctx, bh, clientTestGK, page)
+	require.NoError(t, err)
+
+	require.Len(t, changes, 2, "five writes to two objects collapse to two changes")
+	assert.Equal(t, second.ID, changes[0].ID, "write order, not id order")
+	assert.Equal(t, first.ID, changes[1].ID)
+	assert.Contains(t, string(changes[1].Object.Spec), "first3", "current state, not a superseded one")
+}
