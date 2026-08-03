@@ -76,13 +76,23 @@ func (b *Backoff) Wait(ctx context.Context) bool {
 	}
 }
 
-// Next returns the next delay and doubles it for the call after.
+// Next returns the next delay and doubles it for the call after, saturating at
+// Max.
+//
+// It saturates rather than doubling past Max because the doubling overflows: 37
+// doublings of a 100ms base pass time.Duration's range, and a negative cur reads
+// as uninitialized below — which would drop a driver back to Base part way
+// through the outage the backoff exists for.
 func (b *Backoff) Next() time.Duration {
 	if b.cur <= 0 {
 		b.cur = b.Base
 	}
 	d := min(b.cur, b.Max)
-	b.cur *= 2
+	if b.cur < b.Max/2 {
+		b.cur *= 2
+	} else {
+		b.cur = b.Max
+	}
 	return d
 }
 
