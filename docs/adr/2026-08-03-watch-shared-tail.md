@@ -1,7 +1,7 @@
 # One tailer per kind, woken by the commit path, above a floor tick
 
-- **Status:** Accepted — implemented in `objectswatch.go`, `watch.go`,
-  `beehive.go`, `client.go`, `controller.go`, `gc.go`.
+- **Status:** Accepted — implemented in `objectswatch.go`, `beehive.go`,
+  `client.go`, `controller.go`, `gc.go`.
 - **Date:** 2026-08-03
 
 ## Context

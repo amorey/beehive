@@ -721,6 +721,35 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 	return nil
 }
 
+// sendOrDone delivers v unless ctx is cancelled first, and reports whether it
+// landed. Cancellation is checked first, on its own: once a reader parks on
+// out, both select arms are ready and Go picks at random — a subscriber that
+// gave up must not be handed one more value.
+func sendOrDone[V any](ctx context.Context, out chan<- V, v V) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	select {
+	case out <- v:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// pollFailed logs a failed poll and says whether to keep going: a transient
+// store error costs one tick, not the stream; a cancelled context is shutdown.
+func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, err error, args ...any) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	c.bh.log().WarnContext(ctx, "beehive: "+what+" poll failed; retrying on the next tick",
+		append([]any{"group", c.gk.Group, "kind", c.gk.Kind, "err", err}, args...)...)
+	return true
+}
+
 // The four lazy ref lookups read their edge query directly, with no scopedGet
 // kind guard: that guard was a second, blob-bearing read on a hot path. The
 // trade: a foreign id reads that kind's edges and a missing id reads empty —
