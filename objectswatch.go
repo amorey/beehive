@@ -622,30 +622,26 @@ func (c *clientImpl[Spec, Status]) consume(
 }
 
 // drainPending takes first plus everything already queued behind it, so a burst
-// costs one relation query rather than one per object.
+// costs one relation query rather than one per object. TryRecvAll is one atomic
+// cut, so the batch is everything pending as of one instant — a TryRecv loop
+// would be a sequence of instants with no defined membership. Its error is
+// ErrEmpty or ErrClosed, both meaning nothing more to add; consume hears about
+// a closed fan-out on its next receive.
 //
 // Ascending by resource version, and that is a correctness requirement rather
 // than tidiness: a caller checkpoints the version on a delivered change and
 // resumes above it, so a version delivered after a higher one would be skipped
-// for good. The fan-out coalesces in place, leaving a re-written object at its
-// original queue position carrying a newer version — the one way the drain sees
-// them out of order.
-//
-// The loop is unbounded and must stay that way. It ends because the producer is
-// store-bound: the tailer publishes at most tailPageCap entries, then has to
-// read the store again before it can publish more, and a pop costs orders of
-// magnitude less than that read. A cap would not be a safe substitute — it
-// would take part of a pending set and leave the rest, which delivers exactly
-// the inversion above. A sound bound needs conflate to hand back everything
-// pending in one call. See docs/specs/gobus-conflate-drain.md.
+// for good. The cut comes back in queue order, and the fan-out coalesces in
+// place, so a re-written object sits at its original position carrying a newer
+// version — sorting is what stops that reaching the caller.
 func drainPending(first rawChange, rx *conflate.Receiver[ObjectID, rawChange]) []rawChange {
-	batch := []rawChange{first}
-	for {
-		next, err := rx.TryRecv()
-		if err != nil {
-			break
-		}
-		batch = append(batch, next.Value)
+	rest, _ := rx.TryRecvAll()
+	batch := make([]rawChange, 0, len(rest)+1)
+	// first left the queue before the cut, so it can repeat a key the cut holds.
+	// Harmless: both are delivered, in version order, and the later one wins.
+	batch = append(batch, first)
+	for _, ev := range rest {
+		batch = append(batch, ev.Value)
 	}
 	slices.SortFunc(batch, func(a, b rawChange) int {
 		return cmp.Compare(a.ResourceVersion, b.ResourceVersion)
