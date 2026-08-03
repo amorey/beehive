@@ -19,7 +19,8 @@ The watch tail has two costs that grow with use:
 This spec replaces the per-watch poll with:
 
 1. **A shared tailer per kind.** One goroutine owns the kind's cursor, runs
-   the gate + log page + batched read once, and fans raw rows out in-process.
+   the position check + log page + batched read once, and fans raw rows out
+   in-process.
    Watches become subscribers that decode for themselves. Query load scales
    with watched kinds, not watch count.
 2. **A wake from the commit path, on top of a slow floor tick.** The wake
@@ -41,10 +42,10 @@ frontend, and the store heals it.
 
 ## Why the wake cannot stand alone
 
-The [drivers ADR](../adr/2026-07-28-periodic-scan-drivers.md) sets the bar the
-schedule watch was granted its exception under: a poll may go only when its
-hub can observe every writer. It then says every store-backed driver fails
-that bar by construction, because a second process can always write to the
+The [drivers ADR](../adr/2026-07-28-periodic-scan-drivers.md) sets the rule
+the schedule watch got its exception under: a poll may be removed only when
+its hub can observe every writer. It then says every store-backed driver fails
+that rule by construction, because a second process can always write to the
 store.
 
 The watch tail fails it too, and not only in the third-party-`Store` case. A
@@ -57,17 +58,18 @@ this `Beehive`".
 
 We do not take that narrowing. The tick drops from 1s to a **30s floor**:
 
-- The query-load win is preserved almost whole. A quiet kind costs one read of
+- Almost all of the query-load savings remain. A quiet kind costs one read of
   one number every 30s per *kind*, not one per watch per second — for 20
   watches on one kind that is ~0.05 queries/s against 20/s today, over 99% of
-  the win.
-- Latency is the wake's job and is unaffected: the floor never delays a write
-  this process made.
+  the savings.
+- Latency comes from the wake and is unaffected: the floor never delays a
+  write this process made.
 - The floor is also the retry path for a failed tail step, and the path that
-  notices a retention trim. Both are otherwise unreachable on a quiet kind.
+  notices a retention trim. Neither is reachable any other way on a quiet
+  kind.
 
 The emit-discipline table below is still required. The floor bounds staleness
-at 30s; it is not a licence to forget a publish.
+at 30s; it is not permission to skip a publish.
 
 The watch tail therefore stays in the periodic-scan driver family, at a
 relaxed cadence, with a wake in front of it. The drivers ADR gains an
@@ -92,19 +94,19 @@ amendment about the cadence, not an exception.
 Two hubs, one per direction, each from a package already in the tree:
 
 - **Commit → tailer:** `gobus/watch`, the keyed latest-value gauge bus the
-  schedule watch already uses. Key: `GroupKind`. Value: a process-local tick.
-  Accept: `next > prev`, so a superseded publish vanishes and a burst coalesces
-  into one pending wake. One key per receiver fits: a tailer watches one kind.
-  `Sender` is safe to share across committing goroutines.
+  schedule watch already uses. Key: `GroupKind`. Value: a process-local
+  counter. Accept: `next > prev`, so a superseded publish vanishes and a burst
+  collapses into one pending wake. One key per receiver fits: a tailer watches
+  one kind. `Sender` is safe to share across committing goroutines.
 
   The value is **not** the write's resource version. Most store writes return
   no version — `ObjectsUpdateStatus`, `ConditionsSet`, `FinalizersDelete` and
   the deletion verbs all return `error` or `(bool, error)`, and the
   [write-shapes ADR](../adr/2026-07-30-store-write-shapes.md) is why. Carrying
   a real version would mean widening those returns for a number the tailer
-  never reads: it reads its own cursor from the store, so the wake only has to
-  say "this kind moved" and to rise monotonically so `Accept` can drop what the
-  hub has already superseded.
+  never reads: it reads its own cursor from the store. The wake only has to
+  say "this kind moved", and to rise so `Accept` can drop what the hub has
+  already superseded.
 - **Tailer → subscribers:** `gobus/conflate`, the single-producer keyed
   fan-out bus. This is its stated use case (Kubernetes-style informers). Key:
   `ObjectID`. Value: a raw envelope, not a decoded change (see below). Merge:
@@ -126,27 +128,26 @@ type rawChange struct {
 
 Each subscriber decodes with its own type parameters and its own migrator.
 
-This is forced, not preferred. `NewClient[Spec, Status](bh, gk)`
+This is forced by the API, not a preference. `NewClient[Spec, Status](bh, gk)`
 (`client.go:261`) is free-form: nothing stops two clients with different type
 parameters over the same `GroupKind` — a `json.RawMessage` client alongside
-the typed one is the obvious case. A typed per-kind hub would either
-type-assert into a panic or need a second tailer per type set, losing the
-sharing that is the point. A non-generic tailer also keeps CLAUDE.md's rule
-that new internal machinery is non-generic.
+the typed one is the obvious case. A typed per-kind hub would either panic on
+a type assertion or need one tailer per type set, losing the sharing. A
+non-generic tailer also keeps CLAUDE.md's rule that new internal machinery is
+non-generic.
 
-Query sharing is unaffected: the gate, the log page and the batched
-`ObjectsListByIDs` still run once per kind. Decode and quarantine move per
-subscriber, which is more correct anyway — one subscriber's undecodable blob
-is not another's.
+Query sharing is unaffected: the position check, the log page and the batched
+`ObjectsListByIDs` still run once per kind. Decode and its error handling move
+per subscriber, which is more correct anyway — a blob one subscriber cannot
+decode may be fine for another.
 
 ### Wake producer
 
 `Beehive` owns the wake hub, created in `New`. Each beehive-layer write path
-publishes its kind through `Store.AfterCommit` — the
-boundary `signalRequeue` uses, for the same reasons: a rollback publishes
-nothing, and the wake cannot arrive before the write is readable. On stop,
-close the sender, not the hub (`Hub.Close` is a hard tear-down; see
-`scheduleHub`).
+publishes its kind through `Store.AfterCommit` — the boundary `signalRequeue`
+uses, for the same reasons: a rollback publishes nothing, and the wake cannot
+arrive before the write is readable. On stop, close the sender, not the hub
+(`Hub.Close` is a hard tear-down; see `scheduleHub`).
 
 ### Emit discipline
 
@@ -171,7 +172,7 @@ sites:
 | `markForDeletion` via `DeletionRequestsCreateFromOwner` (`store.go:1882`) | the owner cascade                        | **per returned `[]ObjectRef`** |
 | `objectsDelete` (`store.go:1916`)          | the GC sweeper's physical delete                                       | that object's gk               |
 
-Two rows are the ones a verb-derived table misses, and both matter:
+A table derived from the verbs would miss two rows, and both matter:
 
 - **`bumpObject`.** Controllers set conditions constantly. A condition write
   that does not wake is a write watchers do not see until the floor tick.
@@ -198,28 +199,28 @@ either signal it runs a **drain loop**, not one step:
 
 ```
 for {
-    n := step()             // gate, page, coalesce, batched read, publish; returns the page length
+    n := step()             // position check, page, coalesce, batched read, publish; returns the page length
     if n < tailPageCap { break }
 }
 ```
 
 The loop is required, not an optimisation. `poll` reads at most `tailPageCap`
 (512) entries and today spills into the next 1s tick. Under a wake, a burst of
-600 writes coalesces into **one** pending wake slot; the tailer consumes it,
+600 writes collapses into **one** pending wake slot; the tailer consumes it,
 reads 512, and the remaining 88 would wait for an unrelated future write —
-only the publish that races the read survives in the slot. With the floor tick
+only a publish that races the read survives in the slot. With the floor tick
 that stall is 30s rather than unbounded, which is still wrong. Re-run until a
 step comes back short; block on the wake only when drained.
 
-The condition is the **page length, not a second gate read**. A short page
-means the log is drained, exactly; re-reading `ObjectWritesMaxVersion` would
-pay a scalar query per wake for an answer the page already gave — `step`
-opens with that read as its gate.
+The stop condition is the **page length, not a second position read**. A
+short page means the log is drained, exactly; re-reading
+`ObjectWritesMaxVersion` would pay a scalar query per wake for an answer the
+page already gave — `step` opens with that read.
 
 **Ordering constraint:** the tailer registers its wake receiver *before* it
-reads its initial cursor. The mirror of the subscriber rule below, and for the
-same reason — a write between the read and the registration would otherwise be
-lost to both.
+reads its initial cursor. This mirrors the subscriber rule below, for the same
+reason — a write between the read and the registration would otherwise be
+missed by both.
 
 A failed step logs and backs off (bounded, capped at the floor interval)
 rather than spinning; the cursor does not advance, so nothing is lost.
@@ -228,14 +229,14 @@ The tailer resolves nothing through `bh.mu` while starting or stepping. It has
 no reason to — decode moved to the subscribers, so it needs neither
 `migratorFor` (`beehive.go:381`) nor `reconcilerFor` (`:388`), and both take
 `bh.mu`, which is not reentrant. **Lazy start holds `bh.mu`; anything it
-resolves through those helpers deadlocks.** Same trap `stop` already carries a
-comment about for `wg.Wait`.
+resolves through those helpers deadlocks.** The same trap `stop` already
+carries a comment about for `wg.Wait`.
 
 ### The tailer's own ErrWatchTooOld
 
 The cursor is shared, so a too-old cursor is not a per-subscriber failure. The
-step can reach it: a long store outage holds the cursor still (backoff is
-capped at the floor, and not advancing is the point), and 24h retention
+step can reach that state: a long store outage holds the cursor still (backoff
+is capped at the floor, and not advancing is the point), and 24h retention
 eventually trims past it.
 
 **Policy: close the fan-out sender, then reset the tailer.** Every subscriber
@@ -245,7 +246,7 @@ watch starts a new tailer at the current position.
 The two tempting alternatives are both wrong. Advancing the cursor to the
 horizon silently drops changes from *every* subscriber — the failure mode this
 whole design exists to avoid. Returning the error to one subscriber is not
-available to a shared reader: there is no one subscriber at fault.
+possible for a shared reader: there is no single subscriber at fault.
 
 A store-wide tailer over `ObjectWritesListSinceAll` (the dependency waker's
 read) is a possible follow-up.
@@ -255,12 +256,11 @@ read) is a possible follow-up.
 `Watch` and `WatchList` register a conflate receiver, then take their
 snapshot, in that order — conflate has no replay, so registration must come
 first — and drop deliveries at or below the snapshot's position. The drop is
-one comparison in the subscriber's own loop, and it stays there: the floor is
-irreducibly per-receiver state that only the subscriber learns, after
-registration, from its own snapshot read. It is sound because
-`resource_version` is one log-wide sequence and the snapshot is a consistent
-cut at it — at or below the floor *means* "already in the snapshot", for every
-key.
+one comparison in the subscriber's own loop, and it belongs there: the floor
+is per-receiver state that only the subscriber learns, after registration,
+from its own snapshot read. It is sound because `resource_version` is one
+log-wide sequence and the snapshot is a consistent cut at it — at or below the
+floor *means* "already in the snapshot", for every key.
 
 The floor comparison needs a resource version on the delivered change.
 `ObjectChange` (`client.go:113`) does not carry one today. **Add it as a
@@ -281,8 +281,9 @@ stays batched and does not become an N+1.
 Conflate takes the coalescing policy as a `Merge(prev, next)` on the hub. It
 runs only when a send lands on a pending slot, which is exactly where a stale
 racing send is caught: returning `prev` keeps the pending value and its queue
-position. After the guard, the change-type algebra. Ids are never reused, so a
-create is always an id's first write; do not handle the unreachable pairs.
+position. After that guard come the change-type rules. Ids are never reused,
+so a create is always an id's first write; do not handle the unreachable
+pairs.
 
 | prev     | next     | merged                   |
 | -------- | -------- | ------------------------ |
@@ -297,44 +298,42 @@ func(prev, next rawChange) (rawChange, bool) {
         return prev, true // stale racing send: keep what's pending
     }
     if prev.Op == writeOpCreate && next.Op != writeOpDelete {
-        next.Op = writeOpCreate // newest state, still a first sighting
+        next.Op = writeOpCreate // newest state, still unseen by subscribers
     }
     return next, true
 }
 ```
 
-**Nothing annihilates.** An earlier draft dropped an `Added` + `Deleted` pair
+**Nothing is dropped.** An earlier draft dropped an `Added` + `Deleted` pair
 on the grounds that the consumer never observed the create. That is wrong: the
-floor is per subscriber, but `Merge` is hub-wide. Sequence — subscriber
+floor is per subscriber, but `Merge` is hub-wide. Sequence — a subscriber
 registers; the tailer publishes `Added@95`; the subscriber's snapshot lands at
-100 with the object present; the object is deleted at 105; the merge
-annihilates the slot. The subscriber holds the object from its snapshot and is
-never told it is gone. That is permanent divergence, not a latency cost, and
-the stale guard does not catch it (105 > 95). A `Deleted` for a key the
-consumer never saw is a no-op delete at any cache; the residue is much cheaper
-than the bug.
+100 with the object present; the object is deleted at 105; the merge cancels
+the slot. The subscriber holds the object from its snapshot and is never told
+it is gone. That is permanent divergence, not a latency cost, and the stale
+guard does not catch it (105 > 95). A `Deleted` for a key the consumer never
+saw is a no-op delete at any cache; that residue is much cheaper than the bug.
 
-The `Added` promotion is blind to the same per-subscriber floor, but benignly:
-a subscriber whose snapshot already contains the object gets a duplicate
-`Added` for it. **State that in the watch contract** — an `Added` may repeat
-for an object the snapshot already carried — rather than paying per-receiver
-bookkeeping to suppress it.
+The `Added` promotion cannot see the per-subscriber floor either, but the
+cost is benign: a subscriber whose snapshot already contains the object gets a
+duplicate `Added` for it. **State that in the watch contract** — an `Added`
+may repeat for an object the snapshot already carried — rather than paying
+per-receiver bookkeeping to suppress it.
 
 The stale guard is defense in depth, not the guarantee. Per key the tailer
-cannot send out of order — one goroutine, a strictly advancing cursor,
-sequential state read-backs, so payloads are monotone as well as stamps. A
-stale send arriving *after* its key's slot was delivered would go through
+cannot send out of order — one goroutine, a strictly rising cursor, and state
+read back in sequence, so payloads are as ordered as their versions. A stale
+send arriving *after* its key's slot was delivered would go through
 undetected; the bus keeps no per-key position (that map would grow with every
-key ever seen), and the backstop belongs to the consumer that per-key
-staleness can hurt — one holding state per object, which therefore already has
-a position to compare. Newest-wins at that cache makes the pipeline idempotent
-end to end.
+key ever seen). The backstop belongs to the one consumer per-key staleness can
+hurt — one holding state per object, which therefore already has a position to
+compare. Newest-wins at that cache makes the pipeline idempotent end to end.
 
 ### Lifecycle and memory
 
 Conflate frees per key on delivery: the delivered key's queue entry and value
 slot both go, so a receiver's memory is bounded by its *undelivered* keys,
-never by every key it saw. The explicit obligations are the receivers: a
+never by every key it saw. The receivers are the explicit obligations: a
 subscriber closes its conflate receiver when its watch ends (the `defer
 rx.Close()` pattern `SchedulesWatch` uses), and a tailer closes its wake
 receiver on stop — that hub is keyed by `GroupKind`, so its footprint is
@@ -344,21 +343,21 @@ bounded by registered kinds.
 50 kinds once holds 50 goroutines and 50 scalar reads per floor interval for
 the process's life. That is the accepted trade against restart churn: a watch
 that opens and closes repeatedly on one kind would otherwise rebuild the
-tailer and its cursor each time, and a tailer torn down mid-step needs a
-teardown race resolved for no benefit. Idle teardown is available later if a
+tailer and its cursor each time, and tearing a tailer down mid-step means
+resolving a teardown race for no benefit. Idle teardown can come later if a
 kind count ever makes it worth the race; it is not free, so it is not in v1.
 
 Memory moves from one shared page per tick to N receivers × undelivered keys ×
 one row image, since each pending slot holds a full spec/status blob. Bounded,
-but it is a real shift; see "Acceptance" for the bound to measure.
+but a real shift; see "Acceptance" for the bound to measure.
 
 `gobus/watch` cannot replace conflate on the fan-out side. Keyed per object, a
 receiver cannot span a kind or see a future create. Keyed per kind, its
-skip-to-latest under lag is safe only for a self-contained value: a skipped
-change batch is objects silently never delivered, which breaks the invariant,
-and a cursor gauge is safe but carries no data — every subscriber then needs
-per-receiver bookkeeping of what it has not seen, which is what conflate is.
-Watch is for gauges; this side is a change stream.
+skip-to-latest under lag is safe only for a self-contained value: skipping a
+change batch means objects are silently never delivered, which breaks the
+invariant, and a cursor gauge is safe but carries no data — every subscriber
+would then need per-receiver bookkeeping of what it has not seen, which is
+what conflate already is. Watch is for gauges; this side is a change stream.
 
 ### Resume
 
@@ -376,7 +375,7 @@ Concurrent commits race their `AfterCommit` hooks, so publishes do not arrive
 in `resource_version` order. This does not matter, at either hub:
 
 - **Per object**, both hubs resolve races by comparing resource versions, so
-  the newest write wins regardless of publish order — and the tailer reads the
+  the newest write wins whatever the publish order — and the tailer reads the
   log, which the store wrote in order, before anything is delivered.
 - **Across objects**, order was never load-bearing: beehive is
   level-triggered, and a subscriber acts on current state per object, never on
@@ -392,20 +391,20 @@ stops reading gets it once retention overtakes its cursor. Under conflate a
 slow subscriber coalesces and cannot fall behind the horizon at all, so the
 sentinel is left with two producers: a resume below the horizon (per
 subscriber) and the tailer's own reset (all subscribers at once, above).
-Record that alongside the ordering relaxation — it is an improvement, but it
-is still a documented sentinel changing meaning.
+Record that alongside the ordering change — it is an improvement, but it is
+still a documented sentinel changing meaning.
 
 ## Consequences
 
 - **A quiet kind costs one query per 30s, whatever the watch count.** Today it
   costs one per watch per second. The acceptance measurement is query count,
   not tick cost.
-- **A single-object watch regresses.** `watchpoll.go` filters by id before the
-  batched read, so today a lone `Watch` decodes one row per tick. Sharing the
-  tailer makes it pay the kind's whole write volume even when it is the only
-  subscriber — the key filter drops changes after the read, not before it. The
-  shared win is real above roughly two subscribers per kind; below that this
-  is a trade of throughput for latency.
+- **A single-object watch gets slower.** `watchpoll.go` filters by id before
+  the batched read, so today a lone `Watch` decodes one row per tick. Sharing
+  the tailer makes it pay for the kind's whole write volume even when it is
+  the only subscriber — the key filter drops changes after the read, not
+  before it. The sharing pays off above roughly two subscribers per kind;
+  below that this trades throughput for latency.
 - **Freshness depends on the wake; correctness does not.** A missed publish (a
   bug) leaves subscribers stale for up to 30s. The emit-discipline table is
   its guard.
@@ -434,8 +433,8 @@ is still a documented sentinel changing meaning.
 - Quiet-state query count: one read per kind per floor interval, independent of
   watch count.
 - Burst: a write burst above `tailPageCap` delivers in full with no further
-  write, and without waiting for the floor tick — at one gate read per wake,
-  not two.
+  write, and without waiting for the floor tick — at one position read per
+  wake, not two.
 - Trim: a tailer whose own cursor falls below the horizon ends every
   subscriber with `ErrWatchTooOld`, and the next watch works.
 - Emit discipline: a test walks every write-log call site in the table above —

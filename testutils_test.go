@@ -220,8 +220,8 @@ func drainRecv[E any, R interface{ TryRecv() (E, error) }](rx R) {
 }
 
 // newTestBeehive is New plus the teardown every test owes a Beehive: the watch
-// tailers come up in New and end in stop, so a test that watches and never stops
-// leaks their goroutines into the next one.
+// tailers come up in New and end in stop, so a test that watches and never
+// stops would leak tailer goroutines into the next test.
 func newTestBeehive(t *testing.T, store Store, opts ...Option) *Beehive {
 	t.Helper()
 	bh, err := New(store, opts...)

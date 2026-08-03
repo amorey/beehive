@@ -43,7 +43,7 @@ Open points in the spec, resolved here so the cycles are executable:
 ### Cycle 1: a create wakes its kind
 
 - **Red:** `TestWakeHubPublishesOnCreate` — register a receiver for a kind
-  on the beehive's wake hub, `Create` an object, receive `(rv)` above zero.
+  on the beehive's wake hub, `Create` an object, receive a value above zero.
   Fails: no hub exists.
 - **Green:** the hub on `Beehive` (`gobus/watch`, key `GroupKind`, value rv,
   `Accept: next > prev`), built in `New`; one publish, in `Create`'s commit
@@ -109,9 +109,9 @@ Open points in the spec, resolved here so the cycles are executable:
   without any interval elapsing (failsafe timeout only).
 - **Green:** `watchtail.go`: a per-kind, non-generic tailer goroutine
   selecting on its wake receiver and `ctx`, running the existing tail step
-  (gate, page, coalesce, batched read) and publishing `rawChange` keyed by
-  `ObjectID`. No decode here. Reuse the poll's step logic by extraction, not
-  copy.
+  (position check, page, coalesce, batched read) and publishing `rawChange`
+  keyed by `ObjectID`. No decode here. Reuse the poll's step logic by
+  extraction, not copy.
 - Commit: `feat(watch): add a per-kind tailer that tails the log on wake`
 
 ### Cycle 7: the tailer registers before it reads its cursor
@@ -130,11 +130,11 @@ Open points in the spec, resolved here so the cycles are executable:
   and no further write. Fails today: one wake slot, one 512-entry page, 88
   entries stranded.
 - **Green:** the drain loop — re-run until a step returns a short page
-  (`len(page) < tailPageCap`); block on the wake only when drained. The page
-  length, not a second `ObjectWritesMaxVersion` read: `step` already opens
-  with that read as its gate, and a re-read would cost a scalar query per
-  wake for an answer the page gives exactly. Add the query-count assertion to
-  this test so the cheap condition is pinned, not merely chosen.
+  (`len(page) < tailPageCap`); block on the wake only when drained. Stop on
+  the page length, not a second `ObjectWritesMaxVersion` read: `step` already
+  opens with that read, and a re-read would cost a scalar query per wake for
+  an answer the page gives exactly. Add the query-count assertion to this
+  test so the cheap condition is pinned, not merely chosen.
 - Commit: `fix(watch): drain the log fully before blocking on the wake`
 
 ### Cycle 9: the merge table
@@ -143,7 +143,7 @@ Open points in the spec, resolved here so the cycles are executable:
   drive the four reachable pairs: unobserved create then update delivers one
   `Added` with the newest state; update then update delivers the last;
   observed object's delete delivers `Deleted`; **create then delete delivers
-  a `Deleted`, not nothing**. The last row is the anti-annihilation case; add
+  a `Deleted`, not nothing**. The last row pins that the pair is not dropped; add
   its motivating test too — `TestWatchSeesDeleteOfSnapshotObject`, where the
   create precedes the subscriber's snapshot and the subscriber has read
   nothing — as the regression that explains why.

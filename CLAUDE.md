@@ -89,7 +89,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   watch one kind with different type parameters; each subscriber decodes and
   drops what its own snapshot already held. Delivery is latest-per-object, so an
   `Added` may repeat for a snapshot object and cross-object write order is not a
-  contract. Nothing annihilates in the merge. A cursor **below** the horizon
+  contract. Nothing is dropped in the merge. A cursor **below** the horizon
   (strictly: equality has lost nothing) ends *every* subscriber with
   `ErrWatchTooOld` and resets the tailer. `EventsWatch` still polls and diffs,
   gated on `EventsMaxVersion`.
@@ -173,8 +173,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   hub. Sound only because the queue is unexported and process-local and the
   gauge reports every move from one type — give `workQueue` a second writer and
   the poll has to come back. (The object tail also has a wake, but it keeps a
-  floor tick, so it is a driver rather than an exception.) Streams end when the beehive stops, after the final
-  value. → [ADR](docs/adr/2026-07-27-schedule-watch.md)
+  floor tick, so it is a driver rather than an exception.) Streams end when the
+  beehive stops, after the final value.
+  → [ADR](docs/adr/2026-07-27-schedule-watch.md)
 
 ## Conventions
 

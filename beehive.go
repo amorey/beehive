@@ -51,8 +51,8 @@ const (
 	defaultStaleDependentsInterval = 60 * time.Second
 	// The client's watch surface polls, so this is the latency a subscriber sees.
 	defaultWatchPollInterval = 1 * time.Second
-	// A watch tail reads on a wake, so this floor is not the latency of a write
-	// made through this Beehive — it bounds staleness for everything else.
+	// The watch tail reads on a commit wake, so this floor is not the latency
+	// of a local write — it bounds staleness for what a wake cannot cover.
 	defaultWatchFloorInterval = 30 * time.Second
 	// The first retry after a failed tail step; it doubles up to the floor.
 	watchRetryBase = 100 * time.Millisecond
@@ -108,9 +108,9 @@ type Beehive struct {
 	// order preserves registration order so Start launches loops deterministically.
 	order []*reconciler
 	waker *waker
-	// wakes tells a kind's tailer that the kind moved; tailCtx is what the
-	// tailers run under. Both come from New, not Start: watches work on a
-	// Beehive that never ran, and stop tears them down either way.
+	// wakes wakes a kind's tailer when the kind changes; the tailers run under
+	// tailCtx. Both come from New, not Start: watches work on a Beehive that
+	// never ran, and stop tears them down either way.
 	wakes      wakeHub
 	tailCtx    context.Context
 	tailCancel context.CancelFunc
@@ -440,11 +440,12 @@ func (bh *Beehive) stopWatchTail() {
 	bh.tailWG.Wait()
 }
 
-// signalObjectWritten wakes gk's tailer once a write to gk commits. AfterCommit
-// for the same reasons as signalRequeue: a rollback publishes nothing, and the
-// wake cannot outrun the row it announces. Callers gate on the write having
-// changed something only where the store already reports it — a spurious wake
-// costs one gate read, a missed one costs a floor tick of staleness.
+// signalObjectWritten wakes gk's tailer once a write to gk commits.
+// AfterCommit for the same reasons as signalRequeue: a rollback publishes
+// nothing, and the wake cannot arrive before the row is readable. Callers
+// check that the write changed something only where the store already reports
+// it — an extra wake costs one position read, a missed one costs up to a
+// floor tick of staleness.
 func (bh *Beehive) signalObjectWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		_ = bh.wakes.Send(gk) // ErrClosed after stop; nothing is left to wake

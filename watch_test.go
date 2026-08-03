@@ -932,8 +932,8 @@ func TestWatchPollFallsBackToTheDefault(t *testing.T) {
 	assert.Equal(t, fastTick, bh.watchPoll(), "a configured interval is used as given")
 }
 
-// The tail's floor falls back the same way, and for a sharper reason: a zero
-// there is a timer that fires in a loop rather than a stream that never emits.
+// The tail's floor falls back the same way, with more at stake: a zero there
+// makes the timer fire in a busy loop, not just a stream that never emits.
 func TestWatchFloorFallsBackToTheDefault(t *testing.T) {
 	assert.Equal(t, defaultWatchFloorInterval, (&Beehive{}).watchFloor(),
 		"an unset floor reads as the default rather than as no wait at all")

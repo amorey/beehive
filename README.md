@@ -88,7 +88,7 @@ func main() {
 
 - **Coordination through the store.** Controllers never call each other. They read and write the shared store, and a change reaches another controller by being found there rather than delivered to it. Nothing is pushed: every write leaves a durable trace — a bumped generation, an owed-wake count, a deletion mark, a higher `resource_version` — and each driver scans for the trace it cares about. So a missed tick costs latency and nothing else. The record is still there next time.
 
-- **Every driver is a tick.** Reconcile passes, garbage collection, dependency wakes and client watches are all periodic scans, each on its own interval (see [Periodic drivers](#periodic-drivers)). Those intervals are the latency the system runs at; two of them are yours to choose. Object watches have a commit wake in front of their tick, so a write made through this `Beehive` reaches them without waiting for it.
+- **Every driver is a tick.** Reconcile passes, garbage collection, dependency wakes and client watches are all periodic scans, each on its own interval (see [Periodic drivers](#periodic-drivers)). Those intervals are the latency the system runs at; two of them are yours to choose. Object watches also have a commit wake in front of their tick, so a write made through this `Beehive` reaches them without waiting for the tick.
 
 - **`spec`/`status` separation.** Only controllers write `status`, and the API enforces it: the user-facing `Client` has no status-write path, only the `Controller` surface does.
 
@@ -123,7 +123,7 @@ Every driver is one of these. They run on separate intervals because they are se
 | watch tail | the write log of each watched kind, once per kind however many watches it has | one cheap read per watched kind per tick, and a commit wakes it before the tick | 30s floor, fixed |
 | event watch poll | one object's event log, for each live `EventsWatch` | one cheap read per subscriber per tick; a listing only when the mark moved | 1s, fixed |
 
-**Only two of these are configurable.** The other four are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding, by what changed, or by the dependency graph rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
+**Only two of these are configurable.** The other five are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding, by what changed, or by the dependency graph rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
 
 The full pass is opt-in because it is the only driver whose cost is unbounded by outstanding work. It is also the only one that reaches an object the store records nothing about: state that belongs to a process and a restart invalidated, such as a liveness condition, which reads as "verifying" until a controller in *this* process rewrites it. Set it well above the 30s owed pass, which it subsumes.
 
@@ -543,7 +543,7 @@ one, ch, err := client.Watch(ctx, id)
 Both **share one reader per kind.** However many watches a kind has, one tailer reads its write-log position, and only a position that moved costs anything more: the entries above the cursor, then one batched read of the objects they name. A commit wakes that tailer, and a 30s floor tick covers what a wake cannot — a second process writing to the same store, a failed read, a retention trim. Three things follow, and they are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
 - **Changes collapse together.** Several writes to one object produce one change carrying current state. An object created *and* updated before you read reports `Added`, since it was not in your snapshot — and an `Added` may repeat for an object your snapshot already held, so treat it as "here is this object" rather than "this object is new".
-- **Order holds per object, not across them.** Each object's latest state arrives once, newest wins. Nothing is dropped: a delete always arrives, even for an object you never saw created.
+- **Order holds per object, not across objects.** Each object's latest state arrives once, newest wins. Nothing is dropped: a delete always arrives, even for an object you never saw created.
 - **Latency is the commit**, not the interval, for writes made through this `Beehive`. A quiet kind reads one indexed number per 30s. Writing to the event log does not move the position, so an object watch stays quiet through a controller that records events on every pass.
 
 **`Deleted` means collected, not requested.** Deleting an object sets `DeletionRequestedAt` and leaves the row live and readable, so you get a `Modified` with that field set. `Deleted` follows only when the GC sweeper physically removes the row — after its finalizers clear, which is controller-defined and unbounded, and after nothing references it any more. So: key on `DeletionRequestedAt != nil` to stop using an object, and on `Deleted` to evict it from a cache.

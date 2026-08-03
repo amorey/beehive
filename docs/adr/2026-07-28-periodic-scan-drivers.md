@@ -34,12 +34,12 @@ rather than asserted at each site. Every driver in the table below fails the fir
 test by construction, because a second process can always write to the store. See
 [the schedule-watch ADR](2026-07-27-schedule-watch.md).
 
-**A wake in front of a scan is not the same claim, and the watch tail has one.**
+**A wake in front of a scan is a weaker claim, and the watch tail has one.**
 A commit publishes its kind to a process-local hub, so a local write reaches
 subscribers without waiting for a tick. That hub sees only this process's
-writers, which is exactly why the scan stays: the floor tick is what covers a
-second process over the same file, a failed read, and a retention trim. The tail
-is a driver with a wake, not an exception to the rule.
+writers, which is exactly why the scan stays: the floor tick covers a second
+process over the same file, a failed read, and a retention trim. The tail is a
+driver with a wake, not an exception to the rule.
 → [ADR](2026-08-03-watch-shared-tail.md).
 
 | Driver | What it scans | Paced by | Default |
@@ -154,13 +154,13 @@ concurrency until a workload shows the stall.
 
 ### The object watches share one tailer per kind
 
-`Watch` and `WatchList` do not scan at all any more. One tailer per kind owns the
-kind's write-log cursor, and every watch on that kind is a subscriber to its
+`Watch` and `WatchList` no longer scan for themselves. One tailer per kind owns
+the kind's write-log cursor, and every watch on that kind subscribes to its
 fan-out, so reads scale with watched kinds rather than with watch count. A quiet
 tick is one read of the kind's log position; a busy one reads the entries above
-the cursor and then one batched read of current state. A commit wakes the tailer,
-so latency is the wake and the floor bounds only what a wake cannot reach.
-→ [ADR](2026-08-03-watch-shared-tail.md).
+the cursor and then one batched read of current state. A commit wakes the
+tailer, so latency comes from the wake and the floor only bounds what a wake
+cannot reach. → [ADR](2026-08-03-watch-shared-tail.md).
 
 The other watches share nothing with it, so read the paragraph
 above as being about the object watches alone. `EventsWatch` also compares
@@ -200,8 +200,8 @@ helper) has no sweeper instead of panicking in `NewTicker`.
 is not a backstop but the delivery mechanism, and a watch that never polls is a
 stream that never emits — there is nothing such a value could mean.
 `withWatchFloorInterval` is mandatory because it is the object tail's backstop in
-the ordinary sense: without it a wake this process never sees is a subscriber
-stale for good.
+the ordinary sense: without it, a write whose wake this process never sees would
+leave subscribers stale for good.
 
 ## Only two cadences are public
 

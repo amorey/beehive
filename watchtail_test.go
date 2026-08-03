@@ -51,8 +51,9 @@ func TestWakeHubPublishesOnCreate(t *testing.T) {
 
 // Every path that appends an object_writes entry wakes the kind. The rows are
 // the store's write-log call sites, not the public verbs: ConditionsSet and
-// ConditionsDelete reach the log through bumpObject, which a verb-derived table
-// misses. A write no row covers is a write watchers see only on the floor tick.
+// ConditionsDelete reach the log through bumpObject, which a verb-derived
+// table misses. A write path missing from this table is one watchers see only
+// on the floor tick.
 func TestWakeHubPublishesOnEveryWrite(t *testing.T) {
 	type writeCase struct {
 		name string
@@ -284,7 +285,7 @@ func TestTailerDeliversOnWake(t *testing.T) {
 }
 
 // writeDuringMaxVersionStore commits one write inside the first position read,
-// after the read has taken its value — the interleaving that costs a wake if the
+// after the read has taken its value — the ordering that loses a wake if the
 // tailer registers its receiver second.
 type writeDuringMaxVersionStore struct {
 	Store
@@ -302,9 +303,9 @@ func (s *writeDuringMaxVersionStore) ObjectWritesMaxVersion(ctx context.Context,
 	return at, err
 }
 
-// The tailer registers its wake receiver before it reads its starting cursor. A
-// write that commits in between is above the cursor and its wake is in the slot;
-// the other order drops it and the object is never delivered.
+// The tailer registers its wake receiver before it reads its starting cursor.
+// A write that commits in between is above the cursor and its wake is in the
+// slot; in the other order the wake is lost and the object never delivered.
 func TestTailerLosesNoWriteAtStartup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -326,18 +327,19 @@ func TestTailerLosesNoWriteAtStartup(t *testing.T) {
 // countingTailStore counts the reads a tail step makes.
 type countingTailStore struct {
 	Store
-	gateReads atomic.Int64
+	positionReads atomic.Int64
 }
 
 func (s *countingTailStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	s.gateReads.Add(1)
+	s.positionReads.Add(1)
 	return s.Store.ObjectWritesMaxVersion(ctx, gk)
 }
 
-// A burst larger than one page drains on its own. The wakes coalesce into one
-// slot, so a tailer that read a single page per wake would strand the remainder
-// until some unrelated later write. The drain loop ends on a short page rather
-// than on a second position read, so a step costs one gate read.
+// A burst larger than one page drains on its own. The wakes collapse into one
+// slot, so a tailer that read a single page per wake would strand the
+// remainder until some unrelated later write. The drain loop stops on a short
+// page rather than on a second position read, so a step costs one position
+// read.
 func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -348,11 +350,11 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	bh := newTestBeehive(t, store)
 
 	_, rx := startTailer(t, bh, clientTestGK)
-	gateReadsAtStart := store.gateReads.Load()
+	positionReadsAtStart := store.positionReads.Load()
 
-	// Written past the client so the burst carries no wakes of its own, then
-	// woken once: a burst coalesces to one wake anyway, and this makes the read
-	// count the tailer's rather than the interleaving's.
+	// The burst is written straight to the store, so it publishes no wakes of
+	// its own; one manual wake follows. A burst collapses to one wake anyway,
+	// and this keeps the read count deterministic.
 	spec, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	for i := range burst {
@@ -370,14 +372,14 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 		require.NoError(t, err, "burst stalled after %d of %d", len(seen), burst)
 		seen[ev.Key] = true
 	}
-	// Two pages, so two steps, so two gate reads.
-	assert.Equal(t, int64(2), store.gateReads.Load()-gateReadsAtStart)
+	// Two pages, so two steps, so two position reads.
+	assert.Equal(t, int64(2), store.positionReads.Load()-positionReadsAtStart)
 }
 
-// Two changes for one object that a subscriber has not read yet coalesce by the
-// merge table. Nothing annihilates: the pending slot is hub-wide but a
-// subscriber's snapshot is its own, so dropping a create/delete pair would leave
-// a subscriber that snapshotted between them holding a deleted object forever.
+// Two unread changes for one object coalesce by the merge table. Nothing is
+// dropped: the pending slot is shared by all subscribers but each snapshot is
+// its own, so dropping a create/delete pair would leave a subscriber that
+// snapshotted between them holding a deleted object forever.
 func TestTailerMergeTable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -476,25 +478,25 @@ func TestTailerMergeTable(t *testing.T) {
 	}
 }
 
-// A send the pending slot already covers keeps the pending value, and its queue
-// position with it. Driven directly: the tailer cannot send a key out of order —
-// one goroutine, a strictly advancing cursor, sequential state read-backs — so
+// A stale send — one the pending slot already covers — keeps the pending value
+// and its queue position. Driven through the merge directly: the tailer itself
+// cannot send a key out of order (one goroutine, a strictly rising cursor), so
 // this guard is defense in depth against a second producer that does not exist
-// yet, and only the merge can be asked whether it holds.
+// yet, and only the merge can show it.
 func TestMergeRawChangeKeepsThePendingValueOnAStaleSend(t *testing.T) {
 	pending := rawChange{ID: 7, Op: WriteUpdate, ResourceVersion: 9}
 
 	for _, rv := range []int64{8, 9} {
 		t.Run(fmt.Sprintf("rv=%d", rv), func(t *testing.T) {
 			got, keep := mergeRawChange(pending, rawChange{ID: 7, Op: WriteDelete, ResourceVersion: rv})
-			assert.True(t, keep, "nothing annihilates")
+			assert.True(t, keep, "nothing is dropped")
 			assert.Equal(t, pending, got, "a stale send must not overwrite a newer pending value")
 		})
 	}
 }
 
-// A writer this process shares no memory with publishes no wake, so the floor
-// tick is what makes its write visible. Same store, second Beehive.
+// A writer in another Beehive publishes no wake here, so only the floor tick
+// makes its write visible. Same store, second Beehive.
 func TestTailerFloorTickPicksUpAForeignWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -570,8 +572,9 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 	assert.Equal(t, obj.ID, ev.Key)
 }
 
-// gateAheadStore reports a log position no listing backs — the shape of a Store
-// that folds a wider counter into the gate, or that trims between the two reads.
+// gateAheadStore reports a log position with no entries behind it — a Store
+// that folds a wider counter into the position, or trims between the two
+// reads.
 type gateAheadStore struct {
 	Store
 	ahead int64
@@ -582,9 +585,9 @@ func (s *gateAheadStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKin
 	return at + s.ahead, err
 }
 
-// A gate above the cursor that no entry backs costs one empty listing, not an
-// index into an empty page. Store is a public extension point, so the two reads
-// agreeing is a contract the tail cannot assume.
+// A position above the cursor with no entries behind it costs one empty
+// listing, not an index into an empty page. Store is a public extension point,
+// so the tail cannot assume the two reads agree.
 func TestTailerStepToleratesAGateAheadOfTheLog(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -714,8 +717,8 @@ func newWriteWorld(t *testing.T) *writeWorld {
 	}
 }
 
-// The public list watch delivers on the commit's wake, with both the old poll
-// interval and the floor set past the test's patience.
+// The public list watch delivers on the commit's wake, with both the poll
+// interval and the floor set far beyond the test timeout.
 func TestWatchListDeliversWithoutPolling(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -737,7 +740,7 @@ func TestWatchListDeliversWithoutPolling(t *testing.T) {
 
 // The delete of an object the snapshot carried is always delivered, even when
 // the tailer published its create before that snapshot and this subscriber has
-// read nothing. Coalescing the pair away would leave this caller holding a row
+// read nothing. Merging the pair away would leave this caller holding a row
 // that no longer exists, with no correction coming.
 func TestWatchSeesDeleteOfSnapshotObject(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -786,7 +789,7 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 	require.NoError(t, err)
 	_, rawCh, err := raw.WatchList(ctx)
 	require.NoError(t, err)
-	gateReadsAtStart := store.gateReads.Load()
+	positionReadsAtStart := store.positionReads.Load()
 
 	obj := mustCreate(t, ctx, typed, "shared", cSpec{Val: "a"})
 
@@ -797,8 +800,8 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 	assert.JSONEq(t, `{"Val":"a"}`, string(rawEv.Object.Spec))
 
 	assert.Len(t, bh.tailers, 1, "the kind is read by one tailer")
-	assert.Equal(t, int64(1), store.gateReads.Load()-gateReadsAtStart,
-		"one write costs one gate read, not one per subscriber")
+	assert.Equal(t, int64(1), store.positionReads.Load()-positionReadsAtStart,
+		"one write costs one position read, not one per subscriber")
 }
 
 // A single-object watch joins the kind's tailer through a key filter, so its
@@ -953,13 +956,13 @@ func TestTailerQueryCountConstantInSubscribers(t *testing.T) {
 			require.NoError(t, err)
 			chans[i] = ch
 		}
-		at := store.gateReads.Load()
+		at := store.positionReads.Load()
 
 		mustCreate(t, ctx, client, "counted", cSpec{})
 		for _, ch := range chans {
 			recv(t, ch)
 		}
-		return store.gateReads.Load() - at
+		return store.positionReads.Load() - at
 	}
 
 	one, two := reads(t, 1), reads(t, 2)
@@ -974,9 +977,9 @@ func TestTailerQueryCountConstantInSubscribers(t *testing.T) {
 		_, _, err := client.WatchList(ctx)
 		require.NoError(t, err)
 	}
-	at := store.gateReads.Load()
+	at := store.positionReads.Load()
 	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Other"}), "elsewhere", cSpec{})
-	assert.Equal(t, at, store.gateReads.Load(), "a quiet kind reads nothing")
+	assert.Equal(t, at, store.positionReads.Load(), "a quiet kind reads nothing")
 }
 
 // One page collapses to the last entry per object, carrying current state, in
@@ -1052,8 +1055,8 @@ func (s *failingLoadStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, R
 }
 
 // A failed relation load is retried, not skipped: the entries it covers are
-// already behind the cursor, so no later read brings them back and a skip is a
-// change the subscriber never hears about. The ladder ends with the caller's
+// already behind the cursor, so no later read brings them back, and a skip is
+// a change the subscriber never hears about. The retry ends with the caller's
 // context — on the live path and on a resume's replay, which decode their
 // batches the same way.
 func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
@@ -1086,7 +1089,7 @@ func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
 				mustCreate(t, ctx, client, "live", cSpec{})
 			}
 
-			<-store.tried // on the ladder, and nothing delivered without its relations
+			<-store.tried // retry in progress, and nothing delivered without its relations
 			cancel()
 			for range ch { // the stream ends rather than parking on a send
 			}
@@ -1209,8 +1212,8 @@ func (s *failListByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind,
 	return s.Store.ObjectsListByIDs(ctx, gk, ids)
 }
 
-// The state read behind a replayed page is retried on the same ladder as the
-// page itself, and for the same reason.
+// The state read behind a replayed page is retried with the same backoff as
+// the page itself, and for the same reason.
 func TestWatchResumeRetriesAFailedStateRead(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -1339,8 +1342,8 @@ func TestWatchResumeStopsDeliveringWhenTheCallerGivesUp(t *testing.T) {
 }
 
 // A replay that cannot read gives up with the caller rather than on its own:
-// each failure costs a rung of the ladder, and the ladder ends when the context
-// does. Both reads behind a replayed page answer to it.
+// each failure waits one backoff step, and the retrying ends when the context
+// does. Both reads behind a replayed page follow this.
 func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1391,7 +1394,7 @@ func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 			_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
 			require.NoError(t, err, "the resume check reads one entry and still passes")
 
-			<-tried // on the ladder, with the gap still unread
+			<-tried // retry in progress, with the gap still unread
 			cancel()
 			for range ch { // the stream ends rather than parking on a send
 			}

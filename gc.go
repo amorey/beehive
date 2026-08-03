@@ -32,9 +32,9 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Mark owned children for deletion; the mark puts them in the sweeper's listing.
-		// The refs are cross-kind, so each one's own kind is what gets woken —
-		// once per kind, not once per child: a wide cascade would otherwise queue
-		// a commit hook per row for wakes that coalesce anyway.
+		// The children span kinds, so wake each child's own kind — deduped per
+		// kind: a wide cascade would otherwise queue one commit hook per row
+		// for wakes that coalesce anyway.
 		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
 		if err != nil {
 			return err

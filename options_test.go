@@ -189,10 +189,10 @@ func TestWatchPollIntervalRejectsNonPositive(t *testing.T) {
 	}
 }
 
-// TestWatchFloorIntervalRejectsNonPositive pins the tail's floor cadence. The
-// wake carries freshness, so a disabled floor would still deliver this process's
-// own writes — and silently drop what only the floor covers: a second writer over
-// the store, a step that failed, a retention trim.
+// TestWatchFloorIntervalRejectsNonPositive pins that the floor cannot be
+// disabled. A disabled floor would still deliver this process's own writes —
+// the wake covers those — but silently drop what only the floor covers: a
+// second writer over the store, a failed step, a retention trim.
 func TestWatchFloorIntervalRejectsNonPositive(t *testing.T) {
 	for _, d := range []time.Duration{0, -time.Second} {
 		t.Run(d.String(), func(t *testing.T) {

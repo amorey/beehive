@@ -546,13 +546,13 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
 - **A watch tailer outlives its last subscriber, and only `stop` ends it** — the
   [shared-tail ADR](adr/2026-08-03-watch-shared-tail.md) takes this deliberately:
-  refcounting subscribers means a teardown race for a saving that only matters to
-  a process watching many kinds briefly. Two loose ends it leaves. An application
-  that watches 50 kinds once holds 50 goroutines and 50 reads per floor interval
-  for the process's life. And a `Beehive` that was never `Start`ed has no public
-  way to stop them at all, because `stop` is only reachable through the closure
-  `Start` returns — before the shared tail, such a watch ended with its own
-  context and nothing outlived it.
+  refcounting subscribers means resolving a teardown race, for a saving that only
+  matters to a process that watches many kinds briefly. It leaves two loose ends.
+  An application that watches 50 kinds once holds 50 goroutines and 50 reads per
+  floor interval for the process's life. And a `Beehive` that was never `Start`ed
+  has no public way to stop them at all, because `stop` is only reachable through
+  the closure `Start` returns — before the shared tail, such a watch ended with
+  its own context and nothing outlived it.
 
   The fix is idle teardown: count receivers in `tailerFor`, cancel the tailer
   when the last one closes. That also removes `tailCtx`/`tailWG`/`stopWatchTail`

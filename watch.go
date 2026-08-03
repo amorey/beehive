@@ -23,12 +23,12 @@ import (
 	"github.com/amorey/beehive/internal/driver"
 )
 
-// This file is the client's watch surface. The object watches subscribe to their
-// kind's shared tail (watchtail.go), which a commit wakes; the event watch still
-// polls and diffs — read current state on a tick, compare with what this
-// subscriber was last told, send the difference. Either way delivery is
-// level-triggered: intermediate states are invisible, and what arrives is the
-// latest state per object.
+// This file is the client's watch surface. The object watches subscribe to
+// their kind's shared tail (watchtail.go), which a commit wakes; the event
+// watch still polls and diffs — read current state on a tick, compare with
+// what this subscriber was last told, send the difference. Both are
+// level-triggered: subscribers get the latest state per object, never the
+// intermediate states.
 
 // WatchOption configures one watch call. A distinct type from Option: these are
 // meaningful only here, and dispatching them on a Beehive or a controller would
@@ -73,8 +73,9 @@ func (bh *Beehive) watchPoll() time.Duration {
 	return bh.watchPollInterval
 }
 
-// watchFloor is watchPoll for the object tail's floor cadence, and exists for
-// the same reason: a zero here would make the tailer's timer fire in a loop.
+// watchFloor returns the object tail's floor interval, with a fallback for the
+// same reason as watchPoll: a zero would make the tailer's timer fire in a
+// loop.
 func (bh *Beehive) watchFloor() time.Duration {
 	if bh.watchFloorInterval <= 0 {
 		return defaultWatchFloorInterval
@@ -120,9 +121,9 @@ func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchO
 // Watch streams changes to the single object id: an id that does not exist yet
 // streams nothing until created, and its removal reads as a Deleted.
 func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	// The tail is the kind's: the log carries no index under object_id, so a
-	// single-object watch joins what its kind already reads and filters the
-	// fan-out down to its own key.
+	// The tail is shared per kind — the log has no index on object_id — so a
+	// single-object watch joins the kind's reader and filters the fan-out down
+	// to its own id.
 	list, ch, err := c.tailStream(ctx, resolveWatch(opts), &id)
 	if err != nil {
 		return ObjectSnapshot[Spec, Status]{}, nil, err
