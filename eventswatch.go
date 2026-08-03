@@ -60,11 +60,6 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 	go func() {
 		defer close(out)
 		driver.Run(ctx, c.bh.watchPoll(), func(ctx context.Context) bool {
-			if foreign {
-				// This id belongs to another kind and always will. The stream
-				// stays open and silent, which is the contract.
-				return true
-			}
 			if !scoped {
 				// Kind-scope the read, as the object watches do; a missing id
 				// streams nothing until it exists.
@@ -76,8 +71,12 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 					return c.pollFailed(ctx, "event watch", err, "id", id)
 				}
 				if raw.Group != c.gk.Group || raw.Kind != c.gk.Kind {
+					// This id belongs to another kind and always will, so there
+					// is nothing left to poll for. Ending the driver rather than
+					// ticking on it costs one wakeup per interval for as long as
+					// the caller holds the stream.
 					foreign = true
-					return true
+					return false
 				}
 				scoped = true
 			}
@@ -118,6 +117,11 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 			seen = next
 			return true
 		})
+		if foreign {
+			// The stream stays open and silent until the caller lets go, which
+			// is the contract; the driver ended early rather than the watch.
+			<-ctx.Done()
+		}
 	}()
 	return out, nil
 }

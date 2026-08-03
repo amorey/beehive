@@ -65,11 +65,11 @@ func TestEventsWatchIsKindScoped(t *testing.T) {
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.metaRead, 1), "the scoping read against the foreign id")
 
-	// The verdict is latched, so later ticks re-read nothing. An id's group and kind
-	// are fixed at insert and its id is never reused, so "foreign" cannot become
-	// false — re-reading would cost one row per tick, forever, to learn the same
-	// thing. Use an object watch as the clock: its ticks are independent of this
-	// stream's, so several of them passing proves the event watch also ticked.
+	// The verdict is final, so the poll ends rather than ticking on: an id's
+	// group and kind are fixed at insert and its id is never reused, so
+	// "foreign" cannot become false, and both re-reading and waking to decide
+	// not to would buy nothing. Use an object watch as the clock, since its
+	// ticks are independent of this stream's.
 	_, _, err = client.WatchList(ctx)
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.polled, 3), "three ticks after the foreign id resolved")
@@ -80,6 +80,11 @@ func TestEventsWatchIsKindScoped(t *testing.T) {
 		t.Fatalf("another kind's log must not stream through this client, got %+v", ev)
 	default:
 	}
+
+	// A stream whose poll has ended still belongs to its caller: it stays open
+	// until the context goes, and then it closes.
+	cancel()
+	waitClosed(t, closedWhenDrained(ch), "the foreign stream to close on cancellation")
 }
 
 // Every read an event watch makes happens per tick, so any one of them failing
