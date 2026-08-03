@@ -879,3 +879,47 @@ func TestWatchResumeReplaysBeyondOnePage(t *testing.T) {
 		seen[recv(t, ch).Object.ID] = true
 	}
 }
+
+// The central cost claim: reads scale with watched kinds, not with watch count,
+// and a quiet kind with watches on it reads nothing at all.
+func TestTailerQueryCountConstantInSubscribers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	reads := func(t *testing.T, subscribers int) int64 {
+		t.Helper()
+		store := &countingTailStore{Store: newClientTestStore(t)}
+		bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+		chans := make([]<-chan ObjectChange[cSpec, cStatus], subscribers)
+		for i := range subscribers {
+			_, ch, err := client.WatchList(ctx)
+			require.NoError(t, err)
+			chans[i] = ch
+		}
+		at := store.gateReads.Load()
+
+		mustCreate(t, ctx, client, "counted", cSpec{})
+		for _, ch := range chans {
+			recv(t, ch)
+		}
+		return store.gateReads.Load() - at
+	}
+
+	one, two := reads(t, 1), reads(t, 2)
+	assert.Equal(t, one, two, "a second subscriber costs no extra read")
+
+	// And a kind nobody writes to costs nothing: the floor is an hour away and
+	// no wake fires.
+	store := &countingTailStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	for range 3 {
+		_, _, err := client.WatchList(ctx)
+		require.NoError(t, err)
+	}
+	at := store.gateReads.Load()
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Other"}), "elsewhere", cSpec{})
+	assert.Equal(t, at, store.gateReads.Load(), "a quiet kind reads nothing")
+}
