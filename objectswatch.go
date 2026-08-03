@@ -637,7 +637,7 @@ func (c *clientImpl[Spec, Status]) consume(
 // magnitude less than that read. A cap would not be a safe substitute — it
 // would take part of a pending set and leave the rest, which delivers exactly
 // the inversion above. A sound bound needs conflate to hand back everything
-// pending in one call.
+// pending in one call. See docs/specs/gobus-conflate-drain.md.
 func drainPending(first rawChange, rx *conflate.Receiver[ObjectID, rawChange]) []rawChange {
 	batch := []rawChange{first}
 	for {
