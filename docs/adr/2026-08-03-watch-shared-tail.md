@@ -106,6 +106,14 @@ The stop condition is the page length, not a second position read: a short
 page means the log is drained, exactly, and `step` already opens with the
 position check.
 
+A failed step logs and backs off, bounded and capped at the floor interval,
+rather than spinning; the cursor does not advance, so nothing is lost. **The
+commit wake is suppressed while it backs off**, or the backoff is not one: a
+commit landing during a failed drain refills the wake slot, so a tailer that
+honoured it would re-read a degraded store as fast as it could fail, for as
+long as anything kept writing. Dropping a wake loses nothing, since the retry
+timer reads the log either way.
+
 ### The merge, and why nothing is dropped
 
 `Merge` keeps the pending value when the new send is stale
