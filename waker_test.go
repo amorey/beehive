@@ -787,9 +787,25 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 }
 
 // staleListErrorStore fails the staleness listing, for the sweep's failure arm.
+// It is a DriverCursorer so a test can watch the cursor it must not move.
 type staleListErrorStore struct {
 	fakeStore
-	calls atomic.Int64
+	calls    atomic.Int64
+	issued   int64
+	setCalls []int64
+}
+
+func (s *staleListErrorStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return s.issued, nil
+}
+
+func (s *staleListErrorStore) DriverCursorsGet(context.Context, string) (int64, bool, error) {
+	return 0, false, nil
+}
+
+func (s *staleListErrorStore) DriverCursorsSet(_ context.Context, _ string, cursor int64) error {
+	s.setCalls = append(s.setCalls, cursor)
+	return nil
 }
 
 func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
@@ -894,24 +910,50 @@ func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
 	assert.Equal(t, []int64{500}, store.setCalls, "and persists it once")
 }
 
-// TestStaleDependentsSweepWarnsAndRetriesOnListFailure pins the failure contract:
-// a sweep that cannot read gives up on this pass and says so. There is no cursor
-// to hold and nothing was drained — the listing derives its answer from current
-// state — so the next tick re-derives the same set, which is why abandoning the
-// sweep is the whole of the repair.
-func TestStaleDependentsSweepWarnsAndRetriesOnListFailure(t *testing.T) {
+// TestStaleDependentsSweepLeavesADurableFinding is the restart property the
+// cursor rests on. The enqueue dies with the process, so what the sweep found
+// has to be on the row: the owed pass names it on the way back up, and the
+// cursor is free to move past a target that has since gone quiet.
+func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
 	ctx := context.Background()
-	store := &staleListErrorStore{}
+	store := newClientTestStore(t)
+	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
+
+	spec := []byte(`{}`)
+	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	bh.staleDependentsSweep(ctx, []GroupKind{clientTestGK}, 0, nil)
+
+	owed, err := store.ReconcileOwedListIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "the finding outlives the queue it was also put on")
+}
+
+// TestStaleDependentsSweepHoldsTheCursorOnListFailure pins the failure contract:
+// a sweep that cannot read gives up on this pass, says so, and leaves the cursor
+// where it was. Holding it is the whole of the repair now that the scan is
+// bounded — advancing past a page that was never read would strand every
+// dependent in it, because nothing re-derives a target that has gone quiet.
+func TestStaleDependentsSweepHoldsTheCursorOnListFailure(t *testing.T) {
+	ctx := context.Background()
+	store := &staleListErrorStore{issued: 900}
 	logger, logs := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: store, logger: logger}
 	kinds := []GroupKind{clientTestGK}
 
-	bh.staleDependentsSweep(ctx, kinds, 0, nil)
+	next := bh.staleDependentsSweep(ctx, kinds, 200, store)
 	require.EqualValues(t, 1, store.calls.Load(), "a failed page abandons the sweep")
 	assert.Contains(t, logs.String(), "listing stale dependents failed")
+	assert.EqualValues(t, 200, next, "the cursor does not move past a page nobody read")
+	assert.Empty(t, store.setCalls, "and nothing is persisted")
 
-	bh.staleDependentsSweep(ctx, kinds, 0, nil)
-	assert.EqualValues(t, 2, store.calls.Load(), "and the next pass asks again from the start")
+	next = bh.staleDependentsSweep(ctx, kinds, next, store)
+	assert.EqualValues(t, 2, store.calls.Load(), "the next pass asks again")
+	assert.EqualValues(t, 200, next, "from the same place")
 }
 
 // TestStaleDependentsSweepIsQuietOnShutdown separates the two reasons a listing
