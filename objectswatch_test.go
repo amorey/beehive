@@ -972,12 +972,12 @@ func TestAVanishedObjectIsSkipped(t *testing.T) {
 
 // A create publishes its kind's new log position, so a tailer never has to poll
 // to learn that the kind moved.
-func TestWakeHubPublishesOnCreate(t *testing.T) {
+func TestKindWriteHubPublishesOnCreate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t))
-	rx := bh.wakes.Watch(clientTestGK)
+	rx := bh.kindWrites.Watch(clientTestGK)
 	defer rx.Close()
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -993,7 +993,7 @@ func TestWakeHubPublishesOnCreate(t *testing.T) {
 // ConditionsDelete reach the log through bumpObject, which a verb-derived
 // table misses. A write path missing from this table is one watchers see only
 // on the floor tick.
-func TestWakeHubPublishesOnEveryWrite(t *testing.T) {
+func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 	type writeCase struct {
 		name string
 		// setup's own wakes are drained before write runs, so a write that
@@ -1104,7 +1104,7 @@ func TestWakeHubPublishesOnEveryWrite(t *testing.T) {
 			defer cancel()
 
 			w := newWriteWorld(t)
-			rx := w.bh.wakes.Watch(clientTestGK)
+			rx := w.bh.kindWrites.Watch(clientTestGK)
 			defer rx.Close()
 
 			var id ObjectID
@@ -1125,7 +1125,7 @@ func TestWakeHubPublishesOnEveryWrite(t *testing.T) {
 // the caller's kind is not enough: it is routed by the refs the store returns.
 // The collection is driven directly — DeletionRequestsCreateFromOwner has one
 // caller, gcCollect, and Delete on the owner only marks the owner.
-func TestWakeHubPublishesPerCascadedKind(t *testing.T) {
+func TestKindWriteHubPublishesPerCascadedKind(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -1138,9 +1138,9 @@ func TestWakeHubPublishesPerCascadedKind(t *testing.T) {
 	mustCreate(t, ctx, NewClient[cSpec, cStatus](w.bh, gkChildB), "b", cSpec{}, WithOwner(owner.ID))
 	require.NoError(t, w.client.Delete(ctx, owner.ID))
 
-	rxA := w.bh.wakes.Watch(gkChildA)
+	rxA := w.bh.kindWrites.Watch(gkChildA)
 	defer rxA.Close()
-	rxB := w.bh.wakes.Watch(gkChildB)
+	rxB := w.bh.kindWrites.Watch(gkChildB)
 	defer rxB.Close()
 
 	_, err := w.bh.gcCollect(ctx, owner.ID)
@@ -1154,12 +1154,12 @@ func TestWakeHubPublishesPerCascadedKind(t *testing.T) {
 
 // A write that never commits wakes nobody: the publish rides AfterCommit, so a
 // rollback discards it with the row it would have announced.
-func TestWakeHubSilentOnRollback(t *testing.T) {
+func TestKindWriteHubSilentOnRollback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
 	w := newWriteWorld(t)
-	rx := w.bh.wakes.Watch(clientTestGK)
+	rx := w.bh.kindWrites.Watch(clientTestGK)
 	defer rx.Close()
 
 	err := w.bh.store.Within(ctx, func(ctx context.Context) error {
@@ -1175,7 +1175,7 @@ func TestWakeHubSilentOnRollback(t *testing.T) {
 
 // Stop closes the wake sender so a blocked tailer ends instead of hanging. The
 // watch machinery comes up in New, not Start, so it goes down either way.
-func TestWakeHubClosesOnStop(t *testing.T) {
+func TestKindWriteHubClosesOnStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -1184,7 +1184,7 @@ func TestWakeHubClosesOnStop(t *testing.T) {
 		require.NoError(t, err)
 		stop, err := bh.Start(ctx)
 		require.NoError(t, err)
-		rx := bh.wakes.Watch(clientTestGK)
+		rx := bh.kindWrites.Watch(clientTestGK)
 		defer rx.Close()
 
 		require.NoError(t, stop(ctx))
@@ -1195,7 +1195,7 @@ func TestWakeHubClosesOnStop(t *testing.T) {
 	t.Run("never started", func(t *testing.T) {
 		bh, err := New(newClientTestStore(t))
 		require.NoError(t, err)
-		rx := bh.wakes.Watch(clientTestGK)
+		rx := bh.kindWrites.Watch(clientTestGK)
 		defer rx.Close()
 
 		require.NoError(t, bh.stop(ctx))
@@ -1303,7 +1303,7 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
-	require.NoError(t, bh.wakes.Send(clientTestGK))
+	require.NoError(t, bh.kindWrites.Send(clientTestGK))
 
 	seen := make(map[ObjectID]bool, burst)
 	for len(seen) < burst {
@@ -1765,7 +1765,7 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 // the context together, so which arm of the select wins there is a coin toss —
 // this one leaves the context live, which is the only way to pin that a tailer
 // does not sit forever on a channel nobody will feed again.
-func TestTailerEndsWhenTheWakeHubCloses(t *testing.T) {
+func TestTailerEndsWhenTheKindWriteHubCloses(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -1780,7 +1780,7 @@ func TestTailerEndsWhenTheWakeHubCloses(t *testing.T) {
 		tailer.run()
 	}()
 
-	bh.wakes.Close()
+	bh.kindWrites.Close()
 	select {
 	case <-done:
 	case <-time.After(testTimeout):

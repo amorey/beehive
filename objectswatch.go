@@ -111,19 +111,19 @@ func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID)
 	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
 }
 
-// wakeHub wakes a kind's tailer when the kind changes. Keyed by GroupKind,
-// latest value only: a burst of commits collapses into one pending wake, and a
-// publish that lands mid-read waits in the slot. The value is a process-local
+// kindWriteHub tells a kind's tailer that the kind moved. Keyed by GroupKind,
+// latest value only: a burst of commits collapses into one pending signal, and
+// a publish that lands mid-read waits in the slot. The value is a process-local
 // counter, not a resource version — it only needs to rise. Close closes the
 // sender, never the hub (scheduleHub's rule).
 // See docs/adr/2026-08-03-watch-shared-tail.md.
-type wakeHub struct {
+type kindWriteHub struct {
 	hub *watch.Hub[GroupKind, int64]
 	seq *atomic.Int64
 }
 
-func newWakeHub() wakeHub {
-	return wakeHub{
+func newKindWriteHub() kindWriteHub {
+	return kindWriteHub{
 		hub: watch.New[GroupKind](watch.WithAccept(
 			func(prev, next int64) bool { return next > prev },
 		)),
@@ -133,7 +133,7 @@ func newWakeHub() wakeHub {
 
 // Send is a no-op on the zero hub, which a Beehive built without New has —
 // the same rule bh.log() applies to an unresolved logger.
-func (h wakeHub) Send(gk GroupKind) error {
+func (h kindWriteHub) Send(gk GroupKind) error {
 	if h.hub == nil {
 		return nil
 	}
@@ -142,12 +142,12 @@ func (h wakeHub) Send(gk GroupKind) error {
 
 // Watch registers a receiver for gk. The seed is zero because the tailer reads
 // its starting cursor from the store, not from the hub.
-func (h wakeHub) Watch(gk GroupKind) *watch.Receiver[GroupKind, int64] {
+func (h kindWriteHub) Watch(gk GroupKind) *watch.Receiver[GroupKind, int64] {
 	return h.hub.Watch(gk, 0)
 }
 
 // Close is a no-op on the zero hub; see Send.
-func (h wakeHub) Close() {
+func (h kindWriteHub) Close() {
 	if h.hub != nil {
 		h.hub.Sender().Close()
 	}
@@ -267,10 +267,10 @@ type rawChange struct {
 // runs the position check, log page and batched read once, and fans the result
 // out to every watch on the kind. One goroutine per kind, not per watch.
 type objectTailer struct {
-	bh    *Beehive
-	gk    GroupKind
-	hub   *conflate.Hub[ObjectID, rawChange]
-	wakes *watch.Receiver[GroupKind, int64]
+	bh         *Beehive
+	gk         GroupKind
+	hub        *conflate.Hub[ObjectID, rawChange]
+	kindWrites *watch.Receiver[GroupKind, int64]
 	// ctx is run's, cancelled when the last subscriber leaves. Held here
 	// because the goroutine outlives the call that started it.
 	ctx    context.Context
@@ -291,10 +291,10 @@ type objectTailer struct {
 // this call cannot fall into the gap either.
 func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTailer, error) {
 	t := &objectTailer{
-		bh:    bh,
-		gk:    gk,
-		hub:   conflate.New[ObjectID](mergeRawChange),
-		wakes: bh.wakes.Watch(gk),
+		bh:         bh,
+		gk:         gk,
+		hub:        conflate.New[ObjectID](mergeRawChange),
+		kindWrites: bh.kindWrites.Watch(gk),
 	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)
@@ -310,7 +310,7 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 // safe on one that never ran.
 func (t *objectTailer) close() {
 	t.cancel()
-	t.wakes.Close()
+	t.kindWrites.Close()
 	t.hub.Sender().Close()
 }
 
@@ -345,7 +345,7 @@ func (t *objectTailer) run() {
 	defer t.close()
 
 	ctx := t.ctx
-	wakes := t.wakes.Chan()
+	written := t.kindWrites.Chan()
 	floor := t.bh.watchFloor()
 	timer := time.NewTimer(floor)
 	defer timer.Stop()
@@ -355,7 +355,7 @@ func (t *objectTailer) run() {
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-wakes:
+		case _, ok := <-written:
 			if !ok {
 				return // the beehive stopped
 			}

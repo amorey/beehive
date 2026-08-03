@@ -108,9 +108,11 @@ type Beehive struct {
 	// order preserves registration order so Start launches loops deterministically.
 	order []*reconciler
 	waker *waker
-	// wakes wakes a kind's tailer when the kind changes. From New, not Start:
-	// watches work on a Beehive that never ran.
-	wakes wakeHub
+	// kindWrites tells a kind's tailer that the kind moved. Nothing to do with
+	// waker/wakeInterval above, which drive reconciles: this one only ever
+	// reaches a watch. From New, not Start: watches work on a Beehive that
+	// never ran.
+	kindWrites kindWriteHub
 	// tailers is one shared reader per watched kind, started on the kind's first
 	// watch and ended by its last. A tailer is here exactly while it has
 	// subscribers. Guarded by tailMu — never bh.mu; see tailerFor.
@@ -278,7 +280,7 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// a Beehive that never ran too — no special case for that below. Deferred so
 	// a stream whose caller is still reading sees what the draining reconcile
 	// loops write; a tailer whose subscribers have all left is already gone.
-	defer bh.wakes.Close()
+	defer bh.kindWrites.Close()
 
 	bh.mu.Lock()
 	if bh.state != beehiveRunning {
@@ -327,7 +329,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		staleDependentsInterval: defaultStaleDependentsInterval,
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),
-		wakes:                   newWakeHub(),
+		kindWrites:              newKindWriteHub(),
 	}
 	cursors, _ := s.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
@@ -430,15 +432,15 @@ func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
 
 // signalKindWritten wakes gk's tailer once a write to gk commits. The signal is
 // the kind, never the object: the tailer holds one cursor for the kind and reads
-// the log to learn what moved, so a wake carries no id and a burst of writes to
-// one kind collapses into one. AfterCommit for the same reasons as
+// the log to learn what moved, so it carries no id and a burst of writes to one
+// kind collapses into one. AfterCommit for the same reasons as
 // signalRequeue: a rollback publishes nothing, and the wake cannot arrive before
 // the row is readable. Callers check that the write changed something only where
 // the store already reports it — an extra wake costs one position read, a missed
 // one costs up to a floor tick of staleness.
 func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
-		_ = bh.wakes.Send(gk) // ErrClosed after stop; nothing is left to wake
+		_ = bh.kindWrites.Send(gk) // ErrClosed after stop; nothing is left to wake
 	})
 }
 
