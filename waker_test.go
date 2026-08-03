@@ -792,9 +792,9 @@ type staleListErrorStore struct {
 	calls atomic.Int64
 }
 
-func (s *staleListErrorStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]ObjectRef, error) {
+func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
 	s.calls.Add(1)
-	return nil, errBoom
+	return nil, after, errBoom
 }
 
 // stampProbeStore serves one page of stale dependents, then nothing, and records
@@ -806,12 +806,12 @@ type stampProbeStore struct {
 	stamped [][]ObjectRef
 }
 
-func (s *stampProbeStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]ObjectRef, error) {
+func (s *stampProbeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
 	if s.served {
-		return nil, nil
+		return nil, after, nil
 	}
 	s.served = true
-	return s.page, nil
+	return s.page, StalePos{TargetVersion: after.TargetVersion + 1}, nil
 }
 
 func (s *stampProbeStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef) error {
@@ -830,9 +830,68 @@ func TestStaleDependentsSweepStampsWhatItFinds(t *testing.T) {
 	store := &stampProbeStore{page: page}
 	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
 
-	bh.staleDependentsSweep(context.Background(), []GroupKind{clientTestGK})
+	bh.staleDependentsSweep(context.Background(), []GroupKind{clientTestGK}, 0, nil)
 
 	assert.Equal(t, [][]ObjectRef{page}, store.stamped)
+}
+
+// staleCursorStore serves the cursor-form listing and records where it was asked
+// to resume from, plus what the sweep persisted.
+type staleCursorStore struct {
+	fakeStore
+	issued   int64
+	pages    [][]ObjectRef
+	asked    []StalePos
+	stored   map[string]int64
+	setCalls []int64
+}
+
+func (s *staleCursorStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return s.issued, nil
+}
+
+func (s *staleCursorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
+	s.asked = append(s.asked, after)
+	if len(s.pages) == 0 {
+		return nil, after, nil
+	}
+	page := s.pages[0]
+	s.pages = s.pages[1:]
+	next := StalePos{TargetVersion: after.TargetVersion + 1, DependentID: page[len(page)-1].ID}
+	return page, next, nil
+}
+
+func (s *staleCursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
+	v, ok := s.stored[name]
+	return v, ok, nil
+}
+
+func (s *staleCursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+	s.setCalls = append(s.setCalls, cursor)
+	if s.stored == nil {
+		s.stored = map[string]int64{}
+	}
+	s.stored[name] = cursor
+	return nil
+}
+
+// TestStaleDependentsSweepResumesAndRecordsThePreScanMark pins both ends of the
+// cursor. It resumes where the last completed sweep stopped, and it records the
+// mark read *before* this scan — a target written while the sweep runs sits above
+// that mark, so the next sweep still finds it.
+func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
+	store := &staleCursorStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 200}}
+	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
+	ctx := context.Background()
+
+	from := bh.staleDependentsResume(ctx, store)
+	require.EqualValues(t, 200, from, "a stored cursor is where the next sweep starts")
+
+	next := bh.staleDependentsSweep(ctx, []GroupKind{clientTestGK}, from, store)
+
+	assert.Equal(t, []StalePos{{TargetVersion: 200}}, store.asked)
+	assert.EqualValues(t, 500, next, "the sweep advances to the mark it read first")
+	assert.Equal(t, []int64{500}, store.setCalls, "and persists it once")
 }
 
 // TestStaleDependentsSweepWarnsAndRetriesOnListFailure pins the failure contract:
@@ -847,11 +906,11 @@ func TestStaleDependentsSweepWarnsAndRetriesOnListFailure(t *testing.T) {
 	bh := &Beehive{store: store, logger: logger}
 	kinds := []GroupKind{clientTestGK}
 
-	bh.staleDependentsSweep(ctx, kinds)
+	bh.staleDependentsSweep(ctx, kinds, 0, nil)
 	require.EqualValues(t, 1, store.calls.Load(), "a failed page abandons the sweep")
 	assert.Contains(t, logs.String(), "listing stale dependents failed")
 
-	bh.staleDependentsSweep(ctx, kinds)
+	bh.staleDependentsSweep(ctx, kinds, 0, nil)
 	assert.EqualValues(t, 2, store.calls.Load(), "and the next pass asks again from the start")
 }
 
@@ -865,7 +924,7 @@ func TestStaleDependentsSweepIsQuietOnShutdown(t *testing.T) {
 	logger, logs := captureLogger(slog.LevelWarn)
 	bh := &Beehive{store: &staleListErrorStore{}, logger: logger}
 
-	bh.staleDependentsSweep(ctx, []GroupKind{clientTestGK})
+	bh.staleDependentsSweep(ctx, []GroupKind{clientTestGK}, 0, nil)
 
 	assert.Empty(t, logs.String(), "a cancelled read is shutdown, not a lost pass")
 }

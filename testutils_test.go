@@ -1052,13 +1052,14 @@ func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) 
 	return storeapi.ReconcileLoad{Object: *obj}, nil
 }
 
-func (s *listProbeStore) DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]storeapi.ObjectRef, error) {
-	refs, err := s.Store.DependentsListStale(ctx, kinds, afterID, limit)
+// DependentsListStaleSince is the form the sweep calls, so it carries the probe.
+func (s *listProbeStore) DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	refs, next, err := s.Store.DependentsListStaleSince(ctx, kinds, after, limit)
 	s.mu.Lock()
 	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
 	s.mu.Unlock()
 	probeSignal(s.staleListed)
-	return refs, err
+	return refs, next, err
 }
 
 // kindsAsked snapshots what the stale-dependents listings have been asked for.

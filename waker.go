@@ -283,6 +283,9 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 // staleDependentsPageCap bounds one page of the stale-dependents scan.
 const staleDependentsPageCap = 256
 
+// cursorNameStaleDependents is the stale-dependents pass's key in driver_cursors.
+const cursorNameStaleDependents = "stale_dependents"
+
 // staleDependentsRun is the correctness backstop behind the waker: it re-derives
 // staleness from current state, comparing each dependent's durable watermark
 // against its targets' resource_version. A wake lost by any means costs latency
@@ -297,10 +300,30 @@ func (bh *Beehive) staleDependentsRun(ctx context.Context) {
 	for _, r := range bh.order {
 		kinds = append(kinds, r.gk)
 	}
+	cursors, _ := bh.store.(DriverCursorer)
+	from := bh.staleDependentsResume(ctx, cursors)
 	driver.Run(ctx, bh.staleDependentsInterval, func(ctx context.Context) bool {
-		bh.staleDependentsSweep(ctx, kinds)
+		from = bh.staleDependentsSweep(ctx, kinds, from, cursors)
 		return true
 	})
+}
+
+// staleDependentsResume reads the position the last completed sweep recorded.
+// Starting at 0 is the safe answer: it re-derives the whole graph once, which is
+// what a store with no persisted cursor needs.
+func (bh *Beehive) staleDependentsResume(ctx context.Context, cursors DriverCursorer) int64 {
+	if cursors == nil {
+		return 0
+	}
+	stored, ok, err := cursors.DriverCursorsGet(ctx, cursorNameStaleDependents)
+	if err != nil {
+		bh.log().WarnContext(ctx, "reading the stale-dependents cursor failed; re-deriving from the start", "err", err)
+		return 0
+	}
+	if !ok {
+		return 0
+	}
+	return stored
 }
 
 // staleDependentsSweep pages the staleness listing to exhaustion, stamping and
@@ -313,36 +336,55 @@ func (bh *Beehive) staleDependentsRun(ctx context.Context) {
 // in memory and a restart loses it, where the stamp is drained by the owed pass.
 // Stamp first, so a crash between the two costs a spare reconcile rather than a
 // lost one.
-func (bh *Beehive) staleDependentsSweep(ctx context.Context, kinds []GroupKind) {
+func (bh *Beehive) staleDependentsSweep(ctx context.Context, kinds []GroupKind, from int64, cursors DriverCursorer) int64 {
+	// Read the mark before the scan, never after. A target written while the
+	// sweep runs sits above this, so the next sweep still finds it. Taking the
+	// highest target the scan returned would skip exactly those.
+	mark, err := bh.store.ResourceVersionsMaxIssued(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			bh.log().WarnContext(ctx, "reading the resource version failed; the next pass retries", "err", err)
+		}
+		return from
+	}
+
 	enqueue := bh.enqueuerForPage()
-	var after ObjectID
+	pos := StalePos{TargetVersion: from}
 	for {
-		page, err := bh.store.DependentsListStale(ctx, kinds, after, staleDependentsPageCap)
+		page, next, err := bh.store.DependentsListStaleSince(ctx, kinds, pos, staleDependentsPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return from
 			}
-			bh.log().WarnContext(ctx, "listing stale dependents failed; the next pass re-derives them",
-				"afterID", after, "err", err)
-			return
+			bh.log().WarnContext(ctx, "listing stale dependents failed; the next pass resumes from the same cursor",
+				"targetVersion", pos.TargetVersion, "err", err)
+			return from
 		}
 		if len(page) == 0 {
-			return
+			break
 		}
 		if err := bh.store.ReconcileOwedStamp(ctx, page); err != nil {
 			if ctx.Err() != nil {
-				return
+				return from
 			}
-			bh.log().WarnContext(ctx, "stamping stale dependents failed; the next pass re-derives them",
-				"afterID", after, "err", err)
-			return
+			bh.log().WarnContext(ctx, "stamping stale dependents failed; the next pass resumes from the same cursor",
+				"targetVersion", pos.TargetVersion, "err", err)
+			return from
 		}
 		for _, d := range page {
 			enqueue(d.GroupKind(), d.ID)
 		}
-		after = page[len(page)-1].ID
+		pos = next
 		if len(page) < staleDependentsPageCap {
-			return
+			break
 		}
 	}
+
+	// Only a sweep that reached the end may move the cursor.
+	if cursors != nil {
+		if err := cursors.DriverCursorsSet(ctx, cursorNameStaleDependents, mark); err != nil {
+			bh.log().WarnContext(ctx, "persisting the stale-dependents cursor failed; the next start re-derives from the last stored one", "err", err)
+		}
+	}
+	return mark
 }
