@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
@@ -140,24 +141,51 @@ func mergeRawChange(prev, next rawChange) (rawChange, bool) {
 // to report, not the tail's.
 func (t *objectTailer) run(ctx context.Context) {
 	defer t.close()
+
+	wakes := t.wakes.Chan()
+	floor := t.bh.watchFloorInterval
+	timer := time.NewTimer(floor)
+	defer timer.Stop()
+
+	retry := watchRetryBase
 	for {
-		if _, err := t.wakes.RecvContext(ctx); err != nil {
+		select {
+		case <-ctx.Done():
 			return
+		case _, ok := <-wakes:
+			if !ok {
+				return // the beehive stopped
+			}
+		case <-timer.C:
 		}
-		// Drain before blocking again: a burst coalesces into one wake, so a
-		// tailer that read a single page per wake would strand the remainder
-		// until some later write. A short page means the log is drained —
-		// exactly, and without the second position read that asking the store
-		// again would cost.
-		for {
-			n, err := t.step(ctx)
-			if err != nil {
-				t.bh.log().Warn("watch tail step failed", "kind", t.gk.Kind, "err", err)
-				break
-			}
-			if n < tailPageCap {
-				break
-			}
+
+		next := floor
+		if err := t.drain(ctx); err != nil {
+			t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
+			// Bounded backoff, capped at the floor: a transient failure recovers
+			// sooner than a floor tick, a persistent one costs no more.
+			next = min(retry, floor)
+			retry *= 2
+		} else {
+			retry = watchRetryBase
+		}
+		timer.Stop()
+		timer.Reset(next)
+	}
+}
+
+// drain reads pages until one comes back short. A burst coalesces into one wake,
+// so a tailer that read a single page per wake would strand the remainder until
+// some later write. A short page means the log is drained — exactly, and without
+// the second position read that asking the store again would cost.
+func (t *objectTailer) drain(ctx context.Context) error {
+	for {
+		n, err := t.step(ctx)
+		if err != nil {
+			return err
+		}
+		if n < tailPageCap {
+			return nil
 		}
 	}
 }

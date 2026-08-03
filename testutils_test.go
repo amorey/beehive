@@ -205,6 +205,7 @@ func fast(opts ...Option) []Option {
 		withDependencyWakeInterval(fastTick),
 		withStaleDependentsInterval(staleDependentsTick),
 		withWatchPollInterval(fastTick),
+		withWatchFloorInterval(fastTick),
 	}, opts...)
 }
 

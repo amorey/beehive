@@ -485,6 +485,45 @@ func drainConflate(rx *conflate.Receiver[ObjectID, rawChange]) {
 	}
 }
 
+// A writer this process shares no memory with publishes no wake, so the floor
+// tick is what makes its write visible. Same store, second Beehive.
+func TestTailerFloorTickPicksUpAForeignWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := newClientTestStore(t)
+	bh, err := New(store, withWatchFloorInterval(fastTick))
+	require.NoError(t, err)
+	_, rx := startTailer(t, bh, clientTestGK)
+
+	foreign, err := New(store)
+	require.NoError(t, err)
+	obj := mustCreate(t, ctx, NewClient[cSpec, cStatus](foreign, clientTestGK), "foreign", cSpec{})
+
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err, "a write through another Beehive was never picked up")
+	assert.Equal(t, obj.ID, ev.Key)
+}
+
+// A failed step costs a retry, not the stream: the cursor did not advance, so
+// the entries are still there to read.
+func TestTailerRetriesAfterAFailedStep(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &flakyListStore{Store: newClientTestStore(t)}
+	bh, err := New(store, withWatchFloorInterval(fastTick))
+	require.NoError(t, err)
+	_, rx := startTailer(t, bh, clientTestGK)
+
+	store.failures.Store(1)
+	obj := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "retried", cSpec{})
+
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err, "the tailer never retried the failed step")
+	assert.Equal(t, obj.ID, ev.Key)
+}
+
 // startTailer runs one tailer with a receiver attached, and tears both down with
 // the test.
 func startTailer(t *testing.T, bh *Beehive, gk GroupKind) (*objectTailer, *conflate.Receiver[ObjectID, rawChange]) {

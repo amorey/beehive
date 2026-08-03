@@ -51,6 +51,11 @@ const (
 	defaultStaleDependentsInterval = 60 * time.Second
 	// The client's watch surface polls, so this is the latency a subscriber sees.
 	defaultWatchPollInterval = 1 * time.Second
+	// A watch tail reads on a wake, so this floor is not the latency of a write
+	// made through this Beehive — it bounds staleness for everything else.
+	defaultWatchFloorInterval = 30 * time.Second
+	// The first retry after a failed tail step; it doubles up to the floor.
+	watchRetryBase = 100 * time.Millisecond
 )
 
 type beehiveState uint8
@@ -76,6 +81,7 @@ type Beehive struct {
 	wakeInterval            time.Duration
 	staleDependentsInterval time.Duration
 	watchPollInterval       time.Duration
+	watchFloorInterval      time.Duration
 	concurrency             int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper. Zero on both
 	// disables the sweep.
@@ -311,6 +317,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeInterval:            defaultWakeInterval,
 		watchPollInterval:       defaultWatchPollInterval,
+		watchFloorInterval:      defaultWatchFloorInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),

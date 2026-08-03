@@ -312,6 +312,24 @@ func withWatchPollInterval(d time.Duration) Option {
 	}
 }
 
+// withWatchFloorInterval sets how often a kind's tailer reads the log without a
+// wake. The wake carries freshness; this floor covers what a wake cannot — a
+// writer this process does not share memory with, a step that failed, a
+// retention trim. Global and meaningful only at New, unexported for the same
+// reason as withWatchPollInterval. Cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption.
+func withWatchFloorInterval(d time.Duration) Option {
+	return func(target any) error {
+		if d <= 0 {
+			return fmt.Errorf("%w: withWatchFloorInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.watchFloorInterval = d
+		}
+		return nil
+	}
+}
+
 // WithEventRetention bounds the per-object event log, enforced globally by the
 // GC sweeper. perObject > 0 caps each (object, category) timeline to its newest
 // perObject runs — per timeline, so a flapping one can't evict a quiet one;
