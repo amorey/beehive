@@ -1,6 +1,6 @@
 # Watch shared tail: implementation plan
 
-- **Status:** Draft — companion to [the spec](watch-shared-tail.md).
+- **Status:** Done — companion to [the spec](watch-shared-tail.md).
 - **Date:** 2026-08-02
 
 ## Ground rules
@@ -34,6 +34,9 @@ Open points in the spec, resolved here so the cycles are executable:
 - `LagPolicy` removal moves **after** the surface flip (phase 4). Removing it
   first is a breaking change that buys nothing until conflate is carrying the
   traffic, and an abandoned run leaves the API broken with no gain.
+  *(As built it landed one cycle earlier, immediately before the flip: the
+  shared tail cannot honour `LagFail`, so keeping the option through the flip
+  would have shipped a commit where it silently did nothing.)*
 
 ## Phase 1 — the wake hub
 

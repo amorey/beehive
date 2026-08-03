@@ -1,6 +1,8 @@
 # Watch shared tail, driven by the commit path
 
-- **Status:** Draft — not implemented. Plan:
+- **Status:** Accepted — implemented. ADR:
+  [2026-08-03-watch-shared-tail.md](../adr/2026-08-03-watch-shared-tail.md).
+  Plan:
   [watch-shared-tail-plan.md](watch-shared-tail-plan.md).
 - **Date:** 2026-08-02
 

@@ -115,8 +115,8 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   it is not a hot loop, but it never converges and never stops. The store runs on one
   connection, so the loop's write transactions queue ahead of every other writer —
   client writes, other kinds' reconciles, the GC sweeper, event retention — while
-  holding a reconcile worker and consuming `resource_version` numbers. Every watch poll
-  sees the pair change on every tick. And nothing reports a problem, because every
+  holding a reconcile worker and consuming `resource_version` numbers. Every watch
+  sees the pair change, forever. And nothing reports a problem, because every
   object is converged and every generation matches.
 
   **Two possible fixes.**
@@ -497,7 +497,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   helps only by keeping the drivers' repeated scans off the disk.
 
   Those scans are the one real argument for it. The owed pass, the stale-dependents
-  pass, the waker and the watch poll all re-read the same indexes on a fixed cadence
+  pass, the waker and the watch floor all re-read the same indexes on a fixed cadence
   forever, which is exactly the working set a page cache is for. Deferred because it is
   a tuning change with no measurement behind it, and adding pragmas we cannot show a
   number for is how a config grows cargo. Revisit with a benchmark on a store large
@@ -543,26 +543,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   choice to settle first is whether an ownership change should itself be a write
   to the child — which would make the logged value correct by construction, and
   would also fix `DependentsList`/`DependenciesList`, which have the same hole.
-
-- **The watches have no push path, so latency is the poll interval** — by design
-  today, and the design is worth revisiting once someone needs sub-second
-  reaction. A tail tick is cheap (one indexed read of one number for a quiet
-  kind), but a change still waits up to `withWatchPollInterval` (1s) before a
-  subscriber sees it.
-
-  The write log makes the missing piece small: a process-local hub that the
-  commit path signals, waking the tail early. It stays a *hint* — the tick
-  remains the guarantee, exactly as `Client.Requeue` is a hint over the periodic
-  passes — so a lost signal costs latency and never correctness. That is what
-  keeps it inside the constraints the
-  [drivers ADR](adr/2026-07-28-periodic-scan-drivers.md) sets, unlike the
-  schedule watch, which is only sound because its gauge has a single
-  process-local writer.
-
-  Deferred because nothing in-tree needs it and an unused signal path is a
-  second way for the tail to be wrong. Revisit when a caller has a latency
-  budget the interval cannot meet; the measurement that justifies it is
-  end-to-end write-to-delivery, not tick cost.
 
 - **`EventsWatch` did not follow the object watches onto the write log** — so
   two watch surfaces on the same `Client` now behave differently for reasons a
