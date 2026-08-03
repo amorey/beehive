@@ -5213,6 +5213,78 @@ func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
 	assert.Empty(t, staleIDs(t, store), "a pass that observed the change settles it")
 }
 
+// TestDependentsListStaleSincePagesInsideAFanOut pins the cursor form's order and
+// its resume point. The scan drives from targets written above the cursor, so a
+// target with more dependents than one page has to resume inside its own fan-out
+// — cutting at a target boundary would drop the rest of it.
+func TestDependentsListStaleSincePagesInsideAFanOut(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	a := newDependentObject(t, store, target.ID)
+	b := newDependentObject(t, store, target.ID)
+	c := newDependentObject(t, store, target.ID)
+
+	refs, pos, err := store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, beehive.StalePos{}, 2)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{a.ID, b.ID}, refIDs(refs), "the cap cuts mid fan-out")
+
+	refs, _, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, pos, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{c.ID}, refIDs(refs), "the next page resumes inside the same target")
+}
+
+// TestDependentsListStaleSinceDrivesFromTheVersionIndex is the cost assertion.
+// The cursor only pays off if the scan seeks targets through idx_objects_rv; a
+// plan that starts anywhere else reads the whole graph again and the cursor buys
+// nothing. The CROSS JOINs in the query are what hold this.
+func TestDependentsListStaleSinceDrivesFromTheVersionIndex(t *testing.T) {
+	store := newRawStore(t)
+	newDependentObject(t, store, newRefObject(t, store).ID)
+
+	plan := queryPlan(t, store, `
+		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
+		  FROM objects t
+		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
+		  CROSS JOIN objects d ON d.id = e.from_id
+		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
+		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND e.from_id != e.to_id
+		   AND (d."group", d.kind) IN (VALUES (?, ?))
+		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
+		 ORDER BY t.resource_version, t.id, e.from_id
+		 LIMIT ?`,
+		int64(0), int64(0), int64(0), testGK.Group, testGK.Kind, 10)
+
+	assert.Contains(t, plan, "idx_objects_rv", "the scan must seek targets by version:\n"+plan)
+	assert.NotContains(t, plan, "SCAN t", "and must not read every object:\n"+plan)
+}
+
+// TestDependentsListStaleSinceSkipsConvergedAndSpentPositions covers the two ways
+// the cursor form returns nothing: the cursor is already past every target, and
+// the dependent has observed the target it depends on. The first is what makes an
+// idle sweep cost one indexed range read.
+func TestDependentsListStaleSinceSkipsConvergedAndSpentPositions(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+	kinds := []beehive.GroupKind{testGK}
+
+	refs, pos, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, 100)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "no watermark counts as stale")
+
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, pos, 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "the scan does not re-read the row it just returned")
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "a dependent that observed its target is not returned")
+}
+
 // A *new* depends_on edge invalidates the dependent's watermark, which the
 // declare drops: a cursor recorded over a smaller dependency set cannot speak for
 // a target just added — one whose resource_version may sit below it, where the

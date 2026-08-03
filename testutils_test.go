@@ -374,6 +374,10 @@ func (s *fakeStore) ReconcileOwedStamp(context.Context, []storeapi.ObjectRef) er
 func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
 	return 0, nil
 }
+
+func (s *fakeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]storeapi.ObjectRef, StalePos, error) {
+	return nil, after, nil
+}
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
 }

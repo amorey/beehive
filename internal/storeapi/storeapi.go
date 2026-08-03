@@ -243,6 +243,19 @@ type ObjectRef struct {
 	Kind  string
 }
 
+// StalePos is a position in the stale-dependents scan: the target whose write
+// put a dependent in scope, and the dependent reached from it. The zero value
+// starts at the beginning.
+//
+// The fields order the scan in turn, so a page can resume inside one target's
+// fan-out. A target with more dependents than one page needs that; cutting at a
+// target boundary would drop the rest of them.
+type StalePos struct {
+	TargetVersion int64
+	TargetID      ObjectID
+	DependentID   ObjectID
+}
+
 // GroupKind is the kind to route a requeue (or a GC step) to.
 func (r ObjectRef) GroupKind() GroupKind {
 	return GroupKind{Group: r.Group, Kind: r.Kind}
@@ -542,6 +555,21 @@ type Store interface {
 	// target: a registered object may depend on a client-only one, and
 	// narrowing to registered targets would silently strand its dependents.
 	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
+
+	// DependentsListStaleSince is DependentsListStale bounded by a cursor: it
+	// returns the dependents of targets written above after, ordered by
+	// StalePos, at most limit rows. It also returns the position of the last
+	// row, which the caller passes back to resume. An empty kinds slice
+	// returns nothing.
+	//
+	// Cost tracks what changed rather than the size of the graph, which is the
+	// point. The watermark still filters, so a dependent that already observed
+	// its target is left out.
+	//
+	// A dependent appears once per moved target it depends on. Stamping and
+	// enqueuing are both idempotent, so a duplicate costs a pass, never
+	// correctness.
+	DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, limit int) ([]ObjectRef, StalePos, error)
 
 	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
 	// order, at most limit. afterRV < trimmedThrough means entries were trimmed

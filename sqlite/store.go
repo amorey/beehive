@@ -996,6 +996,62 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 	return scanObjectRefs(rows)
 }
 
+// DependentsListStaleSince is the cursor form of DependentsListStale (see the
+// contract on storeapi.Store). It drives from the targets written above the
+// cursor, so its cost is what changed, not the size of the graph.
+//
+// The CROSS JOINs pin that order — targets, then their incoming edges, then the
+// dependents — the same reason the unbounded form pins its own. Driving from
+// idx_objects_rv is what makes the cursor worth having; letting the planner
+// choose gives back the whole-graph scan.
+//
+// No GROUP BY, unlike the unbounded form: a row is one (target, dependent) pair,
+// and the position needs both to resume.
+func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
+	if len(kinds) == 0 || limit <= 0 {
+		return nil, after, nil
+	}
+	args := []any{after.TargetVersion, after.TargetID, after.DependentID}
+	placeholders := make([]string, len(kinds))
+	for i, gk := range kinds {
+		placeholders[i] = "(?, ?)"
+		args = append(args, gk.Group, gk.Kind)
+	}
+	args = append(args, limit)
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
+		  FROM objects t
+		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
+		  CROSS JOIN objects d ON d.id = e.from_id
+		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
+		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND e.from_id != e.to_id
+		   AND (d."group", d.kind) IN (VALUES `+strings.Join(placeholders, ", ")+`)
+		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
+		 ORDER BY t.resource_version, t.id, e.from_id
+		 LIMIT ?`, args...)
+	if err != nil {
+		return nil, after, err
+	}
+	defer rows.Close()
+
+	refs := make([]storeapi.ObjectRef, 0, limit)
+	pos := after
+	for rows.Next() {
+		var ref storeapi.ObjectRef
+		var next storeapi.StalePos
+		if err := rows.Scan(&next.TargetVersion, &next.TargetID, &ref.ID, &ref.Group, &ref.Kind); err != nil {
+			return nil, after, err
+		}
+		next.DependentID = ref.ID
+		refs, pos = append(refs, ref), next
+	}
+	if err := rows.Err(); err != nil {
+		return nil, after, err
+	}
+	return refs, pos, nil
+}
+
 // DependencyWatermarksSet upserts id's dependency watermark (see the contract on
 // storeapi.Store). The EXISTS gate rides the edges primary-key prefix, and is
 // also what keeps the foreign key satisfied when gcCollect removes the row
