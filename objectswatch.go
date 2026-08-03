@@ -152,22 +152,10 @@ func (h kindWriteHub) Watch(gk GroupKind) (*watch.Receiver[GroupKind, struct{}],
 // release.
 //
 // Guarded by tailMu, never bh.mu: bh.mu is not reentrant, and migratorFor and
-// reconcilerFor take it.
-//
-// **The build runs outside tailMu**, and the second registry check below is the
-// price of that. tailMu is process-global while the cursor read parks on the
-// store's single connection, so holding one across the other lets a slow
-// transaction stall every kind's setup — and every release, which is what
-// closes a cancelled watch's channel (tailStream's defers close the stream
-// after the lease goes). That is a three-party deadlock as soon as the
-// transaction's own goroutine waits on such a channel. The cursor still has to
-// be read before this returns, or a subscriber's snapshot could fall into the
-// gap below it, so the read cannot move into run either.
-//
-// The health check is not redundant with the registry. A tailer that ended
-// below the horizon stays registered until the last subscriber holding a lease
-// on it releases, and this is what stops a resubscribe from rejoining the
-// tailer that just told it ErrWatchTooOld.
+// reconcilerFor take it. The build runs outside tailMu, and the cursor read
+// must still happen before this returns. The health check is not redundant with
+// the registry: a failed tailer stays registered until its subscribers release.
+// See docs/adr/2026-08-03-watch-shared-tail.md.
 func (bh *Beehive) tailerFor(ctx context.Context, gk GroupKind) (*objectTailer, error) {
 	if t, ok := bh.joinTailer(gk); ok {
 		return t, nil

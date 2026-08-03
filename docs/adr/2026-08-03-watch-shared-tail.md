@@ -183,11 +183,18 @@ compares identity rather than presence, because a tailer that reset below the
 horizon was already replaced in the registry and its last subscriber must not
 evict the successor.
 
-`tailerFor` holds `tailMu` across the build, cursor read included. Building
-outside the lock spares one kind's first watch from waiting behind another
-kind's cursor read — a read that happens once per kind per process — and costs
-a second registry check and a discard path for the loser of the race it opens.
-The read cannot move into `run` instead: the cursor has to be read before
+**`tailerFor` builds outside `tailMu`**, and the second registry check plus the
+discard path for the loser are the price. An earlier cut held the lock across
+the build, on the reasoning that the cursor read happens once per kind per
+process, so the only cost was that one kind's first watch. That priced the
+wrong thing. `tailMu` is process-global and the cursor read parks on the
+store's single connection, so holding one across the other stalls every kind's
+watch setup — and every `release`, which `tailStream`'s defers run *before*
+closing the caller's channel. A transaction holding the connection while its
+own goroutine waits for such a channel to close then deadlocks all three ways
+round.
+
+The read still cannot move into `run`: the cursor has to be read before
 `tailerFor` returns, or a subscriber that snapshots in between falls into the
 gap below it.
 
