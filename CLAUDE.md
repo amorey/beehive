@@ -31,6 +31,11 @@ go run ./examples/greeting/main.go   # the end-to-end smoke target
 go run ./examples/events/main.go     # Events API demo: a connection-health panel
 go test ./...
 go test -run TestName ./  # single test
+
+# Benchmarks live in *_bench_test.go and never run under `go test`; -bench opts
+# them in, and -run '^$' keeps the tests from running alongside them.
+go test -run '^$' -bench . -benchtime 2000x -count 3 ./
+go test -run '^$' -bench . -benchtime 1x ./   # smoke: compiles and runs each once
 ```
 
 ## Architecture
@@ -197,7 +202,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Whitebox tests**: tests go in `package beehive`, so they reach unexported
   machinery.
 - **Test files mirror source files, not features.** Shared helpers and fakes go
-  in `testutils_test.go`.
+  in `testutils_test.go`. Benchmarks mirror the same way but in
+  `<source>_bench_test.go`, so a semantics file never carries a load harness.
+  No build tag: `go test` already skips benchmarks, and a tag only hides them
+  from `go vet` until they stop compiling.
 - **Assertions use `stretchr/testify`**: `require` for preconditions, `assert`
   for independent checks.
 - **Synchronize on signals, never on sleeps.** The only use of `time` is a
