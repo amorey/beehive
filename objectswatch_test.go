@@ -2687,3 +2687,38 @@ func TestWatchOnABeehiveNotBuiltByNewFails(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "built by New")
 }
+
+// A stream that ends because the beehive stopped must say so. The contract is
+// that a silent close means the caller's own context ended, so a supervisor
+// written to it — no Failed change and my ctx is live, therefore resubscribe —
+// would otherwise loop hot after Stop, re-reading a full snapshot every pass.
+func TestWatchEndsWithErrStoppedOnStop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, live, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	require.NoError(t, bh.stop(ctx))
+
+	var last ObjectChange[cSpec, cStatus]
+	for ch := range live {
+		last = ch
+	}
+	assert.Equal(t, Failed, last.Type, "the stream closed silently on stop")
+	assert.ErrorIs(t, last.Err, ErrStopped)
+
+	// A watch opened after stop ends the same way rather than closing silently,
+	// which is what stops a resubscribe loop from spinning.
+	_, after, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	last = ObjectChange[cSpec, cStatus]{}
+	for ch := range after {
+		last = ch
+	}
+	assert.Equal(t, Failed, last.Type, "a watch opened after stop closed silently")
+	assert.ErrorIs(t, last.Err, ErrStopped)
+}

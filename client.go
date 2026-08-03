@@ -36,6 +36,12 @@ var ErrNoController = errors.New("beehive: no controller registered for kind")
 // snapshot.
 var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
 
+// ErrStopped ends a watch whose Beehive has stopped, reported on a Failed
+// change like ErrWatchTooOld. It is what separates shutdown from the caller
+// cancelling: resubscribing answers ErrWatchTooOld and cannot answer this one,
+// since a stopped Beehive does not start again.
+var ErrStopped = errors.New("beehive: the beehive has stopped")
+
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
 // objects have no natural name:
 //
@@ -105,8 +111,10 @@ type ObjectListSnapshot[Spec, Status any] struct {
 // decoded — the removal is reported either way, because nothing later in the
 // log mentions a deleted id. On a Failed change, Object is nil and Err is
 // non-nil: the stream is over, and a Failed change is always the last value
-// before the channel closes. A channel that closes with no Failed change ended
-// because the caller's context did.
+// before the channel closes — ErrWatchTooOld for a stream that fell behind
+// retention, ErrStopped for a Beehive that stopped. A channel that closes with
+// no Failed change ended because the caller's context did, so a supervisor may
+// treat that alone as its own cancellation.
 type ObjectChange[Spec, Status any] struct {
 	Type ChangeType
 	// ID is the object this change is about, set whether or not Object is. Zero

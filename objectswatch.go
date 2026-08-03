@@ -371,7 +371,13 @@ func (t *objectTailer) run() {
 			return
 		case _, ok := <-written:
 			if !ok {
-				return // the beehive stopped
+				// Only stop closes the wake hub — the last subscriber leaving
+				// comes through ctx above — so this is shutdown, and saying so
+				// is what keeps a closed stream distinguishable from a
+				// cancelled one.
+				err := error(ErrStopped)
+				t.failed.Store(&err)
+				return
 			}
 			// Consumed rather than ignored, so the closed arm above stays live.
 			if backingOff {
