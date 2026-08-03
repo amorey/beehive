@@ -892,8 +892,7 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 }
 
 // ResourceVersionsMaxIssued reads the sequence itself (contract on
-// storeapi.Store), which is why retention cannot lower it. One row, always
-// present: the migration seeds it.
+// storeapi.Store). One row, always present: the migration seeds it.
 func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, error) {
 	var rv int64
 	err := s.conn(ctx).QueryRowContext(ctx,
@@ -902,10 +901,8 @@ func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, err
 }
 
 // ReconcileOwedStamp stamps a page of findings in one statement (contract on
-// storeapi.Store). One UPDATE over an id list, not one per row: the stale
-// pass stamps a whole page at a time.
-//
-// A missing id matches no row, which is how vanished dependents are skipped.
+// storeapi.Store). A missing id matches no row, which is how a vanished
+// dependent is skipped.
 func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.ObjectRef) error {
 	if len(refs) == 0 {
 		return nil
@@ -968,13 +965,10 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(kinds)*2+2)
+	tuples, kindArgs := kindTuples(kinds)
+	args := make([]any, 0, len(kindArgs)+2)
 	args = append(args, afterID)
-	placeholders := make([]string, len(kinds))
-	for i, gk := range kinds {
-		placeholders[i] = "(?, ?)"
-		args = append(args, gk.Group, gk.Kind)
-	}
+	args = append(args, kindArgs...)
 	args = append(args, limit)
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT e.from_id, d."group", d.kind
@@ -985,7 +979,7 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 		 WHERE e.relation = 'depends_on'
 		   AND e.from_id != e.to_id
 		   AND e.from_id > ?
-		   AND (d."group", d.kind) IN (VALUES `+strings.Join(placeholders, ", ")+`)
+		   AND (d."group", d.kind) IN (VALUES `+tuples+`)
 		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
 		 GROUP BY e.from_id
 		 ORDER BY e.from_id
@@ -997,26 +991,22 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 }
 
 // DependentsListStaleSince is the cursor form of DependentsListStale (see the
-// contract on storeapi.Store). It drives from the targets written above the
-// cursor, so its cost is what changed, not the size of the graph.
+// contract on storeapi.Store).
 //
-// The CROSS JOINs pin that order — targets, then their incoming edges, then the
-// dependents — the same reason the unbounded form pins its own. Driving from
-// idx_objects_rv is what makes the cursor worth having; letting the planner
-// choose gives back the whole-graph scan.
+// The CROSS JOINs pin the join order: targets, then incoming edges, then
+// dependents. Without them the planner reads the whole graph and the cursor
+// buys nothing.
 //
-// No GROUP BY, unlike the unbounded form: a row is one (target, dependent) pair,
-// and the position needs both to resume.
+// No GROUP BY, unlike the unbounded form: a row is one (target, dependent)
+// pair, and the position needs both to resume.
 func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, after, nil
 	}
-	args := []any{after.TargetVersion, after.TargetID, after.DependentID}
-	placeholders := make([]string, len(kinds))
-	for i, gk := range kinds {
-		placeholders[i] = "(?, ?)"
-		args = append(args, gk.Group, gk.Kind)
-	}
+	tuples, kindArgs := kindTuples(kinds)
+	args := make([]any, 0, len(kindArgs)+4)
+	args = append(args, after.TargetVersion, after.TargetID, after.DependentID)
+	args = append(args, kindArgs...)
 	args = append(args, limit)
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
@@ -1026,7 +1016,7 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
 		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
 		   AND e.from_id != e.to_id
-		   AND (d."group", d.kind) IN (VALUES `+strings.Join(placeholders, ", ")+`)
+		   AND (d."group", d.kind) IN (VALUES `+tuples+`)
 		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
 		 ORDER BY t.resource_version, t.id, e.from_id
 		 LIMIT ?`, args...)
@@ -1035,16 +1025,15 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 	}
 	defer rows.Close()
 
-	refs := make([]storeapi.ObjectRef, 0, limit)
+	var refs []storeapi.ObjectRef
 	pos := after
 	for rows.Next() {
 		var ref storeapi.ObjectRef
-		var next storeapi.StalePos
-		if err := rows.Scan(&next.TargetVersion, &next.TargetID, &ref.ID, &ref.Group, &ref.Kind); err != nil {
+		if err := rows.Scan(&pos.TargetVersion, &pos.TargetID, &ref.ID, &ref.Group, &ref.Kind); err != nil {
 			return nil, after, err
 		}
-		next.DependentID = ref.ID
-		refs, pos = append(refs, ref), next
+		pos.DependentID = ref.ID
+		refs = append(refs, ref)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, after, err
@@ -2624,6 +2613,18 @@ func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKin
 }
 
 // placeholders builds "?, ?, ?" for an IN list of n values.
+// kindTuples builds the "(?, ?), (?, ?)" list for an IN (VALUES …) kind filter,
+// with the matching args. Both stale-dependent listings filter the same way.
+func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
+	tuples := make([]string, len(kinds))
+	args := make([]any, 0, len(kinds)*2)
+	for i, gk := range kinds {
+		tuples[i] = "(?, ?)"
+		args = append(args, gk.Group, gk.Kind)
+	}
+	return strings.Join(tuples, ", "), args
+}
+
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }

@@ -60,13 +60,24 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Declarative and level-triggered.** Controllers reconcile from *current*
   state, never from a sequence of changes; controllers coordinate through the
   store, never with each other.
-- **Dependency staleness is re-derived, not recorded.** A successful reconcile
-  stamps `dependency_watermarks.reconciled_against` with the write cursor as of
-  its *load*; the stale-dependents pass enqueues every dependent a target has
-  moved past, so any lost wake costs latency, never divergence. `EdgesAdd`
-  *clears* the watermark on a new `depends_on` edge; the `reconcile_owed` stamp
-  on that same edge is what guarantees the dependent a pass.
+- **Dependency staleness is derived from watermarks, and every finding is
+  durable.** A successful reconcile stamps
+  `dependency_watermarks.reconciled_against` with the write cursor as of its
+  *load*; the stale-dependents pass finds every dependent a target has moved
+  past, so any lost wake costs latency, never divergence. `EdgesAdd` *clears*
+  the watermark on a new `depends_on` edge; the `reconcile_owed` stamp on that
+  same edge is what guarantees the dependent a pass. A failed watermark write
+  stamps `reconcile_owed` too — the pass is cursor-bound and re-derives nothing
+  for a target that has gone quiet.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
+- **The stale-dependents pass scans from a cursor over target
+  `resource_version`** (`DependentsListStaleSince`, persisted in
+  `driver_cursors`), so its cost is what changed, not the size of the graph. It
+  is sound only because the pass *stamps* `reconcile_owed` for what it finds
+  before enqueuing: the queue dies with the process, the stamp does not. The
+  cursor moves only when a sweep reaches the end. **`reconcile_owed` now has
+  three producers** — `EdgesAdd`, the pass, and the reconciler's watermark
+  fallback. → [spec](docs/specs/stale-dependents-cursor.md)
 - **The dependency waker scans the write log from a watermark**
   (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
   client-only kind). Cost is bounded by what changed. The cursor persists via

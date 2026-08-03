@@ -30,7 +30,7 @@ is pushed, and no delete schedules a collect.
 | Wake owed | `reconcile_owed` | `ReconcileOwedListIDs` | owed pass, per kind, 30s — **and the new edge's own enqueue** |
 | Deletion requested | `deletion_requested_at` | `DeletionRequestsList` | GC sweeper, global, 30s, **cannot be disabled** |
 | Anything changed | `resource_version` | `ObjectWritesListSince` | dependency waker, global, 1s |
-| A dependency moved | `dependency_watermarks.reconciled_against` vs targets' `resource_version` | `DependentsListStale` | stale-dependents pass, global, 60s, **cannot be disabled** |
+| A dependency moved | `dependency_watermarks.reconciled_against` vs targets' `resource_version` | `DependentsListStaleSince` | stale-dependents pass, global, 60s, cursor-bound, **cannot be disabled** |
 | *(none)* | — | — | `workQueue`, in memory only |
 
 The first three and the fifth are re-derived from state, so a restart finds them by
@@ -270,14 +270,17 @@ process with no waker, a bug in the wake path.
 - **Recorded by:** `Store.DependencyWatermarksSet`, from `typedController.reconcile` on
   every successful pass of an object with dependencies. The value is the write cursor
   as of the pass's *load*, never the end of the pass.
-- **Found by:** `Beehive.staleDependentsSweep` → `DependentsListStale(kinds, afterID,
-  limit)`, paged to exhaustion, enqueuing each dependent under its own kind.
+- **Found by:** `staleDependents.sweep` → `DependentsListStaleSince(kinds, pos, limit)`,
+  paged to exhaustion, **stamping** each dependent's `reconcile_owed` and then
+  enqueuing it under its own kind.
 - **Normal:** ✅ 60s. Slower than the waker on purpose: it is the guarantee, not the
-  latency. A failed page abandons the sweep and the next tick re-derives the same set,
-  since nothing was drained.
-- **Restart:** ✅ **derived from current state, so there is nothing to lose.** An
-  absent watermark row already means stale, which is also why no backfill was needed
-  and why the first start after this landed enqueued the whole dependency graph once.
+  latency. The scan is bounded by a cursor over target `resource_version`, so its cost
+  is what changed rather than the size of the graph. A tick where nothing has been
+  issued since the last sweep skips the listing entirely.
+- **Restart:** ✅ **the stamp is durable, so a finding outlives the queue.** The cursor
+  persists in `driver_cursors` under `stale_dependents`; it moves only when a sweep
+  reaches the end, so a failed page is re-read rather than skipped. A cursor above the
+  store's own sequence (another database) resets to 0 and re-derives once.
 - **Not covered:** a dependent whose kind has no controller is excluded from the scan
   (there is no loop to enqueue into, and it would be stale forever); it is found on the
   first pass after its kind is registered. The kind filter applies to the *dependent*
@@ -291,6 +294,16 @@ process with no waker, a bug in the wake path.
   `TestReconcileHoldsDependencyWatermarkOnFailure`,
   `TestReconcileHoldsDependencyWatermarkOnUndecodableRow`,
   `TestReconcileWarnsAndContinuesOnCursorWriteFailure`,
+  `TestReconcileStampsOwedWhenTheWatermarkWriteFails`,
+  `TestStaleDependentsSweepStampsWhatItFinds`,
+  `TestStaleDependentsSweepResumesAndRecordsThePreScanMark`,
+  `TestStaleDependentsSweepSkipsAQuietStore`,
+  `TestStaleDependentsSweepRederivesFromAForeignCursor`,
+  `TestStaleDependentsSweepLeavesADurableFinding`,
+  `TestStaleDependentsSweepHoldsTheCursorOnListFailure`,
+  `TestDependentsListStaleSincePagesInsideAFanOut`,
+  `TestDependentsListStaleSinceDrivesFromTheVersionIndex`,
+  `TestDependentsListStaleSinceSkipsConvergedAndSpentPositions`,
   `TestDependentsListStaleFindsMovedTargets`,
   `TestDependentsListStaleTreatsMissingWatermarkAsStale`,
   `TestDependentsListStaleFindsDependentsOfUnregisteredTargets`,

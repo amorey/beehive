@@ -178,7 +178,8 @@ type RawObject struct {
 	ResourceVersion     int64      `json:"resourceVersion"`
 	DeletionRequestedAt *time.Time `json:"deletionRequestedAt,omitempty"`
 	// ReconcileOwed is the objects.reconcile_owed count; 0 means none. Store-
-	// owned: moved only by EdgesAdd's stamp and ReconcileOwedDecrement.
+	// owned: moved only by EdgesAdd's stamp, ReconcileOwedStamp and
+	// ReconcileOwedDecrement.
 	ReconcileOwed int64       `json:"reconcileOwed"`
 	Finalizers    []string    `json:"finalizers"`
 	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
@@ -499,26 +500,6 @@ type Store interface {
 	// ordered by id — the inverse of EdgesListIncoming.
 	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
-	// ResourceVersionsMaxIssued returns the highest resource version the store
-	// has issued. It reads the sequence, not any table, so it never falls —
-	// unlike ObjectWritesMaxVersionAll, which retention lowers. Use it wherever
-	// a stored position is compared against "now".
-	//
-	// It also moves for an event write, which no object cursor can be shown. A
-	// caller that scans must not treat it as a log position; a caller that only
-	// asks "could anything have changed" is safe, and pays a spare pass.
-	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
-
-	// ReconcileOwedStamp increments reconcile_owed for each ref, so a finding
-	// outlives the in-memory queue it was also enqueued on. An id that is gone
-	// is skipped rather than reported: a dependent can be collected between the
-	// listing that found it and this write. Empty refs writes nothing. Bumps no
-	// resource_version.
-	//
-	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
-	// store's own listing, which spans every registered kind in one page.
-	ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error
-
 	// ReconcileOwedDecrement subtracts observed from id's reconcile_owed,
 	// floored at 0. Callers pass the count they loaded, not 1: one pass
 	// answers every wake outstanding at its load, and increments landing after
@@ -531,6 +512,20 @@ type Store interface {
 	// restart. Separate from ObjectsListUnsettledIDs: a settled object can still owe
 	// a wake.
 	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// ReconcileOwedStamp increments reconcile_owed for each ref, so a finding
+	// outlives the in-memory queue. An id that is gone is skipped, not
+	// reported. Empty refs writes nothing. Bumps no resource_version.
+	//
+	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
+	// store's own listing, which spans every registered kind in one page.
+	ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error
+
+	// ResourceVersionsMaxIssued returns the highest resource version issued. It
+	// reads the sequence, not a table, so retention cannot lower it. It moves
+	// for an event write too, so it is a "did anything change" answer, not a
+	// log position to scan from.
+	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
 
 	// DependencyWatermarksSet records cursor as the store-wide write cursor
 	// id's reconcile observed. Upserts; the stored cursor never decreases, and
@@ -556,19 +551,13 @@ type Store interface {
 	// narrowing to registered targets would silently strand its dependents.
 	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
 
-	// DependentsListStaleSince is DependentsListStale bounded by a cursor: it
-	// returns the dependents of targets written above after, ordered by
-	// StalePos, at most limit rows. It also returns the position of the last
-	// row, which the caller passes back to resume. An empty kinds slice
-	// returns nothing.
+	// DependentsListStaleSince is DependentsListStale bounded by a cursor: the
+	// dependents of targets written above after, ordered by StalePos, at most
+	// limit rows, plus the position of the last row to resume from. An empty
+	// kinds slice returns nothing. Cost tracks what changed, not the graph.
 	//
-	// Cost tracks what changed rather than the size of the graph, which is the
-	// point. The watermark still filters, so a dependent that already observed
-	// its target is left out.
-	//
-	// A dependent appears once per moved target it depends on. Stamping and
-	// enqueuing are both idempotent, so a duplicate costs a pass, never
-	// correctness.
+	// A dependent appears once per moved target it depends on; stamping and
+	// enqueuing are idempotent, so a duplicate costs a pass, not correctness.
 	DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, limit int) ([]ObjectRef, StalePos, error)
 
 	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
