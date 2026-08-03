@@ -921,31 +921,49 @@ func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
 // indexing the last element of an empty page.
 type emptyPageStore struct {
 	Store
+	gate   atomic.Int64
+	listed chan struct{}
 }
 
 func (s *emptyPageStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
-	return 1 << 40, nil
+	// Rises on every call, so it stays above the cursor the tailer seeds from
+	// this same read. A constant equals that cursor and gates every drain out —
+	// which is how this test used to assert quiet while exercising nothing.
+	return s.gate.Add(1), nil
 }
 
 func (s *emptyPageStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]ObjectWrite, int64, error) {
+	probeSignal(s.listed)
 	return nil, 0, nil
 }
 
 func TestAnEmptyPageAboveTheCursorIsQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, &emptyPageStore{newClientTestStore(t)}, fast()...)
+	store := &emptyPageStore{Store: newClientTestStore(t), listed: make(chan struct{}, 8)}
+
+	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
+	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
+
+	// Gate on the read this test is about. Asserting before the tail has read a
+	// page above its cursor passes against any implementation at all — and did,
+	// since without this wake the tail never ran and the timer measured nothing.
+	select {
+	case <-store.listed:
+	case <-time.After(testTimeout):
+		t.Fatal("the tail never read a page above its cursor")
+	}
 
 	select {
 	case ev, ok := <-ch:
 		t.Fatalf("nothing to report, got %+v (open=%v)", ev, ok)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 }
 
