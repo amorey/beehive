@@ -311,15 +311,14 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 // A removal is reported even when the row image will not decode, with a nil
 // Object and the id.
 //
-// This was once silent, on the ground that a subscriber never shown the object
-// should not be told it went away. That reasoning only covers a row that never
-// decoded. A row can also decode for a while and then stop — a peer writes it at
-// a schema version this binary cannot read, or the blob is corrupted — and there
-// the subscriber does hold it. A physical delete is the last thing the log will
-// ever say about an id, and ids are never reused, so a dropped Deleted strands
-// that object in every mirror for good, where a redundant one is a no-op for any
-// consumer keyed by id. The tailer cannot tell the two cases apart, and this
-// codebase resolves that the same way everywhere else: redundant beats missing.
+// Two cases reach here and the tailer cannot tell them apart. A row that never
+// decoded was never shown to the subscriber, so its removal is news to nobody.
+// A row that decoded for a while and then stopped — a peer writes it at a schema
+// version this binary cannot read, or the blob is corrupted — is one the
+// subscriber holds. A physical delete is the last thing the log will ever say
+// about an id, and ids are never reused, so withholding the Deleted strands that
+// object in every mirror for good, where a redundant one is a no-op for any
+// consumer keyed by id. Redundant beats missing, as everywhere else here.
 func TestWatchReportsRemovalOfARowItCouldNeverDecode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -927,8 +926,8 @@ type emptyPageStore struct {
 
 func (s *emptyPageStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	// Rises on every call, so it stays above the cursor the tailer seeds from
-	// this same read. A constant equals that cursor and gates every drain out —
-	// which is how this test used to assert quiet while exercising nothing.
+	// this same read. A constant would equal that cursor and gate every drain
+	// out, leaving the test asserting quiet while exercising nothing.
 	return s.gate.Add(1), nil
 }
 
@@ -951,9 +950,8 @@ func TestAnEmptyPageAboveTheCursorIsQuiet(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
 
-	// Gate on the read this test is about. Asserting before the tail has read a
-	// page above its cursor passes against any implementation at all — and did,
-	// since without this wake the tail never ran and the timer measured nothing.
+	// Gate on the read this test is about: asserting before the tail has read a
+	// page above its cursor would pass against any implementation at all.
 	select {
 	case <-store.listed:
 	case <-time.After(testTimeout):

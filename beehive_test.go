@@ -371,10 +371,10 @@ func TestSweepWriteLogRetention(t *testing.T) {
 }
 
 // A second stop must not tear the watches down while the first is still
-// draining. state flips to stopped before the drain, so a retry after a drain
-// timeout — or a signal handler racing the first call — used to take the early
-// return and close the wake hub straight away, ending every stream before the
-// loops it was still waiting for had written.
+// draining. state flips to stopped before the drain begins, so a call that finds
+// it — a retry after a drain timeout, a signal handler racing the first — is not
+// the one that owns the teardown: it returns without closing the wake hub, which
+// is what leaves every stream open for the writes the draining loops still owe.
 func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
