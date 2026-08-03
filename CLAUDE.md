@@ -77,7 +77,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   before enqueuing: the queue dies with the process, the stamp does not. The
   cursor moves only when a sweep reaches the end. **`reconcile_owed` now has
   three producers** — `EdgesAdd`, the pass, and the reconciler's watermark
-  fallback. → [spec](docs/specs/stale-dependents-cursor.md)
+  fallback. → [ADR](docs/adr/2026-08-03-stale-dependents-cursor.md)
 - **The dependency waker scans the write log from a watermark**
   (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
   client-only kind). Cost is bounded by what changed. The cursor persists via
