@@ -999,13 +999,13 @@ func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.
 //
 // No GROUP BY, unlike the unbounded form: a row is one (target, dependent)
 // pair, and the position needs both to resume.
-func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
+func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, through int64, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, after, nil
 	}
 	tuples, kindArgs := kindTuples(kinds)
-	args := make([]any, 0, len(kindArgs)+4)
-	args = append(args, after.TargetVersion, after.TargetID, after.DependentID)
+	args := make([]any, 0, len(kindArgs)+5)
+	args = append(args, after.TargetVersion, after.TargetID, after.DependentID, through)
 	args = append(args, kindArgs...)
 	args = append(args, limit)
 	rows, err := s.conn(ctx).QueryContext(ctx, `
@@ -1015,6 +1015,7 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 		  CROSS JOIN objects d ON d.id = e.from_id
 		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
 		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND t.resource_version <= ?
 		   AND e.from_id != e.to_id
 		   AND (d."group", d.kind) IN (VALUES `+tuples+`)
 		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)

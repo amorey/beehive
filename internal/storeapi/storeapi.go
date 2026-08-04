@@ -552,13 +552,19 @@ type Store interface {
 	DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]ObjectRef, error)
 
 	// DependentsListStaleSince is DependentsListStale bounded by a cursor: the
-	// dependents of targets written above after, ordered by StalePos, at most
-	// limit rows, plus the position of the last row to resume from. An empty
-	// kinds slice returns nothing. Cost tracks what changed, not the graph.
+	// dependents of targets written above after and no higher than through,
+	// ordered by StalePos, at most limit rows, plus the position of the last row
+	// to resume from. An empty kinds slice returns nothing. Cost tracks what
+	// changed, not the graph.
+	//
+	// through is what makes a sweep finite. Without it a store taking writes
+	// faster than the caller pages could never reach a short page, so the sweep
+	// would never end and its cursor would never move. Targets written above
+	// through belong to the next sweep.
 	//
 	// A dependent appears once per moved target it depends on; stamping and
 	// enqueuing are idempotent, so a duplicate costs a pass, not correctness.
-	DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, limit int) ([]ObjectRef, StalePos, error)
+	DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]ObjectRef, StalePos, error)
 
 	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
 	// order, at most limit. afterRV < trimmedThrough means entries were trimmed

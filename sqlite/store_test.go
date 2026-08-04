@@ -5225,13 +5225,49 @@ func TestDependentsListStaleSincePagesInsideAFanOut(t *testing.T) {
 	b := newDependentObject(t, store, target.ID)
 	c := newDependentObject(t, store, target.ID)
 
-	refs, pos, err := store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, beehive.StalePos{}, 2)
+	refs, pos, err := store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, beehive.StalePos{}, markNow(t, store), 2)
 	require.NoError(t, err)
 	require.Equal(t, []beehive.ObjectID{a.ID, b.ID}, refIDs(refs), "the cap cuts mid fan-out")
 
-	refs, _, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, pos, 2)
+	refs, _, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, pos, markNow(t, store), 2)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{c.ID}, refIDs(refs), "the next page resumes inside the same target")
+}
+
+// markNow is the pre-scan mark a sweep would read.
+func markNow(t *testing.T, store *sqliteStore) int64 {
+	t.Helper()
+	mark, err := store.ResourceVersionsMaxIssued(context.Background())
+	require.NoError(t, err)
+	return mark
+}
+
+// TestDependentsListStaleSinceStopsAtTheMark is what makes a sweep finite. A
+// target written after the sweep read its mark is above the bound and belongs to
+// the next sweep. Without it a store taking writes faster than the sweep pages
+// never reaches a short page, so the sweep never ends and its cursor never moves.
+func TestDependentsListStaleSinceStopsAtTheMark(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	kinds := []beehive.GroupKind{testGK}
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+	mark := markNow(t, store)
+
+	refs, _, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "in scope as of the mark")
+
+	// A write landing while the sweep runs.
+	moveTarget(t, store, target.ID)
+
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "the target moved above the mark, so this sweep leaves it")
+
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "and the next sweep picks it up")
 }
 
 // TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit: no kinds means no
@@ -5244,12 +5280,12 @@ func TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit(t *testing.T) {
 	newDependentObject(t, store, newRefObject(t, store).ID)
 	after := beehive.StalePos{TargetVersion: 7, TargetID: 2, DependentID: 3}
 
-	refs, pos, err := store.DependentsListStaleSince(ctx, nil, after, 100)
+	refs, pos, err := store.DependentsListStaleSince(ctx, nil, after, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "no kinds, nothing to enqueue into")
 	assert.Equal(t, after, pos)
 
-	refs, pos, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, after, 0)
+	refs, pos, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, after, markNow(t, store), 0)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "a non-positive limit asks for nothing")
 	assert.Equal(t, after, pos)
@@ -5263,7 +5299,7 @@ func TestDependentsListStaleSinceQueryError(t *testing.T) {
 	store.db.Close()
 
 	_, _, err := store.DependentsListStaleSince(context.Background(),
-		[]beehive.GroupKind{testGK}, beehive.StalePos{}, 10)
+		[]beehive.GroupKind{testGK}, beehive.StalePos{}, 9000, 10)
 
 	assert.Error(t, err)
 }
@@ -5283,12 +5319,13 @@ func TestDependentsListStaleSinceDrivesFromTheVersionIndex(t *testing.T) {
 		  CROSS JOIN objects d ON d.id = e.from_id
 		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
 		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND t.resource_version <= ?
 		   AND e.from_id != e.to_id
 		   AND (d."group", d.kind) IN (VALUES (?, ?))
 		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
 		 ORDER BY t.resource_version, t.id, e.from_id
 		 LIMIT ?`,
-		int64(0), int64(0), int64(0), testGK.Group, testGK.Kind, 10)
+		int64(0), int64(0), int64(0), int64(9000), testGK.Group, testGK.Kind, 10)
 
 	assert.Contains(t, plan, "idx_objects_rv", "the scan must seek targets by version:\n"+plan)
 	assert.NotContains(t, plan, "SCAN t", "and must not read every object:\n"+plan)
@@ -5305,16 +5342,16 @@ func TestDependentsListStaleSinceSkipsConvergedAndSpentPositions(t *testing.T) {
 	dep := newDependentObject(t, store, target.ID)
 	kinds := []beehive.GroupKind{testGK}
 
-	refs, pos, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, 100)
+	refs, pos, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
 	require.NoError(t, err)
 	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "no watermark counts as stale")
 
-	refs, _, err = store.DependentsListStaleSince(ctx, kinds, pos, 100)
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, pos, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "the scan does not re-read the row it just returned")
 
 	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
-	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, 100)
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "a dependent that observed its target is not returned")
 }

@@ -344,9 +344,10 @@ func (sd *staleDependents) resume(ctx context.Context) {
 // a crash between the two costs a spare reconcile rather than a lost one.
 func (sd *staleDependents) sweep(ctx context.Context) {
 	log := sd.bh.log()
-	// Read the mark before the scan, never after. A target written while the
-	// sweep runs sits above it, so the next sweep still finds it. Taking the
-	// highest target the scan returned would skip exactly those.
+	// Read the mark before the scan, never after, and scan only up to it. A
+	// target written while the sweep runs sits above the mark, so the next sweep
+	// finds it — and the scan stays finite under sustained writes. Taking the
+	// highest target the scan returned instead would skip exactly those targets.
 	mark, err := sd.bh.store.ResourceVersionsMaxIssued(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -372,7 +373,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	enqueue := sd.bh.enqueuerForPage()
 	pos := StalePos{TargetVersion: sd.cursor}
 	for {
-		page, next, err := sd.bh.store.DependentsListStaleSince(ctx, sd.kinds, pos, staleDependentsPageCap)
+		page, next, err := sd.bh.store.DependentsListStaleSince(ctx, sd.kinds, pos, mark, staleDependentsPageCap)
 		if err != nil {
 			abandon("listing stale dependents failed; the next pass resumes from the same cursor", pos, err)
 			return

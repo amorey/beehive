@@ -813,7 +813,7 @@ func (s *staleListErrorStore) DriverCursorsSet(_ context.Context, _ string, curs
 	return nil
 }
 
-func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
+func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.calls.Add(1)
 	return nil, after, errBoom
 }
@@ -827,6 +827,7 @@ type staleSweepStore struct {
 	stampErr  error
 	pages     [][]ObjectRef
 	asked     []StalePos
+	throughs  []int64
 	stamped   [][]ObjectRef
 	stored    map[string]int64
 	setCalls  []int64
@@ -836,8 +837,9 @@ func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, err
 	return s.issued, s.issuedErr
 }
 
-func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
+func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, through int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.asked = append(s.asked, after)
+	s.throughs = append(s.throughs, through)
 	if len(s.pages) == 0 {
 		return nil, after, nil
 	}
@@ -906,6 +908,7 @@ func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
 	sd.sweep(ctx)
 
 	assert.Equal(t, []StalePos{{TargetVersion: 200}}, store.asked)
+	assert.Equal(t, []int64{500}, store.throughs, "and bounds the scan at that same mark")
 	assert.EqualValues(t, 500, sd.cursor, "the sweep advances to the mark it read first")
 	assert.Equal(t, []int64{500}, store.setCalls, "and persists it once")
 }

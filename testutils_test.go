@@ -375,7 +375,7 @@ func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
 	return 0, nil
 }
 
-func (s *fakeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]storeapi.ObjectRef, StalePos, error) {
+func (s *fakeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]storeapi.ObjectRef, StalePos, error) {
 	return nil, after, nil
 }
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
@@ -1053,8 +1053,8 @@ func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) 
 }
 
 // DependentsListStaleSince is the form the sweep calls, so it carries the probe.
-func (s *listProbeStore) DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, limit int) ([]storeapi.ObjectRef, StalePos, error) {
-	refs, next, err := s.Store.DependentsListStaleSince(ctx, kinds, after, limit)
+func (s *listProbeStore) DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	refs, next, err := s.Store.DependentsListStaleSince(ctx, kinds, after, through, limit)
 	s.mu.Lock()
 	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
 	s.mu.Unlock()
