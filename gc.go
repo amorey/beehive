@@ -25,10 +25,12 @@ import "context"
 // touched waits for the sweeper's next tick. See
 // docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md.
 //
-// Watches are woken separately — both the cascade's marks and the physical
-// delete are the last the log will say about those rows, so a subscriber that
-// missed them would wait out a floor tick for a change nothing else will
-// report. The cascade wakes once per child kind, since it is cross-kind.
+// Watches are woken separately, and on a wider gate than the push: once per
+// child kind returned, marked or not. A mark and the physical delete are the
+// last the log will say about those rows, so a subscriber that missed either
+// would wait out a floor tick for a change nothing else reports — where a wake
+// for an unmarked child costs one position read that finds nothing. The wake is
+// per kind rather than per child because it is cross-kind and coalesces anyway.
 func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
 		obj, err := bh.store.ObjectsGetMeta(ctx, id)
@@ -42,7 +44,8 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// Mark owned children for deletion; the mark puts them in the sweeper's listing.
 		// The children span kinds, so wake each child's own kind — deduped per
 		// kind: a wide cascade would otherwise queue one commit hook per row
-		// for wakes that coalesce anyway.
+		// for wakes that coalesce anyway. Ungated on Marked, unlike the push: a
+		// re-cascade's wake reads one position and finds nothing.
 		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
 		if err != nil {
 			return err
