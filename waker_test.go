@@ -893,10 +893,22 @@ func (s *staleSweepStore) DriverCursorsSet(_ context.Context, name string, curso
 // sweeperOver builds a stale-dependents sweeper over a store double, mirroring
 // what staleDependentsRun assembles.
 func sweeperOver(store Store) *staleDependents {
+	return sweeperOverKinds(store, clientTestGK)
+}
+
+// sweeperOverKinds is sweeperOver for an explicit kind set, so a test can change
+// it between processes.
+func sweeperOverKinds(store Store, kinds ...GroupKind) *staleDependents {
 	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
 	cursors, _ := store.(DriverCursorer)
 	resets, _ := store.(DriverCursorResetter)
-	return &staleDependents{bh: bh, kinds: []GroupKind{clientTestGK}, cursors: cursors, resets: resets}
+	return &staleDependents{
+		bh:         bh,
+		kinds:      kinds,
+		cursors:    cursors,
+		resets:     resets,
+		cursorName: staleDependentsCursorName(kinds),
+	}
 }
 
 // TestStaleDependentsSweepStampsWhatItFinds pins the durable half of a finding.
@@ -919,7 +931,7 @@ func TestStaleDependentsSweepStampsWhatItFinds(t *testing.T) {
 // mark read *before* this scan — a target written while the sweep runs sits above
 // that mark, so the next sweep still finds it.
 func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
-	store := &staleSweepStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 200}}
+	store := &staleSweepStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 200}}
 	sd := sweeperOver(store)
 	ctx := context.Background()
 
@@ -938,7 +950,7 @@ func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
 // sweep means no target moved, so no row can be stale. The listing and the
 // cursor write are both skipped, leaving one read per tick.
 func TestStaleDependentsSweepSkipsAQuietStore(t *testing.T) {
-	store := &staleSweepStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 500}}
+	store := &staleSweepStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 500}}
 	sd := sweeperOver(store)
 	ctx := context.Background()
 	sd.resume(ctx)
@@ -953,7 +965,7 @@ func TestStaleDependentsSweepSkipsAQuietStore(t *testing.T) {
 // own sequence came from another database. Scanning above it would find nothing
 // for good, which would silently disable the one pass that cannot be disabled.
 func TestStaleDependentsSweepRederivesFromAForeignCursor(t *testing.T) {
-	store := &staleSweepStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 9000}}
+	store := &staleSweepStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 9000}}
 	sd := sweeperOver(store)
 	ctx := context.Background()
 	sd.resume(ctx)
@@ -969,6 +981,53 @@ func TestStaleDependentsSweepRederivesFromAForeignCursor(t *testing.T) {
 	next := sweeperOver(store)
 	next.resume(ctx)
 	assert.EqualValues(t, 500, next.cursor, "a restart reads the repaired cursor")
+}
+
+// staleCursorName is the cursor key for a kind set, for seeding a double.
+func staleCursorName(kinds ...GroupKind) string {
+	return staleDependentsCursorName(kinds)
+}
+
+// TestStaleDependentsCursorNameScopesToTheKindSet: order does not matter, but
+// membership does. A name that ignored membership would let a cursor earned
+// without a kind be resumed once that kind is back.
+func TestStaleDependentsCursorNameScopesToTheKindSet(t *testing.T) {
+	a := GroupKind{Kind: "A"}
+	b := GroupKind{Group: "g", Kind: "B"}
+
+	assert.Equal(t, staleCursorName(a, b), staleCursorName(b, a), "order is not membership")
+	assert.NotEqual(t, staleCursorName(a), staleCursorName(a, b), "an added kind is a different set")
+	assert.NotEqual(t, staleCursorName(a, b), staleCursorName(b), "so is a dropped one")
+	assert.Contains(t, staleCursorName(a), cursorNameStaleDependents+"/")
+}
+
+// TestStaleDependentsSweepRederivesForANewlyRegisteredKind is the strand the
+// scoping exists to stop. A process running without a kind still advances its
+// cursor past target writes; if that cursor were shared, the process that brings
+// the kind back would resume above those writes and never find its dependents
+// while the targets stay quiet.
+func TestStaleDependentsSweepRederivesForANewlyRegisteredKind(t *testing.T) {
+	other := GroupKind{Kind: "Other"}
+	store := &staleSweepStore{issued: 500}
+	ctx := context.Background()
+
+	// A process that registers only clientTestGK sweeps and records its cursor.
+	first := sweeperOverKinds(store, clientTestGK)
+	first.resume(ctx)
+	first.sweep(ctx)
+	require.EqualValues(t, 500, first.cursor)
+	require.Len(t, store.setCalls, 1)
+
+	// A later process registers one more kind. Its dependents were never in the
+	// first process's scope, so the cursor above says nothing about them.
+	second := sweeperOverKinds(store, clientTestGK, other)
+	second.resume(ctx)
+
+	assert.Zero(t, second.cursor, "a wider kind set re-derives from the start")
+
+	store.asked = nil
+	second.sweep(ctx)
+	assert.Equal(t, []StalePos{{}}, store.asked, "and scans the whole graph once")
 }
 
 // cursorOnlyStore implements DriverCursorer and nothing more — a backend written
@@ -1007,7 +1066,7 @@ func (s *cursorOnlyStore) DriverCursorsSet(_ context.Context, name string, curso
 // persists its cursors — folding Reset into DriverCursorer would have made such
 // a store fail the assertion and lose persistence with no build error.
 func TestStaleDependentsSweepKeepsCursorsWithoutTheResetter(t *testing.T) {
-	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 200}}
+	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 200}}
 	sd := sweeperOver(store)
 	ctx := context.Background()
 
@@ -1025,7 +1084,7 @@ func TestStaleDependentsSweepKeepsCursorsWithoutTheResetter(t *testing.T) {
 // row. The cost is one re-derivation per start, which is what this pass did
 // before the cursor existed.
 func TestStaleDependentsSweepRederivesInMemoryWithoutTheResetter(t *testing.T) {
-	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 9000}}
+	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 9000}}
 	sd := sweeperOver(store)
 	ctx := context.Background()
 	sd.resume(ctx)
@@ -1033,7 +1092,7 @@ func TestStaleDependentsSweepRederivesInMemoryWithoutTheResetter(t *testing.T) {
 	sd.sweep(ctx)
 
 	assert.EqualValues(t, 500, sd.cursor, "this process re-derives and moves on")
-	assert.Equal(t, 9000, int(store.stored[cursorNameStaleDependents]), "the row it cannot lower is left alone")
+	assert.Equal(t, 9000, int(store.stored[staleCursorName(clientTestGK)]), "the row it cannot lower is left alone")
 }
 
 // TestStaleDependentsSweepSweepsWhenTheForeignResetFails: the reset is the
@@ -1042,7 +1101,7 @@ func TestStaleDependentsSweepRederivesInMemoryWithoutTheResetter(t *testing.T) {
 func TestStaleDependentsSweepSweepsWhenTheForeignResetFails(t *testing.T) {
 	store := &staleSweepStore{
 		issued:   500,
-		stored:   map[string]int64{cursorNameStaleDependents: 9000},
+		stored:   map[string]int64{staleCursorName(clientTestGK): 9000},
 		resetErr: errBoom,
 	}
 	logger, logs := captureLogger(slog.LevelWarn)

@@ -127,6 +127,15 @@ reached and finding nothing for good.
 - **`DependentsListStale`, the unbounded form, has no production caller.** It
   survives for the tests that assert against a full re-derivation. Removing it
   belongs with the merge above.
+- **The cursor is keyed by the registered kind set**, as
+  `stale_dependents/<digest>`. The scan returns only dependents of registered
+  kinds, so a cursor earned under one set says nothing about a kind registered
+  later: the earlier process advanced past target writes that kind never saw,
+  and those targets can stay quiet forever. A changed set reads a different
+  name, finds none, and re-derives once. Dropping a kind is over-invalidated for
+  the same reason a digest cannot express set containment, which costs one sweep
+  in the safe direction. The cost is one abandoned row per kind set ever
+  registered, which is a development-time event.
 - **A cursor that must move backwards needs its own capability.** A stored
   position above this database's sequence cannot be replaced by
   `DriverCursorsSet`, whose monotone guard discards it, so the repair would be

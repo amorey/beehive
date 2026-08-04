@@ -16,6 +16,10 @@ package beehive
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"slices"
+	"strings"
 
 	"github.com/amorey/beehive/internal/driver"
 )
@@ -283,8 +287,30 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 // staleDependentsPageCap bounds one page of the stale-dependents scan.
 const staleDependentsPageCap = 256
 
-// cursorNameStaleDependents is the stale-dependents pass's key in driver_cursors.
+// cursorNameStaleDependents prefixes the stale-dependents pass's keys in
+// driver_cursors. The kind set completes the name; see staleDependentsCursorName.
 const cursorNameStaleDependents = "stale_dependents"
+
+// staleDependentsCursorName keys the cursor by the registered kind set.
+//
+// The scan returns only dependents of registered kinds, so a cursor earned under
+// one set says nothing about a kind registered later: it advanced past target
+// writes while that kind had no controller, and those targets can stay quiet
+// forever. A different set reads a different name, finds none, and re-derives
+// once.
+//
+// Dropping a kind needs no invalidation but gets one, because a digest cannot
+// express "the stored set contains this one". That costs one sweep, in the safe
+// direction.
+func staleDependentsCursorName(kinds []GroupKind) string {
+	lines := make([]string, len(kinds))
+	for i, gk := range kinds {
+		lines[i] = gk.Group + "/" + gk.Kind + "\n"
+	}
+	slices.Sort(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "")))
+	return cursorNameStaleDependents + "/" + hex.EncodeToString(sum[:])
+}
 
 // staleDependents is the correctness backstop behind the waker: it finds the
 // dependents their targets have moved past, stamps each one, and enqueues it.
@@ -298,6 +324,9 @@ type staleDependents struct {
 	kinds   []GroupKind
 	cursors DriverCursorer       // nil when the store cannot persist a cursor
 	resets  DriverCursorResetter // nil when it cannot lower one
+
+	// cursorName is scoped to kinds, so a changed kind set re-derives.
+	cursorName string
 
 	// cursor is the target version the last completed sweep covered.
 	cursor int64
@@ -314,7 +343,13 @@ func (bh *Beehive) staleDependentsRun(ctx context.Context) {
 	}
 	cursors, _ := bh.store.(DriverCursorer)
 	resets, _ := bh.store.(DriverCursorResetter)
-	sd := &staleDependents{bh: bh, kinds: kinds, cursors: cursors, resets: resets}
+	sd := &staleDependents{
+		bh:         bh,
+		kinds:      kinds,
+		cursors:    cursors,
+		resets:     resets,
+		cursorName: staleDependentsCursorName(kinds),
+	}
 	sd.resume(ctx)
 	driver.Run(ctx, bh.staleDependentsInterval, func(ctx context.Context) bool {
 		sd.sweep(ctx)
@@ -328,7 +363,7 @@ func (sd *staleDependents) resume(ctx context.Context) {
 	if sd.cursors == nil {
 		return
 	}
-	stored, ok, err := sd.cursors.DriverCursorsGet(ctx, cursorNameStaleDependents)
+	stored, ok, err := sd.cursors.DriverCursorsGet(ctx, sd.cursorName)
 	if err != nil {
 		sd.bh.log().WarnContext(ctx, "reading the stale-dependents cursor failed; re-deriving from the start", "err", err)
 		return
@@ -364,7 +399,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 		// cannot lower it, so otherwise every start re-reads the same cursor.
 		sd.cursor = 0
 		if sd.resets != nil {
-			if err := sd.resets.DriverCursorsReset(ctx, cursorNameStaleDependents, 0); err != nil {
+			if err := sd.resets.DriverCursorsReset(ctx, sd.cursorName, 0); err != nil {
 				log.WarnContext(ctx, "resetting the stale-dependents cursor failed; the next start re-derives again", "err", err)
 			}
 		}
@@ -405,7 +440,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	// Only a sweep that reached the end may move the cursor.
 	sd.cursor = mark
 	if sd.cursors != nil {
-		if err := sd.cursors.DriverCursorsSet(ctx, cursorNameStaleDependents, mark); err != nil {
+		if err := sd.cursors.DriverCursorsSet(ctx, sd.cursorName, mark); err != nil {
 			log.WarnContext(ctx, "persisting the stale-dependents cursor failed; a restart re-derives from the stored one", "err", err)
 		}
 	}
