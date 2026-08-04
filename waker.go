@@ -20,6 +20,7 @@ import (
 
 	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/rategate"
+	"github.com/amorey/gobus"
 )
 
 // waker requeues the dependents of everything that changed: each tick scans the
@@ -98,19 +99,59 @@ const wakeScanPageCap = 256
 // watermark to the next pass.
 const wakeScanPagesPerPass = 16
 
-// run drives the waker for the life of the control plane. A non-positive
-// interval turns it off — the reconcile_owed stamp and the stale-dependents
-// pass still cover correctness.
+// run drives the waker for the life of the control plane: a commit wakes it,
+// and the interval is the floor behind that. A non-positive interval turns it
+// off, wake included — the reconcile_owed stamp and the stale-dependents pass
+// still cover correctness.
 func (dw *waker) run(ctx context.Context) {
 	// No registered controllers means nowhere to queue anything.
-	if len(dw.bh.order) == 0 {
+	if len(dw.bh.order) == 0 || dw.bh.wakeInterval <= 0 {
 		return
 	}
 	dw.arm()
-	driver.Run(ctx, dw.bh.wakeInterval, func(ctx context.Context) bool {
-		dw.scan(ctx)
-		return true
-	})
+
+	// Subscribed before the first pass, for newObjectTailer's reason: a write
+	// landing between the subscribe and the seed read would be missed by both.
+	// Every kind, because an edge can point at one the waker cannot name. A nil
+	// channel blocks forever, which is the floor-only fallback for a Beehive
+	// assembled without a hub.
+	var written <-chan gobus.Event[GroupKind, struct{}]
+	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
+		defer rx.Close()
+		written = rx.Chan()
+	}
+
+	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
+	defer timer.Stop()
+	armedFor := dw.now()
+
+	backingOff := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, open := <-written:
+			if !open {
+				return // only stop closes the hub, and the waker has nobody to tell
+			}
+			// Consumed rather than skipped, so the closed arm above stays live.
+			if backingOff {
+				continue
+			}
+		case <-timer.C:
+			armedFor = time.Time{} // fired: nothing is armed until the Rearm below
+		}
+
+		now := dw.now()
+		var next time.Duration
+		next, backingOff = dw.pass(ctx, now)
+		// A wake that only re-arms the timer later than it already fires buys
+		// nothing, and under a sustained stream the loop turns at commit rate.
+		if at := now.Add(next); armedFor.IsZero() || at.Before(armedFor) {
+			driver.Rearm(timer, next)
+			armedFor = at
+		}
+	}
 }
 
 // arm builds what the waker reads from its Beehive's options, once, on first

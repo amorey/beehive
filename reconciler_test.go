@@ -2592,14 +2592,16 @@ var clientOnlyGK = GroupKind{Kind: "Config"}
 // beyond the test — so the only thing that can requeue D is the dependency
 // waker. The GC sweeper's interval cannot be disabled, so it is set long enough
 // to never fire on its own; tests that need a sweep drive it directly.
-func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, chan *Object[tSpec, tStatus], func()) {
+func newClientOnlyTargetFixture(t *testing.T, opts ...Option) (*Beehive, Store, chan *Object[tSpec, tStatus], func()) {
 	t.Helper()
 	ctx := context.Background()
 	store := &seedProbeStore{Store: newClientTestStore(t), seeded: make(chan struct{}, 8)}
 
 	// The dependency waker is the only driver under test here, so it runs fast
-	// while everything else is pushed out of the way.
-	bh := newTestBeehive(t, store, WithGCInterval(time.Hour), withDependencyWakeInterval(fastTick))
+	// while everything else is pushed out of the way. A caller that passes its
+	// own wake interval overrides this one, since options apply in order.
+	opts = append([]Option{WithGCInterval(time.Hour), withDependencyWakeInterval(fastTick)}, opts...)
+	bh := newTestBeehive(t, store, opts...)
 	reconciled := make(chan *Object[tSpec, tStatus], 16)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{ch: reconciled},
 		WithFullPassInterval(0),
@@ -2672,6 +2674,29 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 
 	awaitReconcile(t, reconciled, dep.ID,
 		"the dependent was never woken: its target's kind has no controller, so no waker observed the change")
+}
+
+// TestClientOnlyTargetWakesDependentOnCommit is the case above with the tick
+// taken away: the waker's floor is an hour, so only the commit wake can reach
+// the dependent. It is also what pins the subscription being across every kind
+// rather than per kind — the target's kind has no controller, so a per-kind
+// receiver would never have named it.
+func TestClientOnlyTargetWakesDependentOnCommit(t *testing.T) {
+	ctx := context.Background()
+	bh, store, reconciled, stop := newClientOnlyTargetFixture(t, withDependencyWakeInterval(time.Hour))
+	defer stop()
+
+	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
+	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnlyGK), uniqueName(), tSpec{})
+	settleFirstPass(t, depClient, reconciled, dep.ID)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	awaitReconcile(t, reconciled, dep.ID,
+		"the dependent waited for a tick that will not come for an hour: the commit did not wake the waker")
 }
 
 // TestClientOnlyTargetCreatedAfterStart is the same defect for a target whose

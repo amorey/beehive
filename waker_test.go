@@ -162,6 +162,69 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 	})
 }
 
+// The commit wake is the whole point: a dependent must not wait out a tick to
+// learn its target moved. The floor here is an hour, so a scan can only be the
+// wake's doing.
+func TestWakerScansWhenAWriteCommits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	inner := &replayStore{rows: replayRows(1), listed: newSignal()}
+	store := &seedProbeStore{Store: inner, seeded: make(chan struct{}, 8)}
+	bh := newTestBeehive(t, store, withDependencyWakeInterval(time.Hour))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() { defer close(done); bh.waker.run(ctx) }()
+
+	// The seed read follows the subscribe, so waiting for it makes "the waker
+	// was listening" a fact rather than a bet on scheduling. A send with no
+	// receiver reaches nobody, and there is no replay.
+	waitClosed(t, chanAfter(store.seeded, 1), "the waker to seed its watermark")
+
+	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Unwatched"}),
+		"any kind wakes it: the scan is store-wide")
+	inner.listed.wait(t, "the waker to scan on the commit wake")
+
+	cancel()
+	waitClosed(t, done, "the waker to stop")
+}
+
+// The wake is an optimisation over the tick, so a Beehive assembled without a
+// hub — every waker test above — still scans on its floor.
+func TestWakerRunsWithoutAWriteHub(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &replayStore{rows: replayRows(1), listed: newSignal()}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.wakeInterval, dw.bh.wakeScanMinInterval = fastTick, 0
+
+	done := make(chan struct{})
+	go func() { defer close(done); dw.run(ctx) }()
+
+	store.listed.wait(t, "the waker to scan on its floor with no hub to wake it")
+	cancel()
+	waitClosed(t, done, "the waker to stop")
+}
+
+// Closing the hub ends the waker. It is a safety net rather than the normal
+// exit — stop cancels runCtx and waits on the WaitGroup the waker is in, and
+// only closes the hub after — so drive it directly, or the test pins nothing.
+func TestWakerClosedHubArmReturns(t *testing.T) {
+	store := &replayStore{rows: replayRows(1)}
+	bh := newTestBeehive(t, store, withDependencyWakeInterval(time.Hour))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() { defer close(done); bh.waker.run(context.Background()) }()
+
+	bh.kindWriteHub.Close()
+	waitClosed(t, done, "the waker to end with the closed hub, rather than spin on it")
+}
+
 // pass is one turn of the run loop: it reports how long to wait and whether
 // wakes are being dropped. The rate assertions drive it at instants of their
 // own choosing, so none of them sleeps.
