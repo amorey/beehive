@@ -47,6 +47,11 @@ type waker struct {
 	// connection every commit needs.
 	persistGate *rategate.Gate[struct{}]
 
+	// scanGate floors wake-driven scans, so a sustained write stream cannot
+	// hold the connection at the full paging budget. Eager after a quiet
+	// period, so an idle-to-active transition adds no latency.
+	scanGate *rategate.Gate[struct{}]
+
 	// watermark is the highest resource_version this waker has processed. The
 	// cursor is store-wide, always increasing and never reused, so "everything
 	// above this" is exactly what changed since the last scan.
@@ -118,7 +123,31 @@ func (dw *waker) arm() {
 	if dw.now == nil {
 		dw.now = time.Now
 	}
+	dw.scanGate = rategate.New[struct{}](dw.bh.wakeScanMinInterval)
 	dw.persistGate = rategate.New[struct{}](dw.bh.wakeInterval)
+}
+
+// pass is one turn of the run loop: scan under the throttle, and report how
+// long to wait and whether to drop the wakes arriving meanwhile. Split from run
+// so the rate tests drive it at instants of their own choosing.
+func (dw *waker) pass(ctx context.Context, now time.Time) (time.Duration, bool) {
+	dw.arm()
+	floor := dw.bh.wakeInterval
+	if opensAt, held := dw.scanGate.Allow(gateKey, now); held {
+		// Re-arming for what is left of the throttle is what remembers the
+		// wake: the scan that runs then reads its position from the store.
+		return opensAt.Sub(now), false
+	}
+	switch dw.scan(ctx) {
+	case scanMore:
+		if throttle := dw.scanGate.Interval(); throttle > 0 {
+			return throttle, false // keep draining, at the throttle's rate
+		}
+		return floor, false
+	case scanFailed:
+		return floor, true
+	}
+	return floor, false
 }
 
 // scanResult says what a pass found. The run loop dispatches on it: how soon to

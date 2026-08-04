@@ -60,7 +60,13 @@ func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconcil
 		rs[gk] = r
 		order = append(order, r)
 	}
-	bh := &Beehive{store: store, reconcilers: rs, order: order, wakeInterval: defaultWakeInterval}
+	// The cadences New would have set: a rate limit left at zero is a rate
+	// limit switched off, which is not what production does.
+	bh := &Beehive{
+		store: store, reconcilers: rs, order: order,
+		wakeInterval:        defaultWakeInterval,
+		wakeScanMinInterval: defaultWakeScanMinInterval,
+	}
 	cursors, _ := store.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
 	return bh.waker, rs
@@ -153,6 +159,83 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 		dw.seeded = true
 
 		assert.Equal(t, scanFailed, dw.scan(context.Background()))
+	})
+}
+
+// pass is one turn of the run loop: it reports how long to wait and whether
+// wakes are being dropped. The rate assertions drive it at instants of their
+// own choosing, so none of them sleeps.
+func TestWakerPassPacesTheLoop(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+	ctx := context.Background()
+
+	t.Run("a quiet pass waits the floor", func(t *testing.T) {
+		dw, _ := wakerOver(&replayStore{}, widget)
+		clk := fakeClockOn(dw)
+		dw.seeded = true
+
+		next, backingOff := dw.pass(ctx, clk.now())
+		assert.Equal(t, defaultWakeInterval, next)
+		assert.False(t, backingOff)
+	})
+
+	t.Run("a throttled pass waits out the throttle and scans nothing", func(t *testing.T) {
+		store := &replayStore{}
+		dw, _ := wakerOver(store, widget)
+		clk := fakeClockOn(dw)
+		dw.seeded = true
+
+		dw.pass(ctx, clk.now())
+		pagesAfterFirst := len(store.pages)
+
+		clk.advance(defaultWakeScanMinInterval / 4)
+		next, _ := dw.pass(ctx, clk.now())
+		assert.Equal(t, 3*defaultWakeScanMinInterval/4, next, "re-armed for what is left of the throttle")
+		assert.Len(t, store.pages, pagesAfterFirst, "and the refused pass read nothing")
+	})
+
+	t.Run("the first wake after a quiet period is eager", func(t *testing.T) {
+		store := &replayStore{}
+		dw, _ := wakerOver(store, widget)
+		clk := fakeClockOn(dw)
+		dw.seeded = true
+
+		dw.pass(ctx, clk.now())
+		clk.advance(defaultWakeScanMinInterval)
+		dw.pass(ctx, clk.now())
+
+		assert.Len(t, store.pages, 2, "an idle-to-active transition pays no added latency")
+	})
+
+	t.Run("more work re-arms at the throttle, not the floor", func(t *testing.T) {
+		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
+		dw, _ := wakerOver(store, widget)
+		clk := fakeClockOn(dw)
+		dw.seeded = true
+
+		next, _ := dw.pass(ctx, clk.now())
+		assert.Equal(t, defaultWakeScanMinInterval, next, "a resume drains at the throttle's rate")
+	})
+
+	t.Run("a failed pass waits the floor and drops wakes", func(t *testing.T) {
+		dw, _ := wakerOver(&replayStore{rows: replayRows(3), err: errBoom}, widget)
+		clk := fakeClockOn(dw)
+		dw.seeded = true
+
+		next, backingOff := dw.pass(ctx, clk.now())
+		assert.Equal(t, defaultWakeInterval, next)
+		assert.True(t, backingOff, "a live writer must not keep a degraded store re-reading as fast as it can fail")
+	})
+
+	t.Run("a disabled throttle drains at the floor", func(t *testing.T) {
+		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
+		dw, _ := wakerOver(store, widget)
+		dw.bh.wakeScanMinInterval = 0
+		clk := fakeClockOn(dw)
+		dw.seeded = true
+
+		next, _ := dw.pass(ctx, clk.now())
+		assert.Equal(t, defaultWakeInterval, next, "with no throttle to re-arm at, today's behaviour")
 	})
 }
 
