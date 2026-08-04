@@ -2605,7 +2605,7 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, fu
 	// woke it.
 	bh := newTestBeehive(t, store, WithGCInterval(time.Hour),
 		withDependencyWakeInterval(fastTick), withMinRequeueInterval(0))
-	observer := &depObserver{store: store, seen: make(chan depObservation, 64), park: make(chan struct{})}
+	observer := &depObserver{store: store, seen: make(chan depObservation, 64)}
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, observer,
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
@@ -2635,9 +2635,14 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, fu
 // an assertion that waits for "a reconcile happened" is satisfied by that one —
 // every test here passed with its mutation deleted before the version was
 // carried through.
+//
+// release is non-nil exactly when this reconcile is parked, waiting to be let
+// go. A reconcile already running when parking was armed carries nil, and must
+// not be mistaken for one that can be released.
 type depObservation struct {
 	id       ObjectID
 	targetRV int64
+	release  chan struct{}
 }
 
 // depObserver reconciles the dependent by reading its target, so a test can
@@ -2649,13 +2654,18 @@ type depObserver struct {
 	store  Store
 	target atomic.Int64
 	seen   chan depObservation
-	parked atomic.Bool
-	park   chan struct{}
-	freed  sync.Once
+
+	// mu guards the parking state. A reconcile takes its channel under the same
+	// lock release closes them under, so it either parks on one that will be
+	// closed or does not park at all — never on one nobody holds. Every release
+	// is a close, so no path here can block.
+	mu      sync.Mutex
+	parking bool
+	parked  map[chan struct{}]struct{}
 }
 
 func (c *depObserver) Reconcile(ctx context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
-	obs := depObservation{id: obj.ID}
+	obs := depObservation{id: obj.ID, release: c.parkChan()}
 	if id := ObjectID(c.target.Load()); id != 0 {
 		switch raw, err := c.store.ObjectsGet(ctx, id); {
 		case err == nil:
@@ -2665,10 +2675,48 @@ func (c *depObserver) Reconcile(ctx context.Context, _ ControllerClient[tStatus]
 		}
 	}
 	c.seen <- obs
-	if c.parked.Load() {
-		<-c.park
+	if obs.release != nil {
+		<-obs.release
 	}
 	return Result{}, nil
+}
+
+// parkChan hands this reconcile the channel it will wait on, or nil when
+// parking is off.
+func (c *depObserver) parkChan() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.parking {
+		return nil
+	}
+	ch := make(chan struct{})
+	c.parked[ch] = struct{}{}
+	return ch
+}
+
+// unpark lets one parked reconcile finish.
+func (c *depObserver) unpark(ch chan struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, held := c.parked[ch]; held {
+		delete(c.parked, ch)
+		close(ch)
+	}
+}
+
+// release stops parking and frees everything parked. Both halves matter: an
+// assertion can succeed while a dispatch is still parked, because the
+// observation is sent before the park — and a worker left parked blocks the
+// beehive's drain until its deadline. Idempotent, so the fixture can call it
+// for a test that failed early.
+func (c *depObserver) release() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.parking = false
+	for ch := range c.parked {
+		delete(c.parked, ch)
+		close(ch)
+	}
 }
 
 // settle drives the dependent until nothing else is queued for it and leaves
@@ -2678,23 +2726,27 @@ func (c *depObserver) Reconcile(ctx context.Context, _ ControllerClient[tStatus]
 // empty. Call release once the change under test has landed.
 //
 // It returns the target's version as of that moment. An observation above it
-// can only have come from a dispatch enqueued after the change, which is the
-// whole assertion — the dependent's own create enqueues it too, and a test that
-// waits for "a reconcile happened" is satisfied by that one.
+// can only have come from a dispatch enqueued after the change.
 func (c *depObserver) settle(t *testing.T, ctx context.Context, bh *Beehive, client Client[tSpec, tStatus], id, target ObjectID) int64 {
 	t.Helper()
 	r, ok := bh.reconcilerFor(GroupKind{Kind: "Widget"})
 	require.True(t, ok)
 
 	c.target.Store(int64(target))
-	c.parked.Store(true)
+	c.mu.Lock()
+	c.parking, c.parked = true, map[chan struct{}]struct{}{}
+	c.mu.Unlock()
+
 	require.NoError(t, client.Requeue(ctx, id))
 	for {
-		awaitReconcile(t, c.seen, id, "the dependent's requeued pass did not run")
+		// Parked, not merely reconciled: a pass already running when parking
+		// was armed is holding nothing, and treating it as held would leave the
+		// queue free to dispatch again behind the test's back.
+		obs := awaitParked(t, c.seen, id)
 		if !queuedFor(r.work, id) {
 			break // parked, with nothing behind it
 		}
-		c.park <- struct{}{} // let it finish so the queued one runs and parks
+		c.unpark(obs.release) // let it finish so the queued one runs and parks
 	}
 
 	raw, err := c.store.ObjectsGet(ctx, target)
@@ -2702,29 +2754,36 @@ func (c *depObserver) settle(t *testing.T, ctx context.Context, bh *Beehive, cli
 	return raw.ResourceVersion
 }
 
-// release lets every parked reconcile through, now and later, by closing the
-// channel they wait on. Both halves matter: an assertion can succeed while a
-// dispatch is still parked, because the observation is sent before the park —
-// and a worker left parked blocks the beehive's drain until its deadline.
-// Idempotent, so the fixture can call it for a test that failed early.
-func (c *depObserver) release() {
-	c.parked.Store(false)
-	c.freed.Do(func() { close(c.park) })
-}
-
-// queuedFor reports whether id is waiting for a dispatch. Read under the
-// queue's own lock, and meaningful only while a reconcile of id is parked:
-// nothing else can move it then.
+// queuedFor reports whether id is owed another dispatch. Both halves are
+// needed: an add that arrives while id is being processed does not queue it, it
+// marks the gauge dirty, and done re-queues it from there. Checking only items
+// reads a parked reconcile with an add behind it as "nothing pending", which is
+// how a test built on this went flaky.
+//
+// Read under the queue's own lock, and meaningful only while a reconcile of id
+// is parked: nothing else can move it then.
 func queuedFor(q *workQueue, id ObjectID) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if _, dirty := q.gauge.dirty[id]; dirty {
+		return true
+	}
 	return slices.Contains(q.items, id)
 }
 
-// awaitReconcile waits for a reconcile of id, ignoring any others.
-func awaitReconcile(t *testing.T, ch chan depObservation, id ObjectID, msg string) {
+// awaitParked waits for a reconcile of id that is parked, and returns it.
+func awaitParked(t *testing.T, ch chan depObservation, id ObjectID) depObservation {
 	t.Helper()
-	awaitObservation(t, ch, msg, func(obs depObservation) bool { return obs.id == id })
+	for {
+		select {
+		case obs := <-ch:
+			if obs.id == id && obs.release != nil {
+				return obs
+			}
+		case <-time.After(testTimeout):
+			t.Fatal("the dependent's requeued pass did not park")
+		}
+	}
 }
 
 // awaitTargetAbove waits for a reconcile of id that read the target at a
