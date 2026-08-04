@@ -145,10 +145,12 @@ type Client[Spec, Status any] interface {
 	// when "already there" is acceptable. The new object is unsettled and owed
 	// its first reconcile.
 	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	// Delete soft-deletes id by setting DeletionRequestedAt; the GC sweeper
-	// takes it from there. Returns ErrNotFound if id holds no object — it was
-	// collected out from under the caller, which is worth hearing about.
-	// Idempotent on an already-pending row. Kind-scoped.
+	// Delete soft-deletes id by setting DeletionRequestedAt. A registered kind
+	// reaches its controller at commit; a client-only kind waits for the GC
+	// sweeper, which takes every deletion from there either way. Returns
+	// ErrNotFound if id holds no object — it was collected out from under the
+	// caller, which is worth hearing about. Idempotent on an already-pending
+	// row. Kind-scoped.
 	Delete(ctx context.Context, id ObjectID) error
 	// DeleteByName is Delete keyed by name: it acts on whatever holds name now.
 	// Idempotent, and absence folds to nil — a name nothing holds is the
@@ -855,10 +857,21 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	}
 	if marked {
 		c.bh.signalKindWritten(ctx, c.gk)
+		c.signalDeletionRequested(ctx, id)
 	}
-	// Nothing is scheduled: the mark is the signal, and the GC tick is
-	// guaranteed (WithGCInterval refuses to be disabled).
 	return nil
+}
+
+// signalDeletionRequested enqueues id once its deletion mark commits, so a
+// registered kind reaches its controller at commit rather than at the next GC
+// tick. A client-only kind resolves to no reconciler and waits for the sweeper:
+// collecting it here would run the whole cascade on the caller's goroutine.
+//
+// Callers pass only writes that actually stamped the row. The mark is once per
+// object, so this cannot repeat on a pass — and a delete carries new
+// information, so it beats a backoff alarm rather than being absorbed by one.
+func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, id ObjectID) {
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 }
 
 // DeleteByName is Delete keyed by name; the store resolves and marks in one
