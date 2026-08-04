@@ -134,7 +134,7 @@ nothing after the first declare, because of the edge-new gate. A controller
 declaring from inside its own `Reconcile` mostly pays nothing either: that pass
 rewrites the watermark when it succeeds, from the cursor it loaded at — which is
 sound for exactly the reason above, since the controller's read of the new target
-happened after the load. Self-edges are skipped, matching `DependentsListStale`,
+happened after the load. Self-edges are skipped, matching `DependentsListStaleSince`,
 which excludes them.
 
 One case does cost a pass, and it is not this change's doing: an object's **first**
@@ -174,7 +174,7 @@ on a small table, paid per pass rather than per reconcile.
 
 ### The kind filter is on the dependent, never the target
 
-`DependentsListStale` filters by kind for the same reason `ReconcileOwedListIDs`
+`DependentsListStaleSince` filters by kind for the same reason `ReconcileOwedListIDs`
 does: only a registered kind has a reconcile loop to enqueue into. A client-only
 dependent never gets a watermark written and is therefore stale forever, so
 filtering is what makes it cost zero rather than a permanent addition to every
@@ -239,12 +239,17 @@ delivered. → [ADR](2026-07-30-durable-waker-cursor.md)
 
 ### Rejected: `idx_edges_depends_on`
 
+*(The plan below is the unbounded `DependentsListStale`, which paged by `from_id`
+and is removed — see [the cursor ADR](2026-08-03-stale-dependents-cursor.md). The
+conclusion carries: `DependentsListStaleSince` drives from `idx_objects_rv` and
+reaches `edges` through `idx_edges_to`, and neither wants this index either.)*
+
 The scan pages by `from_id`, and the `edges` primary key already leads on `from_id`,
 so the plan is `SEARCH e USING PRIMARY KEY (from_id>?)` — already a covering range
 scan with no row fetch, arriving in the order the `GROUP BY` and `ORDER BY` want. (The
 query says `CROSS JOIN` to *get* that plan: left to choose, the planner drives from
 `idx_objects_kind` instead, which turns paging to exhaustion into one full scan per
-page. See `DependentsListStale`.) The index would buy only skipping `owned_by` entries
+page.) The index would buy only skipping `owned_by` entries
 during that range scan, and would cost a second full copy of every `depends_on` edge — a secondary
 index on a `WITHOUT ROWID` table carries the whole primary key in its payload, so
 `(from_id, to_id)` plus the implicit rest *is* the row, byte for byte. Add it only if

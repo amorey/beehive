@@ -65,7 +65,7 @@ gets no error at all — it just converges anyway.
 
 The watermark clear on a new edge stays, demoted from coverage to hygiene: a cursor
 recorded over a smaller dependency set cannot speak for a target just added, and
-leaving the row standing would misreport convergence to `DependentsListStale` for
+leaving the row standing would misreport convergence to the staleness listing for
 the window until the stamped pass runs and rewrites it honestly.
 
 ## What carries over unchanged
