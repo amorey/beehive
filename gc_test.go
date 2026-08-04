@@ -335,6 +335,31 @@ func TestCascadePushesEachMarkedChild(t *testing.T) {
 		"both marked children are queued")
 }
 
+// owned_by is cross-kind, so each child's push routes by its own GroupKind, never
+// the owner's. The wake beside it is deduped per kind for the same reason.
+func TestCascadePushesAcrossKinds(t *testing.T) {
+	ctx := context.Background()
+	bh, client, ownerR := cascadeFixture(t)
+	childGK := GroupKind{Kind: "CascadeChild"}
+	_, err := Register(bh, childGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	childR, ok := bh.reconcilerFor(childGK)
+	require.True(t, ok)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, childGK), uniqueName(),
+		cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(ownerR.work)
+	drainQueue(childR.work)
+
+	_, err = bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{child.ID}, queuedIDs(childR.work), "the child's own kind is queued")
+	assert.Empty(t, queuedIDs(ownerR.work), "the owner's kind is not")
+}
+
 // A client-only child has no reconciler to reach, so it is marked and left to the
 // sweeper. Collecting it inline instead would put the whole subtree below it on
 // the caller's goroutine.
