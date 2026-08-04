@@ -120,7 +120,10 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// re-derive it. That pass scans from a cursor, so it finds nothing for a
 	// target that has since gone quiet.
 	if reconcileErr == nil && load.HasDependencies {
-		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil {
+		err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor)
+		// A cancelled write is shutdown, not a lost pass: the stamp would fail the
+		// same way, and reporting it would fault every clean stop.
+		if err != nil && ctx.Err() == nil {
 			log.WarnContext(ctx, "failed to record the dependency watermark; owing another pass instead", "err", err)
 			ref := ObjectRef{ID: id, Group: t.gk.Group, Kind: t.gk.Kind}
 			if err := t.bh.store.ReconcileOwedStamp(ctx, []ObjectRef{ref}); err != nil {

@@ -2249,12 +2249,9 @@ func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64,
 	return cursor, true, nil
 }
 
-// DriverCursorsSet upserts name's persisted cursor (see storeapi.DriverCursorer).
-// The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
-// write outright — no page dirtied on a quiet tick.
 // DriverCursorsReset writes name's cursor with no monotone guard (contract on
-// storeapi.DriverCursorer). Same statement as DriverCursorsSet without the
-// WHERE, so a lower value replaces a higher one.
+// storeapi.DriverCursorResetter). The same statement as DriverCursorsSet without
+// the WHERE, so a lower value replaces a higher one.
 func (s *sqliteStore) DriverCursorsReset(ctx context.Context, name string, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
@@ -2264,6 +2261,9 @@ func (s *sqliteStore) DriverCursorsReset(ctx context.Context, name string, curso
 	return err
 }
 
+// DriverCursorsSet upserts name's persisted cursor (see storeapi.DriverCursorer).
+// The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
+// write outright — no page dirtied on a quiet tick.
 func (s *sqliteStore) DriverCursorsSet(ctx context.Context, name string, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
@@ -2622,7 +2622,6 @@ func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKin
 		`WHERE o.id IN (`+placeholders(len(ids))+`) AND o."group" = ? AND o.kind = ?`, args...)
 }
 
-// placeholders builds "?, ?, ?" for an IN list of n values.
 // kindTuples builds the "(?, ?), (?, ?)" list for an IN (VALUES …) kind filter,
 // with the matching args. Both stale-dependent listings filter the same way.
 func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
@@ -2635,6 +2634,7 @@ func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
 	return strings.Join(tuples, ", "), args
 }
 
+// placeholders builds "?, ?, ?" for an IN list of n values.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
