@@ -60,13 +60,29 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Declarative and level-triggered.** Controllers reconcile from *current*
   state, never from a sequence of changes; controllers coordinate through the
   store, never with each other.
-- **Dependency staleness is re-derived, not recorded.** A successful reconcile
-  stamps `dependency_watermarks.reconciled_against` with the write cursor as of
-  its *load*; the stale-dependents pass enqueues every dependent a target has
-  moved past, so any lost wake costs latency, never divergence. `EdgesAdd`
-  *clears* the watermark on a new `depends_on` edge; the `reconcile_owed` stamp
-  on that same edge is what guarantees the dependent a pass.
+- **Dependency staleness is derived from watermarks, and every finding is
+  durable.** A successful reconcile stamps
+  `dependency_watermarks.reconciled_against` with the write cursor as of its
+  *load*; the stale-dependents pass finds every dependent a target has moved
+  past, so any lost wake costs latency, never divergence. `EdgesAdd` *clears*
+  the watermark on a new `depends_on` edge; the `reconcile_owed` stamp on that
+  same edge is what guarantees the dependent a pass. A failed watermark write
+  stamps `reconcile_owed` too — the pass is cursor-bound and re-derives nothing
+  for a target that has gone quiet.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
+- **The stale-dependents pass scans from a cursor over target
+  `resource_version`** (`DependentsListStaleSince`), so its cost is what
+  changed, not the size of the graph. **The cursor is process-local and never
+  persisted**: a reconcile writes its owed decrement and its watermark
+  separately, so a crash between them strands a dependent that only a
+  re-derivation can find, and every process does one. **That re-derivation is
+  what makes the cursor sound**, together with the reconciler's stamp on a
+  failed watermark write, which covers the same strand inside a process that
+  keeps running. The pass *also* stamps `reconcile_owed` for what it finds
+  before enqueuing, so a finding outlives the queue; that stamp is what a
+  persisted cursor would need, and it is not load-bearing today. The cursor
+  moves only when a sweep reaches the end. **`reconcile_owed` now has three
+  producers** — `EdgesAdd`, the pass, and the reconciler's watermark fallback. → [ADR](docs/adr/2026-08-03-stale-dependents-cursor.md)
 - **The dependency waker scans the write log from a watermark**
   (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
   client-only kind). Cost is bounded by what changed. The cursor persists via

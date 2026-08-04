@@ -185,7 +185,7 @@ on the next pass.
 Extending that filter to the *target* would be silently wrong. A registered object
 may depend on a client-only one — the whole reason the waker's scan is store-wide —
 so a target's kind is irrelevant to whether its dependents are owed a pass.
-`TestDependentsListStaleFindsDependentsOfUnregisteredTargets` is the tripwire.
+`TestDependentsListStaleSinceFindsDependentsOfUnregisteredTargets` is the tripwire.
 
 ## Consequences
 
