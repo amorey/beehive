@@ -47,7 +47,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 		woken := make(map[GroupKind]bool, len(children))
 		for _, ch := range children {
-			if gk := ch.GroupKind(); !woken[gk] {
+			if gk := ch.Ref.GroupKind(); !woken[gk] {
 				woken[gk] = true
 				bh.signalKindWritten(ctx, gk)
 			}

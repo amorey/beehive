@@ -224,6 +224,14 @@ type ObjectsCreateInput struct {
 	SpecVersion int
 }
 
+// DeletionCascadeChild is one owned child of a cascade. Marked reports whether
+// this call stamped it, so a caller can follow up on exactly the children that
+// moved; a re-cascade over a deleting subtree returns them all with Marked false.
+type DeletionCascadeChild struct {
+	Marked bool
+	Ref    ObjectRef
+}
+
 // EdgesAddResult is what a caller needs to follow up on an edge it declared;
 // all of it falls out of work EdgesAdd already does.
 type EdgesAddResult struct {
@@ -330,7 +338,7 @@ type Store interface {
 	// DeletionRequestsCreateFromOwner requests deletion of every object owned by
 	// ownerID and returns them all. Writes only to children not already
 	// deletion-pending, so repeating over a deleting subtree costs one read.
-	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]ObjectRef, error)
+	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]DeletionCascadeChild, error)
 
 	// DeletionRequestsList returns every deletion-pending object of every
 	// kind, each with its GroupKind, so the global GC sweeper can route

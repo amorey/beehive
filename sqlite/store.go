@@ -1869,12 +1869,12 @@ func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk store
 }
 
 // DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children,
-// returning every owned child for requeue, deleting or not. A re-cascade over an
-// already-deleting subtree is a lone SELECT.
-func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+// returning every owned child, deleting or not, each flagged with whether this
+// call stamped it. A re-cascade over an already-deleting subtree is a lone SELECT.
+func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.DeletionCascadeChild, error) {
 	// Self-wrapped: several children each draw a version, and publication is in
 	// commit order only inside Within.
-	var out []storeapi.ObjectRef
+	var out []storeapi.DeletionCascadeChild
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
 		out, err = s.deletionRequestsCreateFromOwner(ctx, ownerID)
@@ -1886,7 +1886,7 @@ func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, owner
 	return out, nil
 }
 
-func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.DeletionCascadeChild, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id
@@ -1911,17 +1911,19 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	_ = rows.Err()
 	rows.Close() // free the single-conn pool before the per-child writes below
 
-	out := make([]storeapi.ObjectRef, 0, len(children))
+	out := make([]storeapi.DeletionCascadeChild, 0, len(children))
 	for _, ch := range children {
-		out = append(out, ch.ref)
 		if ch.deleting {
+			out = append(out, storeapi.DeletionCascadeChild{Ref: ch.ref})
 			continue // already deletion-pending: nothing to stamp
 		}
-		// A race may have set the flag since the SELECT; the guard then stamps
-		// nothing — benign, so only the error matters.
-		if _, _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
+		// Marked is the guarded UPDATE's own answer, never !deleting: a race may
+		// have set the flag since the SELECT, and then this stamps nothing.
+		_, marked, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID)
+		if err != nil {
 			return nil, err
 		}
+		out = append(out, storeapi.DeletionCascadeChild{Marked: marked, Ref: ch.ref})
 	}
 	return out, nil
 }
