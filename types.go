@@ -29,6 +29,9 @@ type GroupKind = storeapi.GroupKind
 // ObjectID is the store-assigned unique identifier for an object.
 type ObjectID = storeapi.ObjectID
 
+// StalePos is a position in the stale-dependents scan. See storeapi.StalePos.
+type StalePos = storeapi.StalePos
+
 // ObjectRef identifies a related object — an owner, a dependency, or a
 // dependent — carrying the GroupKind needed to address it.
 type ObjectRef = storeapi.ObjectRef

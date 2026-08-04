@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"runtime/pprof"
 	"slices"
@@ -350,17 +351,30 @@ func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef,
 	return nil, nil
 }
 
-// DependentsListStale answers empty like the listings above it, rather than
-// panicking: the stale-dependents driver runs in every Beehive that has
-// controllers, so a panic would make the fake unusable for anything calling Start.
-func (s *fakeStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
 func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
 func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	panic("not implemented: fakeStore.ReconcileOwedDecrement")
+}
+
+// ReconcileOwedStamp answers nil like the listings above it: the stale-dependents
+// driver stamps what it finds, so a panic would break every Start.
+func (s *fakeStore) ReconcileOwedStamp(context.Context, []storeapi.ObjectRef) error {
+	return nil
+}
+
+// ResourceVersionsMaxIssued answers 0: the stale-dependents driver reads it every
+// tick, so a panic would break every Start.
+func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return 0, nil
+}
+
+// DependentsListStaleSince answers empty like the listings above it, rather than
+// panicking: the stale-dependents driver runs in every Beehive that has
+// controllers, so a panic would make the fake unusable for anything calling Start.
+func (s *fakeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]storeapi.ObjectRef, StalePos, error) {
+	return nil, after, nil
 }
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
@@ -895,6 +909,29 @@ func objectRefIDs(refs []ObjectRef) []ObjectID {
 	return ids
 }
 
+// staleDependentIDs is what the stale-dependents pass would find right now: the
+// listing from the beginning, bounded above by everything issued, deduped.
+//
+// The listing returns one row per (target, dependent) pair, so a dependent with
+// two moved targets appears twice. The sweep folds that in the queue, and these
+// assertions are about which objects are owed a pass, not how many rows say so.
+func staleDependentIDs(t *testing.T, store Store, gk GroupKind) []ObjectID {
+	t.Helper()
+	refs, _, err := store.DependentsListStaleSince(
+		context.Background(), []GroupKind{gk}, StalePos{}, math.MaxInt64, 100)
+	require.NoError(t, err)
+	seen := make(map[ObjectID]struct{}, len(refs))
+	var ids []ObjectID
+	for _, r := range refs {
+		if _, dup := seen[r.ID]; dup {
+			continue
+		}
+		seen[r.ID] = struct{}{}
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
 // wakeProbeStore signals every time someone asks who depends on targetID. The
 // race is between the *waker's lookup* and the edge's commit, not between the
 // change and the commit, so a test that wants the window deterministically has to
@@ -985,7 +1022,7 @@ type listProbeStore struct {
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
 	owedListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
-	staleListed     chan struct{} // DependentsListStale (global)
+	staleListed     chan struct{} // DependentsListStaleSince (global)
 	watermarkSet    chan struct{} // DependencyWatermarksSet (per successful dependent pass)
 
 	// mu guards staleKinds alone. The other fields are channels, but this one is
@@ -1036,13 +1073,14 @@ func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) 
 	return storeapi.ReconcileLoad{Object: *obj}, nil
 }
 
-func (s *listProbeStore) DependentsListStale(ctx context.Context, kinds []GroupKind, afterID ObjectID, limit int) ([]storeapi.ObjectRef, error) {
-	refs, err := s.Store.DependentsListStale(ctx, kinds, afterID, limit)
+// DependentsListStaleSince is the form the sweep calls, so it carries the probe.
+func (s *listProbeStore) DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	refs, next, err := s.Store.DependentsListStaleSince(ctx, kinds, after, through, limit)
 	s.mu.Lock()
 	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
 	s.mu.Unlock()
 	probeSignal(s.staleListed)
-	return refs, err
+	return refs, next, err
 }
 
 // kindsAsked snapshots what the stale-dependents listings have been asked for.

@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -3100,6 +3101,96 @@ func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
 	assert.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
 }
 
+// TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
+// The stale-dependents pass enqueues in memory, and a restart loses that; the
+// stamp is what survives.
+func TestReconcileOwedStampRecordsFindings(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+
+	require.NoError(t, store.ReconcileOwedStamp(ctx, nil), "no refs writes nothing")
+
+	refs := []beehive.ObjectRef{
+		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
+	}
+	require.NoError(t, store.ReconcileOwedStamp(ctx, refs))
+	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID))
+	assert.Equal(t, int64(1), reconcileOwed(t, store, b.ID))
+
+	// Two sweeps that both found the dependent owe two wakes. One pass drains
+	// both, because the decrement subtracts the count it observed.
+	require.NoError(t, store.ReconcileOwedStamp(ctx, refs[:1]))
+	assert.Equal(t, int64(2), reconcileOwed(t, store, a.ID))
+}
+
+// TestReconcileOwedStampFoldsRepeatedRefs pins the fold the contract states.
+// DependentsListStaleSince returns a row per (target, dependent) pair, so a
+// dependent with two moved targets reaches one page twice; IN matches its row
+// once. Sound because one reconcile answers every wake outstanding at its load,
+// and the decrement subtracts the whole count it observed — but it is a contract
+// a per-ref caller has to know about, not an accident of the statement.
+func TestReconcileOwedStampFoldsRepeatedRefs(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	ref := beehive.ObjectRef{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind}
+
+	require.NoError(t, store.ReconcileOwedStamp(ctx, []beehive.ObjectRef{ref, ref, ref}))
+
+	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "one increment, not three")
+}
+
+// TestReconcileOwedStampSkipsVanishedRows: a dependent can be collected between
+// the listing that found it and the stamp. There is nothing left to owe a wake
+// to, which is not a fault.
+func TestReconcileOwedStampSkipsVanishedRows(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
+
+	err := store.ReconcileOwedStamp(ctx, []beehive.ObjectRef{
+		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
+		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), reconcileOwed(t, store, b.ID), "the surviving ref is still stamped")
+}
+
+// TestResourceVersionsMaxIssuedNeverFalls pins the difference from
+// ObjectWritesMaxVersionAll, which reads a table retention trims. A cursor that
+// falls would compare wrongly against a stored position, so the stale pass reads
+// the sequence instead.
+func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	newRefObject(t, store)
+
+	issued, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	require.Positive(t, issued, "a create takes a version")
+
+	// Age the log out from under the sweep, which is what an idle store past its
+	// retention window sees.
+	_, err = store.db.ExecContext(ctx, `UPDATE object_writes SET written_at = 0`)
+	require.NoError(t, err)
+	_, err = store.ObjectWritesSweep(ctx, 0, time.Hour)
+	require.NoError(t, err)
+
+	logged, err := store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	require.Zero(t, logged, "the log is empty, so its max is back to 0")
+
+	after, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, issued, after, "the sequence is unmoved by retention")
+}
+
 func TestReconcileOwedQueryErrors(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
@@ -4820,7 +4911,7 @@ func newDependentObject(t *testing.T, store beehive.Store, target beehive.Object
 
 // readWatermark returns the stored watermark row for id, or ok=false when the
 // object has none. It reads the table directly because nothing on the Store
-// surface exposes it — DependentsListStale consumes it in a join, and a test
+// surface exposes it — DependentsListStaleSince consumes it in a join, and a test
 // asserting on the write itself needs the columns.
 func readWatermark(t *testing.T, store *sqliteStore, id beehive.ObjectID) (against, at int64, ok bool) {
 	t.Helper()
@@ -5114,18 +5205,41 @@ func cursorNow(t *testing.T, store beehive.Store) int64 {
 	return rv
 }
 
-// staleIDs is DependentsListStale over testGK from the start, projected to ids.
+// staleIDs is the staleness listing over testGK from the beginning, unbounded
+// above, projected to ids and deduped. The listing returns one row per
+// (target, dependent) pair, so a dependent with two moved targets appears twice;
+// these assertions are about which objects are owed a pass.
 func staleIDs(t *testing.T, store beehive.Store) []beehive.ObjectID {
 	t.Helper()
-	refs, err := store.DependentsListStale(context.Background(),
-		[]beehive.GroupKind{testGK}, 0, 100)
+	return dedupeIDs(refIDs(staleRefs(t, store, testGK)))
+}
+
+// staleRefs is staleIDs without the projection, for the tests that assert on the
+// rows themselves.
+func staleRefs(t *testing.T, store beehive.Store, kinds ...beehive.GroupKind) []beehive.ObjectRef {
+	t.Helper()
+	refs, _, err := store.DependentsListStaleSince(context.Background(),
+		kinds, beehive.StalePos{}, math.MaxInt64, 100)
 	require.NoError(t, err)
-	return refIDs(refs)
+	return refs
+}
+
+func dedupeIDs(ids []beehive.ObjectID) []beehive.ObjectID {
+	seen := make(map[beehive.ObjectID]struct{}, len(ids))
+	var out []beehive.ObjectID
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 // A dependent is stale exactly while a target it depends on sits above its
 // watermark, and converges out of the listing once it records a later one.
-func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
+func TestDependentsListStaleSinceFindsMovedTargets(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	target := newRefObject(t, store)
@@ -5138,6 +5252,149 @@ func TestDependentsListStaleFindsMovedTargets(t *testing.T) {
 
 	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
 	assert.Empty(t, staleIDs(t, store), "a pass that observed the change settles it")
+}
+
+// TestDependentsListStaleSincePagesInsideAFanOut pins the cursor form's order and
+// its resume point. The scan drives from targets written above the cursor, so a
+// target with more dependents than one page has to resume inside its own fan-out
+// — cutting at a target boundary would drop the rest of it.
+func TestDependentsListStaleSincePagesInsideAFanOut(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	a := newDependentObject(t, store, target.ID)
+	b := newDependentObject(t, store, target.ID)
+	c := newDependentObject(t, store, target.ID)
+
+	refs, pos, err := store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, beehive.StalePos{}, markNow(t, store), 2)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{a.ID, b.ID}, refIDs(refs), "the cap cuts mid fan-out")
+
+	refs, _, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, pos, markNow(t, store), 2)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{c.ID}, refIDs(refs), "the next page resumes inside the same target")
+}
+
+// markNow is the pre-scan mark a sweep would read.
+func markNow(t *testing.T, store *sqliteStore) int64 {
+	t.Helper()
+	mark, err := store.ResourceVersionsMaxIssued(context.Background())
+	require.NoError(t, err)
+	return mark
+}
+
+// TestDependentsListStaleSinceStopsAtTheMark is what makes a sweep finite. A
+// target written after the sweep read its mark is above the bound and belongs to
+// the next sweep. Without it a store taking writes faster than the sweep pages
+// never reaches a short page, so the sweep never ends and its cursor never moves.
+func TestDependentsListStaleSinceStopsAtTheMark(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	kinds := []beehive.GroupKind{testGK}
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+	mark := markNow(t, store)
+
+	refs, _, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "in scope as of the mark")
+
+	// A write landing while the sweep runs.
+	moveTarget(t, store, target.ID)
+
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "the target moved above the mark, so this sweep leaves it")
+
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	require.NoError(t, err)
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "and the next sweep picks it up")
+}
+
+// TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit: no kinds means no
+// reconcile loop to enqueue into, and a non-positive limit asks for nothing.
+// Both answer without reading, and hand the cursor back unmoved so a caller
+// cannot mistake the empty answer for progress.
+func TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	newDependentObject(t, store, newRefObject(t, store).ID)
+	after := beehive.StalePos{TargetVersion: 7, TargetID: 2, DependentID: 3}
+
+	refs, pos, err := store.DependentsListStaleSince(ctx, nil, after, markNow(t, store), 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "no kinds, nothing to enqueue into")
+	assert.Equal(t, after, pos)
+
+	refs, pos, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, after, markNow(t, store), 0)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "a non-positive limit asks for nothing")
+	assert.Equal(t, after, pos)
+}
+
+// TestDependentsListStaleSinceQueryError: a read that fails is an error, never
+// an empty page — the sweep holds its cursor on it, where an empty page would
+// let the cursor move past a range nobody read.
+func TestDependentsListStaleSinceQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, _, err := store.DependentsListStaleSince(context.Background(),
+		[]beehive.GroupKind{testGK}, beehive.StalePos{}, 9000, 10)
+
+	assert.Error(t, err)
+}
+
+// TestDependentsListStaleSinceDrivesFromTheVersionIndex is the cost assertion.
+// The cursor only pays off if the scan seeks targets through idx_objects_rv; a
+// plan that starts anywhere else reads the whole graph again and the cursor buys
+// nothing. The CROSS JOINs in the query are what hold this.
+func TestDependentsListStaleSinceDrivesFromTheVersionIndex(t *testing.T) {
+	store := newRawStore(t)
+	newDependentObject(t, store, newRefObject(t, store).ID)
+
+	plan := queryPlan(t, store, `
+		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
+		  FROM objects t
+		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
+		  CROSS JOIN objects d ON d.id = e.from_id
+		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
+		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND t.resource_version <= ?
+		   AND e.from_id != e.to_id
+		   AND (d."group", d.kind) IN (VALUES (?, ?))
+		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
+		 ORDER BY t.resource_version, t.id, e.from_id
+		 LIMIT ?`,
+		int64(0), int64(0), int64(0), int64(9000), testGK.Group, testGK.Kind, 10)
+
+	assert.Contains(t, plan, "idx_objects_rv", "the scan must seek targets by version:\n"+plan)
+	assert.NotContains(t, plan, "SCAN t", "and must not read every object:\n"+plan)
+}
+
+// TestDependentsListStaleSinceSkipsConvergedAndSpentPositions covers the two ways
+// the cursor form returns nothing: the cursor is already past every target, and
+// the dependent has observed the target it depends on. The first is what makes an
+// idle sweep cost one indexed range read.
+func TestDependentsListStaleSinceSkipsConvergedAndSpentPositions(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newDependentObject(t, store, target.ID)
+	kinds := []beehive.GroupKind{testGK}
+
+	refs, pos, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	require.NoError(t, err)
+	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "no watermark counts as stale")
+
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, pos, markNow(t, store), 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "the scan does not re-read the row it just returned")
+
+	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "a dependent that observed its target is not returned")
 }
 
 // A *new* depends_on edge invalidates the dependent's watermark, which the
@@ -5216,28 +5473,17 @@ func TestRefsAddKeepsTheWatermarkOnASelfEdge(t *testing.T) {
 // A dependent that has never reconciled against a known point cannot have
 // converged, mirroring how the unsettled index treats a NULL observed_generation
 // — and it is what makes the table need no backfill.
-func TestDependentsListStaleTreatsMissingWatermarkAsStale(t *testing.T) {
+func TestDependentsListStaleSinceTreatsMissingWatermarkAsStale(t *testing.T) {
 	store := newRawStore(t)
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 
 	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
 }
 
-// No kinds means no reconcile loop to enqueue into, so there is nothing to ask
-// for.
-func TestDependentsListStaleReturnsNothingForNoKinds(t *testing.T) {
-	store := newRawStore(t)
-	newDependentObject(t, store, newRefObject(t, store).ID)
-
-	refs, err := store.DependentsListStale(context.Background(), nil, 0, 100)
-	require.NoError(t, err)
-	assert.Empty(t, refs)
-}
-
 // A self-dependent object would be stale against itself for an extra pass every
 // time its own reconcile writes anything, so the edge is excluded — the same
 // reason the waker skips it.
-func TestDependentsListStaleExcludesSelfEdges(t *testing.T) {
+func TestDependentsListStaleSinceExcludesSelfEdges(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5255,7 +5501,7 @@ func TestDependentsListStaleExcludesSelfEdges(t *testing.T) {
 // dependent — stale forever, since nothing ever writes it a watermark — is left
 // out rather than re-scanned on every pass. Registering the kind later is all it
 // takes for the same row to appear.
-func TestDependentsListStaleFiltersByKind(t *testing.T) {
+func TestDependentsListStaleSinceFiltersByKind(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	other := beehive.GroupKind{Kind: "Gadget"}
@@ -5269,9 +5515,8 @@ func TestDependentsListStaleFiltersByKind(t *testing.T) {
 
 	assert.Empty(t, staleIDs(t, store), "a kind with no controller is not listed")
 
-	refs, err := store.DependentsListStale(ctx, []beehive.GroupKind{testGK, other}, 0, 100)
-	require.NoError(t, err)
-	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "and appears once its kind is registered")
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(staleRefs(t, store, testGK, other)),
+		"and appears once its kind is registered")
 }
 
 // The kind filter binds the dependent alone. A registered object may depend on a
@@ -5279,7 +5524,7 @@ func TestDependentsListStaleFiltersByKind(t *testing.T) {
 // narrowing the scan to edges with two registered endpoints would silently strand
 // every dependent of a client-only target. This is the test that fails if someone
 // does that.
-func TestDependentsListStaleFindsDependentsOfUnregisteredTargets(t *testing.T) {
+func TestDependentsListStaleSinceFindsDependentsOfUnregisteredTargets(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	target, err := store.ObjectsCreate(ctx, beehive.GroupKind{Group: "", Kind: "Gadget"}, beehive.ObjectsCreateInput{
@@ -5298,36 +5543,21 @@ func TestDependentsListStaleFindsDependentsOfUnregisteredTargets(t *testing.T) {
 		"a registered dependent of a client-only target is still owed a pass")
 }
 
-// A dependent with several stale targets is owed one pass, not one per target.
-func TestDependentsListStaleReturnsEachDependentOnce(t *testing.T) {
+// A dependent with several stale targets is returned once per target, not once
+// overall: a row is a (target, dependent) pair, because the resume position needs
+// both. The sweep stamps and enqueues, and both fold a duplicate — so this is a
+// contract the caller must tolerate, not one the query should hide with a
+// GROUP BY it cannot afford.
+func TestDependentsListStaleSinceReturnsAPairPerMovedTarget(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	first, second := newRefObject(t, store), newRefObject(t, store)
 	dep := newDependentObject(t, store, first.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, second.ID, beehive.RelationDependsOn))
 
-	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
-}
-
-// Paging is by dependent id, so a caller resumes from the last id it saw.
-func TestDependentsListStalePages(t *testing.T) {
-	store := newRawStore(t)
-	ctx := context.Background()
-	target := newRefObject(t, store)
-	first := newDependentObject(t, store, target.ID)
-	second := newDependentObject(t, store, target.ID)
-
-	page, err := store.DependentsListStale(ctx, []beehive.GroupKind{testGK}, 0, 1)
-	require.NoError(t, err)
-	require.Equal(t, []beehive.ObjectID{first.ID}, refIDs(page))
-
-	page, err = store.DependentsListStale(ctx, []beehive.GroupKind{testGK}, first.ID, 1)
-	require.NoError(t, err)
-	assert.Equal(t, []beehive.ObjectID{second.ID}, refIDs(page))
-
-	page, err = store.DependentsListStale(ctx, []beehive.GroupKind{testGK}, second.ID, 1)
-	require.NoError(t, err)
-	assert.Empty(t, page)
+	assert.Equal(t, []beehive.ObjectID{dep.ID, dep.ID}, refIDs(staleRefs(t, store, testGK)),
+		"one row for each target above the dependent's watermark")
+	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store), "and one object owed a pass")
 }
 
 // The reconcile load carries the write cursor as of the same statement that read
@@ -5396,16 +5626,6 @@ func TestObjectsGetForReconcileAttachesConditions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, load.Object.Conditions, 1)
 	assert.Equal(t, "Ready", load.Object.Conditions[0].Type)
-}
-
-// The staleness scan surfaces a failed query rather than reporting an empty
-// listing, which the sweep would read as "nothing is owed".
-func TestDependentsListStaleQueryError(t *testing.T) {
-	store := newRawStore(t)
-	store.db.Close()
-
-	_, err := store.DependentsListStale(context.Background(), []beehive.GroupKind{testGK}, 0, 10)
-	require.Error(t, err)
 }
 
 // The write log's high-water mark is the maximum over live objects rows, not the

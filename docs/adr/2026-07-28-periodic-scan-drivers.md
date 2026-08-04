@@ -1,7 +1,7 @@
 # Every driver is a periodic scan of the store, on its own cadence
 
-- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `objectswatch.go`, `eventswatch.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md).
-- **Date:** 2026-07-28; watch tail amended 2026-08-03
+- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `objectswatch.go`, `eventswatch.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md). **The stale-dependents pass gained a cursor on 2026-08-03**; it is still a scan. See [the cursor ADR](2026-08-03-stale-dependents-cursor.md).
+- **Date:** 2026-07-28; watch tail and stale-dependents cursor amended 2026-08-03
 
 This record is the *why*. For the case-by-case map of what each driver actually
 covers — every trigger, where it is recorded, which driver finds it, whether it
@@ -64,16 +64,23 @@ disables this driver" one answer rather than one per driver.
 
 ### The stale-dependents pass re-derives what the waker may have missed
 
-`DependentsListStale(kinds, afterID, limit)`, paged to exhaustion on each step, over
-the `depends_on` edges of registered kinds: a dependent is stale when a target sits
-above the watermark its last successful reconcile recorded. It is the correctness
-backstop the waker is an optimisation over, so unlike the waker it **cannot be
-disabled**, and unlike every other driver it asks about current state rather than
-about a column a write moved — which is exactly why it recovers a wake lost by any
-means, including a bug in the wake path or a process that never ran a waker. Its
-cadence is set by acceptable staleness after a crash rather than by cost, since a
-steady-state pass finds nothing and enqueues nothing. Full reasoning in [its
-ADR](2026-07-29-dependency-watermarks.md).
+`DependentsListStaleSince(kinds, pos, through, limit)`, paged to exhaustion on each
+step, over the `depends_on` edges of registered kinds: a dependent is stale when a
+target sits above the watermark its last successful reconcile recorded. It is the
+correctness backstop the waker is an optimisation over, so unlike the waker it
+**cannot be disabled**, and unlike every other driver it asks about current state
+rather than about a column a write moved — which is exactly why it recovers a wake
+lost by any means, including a bug in the wake path or a process that never ran a
+waker. Its cadence is set by acceptable staleness after a crash rather than by
+cost, since a steady-state pass finds nothing and enqueues nothing. Full reasoning
+in [its ADR](2026-07-29-dependency-watermarks.md).
+
+*(Amended 2026-08-03.)* The scan is now bounded by a cursor over target
+`resource_version`, so a sweep costs what changed rather than the size of the
+graph, and an idle tick is one read. It still asks about current state: the cursor
+is process-local and starts at 0, so every process re-derives the whole graph once.
+That is what keeps "recovers a wake lost by any means" true. See
+[the cursor ADR](2026-08-03-stale-dependents-cursor.md).
 
 ### The owed pass drains what the store records as owed
 

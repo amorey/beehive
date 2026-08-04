@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -774,6 +775,11 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
+	// One object, so a version has been issued: the sweep skips a store where
+	// nothing has ever been written, and would never reach the listing.
+	_, err = probe.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() { stop(ctx) })
@@ -786,34 +792,276 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 }
 
 // staleListErrorStore fails the staleness listing, for the sweep's failure arm.
+// It is a DriverCursorer so a test can watch the cursor it must not move.
 type staleListErrorStore struct {
 	fakeStore
-	calls atomic.Int64
+	calls  atomic.Int64
+	issued int64
 }
 
-func (s *staleListErrorStore) DependentsListStale(context.Context, []GroupKind, ObjectID, int) ([]ObjectRef, error) {
+func (s *staleListErrorStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return s.issued, nil
+}
+
+func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.calls.Add(1)
-	return nil, errBoom
+	return nil, after, errBoom
 }
 
-// TestStaleDependentsSweepWarnsAndRetriesOnListFailure pins the failure contract:
-// a sweep that cannot read gives up on this pass and says so. There is no cursor
-// to hold and nothing was drained — the listing derives its answer from current
-// state — so the next tick re-derives the same set, which is why abandoning the
-// sweep is the whole of the repair.
-func TestStaleDependentsSweepWarnsAndRetriesOnListFailure(t *testing.T) {
-	ctx := context.Background()
-	store := &staleListErrorStore{}
-	logger, logs := captureLogger(slog.LevelWarn)
-	bh := &Beehive{store: store, logger: logger}
-	kinds := []GroupKind{clientTestGK}
+// staleSweepStore serves the cursor-form listing one page at a time and records
+// what the sweep asked for, stamped, and persisted.
+type staleSweepStore struct {
+	fakeStore
+	issued    int64
+	issuedErr error
+	stampErr  error
+	pages     [][]ObjectRef
+	asked     []StalePos
+	throughs  []int64
+	stamped   [][]ObjectRef
+}
 
-	bh.staleDependentsSweep(ctx, kinds)
+func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return s.issued, s.issuedErr
+}
+
+func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, through int64, _ int) ([]ObjectRef, StalePos, error) {
+	s.asked = append(s.asked, after)
+	s.throughs = append(s.throughs, through)
+	if len(s.pages) == 0 {
+		return nil, after, nil
+	}
+	page := s.pages[0]
+	s.pages = s.pages[1:]
+	return page, StalePos{TargetVersion: after.TargetVersion + 1}, nil
+}
+
+func (s *staleSweepStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef) error {
+	if s.stampErr != nil {
+		return s.stampErr
+	}
+	s.stamped = append(s.stamped, slices.Clone(refs))
+	return nil
+}
+
+// sweeperOver builds a stale-dependents sweeper over a store double, mirroring
+// what staleDependentsRun assembles.
+func sweeperOver(store Store) *staleDependents {
+	return &staleDependents{
+		bh:    &Beehive{store: store, logger: slog.New(slog.DiscardHandler)},
+		kinds: []GroupKind{clientTestGK},
+	}
+}
+
+// TestStaleDependentsSweepStampsWhatItFinds pins the durable half of a finding.
+// The enqueue lives in memory and a restart loses it; the stamp is what the owed
+// pass drains afterwards. One call per page, not per row.
+func TestStaleDependentsSweepStampsWhatItFinds(t *testing.T) {
+	page := []ObjectRef{
+		{ID: 1, Group: clientTestGK.Group, Kind: clientTestGK.Kind},
+		{ID: 2, Group: clientTestGK.Group, Kind: clientTestGK.Kind},
+	}
+	sd := sweeperOver(&staleSweepStore{issued: 500, pages: [][]ObjectRef{page}})
+
+	sd.sweep(context.Background())
+
+	assert.Equal(t, [][]ObjectRef{page}, sd.bh.store.(*staleSweepStore).stamped)
+}
+
+// TestStaleDependentsSweepAdvancesToThePreScanMark: the cursor moves to the mark
+// read *before* the scan, and the next scan starts above it. A target written
+// while the sweep runs sits above that mark, so the next sweep still finds it.
+func TestStaleDependentsSweepAdvancesToThePreScanMark(t *testing.T) {
+	store := &staleSweepStore{issued: 500}
+	sd := sweeperOver(store)
+	sd.cursor = 200
+
+	sd.sweep(context.Background())
+
+	assert.Equal(t, []StalePos{{TargetVersion: 201}}, store.asked, "above the version already consumed")
+	assert.Equal(t, []int64{500}, store.throughs, "and bounded at the mark it read first")
+	assert.EqualValues(t, 500, sd.cursor)
+}
+
+// TestStaleDependentsSweepSkipsAQuietStore: no version issued since the last
+// sweep means no target moved, so no row can be stale. The listing is skipped,
+// leaving one read per tick.
+func TestStaleDependentsSweepSkipsAQuietStore(t *testing.T) {
+	store := &staleSweepStore{issued: 500}
+	sd := sweeperOver(store)
+	sd.cursor = 500
+
+	sd.sweep(context.Background())
+
+	assert.Empty(t, store.asked, "nothing has moved, so nothing is listed")
+}
+
+// TestStaleDependentsSweepStartsEveryProcessAtTheBeginning is why the cursor is
+// not persisted. A reconcile clears the owed count in one statement and records
+// its watermark in another, so a process killed between them leaves a dependent
+// stale with nothing durable naming it — the count gone, the object settled, its
+// target quiet. Only re-derivation finds it, and every process does one.
+func TestStaleDependentsSweepStartsEveryProcessAtTheBeginning(t *testing.T) {
+	store := &staleSweepStore{issued: 500}
+	ctx := context.Background()
+
+	first := sweeperOver(store)
+	first.sweep(ctx)
+	require.EqualValues(t, 500, first.cursor, "this process will not rescan what it covered")
+
+	store.asked = nil
+	second := sweeperOver(store)
+	second.sweep(ctx)
+
+	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked,
+		"a fresh process starts from nothing, so its first sweep scans the whole graph")
+}
+
+// TestStaleDependentsSweepDoesNotRestampAConsumedVersion: a completed sweep
+// consumed everything up to its mark, so the next one must start above it.
+// Resuming at (mark, 0, 0) still matches every target at that version, because
+// ids are positive — so a target sitting exactly there, whose dependents have
+// not reconciled yet, would have its whole fan-out stamped again on every sweep.
+func TestStaleDependentsSweepDoesNotRestampAConsumedVersion(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	sd := sweeperOver(store)
+	spec := []byte(`{}`)
+
+	// The target is written last, so it sits at exactly the mark sweep one ends on.
+	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	sd.sweep(ctx)
+	raw, err := store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, raw.ReconcileOwed, "the dependent has no watermark, so one pass is owed")
+
+	// An unrelated write moves the mark, so the next tick sweeps. The target
+	// itself has not moved, and the dependent is still stale.
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+
+	sd.sweep(ctx)
+
+	raw, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, raw.ReconcileOwed, "the target did not move, so nothing more is owed")
+}
+
+// TestStaleDependentsSweepLeavesADurableFinding pins that a finding reaches the
+// row and not only the queue, so the owed pass names it on the way back up. This
+// is not what makes the cursor sound — the process-local cursor is (see
+// TestStaleDependentsSweepStartsEveryProcessAtTheBeginning). It is what keeps the
+// guarantee off the queue's drop policy.
+func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	sd := sweeperOver(store)
+
+	spec := []byte(`{}`)
+	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	sd.sweep(ctx)
+
+	owed, err := store.ReconcileOwedListIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "the finding outlives the queue it was also put on")
+}
+
+// TestStaleDependentsSweepWarnsWhenTheMarkReadFails: without the mark the sweep
+// cannot say what it would have covered, so it lists nothing and keeps its
+// cursor.
+func TestStaleDependentsSweepWarnsWhenTheMarkReadFails(t *testing.T) {
+	store := &staleSweepStore{issued: 500, issuedErr: errBoom}
+	logger, logs := captureLogger(slog.LevelWarn)
+	sd := sweeperOver(store)
+	sd.bh.logger = logger
+
+	sd.sweep(context.Background())
+
+	assert.Empty(t, store.asked, "nothing is listed")
+	assert.Zero(t, sd.cursor, "and the cursor stays put")
+	assert.Contains(t, logs.String(), "reading the resource version failed")
+}
+
+// TestStaleDependentsSweepHoldsTheCursorOnStampFailure: a page that could not be
+// stamped was never enqueued either, so counting it as covered would leave those
+// dependents to the next process's re-derivation — a whole restart of latency for
+// a store that is merely failing writes.
+func TestStaleDependentsSweepHoldsTheCursorOnStampFailure(t *testing.T) {
+	page := []ObjectRef{{ID: 1, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}
+	store := &staleSweepStore{issued: 500, pages: [][]ObjectRef{page}, stampErr: errBoom}
+	logger, logs := captureLogger(slog.LevelWarn)
+	sd := sweeperOver(store)
+	sd.bh.logger = logger
+
+	sd.sweep(context.Background())
+
+	assert.Zero(t, sd.cursor, "the cursor does not move past an unrecorded finding")
+	assert.Contains(t, logs.String(), "stamping stale dependents failed")
+}
+
+// TestStaleDependentsSweepRepairsALostWatermarkAfterRestart walks the crash the
+// process-local cursor exists for. The sweep stamps the dependent; a reconcile
+// clears that stamp and dies before recording its watermark. Nothing durable
+// names the dependent any more, and its target never moves again — so only the
+// next process's re-derivation can find it.
+func TestStaleDependentsSweepRepairsALostWatermarkAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	spec := []byte(`{}`)
+	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	sweeperOver(store).sweep(ctx)
+	owed, err := store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, owed.ReconcileOwed, "the sweep recorded the finding")
+
+	// The reconcile that drained it, killed before DependencyWatermarksSet.
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, clientTestGK, dep.ID, 1))
+	owed, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	require.Zero(t, owed.ReconcileOwed, "nothing durable names the dependent now")
+
+	sweeperOver(store).sweep(ctx)
+
+	owed, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, owed.ReconcileOwed, "the new process re-derives and finds it again")
+}
+
+// TestStaleDependentsSweepHoldsTheCursorOnListFailure pins the failure contract:
+// a sweep that cannot read gives up on this pass, says so, and leaves the cursor
+// where it was. Holding it is the repair inside a live process: advancing past a
+// page that was never read leaves every dependent in it to the next restart,
+// because this process re-derives nothing for a target that has gone quiet.
+func TestStaleDependentsSweepHoldsTheCursorOnListFailure(t *testing.T) {
+	ctx := context.Background()
+	store := &staleListErrorStore{issued: 900}
+	logger, logs := captureLogger(slog.LevelWarn)
+	sd := sweeperOver(store)
+	sd.bh.logger, sd.cursor = logger, 200
+
+	sd.sweep(ctx)
 	require.EqualValues(t, 1, store.calls.Load(), "a failed page abandons the sweep")
 	assert.Contains(t, logs.String(), "listing stale dependents failed")
+	assert.EqualValues(t, 200, sd.cursor, "the cursor does not move past a page nobody read")
 
-	bh.staleDependentsSweep(ctx, kinds)
-	assert.EqualValues(t, 2, store.calls.Load(), "and the next pass asks again from the start")
+	sd.sweep(ctx)
+	assert.EqualValues(t, 2, store.calls.Load(), "the next pass asks again")
+	assert.EqualValues(t, 200, sd.cursor, "from the same place")
 }
 
 // TestStaleDependentsSweepIsQuietOnShutdown separates the two reasons a listing
@@ -824,9 +1072,10 @@ func TestStaleDependentsSweepIsQuietOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	logger, logs := captureLogger(slog.LevelWarn)
-	bh := &Beehive{store: &staleListErrorStore{}, logger: logger}
+	sd := sweeperOver(&staleListErrorStore{issued: 900})
+	sd.bh.logger = logger
 
-	bh.staleDependentsSweep(ctx, []GroupKind{clientTestGK})
+	sd.sweep(ctx)
 
 	assert.Empty(t, logs.String(), "a cancelled read is shutdown, not a lost pass")
 }

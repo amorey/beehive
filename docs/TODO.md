@@ -18,86 +18,64 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   Revisit only if an events push path is ruled out for good.
 
-- **The stale-dependents pass rescans the whole dependency graph on every
-  sweep, and a cursor is only sound if the pass records what it finds** —
-  known, not fixed, and deferred on scale rather than on doubt. The fix is
-  understood; the graph is not yet large enough to pay for it.
+- **A standing `reconcile_owed` count overrides the backoff ladder above 30 s** —
+  known, not fixed, and invisible on the default settings.
 
-  **Measured cost.** One converged sweep, in-memory store, one kind:
+  `ReconcileOwedDecrement` is gated on `reconcileErr == nil`, so a failing object
+  keeps whatever stamped it. The owed pass lists it every `owedPassInterval` and
+  calls `work.add`, and `add` consults only the queued-now set: an id parked on a
+  backoff alarm is not in that set, so it is dispatched at once and the alarm
+  later fires into a no-op. Retries are therefore floored at the owed-pass
+  cadence for as long as the count stands.
 
-  | Objects | `depends_on` edges | One sweep |
-  | --- | --- | --- |
-  | 1,000 | 2,000 | 1.5 ms |
-  | 10,000 | 20,000 | 17 ms |
-  | 10,000 | 50,000 | 37 ms |
-  | 50,000 | 250,000 | 190 ms |
+  **The defaults hide it.** `defaultMaxRetryInterval` and
+  `defaultOwedPassInterval` are both 30 s, so every rung of the ladder is at or
+  under the tick and the alarm always beats it. Raising `WithMaxRetryInterval`
+  above the owed-pass interval is what exposes it, and nothing in that option's
+  documentation says so — which is the actual defect here.
 
-  About 0.75 µs for each edge, tracking the edge count rather than the
-  object count. A converged sweep is the *worst* case: `LIMIT` cannot stop
-  the scan early when nothing matches, so a healthy system pays the full
-  scan in one query. With every dependent stale the first query costs
-  1.3 ms, because it stops after 256 groups.
+  The stale-dependents pass widened who this reaches. Before it stamped its
+  findings, a standing count meant a non-converging edge set; now it means any
+  dependent the pass found whose reconcile is failing. See
+  [the cursor ADR](adr/2026-08-03-stale-dependents-cursor.md).
 
-  Compare the owed pass on the same 50,000-object store, converged: 116 µs
-  for the unsettled listing and 25 µs for the reconcile-owed listing, both
-  returning nothing. Their indexes are partial, so they hold no entries when
-  the system is settled. The stale-dependents pass has no equivalent,
-  because "stale" compares `objects.resource_version` with
-  `dependency_watermarks.reconciled_against` — two columns in two different
-  rows, which no index can serve.
+  **The fix is a floor, not a gate**: have the owed pass enqueue through a path
+  that respects a pending alarm, or document the interaction on
+  `WithMaxRetryInterval`. Deferred because the cheap half is documentation and the
+  real half needs `workQueue` to distinguish "queued now" from "waiting on an
+  alarm" at the `add` call site, which is the same signal the
+  minimum-re-enqueue-interval item below wants. Do them together.
 
-  **Why there is no cursor today.** A cursor would limit the sweep to
-  targets written since the last one. It would then never re-examine a
-  dependent that is already stale and whose target has gone quiet. Three
-  ways that happens:
+- **A reconcile's owed decrement and its dependency-watermark write are two
+  statements, so losing both strands the dependent** — known, not fixed, and
+  bounded to a process that keeps running after the failure.
 
-  1. The pass found the dependent and the process died before the reconcile
-     ran. The enqueue was in memory, and nothing failed, so nothing was
-     recorded.
-  2. The reconcile succeeded and the watermark write failed. `reconciler.go`
-     writes it independently and swallows the error, on the stated ground
-     that "the next stale pass re-derives it".
-  3. `EdgesAdd` cleared the watermark for a new edge whose target is quiet.
-     This one is already covered, because `EdgesAdd` stamps
-     `reconcile_owed`.
+  `typedController.reconcile` clears `reconcile_owed` and then records
+  `dependency_watermarks.reconciled_against` in separate non-transactional
+  statements. If the watermark write fails, the fallback at that site stamps
+  `reconcile_owed` again — but both calls share the store's single connection
+  and usually fail together. When the stamp fails too, nothing durable names the
+  dependent: the count is gone, the object is settled by its status write, and
+  the stale-dependents pass is cursor-bound, so a target that stays quiet is
+  never rescanned.
 
-  **What makes a cursor sound: let the pass stamp `reconcile_owed` instead
-  of enqueueing in memory.** Then every finding is durable, the owed pass
-  drains it on an empty partial index, and the sweep may advance a cursor
-  because it never has to re-find anything. A failed reconcile already
-  leaves the count up — the decrement is gated on `reconcileErr == nil` —
-  so that half needs no change. Case 2 needs one: stamp the count when the
-  watermark write fails, rather than swallowing it.
+  **The crash case is already covered**, and by a different mechanism: the
+  stale-dependents cursor is process-local, so every process re-derives once and
+  repairs any strand a crash produced. What is left is a *live* process that
+  loses both writes and then keeps running, where the dependent waits for the
+  next restart instead of the next owed pass.
 
-  **What that turns the pass into.** Listing targets above a cursor and
-  resolving their dependents through `edges` is the dependency waker, with
-  a durable stamp added. So this is not a new mechanism; it is the waker
-  made into a guarantee, replacing a scan whose cost is the graph with one
-  whose cost is the change rate.
+  **The fix is one transaction.** Fold the decrement and the watermark set into
+  a single `Within`. A failure then rolls back both, leaving `reconcile_owed`
+  standing by construction, and the fallback stamp is needed only where the
+  count was already 0 at load. See
+  [the ADR](adr/2026-08-03-stale-dependents-cursor.md).
 
-  **Three costs, which is why it waits.** It reintroduces the durable
-  cursor that the push conversion deletes with the waker. It turns a
-  read-only pass into one that writes once for each stale dependent, on the
-  single connection. And one cursor shared by two processes on one database
-  breaks — each would skip work the other's cursor claimed — where the full
-  scan is immune to that by construction.
-
-  **Revisit at roughly ten times the current measured graph.** At 250,000
-  edges the sweep is 190 ms, which is 0.06% of one connection at a
-  five-minute interval. At 2.5 million edges it is near 2 s a sweep, and
-  the arithmetic changes. Revisit sooner if the interval ever has to come
-  back down, since the cost is per sweep.
-
-  **Tripwires.** `TestStaleDependentsPassEnqueuesStaleDependents` closes
-  every other route to the dependent — the waker off, the full pass off,
-  the dependent settled — so it asserts the pass finds a dependent nobody
-  told it about. That is the property a cursor puts at risk.
-  `TestStaleDependentsSweepWarnsAndRetriesOnListFailure` is the sharper
-  one: its comment reads "there is no cursor to hold and nothing was
-  drained", which is the exact sentence a cursor invalidates. Adding one
-  makes "hold the cursor on a failed sweep" a new requirement, and that
-  test is where it has to be pinned. The measurements above came from a
-  throwaway benchmark; rebuild it before changing anything here.
+  Deferred because it puts a transaction on the reconcile path, which
+  `CLAUDE.md` deliberately keeps non-transactional, on the single connection
+  every writer shares. That trade deserves its own review rather than riding
+  along with the cursor work. Do it before the first release: after one, a
+  dependent stranded this way is a support case nobody can diagnose.
 
 - **An edge write is invisible to every cursor in the system, and the fix is one
   counter rather than a log** — known, not fixed, and recorded here mostly to
@@ -107,10 +85,17 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   `EdgesAdd` and `EdgesDelete` bump no `resource_version` and append no write-log
   entry, because a ref is not a field of the object. So no log cursor can see a
   new edge, a dropped one, or the `dependency_watermarks` clear that rides a new
-  one. Two places pay for it: an idle gate on the stale-dependents sweep cannot
-  be justified from the write log alone, and a deletion unblocked by
-  `DependenciesDelete` waits for the next GC tick with nothing able to signal it
-  (case 9 in [`reconcile-triggers.md`](reconcile-triggers.md)).
+  one. One place pays for it: a deletion unblocked by `DependenciesDelete` waits
+  for the next GC tick with nothing able to signal it (case 9 in
+  [`reconcile-triggers.md`](reconcile-triggers.md)).
+
+  **The stale-dependents pass no longer pays.** Its scan is bounded by a cursor
+  over target `resource_version`, which an edge write also cannot move — but a
+  new edge stamps `reconcile_owed` inside `EdgesAdd`, so the owed pass carries
+  that dependent and the scan is not asked to see it. An idle tick of the pass is
+  now one `ResourceVersionsMaxIssued` read, so there is no full scan left for a
+  gate to skip. See
+  [the ADR](adr/2026-08-03-stale-dependents-cursor.md).
 
   **Recording edges in `object_writes` is the wrong fix, on four counts.**
   `edges.from_id` is `ON DELETE CASCADE`, so collecting an object removes its
@@ -125,19 +110,15 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   a `resource_version` and an append for each edge write, on a path that is free
   today, which a controller re-declaring its edge set every pass pays per pass.
 
-  **One monotonic counter covers what actually needs covering.** The only
-  consumer that needs "did the edge set move" is the stale-dependents pass, and it
-  needs one bit, not a stream: an epoch bumped by `EdgesAdd` and `EdgesDelete`,
-  shaped like `driver_cursors`. An idle gate reading `(ObjectWritesMaxVersionAll,
-  edgesEpoch)` unchanged → skip is then sound outright, rather than resting on the
-  argument that the watermark clear is backstopped by the stamp. No retention, no
+  **One monotonic counter covers what actually needs covering.** A consumer that
+  needs "did the edge set move" needs one bit, not a stream: an epoch bumped by
+  `EdgesAdd` and `EdgesDelete`, shaped like `driver_cursors`. No retention, no
   watch noise, and the cascade needs no trigger, because a cascade that removes
   edges also collects an object and that already appends.
 
-  Deferred with the gate itself: the sweep it would skip is 190 ms at 250,000
-  edges, so the saving is real only for an idle store, and the item above is the
-  one that matters at scale. Do this one first if the gate is ever wanted, since
-  the counter is what makes it correct rather than merely defensible.
+  Deferred because the one consumer left is case 9, where the cost is a single GC
+  tick of latency on a deletion. Build the counter only when a second consumer
+  appears, or when that latency is measured to matter.
 
 - **A dependency cycle of length ≥ 2 reconciles forever** — known, not fixed. The
   self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`, so an object
@@ -220,8 +201,10 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   Either way that change is never read by any scan — and a settled dependent D of T is
   invisible to every owed-work listing, since D's own generation never moved and
   nothing stamped `reconcile_owed`. **What closes it is the stale-dependents pass**,
-  which re-derives staleness from `dependency_watermarks` rather than from anything the
-  waker recorded (see [the ADR](docs/adr/2026-07-29-dependency-watermarks.md)). So D
+  which derives staleness from `dependency_watermarks` rather than from anything the
+  waker recorded (see [the ADR](docs/adr/2026-07-29-dependency-watermarks.md)). Its
+  cursor does not narrow this case: the racing write bumps T's `resource_version`, so T
+  sits inside the range the next sweep reads. So D
   converges within one stale-pass interval instead of never, and what is left here is
   60 seconds of latency where the waker promises one.
 
@@ -290,8 +273,10 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   them.
 
   **Correctness is intact and that is why this is deferred:** those dependents are
-  found by the stale-dependents pass, which re-derives staleness from
-  `dependency_watermarks` and records nothing the trim could remove. The cost is
+  found by the stale-dependents pass, which derives staleness from
+  `dependency_watermarks` and from `reconcile_owed`, neither of which the write
+  log's trim can touch. This path opens only after a restart, which is also when
+  that pass re-derives the whole graph from a cursor of 0. The cost is
   up to one `staleDependentsInterval` of latency, on a path that only opens after
   a downtime exceeding the write log's retention.
 

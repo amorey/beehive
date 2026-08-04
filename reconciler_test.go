@@ -446,11 +446,11 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
 
-	// The stale-dependents pass cannot be disabled, and it would re-derive this
-	// dependent's staleness within a tick or two — closing the gap for a reason other
-	// than the one under test. Pushing it past the test's own timeout leaves the
-	// EdgesAdd stamp as the only thing that can requeue the dependent, which is what
-	// this is about.
+	// The stale-dependents pass cannot be disabled, and its first sweep of a fresh
+	// process scans from 0 — so it can re-derive this dependent's staleness and
+	// close the gap for a reason other than the one under test. Pushing it past the
+	// test's own timeout leaves the EdgesAdd stamp as the only thing that can
+	// requeue the dependent, which is what this is about.
 	bh := newTestBeehive(t, store, fast(withStaleDependentsInterval(time.Hour))...)
 
 	gk := GroupKind{Kind: "Widget"}
@@ -2738,9 +2738,7 @@ func newWatermarkHarness(t *testing.T, wrap func(Store) Store) *watermarkHarness
 // stale is what the stale-dependents pass would enqueue right now.
 func (h *watermarkHarness) stale(t *testing.T) []ObjectID {
 	t.Helper()
-	refs, err := h.store.DependentsListStale(context.Background(), []GroupKind{clientTestGK}, 0, 100)
-	require.NoError(t, err)
-	return objectRefIDs(refs)
+	return staleDependentIDs(t, h.store, clientTestGK)
 }
 
 // touchTarget writes the target's spec, so it moves above any watermark recorded
@@ -2866,11 +2864,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 	target, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	tc, inner := newSyncController(s)
-	stale := func() []ObjectID {
-		refs, err := s.DependentsListStale(ctx, []GroupKind{clientTestGK}, 0, 100)
-		require.NoError(t, err)
-		return objectRefIDs(refs)
-	}
+	stale := func() []ObjectID { return staleDependentIDs(t, s, clientTestGK) }
 
 	inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, cc.DependenciesAdd(ctx, dep.ID, target.ID)
@@ -2895,8 +2889,16 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 // not catch.
 type watermarkProbeStore struct {
 	Store
-	sets []ObjectID
-	err  error
+	sets     []ObjectID
+	err      error
+	stampErr error
+}
+
+func (s *watermarkProbeStore) ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error {
+	if s.stampErr != nil {
+		return s.stampErr
+	}
+	return s.Store.ReconcileOwedStamp(ctx, refs)
 }
 
 func (s *watermarkProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
@@ -2928,6 +2930,76 @@ func TestReconcileSkipsDependencyWatermarkWithoutDependencies(t *testing.T) {
 	_, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{h.dep}, probe.sets, "a dependent does record one")
+}
+
+// TestReconcileStampsOwedWhenTheWatermarkWriteFails pins the durable record a
+// failed watermark write has to leave. Re-deriving the object was enough while
+// the stale pass scanned everything; a cursor-bound pass re-derives nothing for a
+// target that has gone quiet, so the failure must record its own owed wake.
+func TestReconcileStampsOwedWhenTheWatermarkWriteFails(t *testing.T) {
+	ctx := context.Background()
+	var probe *watermarkProbeStore
+	h := newWatermarkHarness(t, func(s Store) Store {
+		probe = &watermarkProbeStore{Store: s, err: errBoom}
+		return probe
+	})
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err, "the reconcile itself succeeded; only the bookkeeping failed")
+
+	raw, err := h.store.ObjectsGet(ctx, h.dep)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, raw.ReconcileOwed, "the lost watermark is owed a pass")
+}
+
+// TestReconcileReportsAnUnrecordableLostWatermark is the end of the line. The
+// watermark write failed and the stamp meant to repair it failed too, on the same
+// connection — so nothing durable records that this dependent is owed a pass, and
+// this process's cursor-bound stale pass will not re-derive it. Only a restart
+// repairs it, which is worth an error.
+func TestReconcileReportsAnUnrecordableLostWatermark(t *testing.T) {
+	ctx := context.Background()
+	logger, logs := captureLogger(slog.LevelWarn)
+	h := newWatermarkHarness(t, func(s Store) Store {
+		return &watermarkProbeStore{Store: s, err: errBoom, stampErr: errBoom}
+	})
+	h.tc.logger = logger
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err, "the reconcile itself succeeded")
+
+	assert.Contains(t, logs.String(), "failed to owe a pass for the lost dependency watermark")
+}
+
+// TestReconcileIsQuietWhenShutdownLosesTheWatermark separates the two reasons the
+// watermark write fails. Stop cancels the ctx the pass runs on, so a reconcile in
+// flight loses the write for no fault of its own — and the stamp that would
+// normally repair it fails the same way. Reporting either would put a WARN and an
+// ERROR on every clean shutdown of any object with dependencies.
+func TestReconcileIsQuietWhenShutdownLosesTheWatermark(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	logger, logs := captureLogger(slog.LevelWarn)
+	h := newWatermarkHarness(t, func(s Store) Store {
+		return &watermarkProbeStore{Store: s, err: errBoom}
+	})
+	h.tc.logger = logger
+	// Cancel inside the pass: the load and the reconcile succeed, and only the
+	// bookkeeping that follows meets a dead context.
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		cancel()
+		return Result{}, nil
+	}
+
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+
+	assert.Empty(t, logs.String(), "a cancelled write is shutdown, not a lost pass")
 }
 
 // TestReconcileRecordsCursorFromTheLoad pins where the cursor comes from. A
@@ -2990,8 +3062,9 @@ func TestReconcileHoldsDependencyWatermarkOnUndecodableRow(t *testing.T) {
 }
 
 // TestReconcileWarnsAndContinuesOnCursorWriteFailure pins the failure contract:
-// no error escapes into the backoff ladder over a bookkeeping write that the next
-// stale pass re-derives anyway.
+// no error escapes into the backoff ladder over a bookkeeping write. The repair is
+// the owed stamp beside it, not the stale pass — that pass is cursor-bound and
+// re-derives nothing for a target that has gone quiet.
 func TestReconcileWarnsAndContinuesOnCursorWriteFailure(t *testing.T) {
 	ctx := context.Background()
 	h := newWatermarkHarness(t, func(s Store) Store {

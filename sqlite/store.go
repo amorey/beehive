@@ -891,12 +891,39 @@ func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.Grou
 	return scanIDs(rows)
 }
 
+// ResourceVersionsMaxIssued reads the sequence itself (contract on
+// storeapi.Store). One row, always present: the migration seeds it.
+func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, error) {
+	var rv int64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
+	return rv, err
+}
+
+// ReconcileOwedStamp stamps a page of findings in one statement (contract on
+// storeapi.Store). A missing id matches no row, which is how a vanished
+// dependent is skipped; a repeated id matches its row once, which is the fold
+// the contract requires.
+func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.ObjectRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	args := make([]any, len(refs))
+	for i, ref := range refs {
+		args[i] = ref.ID
+	}
+	_, err := s.conn(ctx).ExecContext(ctx,
+		`UPDATE objects SET reconcile_owed = reconcile_owed + 1
+		  WHERE id IN (`+placeholders(len(refs))+`)`, args...)
+	return err
+}
+
 // ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs
 // on the owed-wake count; the decrement floors at 0 (contract on storeapi.Store).
 //
 // The increment is deliberately not on that interface: production wakes come
-// from EdgesAdd, whose stamp must be indivisible from the edge insert. It stays
-// here so tests can seed a count.
+// from EdgesAdd, whose stamp must be indivisible from the edge insert, and from
+// ReconcileOwedStamp. It stays here so tests can seed a count.
 func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)
@@ -923,48 +950,59 @@ func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.Gr
 	return nil
 }
 
-// DependentsListStale re-derives which dependents are owed a pass (see the
-// contract on storeapi.Store). to_id is ON DELETE RESTRICT, so a target always
-// outlives its edges — only the watermark side needs a LEFT JOIN.
+// DependentsListStaleSince re-derives which dependents are owed a pass, bounded
+// by a cursor over target versions (see the contract on storeapi.Store). to_id is
+// ON DELETE RESTRICT, so a target always outlives its edges — only the watermark
+// side needs a LEFT JOIN.
 //
-// The CROSS JOINs pin the join order; the query is superlinear without them.
-// Left to choose, the planner drives from idx_objects_kind and materialises a
-// temp B-tree before LIMIT — one full scan per page. Driving from edges bounds
-// the cost by the dependency graph, not the object count.
+// The CROSS JOINs pin the join order: targets, then incoming edges, then
+// dependents. Without them the planner reads the whole graph and the cursor
+// buys nothing.
 //
-// GROUP BY, not DISTINCT: with the scan in from_id order the grouping is free,
-// where DISTINCT plans two temp B-trees. The kinds list is not chunked: it comes
-// from Register calls, not caller data.
-func (s *sqliteStore) DependentsListStale(ctx context.Context, kinds []storeapi.GroupKind, afterID storeapi.ObjectID, limit int) ([]storeapi.ObjectRef, error) {
+// No GROUP BY: a row is one (target, dependent) pair, and the position needs
+// both to resume. The kinds list is not chunked; it comes from Register calls,
+// not caller data.
+func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, through int64, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
 	if len(kinds) == 0 || limit <= 0 {
-		return nil, nil
+		return nil, after, nil
 	}
-	args := make([]any, 0, len(kinds)*2+2)
-	args = append(args, afterID)
-	placeholders := make([]string, len(kinds))
+	args := make([]any, 0, len(kinds)*2+5)
+	args = append(args, after.TargetVersion, after.TargetID, after.DependentID, through)
+	tuples := make([]string, len(kinds))
 	for i, gk := range kinds {
-		placeholders[i] = "(?, ?)"
+		tuples[i] = "(?, ?)"
 		args = append(args, gk.Group, gk.Kind)
 	}
 	args = append(args, limit)
 	rows, err := s.conn(ctx).QueryContext(ctx, `
-		SELECT e.from_id, d."group", d.kind
-		  FROM edges e
+		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
+		  FROM objects t
+		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
 		  CROSS JOIN objects d ON d.id = e.from_id
-		  CROSS JOIN objects t ON t.id = e.to_id
 		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
-		 WHERE e.relation = 'depends_on'
+		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND t.resource_version <= ?
 		   AND e.from_id != e.to_id
-		   AND e.from_id > ?
-		   AND (d."group", d.kind) IN (VALUES `+strings.Join(placeholders, ", ")+`)
+		   AND (d."group", d.kind) IN (VALUES `+strings.Join(tuples, ", ")+`)
 		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
-		 GROUP BY e.from_id
-		 ORDER BY e.from_id
+		 ORDER BY t.resource_version, t.id, e.from_id
 		 LIMIT ?`, args...)
 	if err != nil {
-		return nil, err
+		return nil, after, err
 	}
-	return scanObjectRefs(rows)
+	defer rows.Close()
+
+	var refs []storeapi.ObjectRef
+	pos := after
+	for rows.Next() {
+		var ref storeapi.ObjectRef
+		// INTEGER -> int64 and TEXT NOT NULL -> string never fail, as in scanObjectRefs.
+		_ = rows.Scan(&pos.TargetVersion, &pos.TargetID, &ref.ID, &ref.Group, &ref.Kind)
+		pos.DependentID = ref.ID
+		refs = append(refs, ref)
+	}
+	// On error the caller discards both, so a half-advanced pos costs nothing.
+	return refs, pos, rows.Err()
 }
 
 // DependencyWatermarksSet upserts id's dependency watermark (see the contract on
@@ -1978,8 +2016,8 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 		// recorded over a smaller dependency set and cannot speak for the new
 		// target. The stamp above is the guarantee — this clear can be undone by a
 		// pass in flight — but a false watermark would misreport convergence to
-		// DependentsListStale until the owed pass. Same edge-new gate; self-edges
-		// skipped to match DependentsListStale.
+		// DependentsListStaleSince until the owed pass. Same edge-new gate;
+		// self-edges skipped to match that listing.
 		if newDependency {
 			if _, err := s.conn(ctx).ExecContext(ctx, `
 				DELETE FROM dependency_watermarks
