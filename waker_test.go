@@ -884,7 +884,9 @@ func (s *staleSweepStore) DriverCursorsSet(_ context.Context, name string, curso
 	if s.stored == nil {
 		s.stored = map[string]int64{}
 	}
-	s.stored[name] = cursor
+	if stored, ok := s.stored[name]; !ok || cursor > stored {
+		s.stored[name] = cursor
+	}
 	return nil
 }
 
@@ -893,7 +895,8 @@ func (s *staleSweepStore) DriverCursorsSet(_ context.Context, name string, curso
 func sweeperOver(store Store) *staleDependents {
 	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
 	cursors, _ := store.(DriverCursorer)
-	return &staleDependents{bh: bh, kinds: []GroupKind{clientTestGK}, cursors: cursors}
+	resets, _ := store.(DriverCursorResetter)
+	return &staleDependents{bh: bh, kinds: []GroupKind{clientTestGK}, cursors: cursors, resets: resets}
 }
 
 // TestStaleDependentsSweepStampsWhatItFinds pins the durable half of a finding.
@@ -966,6 +969,71 @@ func TestStaleDependentsSweepRederivesFromAForeignCursor(t *testing.T) {
 	next := sweeperOver(store)
 	next.resume(ctx)
 	assert.EqualValues(t, 500, next.cursor, "a restart reads the repaired cursor")
+}
+
+// cursorOnlyStore implements DriverCursorer and nothing more — a backend written
+// against the interface before DriverCursorResetter existed.
+type cursorOnlyStore struct {
+	fakeStore
+	issued   int64
+	stored   map[string]int64
+	setCalls []int64
+}
+
+func (s *cursorOnlyStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+	return s.issued, nil
+}
+
+func (s *cursorOnlyStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
+	v, ok := s.stored[name]
+	return v, ok, nil
+}
+
+// Set-if-greater, as the contract requires: without the guard a test could not
+// tell a cursor that was lowered from one that was left alone.
+func (s *cursorOnlyStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+	s.setCalls = append(s.setCalls, cursor)
+	if s.stored == nil {
+		s.stored = map[string]int64{}
+	}
+	if stored, ok := s.stored[name]; !ok || cursor > stored {
+		s.stored[name] = cursor
+	}
+	return nil
+}
+
+// TestStaleDependentsSweepKeepsCursorsWithoutTheResetter is the compatibility
+// guarantee. Reset is a capability of its own, so a store that predates it still
+// persists its cursors — folding Reset into DriverCursorer would have made such
+// a store fail the assertion and lose persistence with no build error.
+func TestStaleDependentsSweepKeepsCursorsWithoutTheResetter(t *testing.T) {
+	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 200}}
+	sd := sweeperOver(store)
+	ctx := context.Background()
+
+	require.NotNil(t, sd.cursors, "the older capability is still satisfied")
+	require.Nil(t, sd.resets)
+
+	sd.resume(ctx)
+	require.EqualValues(t, 200, sd.cursor, "the stored cursor is still read")
+
+	sd.sweep(ctx)
+	assert.Equal(t, []int64{500}, store.setCalls, "and still written")
+}
+
+// A foreign cursor is repaired in memory even where the store cannot lower the
+// row. The cost is one re-derivation per start, which is what this pass did
+// before the cursor existed.
+func TestStaleDependentsSweepRederivesInMemoryWithoutTheResetter(t *testing.T) {
+	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{cursorNameStaleDependents: 9000}}
+	sd := sweeperOver(store)
+	ctx := context.Background()
+	sd.resume(ctx)
+
+	sd.sweep(ctx)
+
+	assert.EqualValues(t, 500, sd.cursor, "this process re-derives and moves on")
+	assert.Equal(t, 9000, int(store.stored[cursorNameStaleDependents]), "the row it cannot lower is left alone")
 }
 
 // TestStaleDependentsSweepSweepsWhenTheForeignResetFails: the reset is the

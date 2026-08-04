@@ -296,7 +296,8 @@ const cursorNameStaleDependents = "stale_dependents"
 type staleDependents struct {
 	bh      *Beehive
 	kinds   []GroupKind
-	cursors DriverCursorer // nil when the store cannot persist a cursor
+	cursors DriverCursorer       // nil when the store cannot persist a cursor
+	resets  DriverCursorResetter // nil when it cannot lower one
 
 	// cursor is the target version the last completed sweep covered.
 	cursor int64
@@ -312,7 +313,8 @@ func (bh *Beehive) staleDependentsRun(ctx context.Context) {
 		kinds = append(kinds, r.gk)
 	}
 	cursors, _ := bh.store.(DriverCursorer)
-	sd := &staleDependents{bh: bh, kinds: kinds, cursors: cursors}
+	resets, _ := bh.store.(DriverCursorResetter)
+	sd := &staleDependents{bh: bh, kinds: kinds, cursors: cursors, resets: resets}
 	sd.resume(ctx)
 	driver.Run(ctx, bh.staleDependentsInterval, func(ctx context.Context) bool {
 		sd.sweep(ctx)
@@ -358,11 +360,11 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	if sd.cursor > mark {
 		// A cursor above the store's own sequence came from another database.
 		// Re-derive everything once rather than scan above a point this store
-		// never reached. Reset the row too: DriverCursorsSet cannot lower it, so
-		// without this every start would re-read the same foreign cursor.
+		// never reached. Reset the row too where the store can: DriverCursorsSet
+		// cannot lower it, so otherwise every start re-reads the same cursor.
 		sd.cursor = 0
-		if sd.cursors != nil {
-			if err := sd.cursors.DriverCursorsReset(ctx, cursorNameStaleDependents, 0); err != nil {
+		if sd.resets != nil {
+			if err := sd.resets.DriverCursorsReset(ctx, cursorNameStaleDependents, 0); err != nil {
 				log.WarnContext(ctx, "resetting the stale-dependents cursor failed; the next start re-derives again", "err", err)
 			}
 		}

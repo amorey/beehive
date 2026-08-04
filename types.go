@@ -49,6 +49,10 @@ type FreePagesReleaser = storeapi.FreePagesReleaser
 // position across restarts. The dependency waker uses it when present.
 type DriverCursorer = storeapi.DriverCursorer
 
+// DriverCursorResetter is an optional Store capability for lowering a driver's
+// persisted cursor. See storeapi.DriverCursorResetter.
+type DriverCursorResetter = storeapi.DriverCursorResetter
+
 // RawObject is the untyped row below the generic boundary: opaque Spec/Status
 // JSON plus Beehive-owned metadata.
 type RawObject = storeapi.RawObject

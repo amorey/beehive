@@ -127,6 +127,17 @@ reached and finding nothing for good.
 - **`DependentsListStale`, the unbounded form, has no production caller.** It
   survives for the tests that assert against a full re-derivation. Removing it
   belongs with the merge above.
+- **A cursor that must move backwards needs its own capability.** A stored
+  position above this database's sequence cannot be replaced by
+  `DriverCursorsSet`, whose monotone guard discards it, so the repair would be
+  redone on every start. `DriverCursorResetter` writes without the guard.
+
+  It is a **separate** optional interface, not a third method on
+  `DriverCursorer`. Growing an optional capability is silent: a backend written
+  against the older interface simply stops satisfying it, the type assertion
+  yields nil, and cursor persistence disappears with no build error. That
+  applies to every optional capability here, and is the reason to add a
+  capability rather than extend one.
 - **A cursor shared by two processes on one database breaks**, because each
   would skip work the other's cursor claimed. The full scan was immune to that
   by construction. This is bounded by the single-writer, single-process
