@@ -303,6 +303,38 @@ func TestCollectCascadesAndBlocksOnChild(t *testing.T) {
 	assert.NotNil(t, gotChild.DeletionRequestedAt, "child deletion requested by cascade")
 }
 
+// cascadeFixture is gcFixture with the kind registered, so the cascade's pushes
+// land somewhere observable. Nothing is started: these assert that the *cascade*
+// queued the children, not that a driver later found them.
+func cascadeFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], *reconciler) {
+	t.Helper()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), r
+}
+
+// The cascade queues the children it marked, so a deletion advances one level per
+// commit instead of one level per sweep.
+func TestCascadePushesEachMarkedChild(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	childA := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+	childB := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []ObjectID{childA.ID, childB.ID}, queuedIDs(r.work),
+		"both marked children are queued")
+}
+
 func TestCollectDeletesOwnerAfterChildGone(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
