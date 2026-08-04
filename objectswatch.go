@@ -438,8 +438,7 @@ func (t *objectTailer) run() {
 			retry.Reset()
 			backingOff = false
 		}
-		timer.Stop()
-		timer.Reset(next)
+		driver.Rearm(timer, next)
 	}
 }
 
