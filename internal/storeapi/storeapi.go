@@ -513,9 +513,15 @@ type Store interface {
 	// a wake.
 	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
-	// ReconcileOwedStamp increments reconcile_owed for each ref, so a finding
-	// outlives the in-memory queue. An id that is gone is skipped, not
-	// reported. Empty refs writes nothing. Bumps no resource_version.
+	// ReconcileOwedStamp increments reconcile_owed once for each DISTINCT ref, so
+	// a finding outlives the in-memory queue. Repeats inside one call fold into
+	// that single increment: a caller owed two wakes for one object must make two
+	// calls. Sound for the pass, whose listing returns a row per (target,
+	// dependent) pair, because one reconcile answers every wake outstanding at its
+	// load and ReconcileOwedDecrement subtracts the whole count it observed.
+	//
+	// An id that is gone is skipped, not reported. Empty refs writes nothing.
+	// Bumps no resource_version.
 	//
 	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
 	// store's own listing, which spans every registered kind in one page.

@@ -3126,6 +3126,23 @@ func TestReconcileOwedStampRecordsFindings(t *testing.T) {
 	assert.Equal(t, int64(2), reconcileOwed(t, store, a.ID))
 }
 
+// TestReconcileOwedStampFoldsRepeatedRefs pins the fold the contract states.
+// DependentsListStaleSince returns a row per (target, dependent) pair, so a
+// dependent with two moved targets reaches one page twice; IN matches its row
+// once. Sound because one reconcile answers every wake outstanding at its load,
+// and the decrement subtracts the whole count it observed — but it is a contract
+// a per-ref caller has to know about, not an accident of the statement.
+func TestReconcileOwedStampFoldsRepeatedRefs(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	ref := beehive.ObjectRef{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind}
+
+	require.NoError(t, store.ReconcileOwedStamp(ctx, []beehive.ObjectRef{ref, ref, ref}))
+
+	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "one increment, not three")
+}
+
 // TestReconcileOwedStampSkipsVanishedRows: a dependent can be collected between
 // the listing that found it and the stamp. There is nothing left to owe a wake
 // to, which is not a fault.

@@ -902,7 +902,8 @@ func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, err
 
 // ReconcileOwedStamp stamps a page of findings in one statement (contract on
 // storeapi.Store). A missing id matches no row, which is how a vanished
-// dependent is skipped.
+// dependent is skipped; a repeated id matches its row once, which is the fold
+// the contract requires.
 func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.ObjectRef) error {
 	if len(refs) == 0 {
 		return nil
