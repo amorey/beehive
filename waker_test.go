@@ -554,20 +554,20 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 		"the dependent of the write made while the process was down is woken on the first scan back")
 }
 
-// One tick reads at most wakeScanPagesPerTick pages, so a long backlog cannot
+// One tick reads at most wakeScanPagesPerPass pages, so a long backlog cannot
 // monopolise the single connection the reconcile loops need too. The remainder
 // is not lost: the cursor persists at whatever this tick reached, and the next
 // tick resumes there rather than re-reading it.
 func TestWakerStopsAtThePageBudget(t *testing.T) {
-	total := wakeScanPagesPerTick*wakeScanPageCap + 5
+	total := wakeScanPagesPerPass*wakeScanPageCap + 5
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(total)}}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 	dw.seeded = true
 
 	dw.scan(context.Background())
-	assert.Len(t, store.pages, wakeScanPagesPerTick, "the tick stops at the page budget")
-	assert.EqualValues(t, wakeScanPagesPerTick*wakeScanPageCap, dw.watermark)
-	assert.Equal(t, []int64{wakeScanPagesPerTick * wakeScanPageCap}, store.setCalls,
+	assert.Len(t, store.pages, wakeScanPagesPerPass, "the tick stops at the page budget")
+	assert.EqualValues(t, wakeScanPagesPerPass*wakeScanPageCap, dw.watermark)
+	assert.Equal(t, []int64{wakeScanPagesPerPass * wakeScanPageCap}, store.setCalls,
 		"progress within the budget is still persisted")
 
 	dw.scan(context.Background())
@@ -577,7 +577,7 @@ func TestWakerStopsAtThePageBudget(t *testing.T) {
 // However far behind a stored cursor is, seed resumes from it: the distance is
 // in resource_version units, which EventsAdd inflates without adding anything
 // this scan would read, so no threshold over it could say whether the gap is
-// worth draining. wakeScanPagesPerTick is what bounds the cost instead, per
+// worth draining. wakeScanPagesPerPass is what bounds the cost instead, per
 // tick, whatever the gap holds.
 func TestWakerResumesAnEnormousBacklog(t *testing.T) {
 	const mark = 50_000_000

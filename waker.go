@@ -72,10 +72,10 @@ const wakePersistRetryCap = 60
 // trips on the store's single connection.
 const wakeScanPageCap = 256
 
-// wakeScanPagesPerTick bounds one tick's scan so resuming after a long gap
+// wakeScanPagesPerPass bounds one pass's scan so resuming after a long gap
 // cannot monopolise the single connection. The remainder rides the in-memory
-// watermark to the next tick.
-const wakeScanPagesPerTick = 16
+// watermark to the next pass.
+const wakeScanPagesPerPass = 16
 
 // run drives the waker for the life of the control plane. A non-positive
 // interval turns it off — the reconcile_owed stamp and the stale-dependents
@@ -167,7 +167,7 @@ func (dw *waker) scan(ctx context.Context) {
 	// A defer, so every early return below — including the error path — still
 	// persists whatever earlier pages advanced the watermark to.
 	defer dw.persist(ctx)
-	for pages := 0; pages < wakeScanPagesPerTick; pages++ {
+	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
 		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
