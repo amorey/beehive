@@ -808,6 +808,10 @@ func (s *staleListErrorStore) DriverCursorsGet(context.Context, string) (int64, 
 	return 0, false, nil
 }
 
+func (s *staleListErrorStore) DriverCursorsReset(context.Context, string, int64) error {
+	return nil
+}
+
 func (s *staleListErrorStore) DriverCursorsSet(_ context.Context, _ string, cursor int64) error {
 	s.setCalls = append(s.setCalls, cursor)
 	return nil
@@ -822,15 +826,17 @@ func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []Gr
 // what the sweep asked for, stamped, and persisted.
 type staleSweepStore struct {
 	fakeStore
-	issued    int64
-	issuedErr error
-	stampErr  error
-	pages     [][]ObjectRef
-	asked     []StalePos
-	throughs  []int64
-	stamped   [][]ObjectRef
-	stored    map[string]int64
-	setCalls  []int64
+	issued     int64
+	issuedErr  error
+	stampErr   error
+	resetErr   error
+	pages      [][]ObjectRef
+	asked      []StalePos
+	throughs   []int64
+	stamped    [][]ObjectRef
+	stored     map[string]int64
+	setCalls   []int64
+	resetCalls []int64
 }
 
 func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
@@ -859,6 +865,18 @@ func (s *staleSweepStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef
 func (s *staleSweepStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
 	v, ok := s.stored[name]
 	return v, ok, nil
+}
+
+func (s *staleSweepStore) DriverCursorsReset(_ context.Context, name string, cursor int64) error {
+	if s.resetErr != nil {
+		return s.resetErr
+	}
+	s.resetCalls = append(s.resetCalls, cursor)
+	if s.stored == nil {
+		s.stored = map[string]int64{}
+	}
+	s.stored[name] = cursor
+	return nil
 }
 
 func (s *staleSweepStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
@@ -941,6 +959,35 @@ func TestStaleDependentsSweepRederivesFromAForeignCursor(t *testing.T) {
 
 	assert.Equal(t, []StalePos{{}}, store.asked, "the scan restarts from the beginning")
 	assert.EqualValues(t, 500, sd.cursor)
+	assert.Equal(t, []int64{0}, store.resetCalls,
+		"the row is reset too: DriverCursorsSet cannot lower it")
+
+	// The repair is durable, so the next process resumes rather than re-deriving.
+	next := sweeperOver(store)
+	next.resume(ctx)
+	assert.EqualValues(t, 500, next.cursor, "a restart reads the repaired cursor")
+}
+
+// TestStaleDependentsSweepSweepsWhenTheForeignResetFails: the reset is the
+// durable half of the repair, and the in-memory half stands on its own. A failed
+// reset costs one more re-derivation at the next start, not a skipped sweep.
+func TestStaleDependentsSweepSweepsWhenTheForeignResetFails(t *testing.T) {
+	store := &staleSweepStore{
+		issued:   500,
+		stored:   map[string]int64{cursorNameStaleDependents: 9000},
+		resetErr: errBoom,
+	}
+	logger, logs := captureLogger(slog.LevelWarn)
+	sd := sweeperOver(store)
+	sd.bh.logger = logger
+	ctx := context.Background()
+	sd.resume(ctx)
+
+	sd.sweep(ctx)
+
+	assert.Equal(t, []StalePos{{}}, store.asked, "the scan still restarts from the beginning")
+	assert.EqualValues(t, 500, sd.cursor)
+	assert.Contains(t, logs.String(), "resetting the stale-dependents cursor failed")
 }
 
 // TestStaleDependentsSweepLeavesADurableFinding is the restart property the

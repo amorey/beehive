@@ -608,6 +608,7 @@ type cursorStore struct {
 	// stores nothing but still costs the round trip.
 	setCalls    []int64
 	setAttempts int
+	resetCalls  []int64
 }
 
 func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
@@ -616,6 +617,16 @@ func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, b
 	}
 	v, ok := s.stored[name]
 	return v, ok, nil
+}
+
+// DriverCursorsReset drops the monotone guard, as the real store does.
+func (s *cursorStore) DriverCursorsReset(_ context.Context, name string, cursor int64) error {
+	s.resetCalls = append(s.resetCalls, cursor)
+	if s.stored == nil {
+		s.stored = map[string]int64{}
+	}
+	s.stored[name] = cursor
+	return nil
 }
 
 func (s *cursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {

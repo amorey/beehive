@@ -640,4 +640,10 @@ type DriverCursorer interface {
 	// stored, and otherwise writes nothing — a non-advancing call must cost no
 	// write, since a driver may call this every tick.
 	DriverCursorsSet(ctx context.Context, name string, cursor int64) error
+
+	// DriverCursorsReset persists cursor for name unconditionally, including a
+	// value below the stored one. For the one case a cursor must move backwards:
+	// a stored position this database never reached, which DriverCursorsSet
+	// cannot replace and which would otherwise be re-read on every start.
+	DriverCursorsReset(ctx context.Context, name string, cursor int64) error
 }

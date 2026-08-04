@@ -5163,6 +5163,41 @@ func TestDriverCursorsSetStoresAZeroCursor(t *testing.T) {
 	assert.Zero(t, cursor)
 }
 
+// TestDriverCursorsResetLowersTheStoredCursor is the one case a cursor must move
+// backwards: a stored position this database never reached. DriverCursorsSet
+// cannot replace it — its monotone guard discards the lower value — so without
+// a reset the foreign cursor is re-read on every start.
+func TestDriverCursorsResetLowersTheStoredCursor(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.DriverCursorsSet(ctx, "stale_dependents", 9000))
+
+	require.NoError(t, store.DriverCursorsSet(ctx, "stale_dependents", 0))
+	cursor, _, err := store.DriverCursorsGet(ctx, "stale_dependents")
+	require.NoError(t, err)
+	require.EqualValues(t, 9000, cursor, "the monotone guard discards the lower value")
+
+	require.NoError(t, store.DriverCursorsReset(ctx, "stale_dependents", 0))
+
+	cursor, ok, err := store.DriverCursorsGet(ctx, "stale_dependents")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Zero(t, cursor, "reset drops the guard")
+}
+
+// A reset with no row yet creates it, like DriverCursorsSet does.
+func TestDriverCursorsResetCreatesTheRow(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.DriverCursorsReset(ctx, "stale_dependents", 7))
+
+	cursor, ok, err := store.DriverCursorsGet(ctx, "stale_dependents")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.EqualValues(t, 7, cursor)
+}
+
 // Two names are two rows: a second driver's cursor must not collide with or
 // clamp against the first's.
 func TestDriverCursorsSetKeysByName(t *testing.T) {

@@ -358,8 +358,14 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	if sd.cursor > mark {
 		// A cursor above the store's own sequence came from another database.
 		// Re-derive everything once rather than scan above a point this store
-		// never reached.
+		// never reached. Reset the row too: DriverCursorsSet cannot lower it, so
+		// without this every start would re-read the same foreign cursor.
 		sd.cursor = 0
+		if sd.cursors != nil {
+			if err := sd.cursors.DriverCursorsReset(ctx, cursorNameStaleDependents, 0); err != nil {
+				log.WarnContext(ctx, "resetting the stale-dependents cursor failed; the next start re-derives again", "err", err)
+			}
+		}
 	}
 	if sd.cursor == mark {
 		return // nothing issued since the last sweep, so nothing can be stale

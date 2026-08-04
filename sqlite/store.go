@@ -2252,6 +2252,18 @@ func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64,
 // DriverCursorsSet upserts name's persisted cursor (see storeapi.DriverCursorer).
 // The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
 // write outright — no page dirtied on a quiet tick.
+// DriverCursorsReset writes name's cursor with no monotone guard (contract on
+// storeapi.DriverCursorer). Same statement as DriverCursorsSet without the
+// WHERE, so a lower value replaces a higher one.
+func (s *sqliteStore) DriverCursorsReset(ctx context.Context, name string, cursor int64) error {
+	_, err := s.conn(ctx).ExecContext(ctx, `
+		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
+		    ON CONFLICT(name) DO UPDATE
+		   SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
+		name, cursor, toMillis(time.Now().UTC()))
+	return err
+}
+
 func (s *sqliteStore) DriverCursorsSet(ctx context.Context, name string, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
