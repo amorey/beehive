@@ -1029,16 +1029,13 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 	pos := after
 	for rows.Next() {
 		var ref storeapi.ObjectRef
-		if err := rows.Scan(&pos.TargetVersion, &pos.TargetID, &ref.ID, &ref.Group, &ref.Kind); err != nil {
-			return nil, after, err
-		}
+		// INTEGER -> int64 and TEXT NOT NULL -> string never fail, as in scanObjectRefs.
+		_ = rows.Scan(&pos.TargetVersion, &pos.TargetID, &ref.ID, &ref.Group, &ref.Kind)
 		pos.DependentID = ref.ID
 		refs = append(refs, ref)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, after, err
-	}
-	return refs, pos, nil
+	// On error the caller discards both, so a half-advanced pos costs nothing.
+	return refs, pos, rows.Err()
 }
 
 // DependencyWatermarksSet upserts id's dependency watermark (see the contract on

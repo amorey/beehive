@@ -5234,6 +5234,40 @@ func TestDependentsListStaleSincePagesInsideAFanOut(t *testing.T) {
 	assert.Equal(t, []beehive.ObjectID{c.ID}, refIDs(refs), "the next page resumes inside the same target")
 }
 
+// TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit: no kinds means no
+// reconcile loop to enqueue into, and a non-positive limit asks for nothing.
+// Both answer without reading, and hand the cursor back unmoved so a caller
+// cannot mistake the empty answer for progress.
+func TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	newDependentObject(t, store, newRefObject(t, store).ID)
+	after := beehive.StalePos{TargetVersion: 7, TargetID: 2, DependentID: 3}
+
+	refs, pos, err := store.DependentsListStaleSince(ctx, nil, after, 100)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "no kinds, nothing to enqueue into")
+	assert.Equal(t, after, pos)
+
+	refs, pos, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, after, 0)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "a non-positive limit asks for nothing")
+	assert.Equal(t, after, pos)
+}
+
+// TestDependentsListStaleSinceQueryError: a read that fails is an error, never
+// an empty page — the sweep holds its cursor on it, where an empty page would
+// let the cursor move past a range nobody read.
+func TestDependentsListStaleSinceQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, _, err := store.DependentsListStaleSince(context.Background(),
+		[]beehive.GroupKind{testGK}, beehive.StalePos{}, 10)
+
+	assert.Error(t, err)
+}
+
 // TestDependentsListStaleSinceDrivesFromTheVersionIndex is the cost assertion.
 // The cursor only pays off if the scan seeks targets through idx_objects_rv; a
 // plan that starts anywhere else reads the whole graph again and the cursor buys

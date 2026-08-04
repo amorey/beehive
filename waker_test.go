@@ -822,16 +822,18 @@ func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []Gr
 // what the sweep asked for, stamped, and persisted.
 type staleSweepStore struct {
 	fakeStore
-	issued   int64
-	pages    [][]ObjectRef
-	asked    []StalePos
-	stamped  [][]ObjectRef
-	stored   map[string]int64
-	setCalls []int64
+	issued    int64
+	issuedErr error
+	stampErr  error
+	pages     [][]ObjectRef
+	asked     []StalePos
+	stamped   [][]ObjectRef
+	stored    map[string]int64
+	setCalls  []int64
 }
 
 func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
-	return s.issued, nil
+	return s.issued, s.issuedErr
 }
 
 func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int) ([]ObjectRef, StalePos, error) {
@@ -845,6 +847,9 @@ func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupK
 }
 
 func (s *staleSweepStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef) error {
+	if s.stampErr != nil {
+		return s.stampErr
+	}
 	s.stamped = append(s.stamped, slices.Clone(refs))
 	return nil
 }
@@ -956,6 +961,39 @@ func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
 	owed, err := store.ReconcileOwedListIDs(ctx, clientTestGK)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "the finding outlives the queue it was also put on")
+}
+
+// TestStaleDependentsSweepWarnsWhenTheMarkReadFails: without the mark the sweep
+// cannot say what it would have covered, so it lists nothing and keeps its
+// cursor.
+func TestStaleDependentsSweepWarnsWhenTheMarkReadFails(t *testing.T) {
+	store := &staleSweepStore{issued: 500, issuedErr: errBoom}
+	logger, logs := captureLogger(slog.LevelWarn)
+	sd := sweeperOver(store)
+	sd.bh.logger = logger
+
+	sd.sweep(context.Background())
+
+	assert.Empty(t, store.asked, "nothing is listed")
+	assert.Zero(t, sd.cursor, "and the cursor stays put")
+	assert.Contains(t, logs.String(), "reading the resource version failed")
+}
+
+// TestStaleDependentsSweepHoldsTheCursorOnStampFailure: a finding that could not
+// be recorded must not be counted as covered. The enqueue alone dies with the
+// process, so moving the cursor past it would strand the dependent.
+func TestStaleDependentsSweepHoldsTheCursorOnStampFailure(t *testing.T) {
+	page := []ObjectRef{{ID: 1, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}
+	store := &staleSweepStore{issued: 500, pages: [][]ObjectRef{page}, stampErr: errBoom}
+	logger, logs := captureLogger(slog.LevelWarn)
+	sd := sweeperOver(store)
+	sd.bh.logger = logger
+
+	sd.sweep(context.Background())
+
+	assert.Zero(t, sd.cursor, "the cursor does not move past an unrecorded finding")
+	assert.Empty(t, store.setCalls, "and nothing is persisted")
+	assert.Contains(t, logs.String(), "stamping stale dependents failed")
 }
 
 // TestStaleDependentsSweepHoldsTheCursorOnListFailure pins the failure contract:
