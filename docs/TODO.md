@@ -55,7 +55,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   entry, because a ref is not a field of the object. So no log cursor can see a
   new edge, a dropped one, or the `dependency_watermarks` clear that rides a new
   one. One place pays for it: a deletion unblocked by `DependenciesDelete` waits
-  for the next GC tick with nothing able to signal it (case 9 in
+  for the next GC tick with nothing able to signal it (case 11 in
   [`reconcile-triggers.md`](reconcile-triggers.md)).
 
   **The stale-dependents pass no longer pays.** Its scan is bounded by a cursor
@@ -85,7 +85,7 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   watch noise, and the cascade needs no trigger, because a cascade that removes
   edges also collects an object and that already appends.
 
-  Deferred because the one consumer left is case 9, where the cost is a single GC
+  Deferred because the one consumer left is case 11, where the cost is a single GC
   tick of latency on a deletion. Build the counter only when a second consumer
   appears, or when that latency is measured to matter.
 
@@ -651,3 +651,38 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   is whether events get a retention horizon of their own, since
   `WithEventRetention` already trims runs out from under a reader with no way to
   tell them.
+
+- **The object watch tail has no minimum interval between wake-driven drains** —
+  known, not fixed, and a duty-cycle question rather than a query-count one.
+  `objectTailer.run` re-arms its floor timer after every drain, but nothing bounds
+  how soon the *next* drain may start: a commit landing during a drain refills the
+  wake slot, so the loop goes straight around. Under a sustained write load to a
+  watched kind the tailer therefore reads as fast as the store can answer, and every
+  one of those reads holds the single connection that writers need.
+
+  **It is not spinning on nothing.** `drain`'s position read is the quiet-wake gate —
+  a wake with nothing behind it costs one scalar query and no listing — and page
+  batching means a burst of 256 writes is read by one drain rather than 256. So the
+  cost per write *falls* as the rate rises. What does not fall is the fraction of
+  time the tailer is running, and that is the part that competes with writers.
+
+  **The fix is a floor between wake-driven drains** — eager on the first wake after
+  a quiet period, so an idle-to-write transition keeps its zero added latency, then
+  rate-limited while writes continue. That trades a bounded delay for connection
+  headroom exactly where per-write latency is already dominated by queueing.
+
+  Deferred because the tailer is demand-scoped: it runs only while something watches,
+  and a caller that opened a watch has asked for the latency. The
+  [commit-wake spec](specs/dependency-waker-commit-wake.md) specifies this limit for
+  the dependency waker, where the same loop runs unconditionally for the life of the
+  process and the trade comes out the other way. Revisit when the two are compared
+  side by side, or if a watched kind under heavy write load is measured to slow its
+  own writers. Whatever is built should be shared: two wake-driven drivers throttling
+  on different curves would be a tuning accident, the same reasoning
+  `Beehive.watchBackoff` already applies to the retry ladder.
+
+  Tripwire: none pins the current cadence. `TestTailerDeliversOnWake` asserts that a
+  wake delivers, not how soon, and `TestTailerDrainsBurstAbovePageCap` and
+  `TestWatchLoadsAreBatchedPerDrain` assert what a drain *reads*, not how soon the
+  next one may start. A throttle under the tests' failsafe timeouts would trip none
+  of them — which is itself worth knowing before adding one.
