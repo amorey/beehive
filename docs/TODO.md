@@ -382,6 +382,31 @@ here shrinks to a pointer.
   *second* one an external backend pays for this, which is a point in favour of
   taking it early rather than waiting for a third.
 
+- **Four types in `Store`'s signatures have no public alias, so the interface is not
+  externally implementable today** — known, not fixed, and recorded because the rest
+  of this file reasons about the cost of breaking external backends as though they
+  exist.
+
+  `Store` is aliased into the root package, and most of what its methods mention is
+  aliased alongside it (`RawObject`, `ObjectRef`, `ObjectsCreateInput`, `RawEvent`,
+  `DeletionCascadeChild`). Four are not: `Condition`, `EdgesAddResult`, `EventQuery`
+  and `ReconcileLoad` live only in `internal/storeapi`, which an external module
+  cannot import. A backend outside this module cannot write those signatures at all,
+  so it cannot satisfy the interface — which makes "this break costs external
+  backends" an argument about a population of zero.
+
+  Three are a one-line alias each. `Condition` is not: the root package already
+  exports a richer `Condition` for the typed API, so the alias needs a distinct name
+  — `RawCondition`, exactly as `RawEvent` already resolves the same collision for
+  `Event`.
+
+  Not done here because it is API surface unrelated to the change that surfaced it,
+  and because it is worth deciding deliberately: aliasing these promotes every field
+  of four store-shaped structs to public API, which is a commitment the internal
+  package currently avoids. Revisit when an external backend is actually attempted,
+  or fold into the next break that touches these types — the same ride-along argument
+  the `EventsAddInput` entry above makes.
+
 - **Two writes still read the whole row to answer a narrow question** — known, not
   fixed, and the tail of the write-shapes pass. Every write that reports *no* row now
   answers from metadata alone: the deletion probes, `ReconcileOwedDecrement`'s fault
