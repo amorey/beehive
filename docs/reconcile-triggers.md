@@ -278,14 +278,14 @@ process with no waker, a bug in the wake path.
   latency. The scan is bounded by a cursor over target `resource_version`, so its cost
   is what changed rather than the size of the graph. A tick where nothing has been
   issued since the last sweep skips the listing entirely.
-- **Restart:** ✅ **every process re-derives once, and that is the guarantee.** The
-  cursor is process-local and is never persisted: a reconcile clears the owed count
-  and records its watermark in two separate statements, so a process killed between
-  them leaves a dependent stale with nothing durable naming it. Starting each process
-  at 0 repairs that, and a changed kind set needs no special handling for the same
-  reason. The stamp makes a finding outlive the queue, but it is the re-derivation
-  that covers a lost enqueue. Within a process the cursor moves only when a sweep
-  reaches the end, so a failed page is re-read rather than skipped.
+- **Restart:** ✅ **every process re-derives once.** The cursor is process-local and
+  is never persisted, so a wake lost only in memory is found again on the next start,
+  and a changed kind set needs no special handling for the same reason. A *lost
+  watermark write* needs no such repair: it leaves the watermark low, and
+  `reconciled_against` is read in one place where lower selects more, so a target
+  change the reconcile did not observe is above the cursor and the next sweep lists
+  it. Within a process the cursor moves only when a sweep reaches the end, so a
+  failed page is re-read rather than skipped.
 - **Not covered:** a dependent whose kind has no controller is excluded from the scan
   (there is no loop to enqueue into, and it would be stale forever); it is found on the
   first pass after its kind is registered. The kind filter applies to the *dependent*
@@ -299,13 +299,14 @@ process with no waker, a bug in the wake path.
   `TestReconcileHoldsDependencyWatermarkOnFailure`,
   `TestReconcileHoldsDependencyWatermarkOnUndecodableRow`,
   `TestReconcileWarnsAndContinuesOnCursorWriteFailure`,
-  `TestReconcileStampsOwedWhenTheWatermarkWriteFails`,
+  `TestALostWatermarkStillFindsAnUnobservedChange`,
+  `TestALostWatermarkCostsOnlyAnObservedChange`,
   `TestStaleDependentsSweepStampsWhatItFinds`,
   `TestStaleDependentsSweepAdvancesToThePreScanMark`,
   `TestStaleDependentsSweepSkipsAQuietStore`,
   `TestStaleDependentsSweepStartsEveryProcessAtTheBeginning`,
   `TestStaleDependentsSweepLeavesADurableFinding`,
-  `TestStaleDependentsSweepRepairsALostWatermarkAfterRestart`,
+  `TestStaleDependentsSweepRepairsALostFindingAfterRestart`,
   `TestStaleDependentsSweepDoesNotRestampAConsumedVersion`,
   `TestStaleDependentsSweepHoldsTheCursorOnListFailure`,
   `TestStaleDependentsSweepHoldsTheCursorOnStampFailure`,

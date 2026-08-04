@@ -290,14 +290,11 @@ const staleDependentsPageCap = 256
 // The scan is bounded by a cursor over target resource versions, so its cost is
 // what changed, not the size of the graph.
 //
-// The cursor is process-local, and deliberately not persisted. A reconcile
-// records its watermark in a separate statement from the owed decrement that
-// preceded it, so a process killed between the two leaves a dependent stale with
-// nothing durable naming it: the count is gone, the object is settled, and its
-// target may never be written again. Only re-derivation finds that dependent,
-// and starting every process at 0 guarantees one — a crash is a restart. That,
-// not the stamp in sweep, is what makes the cursor sound. See
-// docs/adr/2026-08-03-stale-dependents-cursor.md.
+// The cursor is process-local, and deliberately not persisted: a finding whose
+// enqueue was lost in memory has no other repair, and starting every process at
+// 0 guarantees one — a crash is a restart. A lost watermark write needs no such
+// repair, because it leaves the watermark low and low only over-reports
+// staleness. See docs/adr/2026-08-03-stale-dependents-cursor.md.
 type staleDependents struct {
 	bh    *Beehive
 	kinds []GroupKind

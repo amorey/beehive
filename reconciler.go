@@ -116,19 +116,14 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// skips the call; the store's own gate keeps the write safe against a
 	// mid-pass collect.
 	//
-	// A failed write stamps an owed wake rather than trusting the stale pass to
-	// re-derive it. That pass scans from a cursor, so it finds nothing for a
-	// target that has since gone quiet.
+	// A lost write leaves the watermark low, which only over-reports staleness:
+	// any target change this pass did not observe is above the stale pass's
+	// cursor, so the next sweep finds it. Costs a redundant pass, never a strand.
+	// See docs/adr/2026-08-03-stale-dependents-cursor.md.
 	if reconcileErr == nil && load.HasDependencies {
-		err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor)
-		// A cancelled write is shutdown, not a lost pass: the stamp would fail the
-		// same way, and reporting it would fault every clean stop.
-		if err != nil && ctx.Err() == nil {
-			log.WarnContext(ctx, "failed to record the dependency watermark; owing another pass instead", "err", err)
-			ref := ObjectRef{ID: id, Group: t.gk.Group, Kind: t.gk.Kind}
-			if err := t.bh.store.ReconcileOwedStamp(ctx, []ObjectRef{ref}); err != nil {
-				log.ErrorContext(ctx, "failed to owe a pass for the lost dependency watermark", "err", err)
-			}
+		// A cancelled write is shutdown, not a lost pass.
+		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
+			log.WarnContext(ctx, "failed to record the dependency watermark; the next target change re-derives it", "err", err)
 		}
 	}
 	// GC runs in its own transaction over the controller's committed writes, so
