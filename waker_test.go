@@ -285,7 +285,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	t.Run("a quiet pass waits the floor", func(t *testing.T) {
 		dw, clk, _ := seededWaker(&replayStore{}, widget)
 
-		next, backingOff := dw.pass(ctx, clk.now())
+		next, backingOff := dw.pass(ctx, clk.now(), false)
 		assert.Equal(t, defaultWakeInterval, next)
 		assert.False(t, backingOff)
 	})
@@ -294,11 +294,11 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		store := &replayStore{}
 		dw, clk, _ := seededWaker(store, widget)
 
-		dw.pass(ctx, clk.now())
+		dw.pass(ctx, clk.now(), false)
 		pagesAfterFirst := len(store.pages)
 
 		clk.advance(defaultWakeScanMinInterval / 4)
-		next, _ := dw.pass(ctx, clk.now())
+		next, _ := dw.pass(ctx, clk.now(), false)
 		assert.Equal(t, 3*defaultWakeScanMinInterval/4, next, "re-armed for what is left of the throttle")
 		assert.Len(t, store.pages, pagesAfterFirst, "and the refused pass read nothing")
 	})
@@ -307,9 +307,9 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		store := &replayStore{}
 		dw, clk, _ := seededWaker(store, widget)
 
-		dw.pass(ctx, clk.now())
+		dw.pass(ctx, clk.now(), false)
 		clk.advance(defaultWakeScanMinInterval)
-		dw.pass(ctx, clk.now())
+		dw.pass(ctx, clk.now(), false)
 
 		assert.Len(t, store.pages, 2, "an idle-to-active transition pays no added latency")
 	})
@@ -318,16 +318,33 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
 		dw, clk, _ := seededWaker(store, widget)
 
-		next, _ := dw.pass(ctx, clk.now())
+		next, _ := dw.pass(ctx, clk.now(), false)
 		assert.Equal(t, defaultWakeScanMinInterval, next, "a resume drains at the throttle's rate")
 	})
 
 	t.Run("a failed pass waits the floor and drops wakes", func(t *testing.T) {
 		dw, clk, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
 
-		next, backingOff := dw.pass(ctx, clk.now())
+		next, backingOff := dw.pass(ctx, clk.now(), false)
 		assert.Equal(t, defaultWakeInterval, next)
 		assert.True(t, backingOff, "a live writer must not keep a degraded store re-reading as fast as it can fail")
+	})
+
+	t.Run("a throttled pass keeps a failure's backoff", func(t *testing.T) {
+		dw, _, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
+		clk := fakeClockOn(dw)
+
+		_, backingOff := dw.pass(ctx, clk.now(), false)
+		require.True(t, backingOff, "the scan failed")
+
+		// The floor timer was already armed when the scan failed, so it fires
+		// inside the throttle window and the next pass is refused. Reporting
+		// "not backing off" there would hand a degraded store back to the
+		// wakes, at the throttle's rate rather than the floor's.
+		clk.advance(defaultWakeScanMinInterval / 2)
+		next, backingOff := dw.pass(ctx, clk.now(), true)
+		assert.Equal(t, defaultWakeScanMinInterval/2, next)
+		assert.True(t, backingOff, "a refused pass decides nothing about the store's health")
 	})
 
 	t.Run("a disabled throttle drains at the floor", func(t *testing.T) {
@@ -339,7 +356,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		dw, clk := newWaker(dw.bh), fakeClockOn(dw)
 		dw.now, dw.seeded = clk.now, true
 
-		next, _ := dw.pass(ctx, clk.now())
+		next, _ := dw.pass(ctx, clk.now(), false)
 		assert.Equal(t, defaultWakeInterval, next, "with no throttle to re-arm at, today's behaviour")
 	})
 }

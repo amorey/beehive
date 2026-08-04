@@ -151,7 +151,7 @@ func (dw *waker) run(ctx context.Context) {
 
 		now := dw.now()
 		var next time.Duration
-		next, backingOff = dw.pass(ctx, now)
+		next, backingOff = dw.pass(ctx, now, backingOff)
 		// A wake that only re-arms the timer later than it already fires buys
 		// nothing, and under a sustained stream the loop turns at commit rate.
 		if at := now.Add(next); armedFor.IsZero() || at.Before(armedFor) {
@@ -176,14 +176,21 @@ func newWaker(bh *Beehive) *waker {
 }
 
 // pass is one turn of the run loop: scan under the throttle, and report how
-// long to wait and whether to drop the wakes arriving meanwhile. Split from run
-// so the rate tests drive it at instants of their own choosing.
-func (dw *waker) pass(ctx context.Context, now time.Time) (time.Duration, bool) {
+// long to wait and whether to drop the wakes arriving meanwhile. backingOff is
+// the loop's current answer to that, carried in because a pass that does not
+// scan has no new one. Split from run so the rate tests drive it at instants of
+// their own choosing.
+func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time.Duration, bool) {
 	floor := dw.bh.wakeInterval
 	if opensAt, held := dw.scanGate.Allow(wakerGateKey, now); held {
 		// Re-arming for what is left of the throttle is what remembers the
 		// wake: the scan that runs then reads its position from the store.
-		return opensAt.Sub(now), false
+		//
+		// backingOff is carried through rather than cleared: the floor timer
+		// armed before a failure fires inside the throttle window, and
+		// answering "not backing off" there would hand a degraded store back to
+		// the wakes at the throttle's rate.
+		return opensAt.Sub(now), backingOff
 	}
 	switch dw.scan(ctx) {
 	case scanMore:

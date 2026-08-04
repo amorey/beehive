@@ -147,7 +147,7 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 				// StopTimer/StartTimer would cost two stop-the-worlds a pass.
 				dw.watermark, dw.persisted = resume, resume
 
-				dw.pass(ctx, clk.now())
+				dw.pass(ctx, clk.now(), false)
 				clk.advance(defaultWakeScanMinInterval) // the rate the throttle allows
 			}
 			b.StopTimer()
