@@ -335,6 +335,51 @@ func TestCascadePushesEachMarkedChild(t *testing.T) {
 		"both marked children are queued")
 }
 
+// A client-only child has no reconciler to reach, so it is marked and left to the
+// sweeper. Collecting it inline instead would put the whole subtree below it on
+// the caller's goroutine.
+func TestCascadeSkipsClientOnlyChild(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+	loose := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Unregistered"})
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	registered := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+	clientOnly := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "b"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{registered.ID}, queuedIDs(r.work), "only the registered child is queued")
+
+	got, err := loose.Get(ctx, clientOnly.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, got.DeletionRequestedAt, "the client-only child is still marked for the sweeper")
+}
+
+// gcCollect reruns after every reconcile of a deleting object, so a cascade that
+// pushed every child it *returned* would re-arm the subtree at reconcile rate.
+// Asserted on a drained queue: with a backoff or floor alarm pending, the throttle
+// would absorb the spurious push and hide the regression.
+func TestCascadePushesOnlyNewlyMarkedChildren(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	drainQueue(r.work)
+
+	_, err = bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, queuedIDs(r.work), "the re-cascade stamped nothing, so it queues nothing")
+}
+
 func TestCollectDeletesOwnerAfterChildGone(t *testing.T) {
 	ctx := context.Background()
 	bh, client := gcFixture(t)
