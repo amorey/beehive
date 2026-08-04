@@ -16,8 +16,10 @@ package beehive
 
 import (
 	"context"
+	"time"
 
 	"github.com/amorey/beehive/internal/driver"
+	"github.com/amorey/beehive/internal/rategate"
 )
 
 // waker requeues the dependents of everything that changed: each tick scans the
@@ -36,6 +38,14 @@ type waker struct {
 	// cursors persists the watermark across restarts when the store supports it;
 	// nil means every restart reseeds from ObjectWritesMaxVersionAll.
 	cursors DriverCursorer
+
+	// now is the waker's only clock, so the rate tests drive it by hand.
+	now func() time.Time
+
+	// persistGate floors the cursor write at the wake interval. Without it a
+	// wake-driven pass would write the cursor at the wake rate, on the one
+	// connection every commit needs.
+	persistGate *rategate.Gate[struct{}]
 
 	// watermark is the highest resource_version this waker has processed. The
 	// cursor is store-wide, always increasing and never reused, so "everything
@@ -57,6 +67,10 @@ type waker struct {
 	seeded bool
 }
 
+// gateKey is the single key every waker rate gate holds: the limits are
+// per waker, not per object.
+var gateKey = struct{}{}
+
 // cursorNameWaker is this waker's key in driver_cursors.
 const cursorNameWaker = "dependency_waker"
 
@@ -65,7 +79,9 @@ const cursorNameWaker = "dependency_waker"
 const noStoredCursor = int64(-1)
 
 // wakePersistRetryCap bounds the backoff between retries of a failing cursor
-// write, in persists sat out — a minute at the default wake interval.
+// write, in persists sat out — a minute at the default wake interval. It reads
+// as seconds only because persistGate floors a persist *attempt* at that
+// interval, which is why the gate is consulted before the skip ladder.
 const wakePersistRetryCap = 60
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
@@ -85,10 +101,24 @@ func (dw *waker) run(ctx context.Context) {
 	if len(dw.bh.order) == 0 {
 		return
 	}
+	dw.arm()
 	driver.Run(ctx, dw.bh.wakeInterval, func(ctx context.Context) bool {
 		dw.scan(ctx)
 		return true
 	})
+}
+
+// arm builds what the waker reads from its Beehive's options, once, on first
+// use. Never in New: New constructs the waker before it applies options, so
+// anything built there captures the defaults and silently ignores the option.
+func (dw *waker) arm() {
+	if dw.persistGate != nil {
+		return
+	}
+	if dw.now == nil {
+		dw.now = time.Now
+	}
+	dw.persistGate = rategate.New[struct{}](dw.bh.wakeInterval)
 }
 
 // scanResult says what a pass found. The run loop dispatches on it: how soon to
@@ -215,8 +245,15 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 // with backoff, warning only on the first of a streak; the watermark itself is
 // never rolled back — the wakes are already queued.
 func (dw *waker) persist(ctx context.Context) {
+	dw.arm()
 	// ctx.Err() checked here so a shutdown mid-scan isn't logged as a failure.
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
+		return
+	}
+	// Ahead of the skip ladder, not just ahead of the write: a gate below it
+	// would let refused passes burn skips at the wake rate, which is what turns
+	// wakePersistRetryCap from a minute into a handful of seconds.
+	if _, held := dw.persistGate.Allow(gateKey, dw.now()); held {
 		return
 	}
 	if dw.persistSkips > 0 {

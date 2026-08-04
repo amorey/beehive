@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -59,11 +60,25 @@ func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconcil
 		rs[gk] = r
 		order = append(order, r)
 	}
-	bh := &Beehive{store: store, reconcilers: rs, order: order}
+	bh := &Beehive{store: store, reconcilers: rs, order: order, wakeInterval: defaultWakeInterval}
 	cursors, _ := store.(DriverCursorer)
 	bh.waker = &waker{bh: bh, cursors: cursors}
 	return bh.waker, rs
 }
+
+// fakeClockOn replaces a waker's clock with one the test advances by hand. The
+// rate limits are wall-clock, and the suite synchronizes on signals rather than
+// sleeps.
+func fakeClockOn(dw *waker) *fakeClock {
+	clk := &fakeClock{at: time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)}
+	dw.now = clk.now
+	return clk
+}
+
+type fakeClock struct{ at time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.at }
+func (c *fakeClock) advance(d time.Duration) { c.at = c.at.Add(d) }
 
 // The seed is what keeps the first scan from replaying history. Without it the
 // watermark starts at zero and the first tick walks every live row in the store,
@@ -585,8 +600,10 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 	store.deps = map[ObjectID][]ObjectRef{1: {{ID: 7, Kind: "Widget"}}}
 
 	first, rsFirst := wakerOver(store, widget)
+	clk := fakeClockOn(first)
 	require.NotEqual(t, scanFailed, first.seed(context.Background()))
 	// A write lands while the first process is up; its scan finds and persists it.
+	clk.advance(defaultWakeInterval) // a floor on from the seed's own write
 	store.rows = append(store.rows, ObjectWrite{ID: 2, ResourceVersion: 20})
 	store.deps[2] = []ObjectRef{{ID: 8, Kind: "Widget"}}
 	store.seed = 20
@@ -686,15 +703,40 @@ func TestWakePersistRetrySkips(t *testing.T) {
 	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(1000), "however long the streak runs")
 }
 
+// The cursor write is the waker's only write, and it lands on the connection
+// every commit needs. A loop that turns ten times a second must not write the
+// cursor ten times a second.
+func TestWakerPersistsAtMostOncePerFloor(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(1)}}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	clk := fakeClockOn(dw)
+	dw.seeded = true
+
+	// Ten passes inside one floor, each with the watermark moving, so nothing
+	// but the gate can be what holds the write back.
+	for i := range 10 {
+		store.rows = replayRows(i + 1)
+		dw.scan(context.Background())
+		clk.advance(defaultWakeInterval / 10)
+	}
+	assert.Equal(t, []int64{1}, store.setCalls, "one write per floor, whatever the pass rate")
+
+	clk.advance(defaultWakeInterval)
+	store.rows = replayRows(20)
+	dw.scan(context.Background())
+	assert.Equal(t, []int64{1, 20}, store.setCalls, "and the next floor writes the watermark it reached")
+}
+
 // A failed persist write is logged and leaves dw.persisted at its old value, so
-// the next tick's guard (watermark > persisted) still holds and the write is
-// retried — even on a tick that finds nothing new to scan, since it is
+// the next pass's guard (watermark > persisted) still holds and the write is
+// retried — even on a pass that finds nothing new to scan, since it is
 // persisted's staleness against watermark that drives the retry, not fresh
 // pages.
 func TestWakerRetriesPersistOnAFailedWrite(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	clk := fakeClockOn(dw)
 	dw.bh.logger = logger
 	dw.seeded = true
 
@@ -705,8 +747,9 @@ func TestWakerRetriesPersistOnAFailedWrite(t *testing.T) {
 	assert.NotEmpty(t, buf.String(), "the failure is logged")
 
 	store.setErr = nil
+	clk.advance(defaultWakeInterval)
 	dw.scan(context.Background()) // no rows above watermark=3, but persisted still lags it
-	assert.Equal(t, []int64{3}, store.setCalls, "the next tick retries the write even though this scan found nothing new")
+	assert.Equal(t, []int64{3}, store.setCalls, "the next pass retries the write even though this scan found nothing new")
 }
 
 // A write that fails forever — a read-only or full database — must not become a
@@ -717,12 +760,16 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	clk := fakeClockOn(dw)
 	dw.bh.logger = logger
 	dw.seeded = true
 
+	// A tick is a floor apart, which is what makes the skip ladder below a
+	// count of seconds rather than a count of passes.
 	const ticks = 30
 	for range ticks {
 		dw.scan(context.Background())
+		clk.advance(defaultWakeInterval)
 	}
 
 	assert.Equal(t, 1, strings.Count(buf.String(), "persisting the dependency waker's cursor failed"),
@@ -736,6 +783,7 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 	store.setErr = nil
 	for range ticks {
 		dw.scan(context.Background())
+		clk.advance(defaultWakeInterval)
 	}
 	assert.Equal(t, []int64{3}, store.setCalls, "the write lands once the store accepts it again")
 	assert.Zero(t, dw.persistFailures, "and the streak is closed")
