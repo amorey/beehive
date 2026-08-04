@@ -86,6 +86,61 @@ func TestWakerSeedsFromTheWriteLogMax(t *testing.T) {
 	assert.Equal(t, []int64{500}, store.cursors(), "the first scan starts at the seed, not at zero")
 }
 
+// scan's result is what the run loop dispatches on: how soon to look again, and
+// whether to drop the wakes arriving meanwhile.
+func TestWakerScanReportsWhatHappened(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+
+	t.Run("a fresh seed has nothing behind it", func(t *testing.T) {
+		store := &replayStore{seed: 500, rows: replayRows(3)}
+		dw, _ := wakerOver(store, widget)
+
+		assert.Equal(t, scanIdle, dw.scan(context.Background()), "seeding at the mark leaves no backlog")
+	})
+
+	t.Run("a resumed seed reports the backlog it found", func(t *testing.T) {
+		store := &cursorStore{
+			replayStore: replayStore{seed: 500, rows: replayRows(3)},
+			stored:      map[string]int64{cursorNameWaker: 200},
+		}
+		dw, _ := wakerOver(store, widget)
+
+		assert.Equal(t, scanMore, dw.scan(context.Background()),
+			"resuming below the mark must not wait a floor for its first page")
+	})
+
+	t.Run("a failed seed", func(t *testing.T) {
+		store := &replayStore{seedErr: errBoom}
+		dw, _ := wakerOver(store, widget)
+
+		assert.Equal(t, scanFailed, dw.scan(context.Background()))
+	})
+
+	t.Run("a drained log", func(t *testing.T) {
+		store := &replayStore{rows: replayRows(3)}
+		dw, _ := wakerOver(store, widget)
+		dw.seeded = true
+
+		assert.Equal(t, scanIdle, dw.scan(context.Background()), "a short page means the log is drained")
+	})
+
+	t.Run("a full page budget", func(t *testing.T) {
+		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
+		dw, _ := wakerOver(store, widget)
+		dw.seeded = true
+
+		assert.Equal(t, scanMore, dw.scan(context.Background()), "stopping at the budget leaves work behind")
+	})
+
+	t.Run("a failed page", func(t *testing.T) {
+		store := &replayStore{rows: replayRows(3), err: errBoom}
+		dw, _ := wakerOver(store, widget)
+		dw.seeded = true
+
+		assert.Equal(t, scanFailed, dw.scan(context.Background()))
+	})
+}
+
 // A store that implements DriverCursorer but has never persisted a cursor for
 // this waker seeds the same way a store with no capability at all does: there is
 // nothing stored to prefer over the write log's max.
@@ -110,14 +165,14 @@ func TestWakerPersistsTheSeedBeforeSeeingAnyWrite(t *testing.T) {
 	store.deps = map[ObjectID][]ObjectRef{1: {{ID: 7, Kind: "Widget"}}}
 
 	first, _ := wakerOver(store, widget)
-	require.True(t, first.seed(context.Background()))
+	require.NotEqual(t, scanFailed, first.seed(context.Background()))
 	require.Equal(t, []int64{10}, store.setCalls, "the seed point is durable before any change arrives")
 
 	// Target 1 changes with no waker running to see it.
 	store.rows, store.seed = changedAt(20), 20
 
 	second, rs := wakerOver(store, widget)
-	require.True(t, second.seed(context.Background()))
+	require.NotEqual(t, scanFailed, second.seed(context.Background()))
 	require.EqualValues(t, 10, second.watermark, "the restart resumes at the stored seed, not the new mark")
 
 	second.scan(context.Background())
@@ -133,7 +188,7 @@ func TestWakerPersistsAZeroSeed(t *testing.T) {
 	store := &cursorStore{replayStore: replayStore{seed: 0}}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 
-	require.True(t, dw.seed(context.Background()))
+	require.NotEqual(t, scanFailed, dw.seed(context.Background()))
 	assert.Equal(t, []int64{0}, store.setCalls, "an empty store still records where it started")
 }
 
@@ -186,7 +241,7 @@ func TestWakerWritesNothingUntilItPassesAClampedRow(t *testing.T) {
 		stored:      map[string]int64{cursorNameWaker: 100},
 	}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	require.True(t, dw.seed(context.Background()))
+	require.NotEqual(t, scanFailed, dw.seed(context.Background()))
 	require.EqualValues(t, 90, dw.watermark)
 
 	dw.scan(context.Background())
@@ -250,7 +305,7 @@ func TestWakerCursorReadFailureDuringShutdownIsQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	assert.False(t, dw.seed(ctx), "a cancelled read still leaves the waker unseeded")
+	assert.Equal(t, scanFailed, dw.seed(ctx), "a cancelled read still leaves the waker unseeded")
 	assert.False(t, dw.seeded)
 	assert.Empty(t, buf.String(), "shutdown is not an outage to report")
 }
@@ -530,7 +585,7 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 	store.deps = map[ObjectID][]ObjectRef{1: {{ID: 7, Kind: "Widget"}}}
 
 	first, rsFirst := wakerOver(store, widget)
-	require.True(t, first.seed(context.Background()))
+	require.NotEqual(t, scanFailed, first.seed(context.Background()))
 	// A write lands while the first process is up; its scan finds and persists it.
 	store.rows = append(store.rows, ObjectWrite{ID: 2, ResourceVersion: 20})
 	store.deps[2] = []ObjectRef{{ID: 8, Kind: "Widget"}}
@@ -546,7 +601,7 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 	store.seed = 30
 
 	second, rsSecond := wakerOver(store, widget)
-	require.True(t, second.seed(context.Background()))
+	require.NotEqual(t, scanFailed, second.seed(context.Background()))
 	assert.EqualValues(t, 20, second.watermark, "seeded from the stored cursor, not the write log's new max")
 
 	second.scan(context.Background())
@@ -587,7 +642,7 @@ func TestWakerResumesAnEnormousBacklog(t *testing.T) {
 	}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 
-	require.True(t, dw.seed(context.Background()))
+	require.NotEqual(t, scanFailed, dw.seed(context.Background()))
 	assert.Zero(t, dw.watermark, "the cursor is resumed, however far behind the mark it sits")
 
 	dw.scan(context.Background())
@@ -701,7 +756,7 @@ func TestNewGivesTheWakerTheStoresCursorCapability(t *testing.T) {
 	require.NotNil(t, bh.waker.cursors, "the sqlite store persists cursors, so the waker must have them")
 
 	// And the wiring carries all the way through a real seed and back.
-	require.True(t, bh.waker.seed(context.Background()))
+	require.NotEqual(t, scanFailed, bh.waker.seed(context.Background()))
 	cursor, ok, err := store.DriverCursorsGet(context.Background(), cursorNameWaker)
 	require.NoError(t, err)
 	require.True(t, ok, "the seed point reached the database")

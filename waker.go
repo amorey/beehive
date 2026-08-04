@@ -91,22 +91,32 @@ func (dw *waker) run(ctx context.Context) {
 	})
 }
 
+// scanResult says what a pass found. The run loop dispatches on it: how soon to
+// look again, and whether to drop the wakes arriving meanwhile.
+type scanResult uint8
+
+const (
+	scanIdle   scanResult = iota // nothing above the watermark
+	scanMore                     // work remains: the page budget stopped the scan, or a seed resumed below the mark
+	scanFailed                   // a read failed, so the watermark is held for the next pass
+)
+
 // seed sets the starting watermark: the persisted cursor when the store has
 // one, otherwise the write log's current high-water mark (so the first scan
 // reports changes from startup, not all history). It persists the seed point so
 // a run that never sees a write still leaves its successor somewhere to resume.
-// On failure the waker stays unseeded and the next tick retries; a change
+// On failure the waker stays unseeded and the next pass retries; a change
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
-func (dw *waker) seed(ctx context.Context) bool {
+func (dw *waker) seed(ctx context.Context) scanResult {
 	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return false // shutdown, not a loss
+			return scanFailed // shutdown, not a loss
 		}
-		dw.bh.log().WarnContext(ctx, "dependency waker could not read the store's write cursor; retrying on the next tick, and changes made before it are not replayed",
+		dw.bh.log().WarnContext(ctx, "dependency waker could not read the store's write cursor; retrying on the next pass, and changes made before it are not replayed",
 			"err", err)
-		return false
+		return scanFailed
 	}
 
 	var stored int64
@@ -114,11 +124,11 @@ func (dw *waker) seed(ctx context.Context) bool {
 	if dw.cursors != nil {
 		if stored, ok, err = dw.cursors.DriverCursorsGet(ctx, cursorNameWaker); err != nil {
 			if ctx.Err() != nil {
-				return false
+				return scanFailed
 			}
-			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next tick",
+			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next pass",
 				"err", err)
-			return false
+			return scanFailed
 		}
 	}
 
@@ -138,7 +148,14 @@ func (dw *waker) seed(ctx context.Context) bool {
 	// a write would otherwise leave its successor to skip everything committed
 	// in between. No-op when the row already covers the watermark.
 	dw.persist(ctx)
-	return true
+
+	// A resume below the mark has a backlog waiting, and making the loop wait a
+	// floor for its first page is the one case where a restart is slower than a
+	// steady state.
+	if watermark < mark {
+		return scanMore
+	}
+	return scanIdle
 }
 
 // resumeWatermark decides where seed resumes from; pure so the clamp is
@@ -157,12 +174,12 @@ func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 // scan runs one pass: everything above the watermark, a page at a time. The
 // cursor advances per page — pages come back in resource_version order, so a
 // page that succeeded means everything below it is done. A failed page holds
-// the cursor and the next tick re-reads it.
-func (dw *waker) scan(ctx context.Context) {
-	// Seeding on this tick sets the cursor and nothing more.
+// the cursor and the next pass re-reads it.
+func (dw *waker) scan(ctx context.Context) scanResult {
+	// Seeding on this pass sets the cursor and nothing more, which is what
+	// keeps a wake from turning a failed seed into a scan.
 	if !dw.seeded {
-		dw.seed(ctx)
-		return
+		return dw.seed(ctx)
 	}
 	// A defer, so every early return below — including the error path — still
 	// persists whatever earlier pages advanced the watermark to.
@@ -171,24 +188,25 @@ func (dw *waker) scan(ctx context.Context) {
 		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
-				return // shutdown cancelled this read
+				return scanFailed // shutdown cancelled this read
 			}
-			dw.bh.log().WarnContext(ctx, "scanning for changed dependencies failed; the wakes are still owed and the next tick retries them",
+			dw.bh.log().WarnContext(ctx, "scanning for changed dependencies failed; the wakes are still owed and the next pass retries them",
 				"watermark", dw.watermark, "err", err)
-			return
+			return scanFailed
 		}
 		if len(page) == 0 {
-			return
+			return scanIdle
 		}
 		if !dw.dependentsWake(ctx, page) {
-			return
+			return scanFailed
 		}
 		if len(page) < wakeScanPageCap {
 			// Nothing was above this page when the store answered; anything
-			// since belongs to the next tick.
-			return
+			// since belongs to the next pass.
+			return scanIdle
 		}
 	}
+	return scanMore
 }
 
 // persist writes the watermark through cursors when it has advanced since the
