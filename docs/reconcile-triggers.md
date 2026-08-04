@@ -38,14 +38,16 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly two push paths that cause a reconcile. Both use
-`Store.AfterCommit`, so a rollback discards them, and neither can run before the row
+There are exactly four push paths that cause a reconcile. All use
+`Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
 | Push path | Made by | Starts | Gate |
 |---|---|---|---|
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
 | A new edge enqueues the edge's source | `ControllerClient.DependenciesAdd` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
+| A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
+| A cascade enqueues the children it marked | `Beehive.gcCollect` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 
 The two paths call different methods. A
 spec write is immediate: it carries new information, so it cancels a pending alarm
@@ -55,9 +57,12 @@ re-enqueue floor.
 → [the floor ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
 Case 1 and case 5 describe them in full.
 
-Nothing else pushes a reconcile. A delete does not push. A target change does not
-push today. `Client.Requeue` is an explicit call by the embedder, not a write, and
-it is case 13.
+Every push is confined to a registered kind: each resolves a reconciler inside its
+own hook, and a client-only kind resolves to none. So a client-only object waits for
+a driver, always.
+
+Nothing else pushes a reconcile. A target change does not push today.
+`Client.Requeue` is an explicit call by the embedder, not a write, and it is case 13.
 
 ### The pull drivers
 
@@ -434,7 +439,10 @@ Cases 9, 10 and 11 share one record and one driver.
 
 **Record:** `deletion_requested_at`.
 
-**Push:** none. A delete does not schedule a collect.
+**Push:** two, both registered-kind only (cases 9 and 10). A client-only object is
+marked and left to the sweeper: `deletionAdvance` collects one directly, and running
+that from a commit hook would put the whole subtree below it on the caller's
+goroutine.
 
 **Pull:** `Beehive.deletionPendingSweep` calls `DeletionRequestsList`, which is
 kind-agnostic. `deletionAdvance` routes each result. A registered kind is
@@ -454,18 +462,29 @@ Thus every error path has a next tick.
 
 ### 9. A delete request
 
-`Delete` and `DeleteByName` stamp `deletion_requested_at` and nothing else.
+`Delete` and `DeleteByName` stamp `deletion_requested_at`, then enqueue the object
+at commit through `signalDeletionRequested`. The gate is the store's `marked`, so a
+retry pushes nothing; the mark is once per object, so the push cannot repeat on a
+pass. `DeleteByName` pushes the row the name resolved to.
 
-Tests: `TestIntegrationDeleteTriggersReconcile`,
-`TestDeletionRequestsCreateIsIdempotent`.
+Tests: `TestDeleteEnqueuesItsOwnObject`, `TestDeleteByNameEnqueuesItsOwnObject`,
+`TestRepeatedDeleteEnqueuesOnce`, `TestIntegrationDeleteTriggersReconcile`,
+`TestIntegrationDeleteCollectsWithoutThePush` (the pull path, which marks through
+the store so no push is issued), `TestDeletionRequestsCreateIsIdempotent`.
 
 ### 10. Cascade to owned children
 
-`gcCollect` marks the children with `DeletionRequestsCreateFromOwner` and returns.
-The mark is what puts them in the next sweep's listing. Thus a cascade advances one
-level for each sweep.
+`gcCollect` marks the children with `DeletionRequestsCreateFromOwner`, then enqueues
+the ones it marked in a single commit hook. Thus a cascade advances one level per
+commit, for as long as the levels are registered kinds; a client-only level costs a
+sweep, and the pushes below it wait on that level's own collect.
 
-Tests: `TestIntegrationGCCascadeDeletesOwnerAndChild`,
+The gate is `DeletionCascadeChild.Marked` — the guarded `UPDATE`'s own answer, not
+"was it already deleting". Without it the push would fire at reconcile rate, since
+`gcCollect` reruns after every pass over a deleting object.
+
+Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChildren`,
+`TestCascadeSkipsClientOnlyChild`, `TestIntegrationGCCascadeDeletesOwnerAndChild`,
 `TestCollectCascadesAndBlocksOnChild`,
 `TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp`.
 
