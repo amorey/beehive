@@ -3086,6 +3086,19 @@ func TestDeleteEnqueuesItsOwnObject(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "the delete queues the object")
 }
 
+// The name sibling pushes the same way; its id comes from the resolve the mark
+// already did.
+func TestDeleteByNameEnqueuesItsOwnObject(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	name := uniqueName()
+	obj := mustCreate(t, ctx, client, name, cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	require.NoError(t, client.DeleteByName(ctx, name))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "the delete queues the row the name held")
+}
+
 // The gate is the store's report that this call stamped the row. Without it a
 // caller retrying Delete would re-arm the object on every attempt.
 func TestRepeatedDeleteEnqueuesOnce(t *testing.T) {
