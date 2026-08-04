@@ -21,13 +21,14 @@ import "context"
 // cascades deletion to owned children, then removes the row once no finalizers
 // and no incoming edges remain.
 //
-// The children this call marks are enqueued at commit; the sweeper's next tick
-// is what finds everything else it touched, including a client-only child, which
-// has no reconciler to reach. Watches are woken separately — both the cascade's
-// marks and the physical delete are the last the log will say about those rows,
-// so a subscriber that missed them would wait out a floor tick for a change
-// nothing else will report. The cascade wakes once per child kind, since it is
-// cross-kind.
+// The children this call marks are enqueued at commit; everything else it
+// touched waits for the sweeper's next tick. See
+// docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md.
+//
+// Watches are woken separately — both the cascade's marks and the physical
+// delete are the last the log will say about those rows, so a subscriber that
+// missed them would wait out a floor tick for a change nothing else will
+// report. The cascade wakes once per child kind, since it is cross-kind.
 func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
 		obj, err := bh.store.ObjectsGetMeta(ctx, id)
@@ -53,23 +54,14 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 				woken[gk] = true
 				bh.signalKindWritten(ctx, gk)
 			}
+			// Gated on Marked: gcCollect reruns after every reconcile of a
+			// deleting object, and an ungated push would re-arm the subtree on
+			// each of them.
 			if ch.Marked {
 				pushed = append(pushed, ch.Ref)
 			}
 		}
-		// Advance the children this call marked, so a cascade costs one commit per
-		// level rather than one sweep. Gated on Marked, since gcCollect reruns
-		// after every reconcile of a deleting object: an ungated push would re-arm
-		// the whole subtree on each of them. One hook for the lot, for the same
-		// reason the wake is deduped.
-		if len(pushed) > 0 {
-			bh.store.AfterCommit(ctx, func(context.Context) {
-				enqueue := bh.enqueuerForPage()
-				for _, ref := range pushed {
-					enqueue(ref.GroupKind(), ref.ID)
-				}
-			})
-		}
+		bh.signalRequeueManyThrottled(ctx, pushed)
 
 		// The controller hasn't finished cleanup.
 		if len(obj.Finalizers) > 0 {

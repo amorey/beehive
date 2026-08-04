@@ -862,15 +862,11 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	return nil
 }
 
-// signalDeletionRequested enqueues id once its deletion mark commits, so a
-// registered kind reaches its controller at commit rather than at the next GC
-// tick. A client-only kind resolves to no reconciler and waits for the sweeper:
-// collecting it here would run the whole cascade on the caller's goroutine.
-//
-// Callers pass only writes that actually stamped the row. The mark is once per
-// object, so this cannot repeat on a pass — and a delete carries new
-// information, so it beats a backoff alarm rather than being absorbed by one.
+// signalDeletionRequested enqueues id once its deletion mark commits. Callers
+// pass only writes that actually stamped the row.
 func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, id ObjectID) {
+	// Not throttled: a delete carries new information, and the mark is once per
+	// object, so it cannot ride this on a repeat.
 	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 }
 

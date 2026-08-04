@@ -47,7 +47,7 @@ can be read.
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
 | A new edge enqueues the edge's source | `ControllerClient.DependenciesAdd` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
-| A cascade enqueues the children it marked | `Beehive.gcCollect` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
+| A cascade enqueues the children it marked | `Beehive.signalRequeueManyThrottled` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 
 The two paths call different methods. A
 spec write is immediate: it carries new information, so it cancels a pending alarm

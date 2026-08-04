@@ -308,12 +308,12 @@ func TestCollectCascadesAndBlocksOnChild(t *testing.T) {
 // queued the children, not that a driver later found them.
 func cascadeFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], *reconciler) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh, client := gcFixture(t)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)
 	require.True(t, ok)
-	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), r
+	return bh, client, r
 }
 
 // The cascade queues the children it marked, so a deletion advances one level per

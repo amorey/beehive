@@ -1913,15 +1913,14 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 
 	out := make([]storeapi.DeletionCascadeChild, 0, len(children))
 	for _, ch := range children {
-		if ch.deleting {
-			out = append(out, storeapi.DeletionCascadeChild{Ref: ch.ref})
-			continue // already deletion-pending: nothing to stamp
-		}
-		// Marked is the guarded UPDATE's own answer, never !deleting: a race may
-		// have set the flag since the SELECT, and then this stamps nothing.
-		_, marked, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID)
-		if err != nil {
-			return nil, err
+		var marked bool
+		if !ch.deleting {
+			// Marked is the guarded UPDATE's own answer, never !deleting: a race
+			// may have set the flag since the SELECT, and then this stamps nothing.
+			var err error
+			if _, marked, err = s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, storeapi.DeletionCascadeChild{Marked: marked, Ref: ch.ref})
 	}

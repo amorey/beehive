@@ -270,6 +270,10 @@ func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 // queued so its controller can clear finalizers (gcCollect can't — calling it
 // directly would make no progress, forever), a client-only kind is collected
 // here. Both arms are safe to repeat.
+//
+// Never from a commit hook: the client-only arm runs gcCollect inline, which
+// would put a whole subtree's collect on the committer's goroutine. A push
+// resolves the reconciler itself and leaves a client-only kind to the sweeper.
 func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectID) error {
 	if r, ok := bh.reconcilerFor(gk); ok {
 		r.enqueue(id)
@@ -463,6 +467,21 @@ func (bh *Beehive) signalRequeueThrottled(ctx context.Context, ref ObjectRef) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {
 			r.enqueue(ref.ID)
+		}
+	})
+}
+
+// signalRequeueManyThrottled is signalRequeueThrottled for a batch, in one hook:
+// a per-ref hook would take bh.mu for each, where enqueuerForPage resolves each
+// kind once. Empty refs queue nothing.
+func (bh *Beehive) signalRequeueManyThrottled(ctx context.Context, refs []ObjectRef) {
+	if len(refs) == 0 {
+		return
+	}
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		enqueue := bh.enqueuerForPage()
+		for _, ref := range refs {
+			enqueue(ref.GroupKind(), ref.ID)
 		}
 	})
 }
