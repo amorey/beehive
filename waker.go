@@ -16,11 +16,6 @@ package beehive
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"slices"
-	"strings"
 
 	"github.com/amorey/beehive/internal/driver"
 )
@@ -288,36 +283,6 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 // staleDependentsPageCap bounds one page of the stale-dependents scan.
 const staleDependentsPageCap = 256
 
-// cursorNameStaleDependents prefixes the stale-dependents pass's keys in
-// driver_cursors. The kind set completes the name; see staleDependentsCursorName.
-const cursorNameStaleDependents = "stale_dependents"
-
-// staleDependentsCursorName keys the cursor by the registered kind set.
-//
-// The scan returns only dependents of registered kinds, so a cursor earned under
-// one set says nothing about a kind registered later: it advanced past target
-// writes while that kind had no controller, and those targets can stay quiet
-// forever. A different set reads a different name, finds none, and re-derives
-// once.
-//
-// Dropping a kind needs no invalidation but gets one, because a digest cannot
-// express "the stored set contains this one". That costs one sweep, in the safe
-// direction.
-//
-// Each field is length-prefixed, never delimiter-joined. Nothing restricts a
-// group or kind to delimiter-free text, and joining lets distinct sets encode
-// alike — {"a", "b/c"} and {"a/b", "c"} both read as a/b/c — which would share a
-// cursor and skip the sweep the new set is owed.
-func staleDependentsCursorName(kinds []GroupKind) string {
-	encoded := make([]string, len(kinds))
-	for i, gk := range kinds {
-		encoded[i] = fmt.Sprintf("%d:%s%d:%s", len(gk.Group), gk.Group, len(gk.Kind), gk.Kind)
-	}
-	slices.Sort(encoded)
-	sum := sha256.Sum256([]byte(strings.Join(encoded, "")))
-	return cursorNameStaleDependents + "/" + hex.EncodeToString(sum[:])
-}
-
 // staleDependents is the correctness backstop behind the waker: it finds the
 // dependents their targets have moved past, stamps each one, and enqueues it.
 // It cannot be disabled.
@@ -325,14 +290,17 @@ func staleDependentsCursorName(kinds []GroupKind) string {
 // The scan is bounded by a cursor over target resource versions, so its cost is
 // what changed, not the size of the graph. That is only safe because the stamp
 // is durable — an enqueue dies with the process.
+//
+// The cursor is process-local, and deliberately not persisted. A reconcile
+// records its watermark in a separate statement from the owed decrement that
+// preceded it, so a process killed between the two leaves a dependent stale with
+// nothing durable naming it: the count is gone, the object is settled, and its
+// target may never be written again. Only re-derivation finds that dependent,
+// and starting every process at 0 guarantees one — a crash is a restart. See
+// docs/adr/2026-08-03-stale-dependents-cursor.md.
 type staleDependents struct {
-	bh      *Beehive
-	kinds   []GroupKind
-	cursors DriverCursorer       // nil when the store cannot persist a cursor
-	resets  DriverCursorResetter // nil when it cannot lower one
-
-	// cursorName is scoped to kinds, so a changed kind set re-derives.
-	cursorName string
+	bh    *Beehive
+	kinds []GroupKind
 
 	// cursor is the target version the last completed sweep covered.
 	cursor int64
@@ -347,40 +315,15 @@ func (bh *Beehive) staleDependentsRun(ctx context.Context) {
 	for _, r := range bh.order {
 		kinds = append(kinds, r.gk)
 	}
-	cursors, _ := bh.store.(DriverCursorer)
-	resets, _ := bh.store.(DriverCursorResetter)
-	sd := &staleDependents{
-		bh:         bh,
-		kinds:      kinds,
-		cursors:    cursors,
-		resets:     resets,
-		cursorName: staleDependentsCursorName(kinds),
-	}
-	sd.resume(ctx)
+	sd := &staleDependents{bh: bh, kinds: kinds}
 	driver.Run(ctx, bh.staleDependentsInterval, func(ctx context.Context) bool {
 		sd.sweep(ctx)
 		return true
 	})
 }
 
-// resume reads the position the last completed sweep recorded. Staying at 0 is
-// the safe answer: it re-derives the whole graph once.
-func (sd *staleDependents) resume(ctx context.Context) {
-	if sd.cursors == nil {
-		return
-	}
-	stored, ok, err := sd.cursors.DriverCursorsGet(ctx, sd.cursorName)
-	if err != nil {
-		sd.bh.log().WarnContext(ctx, "reading the stale-dependents cursor failed; re-deriving from the start", "err", err)
-		return
-	}
-	if ok {
-		sd.cursor = stored
-	}
-}
-
-// staleResumeAt turns the durable cursor — the version a completed sweep
-// consumed through — into a scan position.
+// staleResumeAt turns the cursor — the version the last completed sweep consumed
+// through — into a scan position.
 //
 // The next version from the start, not (consumed, 0, 0). Ids are positive, so
 // that position still matches every target at the consumed version: a target
@@ -409,18 +352,6 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 			log.WarnContext(ctx, "reading the resource version failed; the next pass retries", "err", err)
 		}
 		return
-	}
-	if sd.cursor > mark {
-		// A cursor above the store's own sequence came from another database.
-		// Re-derive everything once rather than scan above a point this store
-		// never reached. Reset the row too where the store can: DriverCursorsSet
-		// cannot lower it, so otherwise every start re-reads the same cursor.
-		sd.cursor = 0
-		if sd.resets != nil {
-			if err := sd.resets.DriverCursorsReset(ctx, sd.cursorName, 0); err != nil {
-				log.WarnContext(ctx, "resetting the stale-dependents cursor failed; the next start re-derives again", "err", err)
-			}
-		}
 	}
 	if sd.cursor == mark {
 		return // nothing issued since the last sweep, so nothing can be stale
@@ -457,9 +388,4 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 
 	// Only a sweep that reached the end may move the cursor.
 	sd.cursor = mark
-	if sd.cursors != nil {
-		if err := sd.cursors.DriverCursorsSet(ctx, sd.cursorName, mark); err != nil {
-			log.WarnContext(ctx, "persisting the stale-dependents cursor failed; a restart re-derives from the stored one", "err", err)
-		}
-	}
 }

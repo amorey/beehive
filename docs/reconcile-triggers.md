@@ -277,17 +277,13 @@ process with no waker, a bug in the wake path.
   latency. The scan is bounded by a cursor over target `resource_version`, so its cost
   is what changed rather than the size of the graph. A tick where nothing has been
   issued since the last sweep skips the listing entirely.
-- **Restart:** ✅ **the stamp is durable, so a finding outlives the queue.** The cursor
-  persists in `driver_cursors` under `stale_dependents/<digest of the kind set>`; it
-  moves only when a sweep reaches the end, so a failed page is re-read rather than
-  skipped. A cursor above the store's own sequence (another database) resets to 0 and
-  re-derives once.
-- **Kind set changes:** ✅ the cursor is keyed by the registered kinds. A process
-  running without a kind still advances its own cursor past target writes, so a
-  shared cursor would let the process that registers that kind again resume above
-  those writes and never find its dependents. A changed set reads a different name,
-  finds none, and re-derives once — which is what makes the "found on the first pass
-  after its kind is registered" promise below hold.
+- **Restart:** ✅ **the stamp is durable, and every process re-derives once.** The
+  cursor is process-local and is never persisted: a reconcile clears the owed count
+  and records its watermark in two separate statements, so a process killed between
+  them leaves a dependent stale with nothing durable naming it. Starting each process
+  at 0 repairs that, and a changed kind set needs no special handling for the same
+  reason. Within a process the cursor moves only when a sweep reaches the end, so a
+  failed page is re-read rather than skipped.
 - **Not covered:** a dependent whose kind has no controller is excluded from the scan
   (there is no loop to enqueue into, and it would be stale forever); it is found on the
   first pass after its kind is registered. The kind filter applies to the *dependent*

@@ -18,6 +18,37 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   Revisit only if an events push path is ruled out for good.
 
+- **A reconcile's owed decrement and its dependency-watermark write are two
+  statements, so losing both strands the dependent** — known, not fixed, and
+  bounded to a process that keeps running after the failure.
+
+  `typedController.reconcile` clears `reconcile_owed` and then records
+  `dependency_watermarks.reconciled_against` in separate non-transactional
+  statements. If the watermark write fails, the fallback at that site stamps
+  `reconcile_owed` again — but both calls share the store's single connection
+  and usually fail together. When the stamp fails too, nothing durable names the
+  dependent: the count is gone, the object is settled by its status write, and
+  the stale-dependents pass is cursor-bound, so a target that stays quiet is
+  never rescanned.
+
+  **The crash case is already covered**, and by a different mechanism: the
+  stale-dependents cursor is process-local, so every process re-derives once and
+  repairs any strand a crash produced. What is left is a *live* process that
+  loses both writes and then keeps running, where the dependent waits for the
+  next restart instead of the next owed pass.
+
+  **The fix is one transaction.** Fold the decrement and the watermark set into
+  a single `Within`. A failure then rolls back both, leaving `reconcile_owed`
+  standing by construction, and the fallback stamp is needed only where the
+  count was already 0 at load. See
+  [the ADR](adr/2026-08-03-stale-dependents-cursor.md).
+
+  Deferred because it puts a transaction on the reconcile path, which
+  `CLAUDE.md` deliberately keeps non-transactional, on the single connection
+  every writer shares. That trade deserves its own review rather than riding
+  along with the cursor work. Do it before the first release: after one, a
+  dependent stranded this way is a support case nobody can diagnose.
+
 - **The stale-dependents pass rescans the whole dependency graph on every
   sweep, and a cursor is only sound if the pass records what it finds** —
   known, not fixed, and deferred on scale rather than on doubt. The fix is

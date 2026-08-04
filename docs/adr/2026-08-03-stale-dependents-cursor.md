@@ -104,11 +104,32 @@ sweep and holds it, so the next tick reads the same range again. Re-reading is
 free: the stamp accumulates and `ReconcileOwedDecrement` subtracts the whole
 count observed at load.
 
-Two positions are handled explicitly. A tick where nothing has been issued since
-the last sweep skips the listing entirely, because no target can have moved. A
-cursor **above** the store's own sequence came from another database; it resets
-to 0 and re-derives once, rather than scanning above a point this store never
-reached and finding nothing for good.
+A tick where nothing has been issued since the last sweep skips the listing
+entirely, because no target can have moved.
+
+### The cursor is process-local
+
+**It is deliberately not persisted, and every process re-derives once.**
+
+A reconcile clears the owed count in one statement and records its watermark in
+another. A process killed between them leaves a dependent stale with nothing
+durable naming it: the count is gone, the object is settled by its status write,
+and its target may never be written again. The owed pass sees no stamp, the
+unsettled pass sees a settled row, and a persisted cursor would already sit
+above the quiet target. That dependent would never reconcile again.
+
+The unbounded scan re-derived it within 60 s. Re-deriving once per process is
+the smallest thing that keeps the guarantee, and it needs no case analysis: this
+strand can only be produced by a crash, and a crash is a restart.
+
+Two other routes reach the same state, which is why the enumeration is not worth
+trusting. A dependent woken by the dependency waker carries no stamp at all, so
+there is nothing to leave standing. So does one enqueued by its own spec write,
+or by `Client.Requeue`, or by a `RequeueAfter`. Any future enqueue path would
+join them silently.
+
+The cost is one full scan per process — 190 ms at 250,000 edges, which this pass
+paid every 60 s before this change. The per-sweep win is untouched.
 
 ## Consequences
 
@@ -117,6 +138,13 @@ reached and finding nothing for good.
   `reconcile_owed` increment… add one only when a producer other than `EdgesAdd`
   exists." This record is that condition being met, twice: the pass and the
   reconciler's watermark fallback.
+- **A live process that loses both writes is still exposed.** If
+  `DependencyWatermarksSet` fails and the repair stamp fails with it, that
+  dependent stays stale until the process restarts — the re-derivation above
+  repairs a crash, not a running process that keeps running. Folding the owed
+  decrement and the watermark set into one store transaction closes it, so a
+  failure leaves `reconcile_owed` standing by construction. Recorded in
+  `docs/TODO.md`, not done here.
 - **The reconciler's fallback is best-effort against the store that just
   failed.** This is the one place the change trades a derived guarantee for a
   durable write that might not land. The store cannot own the fallback — a
@@ -135,26 +163,12 @@ reached and finding nothing for good.
 - **`DependentsListStale`, the unbounded form, has no production caller.** It
   survives for the tests that assert against a full re-derivation. Removing it
   belongs with the merge above.
-- **The cursor is keyed by the registered kind set**, as
-  `stale_dependents/<digest>`. The scan returns only dependents of registered
-  kinds, so a cursor earned under one set says nothing about a kind registered
-  later: the earlier process advanced past target writes that kind never saw,
-  and those targets can stay quiet forever. A changed set reads a different
-  name, finds none, and re-derives once. Dropping a kind is over-invalidated for
-  the same reason a digest cannot express set containment, which costs one sweep
-  in the safe direction. The cost is one abandoned row per kind set ever
-  registered, which is a development-time event.
-- **A cursor that must move backwards needs its own capability.** A stored
-  position above this database's sequence cannot be replaced by
-  `DriverCursorsSet`, whose monotone guard discards it, so the repair would be
-  redone on every start. `DriverCursorResetter` writes without the guard.
-
-  It is a **separate** optional interface, not a third method on
-  `DriverCursorer`. Growing an optional capability is silent: a backend written
-  against the older interface simply stops satisfying it, the type assertion
-  yields nil, and cursor persistence disappears with no build error. That
-  applies to every optional capability here, and is the reason to add a
-  capability rather than extend one.
+- **A process-local cursor needs no scoping and no repair path.** A persisted
+  one would: it would have to be keyed by the registered kind set, because a
+  cursor earned while a kind had no controller says nothing about that kind's
+  dependents; and it would need a way to move backwards, because a position
+  above this database's sequence can never be replaced by a monotone write. Both
+  disappear when the cursor starts at 0 in every process.
 - **A cursor shared by two processes on one database breaks**, because each
   would skip work the other's cursor claimed. The full scan was immune to that
   by construction. This is bounded by the single-writer, single-process

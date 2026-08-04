@@ -71,8 +71,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   for a target that has gone quiet.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The stale-dependents pass scans from a cursor over target
-  `resource_version`** (`DependentsListStaleSince`, persisted in
-  `driver_cursors`), so its cost is what changed, not the size of the graph. It
+  `resource_version`** (`DependentsListStaleSince`), so its cost is what
+  changed, not the size of the graph. **The cursor is process-local and never
+  persisted**: a reconcile writes its owed decrement and its watermark
+  separately, so a crash between them strands a dependent that only a
+  re-derivation can find, and every process does one. It
   is sound only because the pass *stamps* `reconcile_owed` for what it finds
   before enqueuing: the queue dies with the process, the stamp does not. The
   cursor moves only when a sweep reaches the end. **`reconcile_owed` now has

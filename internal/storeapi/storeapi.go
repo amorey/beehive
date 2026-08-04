@@ -641,17 +641,3 @@ type DriverCursorer interface {
 	// write, since a driver may call this every tick.
 	DriverCursorsSet(ctx context.Context, name string, cursor int64) error
 }
-
-// DriverCursorResetter is an optional companion to DriverCursorer: it writes a
-// cursor with no monotone guard, for the one case a cursor must move backwards
-// — a stored position this database never reached, which DriverCursorsSet
-// cannot replace and which would otherwise be re-read on every start.
-//
-// Separate from DriverCursorer, not a third method on it. Adding a method to an
-// optional capability is silent: a backend implementing the older interface
-// stops satisfying it, the type assertion yields nil, and cursor persistence
-// disappears with no build error. A store that omits this one keeps its cursors
-// and repairs a foreign position in memory once per start.
-type DriverCursorResetter interface {
-	DriverCursorsReset(ctx context.Context, name string, cursor int64) error
-}

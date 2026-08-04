@@ -795,26 +795,12 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 // It is a DriverCursorer so a test can watch the cursor it must not move.
 type staleListErrorStore struct {
 	fakeStore
-	calls    atomic.Int64
-	issued   int64
-	setCalls []int64
+	calls  atomic.Int64
+	issued int64
 }
 
 func (s *staleListErrorStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
 	return s.issued, nil
-}
-
-func (s *staleListErrorStore) DriverCursorsGet(context.Context, string) (int64, bool, error) {
-	return 0, false, nil
-}
-
-func (s *staleListErrorStore) DriverCursorsReset(context.Context, string, int64) error {
-	return nil
-}
-
-func (s *staleListErrorStore) DriverCursorsSet(_ context.Context, _ string, cursor int64) error {
-	s.setCalls = append(s.setCalls, cursor)
-	return nil
 }
 
 func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
@@ -826,17 +812,13 @@ func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []Gr
 // what the sweep asked for, stamped, and persisted.
 type staleSweepStore struct {
 	fakeStore
-	issued     int64
-	issuedErr  error
-	stampErr   error
-	resetErr   error
-	pages      [][]ObjectRef
-	asked      []StalePos
-	throughs   []int64
-	stamped    [][]ObjectRef
-	stored     map[string]int64
-	setCalls   []int64
-	resetCalls []int64
+	issued    int64
+	issuedErr error
+	stampErr  error
+	pages     [][]ObjectRef
+	asked     []StalePos
+	throughs  []int64
+	stamped   [][]ObjectRef
 }
 
 func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
@@ -862,52 +844,17 @@ func (s *staleSweepStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef
 	return nil
 }
 
-func (s *staleSweepStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
-	v, ok := s.stored[name]
-	return v, ok, nil
-}
-
-func (s *staleSweepStore) DriverCursorsReset(_ context.Context, name string, cursor int64) error {
-	if s.resetErr != nil {
-		return s.resetErr
-	}
-	s.resetCalls = append(s.resetCalls, cursor)
-	if s.stored == nil {
-		s.stored = map[string]int64{}
-	}
-	s.stored[name] = cursor
-	return nil
-}
-
-func (s *staleSweepStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
-	s.setCalls = append(s.setCalls, cursor)
-	if s.stored == nil {
-		s.stored = map[string]int64{}
-	}
-	if stored, ok := s.stored[name]; !ok || cursor > stored {
-		s.stored[name] = cursor
-	}
-	return nil
-}
-
 // sweeperOver builds a stale-dependents sweeper over a store double, mirroring
 // what staleDependentsRun assembles.
 func sweeperOver(store Store) *staleDependents {
 	return sweeperOverKinds(store, clientTestGK)
 }
 
-// sweeperOverKinds is sweeperOver for an explicit kind set, so a test can change
-// it between processes.
+// sweeperOverKinds is sweeperOver for an explicit kind set.
 func sweeperOverKinds(store Store, kinds ...GroupKind) *staleDependents {
-	bh := &Beehive{store: store, logger: slog.New(slog.DiscardHandler)}
-	cursors, _ := store.(DriverCursorer)
-	resets, _ := store.(DriverCursorResetter)
 	return &staleDependents{
-		bh:         bh,
-		kinds:      kinds,
-		cursors:    cursors,
-		resets:     resets,
-		cursorName: staleDependentsCursorName(kinds),
+		bh:    &Beehive{store: store, logger: slog.New(slog.DiscardHandler)},
+		kinds: kinds,
 	}
 }
 
@@ -926,211 +873,53 @@ func TestStaleDependentsSweepStampsWhatItFinds(t *testing.T) {
 	assert.Equal(t, [][]ObjectRef{page}, sd.bh.store.(*staleSweepStore).stamped)
 }
 
-// TestStaleDependentsSweepResumesAndRecordsThePreScanMark pins both ends of the
-// cursor. It resumes where the last completed sweep stopped, and it records the
-// mark read *before* this scan — a target written while the sweep runs sits above
-// that mark, so the next sweep still finds it.
-func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
-	store := &staleSweepStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 200}}
+// TestStaleDependentsSweepAdvancesToThePreScanMark: the cursor moves to the mark
+// read *before* the scan, and the next scan starts above it. A target written
+// while the sweep runs sits above that mark, so the next sweep still finds it.
+func TestStaleDependentsSweepAdvancesToThePreScanMark(t *testing.T) {
+	store := &staleSweepStore{issued: 500}
 	sd := sweeperOver(store)
-	ctx := context.Background()
+	sd.cursor = 200
 
-	sd.resume(ctx)
-	require.EqualValues(t, 200, sd.cursor, "a stored cursor is where the next sweep starts")
+	sd.sweep(context.Background())
 
-	sd.sweep(ctx)
-
-	assert.Equal(t, []StalePos{{TargetVersion: 201}}, store.asked, "above the version the last sweep consumed")
-	assert.Equal(t, []int64{500}, store.throughs, "and bounds the scan at that same mark")
-	assert.EqualValues(t, 500, sd.cursor, "the sweep advances to the mark it read first")
-	assert.Equal(t, []int64{500}, store.setCalls, "and persists it once")
+	assert.Equal(t, []StalePos{{TargetVersion: 201}}, store.asked, "above the version already consumed")
+	assert.Equal(t, []int64{500}, store.throughs, "and bounded at the mark it read first")
+	assert.EqualValues(t, 500, sd.cursor)
 }
 
 // TestStaleDependentsSweepSkipsAQuietStore: no version issued since the last
-// sweep means no target moved, so no row can be stale. The listing and the
-// cursor write are both skipped, leaving one read per tick.
+// sweep means no target moved, so no row can be stale. The listing is skipped,
+// leaving one read per tick.
 func TestStaleDependentsSweepSkipsAQuietStore(t *testing.T) {
-	store := &staleSweepStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 500}}
+	store := &staleSweepStore{issued: 500}
 	sd := sweeperOver(store)
-	ctx := context.Background()
-	sd.resume(ctx)
+	sd.cursor = 500
 
-	sd.sweep(ctx)
+	sd.sweep(context.Background())
 
 	assert.Empty(t, store.asked, "nothing has moved, so nothing is listed")
-	assert.Empty(t, store.setCalls, "and the cursor row is left alone")
 }
 
-// TestStaleDependentsSweepRederivesFromAForeignCursor: a cursor above the store's
-// own sequence came from another database. Scanning above it would find nothing
-// for good, which would silently disable the one pass that cannot be disabled.
-func TestStaleDependentsSweepRederivesFromAForeignCursor(t *testing.T) {
-	store := &staleSweepStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 9000}}
-	sd := sweeperOver(store)
-	ctx := context.Background()
-	sd.resume(ctx)
-
-	sd.sweep(ctx)
-
-	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked, "the scan restarts from the beginning")
-	assert.EqualValues(t, 500, sd.cursor)
-	assert.Equal(t, []int64{0}, store.resetCalls,
-		"the row is reset too: DriverCursorsSet cannot lower it")
-
-	// The repair is durable, so the next process resumes rather than re-deriving.
-	next := sweeperOver(store)
-	next.resume(ctx)
-	assert.EqualValues(t, 500, next.cursor, "a restart reads the repaired cursor")
-}
-
-// staleCursorName is the cursor key for a kind set, for seeding a double.
-func staleCursorName(kinds ...GroupKind) string {
-	return staleDependentsCursorName(kinds)
-}
-
-// TestStaleDependentsCursorNameScopesToTheKindSet: order does not matter, but
-// membership does. A name that ignored membership would let a cursor earned
-// without a kind be resumed once that kind is back.
-func TestStaleDependentsCursorNameScopesToTheKindSet(t *testing.T) {
-	a := GroupKind{Kind: "A"}
-	b := GroupKind{Group: "g", Kind: "B"}
-
-	assert.Equal(t, staleCursorName(a, b), staleCursorName(b, a), "order is not membership")
-	assert.NotEqual(t, staleCursorName(a), staleCursorName(a, b), "an added kind is a different set")
-	assert.NotEqual(t, staleCursorName(a, b), staleCursorName(b), "so is a dropped one")
-	assert.Contains(t, staleCursorName(a), cursorNameStaleDependents+"/")
-}
-
-// TestStaleDependentsCursorNameIsUnambiguous: nothing restricts a group or kind
-// to delimiter-free text, so the encoding must not depend on delimiters. Both
-// pairs below collide under a "group/kind\n" join, and a collision means a set
-// silently inherits another set's cursor and skips the sweep it is owed.
-func TestStaleDependentsCursorNameIsUnambiguous(t *testing.T) {
-	assert.NotEqual(t,
-		staleCursorName(GroupKind{Group: "a", Kind: "b/c"}),
-		staleCursorName(GroupKind{Group: "a/b", Kind: "c"}),
-		"a slash inside a field is not a field boundary")
-
-	assert.NotEqual(t,
-		staleCursorName(GroupKind{Group: "a", Kind: "b\nc/d"}),
-		staleCursorName(GroupKind{Group: "a", Kind: "b"}, GroupKind{Group: "c", Kind: "d"}),
-		"a newline inside a field is not a set boundary")
-}
-
-// TestStaleDependentsSweepRederivesForANewlyRegisteredKind is the strand the
-// scoping exists to stop. A process running without a kind still advances its
-// cursor past target writes; if that cursor were shared, the process that brings
-// the kind back would resume above those writes and never find its dependents
-// while the targets stay quiet.
-func TestStaleDependentsSweepRederivesForANewlyRegisteredKind(t *testing.T) {
-	other := GroupKind{Kind: "Other"}
+// TestStaleDependentsSweepStartsEveryProcessAtTheBeginning is why the cursor is
+// not persisted. A reconcile clears the owed count in one statement and records
+// its watermark in another, so a process killed between them leaves a dependent
+// stale with nothing durable naming it — the count gone, the object settled, its
+// target quiet. Only re-derivation finds it, and every process does one.
+func TestStaleDependentsSweepStartsEveryProcessAtTheBeginning(t *testing.T) {
 	store := &staleSweepStore{issued: 500}
 	ctx := context.Background()
 
-	// A process that registers only clientTestGK sweeps and records its cursor.
-	first := sweeperOverKinds(store, clientTestGK)
-	first.resume(ctx)
+	first := sweeperOver(store)
 	first.sweep(ctx)
-	require.EqualValues(t, 500, first.cursor)
-	require.Len(t, store.setCalls, 1)
-
-	// A later process registers one more kind. Its dependents were never in the
-	// first process's scope, so the cursor above says nothing about them.
-	second := sweeperOverKinds(store, clientTestGK, other)
-	second.resume(ctx)
-
-	assert.Zero(t, second.cursor, "a wider kind set re-derives from the start")
+	require.EqualValues(t, 500, first.cursor, "this process will not rescan what it covered")
 
 	store.asked = nil
+	second := sweeperOver(store)
 	second.sweep(ctx)
-	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked, "and scans the whole graph once")
-}
 
-// cursorOnlyStore implements DriverCursorer and nothing more — a backend written
-// against the interface before DriverCursorResetter existed.
-type cursorOnlyStore struct {
-	fakeStore
-	issued   int64
-	stored   map[string]int64
-	setCalls []int64
-}
-
-func (s *cursorOnlyStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
-	return s.issued, nil
-}
-
-func (s *cursorOnlyStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
-	v, ok := s.stored[name]
-	return v, ok, nil
-}
-
-// Set-if-greater, as the contract requires: without the guard a test could not
-// tell a cursor that was lowered from one that was left alone.
-func (s *cursorOnlyStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
-	s.setCalls = append(s.setCalls, cursor)
-	if s.stored == nil {
-		s.stored = map[string]int64{}
-	}
-	if stored, ok := s.stored[name]; !ok || cursor > stored {
-		s.stored[name] = cursor
-	}
-	return nil
-}
-
-// TestStaleDependentsSweepKeepsCursorsWithoutTheResetter is the compatibility
-// guarantee. Reset is a capability of its own, so a store that predates it still
-// persists its cursors — folding Reset into DriverCursorer would have made such
-// a store fail the assertion and lose persistence with no build error.
-func TestStaleDependentsSweepKeepsCursorsWithoutTheResetter(t *testing.T) {
-	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 200}}
-	sd := sweeperOver(store)
-	ctx := context.Background()
-
-	require.NotNil(t, sd.cursors, "the older capability is still satisfied")
-	require.Nil(t, sd.resets)
-
-	sd.resume(ctx)
-	require.EqualValues(t, 200, sd.cursor, "the stored cursor is still read")
-
-	sd.sweep(ctx)
-	assert.Equal(t, []int64{500}, store.setCalls, "and still written")
-}
-
-// A foreign cursor is repaired in memory even where the store cannot lower the
-// row. The cost is one re-derivation per start, which is what this pass did
-// before the cursor existed.
-func TestStaleDependentsSweepRederivesInMemoryWithoutTheResetter(t *testing.T) {
-	store := &cursorOnlyStore{issued: 500, stored: map[string]int64{staleCursorName(clientTestGK): 9000}}
-	sd := sweeperOver(store)
-	ctx := context.Background()
-	sd.resume(ctx)
-
-	sd.sweep(ctx)
-
-	assert.EqualValues(t, 500, sd.cursor, "this process re-derives and moves on")
-	assert.Equal(t, 9000, int(store.stored[staleCursorName(clientTestGK)]), "the row it cannot lower is left alone")
-}
-
-// TestStaleDependentsSweepSweepsWhenTheForeignResetFails: the reset is the
-// durable half of the repair, and the in-memory half stands on its own. A failed
-// reset costs one more re-derivation at the next start, not a skipped sweep.
-func TestStaleDependentsSweepSweepsWhenTheForeignResetFails(t *testing.T) {
-	store := &staleSweepStore{
-		issued:   500,
-		stored:   map[string]int64{staleCursorName(clientTestGK): 9000},
-		resetErr: errBoom,
-	}
-	logger, logs := captureLogger(slog.LevelWarn)
-	sd := sweeperOver(store)
-	sd.bh.logger = logger
-	ctx := context.Background()
-	sd.resume(ctx)
-
-	sd.sweep(ctx)
-
-	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked, "the scan still restarts from the beginning")
-	assert.EqualValues(t, 500, sd.cursor)
-	assert.Contains(t, logs.String(), "resetting the stale-dependents cursor failed")
+	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked,
+		"a fresh process starts from nothing, so its first sweep scans the whole graph")
 }
 
 // TestStaleDependentsSweepDoesNotRestampAConsumedVersion: a completed sweep
@@ -1220,8 +1009,40 @@ func TestStaleDependentsSweepHoldsTheCursorOnStampFailure(t *testing.T) {
 	sd.sweep(context.Background())
 
 	assert.Zero(t, sd.cursor, "the cursor does not move past an unrecorded finding")
-	assert.Empty(t, store.setCalls, "and nothing is persisted")
 	assert.Contains(t, logs.String(), "stamping stale dependents failed")
+}
+
+// TestStaleDependentsSweepRepairsALostWatermarkAfterRestart walks the crash the
+// process-local cursor exists for. The sweep stamps the dependent; a reconcile
+// clears that stamp and dies before recording its watermark. Nothing durable
+// names the dependent any more, and its target never moves again — so only the
+// next process's re-derivation can find it.
+func TestStaleDependentsSweepRepairsALostWatermarkAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	spec := []byte(`{}`)
+	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	sweeperOver(store).sweep(ctx)
+	owed, err := store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, owed.ReconcileOwed, "the sweep recorded the finding")
+
+	// The reconcile that drained it, killed before DependencyWatermarksSet.
+	require.NoError(t, store.ReconcileOwedDecrement(ctx, clientTestGK, dep.ID, 1))
+	owed, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	require.Zero(t, owed.ReconcileOwed, "nothing durable names the dependent now")
+
+	sweeperOver(store).sweep(ctx)
+
+	owed, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, owed.ReconcileOwed, "the new process re-derives and finds it again")
 }
 
 // TestStaleDependentsSweepHoldsTheCursorOnListFailure pins the failure contract:
@@ -1240,7 +1061,6 @@ func TestStaleDependentsSweepHoldsTheCursorOnListFailure(t *testing.T) {
 	require.EqualValues(t, 1, store.calls.Load(), "a failed page abandons the sweep")
 	assert.Contains(t, logs.String(), "listing stale dependents failed")
 	assert.EqualValues(t, 200, sd.cursor, "the cursor does not move past a page nobody read")
-	assert.Empty(t, store.setCalls, "and nothing is persisted")
 
 	sd.sweep(ctx)
 	assert.EqualValues(t, 2, store.calls.Load(), "the next pass asks again")
