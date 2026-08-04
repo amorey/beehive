@@ -97,7 +97,12 @@ const wakeScanPageCap = 256
 // wakeScanPagesPerPass bounds one pass's scan so resuming after a long gap
 // cannot monopolise the single connection. The remainder rides the in-memory
 // watermark to the next pass.
-const wakeScanPagesPerPass = 16
+//
+// Four, not sixteen, because a wake-driven pass can run ten times a second:
+// BenchmarkWakerScanRateUnderSustainedWrites measures a full-budget pass at
+// ~3ms against ~13ms, so a writer waits behind a shorter hold while a resume
+// still drains faster than the old one-pass-per-second could.
+const wakeScanPagesPerPass = 4
 
 // run drives the waker for the life of the control plane: a commit wakes it,
 // and the interval is the floor behind that. A non-positive interval turns it
