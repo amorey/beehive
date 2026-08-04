@@ -1001,6 +1001,22 @@ func TestStaleDependentsCursorNameScopesToTheKindSet(t *testing.T) {
 	assert.Contains(t, staleCursorName(a), cursorNameStaleDependents+"/")
 }
 
+// TestStaleDependentsCursorNameIsUnambiguous: nothing restricts a group or kind
+// to delimiter-free text, so the encoding must not depend on delimiters. Both
+// pairs below collide under a "group/kind\n" join, and a collision means a set
+// silently inherits another set's cursor and skips the sweep it is owed.
+func TestStaleDependentsCursorNameIsUnambiguous(t *testing.T) {
+	assert.NotEqual(t,
+		staleCursorName(GroupKind{Group: "a", Kind: "b/c"}),
+		staleCursorName(GroupKind{Group: "a/b", Kind: "c"}),
+		"a slash inside a field is not a field boundary")
+
+	assert.NotEqual(t,
+		staleCursorName(GroupKind{Group: "a", Kind: "b\nc/d"}),
+		staleCursorName(GroupKind{Group: "a", Kind: "b"}, GroupKind{Group: "c", Kind: "d"}),
+		"a newline inside a field is not a set boundary")
+}
+
 // TestStaleDependentsSweepRederivesForANewlyRegisteredKind is the strand the
 // scoping exists to stop. A process running without a kind still advances its
 // cursor past target writes; if that cursor were shared, the process that brings

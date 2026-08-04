@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -302,13 +303,18 @@ const cursorNameStaleDependents = "stale_dependents"
 // Dropping a kind needs no invalidation but gets one, because a digest cannot
 // express "the stored set contains this one". That costs one sweep, in the safe
 // direction.
+//
+// Each field is length-prefixed, never delimiter-joined. Nothing restricts a
+// group or kind to delimiter-free text, and joining lets distinct sets encode
+// alike — {"a", "b/c"} and {"a/b", "c"} both read as a/b/c — which would share a
+// cursor and skip the sweep the new set is owed.
 func staleDependentsCursorName(kinds []GroupKind) string {
-	lines := make([]string, len(kinds))
+	encoded := make([]string, len(kinds))
 	for i, gk := range kinds {
-		lines[i] = gk.Group + "/" + gk.Kind + "\n"
+		encoded[i] = fmt.Sprintf("%d:%s%d:%s", len(gk.Group), gk.Group, len(gk.Kind), gk.Kind)
 	}
-	slices.Sort(lines)
-	sum := sha256.Sum256([]byte(strings.Join(lines, "")))
+	slices.Sort(encoded)
+	sum := sha256.Sum256([]byte(strings.Join(encoded, "")))
 	return cursorNameStaleDependents + "/" + hex.EncodeToString(sum[:])
 }
 
