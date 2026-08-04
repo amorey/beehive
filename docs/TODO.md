@@ -18,6 +18,34 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   Revisit only if an events push path is ruled out for good.
 
+- **A standing `reconcile_owed` count overrides the backoff ladder above 30 s** —
+  known, not fixed, and invisible on the default settings.
+
+  `ReconcileOwedDecrement` is gated on `reconcileErr == nil`, so a failing object
+  keeps whatever stamped it. The owed pass lists it every `owedPassInterval` and
+  calls `work.add`, and `add` consults only the queued-now set: an id parked on a
+  backoff alarm is not in that set, so it is dispatched at once and the alarm
+  later fires into a no-op. Retries are therefore floored at the owed-pass
+  cadence for as long as the count stands.
+
+  **The defaults hide it.** `defaultMaxRetryInterval` and
+  `defaultOwedPassInterval` are both 30 s, so every rung of the ladder is at or
+  under the tick and the alarm always beats it. Raising `WithMaxRetryInterval`
+  above the owed-pass interval is what exposes it, and nothing in that option's
+  documentation says so — which is the actual defect here.
+
+  The stale-dependents pass widened who this reaches. Before it stamped its
+  findings, a standing count meant a non-converging edge set; now it means any
+  dependent the pass found whose reconcile is failing. See
+  [the cursor ADR](adr/2026-08-03-stale-dependents-cursor.md).
+
+  **The fix is a floor, not a gate**: have the owed pass enqueue through a path
+  that respects a pending alarm, or document the interaction on
+  `WithMaxRetryInterval`. Deferred because the cheap half is documentation and the
+  real half needs `workQueue` to distinguish "queued now" from "waiting on an
+  alarm" at the `add` call site, which is the same signal the
+  minimum-re-enqueue-interval item below wants. Do them together.
+
 - **A reconcile's owed decrement and its dependency-watermark write are two
   statements, so losing both strands the dependent** — known, not fixed, and
   bounded to a process that keeps running after the failure.

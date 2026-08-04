@@ -182,6 +182,26 @@ finding through the owed pass. The queue folds the duplicate.
   owed decrement and the watermark set into one store transaction, so a failure
   leaves `reconcile_owed` standing by construction. That also removes route 4,
   and with it the reason the cursor cannot be persisted.
+- **A stamped dependent whose reconcile keeps failing retries on the owed pass's
+  cadence, not only on its backoff ladder.** `ReconcileOwedDecrement` is gated on
+  success, so a failing dependent keeps the count the pass stamped. The owed pass
+  lists it every `owedPassInterval` and calls `work.add`, which consults only the
+  queued-now set — an id parked on a backoff alarm is not in it, so the add
+  dispatches at once and the alarm later fires into a no-op.
+
+  **Harmless on the defaults, and deliberately left there.**
+  `defaultMaxRetryInterval` and `defaultOwedPassInterval` are both 30 s, so every
+  rung of the ladder is at or under the owed-pass cadence and the alarm always
+  beats the tick. The cost appears only when `WithMaxRetryInterval` is raised
+  above `withOwedPassInterval`, where the ladder is effectively capped at the
+  owed-pass cadence for any object carrying a standing stamp.
+
+  The mechanism is not new — `EdgesAdd`'s stamp has always left a count standing
+  through a failing reconcile — but this change widens the population from
+  objects with a non-converging edge set to any dependent the pass has found. It
+  is distinct from the `requeueNow` cost recorded in
+  [the spec-write ADR](2026-07-31-a-spec-write-enqueues-its-own-object.md), which
+  fires immediately rather than on a tick. Recorded in `docs/TODO.md`.
 - **The pass and the dependency waker are now the same mechanism.** Both scan
   from a cursor and wake dependents. The waker's own record calls it "an
   optimisation, not a guarantee", and the guarantee it defers to is this pass —
