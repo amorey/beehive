@@ -379,6 +379,18 @@ func (sd *staleDependents) resume(ctx context.Context) {
 	}
 }
 
+// staleResumeAt turns the durable cursor — the version a completed sweep
+// consumed through — into a scan position.
+//
+// The next version from the start, not (consumed, 0, 0). Ids are positive, so
+// that position still matches every target at the consumed version: a target
+// there whose dependents are still stale would have its whole fan-out listed and
+// stamped again on every sweep. Tuple paging is for resuming inside one sweep,
+// where the position is a row the scan actually returned.
+func staleResumeAt(consumed int64) StalePos {
+	return StalePos{TargetVersion: consumed + 1}
+}
+
 // sweep pages the listing to exhaustion, stamping and enqueuing each dependent
 // under its own kind. A failed page abandons the sweep and holds the cursor, so
 // the next tick reads the same range again.
@@ -420,7 +432,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 		}
 	}
 	enqueue := sd.bh.enqueuerForPage()
-	pos := StalePos{TargetVersion: sd.cursor}
+	pos := staleResumeAt(sd.cursor)
 	for {
 		page, next, err := sd.bh.store.DependentsListStaleSince(ctx, sd.kinds, pos, mark, staleDependentsPageCap)
 		if err != nil {

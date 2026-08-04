@@ -91,6 +91,14 @@ That value comes from `ResourceVersionsMaxIssued`, which reads
 retention lowers that one, and an idle store past its retention window reads 0.
 A falling cursor compares wrongly against a stored position.
 
+A completed sweep consumed its mark, so the next one resumes at the **next**
+version, from the start. Resuming at `(mark, 0, 0)` would not do: ids are
+positive, so that position still matches every target at the consumed version,
+and a target sitting exactly there whose dependents have not reconciled yet
+would have its whole fan-out listed and stamped again on every sweep. Tuple
+paging is for resuming inside one sweep, where the position is a row the scan
+actually returned.
+
 The cursor moves only when a sweep reaches the end. A failed page abandons the
 sweep and holds it, so the next tick reads the same range again. Re-reading is
 free: the stamp accumulates and `ReconcileOwedDecrement` subtracts the whole

@@ -940,7 +940,7 @@ func TestStaleDependentsSweepResumesAndRecordsThePreScanMark(t *testing.T) {
 
 	sd.sweep(ctx)
 
-	assert.Equal(t, []StalePos{{TargetVersion: 200}}, store.asked)
+	assert.Equal(t, []StalePos{{TargetVersion: 201}}, store.asked, "above the version the last sweep consumed")
 	assert.Equal(t, []int64{500}, store.throughs, "and bounds the scan at that same mark")
 	assert.EqualValues(t, 500, sd.cursor, "the sweep advances to the mark it read first")
 	assert.Equal(t, []int64{500}, store.setCalls, "and persists it once")
@@ -972,7 +972,7 @@ func TestStaleDependentsSweepRederivesFromAForeignCursor(t *testing.T) {
 
 	sd.sweep(ctx)
 
-	assert.Equal(t, []StalePos{{}}, store.asked, "the scan restarts from the beginning")
+	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked, "the scan restarts from the beginning")
 	assert.EqualValues(t, 500, sd.cursor)
 	assert.Equal(t, []int64{0}, store.resetCalls,
 		"the row is reset too: DriverCursorsSet cannot lower it")
@@ -1043,7 +1043,7 @@ func TestStaleDependentsSweepRederivesForANewlyRegisteredKind(t *testing.T) {
 
 	store.asked = nil
 	second.sweep(ctx)
-	assert.Equal(t, []StalePos{{}}, store.asked, "and scans the whole graph once")
+	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked, "and scans the whole graph once")
 }
 
 // cursorOnlyStore implements DriverCursorer and nothing more — a backend written
@@ -1128,9 +1128,44 @@ func TestStaleDependentsSweepSweepsWhenTheForeignResetFails(t *testing.T) {
 
 	sd.sweep(ctx)
 
-	assert.Equal(t, []StalePos{{}}, store.asked, "the scan still restarts from the beginning")
+	assert.Equal(t, []StalePos{{TargetVersion: 1}}, store.asked, "the scan still restarts from the beginning")
 	assert.EqualValues(t, 500, sd.cursor)
 	assert.Contains(t, logs.String(), "resetting the stale-dependents cursor failed")
+}
+
+// TestStaleDependentsSweepDoesNotRestampAConsumedVersion: a completed sweep
+// consumed everything up to its mark, so the next one must start above it.
+// Resuming at (mark, 0, 0) still matches every target at that version, because
+// ids are positive — so a target sitting exactly there, whose dependents have
+// not reconciled yet, would have its whole fan-out stamped again on every sweep.
+func TestStaleDependentsSweepDoesNotRestampAConsumedVersion(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	sd := sweeperOver(store)
+	spec := []byte(`{}`)
+
+	// The target is written last, so it sits at exactly the mark sweep one ends on.
+	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	sd.sweep(ctx)
+	raw, err := store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, raw.ReconcileOwed, "the dependent has no watermark, so one pass is owed")
+
+	// An unrelated write moves the mark, so the next tick sweeps. The target
+	// itself has not moved, and the dependent is still stale.
+	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	require.NoError(t, err)
+
+	sd.sweep(ctx)
+
+	raw, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, raw.ReconcileOwed, "the target did not move, so nothing more is owed")
 }
 
 // TestStaleDependentsSweepLeavesADurableFinding is the restart property the
