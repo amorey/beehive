@@ -2932,56 +2932,98 @@ func TestReconcileSkipsDependencyWatermarkWithoutDependencies(t *testing.T) {
 	assert.Equal(t, []ObjectID{h.dep}, probe.sets, "a dependent does record one")
 }
 
-// TestReconcileStampsOwedWhenTheWatermarkWriteFails pins the durable record a
-// failed watermark write has to leave. Re-deriving the object was enough while
-// the stale pass scanned everything; a cursor-bound pass re-derives nothing for a
-// target that has gone quiet, so the failure must record its own owed wake.
-func TestReconcileStampsOwedWhenTheWatermarkWriteFails(t *testing.T) {
+// TestALostWatermarkStillFindsAnUnobservedChange is why a failed watermark write
+// needs no compensating record. The write leaves the watermark low, and a low
+// watermark only over-reports staleness: a target change this pass did not
+// observe is issued above the sweep's cursor, so even a process that keeps
+// running finds the dependent. See docs/adr/2026-08-03-stale-dependents-cursor.md.
+func TestALostWatermarkStillFindsAnUnobservedChange(t *testing.T) {
 	ctx := context.Background()
 	var probe *watermarkProbeStore
 	h := newWatermarkHarness(t, func(s Store) Store {
-		probe = &watermarkProbeStore{Store: s, err: errBoom}
+		probe = &watermarkProbeStore{Store: s}
 		return probe
 	})
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, nil
 	}
-
+	// One sweeper for the whole test: a live process, the case no restart repairs.
+	sd := sweeperOver(h.store)
 	_, err := h.tc.reconcile(ctx, h.dep)
-	require.NoError(t, err, "the reconcile itself succeeded; only the bookkeeping failed")
+	require.NoError(t, err)
+	sd.sweep(ctx)
+	require.Empty(t, h.stale(t), "converged: the watermark is current and the cursor is past it")
+
+	// The watermark write fails for a pass that could not have observed the change
+	// its own controller triggered.
+	probe.err = errBoom
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		h.touchTarget(t, `{"val":"moved mid-pass"}`)
+		return Result{}, nil
+	}
+	_, err = h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err, "the reconcile succeeded; only the watermark write failed")
+	raw, err := h.store.ObjectsGet(ctx, h.dep)
+	require.NoError(t, err)
+	require.Zero(t, raw.ReconcileOwed, "nothing durable names the dependent")
+
+	sd.sweep(ctx)
+
+	raw, err = h.store.ObjectsGet(ctx, h.dep)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, raw.ReconcileOwed,
+		"the same process finds it: the unobserved change is above its cursor")
+}
+
+// TestALostWatermarkCostsOnlyAnObservedChange pins what the lost write does give
+// up. Once the target goes quiet, a cursor-bound sweep stops re-reporting the
+// dependent — but every change still below that cursor is one this pass already
+// observed, so the pass it gives up is a redundant one.
+func TestALostWatermarkCostsOnlyAnObservedChange(t *testing.T) {
+	ctx := context.Background()
+	var probe *watermarkProbeStore
+	h := newWatermarkHarness(t, func(s Store) Store {
+		probe = &watermarkProbeStore{Store: s}
+		return probe
+	})
+	var observed int64
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
+		target, err := h.store.ObjectsGet(ctx, h.target)
+		require.NoError(t, err)
+		observed = target.ResourceVersion
+		return Result{}, nil
+	}
+	sd := sweeperOver(h.store)
+	_, err := h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+	sd.sweep(ctx)
+
+	h.touchTarget(t, `{"val":"moved"}`)
+	sd.sweep(ctx)
+	require.NoError(t, h.store.ReconcileOwedDecrement(ctx, clientTestGK, h.dep, 1),
+		"drain the finding, as the reconcile it dispatched would")
+
+	probe.err = errBoom
+	_, err = h.tc.reconcile(ctx, h.dep)
+	require.NoError(t, err)
+
+	target, err := h.store.ObjectsGet(ctx, h.target)
+	require.NoError(t, err)
+	require.Equal(t, target.ResourceVersion, observed,
+		"the pass whose watermark was lost observed the target's latest version")
+
+	sd.sweep(ctx)
 
 	raw, err := h.store.ObjectsGet(ctx, h.dep)
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, raw.ReconcileOwed, "the lost watermark is owed a pass")
-}
-
-// TestReconcileReportsAnUnrecordableLostWatermark is the end of the line. The
-// watermark write failed and the stamp meant to repair it failed too, on the same
-// connection — so nothing durable records that this dependent is owed a pass, and
-// this process's cursor-bound stale pass will not re-derive it. Only a restart
-// repairs it, which is worth an error.
-func TestReconcileReportsAnUnrecordableLostWatermark(t *testing.T) {
-	ctx := context.Background()
-	logger, logs := captureLogger(slog.LevelWarn)
-	h := newWatermarkHarness(t, func(s Store) Store {
-		return &watermarkProbeStore{Store: s, err: errBoom, stampErr: errBoom}
-	})
-	h.tc.logger = logger
-	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
-		return Result{}, nil
-	}
-
-	_, err := h.tc.reconcile(ctx, h.dep)
-	require.NoError(t, err, "the reconcile itself succeeded")
-
-	assert.Contains(t, logs.String(), "failed to owe a pass for the lost dependency watermark")
+	assert.Zero(t, raw.ReconcileOwed,
+		"not re-reported, and nothing is owed: the only change below the cursor was observed")
 }
 
 // TestReconcileIsQuietWhenShutdownLosesTheWatermark separates the two reasons the
 // watermark write fails. Stop cancels the ctx the pass runs on, so a reconcile in
-// flight loses the write for no fault of its own — and the stamp that would
-// normally repair it fails the same way. Reporting either would put a WARN and an
-// ERROR on every clean shutdown of any object with dependencies.
+// flight loses the write for no fault of its own — reporting it would put a WARN
+// on every clean shutdown of any object with dependencies.
 func TestReconcileIsQuietWhenShutdownLosesTheWatermark(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger, logs := captureLogger(slog.LevelWarn)

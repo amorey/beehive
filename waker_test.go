@@ -1009,12 +1009,13 @@ func TestStaleDependentsSweepHoldsTheCursorOnStampFailure(t *testing.T) {
 	assert.Contains(t, logs.String(), "stamping stale dependents failed")
 }
 
-// TestStaleDependentsSweepRepairsALostWatermarkAfterRestart walks the crash the
-// process-local cursor exists for. The sweep stamps the dependent; a reconcile
-// clears that stamp and dies before recording its watermark. Nothing durable
-// names the dependent any more, and its target never moves again — so only the
-// next process's re-derivation can find it.
-func TestStaleDependentsSweepRepairsALostWatermarkAfterRestart(t *testing.T) {
+// TestStaleDependentsSweepRepairsALostFindingAfterRestart walks what the
+// process-local cursor exists for. The sweep stamps the dependent; that stamp is
+// drained but the dependent is never reconciled, and its target never moves
+// again — so only the next process's re-derivation can find it. A lost watermark
+// *write* is a different case and needs no repair: see
+// docs/adr/2026-08-03-stale-dependents-cursor.md.
+func TestStaleDependentsSweepRepairsALostFindingAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	spec := []byte(`{}`)
@@ -1029,7 +1030,7 @@ func TestStaleDependentsSweepRepairsALostWatermarkAfterRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, owed.ReconcileOwed, "the sweep recorded the finding")
 
-	// The reconcile that drained it, killed before DependencyWatermarksSet.
+	// Drained, then lost: the reconcile it dispatched never ran.
 	require.NoError(t, store.ReconcileOwedDecrement(ctx, clientTestGK, dep.ID, 1))
 	owed, err = store.ObjectsGet(ctx, dep.ID)
 	require.NoError(t, err)

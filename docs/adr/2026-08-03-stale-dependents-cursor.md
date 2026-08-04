@@ -3,7 +3,8 @@
 - **Status:** Accepted — implemented in `waker.go` (`staleDependents`),
   `sqlite/store.go` (`DependentsListStaleSince`, `ReconcileOwedStamp`,
   `ResourceVersionsMaxIssued`), `reconciler.go`.
-- **Date:** 2026-08-03
+- **Date:** 2026-08-03, amended 2026-08-04 — routes 2 and 4 are latency, not
+  divergence, and the reconciler's compensating stamp is removed.
 
 ## Context
 
@@ -37,23 +38,37 @@ gone quiet. Four routes reach that state:
 1. **The pass found the dependent and the process stopped before the reconcile
    ran.** The enqueue was in memory. Nothing failed, so nothing was recorded.
 2. **The reconcile succeeded and the watermark write failed.** `reconciler.go`
-   logged the error and continued, on the stated ground that the pass would
-   re-derive it.
+   logs the error and continues.
 3. **`EdgesAdd` cleared the watermark for a new edge whose target is quiet.**
    Already covered by `EdgesAdd`'s own `reconcile_owed` stamp.
 4. **The process was killed between a reconcile's owed decrement and its
    watermark write.** These are two statements, not one transaction. The count
-   is gone, the object is settled by its status write, and the target may never
-   be written again.
+   is gone and the object is settled by its status write.
 
-The full scan covered routes 1, 2 and 4. A cursor removes that cover. Route 4 is
-the hard one: no durable record names that dependent, because the decrement that
-removed the record was correct at the time it ran.
+**Routes 2 and 4 are latency, not divergence**, and this record originally had
+that wrong. Both are gated on `reconcileErr == nil`, so the reconcile succeeded;
+it observed the store as of `load.Cursor`, which the store reads in the same
+statement as the object. A lost watermark write therefore leaves the watermark
+*low*, and `reconciled_against` is read in exactly one place —
+`DependentsListStaleSince`'s `t.resource_version > c.reconciled_against` — where
+lower selects more. The failure over-reports staleness; it cannot under-report
+it.
+
+That closes the routes rather than covering them. For the dependent to owe work
+there must be a target write it did not observe, so above `load.Cursor`. Any
+such write is issued above the sweep's cursor too — the cursor only advances to
+a `mark` sampled before it, and never past `through` — so the next sweep lists
+it. What the lost write gives up is a re-report for a change the reconcile
+already observed: one redundant reconcile. Pinned by
+`TestALostWatermarkStillFindsAnUnobservedChange` and
+`TestALostWatermarkCostsOnlyAnObservedChange`.
+
+Route 1 is the one the full scan genuinely covered.
 
 ## Decision
 
-Add the cursor, and cover each route with a named mechanism. Three mechanisms do
-the work, and they are not interchangeable.
+Add the cursor. Routes 2 and 4 need no cover — see above — and the two that
+remain get a named mechanism each.
 
 ### The bounded scan
 
@@ -95,7 +110,7 @@ the whole count observed at load.
 A tick where nothing has been issued since the last sweep skips the listing
 entirely, because no target can have moved.
 
-### Mechanism 1: the cursor is process-local, and covers routes 1 and 4
+### Mechanism 1: the cursor is process-local, and covers route 1
 
 **It is deliberately not persisted. Every process re-derives the graph once.**
 
@@ -103,42 +118,31 @@ The cursor starts at 0, so the first sweep of each process scans from the
 beginning and finds every dependent whose watermark is behind its target. That
 is the same set the unbounded scan produced.
 
-This is what covers route 4, and it is the only thing that can. A crash between
-the decrement and the watermark write leaves nothing durable to read. It also
-covers route 1, because a lost in-memory enqueue requires the process to stop,
-and a stop is followed by a start.
+This covers route 1: a lost in-memory enqueue requires the process to stop, and
+a stop is followed by a start.
 
-Re-derivation once per process needs no case analysis. Both routes are produced
-only by a crash, and a crash is a restart. The alternative — enumerating every
-enqueue path that could lose a wake — is not worth trusting. A dependent woken by
-the dependency waker carries no stamp at all. So does one enqueued by its own
-spec write, by `Client.Requeue`, or by a `RequeueAfter`. Any future enqueue path
-would join them silently.
+Re-derivation once per process needs no case analysis. The alternative —
+enumerating every enqueue path that could lose a wake — is not worth trusting. A
+dependent woken by the dependency waker carries no stamp at all. So does one
+enqueued by its own spec write, by `Client.Requeue`, or by a `RequeueAfter`. Any
+future enqueue path would join them silently.
+
+It is **not** what covers route 4, which is closed above and needs no mechanism.
+Mechanism 2's stamp is the durable half of route 1, so re-derivation is a
+backstop behind it rather than the only cover.
 
 The cost is one full scan per process: 190 ms at 250,000 edges, which this pass
 paid every 60 s before this change. The per-sweep saving is untouched.
 
-### Mechanism 2: the reconciler stamps a lost watermark, and covers route 2
-
-`reconciler.go` now calls `ReconcileOwedStamp` when `DependencyWatermarksSet`
-fails. Route 2 is closed by that stamp alone, and by nothing else.
-
-The cursor cannot close it. Route 2 happens inside a process that keeps running,
-and that process's cursor has already moved past the target. The dependent would
-wait for the next restart.
-
-A cancelled write is a shutdown rather than a lost pass, so the stamp is skipped
-when `ctx.Err() != nil`. The stamp would fail the same way, and a report would
-fault every clean stop.
-
-### Mechanism 3: the pass stamps what it finds
+### Mechanism 2: the pass stamps what it finds
 
 `ReconcileOwedStamp` increments `reconcile_owed` for a page of refs in one
 statement. The pass stamps each page before it enqueues that page, so a crash
 between the two costs a spare reconcile, which is idempotent.
 
-**This stamp is not what makes the cursor sound.** Routes 1 and 4 are covered by
-mechanism 1, route 2 by mechanism 2, and route 3 by `EdgesAdd`. With the current
+**This stamp is not what makes the cursor sound.** Route 1 is covered by
+mechanism 1, routes 2 and 4 need no cover, and route 3 by `EdgesAdd`. With the
+current
 `workQueue`, removing this stamp would not strand any dependent: `add` marks an
 in-flight id dirty rather than dropping it, `done` re-queues it, and the retry
 ladder is unbounded, so the only way to lose a finding is to stop the process.
@@ -163,28 +167,31 @@ finding through the owed pass. The queue folds the duplicate.
 
 ## Consequences
 
-- **`reconcile_owed` has three producers, where the contract said it should have
+- **`reconcile_owed` has two producers, where the contract said it should have
   one.** `storeapi.Store` carried the note "there is deliberately no standalone
   `reconcile_owed` increment… add one only when a producer other than `EdgesAdd`
-  exists." This record is that condition being met, twice: the pass and the
-  reconciler's watermark fallback.
-- **A live process that loses both writes is still exposed.** If
-  `DependencyWatermarksSet` fails and the repair stamp fails with it, that
-  dependent stays stale until the process restarts. Mechanism 1 repairs a crash,
-  not a running process that keeps running. Recorded in `docs/TODO.md`, not done
-  here.
-- **The reconciler's fallback is best-effort against the store that just
-  failed.** This is the one place the change trades a derived guarantee for a
-  durable write that might not land. The store cannot own the fallback — a
-  compensating write inside `DependencyWatermarksSet` fails for the same reason
-  the watermark write did — so the caller is the right level. But the two calls
-  share one connection and usually fail together. The deeper fix is to fold the
-  owed decrement and the watermark set into one store transaction, so a failure
-  leaves `reconcile_owed` standing by construction. That also removes route 4,
-  and with it the reason the cursor cannot be persisted.
+  exists." This record is that condition being met once, by the stale-dependents
+  pass. The owed pass is this count's consumer, not a second producer.
+- **The reconciler's compensating stamp was removed.** An earlier revision of
+  this record had `reconciler.go` call `ReconcileOwedStamp` when
+  `DependencyWatermarksSet` failed, to cover route 2. It bought nothing once
+  route 2 was shown not to be a strand, and it was a durable write attempted
+  against the store that had just failed the write it compensated for. The
+  failure is logged and skipped on `ctx.Err() != nil`, since a cancelled write
+  is a shutdown and a report would fault every clean stop.
+- **A lost watermark write costs a redundant pass and nothing else.** It leaves
+  the watermark low, which over-reports staleness rather than under-reporting
+  it, so no dependent is stranded and the reconcile path stays free of a
+  transaction on the connection every writer shares.
+- **The reconcile path stays non-transactional.** Folding the owed decrement and
+  the watermark set into one `Within` was considered as a fix for routes 2 and 4
+  and is not needed, because neither is a strand. It would also have covered
+  little: the dependency waker enqueues dependents without stamping
+  `reconcile_owed` (`waker.go`), so in the most common wake path there is no
+  count for a rollback to restore.
 - **A stamped dependent whose reconcile keeps failing retries on the owed pass's
   cadence, not only on its backoff ladder.** `ReconcileOwedDecrement` is gated on
-  success, so a failing dependent keeps the count the pass stamped. The owed pass
+  success, so a failing dependent keeps the count the sweep stamped. The owed pass
   lists it every `owedPassInterval` and calls `work.add`, which consults only the
   queued-now set — an id parked on a backoff alarm is not in it, so the add
   dispatches at once and the alarm later fires into a no-op.
@@ -198,7 +205,7 @@ finding through the owed pass. The queue folds the duplicate.
 
   The mechanism is not new — `EdgesAdd`'s stamp has always left a count standing
   through a failing reconcile — but this change widens the population from
-  objects with a non-converging edge set to any dependent the pass has found. It
+  objects with a non-converging edge set to any dependent the sweep has found. It
   is distinct from the `requeueNow` cost recorded in
   [the spec-write ADR](2026-07-31-a-spec-write-enqueues-its-own-object.md), which
   fires immediately rather than on a tick. Recorded in `docs/TODO.md`.
