@@ -4,7 +4,7 @@
   `signalCreated`) over a `changed` bool added to both `ObjectsUpdateSpec*`
   mutators in `internal/storeapi` and `sqlite/store.go`, and in `controller.go`
   (`DependenciesAdd`) over `EdgesAddResult`. Both go through
-  `Beehive.signalRequeue`. Narrows the "Writes schedule nothing" section of
+  `Beehive.signalRequeueNow`/`signalRequeueThrottled`. Narrows the "Writes schedule nothing" section of
   [the drivers ADR](2026-07-28-periodic-scan-drivers.md), which still governs
   every other write.
 - **Date:** 2026-07-31, extended 2026-08-01 to the new-edge stamp
@@ -150,30 +150,30 @@ edge is deliberately cross-kind, so the enqueue routes by `EdgesAddResult.From` 
 caller's kind would reach the wrong reconciler, or none.
 `TestAddDependencyEnqueueRoutesByTheSourcesKind` is the only test that catches it.
 
-### The backoff ladder does not survive a non-converging edge set
+### The backoff ladder now survives a non-converging edge set
 
-This is a known cost of `requeueNow`, and it is accepted rather than fixed.
+This was a known cost of `requeueNow`, accepted rather than fixed. The
+[re-enqueue floor](2026-08-04-work-queue-re-enqueue-floor.md) closed it.
 
 `requeueNow` on an id that is in flight marks it dirty rather than queueing it.
 `runWorker` then calls `work.done(id)` before `work.addAfter(id, backoff)`, and
 `done` makes a dirty id dispatchable at once, so the backoff alarm set on the next
-line does not hold it. A failing pass that created an edge therefore retries
-immediately, however deep its ladder is.
+line did not hold it. A failing pass that created an edge retried immediately,
+however deep its ladder was.
 
-The edge-new gate bounds this to controllers whose edge set never converges: one
-that creates a fresh child per attempt, and one that deletes and re-declares its set
-every pass. An ordinary failing controller re-asserts the same edges, stamps
-nothing, and keeps its ladder.
+**The new-edge push now goes through `work.add` rather than `requeueNow`.** The
+dispatch that started the pass opened the source's re-enqueue floor, so the
+declaration is held rather than queued, and the backoff the worker sets a line
+later takes the floor's place. The stamp is durable either way, so nothing is
+lost: the owed pass still carries the dependent.
 
-The alternative was to skip the enqueue when the source is the object this
-reconciler currently has in flight. There is no clean signal for that at the call
-site — the hook is cross-kind, so the source may sit in another kind's queue — and
-reading the work queue's in-flight state from a commit hook is a worse coupling than
-the cost it removes. The cost falls on a controller that is already failing, and it
-is CPU rather than divergence.
+**The spec write's own enqueue stays immediate**, and keeps this cost. A spec
+write carries new information, so absorbing one into a pending backoff would make
+a user's edit to a failing object wait out `maxRetryInterval`. Its own runaway
+case — a controller writing a genuinely changing spec every pass — is
+self-announcing, because the generation climbs. The `changed` gate above is what
+stops the byte-identical case.
 
-The property is pinned in both directions:
-`TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges` and
-`TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce`. A fix, if one is ever wanted,
-belongs at `requeueNow` or at the `done`/`addAfter` ordering, where it would also
-cover `Client.Requeue` and the spec write's own enqueue.
+Pinned by `TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges`,
+`TestANewEdgeOnAnInFlightSourceRespectsTheBackoff` and
+`TestFailingRespecControllerKeepsItsBackoff`.

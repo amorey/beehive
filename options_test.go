@@ -307,3 +307,34 @@ func TestWithWriteLogRetentionDispatch(t *testing.T) {
 	require.NoError(t, WithWriteLogRetention(9, time.Minute)(&reconciler{}))
 	require.NoError(t, WithWriteLogRetention(9, time.Minute)("unrelated"))
 }
+
+func TestWithMinRequeueIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, withMinRequeueInterval(time.Minute)(bh))
+	assert.Equal(t, time.Minute, bh.minRequeueInterval)
+
+	r := &reconciler{work: newWorkQueue()}
+	require.NoError(t, withMinRequeueInterval(time.Second)(r))
+	r.work.gate.Admit(1, time.Now())
+	_, held := r.work.gate.OpensAt(1, time.Now())
+	assert.True(t, held, "the option must reach the queue's gate")
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, withMinRequeueInterval(time.Second)("unrelated"))
+}
+
+// Register seeds the queue's floor from the New-level default, and a per-kind
+// option overrides it.
+func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t), withMinRequeueInterval(time.Hour))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, withMinRequeueInterval(time.Minute))
+	require.NoError(t, err)
+
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+
+	r.work.gate.Admit(1, time.Now())
+	opensAt, held := r.work.gate.OpensAt(1, time.Now())
+	require.True(t, held, "the queue's gate must carry the resolved interval")
+	assert.True(t, opensAt.Before(time.Now().Add(2*time.Minute)), "got the New-level interval, not Register's")
+}

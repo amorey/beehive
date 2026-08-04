@@ -414,7 +414,9 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawOb
 // a harmless duplicate in the direction this design errs throughout (pinned by
 // TestSpecThenStatusInOneTransactionStillEnqueues).
 func (c *clientImpl[Spec, Status]) signalSpecWritten(ctx context.Context, id ObjectID) {
-	c.bh.signalRequeue(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
+	// Not throttled: a spec write carries new information. The changed gate is
+	// what stops a controller re-applying its own spec from riding this forever.
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 }
 
 // GetOrCreate returns the row holding name, creating it only when absent. The

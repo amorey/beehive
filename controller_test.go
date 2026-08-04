@@ -762,28 +762,27 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 		"a re-asserted edge must not requeue past the backoff")
 }
 
-// TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce pins the accepted trade, and it
-// is the sharpest edge in this path. A source that creates a genuinely new edge on
-// every failing pass loses its backoff ladder: requeueNow marks the in-flight id
-// dirty rather than queueing it, work.done then makes it dispatchable, and the
-// backoff alarm the worker sets a line later does not hold it back.
+// TestANewEdgeOnAnInFlightSourceRespectsTheBackoff closes what the
+// stamp-every-new-edge ADR pinned as an accepted cost: a source creating a
+// genuinely new edge on every failing pass used to lose its backoff ladder,
+// because the push went through requeueNow, which marks an in-flight id dirty
+// and work.done then makes it dispatchable ahead of the alarm.
 //
-// The edge-new gate bounds this to controllers whose edge set never converges — one
-// that creates a fresh child per attempt, or that deletes and re-declares its set.
-// It costs CPU against a controller that is already failing, and never divergence.
-// Suppressing it would mean reading the work queue's in-flight state from a commit
-// hook, across kinds, which is why it is accepted rather than fixed here.
+// The push now goes through work.add, so the re-enqueue floor opened by the
+// dispatch holds it, and the backoff the worker sets a line later takes the
+// floor's place. The stamp is durable either way, so nothing is lost — the owed
+// pass still carries the dependent.
 //
-// The assertion is on the mechanism and not on the clock. "Retries at once" is a
-// claim about time, and this suite has no clock to assert on: baseRetryInterval has
-// no option, and WithMaxRetryInterval only caps upward. So the test drives the
-// worker's own sequence — get, declare, done, addAfter — and asserts the id is
-// dispatchable while an alarm far in the future is set.
-func TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce(t *testing.T) {
+// The assertion is on the mechanism and not on the clock. "Retries on the
+// ladder" is a claim about time, and this suite has no clock to assert on, so
+// the test drives the worker's own sequence — get, declare, done, addAfter —
+// and asserts the id is not dispatchable while an alarm holds it.
+func TestANewEdgeOnAnInFlightSourceRespectsTheBackoff(t *testing.T) {
 	ctx := context.Background()
 	f := newSameKindFixture(t)
 
-	// Take the id, as a worker does before it runs the controller.
+	// Take the id, as a worker does before it runs the controller. The dispatch
+	// opens the source's floor.
 	f.r.work.add(f.dep.ID)
 	got, ok := f.r.work.get()
 	require.True(t, ok)
@@ -794,10 +793,12 @@ func TestANewEdgeOnAnInFlightSourceIsDispatchableAtOnce(t *testing.T) {
 
 	// runWorker releases the id and only then sets the backoff.
 	f.r.work.done(f.dep.ID)
-	f.r.work.addAfter(f.dep.ID, time.Hour)
+	f.r.work.addAfter(f.dep.ID, time.Hour, alarmBackoff)
 
-	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(),
-		"the enqueue beat the backoff, so the id is dispatchable now")
+	assert.Empty(t, f.queued(), "the declaration must not jump the ladder")
+	at := f.r.work.scheduleAt(f.dep.ID).NextRequeueAt
+	assert.True(t, at.After(time.Now().Add(time.Minute)),
+		"the id is on the backoff ladder, got %s", at)
 }
 
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:

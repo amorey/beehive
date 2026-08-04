@@ -216,6 +216,21 @@ func withOwedPassInterval(d time.Duration) Option {
 	}
 }
 
+// withMinRequeueInterval floors the gap between two dispatches of one object;
+// <= 0 turns the floor off. Unexported: it exists to bound a dependency cycle,
+// not to be tuned, and Client.Requeue is the supported way to beat a cadence.
+func withMinRequeueInterval(d time.Duration) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.minRequeueInterval = d
+		case *reconciler:
+			t.work.setFloor(d)
+		}
+		return nil
+	}
+}
+
 // WithFullPassInterval sets how often a controller re-dispatches *every* object
 // it owns, converged or not. Default 0 (disabled).
 //
@@ -436,6 +451,9 @@ func WithLogLevel(level slog.Level) Option {
 // WithMaxRetryInterval caps the exponential backoff between failed reconciles
 // for a controller. A value <= 0 is ignored, keeping the default — a
 // non-positive cap would busy-loop the reconciler on a persistent error.
+//
+// The cap bounds the retry rate outright: a wake arriving while the object sits
+// on its backoff alarm is absorbed by that alarm rather than dispatched.
 func WithMaxRetryInterval(d time.Duration) Option {
 	return func(target any) error {
 		if t, ok := target.(*reconciler); ok && d > 0 {

@@ -390,12 +390,12 @@ func (r *reconciler) runWorker(ctx context.Context) {
 				r.work.done(id)
 				if err != nil {
 					delay := r.backoffNext(id)
-					r.work.addAfter(id, delay)
+					r.work.addAfter(id, delay, alarmBackoff)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
 				} else {
 					r.backoffClear(id)
 					if result.RequeueAfter > 0 {
-						r.work.addAfter(id, result.RequeueAfter)
+						r.work.addAfter(id, result.RequeueAfter, alarmRequeueAfter)
 						r.logger.Debug("requeued", "id", id, "after", result.RequeueAfter)
 					}
 				}

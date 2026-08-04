@@ -46,6 +46,11 @@ const (
 	// The dependency-wake scan costs nothing in a quiet system, so it runs an
 	// order of magnitude more often than the passes that scale with object count.
 	defaultWakeInterval = 1 * time.Second
+
+	// defaultMinRequeueInterval floors the gap between two dispatches of one
+	// object. It matches defaultWakeInterval, which is what bounds a dependency
+	// cycle today; raising one without the other changes that bound.
+	defaultMinRequeueInterval = 1 * time.Second
 	// The stale-dependents pass is the waker's backstop; its cadence is set by
 	// acceptable staleness after a crash, not by cost.
 	defaultStaleDependentsInterval = 60 * time.Second
@@ -76,6 +81,7 @@ type Beehive struct {
 	// changed. gcInterval and staleDependentsInterval are always positive when
 	// the Beehive came from New; wakeInterval <= 0 turns the waker off.
 	owedPassInterval        time.Duration
+	minRequeueInterval      time.Duration
 	fullPassInterval        time.Duration
 	gcInterval              time.Duration
 	wakeInterval            time.Duration
@@ -341,6 +347,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		gcInterval:              defaultGCInterval,
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeInterval:            defaultWakeInterval,
+		minRequeueInterval:      defaultMinRequeueInterval,
 		watchPollInterval:       defaultWatchPollInterval,
 		watchFloorInterval:      defaultWatchFloorInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,
@@ -384,6 +391,8 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		logger:           bh.logger,
 		logLevel:         bh.logLevel,
 	}
+	r.work.setFloor(bh.minRequeueInterval) // withMinRequeueInterval may override below
+
 	// One client per kind, shared by the adapter and the caller.
 	client := &controllerClientImpl[Status]{bh: bh, gk: gk}
 	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c, client: client}
@@ -433,16 +442,27 @@ func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 	return r, ok
 }
 
-// signalRequeue enqueues ref's reconcile when the write that owes it commits.
-// AfterCommit means a rollback (or savepoint unwind) discards the enqueue, and
-// outside a transaction it runs inline. The enqueue does not clear the backoff
-// ladder, and requeueNow on an in-flight id makes it dispatchable again at
-// once — so callers must gate on what the write actually changed (see
-// signalSpecWritten and DependenciesAdd).
-func (bh *Beehive) signalRequeue(ctx context.Context, ref ObjectRef) {
+// signalRequeueNow enqueues ref's reconcile at commit, cancelling any pending
+// alarm. For a write that carries new information, which must not wait out a
+// backoff or a re-enqueue floor. AfterCommit means a rollback (or savepoint
+// unwind) discards the enqueue, and outside a transaction it runs inline.
+// Callers gate on what the write actually changed (see signalSpecWritten and
+// DependenciesAdd).
+func (bh *Beehive) signalRequeueNow(ctx context.Context, ref ObjectRef) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {
 			r.requeueNow(ref.ID)
+		}
+	})
+}
+
+// signalRequeueThrottled enqueues ref's reconcile at commit through the
+// ordinary wake path, so a pending alarm absorbs it. For a write a controller
+// may repeat on every pass. Same commit semantics as signalRequeueNow.
+func (bh *Beehive) signalRequeueThrottled(ctx context.Context, ref ObjectRef) {
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {
+			r.enqueue(ref.ID)
 		}
 	})
 }

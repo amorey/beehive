@@ -2344,7 +2344,7 @@ func TestClientGetScheduleScheduled(t *testing.T) {
 	// Drain the create-time enqueue so only the future schedule remains.
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
-	r.work.addAfter(obj.ID, time.Hour)
+	r.work.addAfter(obj.ID, time.Hour, alarmRequeueAfter)
 
 	s, err := client.SchedulesGet(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2402,7 +2402,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 	// Drain the create-time enqueue and schedule a future requeue before watching.
 	r := bh.reconcilers[clientTestGK]
 	drainQueue(r.work)
-	r.work.addAfter(obj.ID, time.Hour)
+	r.work.addAfter(obj.ID, time.Hour, alarmRequeueAfter)
 
 	ch, err := client.SchedulesWatch(ctx, obj.ID)
 	require.NoError(t, err)
@@ -2436,7 +2436,7 @@ func TestClientWatchScheduleLive(t *testing.T) {
 	assert.True(t, snap.NextRequeueAt.IsZero(), "snapshot must be unscheduled, got %s", snap.NextRequeueAt)
 
 	// A future requeue: emits the fire time.
-	r.work.addAfter(obj.ID, time.Hour)
+	r.work.addAfter(obj.ID, time.Hour, alarmRequeueAfter)
 	future := recv(t, ch)
 	assert.True(t, future.NextRequeueAt.After(time.Now().Add(time.Minute)),
 		"reschedule must emit the ~1h fire time, got %s", future.NextRequeueAt)

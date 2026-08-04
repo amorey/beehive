@@ -97,7 +97,7 @@ func pushOnlyClient(t *testing.T) (context.Context, *Beehive, Client[cSpec, cSta
 // waits for a change to learn the current schedule.
 func TestScheduleStreamDeliversTheSnapshotFirst(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	r.work.addAfter(1, time.Hour)
+	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 
 	ch, err := client.SchedulesWatch(ctx, 1)
 	require.NoError(t, err)
@@ -168,7 +168,7 @@ func TestScheduleStreamRepeatsNothing(t *testing.T) {
 // intermediate "nothing scheduled" never reaches a subscriber.
 func TestScheduleStreamHidesTheRequeueNowIntermediate(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	r.work.addAfter(1, time.Hour)
+	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 	ch, err := client.SchedulesWatch(ctx, 1)
 	require.NoError(t, err)
 	require.False(t, recv(t, ch).NextRequeueAt.IsZero(), "snapshot: the pending alarm")
@@ -255,7 +255,7 @@ func TestScheduleStreamShutdownDeliversThenEnds(t *testing.T) {
 	ctx, bh, client, r := pushOnlyClient(t)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
-	r.work.addAfter(1, time.Hour)
+	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 
 	ch, err := client.SchedulesWatch(ctx, 1)
 	require.NoError(t, err)

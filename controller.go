@@ -159,7 +159,9 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 		return err
 	}
 	if res.ReconcileOwedStamped {
-		c.bh.signalRequeue(ctx, ObjectRef{ID: fromID, Group: res.From.Group, Kind: res.From.Kind})
+		// Throttled: a controller can declare on every pass, and the stamp is
+		// durable, so this must not jump the source's backoff ladder.
+		c.bh.signalRequeueThrottled(ctx, ObjectRef{ID: fromID, Group: res.From.Group, Kind: res.From.Kind})
 	}
 	return nil
 }
