@@ -60,9 +60,18 @@ only new surface here.
 
 ### Step 0 — two store widenings
 
-Neither is optional; both steps below need an identity the store already has in hand
-and currently drops. Each ripples to three places: the `storeapi` interface, the
-`sqlite` implementation, and the `fakeStore` double in `testutils_test.go`.
+Neither is optional; both steps below need something the store already computes and
+currently drops.
+
+**The ripple is five implementations, not three.** The `storeapi` interface, the
+`sqlite` implementation, `fakeStore` (`testutils_test.go`), and two narrower doubles:
+`collectFakeStore` (`gc_test.go`) implements `DeletionRequestsCreateFromOwner`, and
+`requestDeletionByNameErrorStore` (`client_test.go`) implements
+`DeletionRequestsCreateByName`. Plus ~29 call sites across `sqlite/store_test.go`,
+of which two assert the returned slice and need **reshaping, not re-typing**:
+`TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp` and
+`TestDeletionRequestsCreateFromOwnerWritesInVersionOrder`. All mechanical; none of it
+is a surprise if it is counted before starting.
 
 **`DeletionRequestsCreateByName` returns the marked id.** `markForDeletion` already
 scans `id, "group", kind, resource_version` off the row it marks (its `RETURNING`
@@ -84,10 +93,23 @@ type DeletionCascadeChild struct {
 }
 ```
 
+**`Marked` is `markForDeletion`'s returned `changed`, not `!ch.deleting`.** That is
+the whole trap in this step. The loop discards the bool today —
+`if _, err := s.markForDeletion(ctx, ...)` — under a comment saying exactly why it
+cannot be reconstructed from the `SELECT`: a race may set the flag between the read
+and the write, and the `deletion_requested_at IS NULL` guard then stamps nothing.
+`!ch.deleting` says "marked" for that row. So `Marked` is the returned bool, with
+`ch.deleting` short-circuiting to `false` on the skip path. It is one word in the
+diff and the only place the implementation can quietly violate the invariant Step 2
+rests on — and it fails silently, as one spurious push that the throttle absorbs and
+no assertion catches.
+
 Do **not** widen `ObjectRef` with the bool. It is a public type alias (`types.go`)
 used at every requeue site, where "marked" is meaningless. `EdgesAddResult` is the
-precedent: a small result type carrying exactly what the caller follows up on, all of
-it falling out of work the write already does.
+precedent, and it settles the naming too: it is declared in `storeapi`, deliberately
+**not** aliased into `types.go`, and stays `storeapi.`-qualified at every use site
+including both doubles. `DeletionCascadeChild` is store-facing in exactly the same
+way — one use site, in `gc.go`. Follow it: no alias.
 
 ### Step 1 — `Delete` and `DeleteByName` (`client.go`)
 
@@ -239,8 +261,9 @@ which is not a cost a caller can predict from the call.
 
 `TestIntegrationGCResumesDanglingDeleteOnStartup`,
 `TestGCSweepDispatchesRegisteredKind` and `TestIntegrationGCSweepsClientOnlyKind` pin
-the pull path. All three must still pass with the push disabled — that is the "every
-push has a pull behind it" test for this spec.
+the pull path. All three must still pass unchanged. They are what "every push has a
+pull behind it" means for this spec — not a disable knob, which does not exist, but a
+test that reaches the collect without issuing a push at all.
 
 `TestIntegrationGCCascadeDeletesOwnerAndChild` and
 `TestCollectCascadesAndBlocksOnChild` pin the cascade. Neither asserts how many
@@ -258,6 +281,14 @@ sweeper. Case 9 then has no pull-path test unless one is added (see below).
 
 ## Tests to add
 
+The `Marked` gate is pinned at two levels, and the cheaper one comes first.
+
+In `sqlite/store_test.go`: `TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp`
+already pins "a second call stamps nothing" and simply cannot observe it today —
+the return value does not say. After Step 0 it can. **Assert `Marked` there**: it is
+the direct test of the store half, and it does not need a `Beehive` to make the
+claim.
+
 In `client_test.go` and `gc_test.go`, mirroring the source files:
 
 - `TestDeleteEnqueuesItsOwnObject` — a delete on a registered kind dispatches with
@@ -273,7 +304,8 @@ In `client_test.go` and `gc_test.go`, mirroring the source files:
   it is a different claim from the one above and shares no assertion with it.
 - `TestCascadePushesOnlyNewlyMarkedChildren` — a second `gcCollect` over an
   already-marked subtree pushes nothing. This is the reconcile-rate regression, and
-  it is the most important test in this list. Arrange a **pending backoff alarm** on
+  it is the beehive-level half of what the store test above pins. Arrange a
+  **pending backoff alarm** on
   a child and assert the re-cascade does not disturb it — not a re-enqueue floor,
   which `newWorkQueue` builds as `rategate.New[ObjectID](0)` and is therefore off
   unless a test calls `setFloor`.
@@ -290,6 +322,11 @@ In `client_test.go` and `gc_test.go`, mirroring the source files:
   cannot be issued until that level's `gcCollect` runs — option 1 buys nothing for a
   mixed tree at the client-only levels, by construction.
 - A re-cascade over an already-marked subtree pushes nothing.
-- With the push paths disabled, every test above still passes.
+- The pull path is still pinned by a test that marks through the store rather than
+  through `Delete`: the three tripwires above plus
+  `TestIntegrationDeleteCollectsWithoutThePush`. There is no knob that disables a
+  push, and the four bullets above this one exist to fail without one — marking
+  through the store is the mechanism, and it is the only sense in which "every push
+  has a pull behind it" is testable here.
 - Case 9 and case 10 in [`reconcile-triggers.md`](../reconcile-triggers.md) list a
   push, and section 1's *"A delete does not push"* is corrected.
