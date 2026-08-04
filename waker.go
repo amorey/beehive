@@ -73,9 +73,9 @@ type waker struct {
 	seeded bool
 }
 
-// gateKey is the single key every waker rate gate holds: the limits are
+// wakerGateKey is the single key the waker's rate gates hold: the limits are
 // per waker, not per object.
-var gateKey = struct{}{}
+var wakerGateKey = struct{}{}
 
 // cursorNameWaker is this waker's key in driver_cursors.
 const cursorNameWaker = "dependency_waker"
@@ -100,8 +100,10 @@ const wakeScanPageCap = 256
 //
 // Four, not sixteen, because a wake-driven pass can run ten times a second:
 // BenchmarkWakerScanRateUnderSustainedWrites measures a full-budget pass at
-// ~3ms against ~13ms, so a writer waits behind a shorter hold while a resume
-// still drains faster than the old one-pass-per-second could.
+// ~4ms against ~16ms, so a writer waits behind a hold a quarter as long. The
+// budget and the throttle multiply, so a resume drains 2.5x faster than one
+// pass per second could and holds a larger share of the connection while it
+// does — shorter waits, not less total work.
 const wakeScanPagesPerPass = 4
 
 // run drives the waker for the life of the control plane: a commit wakes it,
@@ -113,8 +115,6 @@ func (dw *waker) run(ctx context.Context) {
 	if len(dw.bh.order) == 0 || dw.bh.wakeInterval <= 0 {
 		return
 	}
-	dw.arm()
-
 	// Subscribed before the first pass, for newObjectTailer's reason: a write
 	// landing between the subscribe and the seed read would be missed by both.
 	// Every kind, because an edge can point at one the waker cannot name. A nil
@@ -128,7 +128,9 @@ func (dw *waker) run(ctx context.Context) {
 
 	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
 	defer timer.Stop()
-	armedFor := dw.now()
+	// The instant timer.C is set to fire, zero when it has fired and not been
+	// re-armed. A wake that would only push it later leaves it alone.
+	var armedFor time.Time
 
 	backingOff := false
 	for {
@@ -159,27 +161,26 @@ func (dw *waker) run(ctx context.Context) {
 	}
 }
 
-// arm builds what the waker reads from its Beehive's options, once, on first
-// use. Never in New: New constructs the waker before it applies options, so
-// anything built there captures the defaults and silently ignores the option.
-func (dw *waker) arm() {
-	if dw.persistGate != nil {
-		return
+// newWaker builds a waker over bh's cadences. Call it after the options are
+// applied: the gates take their intervals here, so one built earlier would hold
+// the defaults whatever the caller asked for.
+func newWaker(bh *Beehive) *waker {
+	cursors, _ := bh.store.(DriverCursorer)
+	return &waker{
+		bh:          bh,
+		cursors:     cursors,
+		now:         time.Now,
+		scanGate:    rategate.New[struct{}](bh.wakeScanMinInterval),
+		persistGate: rategate.New[struct{}](bh.wakeInterval),
 	}
-	if dw.now == nil {
-		dw.now = time.Now
-	}
-	dw.scanGate = rategate.New[struct{}](dw.bh.wakeScanMinInterval)
-	dw.persistGate = rategate.New[struct{}](dw.bh.wakeInterval)
 }
 
 // pass is one turn of the run loop: scan under the throttle, and report how
 // long to wait and whether to drop the wakes arriving meanwhile. Split from run
 // so the rate tests drive it at instants of their own choosing.
 func (dw *waker) pass(ctx context.Context, now time.Time) (time.Duration, bool) {
-	dw.arm()
 	floor := dw.bh.wakeInterval
-	if opensAt, held := dw.scanGate.Allow(gateKey, now); held {
+	if opensAt, held := dw.scanGate.Allow(wakerGateKey, now); held {
 		// Re-arming for what is left of the throttle is what remembers the
 		// wake: the scan that runs then reads its position from the store.
 		return opensAt.Sub(now), false
@@ -189,7 +190,6 @@ func (dw *waker) pass(ctx context.Context, now time.Time) (time.Duration, bool) 
 		if throttle := dw.scanGate.Interval(); throttle > 0 {
 			return throttle, false // keep draining, at the throttle's rate
 		}
-		return floor, false
 	case scanFailed:
 		return floor, true
 	}
@@ -320,7 +320,6 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 // with backoff, warning only on the first of a streak; the watermark itself is
 // never rolled back — the wakes are already queued.
 func (dw *waker) persist(ctx context.Context) {
-	dw.arm()
 	// ctx.Err() checked here so a shutdown mid-scan isn't logged as a failure.
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return
@@ -328,7 +327,7 @@ func (dw *waker) persist(ctx context.Context) {
 	// Ahead of the skip ladder, not just ahead of the write: a gate below it
 	// would let refused passes burn skips at the wake rate, which is what turns
 	// wakePersistRetryCap from a minute into a handful of seconds.
-	if _, held := dw.persistGate.Allow(gateKey, dw.now()); held {
+	if _, held := dw.persistGate.Allow(wakerGateKey, dw.now()); held {
 		return
 	}
 	if dw.persistSkips > 0 {

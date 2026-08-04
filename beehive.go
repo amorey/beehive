@@ -366,13 +366,14 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		migrators:               make(map[GroupKind]Migrator),
 		kindWriteHub:            newKindWriteHub(),
 	}
-	cursors, _ := s.(DriverCursorer)
-	bh.waker = &waker{bh: bh, cursors: cursors}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
 			return nil, err
 		}
 	}
+	// After the options: the waker reads its cadences at construction, so
+	// building it above would capture the defaults and ignore them.
+	bh.waker = newWaker(bh)
 	return bh, nil
 }
 

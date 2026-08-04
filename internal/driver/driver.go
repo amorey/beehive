@@ -57,9 +57,9 @@ func TickerChan(d time.Duration) (<-chan time.Time, func()) {
 }
 
 // Rearm resets t to fire d from now, for a wake-driven loop that re-arms one
-// timer after every pass. Stop before Reset, and the caller must have drained
-// the channel already — which is the shape of a loop that only reaches here
-// after selecting on it.
+// timer after every pass. Safe on a timer that is still running, one that has
+// fired, and one whose value was never received: since Go 1.23 the timer
+// channel is unbuffered, so Reset cannot leave a stale value behind.
 func Rearm(t *time.Timer, d time.Duration) {
 	t.Stop()
 	t.Reset(d)

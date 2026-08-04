@@ -143,9 +143,9 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 			store.reads, store.cursorWrites = 0, 0
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				b.StopTimer()
+				// Timed: two int64 stores are far below the noise, and
+				// StopTimer/StartTimer would cost two stop-the-worlds a pass.
 				dw.watermark, dw.persisted = resume, resume
-				b.StartTimer()
 
 				dw.pass(ctx, clk.now())
 				clk.advance(defaultWakeScanMinInterval) // the rate the throttle allows
@@ -159,37 +159,17 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 }
 
 // benchWakeLog builds a store whose write log holds rows entries above the
-// waker's seed point, each with a dependent to wake.
+// waker's seed point, each with dependents to wake, and counts what a pass
+// costs it.
+//
+// The graph is benchStaleGraph's: same shape, and its watermark backfill writes
+// no write-log entry, so the log still holds exactly one row per object.
 func benchWakeLog(b *testing.B, rows int) *wakeCountingStore {
 	b.Helper()
-	ctx := context.Background()
-
-	store, err := sqlite.OpenMemory()
-	require.NoError(b, err)
-	b.Cleanup(func() { store.Close() })
-
-	err = store.Within(ctx, func(ctx context.Context) error {
-		var prev ObjectID
-		for range max(rows, 1) {
-			obj, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
-				Name: uniqueName(),
-				Spec: []byte(`{"Val":"0"}`),
-			})
-			if err != nil {
-				return err
-			}
-			if prev != 0 {
-				if _, err := store.EdgesAdd(ctx, obj.ID, prev, RelationDependsOn); err != nil {
-					return err
-				}
-			}
-			prev = obj.ID
-		}
-		return nil
-	})
-	require.NoError(b, err)
-
-	return &wakeCountingStore{Store: store, DriverCursorer: store}
+	store, _ := benchStaleGraph(b, max(rows, 1))
+	cursors, ok := store.(DriverCursorer)
+	require.True(b, ok, "the waker's cursor path needs a store that can persist one")
+	return &wakeCountingStore{Store: store, DriverCursorer: cursors}
 }
 
 // wakeCountingStore counts what one pass costs the store, split the way the

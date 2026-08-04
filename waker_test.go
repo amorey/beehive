@@ -67,24 +67,18 @@ func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconcil
 		wakeInterval:        defaultWakeInterval,
 		wakeScanMinInterval: defaultWakeScanMinInterval,
 	}
-	cursors, _ := store.(DriverCursorer)
-	bh.waker = &waker{bh: bh, cursors: cursors}
+	bh.waker = newWaker(bh)
 	return bh.waker, rs
 }
 
-// fakeClockOn replaces a waker's clock with one the test advances by hand. The
-// rate limits are wall-clock, and the suite synchronizes on signals rather than
-// sleeps.
-func fakeClockOn(dw *waker) *fakeClock {
-	clk := &fakeClock{at: time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)}
-	dw.now = clk.now
-	return clk
+// seededWaker is wakerOver for a test that starts from a waker already past its
+// seed, with a clock it drives by hand.
+func seededWaker(store Store, kinds ...GroupKind) (*waker, *fakeClock, map[GroupKind]*reconciler) {
+	dw, rs := wakerOver(store, kinds...)
+	clk := fakeClockOn(dw)
+	dw.seeded = true
+	return dw, clk, rs
 }
-
-type fakeClock struct{ at time.Time }
-
-func (c *fakeClock) now() time.Time          { return c.at }
-func (c *fakeClock) advance(d time.Duration) { c.at = c.at.Add(d) }
 
 // The seed is what keeps the first scan from replaying history. Without it the
 // watermark starts at zero and the first tick walks every live row in the store,
@@ -139,24 +133,21 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 
 	t.Run("a drained log", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(3)}
-		dw, _ := wakerOver(store, widget)
-		dw.seeded = true
+		dw, _, _ := seededWaker(store, widget)
 
 		assert.Equal(t, scanIdle, dw.scan(context.Background()), "a short page means the log is drained")
 	})
 
 	t.Run("a full page budget", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
-		dw, _ := wakerOver(store, widget)
-		dw.seeded = true
+		dw, _, _ := seededWaker(store, widget)
 
 		assert.Equal(t, scanMore, dw.scan(context.Background()), "stopping at the budget leaves work behind")
 	})
 
 	t.Run("a failed page", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(3), err: errBoom}
-		dw, _ := wakerOver(store, widget)
-		dw.seeded = true
+		dw, _, _ := seededWaker(store, widget)
 
 		assert.Equal(t, scanFailed, dw.scan(context.Background()))
 	})
@@ -199,7 +190,7 @@ func TestWakerRunsWithoutAWriteHub(t *testing.T) {
 
 	store := &replayStore{rows: replayRows(1), listed: newSignal()}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	dw.bh.wakeInterval, dw.bh.wakeScanMinInterval = fastTick, 0
+	dw.bh.wakeInterval = fastTick // the floor is read per pass, so this one still takes
 
 	done := make(chan struct{})
 	go func() { defer close(done); dw.run(ctx) }()
@@ -233,9 +224,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("a quiet pass waits the floor", func(t *testing.T) {
-		dw, _ := wakerOver(&replayStore{}, widget)
-		clk := fakeClockOn(dw)
-		dw.seeded = true
+		dw, clk, _ := seededWaker(&replayStore{}, widget)
 
 		next, backingOff := dw.pass(ctx, clk.now())
 		assert.Equal(t, defaultWakeInterval, next)
@@ -244,9 +233,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 
 	t.Run("a throttled pass waits out the throttle and scans nothing", func(t *testing.T) {
 		store := &replayStore{}
-		dw, _ := wakerOver(store, widget)
-		clk := fakeClockOn(dw)
-		dw.seeded = true
+		dw, clk, _ := seededWaker(store, widget)
 
 		dw.pass(ctx, clk.now())
 		pagesAfterFirst := len(store.pages)
@@ -259,9 +246,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 
 	t.Run("the first wake after a quiet period is eager", func(t *testing.T) {
 		store := &replayStore{}
-		dw, _ := wakerOver(store, widget)
-		clk := fakeClockOn(dw)
-		dw.seeded = true
+		dw, clk, _ := seededWaker(store, widget)
 
 		dw.pass(ctx, clk.now())
 		clk.advance(defaultWakeScanMinInterval)
@@ -272,18 +257,14 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 
 	t.Run("more work re-arms at the throttle, not the floor", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
-		dw, _ := wakerOver(store, widget)
-		clk := fakeClockOn(dw)
-		dw.seeded = true
+		dw, clk, _ := seededWaker(store, widget)
 
 		next, _ := dw.pass(ctx, clk.now())
 		assert.Equal(t, defaultWakeScanMinInterval, next, "a resume drains at the throttle's rate")
 	})
 
 	t.Run("a failed pass waits the floor and drops wakes", func(t *testing.T) {
-		dw, _ := wakerOver(&replayStore{rows: replayRows(3), err: errBoom}, widget)
-		clk := fakeClockOn(dw)
-		dw.seeded = true
+		dw, clk, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
 
 		next, backingOff := dw.pass(ctx, clk.now())
 		assert.Equal(t, defaultWakeInterval, next)
@@ -292,10 +273,12 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 
 	t.Run("a disabled throttle drains at the floor", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
-		dw, _ := wakerOver(store, widget)
+		dw, _, _ := seededWaker(store, widget)
+		// Rebuilt, not just re-set: the gates take their intervals at
+		// construction, which is what keeps an option from being ignored.
 		dw.bh.wakeScanMinInterval = 0
-		clk := fakeClockOn(dw)
-		dw.seeded = true
+		dw, clk := newWaker(dw.bh), fakeClockOn(dw)
+		dw.now, dw.seeded = clk.now, true
 
 		next, _ := dw.pass(ctx, clk.now())
 		assert.Equal(t, defaultWakeInterval, next, "with no throttle to re-arm at, today's behaviour")
@@ -528,8 +511,7 @@ func TestWakerSkipsTheSelfEdge(t *testing.T) {
 func TestWakerResolvesAPageInOneQuery(t *testing.T) {
 	widget := GroupKind{Kind: "Widget"}
 	store := &replayStore{rows: changedAt(10, 11, 12)}
-	dw, _ := wakerOver(store, widget)
-	dw.seeded = true
+	dw, _, _ := seededWaker(store, widget)
 
 	dw.scan(context.Background())
 
@@ -854,9 +836,7 @@ func TestWakePersistRetrySkips(t *testing.T) {
 // cursor ten times a second.
 func TestWakerPersistsAtMostOncePerFloor(t *testing.T) {
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(1)}}
-	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	clk := fakeClockOn(dw)
-	dw.seeded = true
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
 
 	// Ten passes inside one floor, each with the watermark moving, so nothing
 	// but the gate can be what holds the write back.
