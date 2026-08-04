@@ -43,15 +43,18 @@ deletion-pending" is worse than merely imprecise: `gcCollect` reruns after every
 reconcile of a deleting object, so an owner blocked on a finalizer and retrying
 under backoff would re-push its entire child set at reconcile rate.
 
-**The cascade queues one hook for the whole set**, over `enqueuerForPage`. The
+**The cascade queues one hook for the whole set**, over `resolverForPage`. The
 per-kind wake beside it is deduped because a wide cascade would otherwise queue
 one commit hook per row; a per-child push would have reintroduced exactly that,
 each closure re-taking `bh.mu` to resolve the same few kinds.
 
-The delete request uses `signalRequeueNow` and the cascade the throttled path.
-With the gate in place neither can repeat on a pass, so the choice is not
-load-bearing; the delete keeps the stronger one because a delete carries new
-information and should beat a backoff alarm rather than be absorbed by one.
+**Both pushes are immediate** — `signalRequeueNow` and `signalRequeueManyNow` —
+because each gate is a write that lands once, so cancelling a pending alarm can
+never become a repeat. Throttling the cascade instead would let a child's backoff
+alarm absorb the mark, and a ladder can outlast the GC interval; worse, a child's
+own reconcile is what cascades to the level below it, so one parked child stalls
+the whole subtree. The sweeper's route through `deletionAdvance` is absorbed the
+same way, so this is a stall the pull path never beat either.
 
 `DeletionRequestsCreateByName` returns the id it marked, since a name delete has
 no id to push. `markForDeletion` already scanned it for the write-log entry.

@@ -61,7 +61,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 				pushed = append(pushed, ch.Ref)
 			}
 		}
-		bh.signalRequeueManyThrottled(ctx, pushed)
+		bh.signalRequeueManyNow(ctx, pushed)
 
 		// The controller hasn't finished cleanup.
 		if len(obj.Finalizers) > 0 {

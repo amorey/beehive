@@ -359,6 +359,28 @@ func TestCascadeSkipsClientOnlyChild(t *testing.T) {
 	assert.NotNil(t, got.DeletionRequestedAt, "the client-only child is still marked for the sweeper")
 }
 
+// A cascade mark is new information, so it clears a pending alarm rather than
+// being absorbed by one. Absorption would park the child behind a backoff ladder
+// that can outlast the GC interval — and the child's own reconcile is what
+// cascades to the level below it, so the whole subtree waits with it.
+func TestCascadePushBeatsAPendingAlarm(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+	// Long enough that the alarm firing on its own would be the test hanging,
+	// not the assertion passing.
+	r.work.addAfter(child.ID, time.Hour, alarmBackoff)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{child.ID}, queuedIDs(r.work), "the mark beats the backoff alarm")
+}
+
 // gcCollect reruns after every reconcile of a deleting object, so a cascade that
 // pushed every child it *returned* would re-arm the subtree at reconcile rate.
 // Asserted on a drained queue: with a backoff or floor alarm pending, the throttle

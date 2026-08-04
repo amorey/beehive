@@ -47,15 +47,15 @@ can be read.
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
 | A new edge enqueues the edge's source | `ControllerClient.DependenciesAdd` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
-| A cascade enqueues the children it marked | `Beehive.signalRequeueManyThrottled` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
+| A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 
-The two paths call different methods. A
-spec write is immediate: it carries new information, so it cancels a pending alarm
-and dispatches at once. A new edge is throttled: a controller can declare on every
-pass, so it goes through `work.add` and respects the source's backoff ladder and
-re-enqueue floor.
+Three of the four are immediate: their gate is a store write that lands once, so
+they carry new information and cancel a pending alarm rather than being absorbed by
+one. The new edge is the exception, and it is throttled because a controller can
+declare the same edge on every pass, so it goes through `work.add` and respects the
+source's backoff ladder and re-enqueue floor.
 → [the floor ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
-Case 1 and case 5 describe them in full.
+Cases 1, 5, 9 and 10 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
 own hook, and a client-only kind resolves to none. So a client-only object waits for
@@ -482,6 +482,13 @@ sweep, and the pushes below it wait on that level's own collect.
 The gate is `DeletionCascadeChild.Marked` — the guarded `UPDATE`'s own answer, not
 "was it already deleting". Without it the push would fire at reconcile rate, since
 `gcCollect` reruns after every pass over a deleting object.
+
+The gate is also what makes the push immediate: a mark lands once per child, so
+cancelling that child's pending alarm cannot become a repeat. Absorbing it instead
+would park the child behind a backoff ladder that can outlast the GC interval — and
+the child's own reconcile is what cascades to the level below it, so the subtree
+would wait with it. The sweeper's route absorbs the same way, which is why the
+ladder, not the tick, is what a stalled cascade waits on.
 
 Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChildren`,
 `TestCascadeSkipsClientOnlyChild`, `TestIntegrationGCCascadeDeletesOwnerAndChild`,
