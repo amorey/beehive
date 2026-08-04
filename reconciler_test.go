@@ -2889,16 +2889,8 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 // not catch.
 type watermarkProbeStore struct {
 	Store
-	sets     []ObjectID
-	err      error
-	stampErr error
-}
-
-func (s *watermarkProbeStore) ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error {
-	if s.stampErr != nil {
-		return s.stampErr
-	}
-	return s.Store.ReconcileOwedStamp(ctx, refs)
+	sets []ObjectID
+	err  error
 }
 
 func (s *watermarkProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
@@ -3104,9 +3096,8 @@ func TestReconcileHoldsDependencyWatermarkOnUndecodableRow(t *testing.T) {
 }
 
 // TestReconcileWarnsAndContinuesOnCursorWriteFailure pins the failure contract:
-// no error escapes into the backoff ladder over a bookkeeping write. The repair is
-// the owed stamp beside it, not the stale pass — that pass is cursor-bound and
-// re-derives nothing for a target that has gone quiet.
+// no error escapes into the backoff ladder over a bookkeeping write, and the
+// unwritten watermark leaves the dependent stale rather than settled.
 func TestReconcileWarnsAndContinuesOnCursorWriteFailure(t *testing.T) {
 	ctx := context.Background()
 	h := newWatermarkHarness(t, func(s Store) Store {
