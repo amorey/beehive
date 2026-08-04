@@ -46,15 +46,18 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   scan** (`internal/driver`). Seven drivers: the owed pass (unsettled specs plus
   `reconcile_owed`, per-kind, 30s), the full pass (`WithFullPassInterval`, off by
   default), the GC sweeper (`WithGCInterval`, **cannot be disabled**), the
-  dependency waker (write log, 1s), the stale-dependents pass (60s, **cannot be
-  disabled**), the object watch tail (`withWatchFloorInterval`, 30s, with a
-  commit wake in front) and the event watch poll (1s). Only
-  `WithFullPassInterval` and `WithGCInterval` are public; the other cadences are
-  unexported options only tests reach, and `Client.Requeue` is the public way to
-  beat one. **No reconcile may depend on either full pass** — both scale with the
-  object count. The schedule watch is the one push exception (see below); the
-  watch tail's wake is not one, because the floor tick stays.
-  → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md). Every reconcile trigger
+  dependency waker (write log, 1s, with a commit wake in front), the
+  stale-dependents pass (60s, **cannot be disabled**), the object watch tail
+  (`withWatchFloorInterval`, 30s, also with a commit wake) and the event watch
+  poll (1s). Only `WithFullPassInterval` and `WithGCInterval` are public; the
+  other cadences are unexported options only tests reach, and `Client.Requeue`
+  is the public way to beat one. **No reconcile may depend on either full pass**
+  — both scale with the object count. The schedule watch is the one push
+  exception (see below); the two commit wakes are not, because their floor ticks
+  stay. Both wakes are rate-limited (`internal/rategate`), and the waker's
+  cursor write keeps a floor of its own so a faster loop is not a faster write.
+  → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
+  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
 - **The work queue floors how often one object is dispatched**, and a pending
@@ -92,10 +95,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   the owed pass is its consumer, not a third. → [ADR](docs/adr/2026-08-03-stale-dependents-cursor.md)
 - **The dependency waker scans the write log from a watermark**
   (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
-  client-only kind). Cost is bounded by what changed. The cursor persists via
-  the optional `DriverCursorer`; it is an optimisation over the stale-dependents
-  pass, never a guarantee.
-  → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md)
+  client-only kind). Cost is bounded by what changed. **A commit wakes it**, and
+  the tick is the floor behind that, so a dependency chain propagates per commit
+  rather than per second. The cursor persists via the optional `DriverCursorer`;
+  it is an optimisation over the stale-dependents pass, never a guarantee.
+  → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md),
+  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md)
 - **Object writes are recorded in an append-only log** (`object_writes`), one
   entry per committed write, in that write's transaction. A create/update entry
   carries no payload — consumers route by id and read current state; a physical
@@ -110,8 +115,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ObjectWritesMaxVersion` (which folds in the horizon so it only rises — gate on
   `>`, not `!=`), a busy one reads the entries above the cursor and then one
   batched `ObjectsListByIDs`, draining until a page comes back short. A commit
-  wakes it (`signalKindWritten`, `AfterCommit`); the emit table is derived from
-  the store's write-log call sites, **not** from the public verbs — conditions
+  wakes it (`signalKindWritten`, `AfterCommit`), and the same signal wakes the
+  dependency waker, which subscribes across every kind rather than to one; the
+  emit table is derived from the store's write-log call sites, **not** from the public verbs — conditions
   reach the log through `bumpObject`, and the owner cascade is routed by the refs
   it returns. The fan-out is non-generic (`rawChange`) because two clients may
   watch one kind with different type parameters; each subscriber decodes and
@@ -145,9 +151,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
-  five users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  six users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
   delete-request enqueue (shared via `Beehive.signalRequeueNow` and
-  `signalRequeueThrottled`) and the GC cascade's own hook.
+  `signalRequeueThrottled`), the GC cascade's own hook, and `signalKindWritten`
+  — which feeds the watch tailers and the dependency waker.
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
   [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md)

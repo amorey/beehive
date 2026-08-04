@@ -641,15 +641,15 @@ here shrinks to a pointer.
   rate-limited while writes continue. That trades a bounded delay for connection
   headroom exactly where per-write latency is already dominated by queueing.
 
-  Deferred because the tailer is demand-scoped: it runs only while something watches,
-  and a caller that opened a watch has asked for the latency. The
-  [commit-wake spec](specs/03-waker-commit-wake.md) needs the same limit for the
-  dependency waker, where the same loop runs unconditionally for the life of the
-  process and the trade comes out the other way. Revisit when the two are compared
-  side by side, or if a watched kind under heavy write load is measured to slow its
-  own writers. Whatever is built should be shared: two wake-driven drivers throttling
-  on different curves would be a tuning accident, the same reasoning
-  `Beehive.watchBackoff` already applies to the retry ladder.
+  **The shared limit now exists and the tailer has not adopted it.** The dependency
+  waker took `rategate.Allow` for exactly this, floored at
+  `wakeScanMinInterval` — see
+  [the ADR](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md). It went there
+  first because that loop runs unconditionally for the life of the process, where
+  the tailer is demand-scoped: it runs only while something watches, and a caller
+  that opened a watch has asked for the latency. Adopting it here is a gate, a
+  constant and the `Allow`/`Rearm` pair the waker's loop already uses. Revisit if a
+  watched kind under heavy write load is measured to slow its own writers.
 
   Tripwire: none pins the current cadence. `TestTailerDeliversOnWake` asserts that a
   wake delivers, not how soon, and `TestTailerDrainsBurstAbovePageCap` and

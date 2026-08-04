@@ -61,8 +61,14 @@ Every push is confined to a registered kind: each resolves a reconciler inside i
 own hook, and a client-only kind resolves to none. So a client-only object waits for
 a driver, always.
 
-Nothing else pushes a reconcile. A target change does not push today.
-`Client.Requeue` is an explicit call by the embedder, not a write, and it is case 13.
+A target change is the one wake that starts anywhere. The commit wakes the
+dependency waker, whose scan is store-wide, so a *client-only* target reaches its
+dependents — but what the waker enqueues is still per registered kind. It is a
+driver with a wake in front rather than a push path, because the floor tick stays.
+See case 6.
+
+Nothing else pushes a reconcile. `Client.Requeue` is an explicit call by the
+embedder, not a write, and it is case 13.
 
 ### The pull drivers
 
@@ -70,7 +76,7 @@ Nothing else pushes a reconcile. A target change does not push today.
 |---|---|---|---|
 | Owed pass | per kind | 30s | no |
 | GC sweeper | global | `WithGCInterval`, 30s | no; a non-positive value is rejected |
-| Dependency waker | global | 1s | yes, by an unexported option |
+| Dependency waker | global | 1s floor, with a commit wake in front | yes, by an unexported option |
 | Stale-dependents pass | global | 60s | no |
 | Full pass | per kind | `WithFullPassInterval`, off | yes; it is off by default |
 
@@ -304,8 +310,12 @@ filter on what changed. Any row for target T wakes every dependent of T.
 
 **Only `depends_on` edges wake.** An `owned_by` edge wakes nothing.
 
-**Push:** none today. A commit wake is proposed but is not built. See
-[the spec](specs/03-waker-commit-wake.md).
+**Push:** the commit wakes the waker. `signalKindWritten` publishes on
+`Store.AfterCommit`, and the waker subscribes across every kind — an edge can point
+at one it cannot name. The wake carries nothing: the waker reads its own cursor, so
+a burst collapses into one wake and a lost one costs only latency. Wake-driven scans
+are floored at 100ms, and dropped while a failed scan is backing off.
+See [the ADR](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md).
 
 **Pull:** the waker, every second. A failed page holds the cursor, and the next tick
 reads the same range again. A failed edges lookup does the same. The self-edge is
@@ -575,10 +585,10 @@ Each item below looks like a trigger. None of them is one.
   It bumps no generation and no `resource_version`. It is delivered by a push hub
   rather than by a poll. That changes how a subscriber learns of it. It changes
   nothing about what it triggers.
-- **The object watch tail wakes no controller.** `signalKindWritten` is a push, and
-  it is the only commit-driven push in the system today, but it feeds watch
-  subscribers only. It never enqueues a reconcile. Do not confuse it with the push
-  paths in section 1.
+- **The object watch tail wakes no controller.** `signalKindWritten` feeds the watch
+  tailers and the dependency waker. The tailer half never enqueues a reconcile; the
+  waker half does, and it is case 6. Do not confuse the tailer with the push paths in
+  section 1.
 - **`EventsWatch` wakes nothing.** It polls the event log for subscribers. It
   enqueues no reconcile.
 - **An object of a client-only kind is never reconciled.** It has no reconcile loop.

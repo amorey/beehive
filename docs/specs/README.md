@@ -26,14 +26,13 @@ What the property does not supply is latency. A timer decides when work starts, 
 the interval is the floor, even when the writer and the controller are in one
 process and the store already knows the answer at commit time.
 
-Today four writes beat the timer. A spec write enqueues its own object, a new
+Today four writes beat the timer, and one commit signal wakes a driver. A spec write enqueues its own object, a new
 `depends_on` edge enqueues the edge's source, a delete request enqueues its own
 object, and a cascade enqueues the children it marked. All run on
 `Store.AfterCommit`. Every other route waits for a tick:
 
 | Route | Latency today | Spec |
 |---|---|---|
-| A target changed, so its dependents are stale | ≤1s (the waker) | [03](03-waker-commit-wake.md) |
 | A blocked collect was unblocked | ≤30s | [04](04-finalizer-unblock-push.md) |
 
 The stale-dependents pass is absent from that table on purpose. It runs every 60
@@ -78,11 +77,15 @@ level rather than a sweep. Both pushes are confined to registered kinds, because
 collecting a client-only kind from a commit hook would run the whole subtree below
 it on the caller's goroutine.
 
-### 3. [Waker commit wake](03-waker-commit-wake.md)
+### 3. Waker commit wake — **shipped**
 
-The largest latency win and the largest change. Dependency propagation costs one
-waker tick per hop, so a chain of depth D settles in D seconds. `objectTailer`
-already runs the pattern this spec copies: a commit wake in front of a floor tick.
+→ [ADR](../adr/2026-08-05-a-commit-wakes-the-dependency-waker.md)
+
+The largest latency win and the largest change: dependency propagation cost one
+waker tick per hop, so a chain of depth D settled in D seconds. It copied
+`objectTailer`'s pattern — a commit wake in front of a floor tick — subscribing
+across every kind of the hub that already fed the tailers, and added the two rate
+limits that removing a tick's own pacing required.
 
 ### 4. [Finalizer unblock push](04-finalizer-unblock-push.md)
 

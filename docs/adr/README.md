@@ -25,6 +25,7 @@ directory of archaeology.
 
 - [The work queue floors how often one object is dispatched](2026-08-04-work-queue-re-enqueue-floor.md)
 - [A delete request pushes its own collect, for a registered kind only](2026-08-04-a-delete-request-pushes-its-own-collect.md)
+- [A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [One tailer per kind, woken by the commit path, above a floor tick](2026-08-03-watch-shared-tail.md)
 - [The stale-dependents pass scans from a cursor over target versions](2026-08-03-stale-dependents-cursor.md)
