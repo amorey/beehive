@@ -323,6 +323,33 @@ func TestWithMinRequeueIntervalDispatch(t *testing.T) {
 	require.NoError(t, withMinRequeueInterval(time.Second)("unrelated"))
 }
 
+// New builds the waker's gates from the resolved intervals, which is only true
+// because it constructs the waker *after* applying the options. Built above the
+// option loop, the gates would hold the defaults and both options below would
+// be silently ignored.
+func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withWakeScanMinInterval(time.Minute),
+		withDependencyWakeInterval(time.Hour))
+
+	assert.Equal(t, time.Minute, bh.waker.scanGate.Interval(), "the option must reach the scan gate")
+	assert.Equal(t, time.Hour, bh.waker.persistGate.Interval(), "and the wake interval the persist gate")
+}
+
+// A non-positive interval turns the throttle off rather than holding forever,
+// which is what rategate's zero interval already means.
+func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(0))
+
+	_, held := bh.waker.scanGate.Allow(wakerGateKey, time.Now())
+	require.False(t, held)
+	_, held = bh.waker.scanGate.Allow(wakerGateKey, time.Now())
+	assert.False(t, held, "a disabled throttle holds nothing, however often it is asked")
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, withWakeScanMinInterval(time.Second)("unrelated"))
+}
+
 // Register seeds the queue's floor from the New-level default, and a per-kind
 // option overrides it.
 func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {
