@@ -2018,6 +2018,35 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	ctrl.deleted.wait(t, "reconcile after deletion requested")
 }
 
+// The pull path under the delete push: Delete enqueues its object, so the test
+// above no longer reaches the sweeper. Marking through the store issues no push
+// at all, which leaves the GC tick as the only thing that can dispatch this.
+func TestIntegrationDeleteCollectsWithoutThePush(t *testing.T) {
+	ctx := context.Background()
+
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
+
+	ctrl := &deletionTrackingController{
+		reconciled: newSignal(),
+		deleted:    newSignal(),
+	}
+	_, err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(deletionTrackingFinalizer))
+
+	ctrl.reconciled.wait(t, "first reconcile")
+
+	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
+	require.NoError(t, err)
+	ctrl.deleted.wait(t, "reconcile after the sweeper found the mark")
+}
+
 // TestIntegrationWritePersistsAcrossReconcileError is the end-to-end counterpart
 // of TestReconcilePersistsWritesOnError: a status write made during a reconcile
 // that then returns an error stays committed, because reconcile no longer runs
