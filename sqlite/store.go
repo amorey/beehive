@@ -1915,8 +1915,11 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	for _, ch := range children {
 		var marked bool
 		if !ch.deleting {
-			// Marked is the guarded UPDATE's own answer, never !deleting: a race
-			// may have set the flag since the SELECT, and then this stamps nothing.
+			// Marked is the UPDATE's own answer, which here matches !ch.deleting:
+			// the SELECT above and these marks share one BEGIN IMMEDIATE
+			// transaction. Reported from the write anyway — it is the source of
+			// truth, it costs nothing, and Store admits backends that do not
+			// serialize the two.
 			var err error
 			if _, marked, err = s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
 				return nil, err

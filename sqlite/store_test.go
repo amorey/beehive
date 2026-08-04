@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1730,6 +1731,38 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	b2, err := store.ObjectsGetMeta(ctx, childB)
 	require.NoError(t, err)
 	assert.Equal(t, b1.ResourceVersion, b2.ResourceVersion)
+}
+
+// The delete push gates on the store's report that *this* call stamped the row,
+// so a losing racer must report false. The probe is outside the transaction, so
+// racers can clear it together and meet at the guarded UPDATE.
+func TestDeletionRequestsCreateStampsOnceUnderConcurrency(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	// Released together, so every racer clears requestDeletion's pre-transaction
+	// probe before any of them commits. Staggered, the probe filters the losers
+	// and the guarded UPDATE never has to.
+	const racers = 4
+	start := make(chan struct{})
+	var stamped atomic.Int32
+	var wg sync.WaitGroup
+	for range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			changed, err := store.DeletionRequestsCreate(ctx, testGK, id)
+			assert.NoError(t, err)
+			if changed {
+				stamped.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	assert.Equal(t, int32(1), stamped.Load(), "exactly one caller stamped the row")
 }
 
 // DeletionRequestsCreateFromOwner's child lookup must ride the idx_edges_to index, not scan

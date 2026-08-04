@@ -36,10 +36,12 @@ to matter.
 `DeletionCascadeChild.Marked`, which is new surface: the store computed the fact
 and discarded it.
 
-`Marked` is the guarded `UPDATE`'s own answer, never a reconstruction from the
-`SELECT` that preceded it. A race may set the flag in between, and then the write
-stamps nothing while `!deleting` still claims it did. Gating on "the row is
-deletion-pending" is worse than merely imprecise: `gcCollect` reruns after every
+`Marked` is reported by the guarded `UPDATE` rather than reconstructed from the
+`SELECT` that preceded it. On the sqlite backend the two coincide — `Within` is
+`BEGIN IMMEDIATE`, so no writer interleaves — and the write's own answer is used
+because it is the source of truth at no cost, and `Store` admits backends that do
+not serialize a read against a later write in the same transaction. Gating on "the
+row is deletion-pending" is a different matter, and worse than imprecise: `gcCollect` reruns after every
 reconcile of a deleting object, so an owner blocked on a finalizer and retrying
 under backoff would re-push its entire child set at reconcile rate.
 
