@@ -336,6 +336,17 @@ func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
 	assert.Equal(t, time.Hour, bh.waker.persistGate.Interval(), "and the wake interval the persist gate")
 }
 
+// The scan floor limits how often a wake may drive a scan; it is not a cadence
+// of its own. Left above the wake interval it would delay a scan past the tick
+// that bounds the worst case — which is every test that runs the waker fast and
+// leaves the scan floor at its default.
+func TestNewClampsTheScanFloorToTheWakeInterval(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t), withDependencyWakeInterval(5*time.Millisecond))
+
+	assert.Equal(t, 5*time.Millisecond, bh.waker.scanGate.Interval(),
+		"the default scan floor is longer than this wake interval, so the wake interval wins")
+}
+
 // A non-positive interval turns the throttle off rather than holding forever,
 // which is what rategate's zero interval already means.
 func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {

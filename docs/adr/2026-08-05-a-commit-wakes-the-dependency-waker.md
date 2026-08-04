@@ -69,6 +69,14 @@ idle-to-active transition pays no added latency and only a sustained stream is
 paced. The value is a constant rather than a fraction of `wakeInterval`:
 deriving it would tie wake latency to a floor we want free to raise.
 
+**It is clamped to `wakeInterval` all the same.** The scan floor limits how
+often a *wake* may drive a scan; it is not a cadence of its own. Above the wake
+interval it would delay a scan past the tick that bounds the worst case — and
+the two are configured independently, so a short wake interval leaving the scan
+floor at its default is the ordinary case in tests rather than a
+misconfiguration. A clamp is not a derivation: the constant stays free to be
+tuned under the floor, and only the incoherent range is cut off.
+
 **The cursor write is floored at `wakeInterval`.** `scan` persists on the way
 out whenever the watermark moved, which under a sustained stream is every pass —
 so a 10×-faster loop would have meant a 10×-faster `DriverCursorsSet`. Every

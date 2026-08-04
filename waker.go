@@ -164,13 +164,20 @@ func (dw *waker) run(ctx context.Context) {
 // newWaker builds a waker over bh's cadences. Call it after the options are
 // applied: the gates take their intervals here, so one built earlier would hold
 // the defaults whatever the caller asked for.
+//
+// The scan floor is clamped to the wake floor. It is meant to sit an order of
+// magnitude under it — a limit on how often a wake may drive a scan, not on how
+// often one happens — so a scan floor above the wake interval would delay a
+// scan past the tick that is supposed to bound the worst case. The two are
+// configured independently, and a short wake interval is the ordinary case in
+// tests.
 func newWaker(bh *Beehive) *waker {
 	cursors, _ := bh.store.(DriverCursorer)
 	return &waker{
 		bh:          bh,
 		cursors:     cursors,
 		now:         time.Now,
-		scanGate:    rategate.New[struct{}](bh.wakeScanMinInterval),
+		scanGate:    rategate.New[struct{}](min(bh.wakeScanMinInterval, bh.wakeInterval)),
 		persistGate: rategate.New[struct{}](bh.wakeInterval),
 	}
 }
