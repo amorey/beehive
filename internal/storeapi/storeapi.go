@@ -323,8 +323,9 @@ type Store interface {
 
 	// DeletionRequestsCreateByName is DeletionRequestsCreate keyed by name within gk, with
 	// resolve and mark in one statement. ErrNotFound if no object of gk holds
-	// the name (no ErrWrongKind: names are per-kind). Returns no row.
-	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (changed bool, err error)
+	// the name (no ErrWrongKind: names are per-kind). id is the row the name
+	// held, and is meaningful only when changed.
+	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (id ObjectID, changed bool, err error)
 
 	// DeletionRequestsCreateFromOwner requests deletion of every object owned by
 	// ownerID and returns them all. Writes only to children not already

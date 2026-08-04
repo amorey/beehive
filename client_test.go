@@ -1293,8 +1293,8 @@ type requestDeletionByNameErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (bool, error) {
-	return false, errBoom
+func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (ObjectID, bool, error) {
+	return 0, false, errBoom
 }
 
 // getOrCreateBadJSONStore drives GetOrCreate's rawToTyped error path: the

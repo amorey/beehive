@@ -1661,7 +1661,7 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	assert.Equal(t, after, seqValue(t, store), "a guard-blocked mark draws no version")
 
 	// Same for a mark that matches no row at all, via the other keying.
-	_, err = store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
+	_, _, err = store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
 	require.ErrorIs(t, err, beehive.ErrNotFound)
 	assert.Equal(t, after, seqValue(t, store), "a mark that matches nothing draws none either")
 }
@@ -2026,7 +2026,7 @@ func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 		// Keyed by a name no row holds, so here ErrNotFound carries its full meaning:
 		// nothing of this kind is named that.
 		"DeletionRequestsCreateByName": func() error {
-			_, err := store.DeletionRequestsCreateByName(ctx, testGK, "never-created")
+			_, _, err := store.DeletionRequestsCreateByName(ctx, testGK, "never-created")
 			return err
 		},
 	}
@@ -2071,14 +2071,14 @@ func TestDeletionRequestsCreateByNameIsIdempotent(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.True(t, changed, "this call set the flag")
 	first, err := store.ObjectsGetByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.NotNil(t, first.DeletionRequestedAt, "the name's own row is the one marked")
 
-	changed, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	_, changed, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	assert.False(t, changed, "the repeat changed nothing")
 	second, err := store.ObjectsGetByName(ctx, testGK, "w1")
@@ -2088,6 +2088,29 @@ func TestDeletionRequestsCreateByNameIsIdempotent(t *testing.T) {
 		"the deletion timestamp is stamped once")
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
 		"a no-op must not bump the watch cursor")
+}
+
+// The id is what lets a caller push the object it just marked; a name delete has
+// no id of its own. It is meaningful only when changed, which is why the repeat
+// below asserts nothing about it.
+func TestDeletionRequestsCreateByNameReturnsTheMarkedID(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Name: "w1",
+		Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	id, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Equal(t, created.ID, id, "the id of the row the name held")
+
+	_, changed, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	require.NoError(t, err)
+	assert.False(t, changed)
 }
 
 // Names are unique per kind, not globally, so another kind's row holding the same
@@ -2103,7 +2126,7 @@ func TestDeletionRequestsCreateByNameIsKindScoped(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = store.DeletionRequestsCreateByName(ctx, testGK, "shared")
+	_, _, err = store.DeletionRequestsCreateByName(ctx, testGK, "shared")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 	assert.NotErrorIs(t, err, beehive.ErrWrongKind)
 
@@ -5975,7 +5998,7 @@ func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
 
 	t.Run("absent name", func(t *testing.T) {
 		before := raw.txCount.Load()
-		changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
+		_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
 		require.ErrorIs(t, err, storeapi.ErrNotFound)
 		assert.False(t, changed)
 		assert.Equal(t, before, raw.txCount.Load(), "an absent name answered from a lock-free read")
@@ -5990,7 +6013,7 @@ func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
 
 	t.Run("the delete that lands does take one", func(t *testing.T) {
 		before := raw.txCount.Load()
-		changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
+		_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
 		require.NoError(t, err)
 		assert.True(t, changed)
 		assert.Equal(t, before+1, raw.txCount.Load())
@@ -5998,7 +6021,7 @@ func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
 
 	t.Run("already pending", func(t *testing.T) {
 		before := raw.txCount.Load()
-		changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
+		_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
 		require.NoError(t, err)
 		assert.False(t, changed, "already deletion-pending is an idempotent no-op")
 		assert.Equal(t, before, raw.txCount.Load())
@@ -6029,7 +6052,7 @@ func TestRequestDeletionResolvesARowThatMovedAfterTheProbe(t *testing.T) {
 		return calls > 1, nil
 	}
 
-	changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	_, changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
 
 	require.NoError(t, err, "the row was collected or marked by someone else; that is success")
 	assert.False(t, changed, "this call stamped nothing")
@@ -6051,7 +6074,7 @@ func TestRequestDeletionReportsARowCollectedAfterTheProbe(t *testing.T) {
 		return false, storeapi.ErrNotFound // gone
 	}
 
-	changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	_, changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
 
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 	assert.False(t, changed)
@@ -6081,7 +6104,7 @@ func TestDeletionRequestsCreateByNameSurfacesAProbeReadError(t *testing.T) {
 	store := newRawStore(t)
 	dropObjects(t, store)
 
-	changed, err := store.DeletionRequestsCreateByName(context.Background(), testGK, "whatever")
+	_, changed, err := store.DeletionRequestsCreateByName(context.Background(), testGK, "whatever")
 
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "a broken read is not an absent row")

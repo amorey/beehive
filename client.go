@@ -869,7 +869,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	_, marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
