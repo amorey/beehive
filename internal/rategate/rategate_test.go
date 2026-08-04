@@ -61,6 +61,29 @@ func TestGateOpensAtRecordsNothing(t *testing.T) {
 	assert.False(t, held, "querying must not extend the window")
 }
 
+func TestGateAllowAdmitsAndThenHolds(t *testing.T) {
+	g := New[int](time.Second)
+
+	_, held := g.Allow(1, base)
+	require.False(t, held, "a free key is allowed")
+
+	opensAt, held := g.Allow(1, base.Add(200*time.Millisecond))
+	assert.True(t, held, "and allowing it recorded the admission")
+	assert.Equal(t, base.Add(time.Second), opensAt)
+}
+
+func TestGateAllowRecordsNothingWhenHeld(t *testing.T) {
+	g := New[int](time.Second)
+	g.Admit(1, base)
+
+	for range 5 {
+		_, _ = g.Allow(1, base.Add(500*time.Millisecond))
+	}
+
+	_, held := g.Allow(1, base.Add(time.Second))
+	assert.False(t, held, "a refused Allow must not extend the window")
+}
+
 func TestGateZeroIntervalHoldsNothing(t *testing.T) {
 	g := New[int](0)
 	g.Admit(1, base)

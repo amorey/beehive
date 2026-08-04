@@ -61,6 +61,17 @@ func (g *Gate[K]) OpensAt(k K, now time.Time) (time.Time, bool) {
 	return opensAt, true
 }
 
+// Allow is OpensAt followed by Admit when k is free: same (opensAt, held)
+// pair, and the admission is recorded when held is false. For a caller whose
+// test and action are at one point.
+func (g *Gate[K]) Allow(k K, now time.Time) (time.Time, bool) {
+	if opensAt, held := g.OpensAt(k, now); held {
+		return opensAt, true
+	}
+	g.Admit(k, now)
+	return time.Time{}, false
+}
+
 // Admit records that k acted at now, holding it until now.Add(interval). It
 // also evicts, so the map stays bounded by the keys admitted within one
 // interval.
