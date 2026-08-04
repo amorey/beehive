@@ -182,6 +182,38 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 	waitClosed(t, done, "the waker to stop")
 }
 
+// The link between a client write and the waker: a commit publishes a wake to
+// the subscription waker.run holds. The loop test above sends on the hub by
+// hand and takes it from there, and the scan tests take it from there again —
+// so this is the one that pins the publish actually happening.
+//
+// The kind here has no controller and no watch, which is the case a per-kind
+// subscription could not serve: nothing but a store-wide subscriber would name
+// it. Nothing is started, so no driver can be the cause of what arrives.
+func TestAClientWriteWakesTheWakersSubscription(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t))
+	rx, ok := bh.kindWriteHub.WatchAcross() // as waker.run subscribes
+	require.True(t, ok)
+	defer rx.Close()
+
+	client := NewClient[cSpec, cStatus](bh, clientOnlyGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
+
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err, "the create published no wake")
+	assert.Equal(t, clientOnlyGK, ev.Key)
+
+	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
+	require.NoError(t, err)
+
+	ev, err = rx.RecvContext(ctx)
+	require.NoError(t, err, "the spec write published no wake")
+	assert.Equal(t, clientOnlyGK, ev.Key)
+}
+
 // The wake is an optimisation over the tick, so a Beehive assembled without a
 // hub — every waker test above — still scans on its floor.
 func TestWakerRunsWithoutAWriteHub(t *testing.T) {
