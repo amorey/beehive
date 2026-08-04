@@ -200,6 +200,33 @@ func TestWakerRunsWithoutAWriteHub(t *testing.T) {
 	waitClosed(t, done, "the waker to stop")
 }
 
+// A commit landing during a failed scan refills the wake slot, so honouring it
+// would keep a degraded store re-reading as fast as it can fail. The wake is
+// consumed and dropped until the retry timer fires.
+//
+// Deterministic without a sleep: Sender.Close lets a receiver read its unread
+// value once more before reporting ErrClosed, so the wake below is delivered
+// first and the close ends the loop second.
+func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
+	store := &replayStore{rows: replayRows(3), err: errBoom, listed: newSignal()}
+	bh := newTestBeehive(t, store, withDependencyWakeInterval(time.Hour))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	require.NoError(t, err)
+	// Past the seed, so the first pass is a scan — and it fails.
+	bh.waker.seeded = true
+
+	done := make(chan struct{})
+	go func() { defer close(done); bh.waker.run(context.Background()) }()
+	store.listed.wait(t, "the waker's first scan")
+
+	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Widget"}))
+	bh.kindWriteHub.Close()
+	waitClosed(t, done, "the waker to stop")
+
+	// The floor is an hour, so a second read could only have come from the wake.
+	assert.Len(t, store.pages, 1, "the wake must not drive a re-read while the store is failing")
+}
+
 // Closing the hub ends the waker. It is a safety net rather than the normal
 // exit — stop cancels runCtx and waits on the WaitGroup the waker is in, and
 // only closes the hub after — so drive it directly, or the test pins nothing.
