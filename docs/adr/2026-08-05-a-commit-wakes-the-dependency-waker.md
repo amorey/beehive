@@ -56,6 +56,17 @@ guarantee underneath. A wake is an optimisation twice over: the waker is already
 an optimisation over that pass, so a lost wake costs latency against a lost
 tick, which costs latency against a lost sweep.
 
+**The floor is also the failure retry, and that is what makes raising it more
+than a cadence change.** A failed scan sets `backingOff`, which *drops* arriving
+wakes so a live writer cannot keep a degraded store re-reading as fast as it can
+fail — and the only thing that clears it is the floor timer. So lengthening
+`wakeInterval` lengthens how long a transient store error suppresses dependency
+propagation entirely, which at seconds is recovery and at a minute is an outage
+the push cannot shorten. Split the retry onto its own backoff before raising it;
+`objectTailer` already uses `driver.Backoff` for exactly this, and the flat
+floor here is only defensible while it *is* the ladder's terminal value. See the
+entry in [`TODO.md`](../TODO.md).
+
 The closed-hub arm in `run` is a safety net rather than the normal exit: `stop`
 cancels `runCtx` and waits on the WaitGroup the waker is in, closing the hub
 only after, so `ctx.Done()` wins except when the drain hits its deadline.
