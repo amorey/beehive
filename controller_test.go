@@ -47,6 +47,96 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
 }
 
+// Clearing the last finalizer is the one route out of a finalizer-blocked
+// collect, so it pushes rather than waiting out a GC tick.
+func TestFinalizersDeletePushesTheCollect(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "f"))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+}
+
+// Every neighbour of that transition owes nothing. Pushing on a live object in
+// particular would collect-probe every finalizer removal in the system.
+func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
+	tests := []struct {
+		name       string
+		finalizers []string
+		deleting   bool
+		remove     string
+	}{
+		{"live object", []string{"f"}, false, "f"},
+		{"finalizers remain", []string{"f", "g"}, true, "f"},
+		{"absent finalizer", []string{"f"}, true, "missing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			client, cc, r := specWriteFixture(t)
+
+			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(tt.finalizers...))
+			if tt.deleting {
+				require.NoError(t, client.Delete(ctx, obj.ID))
+			}
+			drainQueue(r.work)
+
+			require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, tt.remove))
+			assert.Empty(t, queuedIDs(r.work))
+		})
+	}
+}
+
+// The push rides AfterCommit, so an unwound frame discards it with its writes —
+// including a nested frame whose error the caller swallows, where the outer
+// transaction still commits.
+func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
+		err := cc.Within(ctx, func(ctx context.Context) error {
+			require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "f"))
+			return errBoom
+		})
+		require.ErrorIs(t, err, errBoom)
+		return nil // swallowed: the outer frame commits
+	}))
+
+	assert.Empty(t, queuedIDs(r.work))
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"f"}, got.Finalizers, "the savepoint unwound the removal too")
+}
+
+// A rejected write pushes nothing: the kind check fires before the gate is even
+// consulted.
+func TestFinalizersDeletePushesNothingOnWrongKind(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	gadgetGK := GroupKind{Kind: "Gadget"}
+	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
+	gadgetR := mustReconciler(t, bh, gadgetGK)
+
+	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
+	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
+	require.NoError(t, gadgets.Delete(ctx, gadget.ID))
+	drainQueue(gadgetR.work)
+
+	require.ErrorIs(t, cc.FinalizersDelete(ctx, gadget.ID, "f"), ErrWrongKind)
+	assert.Empty(t, queuedIDs(gadgetR.work))
+}
+
 // TestWriteStampsSchemaVersions verifies the lazy stamp-on-write half of the
 // migrator model: with a migrator registered, a spec write (Create) stamps the
 // migrator's current spec version and a controller status write stamps its

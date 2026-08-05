@@ -1736,9 +1736,10 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge tim
 	return int(total), err
 }
 
-func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) error {
+func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (bool, error) {
+	var clearedLast bool
 	// Within keeps the read-modify-write of the finalizer list atomic.
-	return s.Within(ctx, func(ctx context.Context) error {
+	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary while loading the finalizer list.
 		obj, err := s.getObjectRowScoped(ctx, gk, id)
@@ -1750,6 +1751,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 		if !removed {
 			return nil
 		}
+		clearedLast = len(remaining) == 0 && obj.DeletionRequestedAt != nil
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
@@ -1761,6 +1763,10 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 			jsonText(marshalFinalizers(remaining)), rv, now, id)
 		return err
 	})
+	if err != nil {
+		return false, err
+	}
+	return clearedLast, nil
 }
 
 // markForDeletion stamps the deletion clock of the row named by where, once: the

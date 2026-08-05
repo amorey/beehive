@@ -36,7 +36,9 @@ const (
 // everything below — reconciler, work queue, Store — stays free of type
 // parameters.
 type controllerAdapter interface {
-	reconcile(ctx context.Context, id ObjectID) (Result, error)
+	// gone reports that id's row no longer exists, so the worker drops what is
+	// queued for it rather than dispatching an ErrNotFound.
+	reconcile(ctx context.Context, id ObjectID) (result Result, gone bool, err error)
 }
 
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
@@ -61,17 +63,17 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 // transaction: each ControllerClient write commits on its own; a controller
 // that needs atomicity uses ControllerClient.Within. GC runs afterwards, in its
 // own transaction.
-func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
+func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, bool, error) {
 	log := t.log().With("id", id)
 
 	load, err := t.bh.store.ObjectsGetForReconcile(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
-		return Result{}, nil
+		return Result{}, true, nil
 	}
 	if err != nil {
-		return Result{}, err
+		return Result{}, false, err
 	}
 	raw := &load.Object
 	deleting := raw.DeletionRequestedAt != nil
@@ -86,12 +88,14 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		if deleting {
 			// Collect needs only the id, so a finalizer-free deletion-pending row
 			// is still collected.
-			if _, gcErr := t.bh.gcCollect(ctx, id); gcErr != nil {
+			gone, gcErr := t.bh.gcCollect(ctx, id)
+			if gcErr != nil {
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
-				return Result{}, gcErr
+				return Result{}, false, gcErr
 			}
+			return Result{}, gone, nil
 		}
-		return Result{}, nil
+		return Result{}, false, nil
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
@@ -132,16 +136,16 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		gone, gcErr := t.bh.gcCollect(ctx, id)
 		if gcErr != nil {
 			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
-			return result, cmp.Or(reconcileErr, gcErr)
+			return result, false, cmp.Or(reconcileErr, gcErr)
 		}
 		// Collected: drop any RequeueAfter and the reconcile error rather than
 		// rescheduling a dead id straight into ErrNotFound.
 		if gone {
 			log.DebugContext(ctx, "object collected")
-			return Result{}, nil
+			return Result{}, true, nil
 		}
 	}
-	return result, reconcileErr
+	return result, false, reconcileErr
 }
 
 // reconciler drives the reconcile loop for a single registered controller.
@@ -384,10 +388,15 @@ func (r *reconciler) runWorker(ctx context.Context) {
 			return
 		case <-workReady:
 			if id, ok := r.work.get(); ok {
-				result, err := r.adapter.reconcile(ctx, id)
+				result, gone, err := r.adapter.reconcile(ctx, id)
 				// done releases the processing hold so a re-add that arrived
-				// mid-reconcile becomes dispatchable.
-				r.work.done(id)
+				// mid-reconcile becomes dispatchable; a collected row has nothing
+				// left to dispatch, so drop what is queued for it instead.
+				if gone {
+					r.work.forget(id)
+				} else {
+					r.work.done(id)
+				}
 				if err != nil {
 					delay := r.backoffNext(id)
 					r.work.addAfter(id, delay, alarmBackoff)

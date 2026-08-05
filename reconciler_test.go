@@ -128,10 +128,12 @@ func TestRunExitsOnCancelWithFullPassEnabled(t *testing.T) {
 // the test via a function field.
 type fakeAdapter struct {
 	reconcileFn func(ctx context.Context, id ObjectID) (Result, error)
+	gone        bool // reported for every id, as a collect would
 }
 
-func (f *fakeAdapter) reconcile(ctx context.Context, id ObjectID) (Result, error) {
-	return f.reconcileFn(ctx, id)
+func (f *fakeAdapter) reconcile(ctx context.Context, id ObjectID) (Result, bool, error) {
+	result, err := f.reconcileFn(ctx, id)
+	return result, f.gone, err
 }
 
 func TestReconcilerRequeuesOnError(t *testing.T) {
@@ -163,6 +165,39 @@ func TestReconcilerRequeuesOnError(t *testing.T) {
 	waitClosed(t, doneCh, "successful reconcile after error")
 	cancel()
 	waitClosed(t, done, "run to exit")
+}
+
+// A push landing mid-pass — the cleared finalizer's own — leaves the id dirty
+// while it is in flight. When that pass collected the row, the worker drops it
+// rather than paying a dispatch that can only read ErrNotFound. The second
+// enqueue is the barrier: one worker dispatches in order, so a re-queued 1 would
+// have been seen before 2.
+func TestReconcilerDropsAWakeForACollectedObject(t *testing.T) {
+	var seen []ObjectID
+	reached2 := make(chan struct{})
+	adapter := &fakeAdapter{gone: true}
+	r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
+	adapter.reconcileFn = func(_ context.Context, id ObjectID) (Result, error) {
+		seen = append(seen, id)
+		switch id {
+		case 1:
+			r.work.add(1) // the push, arriving while 1 is still in flight
+		case 2:
+			close(reached2)
+		}
+		return Result{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(1)
+	r.enqueue(2)
+	waitClosed(t, reached2, "the barrier object reconciled")
+	cancel()
+	waitClosed(t, done, "run to exit")
+
+	assert.Equal(t, []ObjectID{1, 2}, seen, "the collected id is not dispatched again")
 }
 
 // TestReconcilerClearsBackoffOnSuccess verifies the per-id backoff entry created
@@ -1290,7 +1325,7 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 		bh:    bh,
 		inner: inner,
 	}
-	res, err := tc.reconcile(context.Background(), 1)
+	res, _, err := tc.reconcile(context.Background(), 1)
 	require.NoError(t, err, "an undecodable row must not retry forever")
 	assert.Equal(t, Result{}, res)
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
@@ -1334,7 +1369,7 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 		}},
 	}
 
-	_, err := tc.reconcile(context.Background(), 1)
+	_, _, err := tc.reconcile(context.Background(), 1)
 	require.NoError(t, err, "an undecodable row is still a no-op success")
 	assert.False(t, store.decremented, "a wake the pass could not service must stay owed")
 }
@@ -1363,7 +1398,7 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	}}
 	tc := &typedController[cSpec, cStatus]{gk: gk, bh: bh, inner: inner}
 
-	res, err := tc.reconcile(ctx, raw.ID)
+	res, _, err := tc.reconcile(ctx, raw.ID)
 	require.NoError(t, err)
 	assert.Equal(t, Result{}, res)
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
@@ -1406,7 +1441,7 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 		bh:    bh,
 		inner: inner,
 	}
-	_, err := tc.reconcile(context.Background(), 1)
+	_, _, err := tc.reconcile(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom, "a failed collect on a poison deleting row must surface for retry")
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
@@ -1444,7 +1479,7 @@ func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) 
 		inner: inner,
 	}
 
-	result, err := tc.reconcile(context.Background(), 1)
+	result, _, err := tc.reconcile(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom, "a failed collect must surface so the pass is retried")
 	assert.True(t, called, "the row decoded, so the controller ran; only the collect failed")
 	assert.Equal(t, time.Minute, result.RequeueAfter, "the controller's schedule survives a failed collect")
@@ -1473,7 +1508,7 @@ func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 		bh:    bh,
 		inner: inner,
 	}
-	_, err := tc.reconcile(context.Background(), 1)
+	_, _, err := tc.reconcile(context.Background(), 1)
 	require.Error(t, err)
 }
 
@@ -1501,7 +1536,7 @@ func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 	}
 	// A gone object is a no-op success, not a retryable error: returning the error
 	// would retry the missing id forever on backoff.
-	result, err := tc.reconcile(context.Background(), 1)
+	result, _, err := tc.reconcile(context.Background(), 1)
 	require.NoError(t, err)
 	assert.Equal(t, Result{}, result, "no requeue for a vanished object")
 }
@@ -1534,7 +1569,7 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 	}
 	// The object exists; only the controller returned ErrNotFound. It must surface
 	// so the worker retries, not be swallowed as a vanished-object no-op.
-	_, err = tc.reconcile(ctx, raw.ID)
+	_, _, err = tc.reconcile(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -1567,9 +1602,10 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	}
 	// GC removes the unfinalized, deletion-pending row; the controller's
 	// RequeueAfter must be dropped so the worker doesn't reschedule a dead id.
-	result, err := tc.reconcile(ctx, raw.ID)
+	result, gone, err := tc.reconcile(ctx, raw.ID)
 	require.NoError(t, err)
 	assert.Equal(t, Result{}, result, "requeue dropped because the row was collected")
+	assert.True(t, gone, "the worker is told the row is gone")
 
 	_, err = s.ObjectsGet(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -1594,7 +1630,7 @@ func TestTypedControllerReconcile(t *testing.T) {
 		bh:    bh,
 		inner: &reconcileCapture{ch: capCh},
 	}
-	result, err := tc.reconcile(ctx, raw.ID)
+	result, _, err := tc.reconcile(ctx, raw.ID)
 	require.NoError(t, err)
 	assert.Equal(t, Result{}, result)
 
@@ -1653,7 +1689,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 		}},
 	}
 
-	_, rerr := tc.reconcile(ctx, raw.ID)
+	_, _, rerr := tc.reconcile(ctx, raw.ID)
 	require.ErrorIs(t, rerr, errBoom, "the reconcile error still surfaces for retry")
 
 	got, err := s.ObjectsGet(ctx, raw.ID)
@@ -1731,7 +1767,7 @@ func TestReconcileDecrementsReconcileOwed(t *testing.T) {
 		return Result{}, nil
 	}
 	require.NoError(t, owe())
-	_, err := tc.reconcile(ctx, id)
+	_, _, err := tc.reconcile(ctx, id)
 	require.NoError(t, err)
 	assert.Zero(t, count(t), "a successful pass services the owed wake")
 
@@ -1740,7 +1776,7 @@ func TestReconcileDecrementsReconcileOwed(t *testing.T) {
 		return Result{}, errBoom
 	}
 	require.NoError(t, owe())
-	_, err = tc.reconcile(ctx, id)
+	_, _, err = tc.reconcile(ctx, id)
 	require.ErrorIs(t, err, errBoom)
 	assert.Equal(t, int64(1), count(t), "a failed pass leaves the wake owed")
 }
@@ -1765,7 +1801,7 @@ func TestReconcileDrainsMultipleOwedPasses(t *testing.T) {
 	}
 	require.Equal(t, int64(3), count(t))
 
-	_, err := tc.reconcile(ctx, id)
+	_, _, err := tc.reconcile(ctx, id)
 	require.NoError(t, err)
 	assert.Zero(t, count(t), "one recovery pass drains every wake it observed")
 }
@@ -1786,7 +1822,7 @@ func TestReconcileOwedSurvivesConcurrentIncrement(t *testing.T) {
 		return Result{}, owe()
 	}
 	require.NoError(t, owe()) // the wake this pass loads
-	_, err := tc.reconcile(ctx, id)
+	_, _, err := tc.reconcile(ctx, id)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), count(t),
 		"the wake owed during the pass is not clobbered by the pass's decrement")
@@ -1816,7 +1852,7 @@ func TestReconcileReconcileOwedDecrementErrorIsNonFatal(t *testing.T) {
 		return Result{}, nil
 	}
 
-	_, err := tc.reconcile(ctx, id)
+	_, _, err := tc.reconcile(ctx, id)
 	require.NoError(t, err, "a failed decrement must not fail an otherwise successful reconcile")
 	assert.Equal(t, int64(1), count(t), "the count stays owed for the backstop to retry")
 }
@@ -1857,7 +1893,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		}},
 	}
 
-	_, _ = tc.reconcile(ctx, raw.ID)
+	_, _, _ = tc.reconcile(ctx, raw.ID)
 
 	_, err = s.ObjectsGet(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound,
@@ -2968,7 +3004,7 @@ func TestReconcileRecordsDependencyWatermark(t *testing.T) {
 	}
 	require.Equal(t, []ObjectID{h.dep}, h.stale(t), "a dependent that never reconciled is stale")
 
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	assert.Empty(t, h.stale(t), "the pass recorded what it reconciled against")
 
@@ -2989,7 +3025,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, nil
 	}
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	require.Empty(t, h.stale(t), "settled, with a watermark for the declare below to clear")
 
@@ -3001,7 +3037,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 		return Result{}, cc.DependenciesAdd(ctx, h.dep, second.ID)
 	}
 
-	_, err = h.tc.reconcile(ctx, h.dep)
+	_, _, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	assert.Empty(t, h.stale(t), "the pass that declared the edge also observed the target")
 }
@@ -3022,7 +3058,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, nil
 	}
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	require.Empty(t, h.stale(t), "settled, with a watermark for the mid-pass declare to clear")
 
@@ -3039,7 +3075,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 		_, err := h.store.EdgesAdd(ctx, h.dep, quiet.ID, RelationDependsOn)
 		return Result{}, err
 	}
-	_, err = h.tc.reconcile(ctx, h.dep)
+	_, _, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 
 	// The derived state really is blind here — that blindness was the strand.
@@ -3077,7 +3113,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 	inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, cc.DependenciesAdd(ctx, dep.ID, target.ID)
 	}
-	_, err = tc.reconcile(ctx, dep.ID)
+	_, _, err = tc.reconcile(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, stale(), "no watermark was written, so one more pass is owed")
 
@@ -3085,7 +3121,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) (Result, error) {
 		return Result{}, nil
 	}
-	_, err = tc.reconcile(ctx, dep.ID)
+	_, _, err = tc.reconcile(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.Empty(t, stale(), "self-extinguishing: once per object, never repeated")
 }
@@ -3123,11 +3159,11 @@ func TestReconcileSkipsDependencyWatermarkWithoutDependencies(t *testing.T) {
 		return Result{}, nil
 	}
 
-	_, err := h.tc.reconcile(ctx, h.target)
+	_, _, err := h.tc.reconcile(ctx, h.target)
 	require.NoError(t, err)
 	assert.Empty(t, probe.sets, "an object with no dependencies never takes the write lock")
 
-	_, err = h.tc.reconcile(ctx, h.dep)
+	_, _, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{h.dep}, probe.sets, "a dependent does record one")
 }
@@ -3149,7 +3185,7 @@ func TestALostWatermarkStillFindsAnUnobservedChange(t *testing.T) {
 	}
 	// One sweeper for the whole test: a live process, the case no restart repairs.
 	sd := sweeperOver(h.store)
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	sd.sweep(ctx)
 	require.Empty(t, h.stale(t), "converged: the watermark is current and the cursor is past it")
@@ -3161,7 +3197,7 @@ func TestALostWatermarkStillFindsAnUnobservedChange(t *testing.T) {
 		h.touchTarget(t, `{"val":"moved mid-pass"}`)
 		return Result{}, nil
 	}
-	_, err = h.tc.reconcile(ctx, h.dep)
+	_, _, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err, "the reconcile succeeded; only the watermark write failed")
 	raw, err := h.store.ObjectsGet(ctx, h.dep)
 	require.NoError(t, err)
@@ -3194,7 +3230,7 @@ func TestALostWatermarkCostsOnlyAnObservedChange(t *testing.T) {
 		return Result{}, nil
 	}
 	sd := sweeperOver(h.store)
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 	sd.sweep(ctx)
 
@@ -3204,7 +3240,7 @@ func TestALostWatermarkCostsOnlyAnObservedChange(t *testing.T) {
 		"drain the finding, as the reconcile it dispatched would")
 
 	probe.err = errBoom
-	_, err = h.tc.reconcile(ctx, h.dep)
+	_, _, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 
 	target, err := h.store.ObjectsGet(ctx, h.target)
@@ -3238,7 +3274,7 @@ func TestReconcileIsQuietWhenShutdownLosesTheWatermark(t *testing.T) {
 		return Result{}, nil
 	}
 
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 
 	assert.Empty(t, logs.String(), "a cancelled write is shutdown, not a lost pass")
@@ -3257,7 +3293,7 @@ func TestReconcileRecordsCursorFromTheLoad(t *testing.T) {
 		return Result{}, nil
 	}
 
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err)
 
 	assert.Equal(t, []ObjectID{h.dep}, h.stale(t),
@@ -3274,7 +3310,7 @@ func TestReconcileHoldsDependencyWatermarkOnFailure(t *testing.T) {
 		return Result{}, errBoom
 	}
 
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 	require.ErrorIs(t, err, errBoom)
 
 	assert.Equal(t, []ObjectID{h.dep}, h.stale(t), "a failed pass leaves the dependent owed one")
@@ -3296,7 +3332,7 @@ func TestReconcileHoldsDependencyWatermarkOnUndecodableRow(t *testing.T) {
 	_, _, err := h.store.ObjectsUpdateSpec(ctx, clientTestGK, h.dep, []byte("not-json"), 0)
 	require.NoError(t, err)
 
-	_, err = h.tc.reconcile(ctx, h.dep)
+	_, _, err = h.tc.reconcile(ctx, h.dep)
 	require.NoError(t, err, "an undecodable row is still a no-op success")
 
 	assert.Empty(t, probe.sets, "a pass that never ran records nothing")
@@ -3317,7 +3353,7 @@ func TestReconcileWarnsAndContinuesOnCursorWriteFailure(t *testing.T) {
 		return Result{}, nil
 	}
 
-	_, err := h.tc.reconcile(ctx, h.dep)
+	_, _, err := h.tc.reconcile(ctx, h.dep)
 
 	require.NoError(t, err, "a failed watermark write must not fail the reconcile")
 	assert.Contains(t, logs.String(), "failed to record the dependency watermark")

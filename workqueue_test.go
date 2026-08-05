@@ -219,6 +219,24 @@ func TestWorkQueueNoConcurrentDispatch(t *testing.T) {
 	assert.False(t, ok, "no spurious re-dispatch after done")
 }
 
+// forget is done for an id whose row the pass deleted: a wake that arrived
+// mid-pass can only resolve to ErrNotFound, and ids are never reused.
+func TestWorkQueueForgetDropsAQueuedReAdd(t *testing.T) {
+	q := newWorkQueue()
+	q.add(7)
+	_, ok := q.get()
+	require.True(t, ok)
+
+	q.add(7)                                    // a wake arrives while the collect is committing
+	q.addAfter(7, time.Hour, alarmRequeueAfter) // and an alarm outlives the pass
+	q.forget(7)
+
+	assert.Empty(t, queuedIDs(q))
+	assert.Zero(t, q.scheduleAt(7), "nothing is left scheduled for a collected id")
+	_, ok = q.get()
+	assert.False(t, ok, "a collected id is never dispatched again")
+}
+
 // TestWorkQueueReaddAfterDone verifies an ID can be queued again once its prior
 // processing has completed via done().
 func TestWorkQueueReaddAfterDone(t *testing.T) {
@@ -713,12 +731,14 @@ func TestPublishAddAfterOnDirtyIDSendsNothing(t *testing.T) {
 // would be the subscriber's last word.
 func TestPublishStoppedQueueSendsNothing(t *testing.T) {
 	q, tx := publishingQueue()
+	q.add(4) // still dirty after stop: finalValues clears alarms, not the dirty set
 	q.stop()
 	before := len(tx.taken())
 
 	q.add(1)
 	q.addAfter(2, time.Hour, alarmRequeueAfter)
 	q.requeueNow(3)
+	q.forget(4)
 
 	assert.Len(t, tx.taken(), before, "a stopped queue must publish nothing")
 }

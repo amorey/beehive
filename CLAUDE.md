@@ -152,13 +152,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
-  six users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
-  delete-request enqueue (shared via `Beehive.signalRequeueNow` and
-  `signalRequeueThrottled`), the GC cascade's own hook, and `signalKindWritten`
-  — which feeds the watch tailers and the dependency waker.
+  seven users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  delete-request enqueue, the cleared-finalizer enqueue (all shared via
+  `Beehive.signalRequeueNow` and `signalRequeueThrottled`), the GC cascade's own
+  hook, and `signalKindWritten` — which feeds the watch tailers and the
+  dependency waker.
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
-  [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md)
+  [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
+  [ADR](docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
 - **The id is the key everywhere; the name is a lookup.** The bare CRUD verbs
   take an `ObjectID` and act on one incarnation; the `…ByName` siblings act on
   whatever holds the name *now*, resolving and writing in one transaction. The
