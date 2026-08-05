@@ -212,6 +212,7 @@ func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 		bh.deletionPendingSweep(ctx)
 		bh.eventRetentionSweep(ctx)
 		bh.writeLogRetentionSweep(ctx)
+		bh.reconcileOwedSweep(ctx)
 		bh.freePagesSweep(ctx)
 		return true
 	})
@@ -236,6 +237,20 @@ func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
 	}
 	if _, err := bh.store.ObjectWritesSweep(ctx, bh.writeLogRetentionPerKind, bh.writeLogRetentionMaxAge); err != nil {
 		bh.log().Warn("write log retention sweep failed; retry next sweep", "err", err)
+	}
+}
+
+// reconcileOwedSweep zeroes the owed count on rows whose kind has no reconcile
+// loop, which nothing else drains.
+// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
+func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
+	cleared, err := bh.store.ReconcileOwedSweep(ctx, bh.registeredKinds())
+	if err != nil {
+		bh.log().Warn("reconcile-owed reclaim failed; retry next sweep", "err", err)
+		return
+	}
+	if cleared > 0 {
+		bh.log().Debug("reclaimed owed counts", "rows", cleared)
 	}
 }
 
@@ -443,6 +458,17 @@ func (bh *Beehive) isRegistered(gk GroupKind) bool {
 	defer bh.mu.Unlock()
 	_, ok := bh.reconcilers[gk]
 	return ok
+}
+
+// registeredKinds returns the kinds with a reconcile loop, in registration order.
+func (bh *Beehive) registeredKinds() []GroupKind {
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
+	kinds := make([]GroupKind, 0, len(bh.order))
+	for _, r := range bh.order {
+		kinds = append(kinds, r.gk)
+	}
+	return kinds
 }
 
 // migratorFor returns the migrator registered for gk, or nil.

@@ -3486,6 +3486,128 @@ func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
 	assert.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
 }
 
+// clientOnlyGK is a kind no reconcile loop covers, so its owed count is the
+// reclaim's target.
+var clientOnlyGK = beehive.GroupKind{Kind: "ClientOnly"}
+
+func newKindObject(t *testing.T, store beehive.Store, gk beehive.GroupKind) *beehive.RawObject {
+	t.Helper()
+	obj, err := store.ObjectsCreate(context.Background(), gk, beehive.ObjectsCreateInput{
+		Name: uniqueName(),
+		Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	return obj
+}
+
+// TestReconcileOwedSweepSkipsKeptKinds pins the reclaim's predicate: a kind with
+// no reconcile loop has its count zeroed, a kind in keep is left alone.
+func TestReconcileOwedSweepSkipsKeptKinds(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	kept := newRefObject(t, store)
+	loose := newKindObject(t, store, clientOnlyGK)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, kept.ID))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, loose.ID))
+
+	_, err := store.ReconcileOwedSweep(ctx, []beehive.GroupKind{testGK})
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), reconcileOwed(t, store, kept.ID), "a kind with a reconcile loop keeps its count")
+	assert.Zero(t, reconcileOwed(t, store, loose.ID), "a client-only kind's count is reclaimed")
+}
+
+// TestReconcileOwedSweepCountsRowsCleared pins the return value the sweeper logs:
+// rows cleared, not rows scanned, and 0 once there is nothing left to reclaim.
+func TestReconcileOwedSweepCountsRowsCleared(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	for range 3 {
+		obj := newKindObject(t, store, clientOnlyGK)
+		require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
+	}
+	newKindObject(t, store, clientOnlyGK) // owes nothing, so it is not counted
+
+	cleared, err := store.ReconcileOwedSweep(ctx, []beehive.GroupKind{testGK})
+	require.NoError(t, err)
+	assert.Equal(t, 3, cleared)
+
+	cleared, err = store.ReconcileOwedSweep(ctx, []beehive.GroupKind{testGK})
+	require.NoError(t, err)
+	assert.Zero(t, cleared, "a second sweep finds nothing to clear")
+}
+
+// TestReconcileOwedSweepWithNoKeptKinds pins the empty-keep arm, which drops the
+// NOT IN clause rather than emitting an empty one.
+func TestReconcileOwedSweepWithNoKeptKinds(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newKindObject(t, store, clientOnlyGK)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, b.ID))
+
+	cleared, err := store.ReconcileOwedSweep(ctx, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, cleared)
+	assert.Zero(t, reconcileOwed(t, store, a.ID))
+	assert.Zero(t, reconcileOwed(t, store, b.ID))
+}
+
+// TestReconcileOwedSweepIsNoEmit pins the reclaim out of the change stream. It
+// runs on every GC tick, so emitting would wake every tailer and the dependency
+// waker for a write no consumer can act on.
+func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newKindObject(t, store, clientOnlyGK)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
+	before, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	writesBefore, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	require.NoError(t, err)
+
+	_, err = store.ReconcileOwedSweep(ctx, nil)
+	require.NoError(t, err)
+
+	after, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "the reclaim issues no resource version")
+	writesAfter, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	require.NoError(t, err)
+	assert.Len(t, writesAfter, len(writesBefore), "the reclaim appends no write-log entry")
+}
+
+// Without the partial index the reclaim is a full scan of objects on every GC
+// tick, and the predicate carries no equality constraint to force the choice.
+func TestReconcileOwedSweepUsesThePartialIndex(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	for _, tc := range []struct {
+		name string
+		keep []storeapi.GroupKind
+	}{
+		{"keeping kinds", []storeapi.GroupKind{testGK}},
+		{"keeping none", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, args := reconcileOwedSweepQuery(tc.keep)
+			plan := queryPlan(t, store, q, args...)
+			assert.Contains(t, plan, "idx_objects_reconcile_owed",
+				"the reclaim must read the partial index, not scan objects:\n"+plan)
+		})
+	}
+}
+
+func TestReconcileOwedSweepQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.ReconcileOwedSweep(context.Background(), nil)
+	require.Error(t, err)
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.
@@ -3733,12 +3855,7 @@ func TestWithinNestedCommitError(t *testing.T) {
 // ids, so no name/spec detail matters.
 func newRefObject(t *testing.T, store beehive.Store) *beehive.RawObject {
 	t.Helper()
-	obj, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
-		Name: uniqueName(),
-		Spec: []byte(`{}`),
-	})
-	require.NoError(t, err)
-	return obj
+	return newKindObject(t, store, testGK)
 }
 
 // refIDs projects an ObjectRef slice to its ids for order-sensitive assertions.

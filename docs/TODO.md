@@ -311,41 +311,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   `TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp` re-cascades over a fixed child
   set, so it never adds a child between passes.
 
-- **A client-only dependent's `reconcile_owed` count is never reclaimed** — known, not
-  fixed. Edges are deliberately cross-kind, so declaring a dependency from a
-  client-only object is legal, and the stamp lands on a row whose kind has no reconcile
-  loop. Nothing drains it, since only a reconcile calls `ReconcileOwedDecrement`, and
-  nothing scans it, since `ReconcileOwedListIDs` is per-kind. So the count and its
-  index entry last as long as the row. Every new `depends_on` edge stamps (see
-  [the stamp-every-new-edge ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md)),
-  and re-creating a deleted edge satisfies the edge-new test once more and increments
-  it again, so it is not even bounded by the number of distinct targets. The count is
-  *unread*, which is not the same as harmless.
-
-  The impact is small and does not compound. Nothing reads the count while the kind
-  stays client-only, and if it later gains a controller the first reconcile subtracts
-  the whole observed count, so N accrued increments cost **one** extra pass rather than
-  N. What is left is stored bytes and an index entry nobody collects.
-
-  **Gating the stamp on registration is the wrong fix.** The stamp is SQL inside
-  `EdgesAdd` — it has to be, for the ordering the nested-`Within` contract forces — and
-  the store cannot know which kinds are registered. So the caller would have to resolve
-  `fromID`'s kind before every declare, which is the per-call pre-read that sank the
-  original guard, on a path controllers re-run forever. It would also freeze a fact
-  that changes between runs: a kind registered later would have lost its wake
-  outright.
-
-  The fix that fits is a **cross-kind sweeper**, the `reconcile_owed` analogue of the
-  global GC sweeper's `DeletionRequestsList`: list rows with a nonzero count
-  across all kinds, zero the ones whose kind has no registered reconciler, on the
-  sweeper's existing cadence. Off the hot path, symmetric with machinery that already
-  exists, and it reclaims the index entry. Deferred because it is new store surface
-  plus a sweep for an effect that is storage-only, and because the "kind gains a
-  controller later" case argues for keeping the count — so whether to reclaim at all
-  is a judgement call worth making deliberately. Revisit if a deployment is found
-  that declares many edges from client-only kinds, where the index entries would
-  actually be measurable.
-
 - **`EventsAdd` still takes the read shape, so the write-shapes rule has one
   exception** — known, not fixed. The
   [write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md) says a write takes
