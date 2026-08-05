@@ -2232,29 +2232,26 @@ func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.Obj
 	if n, _ := res.RowsAffected(); n == 0 {
 		return storeapi.EdgesDeleteResult{}, nil
 	}
-	// Both endpoints in one row, as EdgesAdd does. Deliberately outside a
-	// transaction of its own: it would hold the single connection across a
-	// BEGIN..COMMIT on a path a controller walks every pass, and no interleaving
-	// gives a wrong answer here — a target collected in the gap has no collect
-	// left to push. See docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
-	var out storeapi.EdgesDeleteResult
+	// Both endpoints in one row, as EdgesAdd does. No transaction of its own; the
+	// gap admits no wrong answer. See
+	// docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
+	var to storeapi.GroupKind
 	var unblocked int
 	err = s.conn(ctx).QueryRowContext(ctx, `
 		SELECT t."group", t.kind,
 		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
 		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
-		toID, fromID).Scan(&out.To.Group, &out.To.Kind, &unblocked)
-	if errors.Is(err, sql.ErrNoRows) {
-		return storeapi.EdgesDeleteResult{}, nil
-	}
+		toID, fromID).Scan(&to.Group, &to.Kind, &unblocked)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil // an endpoint went in the gap: nothing left to push
+		}
 		return storeapi.EdgesDeleteResult{}, err
 	}
 	if unblocked == 0 {
 		return storeapi.EdgesDeleteResult{}, nil
 	}
-	out.Unblocked = true
-	return out, nil
+	return storeapi.EdgesDeleteResult{To: to, Unblocked: true}, nil
 }
 
 // EdgesListIncoming returns the objects pointing at toID through relation, joining edges

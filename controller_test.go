@@ -51,7 +51,7 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 // collect, so it pushes rather than waiting out a GC tick.
 func TestFinalizersDeletePushesTheCollect(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -61,7 +61,8 @@ func TestFinalizersDeletePushesTheCollect(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
 }
 
-// Every neighbour of that transition owes nothing. Pushing on a live object in
+// The three gates that decline the push: a live target, an edge that was never
+// there, and a dependent already finalizing (whose edge blocks nothing). Pushing on a live object in
 // particular would collect-probe every finalizer removal in the system.
 func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 	tests := []struct {
@@ -77,7 +78,7 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			client, cc, r := specWriteFixture(t)
+			_, client, cc, r := specWriteFixture(t)
 
 			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(tt.finalizers...))
 			if tt.deleting {
@@ -96,7 +97,7 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 // transaction still commits.
 func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -1067,21 +1068,11 @@ func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
-// dropFixture is a registered kind with its client, controller client and
-// reconciler: enough to declare a dependency and watch what dropping it queues.
-func dropFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
-	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t))
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc, mustReconciler(t, bh, clientTestGK)
-}
-
 // Dropping the last live referrer is one of the routes out of a RESTRICT-blocked
 // collect, so it pushes rather than waiting out a GC tick.
 func TestDependenciesDeletePushesTheBlockedTarget(t *testing.T) {
 	ctx := context.Background()
-	_, client, cc, r := dropFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
@@ -1093,7 +1084,8 @@ func TestDependenciesDeletePushesTheBlockedTarget(t *testing.T) {
 	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work))
 }
 
-// Every neighbour of that transition owes nothing.
+// The three gates that decline the push: a live target, an edge that was never
+// there, and a dependent already finalizing (whose edge blocks nothing).
 func TestDependenciesDeletePushesNothingOtherwise(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -1108,7 +1100,7 @@ func TestDependenciesDeletePushesNothingOtherwise(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			_, client, cc, r := dropFixture(t)
+			_, client, cc, r := specWriteFixture(t)
 
 			target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 			dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
@@ -1133,7 +1125,7 @@ func TestDependenciesDeletePushesNothingOtherwise(t *testing.T) {
 // the controller's own.
 func TestDependenciesDeletePushesAcrossKinds(t *testing.T) {
 	ctx := context.Background()
-	bh, client, cc, depR := dropFixture(t)
+	bh, client, cc, depR := specWriteFixture(t)
 	targetGK := GroupKind{Kind: "DropTarget"}
 	registerNoop[cSpec, cStatus](t, bh, targetGK)
 	targetR := mustReconciler(t, bh, targetGK)
@@ -1155,7 +1147,7 @@ func TestDependenciesDeletePushesAcrossKinds(t *testing.T) {
 // push; an absorbed push would wait out the ladder the sweep was going to beat.
 func TestDependenciesDeletePushBeatsAPendingAlarm(t *testing.T) {
 	ctx := context.Background()
-	_, client, cc, r := dropFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
@@ -1173,7 +1165,7 @@ func TestDependenciesDeletePushBeatsAPendingAlarm(t *testing.T) {
 // A client-only target resolves to no reconciler; the sweeper stays its route.
 func TestDependenciesDeleteSkipsClientOnlyTarget(t *testing.T) {
 	ctx := context.Background()
-	bh, client, cc, r := dropFixture(t)
+	bh, client, cc, r := specWriteFixture(t)
 	targetClient := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "UnregisteredTarget"})
 
 	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})

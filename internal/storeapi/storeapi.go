@@ -264,8 +264,7 @@ type EdgesAddResult struct {
 	ReconcileOwedStamped bool
 }
 
-// EdgesDeleteResult is what a caller needs to follow up on an edge it dropped;
-// like EdgesAddResult, all of it falls out of work EdgesDelete already does.
+// EdgesDeleteResult is what a caller needs to follow up on an edge it dropped.
 type EdgesDeleteResult struct {
 	// To is the target's GroupKind, needed to route a requeue to it. Edges are
 	// cross-kind. Zero unless Unblocked.

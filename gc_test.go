@@ -987,22 +987,17 @@ func TestGCSweepLogsCollectFailure(t *testing.T) {
 // depReleaseController models a dependent that outlives its target: it releases
 // the depends_on edge once the target is finalizing, on its own pass and never
 // on a wake of its own, so a test can order the release after a blocked collect.
-// It reports each pass over a finalizing target on passes.
 type depReleaseController struct {
 	mu       sync.Mutex
 	reader   Client[cSpec, cStatus]
 	depID    ObjectID
 	targetID ObjectID
-	passes   chan ObjectID
 }
 
 func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
 	c.mu.Lock()
 	reader, depID, targetID := c.reader, c.depID, c.targetID
 	c.mu.Unlock()
-	if obj.ID == targetID && obj.DeletionRequestedAt != nil {
-		c.passes <- obj.ID
-	}
 	if obj.ID != depID {
 		return Result{}, nil
 	}
@@ -1032,7 +1027,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 		withoutGCSweeper(),
 	)...)
 
-	ctrl := &depReleaseController{passes: make(chan ObjectID, 8)}
+	ctrl := &depReleaseController{}
 	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1062,7 +1057,6 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	// collect. Waiting for that pass to go idle is what leaves the drop's push as
 	// the only thing that can collect: an in-flight pass would do it instead.
 	require.NoError(t, client.Delete(ctx, target.ID))
-	awaitPass(t, ctrl.passes, target.ID)
 	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
 
 	// Only now does the dependent release the edge.
@@ -1072,21 +1066,6 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	// The dependent is untouched.
 	_, err = client.Get(ctx, dep.ID)
 	require.NoError(t, err)
-}
-
-// awaitPass blocks until a controller reports a pass over id.
-func awaitPass(t *testing.T, passes <-chan ObjectID, id ObjectID) {
-	t.Helper()
-	for {
-		select {
-		case got := <-passes:
-			if got == id {
-				return
-			}
-		case <-time.After(testTimeout):
-			t.Fatalf("timed out waiting for a reconcile of %d", id)
-		}
-	}
 }
 
 // The pull path under that push: dropping the edge through the store issues no
