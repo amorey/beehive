@@ -219,6 +219,22 @@ func TestWorkQueueNoConcurrentDispatch(t *testing.T) {
 	assert.False(t, ok, "no spurious re-dispatch after done")
 }
 
+// forget is done for an id whose row the pass deleted: a wake that arrived
+// mid-pass can only resolve to ErrNotFound, and ids are never reused.
+func TestWorkQueueForgetDropsAQueuedReAdd(t *testing.T) {
+	q := newWorkQueue()
+	q.add(7)
+	_, ok := q.get()
+	require.True(t, ok)
+
+	q.add(7) // a wake arrives while the collect is committing
+	q.forget(7)
+
+	assert.Empty(t, queuedIDs(q))
+	_, ok = q.get()
+	assert.False(t, ok, "a collected id is never dispatched again")
+}
+
 // TestWorkQueueReaddAfterDone verifies an ID can be queued again once its prior
 // processing has completed via done().
 func TestWorkQueueReaddAfterDone(t *testing.T) {

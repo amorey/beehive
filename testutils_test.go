@@ -828,7 +828,7 @@ func unsettledIDs(t *testing.T, store Store) []ObjectID {
 // test must not be held by a floor this loop opened.
 func drainQueue(q *workQueue) {
 	for id, ok := q.get(); ok; id, ok = q.get() {
-		q.discard(id)
+		q.forget(id)
 	}
 }
 

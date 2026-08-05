@@ -190,13 +190,20 @@ func (q *workQueue) setFloor(d time.Duration) {
 	q.gate = rategate.New[ObjectID](d)
 }
 
-// discard ends id's processing without acting on it, releasing the hold get
-// placed on it — nothing ran, so there is no dispatch to space out.
-func (q *workQueue) discard(id ObjectID) {
-	q.done(id)
+// forget ends id's processing and drops what is queued for it: the re-add a wake
+// left behind and the floor entry. For an id nothing can act on again — a row
+// the pass collected, since ids are never reused — and for draining the queue.
+// clearDirty before done, or done would re-queue what this just dropped.
+func (q *workQueue) forget(id ObjectID) {
+	var pending pendingSend
 	q.mu.Lock()
+	if s, ok := q.gauge.clearDirty(id); ok {
+		pending.put(s)
+	}
 	q.gate.Forget(id)
 	q.mu.Unlock()
+	q.done(id)
+	q.publish(id, pending)
 }
 
 func (q *workQueue) signal() {
