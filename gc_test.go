@@ -1224,6 +1224,43 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutASweep(t *testing.T) {
 	waitForDeletions(t, w, child.ID, owner.ID)
 }
 
+// A child created after its owner's cascade has already run is invisible to
+// everything but a re-cascade: no version moves, and the child's own collect
+// returns at once because the child is not finalizing. With the sweeper stopped
+// and the periodic passes off, the create's push is the only route left.
+func TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withoutGCSweeper(),
+	)...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	// The finalizer holds this child's row, and its owned_by edge RESTRICT-blocks
+	// the owner, so the owner stays deletion-pending after its cascade.
+	held := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "held"},
+		WithOwner(owner.ID), WithFinalizers("f"))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	waitForDeletionRequest(t, w, held.ID) // the cascade has provably run
+
+	late := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "late"}, WithOwner(owner.ID))
+	waitForDeletionRequest(t, w, late.ID)
+}
+
 // The pull path under this push: the child's finalizer keeps its own collect from
 // running, so removing it through the store issues no push. The owed pass is off
 // too, or it would dispatch the still-unsettled owner and stand in for the sweep.

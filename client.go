@@ -384,9 +384,13 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it.
 	// No wake stamp: ownership owes the child no reconcile.
 	if co.owner != nil {
-		if _, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy); err != nil {
+		res, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		if err != nil {
 			return nil, err
 		}
+		// Routed by res.To: the edge is cross-kind, so the owner need not share
+		// this client's kind.
+		c.bh.signalRequeueNow(ctx, ObjectRef{ID: *co.owner, Group: res.To.Group, Kind: res.To.Kind})
 	}
 	return raw, nil
 }
