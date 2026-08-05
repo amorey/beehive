@@ -122,7 +122,7 @@ const wakeScanPagesPerPass = 4
 // still cover correctness.
 func (dw *waker) run(ctx context.Context) {
 	// No registered controllers means nowhere to queue anything.
-	if len(dw.bh.order) == 0 || dw.bh.wakeInterval <= 0 {
+	if len(dw.bh.order) == 0 || dw.bh.wakerOff {
 		return
 	}
 	// Subscribed before the first pass, for newObjectTailer's reason: a write

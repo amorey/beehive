@@ -747,13 +747,13 @@ func TestWakerLookupFailureDuringShutdownIsQuiet(t *testing.T) {
 	assert.Empty(t, buf.String(), "shutdown is not a lookup outage to report")
 }
 
-// A non-positive interval disables the waker outright. It is a supported choice —
-// the reconcile_owed stamp still covers a dependency declared against a target
-// that moved — so run must simply return rather than panic in NewTicker.
-func TestWakerDisabledByNonPositiveInterval(t *testing.T) {
+// The waker can be turned off outright. It is a supported choice — the
+// reconcile_owed stamp still covers a dependency declared against a target that
+// moved — so run must simply return.
+func TestWakerDisabledByOption(t *testing.T) {
 	store := &replayStore{rows: replayRows(3)}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	dw.bh.wakeInterval = 0
+	require.NoError(t, withDependencyWakerOff()(dw.bh))
 
 	dw.run(context.Background()) // returns immediately; a running waker would block
 
@@ -1075,7 +1075,7 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 		watermarkSet: make(chan struct{}, 1),
 	}
 	// The waker off, so only re-derivation can reach the dependent.
-	bh := newTestBeehive(t, probe, fast(withDependencyWakeInterval(0))...)
+	bh := newTestBeehive(t, probe, fast(withDependencyWakerOff())...)
 
 	reconciled := make(chan ObjectID, 8)
 	_, err := Register(bh, clientTestGK, &settlingCapture{ch: reconciled}, WithFullPassInterval(0))

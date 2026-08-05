@@ -3416,7 +3416,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	require.NoError(t, err)
 
 	// --- second process over the same store ---
-	bh2, err := New(db, withDependencyWakeInterval(0))
+	bh2, err := New(db, withDependencyWakerOff())
 	require.NoError(t, err)
 	ctrl2 := &dependentController{
 		observed: make(chan bool, 8),

@@ -88,7 +88,8 @@ type Beehive struct {
 	// Driver cadences. Owed work is bounded by what is outstanding, a full pass
 	// by the object count, GC by deletion-pending rows, the wake scan by what
 	// changed. gcInterval and staleDependentsInterval are always positive when
-	// the Beehive came from New; wakeInterval <= 0 turns the waker off.
+	// the Beehive came from New; wakerOff turns the waker off.
+	wakerOff                bool
 	owedPassInterval        time.Duration
 	minRequeueInterval      time.Duration
 	fullPassInterval        time.Duration
