@@ -1293,8 +1293,8 @@ type requestDeletionByNameErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (bool, error) {
-	return false, errBoom
+func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (ObjectID, bool, error) {
+	return 0, false, errBoom
 }
 
 // getOrCreateBadJSONStore drives GetOrCreate's rawToTyped error path: the
@@ -3072,6 +3072,46 @@ func TestNoOpUpdateOnASettledObjectEnqueuesNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, obj.Generation, same.Generation, "identical bytes must not bump the generation")
 	assert.Empty(t, queuedIDs(r.work), "a settled row that did not move owes no pass")
+}
+
+// A delete enqueues its own object, so the controller gets to clear finalizers
+// without waiting out a GC tick — the asymmetry with Create that this closes.
+func TestDeleteEnqueuesItsOwnObject(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "the delete queues the object")
+}
+
+// The name sibling pushes the same way; its id comes from the resolve the mark
+// already did.
+func TestDeleteByNameEnqueuesItsOwnObject(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	name := uniqueName()
+	obj := mustCreate(t, ctx, client, name, cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	require.NoError(t, client.DeleteByName(ctx, name))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "the delete queues the row the name held")
+}
+
+// The gate is the store's report that this call stamped the row. Without it a
+// caller retrying Delete would re-arm the object on every attempt.
+func TestRepeatedDeleteEnqueuesOnce(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	assert.Empty(t, queuedIDs(r.work), "the repeat stamped nothing, so it queues nothing")
 }
 
 // The enqueue rides AfterCommit, so an outer transaction that rolls back discards

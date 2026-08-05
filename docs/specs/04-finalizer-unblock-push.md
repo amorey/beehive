@@ -1,6 +1,7 @@
 # A cleared finalizer pushes its own collect
 
-**Status:** not built. Needs [02](02-deletion-push.md).
+**Status:** not built. The deletion push it builds on has
+[shipped](../adr/2026-08-04-a-delete-request-pushes-its-own-collect.md).
 
 ## Problem
 
@@ -13,8 +14,8 @@ route out of one is signalled. An owner freed by its last child's removal, by a
 `DependenciesDelete`, or by its controller clearing its last finalizer is simply
 still deletion-pending when the next sweep runs, up to 30 seconds later.
 
-This is the last GC interval left on the deletion path once
-[spec 02](02-deletion-push.md) ships, and it is the interval a caller is most likely
+This is the last GC interval left on the deletion path now that the
+[deletion push](../adr/2026-08-04-a-delete-request-pushes-its-own-collect.md) has shipped, and it is the interval a caller is most likely
 to be watching: the object is visibly stuck deletion-pending with nothing to do.
 
 ## Three unblocking routes, and only one is cheap
@@ -39,9 +40,16 @@ named consumer is exactly this case.
 Build route 1 only.
 
 `FinalizersDelete` pushes a collect of the object when the removal was real, the
-object is deletion-pending, and no finalizers remain. Route it through
-`deletionAdvance` on `Store.AfterCommit`, the same path
-[spec 02](02-deletion-push.md) establishes.
+object is deletion-pending, and no finalizers remain, on `Store.AfterCommit`.
+
+**Open: how it routes.** The shipped deletion push holds that no commit hook calls
+`deletionAdvance`, whose client-only arm runs `gcCollect` inline — it resolves a
+reconciler in the hook instead, and a client-only kind gets nothing. This spec has a
+standing argument for the exception (a client-only kind cannot hold a clearable
+finalizer, so that arm is unreachable here), and that argument rests entirely on
+`TestClientCreateRejectsFinalizersOnUnregisteredKind`. Decide before building:
+take the exception, or follow
+[the ADR](../adr/2026-08-04-a-delete-request-pushes-its-own-collect.md) and resolve the reconciler in the hook.
 
 The store reports whether the removal was real — `FinalizersDelete` bumps a
 `resource_version` only on one. The remaining-count and the deletion-pending flag are
@@ -93,6 +101,7 @@ fails with it.
 
 - Clearing the last finalizer on a deletion-pending object collects it at commit.
 - Clearing a finalizer on a live object still pushes nothing.
-- With the push disabled, every test above still passes.
+- The pull path is still pinned by a test that reaches the collect without
+  issuing a push — there is no knob that disables one.
 - Case 11 in [`reconcile-triggers.md`](../reconcile-triggers.md) records which of the
   three routes pushes and which two wait for a tick.

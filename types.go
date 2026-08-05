@@ -60,6 +60,10 @@ type ObjectsCreateInput = storeapi.ObjectsCreateInput
 // RawEvent is the untyped event-log row below the generic boundary.
 type RawEvent = storeapi.Event
 
+// DeletionCascadeChild is one owned child of a deletion cascade, as
+// DeletionRequestsCreateFromOwner reports it.
+type DeletionCascadeChild = storeapi.DeletionCascadeChild
+
 // Relation is the kind of edge in the edges table.
 type Relation = storeapi.Relation
 

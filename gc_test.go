@@ -153,7 +153,7 @@ func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawO
 	now := time.Now()
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
+func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
 	return nil, s.markErr
 }
 func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
@@ -301,6 +301,130 @@ func TestCollectCascadesAndBlocksOnChild(t *testing.T) {
 	gotChild, err := client.Get(ctx, child.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, gotChild.DeletionRequestedAt, "child deletion requested by cascade")
+}
+
+// cascadeFixture is gcFixture with the kind registered, so the cascade's pushes
+// land somewhere observable. Nothing is started: these assert that the *cascade*
+// queued the children, not that a driver later found them.
+func cascadeFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], *reconciler) {
+	t.Helper()
+	bh, client := gcFixture(t)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+	return bh, client, r
+}
+
+// The cascade queues the children it marked, so a deletion advances one level per
+// commit instead of one level per sweep.
+func TestCascadePushesEachMarkedChild(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	childA := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+	childB := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []ObjectID{childA.ID, childB.ID}, queuedIDs(r.work),
+		"both marked children are queued")
+}
+
+// owned_by is cross-kind, so each child's push routes by its own GroupKind, never
+// the owner's. The wake beside it is deduped per kind for the same reason.
+func TestCascadePushesAcrossKinds(t *testing.T) {
+	ctx := context.Background()
+	bh, client, ownerR := cascadeFixture(t)
+	childGK := GroupKind{Kind: "CascadeChild"}
+	_, err := Register(bh, childGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	childR, ok := bh.reconcilerFor(childGK)
+	require.True(t, ok)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, childGK), uniqueName(),
+		cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(ownerR.work)
+	drainQueue(childR.work)
+
+	_, err = bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{child.ID}, queuedIDs(childR.work), "the child's own kind is queued")
+	assert.Empty(t, queuedIDs(ownerR.work), "the owner's kind is not")
+}
+
+// A client-only child has no reconciler to reach, so it is marked and left to the
+// sweeper. Collecting it inline instead would put the whole subtree below it on
+// the caller's goroutine.
+func TestCascadeSkipsClientOnlyChild(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+	loose := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Unregistered"})
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	registered := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+	clientOnly := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "b"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{registered.ID}, queuedIDs(r.work), "only the registered child is queued")
+
+	got, err := loose.Get(ctx, clientOnly.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, got.DeletionRequestedAt, "the client-only child is still marked for the sweeper")
+}
+
+// A cascade mark is new information, so it clears a pending alarm rather than
+// being absorbed by one. Absorption would park the child behind a backoff ladder
+// that can outlast the GC interval — and the child's own reconcile is what
+// cascades to the level below it, so the whole subtree waits with it.
+func TestCascadePushBeatsAPendingAlarm(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+	// Long enough that the alarm firing on its own would be the test hanging,
+	// not the assertion passing.
+	r.work.addAfter(child.ID, time.Hour, alarmBackoff)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{child.ID}, queuedIDs(r.work), "the mark beats the backoff alarm")
+}
+
+// gcCollect reruns after every reconcile of a deleting object, so a cascade that
+// pushed every child it *returned* would re-arm the subtree at reconcile rate.
+// Asserted on a drained queue: with a backoff or floor alarm pending, the throttle
+// would absorb the spurious push and hide the regression.
+func TestCascadePushesOnlyNewlyMarkedChildren(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	drainQueue(r.work)
+
+	_, err = bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, queuedIDs(r.work), "the re-cascade stamped nothing, so it queues nothing")
 }
 
 func TestCollectDeletesOwnerAfterChildGone(t *testing.T) {

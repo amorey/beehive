@@ -26,15 +26,14 @@ What the property does not supply is latency. A timer decides when work starts, 
 the interval is the floor, even when the writer and the controller are in one
 process and the store already knows the answer at commit time.
 
-Today two writes beat the timer. A spec write enqueues its own object. A new
-`depends_on` edge enqueues the edge's source. Both run on `Store.AfterCommit`. Every
-other route waits for a tick:
+Today four writes beat the timer. A spec write enqueues its own object, a new
+`depends_on` edge enqueues the edge's source, a delete request enqueues its own
+object, and a cascade enqueues the children it marked. All run on
+`Store.AfterCommit`. Every other route waits for a tick:
 
 | Route | Latency today | Spec |
 |---|---|---|
 | A target changed, so its dependents are stale | ≤1s (the waker) | [03](03-waker-commit-wake.md) |
-| A delete was requested | ≤30s (the GC sweeper) | [02](02-deletion-push.md) |
-| A cascade reached the next level of children | ≤30s per level | [02](02-deletion-push.md) |
 | A blocked collect was unblocked | ≤30s | [04](04-finalizer-unblock-push.md) |
 
 The stale-dependents pass is absent from that table on purpose. It runs every 60
@@ -50,8 +49,10 @@ commit and the dispatch discards it. So a push may only remove latency. It may n
 become the sole route to a reconcile, and no spec here adds a durable record or
 removes a driver.
 
-The test for each spec is the same: disable the push and the system must still
-converge, more slowly. If it does not, the spec is wrong.
+The test for each spec is the same: the system must still converge, more slowly,
+with the push absent. There is no knob that disables one, so a pull-path test is a
+test that issues no push — it makes the write through the store rather than through
+the client verb that pushes. If none exists, the spec is wrong.
 
 ## Execution order
 
@@ -67,12 +68,15 @@ floor, absorbed a wake into a pending backoff alarm, and built
 `internal/rategate` — the one piece of shared machinery in this set, which the
 waker's scan limit and the object tail's drain limit both want.
 
-### 2. [Deletion push](02-deletion-push.md)
+### 2. Deletion push — **shipped**
 
-Cheapest, and the most visible asymmetry in the public API: `Create` reconciles at
-commit and `Delete` waits up to 30 seconds, on the same object through the same
-controller. The gate the write needs is already returned, and the routing function
-already exists.
+→ [ADR](../adr/2026-08-04-a-delete-request-pushes-its-own-collect.md)
+
+It closed the most visible asymmetry in the public API — `Create` reconciled at
+commit while `Delete` waited out a GC tick — and made a cascade cost a commit per
+level rather than a sweep. Both pushes are confined to registered kinds, because
+collecting a client-only kind from a commit hook would run the whole subtree below
+it on the caller's goroutine.
 
 ### 3. [Waker commit wake](03-waker-commit-wake.md)
 

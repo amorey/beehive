@@ -1774,7 +1774,7 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 // `value + 1` matches the later draw exactly: same transaction, one connection.
 // The subquery tolerates a multi-row match only because every where here keys on
 // a unique column.
-func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (bool, error) {
+func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (storeapi.ObjectID, bool, error) {
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
 	args := append([]any{now, now}, whereArgs...)
@@ -1792,20 +1792,20 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	var rv int64
 	err := row.Scan(&id, &gk.Group, &gk.Kind, &rv)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
 	// Commit the value the row above just took; same transaction, same connection.
 	if _, err := nextResourceVersion(ctx, c); err != nil {
-		return false, err
+		return 0, false, err
 	}
 	// The soft delete is an update: the row is still live and readable.
 	if err := appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now); err != nil {
-		return false, err
+		return 0, false, err
 	}
-	return true, nil
+	return id, true, nil
 }
 
 // probeDeletionByName is probeObjectScoped keyed by name; a name this kind does
@@ -1834,45 +1834,47 @@ func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
 	probe func(context.Context) (pending bool, err error),
 	where string, whereArgs ...any,
-) (bool, error) {
+) (storeapi.ObjectID, bool, error) {
 	if pending, err := probe(ctx); err != nil || pending {
-		return false, err
+		return 0, false, err
 	}
+	var id storeapi.ObjectID
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		if changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
+		if id, changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
 			return err
 		}
 		_, err = probe(ctx)
 		return err
 	})
-	return changed, err
+	return id, changed, err
 }
 
 // DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
 // foreign id matches no row and the probe reports ErrWrongKind.
 func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
-	return s.requestDeletion(ctx,
+	_, changed, err := s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeObjectScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
+	return changed, err
 }
 
 // DeletionRequestsCreateByName marks the gk row holding name; the resolve and the mark
-// are one statement.
-func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
+// are one statement, which is where the returned id comes from.
+func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (storeapi.ObjectID, bool, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeDeletionByName(ctx, gk, name) },
 		`"group" = ? AND kind = ? AND name = ?`, gk.Group, gk.Kind, name)
 }
 
 // DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children,
-// returning every owned child for requeue, deleting or not. A re-cascade over an
-// already-deleting subtree is a lone SELECT.
-func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+// returning every owned child, deleting or not, each flagged with whether this
+// call stamped it. A re-cascade over an already-deleting subtree is a lone SELECT.
+func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.DeletionCascadeChild, error) {
 	// Self-wrapped: several children each draw a version, and publication is in
 	// commit order only inside Within.
-	var out []storeapi.ObjectRef
+	var out []storeapi.DeletionCascadeChild
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
 		out, err = s.deletionRequestsCreateFromOwner(ctx, ownerID)
@@ -1884,7 +1886,7 @@ func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, owner
 	return out, nil
 }
 
-func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.DeletionCascadeChild, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id
@@ -1909,17 +1911,21 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	_ = rows.Err()
 	rows.Close() // free the single-conn pool before the per-child writes below
 
-	out := make([]storeapi.ObjectRef, 0, len(children))
+	out := make([]storeapi.DeletionCascadeChild, 0, len(children))
 	for _, ch := range children {
-		out = append(out, ch.ref)
-		if ch.deleting {
-			continue // already deletion-pending: nothing to stamp
+		var marked bool
+		if !ch.deleting {
+			// Marked is the UPDATE's own answer, which here matches !ch.deleting:
+			// the SELECT above and these marks share one BEGIN IMMEDIATE
+			// transaction. Reported from the write anyway — it is the source of
+			// truth, it costs nothing, and Store admits backends that do not
+			// serialize the two.
+			var err error
+			if _, marked, err = s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
+				return nil, err
+			}
 		}
-		// A race may have set the flag since the SELECT; the guard then stamps
-		// nothing — benign, so only the error matters.
-		if _, err := s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
-			return nil, err
-		}
+		out = append(out, storeapi.DeletionCascadeChild{Marked: marked, Ref: ch.ref})
 	}
 	return out, nil
 }

@@ -145,10 +145,12 @@ type Client[Spec, Status any] interface {
 	// when "already there" is acceptable. The new object is unsettled and owed
 	// its first reconcile.
 	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	// Delete soft-deletes id by setting DeletionRequestedAt; the GC sweeper
-	// takes it from there. Returns ErrNotFound if id holds no object — it was
-	// collected out from under the caller, which is worth hearing about.
-	// Idempotent on an already-pending row. Kind-scoped.
+	// Delete soft-deletes id by setting DeletionRequestedAt. A registered kind
+	// reaches its controller at commit; a client-only kind waits for the GC
+	// sweeper, which takes every deletion from there either way. Returns
+	// ErrNotFound if id holds no object — it was collected out from under the
+	// caller, which is worth hearing about. Idempotent on an already-pending
+	// row. Kind-scoped.
 	Delete(ctx context.Context, id ObjectID) error
 	// DeleteByName is Delete keyed by name: it acts on whatever holds name now.
 	// Idempotent, and absence folds to nil — a name nothing holds is the
@@ -855,10 +857,17 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	}
 	if marked {
 		c.bh.signalKindWritten(ctx, c.gk)
+		c.signalDeletionRequested(ctx, id)
 	}
-	// Nothing is scheduled: the mark is the signal, and the GC tick is
-	// guaranteed (WithGCInterval refuses to be disabled).
 	return nil
+}
+
+// signalDeletionRequested enqueues id once its deletion mark commits. Callers
+// pass only writes that actually stamped the row.
+func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, id ObjectID) {
+	// Not throttled: a delete carries new information, and the mark is once per
+	// object, so it cannot ride this on a repeat.
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 }
 
 // DeleteByName is Delete keyed by name; the store resolves and marks in one
@@ -869,7 +878,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	id, marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
@@ -878,6 +887,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	if marked {
 		c.bh.signalKindWritten(ctx, c.gk)
+		c.signalDeletionRequested(ctx, id)
 	}
 	return nil
 }

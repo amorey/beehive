@@ -270,6 +270,10 @@ func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
 // queued so its controller can clear finalizers (gcCollect can't — calling it
 // directly would make no progress, forever), a client-only kind is collected
 // here. Both arms are safe to repeat.
+//
+// Never from a commit hook: the client-only arm runs gcCollect inline, which
+// would put a whole subtree's collect on the committer's goroutine. A push
+// resolves the reconciler itself and leaves a client-only kind to the sweeper.
 func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectID) error {
 	if r, ok := bh.reconcilerFor(gk); ok {
 		r.enqueue(id)
@@ -467,6 +471,23 @@ func (bh *Beehive) signalRequeueThrottled(ctx context.Context, ref ObjectRef) {
 	})
 }
 
+// signalRequeueManyNow is signalRequeueNow for a batch, in one hook: a per-ref
+// hook would take bh.mu for each, where resolverForPage resolves each kind once.
+// Empty refs queue nothing.
+func (bh *Beehive) signalRequeueManyNow(ctx context.Context, refs []ObjectRef) {
+	if len(refs) == 0 {
+		return
+	}
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		resolve := bh.resolverForPage()
+		for _, ref := range refs {
+			if r := resolve(ref.GroupKind()); r != nil {
+				r.requeueNow(ref.ID)
+			}
+		}
+	})
+}
+
 // signalKindWritten wakes gk's tailer once a write to gk commits. The signal is
 // the kind, never the object: the tailer holds one cursor for the kind and reads
 // the log to learn what moved, so it carries no id and a burst of writes to one
@@ -481,19 +502,28 @@ func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
 	})
 }
 
-// enqueuerForPage returns an enqueue function that resolves each kind once and
+// resolverForPage returns a reconciler lookup that resolves each kind once and
 // caches it, for callers queueing many ids across a few kinds — resolving per
-// id would take bh.mu every time. The registration set is frozen after Start,
-// so the cache cannot go stale.
-func (bh *Beehive) enqueuerForPage() func(GroupKind, ObjectID) {
+// id would take bh.mu every time. nil for a client-only kind. The registration
+// set is frozen after Start, so the cache cannot go stale.
+func (bh *Beehive) resolverForPage() func(GroupKind) *reconciler {
 	resolved := map[GroupKind]*reconciler{}
-	return func(gk GroupKind, id ObjectID) {
+	return func(gk GroupKind) *reconciler {
 		r, ok := resolved[gk]
 		if !ok {
-			r, _ = bh.reconcilerFor(gk) // nil for a client-only kind, cached as such
+			r, _ = bh.reconcilerFor(gk)
 			resolved[gk] = r
 		}
-		if r != nil {
+		return r
+	}
+}
+
+// enqueuerForPage is resolverForPage on the ordinary wake path, so a pending
+// alarm absorbs the enqueue. For a driver's page, which repeats every pass.
+func (bh *Beehive) enqueuerForPage() func(GroupKind, ObjectID) {
+	resolve := bh.resolverForPage()
+	return func(gk GroupKind, id ObjectID) {
+		if r := resolve(gk); r != nil {
 			r.enqueue(id)
 		}
 	}
