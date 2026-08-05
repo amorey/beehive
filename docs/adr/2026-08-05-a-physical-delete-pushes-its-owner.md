@@ -59,7 +59,9 @@ teardown collapses to roughly one owner dispatch per drain — an owner with 10k
 children does not get 10k reconciles. What it does *not* bound is an owner sitting
 in backoff: `requeueNow` stops the timer and clears the alarm before `addLocked`,
 and `isQueued` is false for an id whose only state is a pending alarm, so a repeat
-push there resets the ladder.
+push there discards the pending wait. The ladder itself survives — `requeueNow` never
+reads `backoffFor`, which only a successful reconcile clears — so the delay goes on
+doubling while nothing waits it out.
 
 This push is gated on an object other than the one it enqueues, which costs one
 `ObjectsGetMeta` per owner — on the delete path only, and owners are normally one.

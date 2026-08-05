@@ -73,9 +73,14 @@ pushes that owner with the floor bypassed. Coalescing bounds that only while the
 owner is queued or in flight — `addLocked` returns early on `isQueued`. It does not
 bound an owner sitting in backoff: `requeueNow` stops the timer and clears the alarm
 before `addLocked`, and `isQueued` is false for an id whose only state is a pending
-alarm. So an owner whose collect keeps failing has its ladder reset by every such
-create. This is a property of `requeueNow` rather than of either push, and the
-physical delete carries it identically.
+alarm. So an owner whose collect keeps failing re-runs at the create rate instead of
+on its retry schedule.
+
+What a repeat push discards is the pending *wait*, not the ladder. `requeueNow` never
+reads `backoffFor`, and only a successful reconcile clears it, so the delay goes on
+doubling while nothing waits it out. This is a property of `requeueNow` rather than of
+either push, and the physical delete carries it identically — though this is the
+easier of the two to reach, being driven by a caller rather than by teardown.
 
 ### Alternatives considered
 
