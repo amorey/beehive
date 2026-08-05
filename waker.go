@@ -23,9 +23,9 @@ import (
 	"github.com/amorey/gobus"
 )
 
-// waker requeues the dependents of everything that changed: each tick scans the
-// store's write log from a watermark and wakes what it finds. One per control
-// plane; only the waker goroutine touches its fields.
+// waker requeues the dependents of everything that changed: each commit wakes a
+// scan of the store's write log from a watermark. One per control plane; only
+// the waker goroutine touches its fields.
 //
 // It is an optimisation, not a guarantee — the stale-dependents pass
 // (staleDependentsRun) is what makes a dependency wake certain, so a wake lost
@@ -43,9 +43,12 @@ type waker struct {
 	// now is the waker's only clock, so the rate tests drive it by hand.
 	now func() time.Time
 
-	// persistGate floors the cursor write at the wake interval. Without it a
-	// wake-driven pass would write the cursor at the wake rate, on the one
-	// connection every commit needs.
+	// retry is the delay after a failed scan, and the loop's only timer.
+	retry driver.Backoff
+
+	// persistGate floors the cursor write. Without it a wake-driven pass would
+	// write the cursor at the wake rate, on the one connection every commit
+	// needs.
 	persistGate *rategate.Gate[struct{}]
 
 	// scanGate floors wake-driven scans, so a sustained write stream cannot
@@ -59,14 +62,16 @@ type waker struct {
 	watermark int64
 
 	// persisted is what the stored cursor row holds (noStoredCursor when none).
-	// Comparing against it keeps a tick from paying a round trip for a write
+	// Comparing against it keeps a pass from paying a round trip for a write
 	// DriverCursorsSet would discard anyway.
 	persisted int64
 
-	// persistFailures counts the current streak of failed cursor writes;
-	// persistSkips is how many persists to sit out before the next attempt.
+	// persistFailures counts the current streak of failed cursor writes, so the
+	// log carries one line per cause; persistRetry paces the attempts and
+	// persistOpensAt is when the next one is worth making.
 	persistFailures int
-	persistSkips    int
+	persistRetry    driver.Backoff
+	persistOpensAt  time.Time
 
 	// seeded says watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero.
@@ -84,11 +89,17 @@ const cursorNameWaker = "dependency_waker"
 // cursor value, so it cannot double as the sentinel.
 const noStoredCursor = int64(-1)
 
-// wakePersistRetryCap bounds the backoff between retries of a failing cursor
-// write, in persists sat out — a minute at the default wake interval. It reads
-// as seconds only because persistGate floors a persist *attempt* at that
-// interval, which is why the gate is consulted before the skip ladder.
-const wakePersistRetryCap = 60
+// wakePersistRetryMax bounds the backoff between retries of a failing cursor
+// write. Every attempt costs the pass that carries it, so a ladder in time is
+// what keeps a store that cannot accept the write from being read once a floor
+// for as long as it stays broken.
+const wakePersistRetryMax = time.Minute
+
+// wakeRetryBase is the first delay after a failed scan; it doubles up to the
+// stale-dependents cadence, past which a retry only re-derives what that pass
+// has already found. A failed pass must re-arm it: backingOff drops the wakes
+// arriving meanwhile, so nothing else would look again.
+const wakeRetryBase = 100 * time.Millisecond
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
 // trips on the store's single connection.
@@ -106,20 +117,20 @@ const wakeScanPageCap = 256
 // does — shorter waits, not less total work.
 const wakeScanPagesPerPass = 4
 
-// run drives the waker for the life of the control plane: a commit wakes it,
-// and the interval is the floor behind that. A non-positive interval turns it
-// off, wake included — the reconcile_owed stamp and the stale-dependents pass
-// still cover correctness.
+// run drives the waker for the life of the control plane: a commit wakes it and
+// nothing else does, so an idle waker reads nothing. A write this process did
+// not publish is left to the stale-dependents pass. See
+// docs/adr/2026-08-05-the-waker-is-wake-driven.md.
 func (dw *waker) run(ctx context.Context) {
 	// No registered controllers means nowhere to queue anything.
-	if len(dw.bh.order) == 0 || dw.bh.wakeInterval <= 0 {
+	if len(dw.bh.order) == 0 || dw.bh.wakerOff {
 		return
 	}
 	// Subscribed before the first pass, for newObjectTailer's reason: a write
 	// landing between the subscribe and the seed read would be missed by both.
 	// Every kind, because an edge can point at one the waker cannot name. A nil
-	// channel blocks forever, which is the floor-only fallback for a Beehive
-	// assembled without a hub.
+	// channel blocks forever, so a Beehive assembled without a hub seeds and
+	// then waits out its context.
 	var written <-chan gobus.Event[GroupKind, struct{}]
 	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
 		defer rx.Close()
@@ -128,8 +139,8 @@ func (dw *waker) run(ctx context.Context) {
 
 	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
 	defer timer.Stop()
-	// The instant timer.C is set to fire, zero when it has fired and not been
-	// re-armed. A wake that would only push it later leaves it alone.
+	// The instant timer.C is set to fire, zero when nothing is armed. A wake
+	// that would only push it later leaves it alone.
 	var armedFor time.Time
 
 	backingOff := false
@@ -152,11 +163,16 @@ func (dw *waker) run(ctx context.Context) {
 		now := dw.now()
 		var next time.Duration
 		next, backingOff = dw.pass(ctx, now, backingOff)
-		// A wake that only re-arms the timer later than it already fires buys
-		// nothing, and under a sustained stream the loop turns at commit rate.
-		if at := now.Add(next); armedFor.IsZero() || at.Before(armedFor) {
+		switch nextTimer(next, now, armedFor) {
+		case timerStop:
+			// Stop, not just continue: a timer that was already ready when a
+			// wake won the select would otherwise drive a pass nobody asked
+			// for. Since Go 1.23 Stop leaves no stale value to receive.
+			timer.Stop()
+			armedFor = time.Time{}
+		case timerArm:
 			driver.Rearm(timer, next)
-			armedFor = at
+			armedFor = now.Add(next)
 		}
 	}
 }
@@ -164,21 +180,19 @@ func (dw *waker) run(ctx context.Context) {
 // newWaker builds a waker over bh's cadences. Call it after the options are
 // applied: the gates take their intervals here, so one built earlier would hold
 // the defaults whatever the caller asked for.
-//
-// The scan floor is clamped to the wake floor. It is meant to sit an order of
-// magnitude under it — a limit on how often a wake may drive a scan, not on how
-// often one happens — so a scan floor above the wake interval would delay a
-// scan past the tick that is supposed to bound the worst case. The two are
-// configured independently, and a short wake interval is the ordinary case in
-// tests.
 func newWaker(bh *Beehive) *waker {
 	cursors, _ := bh.store.(DriverCursorer)
 	return &waker{
-		bh:          bh,
-		cursors:     cursors,
-		now:         time.Now,
-		scanGate:    rategate.New[struct{}](min(bh.wakeScanMinInterval, bh.wakeInterval)),
-		persistGate: rategate.New[struct{}](bh.wakeInterval),
+		bh:      bh,
+		cursors: cursors,
+		now:     time.Now,
+		retry:   driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
+		persistRetry: driver.Backoff{
+			Base: max(bh.wakePersistInterval, wakeRetryBase),
+			Max:  wakePersistRetryMax,
+		},
+		scanGate:    rategate.New[struct{}](bh.wakeScanMinInterval),
+		persistGate: rategate.New[struct{}](bh.wakePersistInterval),
 	}
 }
 
@@ -188,26 +202,72 @@ func newWaker(bh *Beehive) *waker {
 // scan has no new one. Split from run so the rate tests drive it at instants of
 // their own choosing.
 func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time.Duration, bool) {
-	floor := dw.bh.wakeInterval
 	if opensAt, held := dw.scanGate.Allow(wakerGateKey, now); held {
 		// Re-arming for what is left of the throttle is what remembers the
 		// wake: the scan that runs then reads its position from the store.
 		//
-		// backingOff is carried through rather than cleared: the floor timer
-		// armed before a failure fires inside the throttle window, and
+		// backingOff is carried through rather than cleared: the retry timer
+		// armed before a failure can fire inside the throttle window, and
 		// answering "not backing off" there would hand a degraded store back to
 		// the wakes at the throttle's rate.
 		return opensAt.Sub(now), backingOff
 	}
-	switch dw.scan(ctx) {
-	case scanMore:
-		if throttle := dw.scanGate.Interval(); throttle > 0 {
-			return throttle, false // keep draining, at the throttle's rate
-		}
-	case scanFailed:
-		return floor, true
+	result := dw.scan(ctx)
+	if result == scanFailed {
+		return dw.retry.Next(), true
 	}
-	return floor, false
+	dw.retry.Reset()
+	if result == scanMore {
+		return dw.scanGate.Interval(), false // keep draining, at the throttle's rate
+	}
+	// A refused cursor write is a reason of its own: the wakes are queued
+	// either way, but a successor that finds no row reseeds at the mark and
+	// skips everything committed while this process was down.
+	if wait, owed := dw.persistWait(now); owed {
+		return wait, false
+	}
+	return wakeIdle, false
+}
+
+// persistWait reports how long until a cursor write is worth attempting again,
+// and whether one is owed at all. Both pacers count, since the pass that
+// carries the attempt costs a scan: the gate floors every attempt, the retry
+// ladder paces a failing one.
+func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
+	if dw.cursors == nil || dw.watermark <= dw.persisted {
+		return 0, false
+	}
+	wait := dw.persistOpensAt.Sub(now)
+	if opensAt, held := dw.persistGate.OpensAt(wakerGateKey, now); held {
+		wait = max(wait, opensAt.Sub(now))
+	}
+	return max(wait, wakeRetryBase), true
+}
+
+// wakeIdle is pass's "no reason to look again": the loop arms nothing.
+const wakeIdle time.Duration = -1
+
+// timerAction is what pass's answer means for the loop's one timer.
+type timerAction uint8
+
+const (
+	timerKeep timerAction = iota // a pending timer already fires sooner
+	timerArm                     // (re)arm for the delay pass returned
+	timerStop                    // nothing to look again for
+)
+
+// nextTimer decides that action from pass's delay and the instant the timer is
+// currently set to fire (zero when nothing is armed). Under a sustained stream
+// the loop turns at commit rate, so a wake that would only push the deadline
+// later must leave it alone.
+func nextTimer(next time.Duration, now, armedFor time.Time) timerAction {
+	if next == wakeIdle {
+		return timerStop
+	}
+	if armedFor.IsZero() || now.Add(next).Before(armedFor) {
+		return timerArm
+	}
+	return timerKeep
 }
 
 // scanResult says what a pass found. The run loop dispatches on it: how soon to
@@ -338,19 +398,16 @@ func (dw *waker) persist(ctx context.Context) {
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return
 	}
-	// Ahead of the skip ladder, not just ahead of the write: a gate below it
-	// would let refused passes burn skips at the wake rate, which is what turns
-	// wakePersistRetryCap from a minute into a handful of seconds.
-	if _, held := dw.persistGate.Allow(wakerGateKey, dw.now()); held {
+	now := dw.now()
+	if _, held := dw.persistGate.Allow(wakerGateKey, now); held {
 		return
 	}
-	if dw.persistSkips > 0 {
-		dw.persistSkips--
+	if now.Before(dw.persistOpensAt) {
 		return
 	}
 	if err := dw.cursors.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
 		dw.persistFailures++
-		dw.persistSkips = wakePersistRetrySkips(dw.persistFailures)
+		dw.persistOpensAt = now.Add(dw.persistRetry.Next())
 		if dw.persistFailures > 1 {
 			dw.bh.log().DebugContext(ctx, "persisting the dependency waker's cursor failed again",
 				"watermark", dw.watermark, "failures", dw.persistFailures, "err", err)
@@ -363,18 +420,10 @@ func (dw *waker) persist(ctx context.Context) {
 	if dw.persistFailures > 0 {
 		dw.bh.log().InfoContext(ctx, "dependency waker's cursor is being persisted again",
 			"watermark", dw.watermark, "failures", dw.persistFailures)
-		dw.persistFailures, dw.persistSkips = 0, 0
+		dw.persistFailures, dw.persistOpensAt = 0, time.Time{}
+		dw.persistRetry.Reset()
 	}
 	dw.persisted = dw.watermark
-}
-
-// wakePersistRetrySkips is how many persists to sit out after `failures`
-// consecutive failures: none after the first, then doubling to a cap.
-func wakePersistRetrySkips(failures int) int {
-	if failures >= 8 { // 1<<7 - 1 is already past the cap
-		return wakePersistRetryCap
-	}
-	return min(1<<(failures-1)-1, wakePersistRetryCap)
 }
 
 // dependentsWake queues every object that depends_on one of the page's targets,
@@ -400,9 +449,9 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 			return false
 		}
 		// Nothing can name who was missed — the lookup that failed is the one
-		// that would have said. Holding the watermark makes the next tick
+		// that would have said. Holding the watermark makes the next pass
 		// re-read the same changes.
-		dw.bh.log().WarnContext(ctx, "dependents lookup failed; these changes stay above the watermark for the next tick",
+		dw.bh.log().WarnContext(ctx, "dependents lookup failed; these changes stay above the watermark for the next pass",
 			"targetIDs", ids, "err", err)
 		return false
 	}

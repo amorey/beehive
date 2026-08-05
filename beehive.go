@@ -43,18 +43,18 @@ const (
 	// Free pages the GC sweeper releases per tick (~4MB/30s at ~3.7µs a page).
 	// Not an option: there is no measurement a caller could tune it against.
 	freePagesPerSweep = 1000
-	// The dependency-wake scan costs nothing in a quiet system, so it runs an
-	// order of magnitude more often than the passes that scale with object count.
-	defaultWakeInterval = 1 * time.Second
-
 	// defaultWakeScanMinInterval floors the gap between two wake-driven scans.
-	// An order of magnitude under defaultWakeInterval: it is what a chain hop
-	// costs, and what bounds the loop's duty cycle under a sustained write
-	// stream. See docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
+	// It is what a chain hop costs, and what bounds the loop's duty cycle under
+	// a sustained write stream. See
+	// docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
 	defaultWakeScanMinInterval = 100 * time.Millisecond
+	// defaultWakePersistInterval floors the waker's cursor write, which lands on
+	// the connection every commit needs. It is also where the retry ladder for a
+	// failing one starts.
+	defaultWakePersistInterval = 1 * time.Second
 	// defaultMinRequeueInterval floors the gap between two dispatches of one
-	// object. It matches defaultWakeInterval, which is what bounds a dependency
-	// cycle today; raising one without the other changes that bound.
+	// object. It is the whole of what bounds a dependency cycle now that the
+	// waker has no cadence of its own; lowering it changes that bound.
 	defaultMinRequeueInterval = 1 * time.Second
 	// The stale-dependents pass is the waker's backstop; its cadence is set by
 	// acceptable staleness after a crash, not by cost.
@@ -84,13 +84,14 @@ type Beehive struct {
 	// Driver cadences. Owed work is bounded by what is outstanding, a full pass
 	// by the object count, GC by deletion-pending rows, the wake scan by what
 	// changed. gcInterval and staleDependentsInterval are always positive when
-	// the Beehive came from New; wakeInterval <= 0 turns the waker off.
+	// the Beehive came from New; wakerOff turns the waker off.
+	wakerOff                bool
 	owedPassInterval        time.Duration
 	minRequeueInterval      time.Duration
 	fullPassInterval        time.Duration
 	gcInterval              time.Duration
-	wakeInterval            time.Duration
 	wakeScanMinInterval     time.Duration
+	wakePersistInterval     time.Duration
 	staleDependentsInterval time.Duration
 	watchPollInterval       time.Duration
 	watchFloorInterval      time.Duration
@@ -356,8 +357,8 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		fullPassInterval:        defaultFullPassInterval,
 		gcInterval:              defaultGCInterval,
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
-		wakeInterval:            defaultWakeInterval,
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
+		wakePersistInterval:     defaultWakePersistInterval,
 		minRequeueInterval:      defaultMinRequeueInterval,
 		watchPollInterval:       defaultWatchPollInterval,
 		watchFloorInterval:      defaultWatchFloorInterval,
@@ -496,14 +497,16 @@ func (bh *Beehive) signalRequeueManyNow(ctx context.Context, refs []ObjectRef) {
 	})
 }
 
-// signalKindWritten wakes gk's tailer once a write to gk commits. The signal is
-// the kind, never the object: the tailer holds one cursor for the kind and reads
-// the log to learn what moved, so it carries no id and a burst of writes to one
-// kind collapses into one. AfterCommit for the same reasons as
+// signalKindWritten wakes gk's tailer and the dependency waker once a write to
+// gk commits. The signal is the kind, never the object: each holds its own
+// cursor and reads the log to learn what moved, so it carries no id and a burst
+// of writes to one kind collapses into one. AfterCommit for the same reasons as
 // signalRequeue: a rollback publishes nothing, and the wake cannot arrive before
 // the row is readable. Callers check that the write changed something only where
-// the store already reports it — an extra wake costs one position read, a missed
-// one costs up to a floor tick of staleness.
+// the store already reports it — an extra wake costs one position read; a missed
+// one costs a watch up to the floor tick, and a dependent up to the
+// stale-dependents pass, which is the waker's only backstop now that it has no
+// tick.
 func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		_ = bh.kindWriteHub.Send(gk) // ErrClosed after stop; nothing is left to wake

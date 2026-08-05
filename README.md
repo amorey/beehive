@@ -88,7 +88,7 @@ func main() {
 
 - **Coordination through the store.** Controllers never call each other. They read and write the shared store, and a change reaches another controller by being found there rather than delivered to it. Nothing is pushed: every write leaves a durable trace — a bumped generation, an owed-wake count, a deletion mark, a higher `resource_version` — and each driver scans for the trace it cares about. So a missed tick costs latency and nothing else. The record is still there next time.
 
-- **Every driver is a tick.** Reconcile passes, garbage collection, dependency wakes and client watches are all periodic scans, each on its own interval (see [Periodic drivers](#periodic-drivers)). Those intervals are the latency the system runs at; two of them are yours to choose. Object watches also have a commit wake in front of their tick, so a write made through this `Beehive` reaches them without waiting for the tick.
+- **Almost every driver is a tick.** Reconcile passes, garbage collection and client watches are all periodic scans, each on its own interval (see [Drivers](#drivers)). Those intervals are the latency the system runs at; two of them are yours to choose. Object watches also have a commit wake in front of their tick, so a write made through this `Beehive` reaches them without waiting for the tick. Dependency wakes are the one driver with no tick at all: a write made through this `Beehive` wakes them, and a 60s pass over dependency watermarks is what covers a write that did not.
 
 - **`spec`/`status` separation.** Only controllers write `status`, and the API enforces it: the user-facing `Client` has no status-write path, only the `Controller` surface does.
 
@@ -109,16 +109,16 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 
 Where you pass an option decides its scope. `WithFullPassInterval` at `New` sets the default for every kind; at `Register` it overrides that one controller. An option a given call site doesn't recognize is ignored. `WithGCInterval` is global and therefore only meaningful at `New` — garbage collection covers kinds with no controller.
 
-#### Periodic drivers
+#### Drivers
 
-Every driver is one of these. They run on separate intervals because they are separate jobs with very different costs — a single interval would mean tuning one of them moves the rest:
+Every driver is one of these. They run on separate intervals because they are separate jobs with very different costs — a single interval would mean tuning one of them moves the rest. One of them has no interval at all: the dependency wake runs when a write commits and not otherwise.
 
 | driver | what it scans | cost scales with | interval |
 |---|---|---|---|
 | owed pass | work the store *records* as owed — unconverged specs (`observed_generation < generation`) and owed dependency wakes | what is actually outstanding | 30s, fixed |
 | full pass | **every** object of the kind, converged or not | the object count | `WithFullPassInterval`, default 0 (off) |
 | GC sweep | deletion-pending rows, event-log retention, then the free space those two leave behind | rows being deleted | `WithGCInterval`, default 30s |
-| dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | 1s, fixed |
+| dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | none: a commit wakes it |
 | stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | 60s, fixed |
 | watch tail | the write log of each watched kind, once per kind however many watches it has | one cheap read per watched kind per tick, and a commit wakes it before the tick | 30s floor, fixed |
 | event watch poll | one object's event log, for each live `EventsWatch` | one cheap read per subscriber per tick; a listing only when the mark moved | 1s, fixed |
@@ -719,7 +719,7 @@ Every call that **creates** the edge records, durably and atomically with the ed
 
 There is nothing else to pass: the call takes no version claim, because nothing conditions on one. An earlier design stamped the wake only when the target had moved past the version the caller read, which made the claim load-bearing and left one interleaving stranded; with the stamp unconditional, a claim would be dead weight in every caller's hands, so it was removed rather than kept as decoration.
 
-**A dependency wake is a guarantee, not a best effort.** The scan above is fast and lives in memory, so a crash, a restart, or a process that never ran one can drop a wake — and a dependent that has already settled is invisible to every listing of owed work, because its own generation never moved. So beehive records, on each successful reconcile of an object that has dependencies, the store-wide write cursor that pass observed; a slower pass (60s) then enqueues every dependent whose targets have moved past it. Nothing about that is bookkeeping you can lose: it compares current state, so it recovers a wake lost by any means. A failed reconcile records nothing and is therefore found again. What you get is a wake within a second in the ordinary case, and within a minute in every case.
+**A dependency wake is a guarantee, not a best effort.** The scan above is fast and lives in memory, so a crash, a restart, or a process that never ran one can drop a wake — and a dependent that has already settled is invisible to every listing of owed work, because its own generation never moved. So beehive records, on each successful reconcile of an object that has dependencies, the store-wide write cursor that pass observed; a slower pass (60s) then enqueues every dependent whose targets have moved past it. Nothing about that is bookkeeping you can lose: it compares current state, so it recovers a wake lost by any means. A failed reconcile records nothing and is therefore found again. What you get is a wake as soon as the target's write commits, and within a minute in every case — including one written by another process, or straight to the `Store` behind this `Beehive`'s back.
 
 → [ADR: stamp every new dependency edge](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md), for how the count is kept atomic with the edge and why the stamp is unconditional on the claim. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md), and the backstop under it is [dependency watermarks](docs/adr/2026-07-29-dependency-watermarks.md).
 

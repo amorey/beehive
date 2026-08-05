@@ -43,22 +43,28 @@ go test -run '^$' -bench . -benchtime 1x ./   # smoke: compiles and runs each on
 
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.
 
-- **Nothing store-backed is pushed; every driver over the store is a periodic
-  scan** (`internal/driver`). Seven drivers: the owed pass (unsettled specs plus
-  `reconcile_owed`, per-kind, 30s), the full pass (`WithFullPassInterval`, off by
-  default), the GC sweeper (`WithGCInterval`, **cannot be disabled**), the
-  dependency waker (write log, 1s, with a commit wake in front), the
-  stale-dependents pass (60s, **cannot be disabled**), the object watch tail
-  (`withWatchFloorInterval`, 30s, also with a commit wake) and the event watch
-  poll (1s). Only `WithFullPassInterval` and `WithGCInterval` are public; the
-  other cadences are unexported options only tests reach, and `Client.Requeue`
-  is the public way to beat one. **No reconcile may depend on either full pass**
-  — both scale with the object count. The schedule watch is the one push
-  exception (see below); the two commit wakes are not, because their floor ticks
-  stay. Both wakes are rate-limited (`internal/rategate`), and the waker's
+- **Nothing store-backed is pushed, and every driver over the store is a
+  periodic scan except the waker** (`internal/driver`). Seven drivers: the owed
+  pass (unsettled specs plus `reconcile_owed`, per-kind, 30s), the full pass
+  (`WithFullPassInterval`, off by default), the GC sweeper (`WithGCInterval`,
+  **cannot be disabled**), the dependency waker (write log, **wake-driven, no
+  tick**), the stale-dependents pass (60s, **cannot be disabled**), the object
+  watch tail (`withWatchFloorInterval`, 30s, with a commit wake in front) and
+  the event watch poll (1s). Only `WithFullPassInterval` and `WithGCInterval`
+  are public; the other cadences are unexported options only tests reach, and
+  `Client.Requeue` is the public way to beat one. **No reconcile may depend on
+  either full pass** — both scale with the object count. The schedule watch is
+  the one push exception (see below); the tail's commit wake is not, because its
+  floor tick stays. **The waker is the exception to the cadence, not to the
+  record**: it still reads the write log, but only a commit makes it look, and
+  what entitles it to that is the stale-dependents pass finding a superset of
+  what it finds. So a write this process did not publish — a second process, or
+  one issued straight to the `Store` — reaches its dependents in 60s rather than
+  on a tick. Both wakes are rate-limited (`internal/rategate`), and the waker's
   cursor write keeps a floor of its own so a faster loop is not a faster write.
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
-  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md). Every reconcile trigger
+  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
+  [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
 - **The work queue floors how often one object is dispatched**, and a pending
@@ -96,12 +102,19 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   the owed pass is its consumer, not a third. → [ADR](docs/adr/2026-08-03-stale-dependents-cursor.md)
 - **The dependency waker scans the write log from a watermark**
   (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
-  client-only kind). Cost is bounded by what changed. **A commit wakes it**, and
-  the tick is the floor behind that, so a dependency chain propagates per commit
-  rather than per second. The cursor persists via the optional `DriverCursorer`;
-  it is an optimisation over the stale-dependents pass, never a guarantee.
+  client-only kind). Cost is bounded by what changed. **A commit is the only
+  thing that wakes it**: an idle waker arms no timer and issues no query, so a
+  dependency chain propagates per commit. Two conditions re-arm its one timer,
+  neither periodic: a failed scan (`driver.Backoff`, 100ms up to the
+  stale-dependents cadence — without it a failed scan would wedge, since
+  `backingOff` drops arriving wakes) and a cursor row still below the watermark,
+  which would otherwise be retried only by a commit that may never come. Going
+  idle **stops** the timer, or one already ready drives a pass nobody asked for.
+  The cursor persists via the optional `DriverCursorer`; it is an optimisation
+  over the stale-dependents pass, never a guarantee.
   → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md),
-  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md)
+  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
+  [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md)
 - **Object writes are recorded in an append-only log** (`object_writes`), one
   entry per committed write, in that write's transaction. A create/update entry
   carries no payload — consumers route by id and read current state; a physical

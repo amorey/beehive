@@ -273,16 +273,14 @@ func WithGCInterval(d time.Duration) Option {
 	}
 }
 
-// withDependencyWakeInterval sets how often the dependency waker scans the
-// write log. Global (a depends_on edge may point at a kind with no controller)
-// and meaningful only at New. Unexported: it is the cheapest driver and already
-// the shortest cadence, so there is nothing to tune it toward. d <= 0 disables
-// it, costing only latency — the reconcile_owed stamp and the stale-dependents
-// pass still cover correctness.
-func withDependencyWakeInterval(d time.Duration) Option {
+// withDependencyWakerOff turns the dependency waker off. Global and meaningful
+// only at New. Unexported: it costs only latency — the reconcile_owed stamp and
+// the stale-dependents pass still cover correctness — but nothing else replaces
+// the waker's cadence.
+func withDependencyWakerOff() Option {
 	return func(target any) error {
 		if t, ok := target.(*Beehive); ok {
-			t.wakeInterval = d
+			t.wakerOff = true
 		}
 		return nil
 	}

@@ -63,9 +63,9 @@ a driver, always.
 
 A target change is the one wake that starts anywhere. The commit wakes the
 dependency waker, whose scan is store-wide, so a *client-only* target reaches its
-dependents — but what the waker enqueues is still per registered kind. It is a
-driver with a wake in front rather than a push path, because the floor tick stays.
-See case 6.
+dependents — but what the waker enqueues is still per registered kind. It is the
+one wake with no tick behind it: the stale-dependents pass is its backstop
+instead. See case 6.
 
 Nothing else pushes a reconcile. `Client.Requeue` is an explicit call by the
 embedder, not a write, and it is case 13.
@@ -76,7 +76,7 @@ embedder, not a write, and it is case 13.
 |---|---|---|---|
 | Owed pass | per kind | 30s | no |
 | GC sweeper | global | `WithGCInterval`, 30s | no; a non-positive value is rejected |
-| Dependency waker | global | 1s floor, with a commit wake in front | yes, by an unexported option |
+| Dependency waker | global | a commit wake; no tick at all | yes, by an unexported option |
 | Stale-dependents pass | global | 60s | no |
 | Full pass | per kind | `WithFullPassInterval`, off | yes; it is off by default |
 
@@ -317,15 +317,20 @@ a burst collapses into one wake and a lost one costs only latency. Wake-driven s
 are floored at 100ms, and dropped while a failed scan is backing off.
 See [the ADR](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md).
 
-**Pull:** the waker, every second. A failed page holds the cursor, and the next tick
-reads the same range again. A failed edges lookup does the same. The self-edge is
-skipped. A wake that arrives during a reconcile is held by the `workQueue` dirty
-bit, and `done` dispatches it again.
+**Pull:** none. The waker holds no timer while it is idle, so a write this process
+did not publish — a second process, or a write issued straight to the `Store` —
+reaches its dependents through case 8 rather than here.
+See [the ADR](adr/2026-08-05-the-waker-is-wake-driven.md).
+
+A failed page holds the cursor, and the retry — `driver.Backoff` from 100ms up to
+the stale-dependents cadence — reads the same range again. A failed edges lookup
+does the same. The self-edge is skipped. A wake that arrives during a reconcile
+is held by the `workQueue` dirty bit, and `done` dispatches it again.
 
 **Restart:** covered by case 8. This mechanism resumes rather than always reseeding.
 `seed` reads a cursor the waker persisted in `driver_cursors` and resumes there,
 instead of at `ObjectWritesMaxVersionAll`. Thus a change committed while the process
-was down is scanned on the first tick back.
+was down is scanned on the eager first pass back.
 
 Case 8 is still the guarantee. Three things bypass the cursor:
 
@@ -395,7 +400,8 @@ each object, and it stops itself.
 This is the backstop under case 6. It is the only mechanism here that records
 nothing. It asks current state whether each dependent has reconciled against its
 targets' latest versions. Thus it recovers a wake lost by any means: a crash, a
-startup seed race, a process with no waker, or a defect in the wake path.
+startup seed race, a process with no waker, a write nobody published — a second
+process, or one issued straight to the `Store` — or a defect in the wake path.
 
 **Record:** `dependency_watermarks.reconciled_against`, written by
 `Store.DependencyWatermarksSet`. `typedController.reconcile` writes it on every

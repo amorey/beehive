@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package driver holds the two periodic-scan loop shapes every beehive driver
-// is built from. In both, a non-positive interval means the driver is off.
+// Package driver holds the two periodic-scan loop shapes, plus the timer and
+// backoff primitives a wake-driven loop builds its own shape from. In both scan
+// shapes a non-positive interval means the driver is off; a wake-driven loop
+// says that some other way, since its intervals are floors rather than cadences.
 package driver
 
 import (
@@ -66,8 +68,9 @@ func Rearm(t *time.Timer, d time.Duration) {
 }
 
 // Backoff is the retry delay a wake-driven driver uses when a step fails: it
-// doubles from Base and is capped at Max, which is the driver's own floor
-// cadence. The zero value is unusable — Base must be positive.
+// doubles from Base and is capped at Max. A non-positive Max means no ceiling
+// to grow toward, so the delay stays at Base rather than collapsing to zero.
+// The zero value is unusable — Base must be positive.
 type Backoff struct {
 	Base time.Duration
 	Max  time.Duration
@@ -93,6 +96,9 @@ func (b *Backoff) Wait(ctx context.Context) bool {
 // as uninitialized below — which would drop a driver back to Base part way
 // through the outage the backoff exists for.
 func (b *Backoff) Next() time.Duration {
+	if b.Max <= 0 {
+		return b.Base
+	}
 	if b.cur <= 0 {
 		b.cur = b.Base
 	}

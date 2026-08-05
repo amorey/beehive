@@ -89,8 +89,9 @@ type controllerClientImpl[Status any] struct {
 
 // wakeAfter returns a store write's error, waking the kind's watches when the
 // write succeeded. Every mutator here that appends to the object write log ends
-// with it: forgetting the wake costs a floor tick of staleness rather than a
-// failure, so nothing else would catch it.
+// with it: forgetting the wake costs staleness rather than a failure, so nothing
+// else would catch it — up to the watch floor for a subscriber, and up to the
+// stale-dependents pass for a dependent, since the waker has no tick behind it.
 //
 // EventsAdd is the one that does not, and must not: an event bumps no
 // resource_version, so it appends no entry for a watch to read.

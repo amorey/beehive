@@ -28,6 +28,7 @@ directory of archaeology.
 - [A cleared finalizer pushes its own collect](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
 - [A cleared finalizer pushes its own collect](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
 - [A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
+- [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [One tailer per kind, woken by the commit path, above a floor tick](2026-08-03-watch-shared-tail.md)
 - [The stale-dependents pass scans from a cursor over target versions](2026-08-03-stale-dependents-cursor.md)
