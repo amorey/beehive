@@ -4,6 +4,9 @@ Deferred work, and why. An item belongs here when it is a real defect or gap we
 chose not to fix yet — not a wishlist. Each one says what would make it worth doing,
 so the next reader can tell "we decided against this" from "nobody thought of it".
 
+Once we decide to build one, it moves to [`specs/`](specs/README.md) and the entry
+here shrinks to a pointer.
+
 - **Do not remove `EventsAdd`'s return value, even though the write-shapes
   rule says to** — a deliberate exception, recorded so nobody applies the
   rule mechanically. `Store.EventsAdd` returns a run that no caller reads
@@ -17,34 +20,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   undone.
 
   Revisit only if an events push path is ruled out for good.
-
-- **A standing `reconcile_owed` count overrides the backoff ladder above 30 s** —
-  known, not fixed, and invisible on the default settings.
-
-  `ReconcileOwedDecrement` is gated on `reconcileErr == nil`, so a failing object
-  keeps whatever stamped it. The owed pass lists it every `owedPassInterval` and
-  calls `work.add`, and `add` consults only the queued-now set: an id parked on a
-  backoff alarm is not in that set, so it is dispatched at once and the alarm
-  later fires into a no-op. Retries are therefore floored at the owed-pass
-  cadence for as long as the count stands.
-
-  **The defaults hide it.** `defaultMaxRetryInterval` and
-  `defaultOwedPassInterval` are both 30 s, so every rung of the ladder is at or
-  under the tick and the alarm always beats it. Raising `WithMaxRetryInterval`
-  above the owed-pass interval is what exposes it, and nothing in that option's
-  documentation says so — which is the actual defect here.
-
-  The stale-dependents pass widened who this reaches. Before it stamped its
-  findings, a standing count meant a non-converging edge set; now it means any
-  dependent the pass found whose reconcile is failing. See
-  [the cursor ADR](adr/2026-08-03-stale-dependents-cursor.md).
-
-  **The fix is a floor, not a gate**: have the owed pass enqueue through a path
-  that respects a pending alarm, or document the interaction on
-  `WithMaxRetryInterval`. Deferred because the cheap half is documentation and the
-  real half needs `workQueue` to distinguish "queued now" from "waiting on an
-  alarm" at the `add` call site, which is the same signal the
-  minimum-re-enqueue-interval item below wants. Do them together.
 
 - **An edge write is invisible to every cursor in the system, and the fix is one
   counter rather than a log** — known, not fixed, and recorded here mostly to
@@ -89,66 +64,36 @@ so the next reader can tell "we decided against this" from "nobody thought of it
   tick of latency on a deletion. Build the counter only when a second consumer
   appears, or when that latency is measured to matter.
 
-- **A dependency cycle of length ≥ 2 reconciles forever** — known, not fixed. The
-  self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`, so an object
-  that depends on itself does not re-queue itself. Two objects that depend on each
-  other still do. A's write wakes B, B's wakes A, and nothing stops it —
-  `workQueue.addLocked` has no rate limiter, and the dispatch path has no
-  already-settled skip.
+- **A dependency cycle of length ≥ 2 never converges** — rate-limited, not fixed.
+  The self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`. Two
+  objects that depend on each other still wake each other forever. A's write wakes
+  B, B's wakes A, and no generation ever moves, so nothing reports a problem.
 
-  Almost any write sustains it: changed status bytes, a byte-identical `UpdateStatus`
-  at a generation the object has not settled at, any real condition write, or
-  `FinalizersDelete`. Keeping status byte-stable is no defence. Only `EventsAdd` is
-  safe, because it bumps no object `resource_version`.
+  Almost any write sustains it: changed status bytes, a byte-identical
+  `UpdateStatus` at a generation the object has not settled at, any real condition
+  write, or `FinalizersDelete`. Only `EventsAdd` is safe, because it bumps no
+  object `resource_version`.
 
-  **What it costs.** The wake interval bounds the rate to one round trip per tick, so
-  it is not a hot loop, but it never converges and never stops. The store runs on one
-  connection, so the loop's write transactions queue ahead of every other writer —
-  client writes, other kinds' reconciles, the GC sweeper, event retention — while
-  holding a reconcile worker and consuming `resource_version` numbers. Every watch
-  sees the pair change, forever. And nothing reports a problem, because every
-  object is converged and every generation matches.
+  **The contention is gone.** The work queue's re-enqueue floor bounds the loop to
+  one round trip per `defaultMinRequeueInterval`, whatever the wake rate, so it no
+  longer queues write transactions ahead of every other writer. Pinned by
+  `TestADependencyCycleIsBoundedByTheFloor`, which runs 25 reconciles in 30ms with
+  the floor off. See [the ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
 
-  **Two possible fixes.**
+  **What is left is that it never stops.** A reconcile worker is occupied once per
+  interval forever, `resource_version` numbers are consumed forever, and every
+  watch sees the pair change forever — quietly, since every object is converged
+  and every generation matches.
 
-  1. *Reject cycles when the edge is declared.* This needs a recursive CTE on the
-     single connection, in `DependenciesAdd`. That is strictly more expensive than the
-     pre-read that already sank an earlier version of the declare-time guard.
-  2. *Give the work queue a minimum re-enqueue interval per item*, which is what
-     controller-runtime does for this. It bounds cycles of any length, needs no graph
-     query, and costs nothing on the hot path. It does not make a cycle converge, but
-     it turns "forever, at speed" into "forever, once per interval", which removes the
-     contention.
+  **The remaining fix is to reject cycles when the edge is declared**, which needs
+  a recursive CTE on the single connection in `DependenciesAdd` — strictly more
+  expensive than the pre-read that already sank an earlier declare-time guard. It
+  is also still open whether beehive should support cycles at all, which is a
+  reason not to guard hastily. Deferred on that question rather than on cost now
+  that the contention is bounded.
 
-  **The stale-dependents pass raises the value of fixing this, and removes the one
-  escape hatch.** It sustains a cycle exactly as the waker does — two mutually
-  dependent controllers that write on every pass keep re-staling each other — but
-  unlike the waker it cannot be turned off, since it is what makes a dependency wake a
-  guarantee. Where a test could previously quiet a cycle by disabling the waker,
-  nothing can now. Its 60s cadence is noise against the 1s waker, so this changes the
-  cost of a cycle not at all; it changes only whether there is a way out.
-
-  Option 2 is the one to try first. It cannot reuse `addAfter`, whose newest-wins alarm
-  would push the item back on every fresh wake and starve it; it needs an oldest-wins
-  watermark on `addLocked`, which is the path every wake takes. The cost is that
-  watermark, one new constant with no natural value, and working out how it interacts
-  with `Result.RequeueAfter` and backoff.
-
-  **Deferred on fix cost, not on likelihood.** The self-edge case was one comparison
-  on values the loop already had; this needs either a recursive CTE or a new work-queue
-  primitive. Likelihood argues the other way: a self-edge means naming your own id,
-  while a mutual dependency is what two separately written controllers fall into when
-  neither author sees both halves. It is also still open whether beehive should support
-  cycles at all, which is a reason not to guard hastily.
-
-  **Tripwires**, since no single test constrains both fixes. For option 1,
-  `TestAddDependencyAcceptsCycle` asserts that cycle-closing and self edges are both
-  accepted today — exactly what that fix would change. For option 2,
-  `TestWorkQueueNoConcurrentDispatch` and `TestWorkQueueReaddAfterDone` both assert
-  that the *second* dispatch of an id is immediately available, which is the latency a
-  minimum interval renegotiates. `TestWorkQueueFIFO` and the dedup tests are not
-  tripwires: they add distinct ids once each, and a first add stays immediately
-  dispatchable under any sane throttle.
+  Tripwire: `TestAddDependencyAcceptsCycle` asserts that cycle-closing and
+  self edges are both accepted today — exactly what such a guard would change.
 
 - **The waker's startup seed race costs latency, not convergence** — known, no longer
   a correctness hole, and narrower than it was since the waker started persisting its
@@ -673,8 +618,8 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 
   Deferred because the tailer is demand-scoped: it runs only while something watches,
   and a caller that opened a watch has asked for the latency. The
-  [commit-wake spec](specs/dependency-waker-commit-wake.md) specifies this limit for
-  the dependency waker, where the same loop runs unconditionally for the life of the
+  [commit-wake spec](specs/03-waker-commit-wake.md) needs the same limit for the
+  dependency waker, where the same loop runs unconditionally for the life of the
   process and the trade comes out the other way. Revisit when the two are compared
   side by side, or if a watched kind under heavy write load is measured to slow its
   own writers. Whatever is built should be shared: two wake-driven drivers throttling

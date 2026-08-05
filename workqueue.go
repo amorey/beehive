@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amorey/beehive/internal/rategate"
 	"github.com/amorey/gobus/watch"
 )
 
@@ -37,6 +38,9 @@ type workQueue struct {
 	items      []ObjectID
 	ready      chan struct{} // pulsed when items are available
 	stopped    bool          // set by stop; adds become no-ops
+	// gate floors the gap between two dispatches of one id. Always non-nil; a
+	// zero interval holds nothing, which is how the floor is turned off.
+	gate *rategate.Gate[ObjectID]
 	// schedules carries each schedule change to this kind's subscribers.
 	schedules scheduleBus
 }
@@ -46,6 +50,45 @@ type workQueue struct {
 type alarm struct {
 	timer  *time.Timer
 	fireAt time.Time
+	kind   alarmKind
+}
+
+// alarmKind says why an alarm exists. It decides whether an arriving add is
+// absorbed by the alarm and whether a later addAfter may replace it.
+type alarmKind uint8
+
+const (
+	// First, so a literal that misses the field never absorbs an add.
+	alarmRequeueAfter alarmKind = iota // Result.RequeueAfter: the controller's own schedule
+	alarmBackoff                       // reconciler.backoffNext: the pass failed
+	alarmFloor                         // the re-enqueue floor: the id ran too recently
+)
+
+// absorbsAdd reports whether a is already the next dispatch, so an arriving
+// wake needs no enqueue of its own. Nil-safe: no alarm absorbs nothing.
+func (a *alarm) absorbsAdd() bool {
+	return a != nil && (a.kind == alarmBackoff || a.kind == alarmFloor)
+}
+
+// outranks reports whether a survives an addAfter of kind incoming firing at
+// fireAt, dropping the newcomer instead of being replaced by it.
+func (a *alarm) outranks(incoming alarmKind, fireAt time.Time) bool {
+	switch {
+	case a == nil:
+		return false
+	case incoming == alarmBackoff:
+		// A backoff always takes the slot: the ladder owns the retry and is
+		// meant to push the dispatch out.
+		return false
+	case a.kind == alarmFloor || incoming == alarmFloor:
+		// Earlier fire time wins, so a held wake never delays work already
+		// scheduled sooner and is never dropped by later work. A tie keeps the
+		// pending alarm — the oldest-wins rule the floor needs.
+		return !a.fireAt.After(fireAt)
+	default:
+		// Two controller schedules arbitrate as they always have: newest wins.
+		return false
+	}
 }
 
 func newWorkQueue() *workQueue {
@@ -53,6 +96,7 @@ func newWorkQueue() *workQueue {
 		gauge:      newGauge(),
 		processing: make(map[ObjectID]struct{}),
 		ready:      make(chan struct{}, 1),
+		gate:       rategate.New[ObjectID](0),
 		schedules:  newScheduleHub(),
 	}
 }
@@ -90,12 +134,21 @@ type pendingSend struct {
 // put records a change the gauge already confirmed.
 func (m *pendingSend) put(s gaugeValue) { m.value, m.set = s, true }
 
-// add queues id, unless it is already queued. If a worker is processing id, it
-// is marked dirty instead and done queues it.
+// addMode selects whether a pending alarm may absorb an add. A wake may be
+// absorbed; an alarm firing and an explicit requeue may not.
+type addMode uint8
+
+const (
+	addThrottled addMode = iota
+	addImmediate
+)
+
+// add queues id, unless it is already queued or a pending alarm absorbs it. If
+// a worker is processing id, it is marked dirty instead and done queues it.
 func (q *workQueue) add(id ObjectID) {
 	var pending pendingSend
 	q.mu.Lock()
-	q.addLocked(id, &pending)
+	q.addLocked(id, &pending, addThrottled)
 	q.mu.Unlock()
 	q.publish(id, pending)
 }
@@ -104,20 +157,46 @@ func (q *workQueue) add(id ObjectID) {
 // publish: the caller owns the critical section, so the caller owns the
 // publish. The stopped check stays above the gauge call, or an add after stop
 // would send a due-now after the final values.
-func (q *workQueue) addLocked(id ObjectID, pending *pendingSend) {
+func (q *workQueue) addLocked(id ObjectID, pending *pendingSend, mode addMode) {
 	if q.stopped {
 		return
 	}
-	s, ok := q.gauge.markDirty(id)
-	if !ok {
-		return // already queued
+	// A read, not markDirty yet: only an add that clears the throttle checks
+	// below may queue the id.
+	if q.gauge.isQueued(id) {
+		return
 	}
+	if mode == addThrottled {
+		if q.gauge.alarmFor(id).absorbsAdd() {
+			return // the alarm owns the dispatch; oldest wins
+		}
+		if opensAt, held := q.gate.OpensAt(id, time.Now()); held {
+			q.addAfterLocked(id, opensAt, alarmFloor, pending)
+			return
+		}
+	}
+	s, _ := q.gauge.markDirty(id)
 	pending.put(s)
 	if _, ok := q.processing[id]; !ok {
 		q.items = append(q.items, id)
 		q.signal()
 	}
 	// else in flight: leave it dirty; done will re-queue it.
+}
+
+// setFloor sets the minimum gap between two dispatches of one id; <= 0 turns
+// the floor off. Call before the queue is in use.
+func (q *workQueue) setFloor(d time.Duration) {
+	q.gate = rategate.New[ObjectID](d)
+}
+
+// discard ends id's processing without acting on it, releasing the hold get
+// placed on it — nothing ran, so there is no dispatch to space out.
+func (q *workQueue) discard(id ObjectID) {
+	q.done(id)
+	q.mu.Lock()
+	q.gate.Forget(id)
+	q.mu.Unlock()
 }
 
 func (q *workQueue) signal() {
@@ -129,26 +208,36 @@ func (q *workQueue) signal() {
 
 // addAfter queues id once delay has elapsed; delay <= 0 queues at once. The
 // timer is tracked per id so stop and requeueNow can cancel it and the gauge
-// can read its fire time. A second addAfter for one id replaces the first.
-func (q *workQueue) addAfter(id ObjectID, delay time.Duration) {
+// can read its fire time. A second addAfter for one id replaces the first,
+// except where the pending alarm outranks it.
+func (q *workQueue) addAfter(id ObjectID, delay time.Duration, kind alarmKind) {
 	if delay <= 0 {
 		q.add(id)
 		return
 	}
 	var pending pendingSend
 	q.mu.Lock()
-	if !q.stopped {
-		if prev := q.gauge.alarmFor(id); prev != nil {
-			prev.timer.Stop() // newest schedule wins
-		}
-		a := &alarm{fireAt: time.Now().Add(delay)}
-		a.timer = time.AfterFunc(delay, func() { q.timerFired(id, a) })
-		if s, ok := q.gauge.setAlarm(id, a); ok {
-			pending.put(s)
-		}
-	}
+	q.addAfterLocked(id, time.Now().Add(delay), kind, &pending)
 	q.mu.Unlock()
 	q.publish(id, pending)
+}
+
+// addAfterLocked is addAfter's body, and the floor's: the throttle sets its
+// alarm from inside addLocked, which already holds q.mu. It does not publish;
+// the caller owns the critical section, so the caller owns the publish.
+func (q *workQueue) addAfterLocked(id ObjectID, fireAt time.Time, kind alarmKind, pending *pendingSend) {
+	prev := q.gauge.alarmFor(id)
+	if q.stopped || prev.outranks(kind, fireAt) {
+		return
+	}
+	if prev != nil {
+		prev.timer.Stop() // newest schedule wins
+	}
+	a := &alarm{fireAt: fireAt, kind: kind}
+	a.timer = time.AfterFunc(time.Until(fireAt), func() { q.timerFired(id, a) })
+	if s, ok := q.gauge.setAlarm(id, a); ok {
+		pending.put(s)
+	}
 }
 
 // timerFired queues id only if a is still the current alarm — a newer addAfter
@@ -163,7 +252,15 @@ func (q *workQueue) timerFired(id ObjectID, a *alarm) {
 		if s, ok := q.gauge.clearAlarm(id); ok {
 			pending.put(s)
 		}
-		q.addLocked(id, &pending) // no-op if stop ran between firing and here
+		if _, inFlight := q.processing[id]; inFlight && a.kind == alarmFloor {
+			// The floor bounds the gap between dispatches and the last one has
+			// not finished, so the window has not started. Marking the id dirty
+			// here would let done queue it ahead of the alarm the pass sets a
+			// line later, losing a failing pass its ladder.
+			q.addAfterLocked(id, time.Now().Add(q.gate.Interval()), alarmFloor, &pending)
+		} else {
+			q.addLocked(id, &pending, addImmediate) // no-op if stop ran between firing and here
+		}
 	}
 	q.mu.Unlock()
 	q.publish(id, pending)
@@ -180,7 +277,7 @@ func (q *workQueue) requeueNow(id ObjectID) {
 			pending.put(s)
 		}
 	}
-	q.addLocked(id, &pending)
+	q.addLocked(id, &pending, addImmediate)
 	q.mu.Unlock()
 	q.publish(id, pending)
 }
@@ -218,6 +315,7 @@ func (q *workQueue) get() (ObjectID, bool) {
 	}
 	id := q.items[0]
 	q.items = q.items[1:]
+	q.gate.Admit(id, time.Now())
 	// Dispatch clears the dirty slot; the id then reads as its pending alarm or
 	// as unscheduled.
 	if s, ok := q.gauge.clearDirty(id); ok {

@@ -290,7 +290,7 @@ type Schedule struct {
 }
 ```
 
-`Schedule` is what the [scheduling API](#scheduling) reports: an object's **next reconcile time**, as a gauge. It is a struct rather than a bare `time.Time` so fields can be added later without breaking anything — a reschedule trigger, for instance (backoff, success cadence, or manual poke), which is reserved but not yet filled in. `NextRequeueAt` covers per-id timers only: a pending backoff retry or `RequeueAfter` delay, or now if the object is already queued, or the zero time if nothing is scheduled.
+`Schedule` is what the [scheduling API](#scheduling) reports: an object's **next reconcile time**, as a gauge. It is a struct rather than a bare `time.Time` so fields can be added later without breaking anything — a reschedule trigger, for instance (backoff, success cadence, or manual poke), which is reserved but not yet filled in. `NextRequeueAt` covers per-id timers only: a pending backoff retry, a `RequeueAfter` delay, or a re-enqueue floor holding a wake until the object may run again — or now if the object is already queued, or the zero time if nothing is scheduled.
 
 ### Client
 
@@ -590,11 +590,11 @@ By default `Requeue` **keeps the object's retry backoff**. A requeue is an ordin
 
 #### Scheduling
 
-The scheduling API reports when an object is **next due to reconcile**, as a [`Schedule`](#schedule) whose `NextRequeueAt` is a pending backoff retry or `RequeueAfter` delay — or now, if the object is already queued, or the zero time if nothing is scheduled.
+The scheduling API reports when an object is **next due to reconcile**, as a [`Schedule`](#schedule) whose `NextRequeueAt` is a pending backoff retry, a `RequeueAfter` delay, or a re-enqueue floor holding a wake — or now, if the object is already queued, or the zero time if nothing is scheduled.
 
 `SchedulesGet` is the point read: a non-blocking read of in-memory state, with no store lookup and no kind check, so it returns no error today (the error is reserved for symmetry with the rest of the surface). A missing id, another kind's id and a client-only kind all read as the zero `Schedule`, which looks the same as a real object with nothing scheduled.
 
-`SchedulesWatch` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It is pushed rather than polled, and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `SchedulesGet` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
+`SchedulesWatch` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a wake held by the re-enqueue floor, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It is pushed rather than polled, and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `SchedulesGet` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
 
 Both are on `Client` only, and both read **per-id timers only**. Neither predicts the next reconcile: the real one can come **earlier**, because the owed pass, the full pass and the dependency wake are not per-id timers, and **a zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee.
 

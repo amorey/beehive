@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2166,7 +2168,7 @@ func TestReconcilerRequeueNow(t *testing.T) {
 	}
 	// Simulate a failed reconcile: a backoff entry and a far-future retry timer.
 	seeded := r.backoffNext(1)
-	r.work.addAfter(1, time.Hour)
+	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 	require.NotZero(t, r.backoffFor[1], "precondition: backoff seeded")
 	require.NotNil(t, r.work.gauge.alarmFor(1), "precondition: retry timer scheduled")
 
@@ -2184,7 +2186,7 @@ func TestReconcilerRequeueNow(t *testing.T) {
 // fire time and reports the zero Schedule for an id with no schedule.
 func TestReconcilerScheduleAt(t *testing.T) {
 	r := &reconciler{work: newWorkQueue()}
-	r.work.addAfter(1, time.Hour)
+	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 
 	at := r.scheduleAt(1).NextRequeueAt
 	require.False(t, at.IsZero())
@@ -3193,4 +3195,51 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("dependent was never reconciled after restart: the wake died with the process that owed it")
 	}
+}
+
+// cycleController writes a changing status on every pass, so each pass bumps
+// its object's resource_version and wakes whatever depends on it.
+type cycleController struct {
+	calls      atomic.Int64
+	first, hot *signal
+}
+
+func (c *cycleController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+	n := c.calls.Add(1)
+	if n >= hotLoopCalls {
+		c.hot.fire()
+	}
+	c.first.fire()
+	return Result{}, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: fmt.Sprint(n)})
+}
+
+// Two objects that depend on each other reconcile forever: each pass wakes the
+// other and no generation ever moves, so nothing reports a problem. The
+// re-enqueue floor is what bounds the loop — see the cycle item in docs/TODO.md,
+// which this does not fix, only rate-limits.
+//
+// The waker runs far below the floor here, so the wake path is not the limiter.
+func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctrl := &cycleController{first: newSignal(), hot: newSignal()}
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withDependencyWakeInterval(time.Millisecond),
+		withMinRequeueInterval(hotLoopWindow))
+	cc, err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
+	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, b.ID))
+	require.NoError(t, cc.DependenciesAdd(ctx, b.ID, a.ID))
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	requireNoHotLoop(t, ctrl.first, ctrl.hot, &ctrl.calls,
+		"a dependency cycle must be floored, not run at wake speed")
 }

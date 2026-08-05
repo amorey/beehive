@@ -57,6 +57,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
+- **The work queue floors how often one object is dispatched**, and a pending
+  backoff or floor alarm absorbs an arriving wake rather than jumping it. The
+  floor is per id (`internal/rategate`), so N distinct objects cost nothing and
+  one object N times costs N intervals — which is the shape of a dependency
+  cycle. It bounds a cycle; it does not converge one. A zero interval turns off
+  the floor but **not** the absorption, which is a semantic change of its own.
+  → [ADR](docs/adr/2026-08-04-work-queue-re-enqueue-floor.md)
 - **Declarative and level-triggered.** Controllers reconcile from *current*
   state, never from a sequence of changes; controllers coordinate through the
   store, never with each other.
@@ -138,7 +145,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled. `Store.AfterCommit` has three users: `WithOnCreate`, the spec-write
-  enqueue and the new-edge enqueue (shared via `Beehive.signalRequeue`).
+  enqueue and the new-edge enqueue (shared via `Beehive.signalRequeueNow` and
+  `signalRequeueThrottled`).
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **The id is the key everywhere; the name is a lookup.** The bare CRUD verbs
@@ -190,8 +198,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   atomically with the edge inside `EdgesAdd`, drained by the owed pass. The
   declaration also enqueues the source at commit, gated on
   `ReconcileOwedStamped` and routed by `EdgesAddResult.From` (the edge is
-  cross-kind). Pinned cost: a source whose edge set never converges loses its
-  backoff ladder.
+  cross-kind). The edge push is throttled; the spec write's is not.
   → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **Secondary lookups are read on request**, never folded into the blob-carrying

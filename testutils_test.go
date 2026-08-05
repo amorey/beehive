@@ -204,6 +204,7 @@ func fast(opts ...Option) []Option {
 		withOwedPassInterval(fastTick),
 		WithGCInterval(fastTick),
 		withDependencyWakeInterval(fastTick),
+		withMinRequeueInterval(fastTick),
 		withStaleDependentsInterval(staleDependentsTick),
 		withWatchPollInterval(fastTick),
 		withWatchFloorInterval(fastTick),
@@ -808,11 +809,11 @@ func unsettledIDs(t *testing.T, store Store) []ObjectID {
 	return ids
 }
 
-// drainQueue removes every dispatchable item from q (get + done, so nothing is
-// left holding a processing slot), leaving the queue empty.
+// drainQueue empties q, discarding rather than dispatching: a later add in the
+// test must not be held by a floor this loop opened.
 func drainQueue(q *workQueue) {
 	for id, ok := q.get(); ok; id, ok = q.get() {
-		q.done(id)
+		q.discard(id)
 	}
 }
 

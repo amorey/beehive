@@ -15,8 +15,9 @@ push-driven than it is.
 
 **Keep this document in step with the code.** When you add a way for work to be
 owed, add it here. Give its record, its driver, and its restart behaviour. Do not
-list gaps here. Gaps belong in [`TODO.md`](TODO.md), linked from the case they
-affect.
+list gaps here. A gap we chose not to close belongs in [`TODO.md`](TODO.md), and one
+we intend to close belongs in [`specs/`](specs/README.md); link either from the case
+it affects.
 
 ## 1. Push and pull
 
@@ -46,7 +47,13 @@ can be read.
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
 | A new edge enqueues the edge's source | `ControllerClient.DependenciesAdd` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
 
-Both paths call `Beehive.signalRequeue`. Case 1 and case 5 describe them in full.
+The two paths call different methods. A
+spec write is immediate: it carries new information, so it cancels a pending alarm
+and dispatches at once. A new edge is throttled: a controller can declare on every
+pass, so it goes through `work.add` and respects the source's backoff ladder and
+re-enqueue floor.
+→ [the floor ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
+Case 1 and case 5 describe them in full.
 
 Nothing else pushes a reconcile. A delete does not push. A target change does not
 push today. `Client.Requeue` is an explicit call by the embedder, not a write, and
@@ -233,10 +240,15 @@ This covers three races:
 The price is one reconcile for each edge ever created. The edge-new gate bounds it.
 See [the ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md).
 
-**Push:** the declaration enqueues the source. `Beehive.signalRequeue` runs on
+**Push:** the declaration enqueues the source. `Beehive.signalRequeueNow`/`signalRequeueThrottled` runs on
 `Store.AfterCommit`. It is gated on `EdgesAddResult.ReconcileOwedStamped` and routed
 by `EdgesAddResult.From`. The route matters because the edge is cross-kind. The
 source's kind can differ from the declarer's kind.
+
+**The enqueue is throttled**, so a source whose edge set never converges keeps its
+backoff ladder, and a declaration made inside the source's own pass is held to that
+object's re-enqueue floor rather than dispatched at once. The stamp is durable, so
+the owed pass carries the dependent either way.
 
 The push does not cover two cases. A source whose kind has no reconciler is not
 enqueued. A declaration made from another process, or through the embedder's own
@@ -246,6 +258,10 @@ enqueued. A declaration made from another process, or through the embedder's own
 seconds. `ReconcileOwedDecrement` drains the count in `typedController.reconcile`.
 It subtracts the whole count observed at load, not one.
 
+A listing that names an object already parked on its backoff alarm no longer
+dispatches it: the alarm absorbs the add, so the ladder holds at every rung. That
+is what makes `WithMaxRetryInterval` mean what it says above 30 seconds.
+
 **Restart:** covered. The stamp is durable and is drained at startup without a gate.
 A crash between the commit and the dispatch loses the push and keeps the stamp. That
 is what the stamp is for.
@@ -254,6 +270,7 @@ is what the stamp is for.
 `WithStartupFullPass(false)`, so the full pass cannot hide the result),
 `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
 `TestAddDependencyEnqueueRoutesByTheSourcesKind`,
+`TestANewEdgeOnAnInFlightSourceRespectsTheBackoff`,
 `TestReconcileMidPassDeclareLeavesTheDependentOwed`.
 
 ### 6. An ordinary target change
@@ -283,7 +300,7 @@ filter on what changed. Any row for target T wakes every dependent of T.
 **Only `depends_on` edges wake.** An `owned_by` edge wakes nothing.
 
 **Push:** none today. A commit wake is proposed but is not built. See
-[the spec](specs/dependency-waker-commit-wake.md).
+[the spec](specs/03-waker-commit-wake.md).
 
 **Pull:** the waker, every second. A failed page holds the cursor, and the next tick
 reads the same range again. A failed edges lookup does the same. The self-edge is
@@ -370,9 +387,11 @@ startup seed race, a process with no waker, or a defect in the wake path.
 successful pass of an object that has dependencies. The value is the write cursor as
 of the pass's *load*. It is never the end of the pass.
 
-**Push:** none, and none is possible. A push form of this mechanism would have to
-record its findings at commit time. See rejected design 6.1 in
-[the waker spec](specs/dependency-waker-commit-wake.md).
+**Push:** none, and none is possible. This mechanism exists to find what every push
+lost. A push form of it would have to record its findings at commit time, which is
+the moment it cannot trust. A commit knows the target moved. It does not know which
+dependents failed to observe the move, because that answer is a comparison against
+each dependent's watermark, and those watermarks move under other transactions.
 
 **Pull:** `staleDependents.sweep` calls `DependentsListStaleSince`, paged to
 exhaustion, every 60 seconds. The sweep stamps each finding's `reconcile_owed`
