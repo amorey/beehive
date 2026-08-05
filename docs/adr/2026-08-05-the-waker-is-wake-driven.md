@@ -27,7 +27,7 @@ on the wake. `scanMore` re-arms at the scan throttle; `scanFailed` re-arms the
 retry. The eager first pass stays — it seeds, and a restart resumes from the
 persisted cursor there rather than on a tick.
 
-### The failure retry moved first, and is the only timer left
+### The failure retry moved first
 
 `backingOff` *drops* arriving wakes, so a degraded store cannot be re-read as
 fast as it can fail. The floor timer used to be what cleared it; with no floor,
@@ -37,6 +37,27 @@ capped at `staleDependentsInterval` — the ladder `objectTailer` already uses. 
 is conditional rather than periodic, so it does not reintroduce what this
 removes, and the cap is where a retry stops being worth making: past it the
 backstop has already swept.
+
+### An outstanding cursor write is the second reason to look again
+
+`persist` failing does not fail the scan, so a pass whose log was drained
+answers "idle" with the cursor row still behind the watermark. Under the tick
+that was retried within a second; wake-driven, the next commit would be the only
+retry, and a process that seeds, fails to persist and then stops leaves its
+successor to reseed at the mark — skipping everything committed while it was
+down, exactly the gap the durable cursor exists to close. So `pass` treats a row
+below the watermark as a reason of its own and re-arms at `wakePersistInterval`,
+which is the unit `wakePersistRetryCap` counts in and therefore the cadence that
+ladder was calibrated against. It stops the moment the write lands.
+
+### Stopping the timer is part of going idle
+
+The loop owns one timer, and `nextTimer` is its whole policy: never push a
+pending deadline later, and **stop** what is armed once a pass reports nothing to
+come back for. The stop is not bookkeeping — when a throttle timer and a commit
+wake become ready together the wake may win the select, and a timer left armed
+then drives a pass nobody asked for. The race is not reproducible on demand, so
+the rule is a pure function with a table test rather than a loop test.
 
 ### Two knobs the tick was standing in for
 
@@ -75,8 +96,10 @@ whose cadence *is* the latency target.
 ## Consequences
 
 - **An idle beehive issues no waker queries and holds no waker timer.**
-  `TestIdleWakerIssuesNoQueries` pins it: after the eager first pass the scans
-  are exactly one per commit wake.
+  `TestIdleWakerIssuesNoQueries` pins the queries; `TestNextTimer` pins that
+  going idle stops whatever was armed.
+- **Two conditions re-arm, neither of them periodic**: a failed scan, and a
+  cursor write the store has not accepted yet. Both stop on success.
 - **A failed scan recovers on its own.** `TestWakerRecoversFromAFailedScanWithoutATick`
   runs with nothing behind the waker at all — no wake is sent — so only the
   retry can produce the second read.

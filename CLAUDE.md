@@ -104,11 +104,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
   client-only kind). Cost is bounded by what changed. **A commit is the only
   thing that wakes it**: an idle waker arms no timer and issues no query, so a
-  dependency chain propagates per commit, and the one timer left is the failure
-  retry (`driver.Backoff`, 100ms up to the stale-dependents cadence) — without
-  it a failed scan would wedge, since `backingOff` drops arriving wakes. The
-  cursor persists via the optional `DriverCursorer`; it is an optimisation over
-  the stale-dependents pass, never a guarantee.
+  dependency chain propagates per commit. Two conditions re-arm its one timer,
+  neither periodic: a failed scan (`driver.Backoff`, 100ms up to the
+  stale-dependents cadence — without it a failed scan would wedge, since
+  `backingOff` drops arriving wakes) and a cursor row still below the watermark,
+  which would otherwise be retried only by a commit that may never come. Going
+  idle **stops** the timer, or one already ready drives a pass nobody asked for.
+  The cursor persists via the optional `DriverCursorer`; it is an optimisation
+  over the stale-dependents pass, never a guarantee.
   → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
   [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md)

@@ -434,6 +434,20 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		assert.True(t, backingOff, "a refused pass decides nothing about the store's health")
 	})
 
+	t.Run("an outstanding cursor write is a reason to look again", func(t *testing.T) {
+		store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
+		dw, clk, _ := seededWaker(store, widget)
+
+		next, _ := dw.pass(ctx, clk.now(), false)
+		assert.Equal(t, defaultWakePersistInterval, next,
+			"the log is drained, but a successor that finds no row would reseed at the mark")
+
+		store.setErr = nil
+		clk.advance(defaultWakePersistInterval)
+		next, _ = dw.pass(ctx, clk.now(), false)
+		assert.Equal(t, wakeIdle, next, "once the write lands there is nothing left to look again for")
+	})
+
 	t.Run("a disabled throttle drains without pausing", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
 		dw, _, _ := seededWaker(store, widget)
@@ -1480,4 +1494,33 @@ func TestStaleDependentsSweepIsQuietOnShutdown(t *testing.T) {
 	sd.sweep(ctx)
 
 	assert.Empty(t, logs.String(), "a cancelled read is shutdown, not a lost pass")
+}
+
+// nextTimer is the loop's whole timer policy: never push a pending deadline
+// later, and stop what is armed once a pass reports nothing to come back for.
+// The race it exists for is not reproducible on demand — a wake and a ready
+// timer arriving together — so the rule is pinned here rather than in run.
+func TestNextTimer(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	armed := now.Add(time.Second)
+
+	cases := []struct {
+		name     string
+		next     time.Duration
+		armedFor time.Time
+		want     timerAction
+	}{
+		{"idle stops a timer left armed", wakeIdle, armed, timerStop},
+		{"idle with nothing armed stays idle", wakeIdle, time.Time{}, timerStop},
+		{"nothing armed arms", time.Second, time.Time{}, timerArm},
+		{"a sooner deadline wins", 100 * time.Millisecond, armed, timerArm},
+		{"a later one leaves the pending timer alone", 2 * time.Second, armed, timerKeep},
+		{"the same deadline changes nothing", time.Second, armed, timerKeep},
+		{"a drain with no throttle arms immediately", 0, armed, timerArm},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, nextTimer(c.next, now, c.armedFor))
+		})
+	}
 }

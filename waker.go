@@ -161,14 +161,16 @@ func (dw *waker) run(ctx context.Context) {
 		now := dw.now()
 		var next time.Duration
 		next, backingOff = dw.pass(ctx, now, backingOff)
-		if next == wakeIdle {
-			continue // nothing to look again for: block until the next commit
-		}
-		// A wake that only re-arms the timer later than it already fires buys
-		// nothing, and under a sustained stream the loop turns at commit rate.
-		if at := now.Add(next); armedFor.IsZero() || at.Before(armedFor) {
+		switch nextTimer(next, now, armedFor) {
+		case timerStop:
+			// Stop, not just continue: a timer that was already ready when a
+			// wake won the select would otherwise drive a pass nobody asked
+			// for. Since Go 1.23 Stop leaves no stale value to receive.
+			timer.Stop()
+			armedFor = time.Time{}
+		case timerArm:
 			driver.Rearm(timer, next)
-			armedFor = at
+			armedFor = now.Add(next)
 		}
 	}
 }
@@ -212,11 +214,48 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 	if result == scanMore {
 		return dw.scanGate.Interval(), false // keep draining, at the throttle's rate
 	}
+	// A refused cursor write is a reason of its own: the wakes are queued
+	// either way, but a successor that finds no row reseeds at the mark and
+	// skips everything committed while this process was down. The floor is the
+	// unit the persist retry ladder counts in, so retrying at it is what that
+	// ladder was calibrated against.
+	if dw.persistOutstanding() {
+		return max(dw.bh.wakePersistInterval, wakeRetryBase), false
+	}
 	return wakeIdle, false
+}
+
+// persistOutstanding says the cursor row still sits below the watermark, so a
+// write is owed. False for a store that persists no cursor at all.
+func (dw *waker) persistOutstanding() bool {
+	return dw.cursors != nil && dw.watermark > dw.persisted
 }
 
 // wakeIdle is pass's "no reason to look again": the loop arms nothing.
 const wakeIdle time.Duration = -1
+
+// timerAction is what pass's answer means for the loop's one timer.
+type timerAction uint8
+
+const (
+	timerKeep timerAction = iota // a pending timer already fires sooner
+	timerArm                     // (re)arm for the delay pass returned
+	timerStop                    // nothing to look again for
+)
+
+// nextTimer decides that action from pass's delay and the instant the timer is
+// currently set to fire (zero when nothing is armed). Under a sustained stream
+// the loop turns at commit rate, so a wake that would only push the deadline
+// later must leave it alone.
+func nextTimer(next time.Duration, now, armedFor time.Time) timerAction {
+	if next == wakeIdle {
+		return timerStop
+	}
+	if armedFor.IsZero() || now.Add(next).Before(armedFor) {
+		return timerArm
+	}
+	return timerKeep
+}
 
 // scanResult says what a pass found. The run loop dispatches on it: how soon to
 // look again, and whether to drop the wakes arriving meanwhile.
