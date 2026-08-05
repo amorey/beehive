@@ -77,6 +77,18 @@ func TestRunStopsWhenAStepReportsFalse(t *testing.T) {
 // A non-positive interval disables a driver outright, first pass included. Running
 // once would make "disabled" fire more often than an enabled driver stopped
 // immediately, which is the reading no caller could want.
+// The eager first step is the one that can end a driver before any ticker
+// exists: a step that answers "nothing here will ever change" must not leave a
+// ticker running behind it.
+func TestRunStopsWhenTheFirstStepReportsFalse(t *testing.T) {
+	var calls int
+	Run(context.Background(), testTimeout, func(context.Context) bool {
+		calls++
+		return false
+	})
+	assert.Equal(t, 1, calls, "the eager step ran and nothing ticked after it")
+}
+
 func TestRunDoesNothingWhenDisabled(t *testing.T) {
 	var calls int
 	Run(context.Background(), 0, func(context.Context) bool {

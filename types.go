@@ -298,6 +298,10 @@ type Event struct {
 	Count    int             // occurrences in this run (>= 1)
 	FirstAt  time.Time       // run start
 	LastAt   time.Time       // run end (latest occurrence)
+
+	// ResourceVersion orders the log and is what a watch resumes above. An
+	// extend re-samples it, so a run that grew carries a fresh one.
+	ResourceVersion int64
 }
 
 // EventDetail unmarshals an event's Detail payload into T. An empty Detail

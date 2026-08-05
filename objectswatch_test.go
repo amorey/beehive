@@ -452,7 +452,7 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Hour))
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -537,7 +537,7 @@ func TestWatchFloorFallsBackToTheDefault(t *testing.T) {
 func TestWatchListReturnsASnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Millisecond))
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Millisecond))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
@@ -2185,7 +2185,7 @@ func TestWatchListDeliversWithoutPolling(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t),
-		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	snap, ch, err := client.WatchList(ctx)
@@ -2272,7 +2272,7 @@ func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t),
-		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
 	other := mustCreate(t, ctx, client, "other", cSpec{Val: "a"})
@@ -2348,7 +2348,7 @@ func TestWatchResumeReplaysGapThenGoesLive(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t),
-		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	snap, _, err := client.WatchList(ctx)
@@ -2376,7 +2376,7 @@ func TestWatchResumeReplaysBeyondOnePage(t *testing.T) {
 	const gap = tailPageCap + 40
 
 	bh := newTestBeehive(t, newClientTestStore(t),
-		withWatchPollInterval(time.Hour), withWatchFloorInterval(time.Hour))
+		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	snap, _, err := client.WatchList(ctx)

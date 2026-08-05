@@ -678,6 +678,17 @@ func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKi
 	return deletionAt.Valid, nil
 }
 
+// checkObjectExists is probeObjectScoped without the kind gate: ErrNotFound, or
+// nil.
+func (s *sqliteStore) checkObjectExists(ctx context.Context, id storeapi.ObjectID) error {
+	var one int
+	err := s.conn(ctx).QueryRowContext(ctx, `SELECT 1 FROM objects WHERE id = ?`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeapi.ErrNotFound // bare, like scanObject's
+	}
+	return err
+}
+
 // checkObjectScoped is probeObjectScoped for callers that only need the gate.
 func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
 	_, err := s.probeObjectScoped(ctx, gk, id)
@@ -1546,16 +1557,26 @@ const eventColumns = `id, object_id, category, type, reason, message, detail,
 // NULL; detail is opaque JSON bytes, nil when NULL.
 func scanEvent(sc scanner) (*storeapi.Event, error) {
 	var e storeapi.Event
+	if err := scanEventInto(sc, &e); err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// scanEventInto decodes one event row into e, with trailing destinations for a
+// query that carries extra columns past eventColumns.
+func scanEventInto(sc scanner, e *storeapi.Event, extra ...any) error {
 	var message sql.NullString
 	var firstMs, lastMs int64
-	if err := sc.Scan(&e.ID, &e.ObjectID, &e.Category, &e.Type, &e.Reason,
-		&message, &e.Detail, &e.Count, &firstMs, &lastMs, &e.ResourceVersion); err != nil {
-		return nil, err
+	dest := append([]any{&e.ID, &e.ObjectID, &e.Category, &e.Type, &e.Reason,
+		&message, &e.Detail, &e.Count, &firstMs, &lastMs, &e.ResourceVersion}, extra...)
+	if err := sc.Scan(dest...); err != nil {
+		return err
 	}
 	e.Message = message.String
 	e.FirstAt = fromMillis(firstMs)
 	e.LastAt = fromMillis(lastMs)
-	return &e, nil
+	return nil
 }
 
 // latestEventRun returns the full newest run for (id, category), or nil if that
@@ -1595,10 +1616,9 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 	return evID, typ, reason, true, nil
 }
 
-func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
+func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) error {
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
-	var result *storeapi.Event
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary; events carries no group/kind to fold in.
 		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
@@ -1614,28 +1634,23 @@ func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id s
 		if err != nil {
 			return err
 		}
-		var row *sql.Row
 		if hasLatest && latestType == ev.Type && latestReason == ev.Reason {
 			// Extend: bump count and window end, re-sample message/detail, advance rv.
-			row = c.QueryRowContext(ctx, `
+			_, err = c.ExecContext(ctx, `
 				UPDATE events SET count = count + 1, last_at = ?, message = ?,
 					detail = ?, resource_version = ?
-				WHERE id = ?
-				RETURNING `+eventColumns, now, ev.Message, jsonText(ev.Detail), rv, latestID)
-		} else {
-			// New run (empty timeline or key changed): count 1, point window.
-			row = c.QueryRowContext(ctx, `
-				INSERT INTO events
-					(object_id, category, type, reason, message, detail,
-					 count, first_at, last_at, resource_version)
-				VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-				RETURNING `+eventColumns,
-				id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
+				WHERE id = ?`, now, ev.Message, jsonText(ev.Detail), rv, latestID)
+			return err
 		}
-		result, err = scanEvent(row)
+		// New run (empty timeline or key changed): count 1, point window.
+		_, err = c.ExecContext(ctx, `
+			INSERT INTO events
+				(object_id, category, type, reason, message, detail,
+				 count, first_at, last_at, resource_version)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+			id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
 		return err
 	})
-	return result, err
 }
 
 // scanEvents decodes all rows of a query into a value slice, closing rows.
@@ -1685,6 +1700,107 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 	return scanEvents(rows)
 }
 
+// EventsSnapshot lists id's runs and reads its log position in one transaction:
+// two reads cannot answer "these runs, as of this position" — whichever order
+// they run in, a write between them is either delivered twice or dropped.
+func (s *sqliteStore) EventsSnapshot(
+	ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery,
+) ([]storeapi.Event, int64, error) {
+	var runs []storeapi.Event
+	var at int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if runs, err = s.EventsList(ctx, id, q); err != nil {
+			return err
+		}
+		at, err = s.EventsMaxVersion(ctx, id)
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return runs, at, nil
+}
+
+// EventsListSince pages id's log above afterRV on idx_events_object_rv.
+//
+// Self-wrapped for ObjectWritesListSince's reason: the page, the horizon and the
+// existence probe must describe one instant, or a sweep landing between them
+// reports a horizon above rows the page already carried.
+func (s *sqliteStore) EventsListSince(
+	ctx context.Context, id storeapi.ObjectID, category *string, afterRV int64, limit int,
+) ([]storeapi.Event, int64, error) {
+	if limit <= 0 {
+		return nil, 0, nil // "LIMIT -1" is unbounded in SQLite
+	}
+	var runs []storeapi.Event
+	var trimmed int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if runs, trimmed, err = s.eventPage(ctx, id, category, afterRV, limit); err != nil {
+			return err
+		}
+		if len(runs) > 0 {
+			return nil // the rows carried the horizon subquery
+		}
+		// No rows carried it, so read it on its own. A horizon proves the object
+		// was there; without one, an empty page still has to tell "quiet" from
+		// "collected" — a log that cascaded with its row is not "no events".
+		if trimmed, err = s.eventHorizon(ctx, id, category); err != nil || trimmed > 0 {
+			return err
+		}
+		return s.checkObjectExists(ctx, id)
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return runs, trimmed, nil
+}
+
+// eventPage reads one page of id's log above afterRV with the horizon carried as
+// a trailing column, which every row repeats — one statement rather than two for
+// the common case. An empty page carries nothing, so its caller reads the
+// horizon on its own.
+func (s *sqliteStore) eventPage(
+	ctx context.Context, id storeapi.ObjectID, category *string, afterRV int64, limit int,
+) ([]storeapi.Event, int64, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT `+eventColumns+`,
+		       coalesce((SELECT MAX(trimmed_through) FROM events_horizon
+		                  WHERE object_id = ?1 AND (?2 IS NULL OR category = ?2)), 0)
+		  FROM events
+		 WHERE object_id = ?1 AND resource_version > ?3
+		 ORDER BY resource_version LIMIT ?4`, id, category, afterRV, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var runs []storeapi.Event
+	var trimmed int64
+	for rows.Next() {
+		var e storeapi.Event
+		if err := scanEventInto(rows, &e, &trimmed); err != nil {
+			return nil, 0, err
+		}
+		runs = append(runs, e)
+	}
+	return runs, trimmed, rows.Err()
+}
+
+// eventHorizon is what retention removed from id's category, or from its highest
+// timeline when category is nil. No row means nothing has been trimmed.
+func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, category *string) (int64, error) {
+	where, args := `object_id = ?`, []any{id}
+	if category != nil {
+		where, args = where+` AND category = ?`, append(args, *category)
+	}
+	var rv sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT MAX(trimmed_through) FROM events_horizon WHERE `+where, args...).Scan(&rv)
+	return rv.Int64, err
+}
+
 // EventsMaxVersion reads the high-water mark of id's event log — a covering seek
 // on idx_events_object_rv, NULL reading as 0. That index exists for this read
 // alone; without it the plan fetches one table row per run, past overflow chains
@@ -1701,39 +1817,60 @@ func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID,
 }
 
 func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error) {
-	var total int64
+	var total int
 	// One transaction so both bounds see the same snapshot and land together.
 	err := s.Within(ctx, func(ctx context.Context) error {
-		c := s.conn(ctx)
 		if perObject > 0 {
 			// Rank runs newest-first per (object, category) and drop past the cap.
-			res, err := c.ExecContext(ctx, `
-				DELETE FROM events WHERE id IN (
-					SELECT id FROM (
-						SELECT id, ROW_NUMBER() OVER (
-							PARTITION BY object_id, category
-							ORDER BY last_at DESC, id DESC) AS rn
-						FROM events
-					) WHERE rn > ?
-				)`, perObject)
+			n, err := s.trimEvents(ctx, `id IN (
+				SELECT id FROM (
+					SELECT id, ROW_NUMBER() OVER (
+						PARTITION BY object_id, category
+						ORDER BY last_at DESC, id DESC) AS rn
+					FROM events
+				) WHERE rn > ?
+			)`, perObject)
 			if err != nil {
 				return err
 			}
-			n, _ := res.RowsAffected()
 			total += n
 		}
 		if maxAge > 0 {
-			cutoff := toMillis(time.Now().UTC().Add(-maxAge))
-			res, err := c.ExecContext(ctx, `DELETE FROM events WHERE last_at < ?`, cutoff)
+			n, err := s.trimEvents(ctx, `last_at < ?`, toMillis(time.Now().UTC().Add(-maxAge)))
 			if err != nil {
 				return err
 			}
-			n, _ := res.RowsAffected()
 			total += n
 		}
 		return nil
 	})
-	return int(total), err
+	return total, err
+}
+
+// trimEvents deletes the runs matching where and raises each affected timeline's
+// horizon to the highest version it removed there.
+//
+// The horizon is recorded BEFORE the delete, from the same predicate in the same
+// transaction: RETURNING would give the same answer, but at the cost of
+// materialising every deleted run and holding a half-read cursor on the single
+// connection between two statements of one transaction.
+func (s *sqliteStore) trimEvents(ctx context.Context, where string, args ...any) (int, error) {
+	c := s.conn(ctx)
+	if _, err := c.ExecContext(ctx, `
+		INSERT INTO events_horizon (object_id, category, trimmed_through)
+		SELECT object_id, category, MAX(resource_version) FROM events
+		 WHERE `+where+`
+		 GROUP BY object_id, category
+		    ON CONFLICT(object_id, category) DO UPDATE SET trimmed_through = excluded.trimmed_through
+		 WHERE excluded.trimmed_through > events_horizon.trimmed_through`, args...); err != nil {
+		return 0, err
+	}
+	res, err := c.ExecContext(ctx, `DELETE FROM events WHERE `+where, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (bool, error) {
