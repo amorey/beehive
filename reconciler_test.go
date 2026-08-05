@@ -2799,6 +2799,12 @@ func (c *depObserver) settle(t *testing.T, ctx context.Context, bh *Beehive, cli
 func queuedFor(q *workQueue, id ObjectID) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	return queuedForLocked(q, id)
+}
+
+// queuedForLocked is queuedFor with q.mu already held, for a caller reading it
+// alongside another field of the queue in one observation.
+func queuedForLocked(q *workQueue, id ObjectID) bool {
 	if _, dirty := q.gauge.dirty[id]; dirty {
 		return true
 	}

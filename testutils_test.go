@@ -912,14 +912,16 @@ func queuedIDs(q *workQueue) []ObjectID {
 }
 
 // awaitQueueIdle blocks until id is neither queued nor in flight, so a following
-// step cannot be served by a pass that was already running.
+// step cannot be served by a pass that was already running. Both halves are read
+// in one lock hold: released between them, the worker moving id from items to
+// processing would read as idle.
 func awaitQueueIdle(t *testing.T, q *workQueue, id ObjectID) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		q.mu.Lock()
+		defer q.mu.Unlock()
 		_, busy := q.processing[id]
-		q.mu.Unlock()
-		return !busy && !queuedFor(q, id)
+		return !busy && !queuedForLocked(q, id)
 	}, testTimeout, time.Millisecond, "object %d never went idle", id)
 }
 
