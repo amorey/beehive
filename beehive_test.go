@@ -152,6 +152,35 @@ func TestSweepReconcileOwedKeepsRegisteredKinds(t *testing.T) {
 	assert.ElementsMatch(t, []GroupKind{widget, drone}, recv(t, store.kept))
 }
 
+// The reclaim runs on every GC tick, so emitting would wake every tailer and the
+// dependency waker for a write no consumer can act on. The control write after
+// the sweep is what makes the absence assertable: an emitting reclaim would put
+// the swept object ahead of it in the stream.
+func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	looseGK := GroupKind{Kind: "ClientOnlyDep"}
+	loose := NewClient[cSpec, cStatus](bh, looseGK)
+	swept := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "swept"})
+	target := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "target"})
+	// The production stamp: a new depends_on edge owes swept a reconcile no loop
+	// will ever run.
+	_, err = bh.store.EdgesAdd(ctx, swept.ID, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+
+	_, ch, err := loose.WatchList(ctx)
+	require.NoError(t, err)
+
+	bh.reconcileOwedReclaimSweep(ctx)
+	control := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "control"})
+
+	ev := recv(t, ch)
+	assert.Equal(t, control.ID, ev.Object.ID, "the reclaim must not reach the change stream")
+}
+
 // The GC sweeper's three steps run together on every tick, so a store that grows a
 // freelist through the first two gets it drained by the third without a cadence of
 // its own.
