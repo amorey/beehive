@@ -105,14 +105,16 @@ One store verb, one call site, riding the existing partial index.
 ### Store surface
 
 Add to `storeapi.Store`, listed alphabetically within the `ReconcileOwed*`
-family (so: `Clear`, `Decrement`, `ListIDs`, `Stamp`):
+family (so: `Decrement`, `ListIDs`, `Stamp`, `Sweep`). The verb was `Clear` when
+this spec was written; review renamed it to join `EventsSweep`/`ObjectWritesSweep`,
+the other two GC-tick bulk trims, which is also why it returns `int`:
 
 ```go
-// ReconcileOwedClear zeroes reconcile_owed for every object whose kind is not
+// ReconcileOwedSweep zeroes reconcile_owed for every object whose kind is not
 // in keep, and returns how many rows it cleared. An empty keep clears every
 // nonzero row, which is correct: with no reconcilers, nothing consumes a count.
 // Bumps no resource_version and appends no write-log entry.
-ReconcileOwedClear(ctx context.Context, keep []GroupKind) (int64, error)
+ReconcileOwedSweep(ctx context.Context, keep []GroupKind) (int, error)
 ```
 
 `keep` rather than an exclude list reads better at the call site and matches
@@ -142,7 +144,8 @@ UPDATE objects SET reconcile_owed = 0
   no equality constraint here, so this is a preference, not a certainty — pin
   it with an EQP assertion (see **Tests**) rather than asserting it in a
   comment.
-- Return `res.RowsAffected()`.
+- Return `res.RowsAffected()`, discarding its error like the four other call
+  sites do — modernc caches the count and it never errors.
 
 ### Call site
 
@@ -150,17 +153,17 @@ UPDATE objects SET reconcile_owed = 0
 `freePagesSweep`, so anything it frees is released on the same tick:
 
 ```go
-bh.reconcileOwedReclaimSweep(ctx)
+bh.reconcileOwedSweep(ctx)
 ```
 
 The sweep itself mirrors `freePagesSweep` — best-effort, warn and swallow,
 retried on the next tick, and logging what it actually did:
 
 ```go
-// reconcileOwedReclaimSweep zeroes the owed count on rows whose kind has no
+// reconcileOwedSweep zeroes the owed count on rows whose kind has no
 // reconcile loop, which nothing else drains. See docs/adr/<file>.
-func (bh *Beehive) reconcileOwedReclaimSweep(ctx context.Context) {
-	cleared, err := bh.store.ReconcileOwedClear(ctx, bh.registeredKinds())
+func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
+	cleared, err := bh.store.ReconcileOwedSweep(ctx, bh.registeredKinds())
 	if err != nil {
 		bh.log().Warn("reconcile-owed reclaim failed; retry next sweep", "err", err)
 		return
@@ -235,7 +238,7 @@ Beehive level, `beehive_test.go`, where the other sweeps are tested:
 - **Empty `keep` in production shape**: a `Beehive` with zero registered
   controllers sweeping counts left by a prior process. This is the path that
   exercises the dropped `NOT IN` clause.
-- A failing `ReconcileOwedClear` is warned and swallowed, and the other sweeps
+- A failing `ReconcileOwedSweep` is warned and swallowed, and the other sweeps
   in the same tick still run.
 
 Whitebox in `package beehive`, `require` for preconditions, `assert` for
@@ -253,7 +256,7 @@ that do not care about it.
   Link it from `docs/adr/README.md`.
 - `internal/storeapi/storeapi.go:180` — the `ReconcileOwed` field godoc says the
   count is "moved only by EdgesAdd's stamp, ReconcileOwedStamp and
-  ReconcileOwedDecrement". Add `ReconcileOwedClear`.
+  ReconcileOwedDecrement". Add `ReconcileOwedSweep`.
 - `CLAUDE.md` — the GC bullet, which lists what the global sweeper does.
 - `docs/TODO.md` — delete the "client-only dependent's `reconcile_owed` count is
   never reclaimed" entry (lines ~328–361). Its "gating the stamp is the wrong

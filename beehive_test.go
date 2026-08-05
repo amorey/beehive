@@ -125,35 +125,29 @@ type owedClearStore struct {
 	err  error
 }
 
-func (s *owedClearStore) ReconcileOwedClear(_ context.Context, keep []GroupKind) (int64, error) {
+func (s *owedClearStore) ReconcileOwedSweep(_ context.Context, keep []GroupKind) (int, error) {
 	select {
 	case s.kept <- keep:
 	default:
 	}
-	if s.err != nil {
-		return 0, s.err
-	}
-	return int64(len(keep)), nil
+	return 0, s.err
 }
 
 // The reclaim keeps exactly the kinds that have a reconcile loop to drain their
-// count; every other kind's count is owed to nobody.
+// count.
 func TestSweepReconcileOwedKeepsRegisteredKinds(t *testing.T) {
 	store := &owedClearStore{Store: &fakeStore{}, kept: make(chan []GroupKind, 4)}
 	bh := newTestBeehive(t, store)
 	widget, drone := GroupKind{Kind: "Widget"}, GroupKind{Kind: "Drone"}
-	_, err := Register(bh, widget, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
-	_, err = Register(bh, drone, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
+	registerNoop[tSpec, tStatus](t, bh, widget)
+	registerNoop[tSpec, tStatus](t, bh, drone)
 
-	bh.reconcileOwedReclaimSweep(context.Background())
+	bh.reconcileOwedSweep(context.Background())
 
 	assert.ElementsMatch(t, []GroupKind{widget, drone}, recv(t, store.kept))
 }
 
-// A failed reclaim must not cost the tick: the sweeps after it still run, and the
-// next tick retries. Nothing is incorrect while a count goes unreclaimed.
+// A failed reclaim must not cost the tick: the sweeps after it still run.
 func TestSweepReconcileOwedFailureIsNotFatal(t *testing.T) {
 	owed := &owedClearStore{Store: &fakeStore{}, kept: make(chan []GroupKind, 4), err: errBoom}
 	store := &freePagesStore{Store: owed, called: make(chan int, 4)}
@@ -175,42 +169,39 @@ func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-	looseGK := GroupKind{Kind: "ClientOnlyDep"}
-	loose := NewClient[cSpec, cStatus](bh, looseGK)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
 	swept := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "swept"})
 	target := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "target"})
 	// The production stamp: a new depends_on edge owes swept a reconcile no loop
 	// will ever run.
-	_, err = bh.store.EdgesAdd(ctx, swept.ID, target.ID, RelationDependsOn)
+	_, err := bh.store.EdgesAdd(ctx, swept.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 
 	_, ch, err := loose.WatchList(ctx)
 	require.NoError(t, err)
 
-	bh.reconcileOwedReclaimSweep(ctx)
+	bh.reconcileOwedSweep(ctx)
 	control := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "control"})
 
 	ev := recv(t, ch)
 	assert.Equal(t, control.ID, ev.Object.ID, "the reclaim must not reach the change stream")
 }
 
-// A Beehive with no controllers at all reclaims every count, which is the arm
-// that drops the NOT IN clause. The counts here are left by a prior process:
-// nothing in this one consumes them.
+// A Beehive with no controllers at all reclaims every count: the counts here are
+// left by a prior process, and nothing in this one consumes them.
 func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
-	loose := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnlyDep"})
+	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
 	from := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "from"})
 	to := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "to"})
 	res, err := bh.store.EdgesAdd(ctx, from.ID, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.True(t, res.ReconcileOwedStamped, "the edge must owe a reconcile to begin with")
 
-	bh.reconcileOwedReclaimSweep(ctx)
+	bh.reconcileOwedSweep(ctx)
 
 	raw, err := store.ObjectsGet(ctx, from.ID)
 	require.NoError(t, err)

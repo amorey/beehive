@@ -492,13 +492,10 @@ type staleDependents struct {
 }
 
 func (bh *Beehive) staleDependentsRun(ctx context.Context) {
-	if len(bh.order) == 0 {
-		return
-	}
 	// order is frozen after Start, so the kind list is built once.
-	kinds := make([]GroupKind, 0, len(bh.order))
-	for _, r := range bh.order {
-		kinds = append(kinds, r.gk)
+	kinds := bh.registeredKinds()
+	if len(kinds) == 0 {
+		return
 	}
 	sd := &staleDependents{bh: bh, kinds: kinds}
 	driver.Run(ctx, bh.staleDependentsInterval, func(ctx context.Context) bool {

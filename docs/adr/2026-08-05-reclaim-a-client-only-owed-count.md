@@ -19,8 +19,8 @@ which is not the same as harmless.
 ## Decision
 
 Zero the count for kinds with no reconcile loop, on the GC sweeper's existing
-cadence. One store verb, `ReconcileOwedClear(ctx, keep)`, called by
-`reconcileOwedReclaimSweep` with the registered kinds.
+cadence. One store verb, `ReconcileOwedSweep(ctx, keep)`, called by
+`reconcileOwedSweep` with the registered kinds.
 
 **Safe because the count is redundant with the dependency watermark.**
 

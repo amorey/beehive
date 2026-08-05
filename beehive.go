@@ -212,7 +212,7 @@ func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 		bh.deletionPendingSweep(ctx)
 		bh.eventRetentionSweep(ctx)
 		bh.writeLogRetentionSweep(ctx)
-		bh.reconcileOwedReclaimSweep(ctx)
+		bh.reconcileOwedSweep(ctx)
 		bh.freePagesSweep(ctx)
 		return true
 	})
@@ -240,12 +240,11 @@ func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
 	}
 }
 
-// reconcileOwedReclaimSweep zeroes the owed count on rows whose kind has no
-// reconcile loop, which nothing else drains. The count is redundant with the
-// dependency watermark, which is what makes dropping it safe.
+// reconcileOwedSweep zeroes the owed count on rows whose kind has no reconcile
+// loop, which nothing else drains.
 // See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
-func (bh *Beehive) reconcileOwedReclaimSweep(ctx context.Context) {
-	cleared, err := bh.store.ReconcileOwedClear(ctx, bh.registeredKinds())
+func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
+	cleared, err := bh.store.ReconcileOwedSweep(ctx, bh.registeredKinds())
 	if err != nil {
 		bh.log().Warn("reconcile-owed reclaim failed; retry next sweep", "err", err)
 		return
