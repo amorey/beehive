@@ -47,25 +47,11 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
 }
 
-// finalizerPushFixture registers a no-op controller and hands back its client,
-// its ControllerClient and its reconciler, for the tests that assert what a
-// finalizer removal queues. The loops are never started: the queue is the
-// observation, not a reconcile.
-func finalizerPushFixture(t *testing.T) (Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
-	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t))
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-	r, ok := bh.reconcilerFor(clientTestGK)
-	require.True(t, ok)
-	return NewClient[cSpec, cStatus](bh, clientTestGK), cc, r
-}
-
 // Clearing the last finalizer is the one route out of a finalizer-blocked
 // collect, so it pushes rather than waiting out a GC tick.
 func TestFinalizersDeletePushesTheCollect(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := finalizerPushFixture(t)
+	client, cc, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -91,7 +77,7 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			client, cc, r := finalizerPushFixture(t)
+			client, cc, r := specWriteFixture(t)
 
 			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(tt.finalizers...))
 			if tt.deleting {
@@ -110,7 +96,7 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 // transaction still commits.
 func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := finalizerPushFixture(t)
+	client, cc, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -140,8 +126,7 @@ func TestFinalizersDeletePushesNothingOnWrongKind(t *testing.T) {
 	require.NoError(t, err)
 	gadgetGK := GroupKind{Kind: "Gadget"}
 	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
-	gadgetR, ok := bh.reconcilerFor(gadgetGK)
-	require.True(t, ok)
+	gadgetR := mustReconciler(t, bh, gadgetGK)
 
 	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
 	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))

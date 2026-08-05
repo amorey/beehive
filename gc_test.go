@@ -905,8 +905,9 @@ func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
 	waitForDeletions(t, w, target.ID)
 }
 
-// The pull path under this push: clearing through the store issues none, which
-// leaves the sweeper's tick as the only thing that can collect the row.
+// The pull path under this push: TestIntegrationGCDeletesAfterFinalizerCleared
+// clears through a controller, so it now passes via the push. Clearing through
+// the store issues none, leaving the sweeper's tick as the only collector.
 func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

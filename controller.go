@@ -143,10 +143,9 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 	return err
 }
 
-// FinalizersDelete pushes the collect the removal unblocks. Immediate: the gate
-// is a transition that lands once per object, so cancelling a pending alarm can
-// never become a repeat. The push is a probe — gcCollect still re-checks the
-// RESTRICT block a referrer holds.
+// Clearing the last finalizer on a deleting row pushes the collect it unblocks;
+// gcCollect still re-checks the RESTRICT block. See
+// docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md.
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
 	clearedLast, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
 	if err := c.wakeAfter(ctx, err); err != nil {

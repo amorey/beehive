@@ -190,19 +190,25 @@ func (q *workQueue) setFloor(d time.Duration) {
 	q.gate = rategate.New[ObjectID](d)
 }
 
-// forget ends id's processing and drops what is queued for it: the re-add a wake
-// left behind and the floor entry. For an id nothing can act on again — a row
-// the pass collected, since ids are never reused — and for draining the queue.
-// clearDirty before done, or done would re-queue what this just dropped.
+// forget ends id's processing and drops everything the queue holds for it: a
+// re-add that arrived mid-pass, a pending alarm and the floor entry. For an id
+// nothing can act on again — ids are never reused, so a row the pass collected
+// can only read back ErrNotFound.
 func (q *workQueue) forget(id ObjectID) {
 	var pending pendingSend
 	q.mu.Lock()
+	if a := q.gauge.alarmFor(id); a != nil {
+		a.timer.Stop()
+		if s, ok := q.gauge.clearAlarm(id); ok {
+			pending.put(s)
+		}
+	}
 	if s, ok := q.gauge.clearDirty(id); ok {
 		pending.put(s)
 	}
 	q.gate.Forget(id)
+	delete(q.processing, id)
 	q.mu.Unlock()
-	q.done(id)
 	q.publish(id, pending)
 }
 

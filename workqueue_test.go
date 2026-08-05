@@ -227,10 +227,12 @@ func TestWorkQueueForgetDropsAQueuedReAdd(t *testing.T) {
 	_, ok := q.get()
 	require.True(t, ok)
 
-	q.add(7) // a wake arrives while the collect is committing
+	q.add(7)                                    // a wake arrives while the collect is committing
+	q.addAfter(7, time.Hour, alarmRequeueAfter) // and an alarm outlives the pass
 	q.forget(7)
 
 	assert.Empty(t, queuedIDs(q))
+	assert.Zero(t, q.scheduleAt(7), "nothing is left scheduled for a collected id")
 	_, ok = q.get()
 	assert.False(t, ok, "a collected id is never dispatched again")
 }
