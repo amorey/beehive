@@ -341,7 +341,7 @@ func TestDependencyRequeue(t *testing.T) {
 // afterRead, when set, runs between the read and the settle. That is where the
 // in-band race lives: the controller declares the edge there, and the test parks
 // it to land a change to the target inside the window. Left nil the controller
-// only observes, which is the out-of-band spelling — there the declaration is the
+// only observes, which is the outside-a-reconcile spelling — there the declaration is the
 // embedding application's, not a reconcile's.
 type dependentController struct {
 	client   Client[tSpec, tStatus]
@@ -465,7 +465,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	}
 }
 
-// TestDependencyRequeueRaceOnOutOfBandDeclare is the out-of-band mirror of
+// TestDependencyRequeueRaceOnDeclareOutsideReconcile is the mirror of
 // TestDependencyRequeueRaceOnDeclare: the same read-then-declare window, but with
 // the two halves in different goroutines. The embedding application declares the
 // edge through the ControllerClient Register handed it, after its own read of the
@@ -476,7 +476,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 // with fromID already settled, so a change that landed before the commit reaches
 // nobody and nothing re-derives it. With the full pass disabled the dependent holds a
 // stale read forever, with no error, no condition and no log line.
-func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
+func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	ctx := context.Background()
 	db, err := sqlite.OpenMemory()
 	require.NoError(t, err)
@@ -522,7 +522,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	}
 
 	// The application changes the target and only then declares the edge — the
-	// out-of-band spelling of read-then-declare. Waiting for the waker's lookup
+	// outside-a-reconcile spelling of read-then-declare. Waiting for the waker's lookup
 	// makes the window deterministic: with no edge yet it comes back empty, so the
 	// change is already unclaimed by the time DependenciesAdd commits.
 	store.resetLooked()
@@ -558,7 +558,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 //
 // The two repros above are about *deriving* the wake; this one is about
 // surviving it. Its diagnostic value lands once the edge-triggered wake exists:
-// at that point the out-of-band repro passes while this one still fails, and the
+// at that point the outside-a-reconcile repro passes while this one still fails, and the
 // failure means exactly one thing — the signal was in-memory only. Until then it
 // fails for the same reason they do, which is why all three are skipped together.
 //
@@ -613,14 +613,14 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 
 	// --- the crash window: both writes commit, the wake reaches nobody ---
 	// The target changes and only then is the edge declared, so the change is
-	// already unclaimed when the edge appears — the out-of-band race. The
+	// already unclaimed when the edge appears — the outside-a-reconcile race. The
 	// ControllerClient outlives the control plane (it holds the store, not the
 	// loops), so the declaration commits normally with no running queue to reach.
 	err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
-	// --- second process over the same store ---
+	// --- the restart: a second process, the first already stopped ---
 	bh2, err := New(db)
 	require.NoError(t, err)
 	ctrl2 := &dependentController{
@@ -3419,7 +3419,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	// --- second process over the same store ---
+	// --- the restart: a second process, the first already stopped ---
 	bh2, err := New(db, withDependencyWakerOff())
 	require.NoError(t, err)
 	ctrl2 := &dependentController{

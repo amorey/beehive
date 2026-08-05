@@ -164,8 +164,7 @@ func resolveCreate(opts []Option) (*createOptions, error) {
 // ControllerClient.FinalizersDelete can clear a finalizer, so one no controller
 // here can remove would leave the row deletion-pending forever, RESTRICT-
 // blocking its owner's delete. The check is process-local and evaluated at call
-// time — the store tracks no registrations — so register the kind first, from
-// whichever process creates these rows.
+// time — the store tracks no registrations — so register the kind first.
 func WithFinalizers(f ...string) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {
@@ -354,8 +353,8 @@ func withWatchScanMinInterval(d time.Duration) Option {
 }
 
 // withWatchFloorInterval sets how often a kind's tailer reads the log without
-// a wake. The wake covers this process's own writes; the floor covers what a
-// wake cannot — a writer in another process, a failed step, a retention trim.
+// a wake. The wake covers writes made through this Beehive; the floor covers
+// what a wake cannot — a failed step, a retention trim.
 // Global and meaningful only at New, unexported for the same reason as
 // withWatchPollInterval. Cannot be disabled: d <= 0 is rejected with
 // ErrInvalidOption.
