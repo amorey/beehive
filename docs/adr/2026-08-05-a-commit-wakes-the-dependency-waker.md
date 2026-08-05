@@ -86,11 +86,13 @@ optimisation over the stale-dependents pass, `persist` writes the current
 watermark rather than a delta, and a crash with a ≤1s-stale cursor replays wakes
 that are idempotent.
 
-**The gate sits ahead of the retry skip ladder, not just ahead of the write.**
-`persistSkips` decrements per persist call, so a gate below it would let refused
-passes burn skips at the wake rate and `wakePersistRetryCap` would collapse from
-a minute to a few seconds — the backoff shrinking during exactly the outage it
-exists for.
+**The gate sits ahead of the retry ladder, not just ahead of the write.**
+*(Amended 2026-08-05.)* The ladder was a count of persists sat out, which made
+its ordering against the gate load-bearing: below it, refused passes would burn
+skips at the wake rate. It is a delay now, for the reason in
+[the wake-driven ADR](2026-08-05-the-waker-is-wake-driven.md) — a pass costs a
+scan, so a ladder counted in passes reads a store that is already failing its
+writes — and the ordering is no longer what protects it.
 
 ### `wakeScanPagesPerPass` drops from 16 to 4
 

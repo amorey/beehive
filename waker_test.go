@@ -448,6 +448,26 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		assert.Equal(t, wakeIdle, next, "once the write lands there is nothing left to look again for")
 	})
 
+	t.Run("a failing cursor write paces the retry in time, not in passes", func(t *testing.T) {
+		store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
+		dw, clk, _ := seededWaker(store, widget)
+
+		// A minute of it, each pass waiting exactly what it asked for. Every
+		// pass costs a scan, so a ladder counted in passes would spend the
+		// minute reading a store that is already failing its writes.
+		var elapsed time.Duration
+		passes := 0
+		for elapsed < time.Minute {
+			next, _ := dw.pass(ctx, clk.now(), false)
+			require.Positive(t, next, "a cursor write still owed is a reason to look again")
+			clk.advance(next)
+			elapsed += next
+			passes++
+		}
+		assert.Less(t, passes, 10, "the retry backs off in time rather than looking every floor")
+		assert.Equal(t, passes, store.setAttempts, "and every pass it does make attempts the write")
+	})
+
 	t.Run("a disabled throttle drains without pausing", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
 		dw, _, _ := seededWaker(store, widget)
@@ -995,21 +1015,8 @@ func TestResumeWatermark(t *testing.T) {
 	}
 }
 
-// The retry ladder, straight rather than through 60-odd scan ticks: immediate
-// after the first failure, doubling, then flat at the cap — including for a
-// streak long enough that the shift itself would overflow if it were taken.
-func TestWakePersistRetrySkips(t *testing.T) {
-	assert.Equal(t, 0, wakePersistRetrySkips(1), "the first retry is immediate")
-	assert.Equal(t, 1, wakePersistRetrySkips(2))
-	assert.Equal(t, 3, wakePersistRetrySkips(3))
-	assert.Equal(t, 31, wakePersistRetrySkips(6))
-	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(7), "the ladder reaches the cap")
-	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(8), "and stays there")
-	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(1000), "however long the streak runs")
-}
-
-// The cursor write is floored by a cadence of its own: it is the unit
-// wakePersistRetryCap counts in, so it must not move when the scan floor does.
+// The cursor write is floored by a cadence of its own: it paces a write on the
+// connection every commit needs, so it must not move when the scan floor does.
 func TestWakerPersistFloorIsItsOwnCadence(t *testing.T) {
 	dw, _ := wakerOver(&replayStore{}, GroupKind{Kind: "Widget"})
 	dw.bh.wakeScanMinInterval = time.Hour
@@ -1066,8 +1073,8 @@ func TestWakerRetriesPersistOnAFailedWrite(t *testing.T) {
 
 // A write that fails forever — a read-only or full database — must not become a
 // doomed round trip and a warning every second. Holding persisted is what makes
-// the retry happen at all, so nothing here stops retrying; the streak is what
-// paces it, and what keeps the log to one line about one cause.
+// the retry happen at all, so nothing here stops retrying; the ladder is what
+// paces it, and the streak is what keeps the log to one line about one cause.
 func TestWakerBacksOffAFailingPersist(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
@@ -1076,8 +1083,8 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 	dw.bh.logger = logger
 	dw.seeded = true
 
-	// A tick is a floor apart, which is what makes the skip ladder below a
-	// count of seconds rather than a count of passes.
+	// A pass a floor apart, which is the shape a busy system produces: the
+	// ladder is a delay, so most of these find the retry still closed.
 	const ticks = 30
 	for range ticks {
 		dw.scan(context.Background())

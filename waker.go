@@ -66,10 +66,12 @@ type waker struct {
 	// DriverCursorsSet would discard anyway.
 	persisted int64
 
-	// persistFailures counts the current streak of failed cursor writes;
-	// persistSkips is how many persists to sit out before the next attempt.
+	// persistFailures counts the current streak of failed cursor writes, so the
+	// log carries one line per cause; persistRetry paces the attempts and
+	// persistOpensAt is when the next one is worth making.
 	persistFailures int
-	persistSkips    int
+	persistRetry    driver.Backoff
+	persistOpensAt  time.Time
 
 	// seeded says watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero.
@@ -87,11 +89,11 @@ const cursorNameWaker = "dependency_waker"
 // cursor value, so it cannot double as the sentinel.
 const noStoredCursor = int64(-1)
 
-// wakePersistRetryCap bounds the backoff between retries of a failing cursor
-// write, in persists sat out — a minute at the default persist interval. It reads
-// as seconds only because persistGate floors a persist *attempt* at that
-// interval, which is why the gate is consulted before the skip ladder.
-const wakePersistRetryCap = 60
+// wakePersistRetryMax bounds the backoff between retries of a failing cursor
+// write. Every attempt costs the pass that carries it, so a ladder in time is
+// what keeps a store that cannot accept the write from being read once a floor
+// for as long as it stays broken.
+const wakePersistRetryMax = time.Minute
 
 // wakeRetryBase is the first delay after a failed scan; it doubles up to the
 // stale-dependents cadence, past which a retry only re-derives what that pass
@@ -181,10 +183,14 @@ func (dw *waker) run(ctx context.Context) {
 func newWaker(bh *Beehive) *waker {
 	cursors, _ := bh.store.(DriverCursorer)
 	return &waker{
-		bh:          bh,
-		cursors:     cursors,
-		now:         time.Now,
-		retry:       driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
+		bh:      bh,
+		cursors: cursors,
+		now:     time.Now,
+		retry:   driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
+		persistRetry: driver.Backoff{
+			Base: max(bh.wakePersistInterval, wakeRetryBase),
+			Max:  wakePersistRetryMax,
+		},
 		scanGate:    rategate.New[struct{}](bh.wakeScanMinInterval),
 		persistGate: rategate.New[struct{}](bh.wakePersistInterval),
 	}
@@ -216,19 +222,26 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 	}
 	// A refused cursor write is a reason of its own: the wakes are queued
 	// either way, but a successor that finds no row reseeds at the mark and
-	// skips everything committed while this process was down. The floor is the
-	// unit the persist retry ladder counts in, so retrying at it is what that
-	// ladder was calibrated against.
-	if dw.persistOutstanding() {
-		return max(dw.bh.wakePersistInterval, wakeRetryBase), false
+	// skips everything committed while this process was down.
+	if wait, owed := dw.persistWait(now); owed {
+		return wait, false
 	}
 	return wakeIdle, false
 }
 
-// persistOutstanding says the cursor row still sits below the watermark, so a
-// write is owed. False for a store that persists no cursor at all.
-func (dw *waker) persistOutstanding() bool {
-	return dw.cursors != nil && dw.watermark > dw.persisted
+// persistWait reports how long until a cursor write is worth attempting again,
+// and whether one is owed at all. Both pacers count, since the pass that
+// carries the attempt costs a scan: the gate floors every attempt, the retry
+// ladder paces a failing one.
+func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
+	if dw.cursors == nil || dw.watermark <= dw.persisted {
+		return 0, false
+	}
+	wait := dw.persistOpensAt.Sub(now)
+	if opensAt, held := dw.persistGate.OpensAt(wakerGateKey, now); held {
+		wait = max(wait, opensAt.Sub(now))
+	}
+	return max(wait, wakeRetryBase), true
 }
 
 // wakeIdle is pass's "no reason to look again": the loop arms nothing.
@@ -385,19 +398,16 @@ func (dw *waker) persist(ctx context.Context) {
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return
 	}
-	// Ahead of the skip ladder, not just ahead of the write: a gate below it
-	// would let refused passes burn skips at the wake rate, which is what turns
-	// wakePersistRetryCap from a minute into a handful of seconds.
-	if _, held := dw.persistGate.Allow(wakerGateKey, dw.now()); held {
+	now := dw.now()
+	if _, held := dw.persistGate.Allow(wakerGateKey, now); held {
 		return
 	}
-	if dw.persistSkips > 0 {
-		dw.persistSkips--
+	if now.Before(dw.persistOpensAt) {
 		return
 	}
 	if err := dw.cursors.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
 		dw.persistFailures++
-		dw.persistSkips = wakePersistRetrySkips(dw.persistFailures)
+		dw.persistOpensAt = now.Add(dw.persistRetry.Next())
 		if dw.persistFailures > 1 {
 			dw.bh.log().DebugContext(ctx, "persisting the dependency waker's cursor failed again",
 				"watermark", dw.watermark, "failures", dw.persistFailures, "err", err)
@@ -410,18 +420,10 @@ func (dw *waker) persist(ctx context.Context) {
 	if dw.persistFailures > 0 {
 		dw.bh.log().InfoContext(ctx, "dependency waker's cursor is being persisted again",
 			"watermark", dw.watermark, "failures", dw.persistFailures)
-		dw.persistFailures, dw.persistSkips = 0, 0
+		dw.persistFailures, dw.persistOpensAt = 0, time.Time{}
+		dw.persistRetry.Reset()
 	}
 	dw.persisted = dw.watermark
-}
-
-// wakePersistRetrySkips is how many persists to sit out after `failures`
-// consecutive failures: none after the first, then doubling to a cap.
-func wakePersistRetrySkips(failures int) int {
-	if failures >= 8 { // 1<<7 - 1 is already past the cap
-		return wakePersistRetryCap
-	}
-	return min(1<<(failures-1)-1, wakePersistRetryCap)
 }
 
 // dependentsWake queues every object that depends_on one of the page's targets,

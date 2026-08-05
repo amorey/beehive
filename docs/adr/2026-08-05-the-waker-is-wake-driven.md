@@ -45,10 +45,18 @@ answers "idle" with the cursor row still behind the watermark. Under the tick
 that was retried within a second; wake-driven, the next commit would be the only
 retry, and a process that seeds, fails to persist and then stops leaves its
 successor to reseed at the mark — skipping everything committed while it was
-down, exactly the gap the durable cursor exists to close. So `pass` treats a row
-below the watermark as a reason of its own and re-arms at `wakePersistInterval`,
-which is the unit `wakePersistRetryCap` counts in and therefore the cadence that
-ladder was calibrated against. It stops the moment the write lands.
+down, exactly the gap the durable cursor exists to close. So `pass` treats a row below
+the watermark as a reason of its own and re-arms for when the write is next
+worth attempting. It stops the moment the write lands.
+
+The retry ladder had to become a **delay** for that to be affordable. It counted
+persists sat out, which was sound under a tick that was going to run anyway;
+wake-driven, the only thing that carries a persist attempt is a pass, and a pass
+costs an `ObjectWritesListSinceAll`. A count of 60 would mean 60 scans of a store
+that is already refusing its writes — the heartbeat this ADR removes, reinstated
+in the one condition where the store can least afford it. `persistRetry` is a
+`driver.Backoff` from the persist floor to a minute, and `persistWait` re-arms
+for whichever of the two pacers is further out.
 
 ### Stopping the timer is part of going idle
 
@@ -61,8 +69,8 @@ the rule is a pure function with a table test rather than a loop test.
 
 ### Two knobs the tick was standing in for
 
-`wakeInterval` also floored the cursor write, and through it decided what
-`wakePersistRetryCap` meant in seconds. That floor is now
+`wakeInterval` also floored the cursor write, and through it decided what the
+persist retry ladder meant in seconds. That floor is now
 `wakePersistInterval` (1s, unchanged in value). And `wakeInterval <= 0` used to
 mean "no waker at all", which needed to stop being a cadence: `withDependencyWakerOff`
 says it directly.

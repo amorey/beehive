@@ -49,8 +49,8 @@ const (
 	// docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
 	defaultWakeScanMinInterval = 100 * time.Millisecond
 	// defaultWakePersistInterval floors the waker's cursor write, which lands on
-	// the connection every commit needs. It is the unit wakePersistRetryCap
-	// counts in.
+	// the connection every commit needs. It is also where the retry ladder for a
+	// failing one starts.
 	defaultWakePersistInterval = 1 * time.Second
 	// defaultMinRequeueInterval floors the gap between two dispatches of one
 	// object. It is the whole of what bounds a dependency cycle now that the
@@ -497,14 +497,16 @@ func (bh *Beehive) signalRequeueManyNow(ctx context.Context, refs []ObjectRef) {
 	})
 }
 
-// signalKindWritten wakes gk's tailer once a write to gk commits. The signal is
-// the kind, never the object: the tailer holds one cursor for the kind and reads
-// the log to learn what moved, so it carries no id and a burst of writes to one
-// kind collapses into one. AfterCommit for the same reasons as
+// signalKindWritten wakes gk's tailer and the dependency waker once a write to
+// gk commits. The signal is the kind, never the object: each holds its own
+// cursor and reads the log to learn what moved, so it carries no id and a burst
+// of writes to one kind collapses into one. AfterCommit for the same reasons as
 // signalRequeue: a rollback publishes nothing, and the wake cannot arrive before
 // the row is readable. Callers check that the write changed something only where
-// the store already reports it — an extra wake costs one position read, a missed
-// one costs up to a floor tick of staleness.
+// the store already reports it — an extra wake costs one position read; a missed
+// one costs a watch up to the floor tick, and a dependent up to the
+// stale-dependents pass, which is the waker's only backstop now that it has no
+// tick.
 func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		_ = bh.kindWriteHub.Send(gk) // ErrClosed after stop; nothing is left to wake
