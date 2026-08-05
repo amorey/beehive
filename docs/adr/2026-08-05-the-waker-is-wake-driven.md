@@ -90,5 +90,7 @@ whose cadence *is* the latency target.
   the amendment in
   [the drivers ADR](2026-07-28-periodic-scan-drivers.md).
 - **A test that changes an object by writing to the `Store` directly must
-  publish the wake itself.** Three did; they call `bh.signalKindWritten` where a
-  client write would have.
+  publish the wake itself.** The two that could moved onto the in-band write
+  (`ControllerClient.ConditionsSet`, which publishes for itself); the two whose
+  target is a client-only kind call `bh.signalKindWritten` by hand, because
+  `Client` has no conditions write to make.

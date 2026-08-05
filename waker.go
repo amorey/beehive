@@ -43,9 +43,7 @@ type waker struct {
 	// now is the waker's only clock, so the rate tests drive it by hand.
 	now func() time.Time
 
-	// retry is the delay after a failed scan. The waker has no other reason to
-	// look again on its own, so a pass that fails without re-arming this would
-	// wedge until the next commit wake — which backingOff drops.
+	// retry is the delay after a failed scan, and the loop's only timer.
 	retry driver.Backoff
 
 	// persistGate floors the cursor write. Without it a wake-driven pass would
@@ -64,7 +62,7 @@ type waker struct {
 	watermark int64
 
 	// persisted is what the stored cursor row holds (noStoredCursor when none).
-	// Comparing against it keeps a tick from paying a round trip for a write
+	// Comparing against it keeps a pass from paying a round trip for a write
 	// DriverCursorsSet would discard anyway.
 	persisted int64
 
@@ -97,7 +95,8 @@ const wakePersistRetryCap = 60
 
 // wakeRetryBase is the first delay after a failed scan; it doubles up to the
 // stale-dependents cadence, past which a retry only re-derives what that pass
-// has already found.
+// has already found. A failed pass must re-arm it: backingOff drops the wakes
+// arriving meanwhile, so nothing else would look again.
 const wakeRetryBase = 100 * time.Millisecond
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
@@ -116,10 +115,9 @@ const wakeScanPageCap = 256
 // does — shorter waits, not less total work.
 const wakeScanPagesPerPass = 4
 
-// run drives the waker for the life of the control plane. It is wake-driven and
-// has no tick: an idle waker arms nothing and reads nothing, and the
-// stale-dependents pass is what bounds a wake nobody published — a second
-// process writing the same store publishes to a hub of its own. See
+// run drives the waker for the life of the control plane: a commit wakes it and
+// nothing else does, so an idle waker reads nothing. A write this process did
+// not publish is left to the stale-dependents pass. See
 // docs/adr/2026-08-05-the-waker-is-wake-driven.md.
 func (dw *waker) run(ctx context.Context) {
 	// No registered controllers means nowhere to queue anything.
@@ -129,8 +127,8 @@ func (dw *waker) run(ctx context.Context) {
 	// Subscribed before the first pass, for newObjectTailer's reason: a write
 	// landing between the subscribe and the seed read would be missed by both.
 	// Every kind, because an edge can point at one the waker cannot name. A nil
-	// channel blocks forever, which is the floor-only fallback for a Beehive
-	// assembled without a hub.
+	// channel blocks forever, so a Beehive assembled without a hub seeds and
+	// then waits out its context.
 	var written <-chan gobus.Event[GroupKind, struct{}]
 	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
 		defer rx.Close()
@@ -200,8 +198,8 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 		// Re-arming for what is left of the throttle is what remembers the
 		// wake: the scan that runs then reads its position from the store.
 		//
-		// backingOff is carried through rather than cleared: the floor timer
-		// armed before a failure fires inside the throttle window, and
+		// backingOff is carried through rather than cleared: the retry timer
+		// armed before a failure can fire inside the throttle window, and
 		// answering "not backing off" there would hand a degraded store back to
 		// the wakes at the throttle's rate.
 		return opensAt.Sub(now), backingOff
@@ -217,8 +215,7 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 	return wakeIdle, false
 }
 
-// wakeIdle is pass's answer for "no reason to look again": the loop arms
-// nothing and blocks until the next commit.
+// wakeIdle is pass's "no reason to look again": the loop arms nothing.
 const wakeIdle time.Duration = -1
 
 // scanResult says what a pass found. The run loop dispatches on it: how soon to
@@ -411,9 +408,9 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 			return false
 		}
 		// Nothing can name who was missed — the lookup that failed is the one
-		// that would have said. Holding the watermark makes the next tick
+		// that would have said. Holding the watermark makes the next pass
 		// re-read the same changes.
-		dw.bh.log().WarnContext(ctx, "dependents lookup failed; these changes stay above the watermark for the next tick",
+		dw.bh.log().WarnContext(ctx, "dependents lookup failed; these changes stay above the watermark for the next pass",
 			"targetIDs", ids, "err", err)
 		return false
 	}

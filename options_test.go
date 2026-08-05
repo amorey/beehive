@@ -325,15 +325,14 @@ func TestWithMinRequeueIntervalDispatch(t *testing.T) {
 
 // New builds the waker's gates from the resolved intervals, which is only true
 // because it constructs the waker *after* applying the options. Built above the
-// option loop, the gates would hold the defaults and both options below would
-// be silently ignored.
+// option loop, the gate would hold the default and the option below would be
+// silently ignored.
 func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t),
-		withWakeScanMinInterval(time.Minute),
-		withWakePersistInterval(time.Hour))
+	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(time.Minute))
 
 	assert.Equal(t, time.Minute, bh.waker.scanGate.Interval(), "the option must reach the scan gate")
-	assert.Equal(t, time.Hour, bh.waker.persistGate.Interval(), "and the persist interval the persist gate")
+	assert.Equal(t, defaultWakePersistInterval, bh.waker.persistGate.Interval(),
+		"and the persist floor is a cadence of its own")
 }
 
 // A non-positive interval turns the throttle off rather than holding forever,

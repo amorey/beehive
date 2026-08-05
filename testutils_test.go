@@ -549,8 +549,7 @@ type replayStore struct {
 	seed    int64         // what ObjectWritesMaxVersionAll reports
 	pages   [][2]int64    // (afterRV, limit) per call
 	read    int           // rows actually served, across every page
-	listed  *signal       // fires on the first page request, when set
-	lists   chan struct{} // one token per page request, when set: "and again"
+	lists   chan struct{} // one token per page request, when set
 	err     error
 	seedErr error
 
@@ -598,12 +597,7 @@ func (s *replayStore) failing() bool {
 
 func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
-	if s.listed != nil {
-		s.listed.fire()
-	}
-	if s.lists != nil {
-		s.lists <- struct{}{}
-	}
+	probeSignal(s.lists)
 	if s.failing() {
 		return nil, s.err
 	}

@@ -69,7 +69,10 @@ watch) and `driver.TickerChan`
 (a nil channel for a disabled cadence, for the reconciler's select over the owed
 *and* full passes). The object tailer and the waker are the loops outside them: each selects over
 its wake, a timer and its context, so neither shape fits. Keeping them together is what makes "a non-positive interval
-disables this driver" one answer rather than one per driver.
+disables this driver" one answer rather than one per driver — for the drivers
+built from them. The waker is built from neither and is turned off by a flag of
+its own: with no cadence left, both of its intervals are floors, and a floor
+switched off means "no floor" rather than "no waker".
 
 ### The stale-dependents pass re-derives what the waker may have missed
 

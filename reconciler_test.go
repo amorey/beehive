@@ -420,7 +420,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	}
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// the dependent — the backstop must not paper over the miss.
-	_, err = Register(bh, gk, ctrl, WithFullPassInterval(0))
+	cc, err := Register(bh, gk, ctrl, WithFullPassInterval(0))
 	require.NoError(t, err)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
@@ -444,9 +444,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	// dependents — with no edge yet, that lookup comes back empty and the change
 	// is now permanently unclaimed. Only then let the declaration commit.
 	store.resetLooked()
-	err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
-	require.NoError(t, err)
-	bh.signalKindWritten(ctx, gk) // a raw store write publishes no wake of its own
+	require.NoError(t, cc.ConditionsSet(ctx, target.ID, Condition{Type: "Ready", Status: ConditionTrue}))
 	store.waitLooked(t)
 	close(proceed)
 
@@ -528,9 +526,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	// makes the window deterministic: with no edge yet it comes back empty, so the
 	// change is already unclaimed by the time DependenciesAdd commits.
 	store.resetLooked()
-	err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
-	require.NoError(t, err)
-	bh.signalKindWritten(ctx, gk) // a raw store write publishes no wake of its own
+	require.NoError(t, cc.ConditionsSet(ctx, target.ID, Condition{Type: "Ready", Status: ConditionTrue}))
 	store.waitLooked(t)
 	// target is the application's read of the target, taken before the change
 	// above — so the version it carries is the one the decision to depend was
@@ -2880,8 +2876,8 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 
 	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	// The waker is wake-driven, and a write made straight to the store announces
-	// nothing — this is what a write through the client publishes for itself.
+	// Client has no conditions write, so this one goes straight to the store —
+	// which announces nothing. Publish what an in-band write would have.
 	bh.signalKindWritten(ctx, clientOnlyGK)
 	observer.release()
 
@@ -2910,8 +2906,8 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 
 	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	// The waker is wake-driven, and a write made straight to the store announces
-	// nothing — this is what a write through the client publishes for itself.
+	// Client has no conditions write, so this one goes straight to the store —
+	// which announces nothing. Publish what an in-band write would have.
 	bh.signalKindWritten(ctx, clientOnlyGK)
 	observer.release()
 

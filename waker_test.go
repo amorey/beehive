@@ -161,7 +161,7 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	inner := &replayStore{rows: replayRows(1), listed: newSignal()}
+	inner := &replayStore{rows: replayRows(1), lists: make(chan struct{}, 8)}
 	store := &seedProbeStore{Store: inner, seeded: make(chan struct{}, 8)}
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
@@ -177,7 +177,7 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 
 	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Unwatched"}),
 		"any kind wakes it: the scan is store-wide")
-	inner.listed.wait(t, "the waker to scan on the commit wake")
+	waitClosed(t, chanAfter(inner.lists, 1), "the waker to scan on the commit wake")
 
 	cancel()
 	waitClosed(t, done, "the waker to stop")
@@ -222,14 +222,14 @@ func TestWakerRunsWithoutAWriteHub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := &replayStore{rows: replayRows(1), listed: newSignal()}
+	store := &replayStore{rows: replayRows(1), lists: make(chan struct{}, 8)}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 	dw.seeded = true
 
 	done := make(chan struct{})
 	go func() { defer close(done); dw.run(ctx) }()
 
-	store.listed.wait(t, "the eager first pass")
+	waitClosed(t, chanAfter(store.lists, 1), "the eager first pass")
 	cancel()
 	waitClosed(t, done, "the waker to stop")
 }
@@ -301,7 +301,7 @@ func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
 // value once more before reporting ErrClosed, so the wake below is delivered
 // first and the close ends the loop second.
 func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
-	store := &replayStore{rows: replayRows(3), err: errBoom, listed: newSignal()}
+	store := &replayStore{rows: replayRows(3), err: errBoom, lists: make(chan struct{}, 8)}
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
@@ -310,7 +310,7 @@ func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(context.Background()) }()
-	store.listed.wait(t, "the waker's first scan")
+	waitClosed(t, chanAfter(store.lists, 1), "the waker's first scan")
 
 	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Widget"}))
 	bh.kindWriteHub.Close()

@@ -53,8 +53,8 @@ const (
 	// counts in.
 	defaultWakePersistInterval = 1 * time.Second
 	// defaultMinRequeueInterval floors the gap between two dispatches of one
-	// object. It matches the dependency waker's scan floor, which is what bounds
-	// a dependency cycle today; raising one without the other changes that bound.
+	// object. It is the whole of what bounds a dependency cycle now that the
+	// waker has no cadence of its own; lowering it changes that bound.
 	defaultMinRequeueInterval = 1 * time.Second
 	// The stale-dependents pass is the waker's backstop; its cadence is set by
 	// acceptable staleness after a crash, not by cost.

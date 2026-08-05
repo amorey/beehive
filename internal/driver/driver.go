@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package driver holds the two periodic-scan loop shapes every beehive driver
-// is built from. In both, a non-positive interval means the driver is off.
+// Package driver holds the two periodic-scan loop shapes, plus the timer and
+// backoff primitives a wake-driven loop builds its own shape from. In both scan
+// shapes a non-positive interval means the driver is off; a wake-driven loop
+// says that some other way, since its intervals are floors rather than cadences.
 package driver
 
 import (
