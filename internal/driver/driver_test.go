@@ -145,3 +145,15 @@ func TestBackoffDoublesUpToMax(t *testing.T) {
 		30 * time.Second, 30 * time.Second,
 	}, got)
 }
+
+// A Backoff whose Max was never set must still back off. Max is a driver's own
+// floor cadence, and a wake-driven driver may have none — min(cur, 0) would
+// otherwise hand back a zero delay forever, which is a hot loop against
+// whatever just failed.
+func TestBackoffWithoutAMaxFallsBackToBase(t *testing.T) {
+	b := Backoff{Base: 100 * time.Millisecond}
+
+	for range 5 {
+		assert.Equal(t, 100*time.Millisecond, b.Next(), "no ceiling means no growth, never zero")
+	}
+}
