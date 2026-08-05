@@ -197,6 +197,12 @@ func (q *workQueue) setFloor(d time.Duration) {
 func (q *workQueue) forget(id ObjectID) {
 	var pending pendingSend
 	q.mu.Lock()
+	// Above the gauge call, as in get: stop has already published its finals, and
+	// a later report would outrank them on seq.
+	if q.stopped {
+		q.mu.Unlock()
+		return
+	}
 	if a := q.gauge.alarmFor(id); a != nil {
 		a.timer.Stop()
 		if s, ok := q.gauge.clearAlarm(id); ok {

@@ -731,12 +731,14 @@ func TestPublishAddAfterOnDirtyIDSendsNothing(t *testing.T) {
 // would be the subscriber's last word.
 func TestPublishStoppedQueueSendsNothing(t *testing.T) {
 	q, tx := publishingQueue()
+	q.add(4) // still dirty after stop: finalValues clears alarms, not the dirty set
 	q.stop()
 	before := len(tx.taken())
 
 	q.add(1)
 	q.addAfter(2, time.Hour, alarmRequeueAfter)
 	q.requeueNow(3)
+	q.forget(4)
 
 	assert.Len(t, tx.taken(), before, "a stopped queue must publish nothing")
 }
