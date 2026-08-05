@@ -635,6 +635,22 @@ func TestWakerRetriesSeedOnAFailedCursorRead(t *testing.T) {
 	assert.EqualValues(t, 500, dw.watermark)
 }
 
+// The write-log read's own shutdown branch: seed's first read fails for the same
+// reason, and reporting it would warn on every shutdown that overlapped a seed.
+func TestWakerSeedReadFailureDuringShutdownIsQuiet(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &replayStore{seed: 500, seedErr: errBoom}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.Equal(t, scanFailed, dw.seed(ctx), "a cancelled read still leaves the waker unseeded")
+	assert.False(t, dw.seeded)
+	assert.Empty(t, buf.String(), "shutdown is not an outage to report")
+}
+
 // A cursor read that fails because stop cancelled the ctx is shutdown, not an
 // outage — the same treatment the write-log read beside it already gets, and the
 // rest of the waker gives a cancelled ctx.
