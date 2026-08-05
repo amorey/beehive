@@ -135,7 +135,7 @@ Every driver is one of these. They run on separate intervals because they are se
 | dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | none: a commit wakes it |
 | stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | 60s, fixed |
 | watch tail | the write log of each watched kind, once per kind however many watches it has | one cheap read per watched kind per tick, and a commit wakes it before the tick | 30s floor, fixed |
-| event watch poll | one object's event log, for each live `EventsWatch` | one cheap read per subscriber per tick; a listing only when the mark moved | 1s, fixed |
+| event watch | one object's event log above a cursor, for each live `EventsWatch` | what the log has grown by, and a commit wakes it before the tick | 30s floor, fixed |
 
 **Only two of these are configurable.** The other five are what make convergence a property of the system rather than a setting, and each is already bounded by what is outstanding, by what changed, or by the dependency graph rather than by what exists — so there is little to gain by moving them and a correctness hole to fall into by turning them off. If a cadence you need isn't here, that's a gap to report rather than one to work around.
 
@@ -367,7 +367,7 @@ type Client[Spec, Status any] interface {
     // Event log — per-object, category-partitioned, contiguous-run aggregated.
     EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
     EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error)
-    EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+    EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 
     // Reconcile control.
     Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
@@ -616,7 +616,13 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 
 #### Events
 
-`EventsList` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `EventsWatch` sends the current runs first, then streams new runs and extensions to existing ones, on a 1s poll of its own — it did not follow the object watches onto the shared tail. Its quiet tick is cheaper for the same reason theirs is: it reads the high-water mark of that object's log — one indexed query, returning one number — and lists only when the mark moved. The mark spans the object's whole log, so an event in a category you filtered out costs one listing that reports nothing. Runs are matched by `EventID`, so you see at most one update per run per interval — a count bump updates the run in place instead of arriving as a new one. There are no tombstones, since an append-only log means a run can only appear or grow. `EventsGetLatest` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `OwnersGet` does.
+`EventsList` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `EventsGetLatest` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `OwnersGet` does.
+
+`EventsWatch` hands back an `EventStream`: `Runs` is the snapshot as of `ResourceVersion`, `Events` streams what the log grows by above it — oldest-first — and `Err()` says why the stream ended once `Events` is closed. It reads the log above a cursor, and an `EventsAdd` commit wakes it, so a local write arrives at commit rather than on a tick; the 30s floor is what covers a write another process made. An **extend is not a new run**: the row comes back with a higher `ResourceVersion` and a bumped `Count`, which is what lets you update it in place. There are no tombstones, since a run can only appear or grow.
+
+`WithEventsResumeFrom(rv)` starts above a position instead of snapshotting, so a reconnecting reader pays for the gap rather than the whole log — checkpoint the `ResourceVersion` of what you were delivered. Two answers end a resume instead of serving it: `ErrWatchTooOld` when retention has taken runs below your position, and `ErrWatchTooNew` when the position is above everything that object's log has held. Both mean "subscribe again without the option". A stream also ends with `ErrNotFound` if the object is collected, because its log cascades away with it — an empty stream would otherwise read as "no events" about an object that no longer exists.
+
+`WithEventLimit` bounds the snapshot only; a tail has no end to count back from. The other filters apply to both, so a run in a category you filtered out is dropped rather than delivered, and costs you nothing.
 
 `WithWriteLogRetention` bounds the object write log, which is what the watches tail and what a resume reads. It looks like `WithEventRetention` and defaults the other way: an event is written when a controller chooses to write one, while a log entry lands on **every** object write — and a status write bumps `resource_version`, so the log grows at reconcile rate whether or not you opt in. Hence a 24h default rather than unbounded. The value is a resume window before it is a storage bound: it is how long a subscriber may be disconnected and still resume instead of resyncing. It also governs how long a collected object's final state lives on, since the delete entry carries the row image a `Deleted` change reports.
 
@@ -753,7 +759,7 @@ func LoadEvents() LoadOption        // fetch the most-recent events (default N p
 func WithResetBackoff() RequeueOption   // clear the retry backoff ladder before requeuing (default: preserve it)
 ```
 
-The event read methods take `EventOption`s (also a separate type from `Option`, applying only to `EventsList`/`EventsWatch`) — see [Events](#events):
+The event read methods take `EventOption`s (also a separate type from `Option`, applying only to `EventsList`/`EventsWatch`) — see [Events](#events). `WithEventsResumeFrom` is the one that means nothing outside `EventsWatch`, and the other reads ignore it:
 
 ```go
 func WithEventCategory(cat string) EventOption  // restrict to a single timeline
@@ -761,4 +767,5 @@ func WithEventType(t EventType) EventOption      // only Normal or only Warning
 func WithEventReason(reason string) EventOption  // only runs with this reason
 func WithEventLimit(n int) EventOption           // cap the number of runs returned / snapshotted
 func WithEventsSince(t time.Time) EventOption    // only runs active at or after t
+func WithEventsResumeFrom(rv int64) EventOption  // EventsWatch: stream above rv instead of snapshotting
 ```

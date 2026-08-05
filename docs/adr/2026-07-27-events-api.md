@@ -45,31 +45,20 @@ Reads live on `Client`: `EventsList` / `EventsGetLatest` / `EventsWatch` (lazy),
 eager `LoadEvents()` → `Object.Events()`, gated by `LoadEventsBit` in the same
 `LoadSet` and returning `ErrNotLoaded` when unrequested.
 
-`EventsWatch` polls on the watch-poll interval and diffs against what it last
-reported, keyed on **`EventID`, not object id**, so a run extended between ticks
-re-emits as itself rather than as a new row. Runs are delivered oldest-first within a
-tick, so an append-only log builds in order. Like every other driver it finds the
-write by reading, and the interval is the resolution — a run that appears and is
-trimmed by retention inside one tick is never seen.
-
-A tick reads `Store.EventsMaxVersion(ctx, id)` first and lists only when that moved,
-so a quiet subscriber costs one number rather than the object's whole log. On SQLite
-that number is not yet free — no index carries `events.resource_version` under
-`object_id`, so the read still touches one table row per run — but it drops the
-decode, the sort and the returned blobs, and a covering index would finish the job.
-The mark is a maximum over the runs that are there, so retention taking the newest
-one lowers it; the watch compares for inequality, and a mark that fell simply buys a
-listing that has nothing new in it. One consequence to know: the `seen` map is
-rebuilt from each listing, so a quiet stream holds the ids of runs retention has
-since deleted until the next real event rebuilds it.
+`EventsWatch` **no longer polls and diffs**; it reads the log above a cursor, woken
+by the write's own commit, and hands back a snapshot plus a resumable stream. That
+half of this ADR is superseded by
+[the event-cursor ADR](2026-08-05-events-get-a-cursor-and-a-commit-wake.md), which
+also covers the retention horizon a resume is checked against. What stays true here
+is the log itself: the run aggregation, the category partition, and `Detail`.
 
 Retention runs in `gcSweeperRun`: a per-`(object, category)` cap-N ring plus optional
 `maxAge` (`WithEventRetention`). `events.object_id` is `FK … ON DELETE CASCADE`, so
 object deletion cascades the log.
 
-Store set: `EventsAdd` / `EventsGetLatest` / `EventsList` / `EventsMaxVersion` /
-`EventsSweep`. The store has no event watch — the watch is a client-side poll over
-`EventsList`, gated by `EventsMaxVersion`.
+Store set: `EventsAdd` / `EventsGetLatest` / `EventsList` / `EventsListSince` /
+`EventsMaxVersion` / `EventsSnapshot` / `EventsSweep`. The store has no event watch:
+the watch is a client-side reader over `EventsListSince`, woken by the commit.
 
 ## Naming: "event(s)" is reserved for the log
 
@@ -81,6 +70,7 @@ The object-change surfaces are deliberately named apart:
 - Typed `ObjectChange[Spec,Status]` values reach users through `Client.Watch` /
   `WatchList`, which poll and diff.
 - `Client.EventsWatch` streams the log's aggregated `Event`s — the value itself, not
-  a `Change`, because an append-only log has nothing for a change type to say.
+  a `Change`, because an append-only log has nothing for a change type to say. Its
+  terminal error lives on the `EventStream` handle for that reason.
 
 See the naming ADR for the return-shape rule each follows.

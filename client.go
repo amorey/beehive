@@ -30,24 +30,23 @@ import (
 // registered controller: there is no reconcile loop to schedule against.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// ErrWatchTooOld ends a watch whose unread log entries retention has already
-// removed. The stream cannot continue truthfully, so it reports this on a Failed
-// change and closes; the caller answers by subscribing again for a fresh
-// snapshot.
-var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
+// ErrWatchTooOld ends a watch whose unread entries retention has already
+// removed — the object write log for Watch/WatchList, the event log for
+// EventsWatch. The stream cannot continue truthfully, so it reports this and
+// closes; the caller answers by subscribing again for a fresh snapshot.
+var ErrWatchTooOld = errors.New("beehive: watch is below the log's retention horizon")
 
-// ErrWatchTooNew ends a resume whose position is above everything the kind's
-// log has held, which means the position did not come from this store — a
-// restored backup or a swapped file restarts the sequence. Reported on a Failed
-// change like ErrWatchTooOld, and answered the same way: subscribe again
-// without WithResumeFrom. Unreported, such a stream says "caught up" and then
-// drops every change until the sequence climbs past the position.
-var ErrWatchTooNew = errors.New("beehive: watch resumes above the write log's head")
+// ErrWatchTooNew ends a resume whose position is above everything the log has
+// held, which means the position did not come from this store — a restored
+// backup or a swapped file restarts the sequence. Answered the same way as
+// ErrWatchTooOld: subscribe again without the resume option. Unreported, such a
+// stream says "caught up" and then drops everything until the sequence climbs
+// past the position.
+var ErrWatchTooNew = errors.New("beehive: watch resumes above the log's head")
 
-// ErrStopped ends a watch whose Beehive has stopped, reported on a Failed
-// change like ErrWatchTooOld. It is what separates shutdown from the caller
-// cancelling: resubscribing answers ErrWatchTooOld and cannot answer this one,
-// since a stopped Beehive does not start again.
+// ErrStopped ends a watch whose Beehive has stopped. It is what separates
+// shutdown from the caller cancelling: resubscribing answers ErrWatchTooOld and
+// cannot answer this one, since a stopped Beehive does not start again.
 var ErrStopped = errors.New("beehive: the beehive has stopped")
 
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose

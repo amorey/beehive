@@ -7,20 +7,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 Once we decide to build one, the entry here shrinks to a pointer at the work, and
 moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
-- **Do not remove `EventsAdd`'s return value, even though the write-shapes
-  rule says to** — a deliberate exception, recorded so nobody applies the
-  rule mechanically. `Store.EventsAdd` returns a run that no caller reads
-  today, which by the
-  [write-shapes ADR](adr/2026-07-30-store-write-shapes.md) means it should
-  return `error` alone.
-
-  An events push path builds its delta from exactly that return value. The
-  store already computes the run to write it, so returning it costs nothing
-  and saves the push path a read. Tidying it away now would have to be
-  undone.
-
-  Revisit only if an events push path is ruled out for good.
-
 - **An edge write is invisible to every cursor in the system, and the fix is one
   counter rather than a log** — known, not fixed, and recorded here mostly to
   settle the question it keeps raising: whether `edges` writes belong in
@@ -611,21 +597,14 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   to the child — which would make the logged value correct by construction, and
   would also fix `DependentsList`/`DependenciesList`, which have the same hole.
 
-- **`EventsWatch` did not follow the object watches onto the write log** — so
-  two watch surfaces on the same `Client` now behave differently for reasons a
-  caller cannot see. Object watches return a snapshot plus a stream, resume
-  from a `resource_version`, and end with `ErrWatchTooOld` when their entries
-  are trimmed. `EventsWatch` still polls, diffs by `EventID`, hands its initial
-  runs back through the channel, and cannot resume.
+- **A kind-wide event watch does not exist, so a panel over N objects runs N
+  readers** — known, not fixed. `EventsWatch` is per object, and each stream is
+  its own receiver, goroutine, timer and gate over its own cursor (see
+  [the ADR](adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)). That is
+  cheaper than the poll it replaced at any fan-out, and still linear in streams.
 
-  The asymmetry is not obviously wrong — an event log has no tombstones, so
-  absence is not a change, and the poll-and-diff it uses is sound. But the
-  argument for splitting the snapshot out ("am I synced?" should be a value, not
-  a guess) applies to events unchanged, and a caller reading both surfaces has
-  to hold two models.
-
-  Worth doing when events grow a consumer that needs to resume — a UI that
-  reconnects, or an exporter. The work is mostly mechanical; the real decision
-  is whether events get a retention horizon of their own, since
-  `WithEventRetention` already trims runs out from under a reader with no way to
-  tell them.
+  A shared reader would need what the object tail has — one cursor per kind and a
+  fan-out — which the events log cannot serve today: it is indexed by object, not
+  by kind, so a kind-wide tail has no seek to ride. Revisit when a consumer holds
+  enough streams for the goroutine count to matter, and expect it to need an index
+  before it needs an API.
