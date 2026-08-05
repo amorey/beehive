@@ -29,6 +29,7 @@ directory of archaeology.
 - [A cleared finalizer pushes its own collect](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
 - [A physical delete pushes the owner it was blocking](2026-08-05-a-physical-delete-pushes-its-owner.md)
 - [A dropped dependency pushes the collect it was blocking](2026-08-05-a-dropped-dependency-pushes-its-target.md)
+- [A create under a deleting owner pushes that owner's collect](2026-08-05-a-create-pushes-a-deleting-owners-collect.md)
 - [A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
 - [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
 - [The dependency waker abandons a drain the stale-dependents pass has overtaken](2026-08-05-the-waker-abandons-an-overtaken-drain.md)
