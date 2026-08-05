@@ -679,52 +679,33 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   next one may start. A throttle under the tests' failsafe timeouts would trip none
   of them — which is itself worth knowing before adding one.
 
-- **`rategate`'s eviction copies the whole live set, and only runs on `Admit`** —
-  known, not fixed, and unmeasured at the cardinality where it would matter. The
-  package holds each key for a fixed interval and bounds its map by *admissions
-  within one interval* rather than by the key space, which is the invariant a
-  per-key limiter map usually gets wrong. Three things about how it does that are
-  worth revisiting, in this order:
+- **`rategate` holds two single-key gates that each carry a map** — the waker's
+  `scanGate` and `persistGate` (`waker.go`) hold one key apiece, so each pays a
+  map and an eviction queue to track a single instant. A `rategate.Single` — one
+  instant, no map, `Allow(now)` — would drop both. Left alone until a third
+  single-key consumer settles the shape; two is thin evidence for a second type,
+  and the cost is a fixed handful of bytes per beehive rather than anything that
+  scales.
 
-  **The compaction is O(live) per eviction round.** `evict` ends with
-  `append(g.order[:0], g.order[i:]...)`, which copies the entire live tail
-  whenever even one entry has expired, and it runs on every `Admit`. That is O(n)
-  per admission where it should be amortised O(1). For the work queue's gate
-  (interval 1s, key `ObjectID`, entry 8 + 24 bytes), 1,000 distinct objects
-  dispatched per second is ~32KB copied per admission, ≈32MB/s of memmove;
-  10,000/s is ≈3.2GB/s, which is not survivable. What keeps it off the floor
-  today is that the store's single connection cannot feed reconciles at that
-  rate — a coincidental bound with a narrower margin than it looks. **The fix is
-  a head index** slid forward on eviction, compacting only when it passes half
-  the slice; same semantics, no API change.
+  Note that none of this is an argument for a token bucket: a per-key
+  `rate.Limiter` map inherits the same key space and usually ships no eviction at
+  all.
 
-  **Memory is reclaimed only inside `Admit`.** A kind that dispatches ten thousand
-  objects and then goes quiet holds their records until its next admission, which
-  may never come. It cannot grow past one interval's admissions, so this is
-  retention rather than a leak, but nothing returns it. `OpensAt` could evict
-  opportunistically without breaking its documented "records nothing" contract —
-  evicting is not recording.
-
-  **Each entry carries a `time.Time` twice**, in the map value and the queue
-  entry: 24 bytes each, and the `loc` pointer is the only part of this package
-  the GC has to trace. An internal monotonic int64 would halve it. Micro, and
-  last.
-
-  Deferred because nothing here is on a measured path. The one benchmark that
-  touches the package — `BenchmarkWakerScanRateUnderSustainedWrites` — drives the
-  waker's gates, which hold a single key each and so exercise none of this; the
-  ~40ns alloc-free `Admit` recorded during review was that same single-key case.
-  **The missing evidence is a benchmark of the work queue's gate at 1k and 10k
-  distinct keys per interval**, and it should come before the fix rather than
-  after it.
-
-  Related, and cheaper: the waker holds two single-key gates
-  (`scanGate`, `persistGate`) that each carry a map and an eviction queue for one
-  key. A `rategate.Single` — one instant, no map, `Allow(now)` — would drop both,
-  and a third single-key consumer would settle it. Note that none of this is an
-  argument for a token bucket: a per-key `rate.Limiter` map inherits the same key
-  space and usually ships no eviction at all.
-
-  Tripwire: none. `internal/rategate`'s tests pin semantics — hold, expiry,
-  re-admission, `Forget` — and say nothing about cost, so every change proposed
-  here would keep them green.
+  The rest of this item is done. `evict` slides a head index and compacts only
+  when it passes half the slice, so an eviction round is amortised O(1) instead
+  of copying the live tail per `Admit`, and clears the slots the move vacates so
+  a pointer-bearing `K` is not held live by the backing array; `OpensAt` evicts
+  too (evicting is not
+  recording), so a caller that reads and stops admitting still reclaims; instants
+  are an int64 offset from a `base` anchored on first use, which halves an entry
+  and leaves the package with no pointer for the GC to trace — `time.Time.Sub`
+  saturates at ±292 years rather than reporting that it could not answer, so a
+  stamp that saturates re-anchors and the interval arithmetic saturates too,
+  every wrap in that range failing a floor *open*; a queue that drains
+  past `shrinkAt` hands its arrays back, since neither a map nor a slice shrinks
+  on its own. `rategate_bench_test.go` is the evidence that was missing —
+  `BenchmarkGateAdmitDistinctKeys` at 1/1k/10k distinct keys per interval went
+  56/675/8743ns to 52/69/87ns, and building a 10k live set allocates 1.28MB
+  where it allocated 2.78MB. Steady-state `Admit` is alloc-free at every
+  cardinality. Peak queue capacity is now ~2x the live set rather than exactly
+  it, which the halved entry more than pays for.
