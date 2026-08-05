@@ -1261,6 +1261,42 @@ func TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep(t *testing.
 	waitForDeletionRequest(t, w, late.ID)
 }
 
+// The pull path under this push: a client-only owner resolves to no reconciler,
+// so the push is spent on nothing and the sweeper is what re-cascades. The same
+// holds for an owner whose kind is registered in another process.
+func TestIntegrationCreateUnderADeletingClientOnlyOwnerHealsOnTheSweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	_, registered := bh.reconcilerFor(clientOnlyGK)
+	require.False(t, registered, "the owner's kind must have no reconciler to push")
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owners := NewClient[cSpec, cStatus](bh, clientOnlyGK)
+	owner := mustCreate(t, ctx, owners, uniqueName(), cSpec{Val: "owner"})
+	// An unregistered kind cannot hold a finalizer, so the owner is held
+	// deletion-pending by this child's RESTRICT instead.
+	held := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "held"},
+		WithOwner(owner.ID), WithFinalizers("f"))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, owners.Delete(ctx, owner.ID))
+	waitForDeletionRequest(t, w, held.ID)
+
+	late := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "late"}, WithOwner(owner.ID))
+	waitForDeletionRequest(t, w, late.ID)
+}
+
 // The pull path under this push: the child's finalizer keeps its own collect from
 // running, so removing it through the store issues no push. The owed pass is off
 // too, or it would dispatch the still-unsettled owner and stand in for the sweep.
