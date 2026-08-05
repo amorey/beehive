@@ -157,21 +157,33 @@ func waitForDeletionRequest(t *testing.T, w <-chan ObjectChange[cSpec, cStatus],
 // runs fn inline (from the embedded fakeStore), so all of collect runs here.
 type collectFakeStore struct {
 	fakeStore
-	finalizers      []string // on the collected object
-	getMetaErr      error    // ObjectsGetMeta
-	markErr         error    // DeletionRequestsCreateFromOwner
-	dropDependsErr  error    // EdgesDeleteFinalizingDependsOn
-	hasEdges        bool     // EdgesHasIncoming result
-	hasEdgesErr     error    // EdgesHasIncoming error
-	listOwnersErr   error    // EdgesListOutgoingByRelation
-	deleteObjectErr error    // ObjectsDelete error
+	finalizers      []string             // on the collected object
+	getMetaErr      error                // ObjectsGetMeta, for the collected object
+	markErr         error                // DeletionRequestsCreateFromOwner
+	dropDependsErr  error                // EdgesDeleteFinalizingDependsOn
+	hasEdges        bool                 // EdgesHasIncoming result
+	hasEdgesErr     error                // EdgesHasIncoming error
+	owners          []storeapi.ObjectRef // EdgesListOutgoingByRelation result
+	listOwnersErr   error                // EdgesListOutgoingByRelation error
+	ownerMetaErr    error                // ObjectsGetMeta, for an owner row
+	deleteObjectErr error                // ObjectsDelete error
 }
 
+// collectedID is the object every collectFakeStore test collects; any other id
+// reaching the fake is one of its owners.
+const collectedID ObjectID = 1
+
 func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawObject, error) {
+	now := time.Now()
+	if id != collectedID {
+		if s.ownerMetaErr != nil {
+			return nil, s.ownerMetaErr
+		}
+		return &RawObject{ID: id, DeletionRequestedAt: &now}, nil
+	}
 	if s.getMetaErr != nil {
 		return nil, s.getMetaErr
 	}
-	now := time.Now()
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
 func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
@@ -184,7 +196,7 @@ func (s *collectFakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, er
 	return s.hasEdges, s.hasEdgesErr
 }
 func (s *collectFakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
-	return nil, s.listOwnersErr
+	return s.owners, s.listOwnersErr
 }
 func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	return s.deleteObjectErr
@@ -192,37 +204,46 @@ func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
 
 func TestCollectGetObjectMetaError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{getMetaErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDeletionRequestsCreateFromOwnerError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{markErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDropDependsRefsError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{dropDependsErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectHasIncomingRefsError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{hasEdgesErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectListOwnersError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{listOwnersErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectOwnerMetaError(t *testing.T) {
+	bh := newTestBeehive(t, &collectFakeStore{
+		owners:       []storeapi.ObjectRef{{ID: 2, Kind: "Owner"}},
+		ownerMetaErr: errBoom,
+	})
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDeleteObjectError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{deleteObjectErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
