@@ -195,8 +195,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
-  nine users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
-  delete-request enqueue, the cleared-finalizer enqueue (all shared via
+  ten users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  delete-request enqueue, the cleared-finalizer enqueue, the dropped-dependency
+  target push (all shared via
   `Beehive.signalRequeueNow` and `signalRequeueThrottled`), the GC cascade's own
   hook, the physical delete's owner push (both `signalRequeueManyNow`),
   `signalKindWritten` — which feeds the watch tailers and the dependency waker —
@@ -205,7 +206,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
   [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
   [ADR](docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md),
-  [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md)
+  [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
+  [ADR](docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md)
 - **The id is the key everywhere; the name is a lookup.** The bare CRUD verbs
   take an `ObjectID` and act on one incarnation; the `…ByName` siblings act on
   whatever holds the name *now*, resolving and writing in one transaction. The
@@ -232,14 +234,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **GC has two backstops**: each reconcile loop runs `gcCollect` for its own
   kind (routing finalizer clearing through the controller), and the global
   sweeper covers client-only kinds. Both are idempotent. A delete request, a
-  cascade and a physical delete each enqueue at commit for a registered kind, so a
-  cascade advances a level per commit and unwinds a level per commit; a client-only
-  level still costs a sweep. **The sweeper also reclaims `reconcile_owed` for
+  cascade, a physical delete and a dropped dependency each enqueue at commit for a
+  registered kind, so a cascade advances a level per commit and unwinds a level per
+  commit; a client-only level still costs a sweep. **The sweeper also reclaims `reconcile_owed` for
   kinds with no reconcile loop**, which nothing else drains — safe because the
   count is redundant with the dependency watermark `EdgesAdd` clears, so a
   cursor-0 sweep in a later process re-derives it. The clear is no-emit.
   → [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
   [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
+  [ADR](docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md),
   [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration

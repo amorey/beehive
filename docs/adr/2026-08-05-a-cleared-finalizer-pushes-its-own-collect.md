@@ -18,7 +18,9 @@ Three routes unblock a collect. Only the cleared finalizer is in process, in Go,
 on a call that already knows the object. The last child's removal needs a
 reverse-edge lookup before the delete, and `DependenciesDelete` dropping the last
 referrer is invisible to every cursor in the system — an edge write bumps no
-`resource_version` and appends no write-log entry (see [`TODO.md`](../TODO.md)).
+`resource_version` and appends no write-log entry, so the edge write reports the
+lifted block itself
+([its ADR](2026-08-05-a-dropped-dependency-pushes-its-target.md)).
 
 ## Decision
 
