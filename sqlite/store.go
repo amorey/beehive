@@ -1701,39 +1701,60 @@ func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID,
 }
 
 func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error) {
-	var total int64
+	var total int
 	// One transaction so both bounds see the same snapshot and land together.
 	err := s.Within(ctx, func(ctx context.Context) error {
-		c := s.conn(ctx)
 		if perObject > 0 {
 			// Rank runs newest-first per (object, category) and drop past the cap.
-			res, err := c.ExecContext(ctx, `
-				DELETE FROM events WHERE id IN (
-					SELECT id FROM (
-						SELECT id, ROW_NUMBER() OVER (
-							PARTITION BY object_id, category
-							ORDER BY last_at DESC, id DESC) AS rn
-						FROM events
-					) WHERE rn > ?
-				)`, perObject)
+			n, err := s.trimEvents(ctx, `id IN (
+				SELECT id FROM (
+					SELECT id, ROW_NUMBER() OVER (
+						PARTITION BY object_id, category
+						ORDER BY last_at DESC, id DESC) AS rn
+					FROM events
+				) WHERE rn > ?
+			)`, perObject)
 			if err != nil {
 				return err
 			}
-			n, _ := res.RowsAffected()
 			total += n
 		}
 		if maxAge > 0 {
-			cutoff := toMillis(time.Now().UTC().Add(-maxAge))
-			res, err := c.ExecContext(ctx, `DELETE FROM events WHERE last_at < ?`, cutoff)
+			n, err := s.trimEvents(ctx, `last_at < ?`, toMillis(time.Now().UTC().Add(-maxAge)))
 			if err != nil {
 				return err
 			}
-			n, _ := res.RowsAffected()
 			total += n
 		}
 		return nil
 	})
-	return int(total), err
+	return total, err
+}
+
+// trimEvents deletes the runs matching where and raises each affected timeline's
+// horizon to the highest version it removed there.
+//
+// The horizon is recorded BEFORE the delete, from the same predicate in the same
+// transaction: RETURNING would give the same answer, but at the cost of
+// materialising every deleted run and holding a half-read cursor on the single
+// connection between two statements of one transaction.
+func (s *sqliteStore) trimEvents(ctx context.Context, where string, args ...any) (int, error) {
+	c := s.conn(ctx)
+	if _, err := c.ExecContext(ctx, `
+		INSERT INTO events_horizon (object_id, category, trimmed_through)
+		SELECT object_id, category, MAX(resource_version) FROM events
+		 WHERE `+where+`
+		 GROUP BY object_id, category
+		    ON CONFLICT(object_id, category) DO UPDATE SET trimmed_through = excluded.trimmed_through
+		 WHERE excluded.trimmed_through > events_horizon.trimmed_through`, args...); err != nil {
+		return 0, err
+	}
+	res, err := c.ExecContext(ctx, `DELETE FROM events WHERE `+where, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (bool, error) {

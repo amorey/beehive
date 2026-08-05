@@ -237,9 +237,31 @@ CREATE INDEX idx_events_object_cat
 -- touch none of these columns, so only a new run inserts an entry.
 CREATE INDEX idx_events_latest ON events(object_id, category, id DESC);
 
--- Covers EventsMaxVersion, EventsWatch's quiet-tick gate; it exists for that read
--- alone. Without it: one table fetch per run, past overflow chains.
+-- Covers EventsMaxVersion and the watch tail's range seek above a cursor.
+-- Without it: one table fetch per run, past overflow chains.
 CREATE INDEX idx_events_object_rv ON events(object_id, resource_version);
+
+-- ============================================================
+-- events_horizon
+-- What event retention has removed, per timeline. A read must
+-- not imply an absence it cannot vouch for: a trimmed run and a
+-- run never written are the same empty result, so a resume BELOW
+-- trimmed_through is refused rather than answered. A cursor
+-- sitting exactly on it has lost nothing.
+-- EventsSweep is the only writer.
+-- ============================================================
+
+-- Keyed by (object_id, category) to match the ring cap's own partition, which
+-- trims each timeline independently: an object-wide horizon would let a chatty
+-- category refuse every resume on a quiet one. WITHOUT ROWID for the
+-- object_writes_horizon reasons: a composite key a rowid table would store
+-- twice, tiny rows, and reads by the full key or its object_id prefix.
+CREATE TABLE events_horizon (
+    object_id       INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+    category        TEXT    NOT NULL,
+    trimmed_through INTEGER NOT NULL, -- highest resource_version trimmed here
+    PRIMARY KEY (object_id, category)
+) STRICT, WITHOUT ROWID;
 
 -- ============================================================
 -- object_writes

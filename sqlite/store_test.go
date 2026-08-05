@@ -368,6 +368,90 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	assert.Equal(t, "New", got[0].Reason, "the run within maxAge is kept")
 }
 
+// eventHorizon reads a timeline's recorded horizon, 0 when none.
+func eventHorizon(t *testing.T, store beehive.Store, id storeapi.ObjectID, category string) int64 {
+	t.Helper()
+	var rv sql.NullInt64
+	err := store.(*sqliteStore).db.QueryRowContext(context.Background(),
+		`SELECT trimmed_through FROM events_horizon WHERE object_id = ? AND category = ?`,
+		id, category).Scan(&rv)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0
+	}
+	require.NoError(t, err)
+	return rv.Int64
+}
+
+// A sweep records what it removed, per (object, category) — the ring cap's own
+// partition — so a trim on a chatty timeline says nothing about a quiet one.
+func TestSweepEventsRecordsHorizonPerTimeline(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	var trimmed int64
+	for _, r := range []string{"C1", "C2", "C3"} {
+		e, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: r})
+		require.NoError(t, err)
+		if r == "C2" {
+			trimmed = e.ResourceVersion // the highest version the cap will drop
+		}
+	}
+	_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "S1"})
+	require.NoError(t, err)
+
+	deleted, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted, "the count survives the horizon write")
+
+	assert.Equal(t, trimmed, eventHorizon(t, store, id, "connection"))
+	assert.Zero(t, eventHorizon(t, store, id, "sync"), "a timeline that lost nothing has no horizon")
+}
+
+// The horizon only rises: a later sweep that trims older runs leaves it alone.
+func TestSweepEventsHorizonOnlyRises(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for _, r := range []string{"R1", "R2", "R3"} {
+		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r})
+		require.NoError(t, err)
+	}
+	_, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	high := eventHorizon(t, store, id, "c")
+	require.NotZero(t, high)
+
+	// Age the survivor and sweep it: it is older, so the horizon must not move down.
+	s := store.(*sqliteStore)
+	_, err = s.db.ExecContext(ctx, `UPDATE events SET resource_version = 1, last_at = ? WHERE object_id = ?`,
+		toMillis(time.Now().UTC().Add(-2*time.Hour)), id)
+	require.NoError(t, err)
+	_, err = store.EventsSweep(ctx, 0, time.Hour)
+	require.NoError(t, err)
+
+	assert.Equal(t, high, eventHorizon(t, store, id, "c"))
+}
+
+// A horizon row cascades with its object, like the log it describes.
+func TestDeleteObjectCascadesEventHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for _, r := range []string{"R1", "R2"} {
+		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r})
+		require.NoError(t, err)
+	}
+	_, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	require.NotZero(t, eventHorizon(t, store, id, "c"))
+
+	require.NoError(t, store.ObjectsDelete(ctx, id))
+	assert.Zero(t, eventHorizon(t, store, id, "c"))
+}
+
 // Deleting an object cascade-deletes its event log (FK ON DELETE CASCADE).
 func TestDeleteObjectCascadesEvents(t *testing.T) {
 	store := newTestStore(t)
