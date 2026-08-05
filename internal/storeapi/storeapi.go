@@ -525,7 +525,10 @@ type Store interface {
 
 	// EdgesDelete removes the (fromID, toID, relation) edge; removing a missing
 	// one does nothing. Bumps no version. Reports whether the removal lifted a
-	// RESTRICT block, so a caller can push the target's collect.
+	// *depends_on* RESTRICT block, so a caller can push the target's collect —
+	// Unblocked reads the source's own deletion mark, which only discounts a
+	// depends_on edge. An owned_by edge always counts, so dropping one may lift
+	// a block this reports as false.
 	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
 
 	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
