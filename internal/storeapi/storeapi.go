@@ -264,6 +264,18 @@ type EdgesAddResult struct {
 	ReconcileOwedStamped bool
 }
 
+// EdgesDeleteResult is what a caller needs to follow up on an edge it dropped;
+// like EdgesAddResult, all of it falls out of work EdgesDelete already does.
+type EdgesDeleteResult struct {
+	// To is the target's GroupKind, needed to route a requeue to it. Edges are
+	// cross-kind. Zero unless Unblocked.
+	To GroupKind
+	// Unblocked reports that this call removed an edge holding a RESTRICT
+	// block: the target is deletion-pending and the source is not. A probe, not
+	// a verdict — it does not check that this was the target's last referrer.
+	Unblocked bool
+}
+
 // ObjectRef names one object: its id plus the GroupKind needed to route a
 // requeue or GC step to it. Direction-free, so it serves both ends of an edge
 // query and the deletion lists.
@@ -513,8 +525,9 @@ type Store interface {
 	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 
 	// EdgesDelete removes the (fromID, toID, relation) edge; removing a missing
-	// one does nothing. Bumps no version.
-	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) error
+	// one does nothing. Bumps no version. Reports whether the removal lifted a
+	// RESTRICT block, so a caller can push the target's collect.
+	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
 
 	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
 	// whose source is itself marked for deletion, so mutually dependent

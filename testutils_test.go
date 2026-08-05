@@ -454,7 +454,7 @@ func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error
 func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	panic("not implemented: fakeStore.EdgesAdd")
 }
-func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
 	panic("not implemented: fakeStore.EdgesDelete")
 }
 func (s *fakeStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {

@@ -1054,8 +1054,8 @@ type failEdgesDeleteStore struct {
 	fakeStore
 }
 
-func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
-	return errBoom
+func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+	return storeapi.EdgesDeleteResult{}, errBoom
 }
 
 // TestControllerClientDeleteDependencyDeleteRefError covers the EdgesDelete failure

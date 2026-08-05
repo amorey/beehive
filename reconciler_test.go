@@ -2944,8 +2944,9 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
-	require.NoError(t, store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn))
-	_, err := bh.gcCollect(ctx, target.ID)
+	_, err := store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	_, err = bh.gcCollect(ctx, target.ID)
 	require.NoError(t, err)
 	_, err = store.ObjectsGet(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")

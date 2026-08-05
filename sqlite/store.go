@@ -2216,11 +2216,11 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 
 // EdgesDelete removes a (from_id, to_id, relation) edge; an absent edge is a
 // silent no-op. Like EdgesAdd it bumps nothing and joins the ambient transaction.
-func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
+func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesDeleteResult, error) {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		fromID, toID, string(relation))
-	return err
+	return storeapi.EdgesDeleteResult{}, err
 }
 
 // EdgesListIncoming returns the objects pointing at toID through relation, joining edges

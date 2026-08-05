@@ -3897,6 +3897,12 @@ func addEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID
 	return nil
 }
 
+// dropEdge is EdgesDelete for a caller that only needs the edge gone.
+func dropEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID, relation beehive.Relation) error {
+	_, err := store.EdgesDelete(ctx, from, to, relation)
+	return err
+}
+
 func TestRefsAddInsertsRow(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
@@ -4195,7 +4201,7 @@ func TestDeleteRefRemovesRow(t *testing.T) {
 	b := newRefObject(t, store)
 
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
-	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
+	require.NoError(t, dropEdge(ctx, store, a.ID, b.ID, "depends_on"))
 	assert.Equal(t, 0, countEdges(t, store, a.ID, b.ID, "depends_on"))
 }
 
@@ -4206,12 +4212,12 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	b := newRefObject(t, store)
 
 	// No edge exists, and a nonexistent endpoint, are both silent no-ops.
-	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
-	require.NoError(t, store.EdgesDelete(ctx, a.ID, 9999, "depends_on"))
+	require.NoError(t, dropEdge(ctx, store, a.ID, b.ID, "depends_on"))
+	require.NoError(t, dropEdge(ctx, store, a.ID, 9999, "depends_on"))
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.EdgesDelete(ctx, a.ID, b.ID, "depends_on"))
+	require.NoError(t, dropEdge(ctx, store, a.ID, b.ID, "depends_on"))
 	probe.expectNone()
 }
 
@@ -4359,7 +4365,7 @@ func TestRefsAddDBError(t *testing.T) {
 func TestDeleteRefDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	require.Error(t, store.EdgesDelete(context.Background(), 1, 2, "depends_on"))
+	require.Error(t, dropEdge(context.Background(), store, 1, 2, "depends_on"))
 }
 
 func TestRefsListIncomingDBError(t *testing.T) {
@@ -5397,7 +5403,7 @@ func TestObjectsDeleteRefusesAReferencedRow(t *testing.T) {
 
 	// Dropping the edge releases it, which is the order GC drives: the referrer goes
 	// first, and the row it was holding open becomes collectable.
-	require.NoError(t, store.EdgesDelete(ctx, dependent.ID, target.ID, beehive.RelationDependsOn))
+	require.NoError(t, dropEdge(ctx, store, dependent.ID, target.ID, beehive.RelationDependsOn))
 	assert.NoError(t, store.ObjectsDelete(ctx, target.ID))
 }
 

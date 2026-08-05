@@ -183,7 +183,8 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 // DependenciesDelete drops the edge and schedules nothing: a finalizing toID is
 // already in the GC sweeper's listing, and the next tick finds the block gone.
 func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
-	return c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
+	_, err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
+	return err
 }
 
 // The ref reads below are plain edge queries with no kind scoping: a controller
