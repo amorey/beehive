@@ -435,6 +435,9 @@ func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) (
 func (s *fakeStore) EventsListSince(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error) {
 	panic("not implemented: fakeStore.EventsListSince")
 }
+func (s *fakeStore) EventsSnapshot(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.EventsSnapshot")
+}
 func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
 	panic("not implemented: fakeStore.EventsMaxVersion")
 }

@@ -406,6 +406,43 @@ func TestEventsListSinceIsTheTail(t *testing.T) {
 	assert.Len(t, got, 1, "limit bounds the page")
 }
 
+// EventsSnapshot is EventsList plus the position it is complete as of, so a
+// watch can start its tail exactly above what it already holds.
+func TestEventsSnapshotCarriesItsPosition(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	runs, at, err := store.EventsSnapshot(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	assert.Empty(t, runs)
+	assert.Zero(t, at, "an empty log reads position 0")
+
+	_, err = store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: "R1"})
+	require.NoError(t, err)
+	last, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Warning", Reason: "R2"})
+	require.NoError(t, err)
+
+	runs, at, err = store.EventsSnapshot(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	require.Len(t, runs, 2)
+	assert.Equal(t, "R2", runs[0].Reason, "newest first, like EventsList")
+	assert.Equal(t, last.ResourceVersion, at)
+
+	tail, _, err := store.EventsListSince(ctx, id, nil, at, 10)
+	require.NoError(t, err)
+	assert.Empty(t, tail, "the tail above the position holds nothing the snapshot did")
+
+	// The position spans every category even when the listing is filtered: it is
+	// the log's, not the query's, or a filtered watch would resume too low.
+	conn := "connection"
+	runs, at, err = store.EventsSnapshot(ctx, id, storeapi.EventQuery{Category: &conn})
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, "R1", runs[0].Reason)
+	assert.Equal(t, last.ResourceVersion, at)
+}
+
 // The page is unfiltered — the caller filters — but category selects which
 // horizon the call reports.
 func TestEventsListSinceReportsTheHorizon(t *testing.T) {

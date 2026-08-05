@@ -1685,6 +1685,28 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 	return scanEvents(rows)
 }
 
+// EventsSnapshot lists id's runs and reads its log position in one transaction:
+// two reads cannot answer "these runs, as of this position" — whichever order
+// they run in, a write between them is either delivered twice or dropped.
+func (s *sqliteStore) EventsSnapshot(
+	ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery,
+) ([]storeapi.Event, int64, error) {
+	var runs []storeapi.Event
+	var at int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		var err error
+		if runs, err = s.EventsList(ctx, id, q); err != nil {
+			return err
+		}
+		at, err = s.EventsMaxVersion(ctx, id)
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return runs, at, nil
+}
+
 // EventsListSince pages id's log above afterRV on idx_events_object_rv.
 //
 // Self-wrapped for ObjectWritesListSince's reason: the page, the horizon and the

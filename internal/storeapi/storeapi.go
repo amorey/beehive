@@ -372,6 +372,13 @@ type Store interface {
 	EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
 		[]Event, int64, error)
 
+	// EventsSnapshot returns id's runs matching q and the log position the
+	// listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what EventsMaxVersion reports — the object's
+	// whole log, not the query's — so a filtered watch resumes above what it
+	// could not see. Not kind-scoped; an unknown id reads as no runs at 0.
+	EventsSnapshot(ctx context.Context, id ObjectID, q EventQuery) ([]Event, int64, error)
+
 	// EventsMaxVersion returns the highest ResourceVersion over id's event
 	// runs, 0 when there are none (unknown id included). Spans every category
 	// and ignores filters. Not monotonic — retention can lower it — so
