@@ -834,6 +834,103 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// siblingFinalizerClearingController clears finalizer on targetID — never on the
+// object it is reconciling — the moment that target is finalizing. It models the
+// case the tail gcCollect cannot serve: the clear lands outside any pass over the
+// object it unblocks.
+type siblingFinalizerClearingController struct {
+	mu        sync.Mutex
+	reader    Client[cSpec, cStatus]
+	targetID  ObjectID
+	finalizer string
+}
+
+func (c *siblingFinalizerClearingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	reader, targetID, finalizer := c.reader, c.targetID, c.finalizer
+	c.mu.Unlock()
+	if reader == nil || obj.ID == targetID {
+		return Result{}, nil
+	}
+	target, err := reader.Get(ctx, targetID)
+	if errors.Is(err, ErrNotFound) {
+		return Result{}, nil // already collected
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	if target.DeletionRequestedAt == nil || len(target.Finalizers) == 0 {
+		return Result{}, nil
+	}
+	return Result{}, cc.FinalizersDelete(ctx, targetID, finalizer)
+}
+
+// With the sweeper stopped and the periodic passes off, the push is the only
+// thing that can dispatch the unblocked object: its own delete push was spent on
+// the pass the finalizer blocked.
+func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withoutGCSweeper(),
+	)...)
+
+	ctrl := &siblingFinalizerClearingController{finalizer: "f"}
+	_, err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"}, WithFinalizers("f"))
+	sibling := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "sibling"})
+
+	ctrl.mu.Lock()
+	ctrl.reader, ctrl.targetID = client, target.ID
+	ctrl.mu.Unlock()
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The delete push reconciles the target once, where the finalizer blocks the
+	// collect. Requeuing the sibling is what then clears it.
+	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.Requeue(ctx, sibling.ID))
+	waitForDeletions(t, w, target.ID)
+}
+
+// The pull path under this push: clearing through the store issues none, which
+// leaves the sweeper's tick as the only thing that can collect the row.
+func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	_, err = store.FinalizersDelete(ctx, clientTestGK, obj.ID, "f")
+	require.NoError(t, err)
+	waitForDeletions(t, w, obj.ID)
+}
+
 // TestGCSweepsOnItsOwnInterval pins that garbage collection has a cadence of its
 // own, independent of the reconcile knobs. Collecting dead rows and re-confirming
 // live ones are different jobs with different costs, and one interval governing
