@@ -2235,6 +2235,10 @@ func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.Obj
 	// Both endpoints in one row, as EdgesAdd does. No transaction of its own; the
 	// gap admits no wrong answer. See
 	// docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
+	//
+	// A failure here is reported, not swallowed, even though the DELETE is
+	// already durable outside a transaction: inside an ambient Within the
+	// caller's rollback unwinds it, and a retry then pushes properly.
 	var to storeapi.GroupKind
 	var unblocked int
 	err = s.conn(ctx).QueryRowContext(ctx, `
