@@ -302,6 +302,19 @@ func withWakeScanMinInterval(d time.Duration) Option {
 	}
 }
 
+// withWakePersistInterval floors how often the dependency waker writes its
+// cursor; <= 0 turns the floor off. Global and meaningful only at New.
+// Unexported: it paces a write on the connection every commit needs, and
+// wakePersistRetryCap counts in it.
+func withWakePersistInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.wakePersistInterval = d
+		}
+		return nil
+	}
+}
+
 // withStaleDependentsInterval sets how often the stale-dependents pass
 // re-derives which dependents a dependency has moved under. Global and
 // meaningful only at New. Unexported because it is the backstop that makes a

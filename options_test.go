@@ -330,10 +330,11 @@ func TestWithMinRequeueIntervalDispatch(t *testing.T) {
 func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t),
 		withWakeScanMinInterval(time.Minute),
-		withDependencyWakeInterval(time.Hour))
+		withDependencyWakeInterval(time.Minute), // the scan floor is clamped to it
+		withWakePersistInterval(time.Hour))
 
 	assert.Equal(t, time.Minute, bh.waker.scanGate.Interval(), "the option must reach the scan gate")
-	assert.Equal(t, time.Hour, bh.waker.persistGate.Interval(), "and the wake interval the persist gate")
+	assert.Equal(t, time.Hour, bh.waker.persistGate.Interval(), "and the persist interval the persist gate")
 }
 
 // The scan floor limits how often a wake may drive a scan; it is not a cadence

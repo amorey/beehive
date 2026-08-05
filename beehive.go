@@ -52,6 +52,10 @@ const (
 	// costs, and what bounds the loop's duty cycle under a sustained write
 	// stream. See docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
 	defaultWakeScanMinInterval = 100 * time.Millisecond
+	// defaultWakePersistInterval floors the waker's cursor write, which lands on
+	// the connection every commit needs. It is the unit wakePersistRetryCap
+	// counts in.
+	defaultWakePersistInterval = 1 * time.Second
 	// defaultMinRequeueInterval floors the gap between two dispatches of one
 	// object. It matches defaultWakeInterval, which is what bounds a dependency
 	// cycle today; raising one without the other changes that bound.
@@ -91,6 +95,7 @@ type Beehive struct {
 	gcInterval              time.Duration
 	wakeInterval            time.Duration
 	wakeScanMinInterval     time.Duration
+	wakePersistInterval     time.Duration
 	staleDependentsInterval time.Duration
 	watchPollInterval       time.Duration
 	watchFloorInterval      time.Duration
@@ -358,6 +363,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeInterval:            defaultWakeInterval,
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
+		wakePersistInterval:     defaultWakePersistInterval,
 		minRequeueInterval:      defaultMinRequeueInterval,
 		watchPollInterval:       defaultWatchPollInterval,
 		watchFloorInterval:      defaultWatchFloorInterval,

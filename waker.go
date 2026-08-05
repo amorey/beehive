@@ -48,9 +48,9 @@ type waker struct {
 	// wedge until the next commit wake — which backingOff drops.
 	retry driver.Backoff
 
-	// persistGate floors the cursor write at the wake interval. Without it a
-	// wake-driven pass would write the cursor at the wake rate, on the one
-	// connection every commit needs.
+	// persistGate floors the cursor write. Without it a wake-driven pass would
+	// write the cursor at the wake rate, on the one connection every commit
+	// needs.
 	persistGate *rategate.Gate[struct{}]
 
 	// scanGate floors wake-driven scans, so a sustained write stream cannot
@@ -90,7 +90,7 @@ const cursorNameWaker = "dependency_waker"
 const noStoredCursor = int64(-1)
 
 // wakePersistRetryCap bounds the backoff between retries of a failing cursor
-// write, in persists sat out — a minute at the default wake interval. It reads
+// write, in persists sat out — a minute at the default persist interval. It reads
 // as seconds only because persistGate floors a persist *attempt* at that
 // interval, which is why the gate is consulted before the skip ladder.
 const wakePersistRetryCap = 60
@@ -189,7 +189,7 @@ func newWaker(bh *Beehive) *waker {
 		now:         time.Now,
 		retry:       driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
 		scanGate:    rategate.New[struct{}](min(bh.wakeScanMinInterval, bh.wakeInterval)),
-		persistGate: rategate.New[struct{}](bh.wakeInterval),
+		persistGate: rategate.New[struct{}](bh.wakePersistInterval),
 	}
 }
 
