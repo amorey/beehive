@@ -3538,6 +3538,25 @@ func TestReconcileOwedClearCountsRowsCleared(t *testing.T) {
 	assert.Zero(t, cleared, "a second sweep finds nothing to clear")
 }
 
+// TestReconcileOwedClearWithNoKeptKinds pins the empty-keep arm, which drops the
+// NOT IN clause rather than emitting an empty one: with no reconcilers, nothing
+// consumes a count, so every row is reclaimed.
+func TestReconcileOwedClearWithNoKeptKinds(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newKindObject(t, store, clientOnlyGK)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, b.ID))
+
+	cleared, err := store.ReconcileOwedClear(ctx, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(2), cleared)
+	assert.Zero(t, reconcileOwed(t, store, a.ID))
+	assert.Zero(t, reconcileOwed(t, store, b.ID))
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.
