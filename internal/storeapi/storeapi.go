@@ -362,6 +362,16 @@ type Store interface {
 	// then id). The zero EventQuery returns every run. Not kind-scoped.
 	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
 
+	// EventsListSince returns id's runs above afterRV, oldest first, at most
+	// limit of them, with the retention horizon (0 when nothing was trimmed). An
+	// extend re-samples ResourceVersion, so the page is exactly what changed. The
+	// page is unfiltered and spans every category; category selects only which
+	// horizon is reported, nil meaning the max across the object's timelines.
+	// ErrNotFound when id holds no object: its log cascaded away with it, so an
+	// empty page there is not "no events".
+	EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
+		[]Event, int64, error)
+
 	// EventsMaxVersion returns the highest ResourceVersion over id's event
 	// runs, 0 when there are none (unknown id included). Spans every category
 	// and ignores filters. Not monotonic — retention can lower it — so

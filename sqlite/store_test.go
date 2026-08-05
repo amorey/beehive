@@ -368,6 +368,94 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	assert.Equal(t, "New", got[0].Reason, "the run within maxAge is kept")
 }
 
+// EventsListSince pages the log above a cursor, oldest-first. An extend
+// re-samples resource_version, so a run that grew comes back as itself.
+func TestEventsListSinceIsTheTail(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	first, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R1"})
+	require.NoError(t, err)
+	second, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "R2"})
+	require.NoError(t, err)
+
+	got, _, err := store.EventsListSince(ctx, id, nil, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "R1", got[0].Reason, "oldest first")
+	assert.Equal(t, "R2", got[1].Reason)
+
+	got, _, err = store.EventsListSince(ctx, id, nil, first.ResourceVersion, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "R2", got[0].Reason, "the cursor excludes what it has seen")
+
+	// An extend lifts R2 above the cursor that already covered it.
+	extended, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "R2"})
+	require.NoError(t, err)
+	got, _, err = store.EventsListSince(ctx, id, nil, second.ResourceVersion, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, second.ID, got[0].ID, "the same run, not a new one")
+	assert.Equal(t, 2, got[0].Count)
+	assert.Equal(t, extended.ResourceVersion, got[0].ResourceVersion)
+
+	got, _, err = store.EventsListSince(ctx, id, nil, 0, 1)
+	require.NoError(t, err)
+	assert.Len(t, got, 1, "limit bounds the page")
+}
+
+// The page is unfiltered — the caller filters — but category selects which
+// horizon the call reports.
+func TestEventsListSinceReportsTheHorizon(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for _, r := range []string{"C1", "C2"} {
+		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: r})
+		require.NoError(t, err)
+	}
+	_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "S1"})
+	require.NoError(t, err)
+	_, err = store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	trimmed := eventHorizon(t, store, id, "connection")
+	require.NotZero(t, trimmed)
+
+	conn, sync := "connection", "sync"
+	page, at, err := store.EventsListSince(ctx, id, &conn, 0, 10)
+	require.NoError(t, err)
+	assert.Equal(t, trimmed, at, "the watched timeline's horizon")
+	assert.Len(t, page, 2, "the page spans every category")
+
+	_, at, err = store.EventsListSince(ctx, id, &sync, 0, 10)
+	require.NoError(t, err)
+	assert.Zero(t, at, "a timeline that lost nothing")
+
+	_, at, err = store.EventsListSince(ctx, id, nil, 0, 10)
+	require.NoError(t, err)
+	assert.Equal(t, trimmed, at, "unfiltered: the max across timelines")
+}
+
+// A collected object's log cascaded away with it, so an empty page there is not
+// "no events" — it is "this object is gone", and saying so is the point.
+func TestEventsListSinceReportsACollectedObject(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	page, at, err := store.EventsListSince(ctx, id, nil, 0, 10)
+	require.NoError(t, err, "an object with no events yet is not gone")
+	assert.Empty(t, page)
+	assert.Zero(t, at)
+
+	require.NoError(t, store.ObjectsDelete(ctx, id))
+	_, _, err = store.EventsListSince(ctx, id, nil, 0, 10)
+	assert.ErrorIs(t, err, storeapi.ErrNotFound)
+}
+
 // eventHorizon reads a timeline's recorded horizon, 0 when none.
 func eventHorizon(t *testing.T, store beehive.Store, id storeapi.ObjectID, category string) int64 {
 	t.Helper()

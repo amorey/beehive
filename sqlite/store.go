@@ -1685,6 +1685,59 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 	return scanEvents(rows)
 }
 
+// EventsListSince pages id's log above afterRV on idx_events_object_rv.
+//
+// Self-wrapped for ObjectWritesListSince's reason: the page, the horizon and the
+// existence probe must describe one instant, or a sweep landing between them
+// reports a horizon above rows the page already carried.
+func (s *sqliteStore) EventsListSince(
+	ctx context.Context, id storeapi.ObjectID, category *string, afterRV int64, limit int,
+) ([]storeapi.Event, int64, error) {
+	if limit <= 0 {
+		return nil, 0, nil // "LIMIT -1" is unbounded in SQLite
+	}
+	var runs []storeapi.Event
+	var trimmed int64
+	err := s.Within(ctx, func(ctx context.Context) error {
+		rows, err := s.conn(ctx).QueryContext(ctx, `
+			SELECT `+eventColumns+` FROM events
+			 WHERE object_id = ? AND resource_version > ?
+			 ORDER BY resource_version LIMIT ?`, id, afterRV, limit)
+		if err != nil {
+			return err
+		}
+		if runs, err = scanEvents(rows); err != nil {
+			return err
+		}
+		if trimmed, err = s.eventHorizon(ctx, id, category); err != nil {
+			return err
+		}
+		if len(runs) > 0 || trimmed > 0 {
+			// Either proves the object was there; skip the probe.
+			return nil
+		}
+		_, err = s.ObjectsGet(ctx, id)
+		return err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return runs, trimmed, nil
+}
+
+// eventHorizon is what retention removed from id's category, or from its highest
+// timeline when category is nil. No row means nothing has been trimmed.
+func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, category *string) (int64, error) {
+	where, args := `object_id = ?`, []any{id}
+	if category != nil {
+		where, args = where+` AND category = ?`, append(args, *category)
+	}
+	var rv sql.NullInt64
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT MAX(trimmed_through) FROM events_horizon WHERE `+where, args...).Scan(&rv)
+	return rv.Int64, err
+}
+
 // EventsMaxVersion reads the high-water mark of id's event log — a covering seek
 // on idx_events_object_rv, NULL reading as 0. That index exists for this read
 // alone; without it the plan fetches one table row per run, past overflow chains
