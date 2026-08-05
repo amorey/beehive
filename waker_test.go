@@ -972,6 +972,41 @@ func TestWakerStopsAtThePageBudget(t *testing.T) {
 	assert.EqualValues(t, total, dw.watermark, "the next tick resumes at the budget, not from the start")
 }
 
+// A drain that has run for as long as the stale-dependents pass takes to sweep is
+// re-deriving wakes that pass has already found, so it stops paging and jumps to
+// the log's mark. The range it skipped is that pass's to deliver.
+func TestWakerAbandonsADrainTheBackstopOvertook(t *testing.T) {
+	const mark int64 = 9000
+	const drains = 3
+	store := &cursorStore{replayStore: replayStore{
+		rows: replayRows(drains * wakeScanPagesPerPass * wakeScanPageCap), seed: mark,
+	}}
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = (drains - 1) * defaultWakePersistInterval
+
+	// Advanced by the persist floor, not the scan floor, so every pass's cursor
+	// write lands and the last one is the jump's.
+	for range drains - 1 {
+		require.Equal(t, scanMore, dw.scan(context.Background()))
+		clk.advance(defaultWakePersistInterval)
+	}
+
+	assert.Equal(t, scanIdle, dw.scan(context.Background()), "the drain gives up rather than paging on")
+	assert.Equal(t, mark, dw.watermark, "and jumps to the log's mark")
+	assert.Len(t, store.pages, drains*wakeScanPagesPerPass, "no page is read after the jump")
+	assert.Equal(t, mark, store.setCalls[len(store.setCalls)-1],
+		"the jump is persisted, so a restart does not re-drain what it skipped")
+}
+
+// The threshold is the backstop's own cadence: past it, the sweep has found
+// everything the drain is still working toward.
+func TestWakerAbandonAfterIsTheBackstopCadence(t *testing.T) {
+	dw, _ := wakerOver(&replayStore{}, GroupKind{Kind: "Widget"})
+	dw.bh.staleDependentsInterval = 42 * time.Second
+
+	assert.Equal(t, 42*time.Second, newWaker(dw.bh).abandonAfter)
+}
+
 // However far behind a stored cursor is, seed resumes from it: the distance is
 // in resource_version units, which EventsAdd inflates without adding anything
 // this scan would read, so no threshold over it could say whether the gap is

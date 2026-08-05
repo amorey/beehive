@@ -76,6 +76,15 @@ type waker struct {
 	// seeded says watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero.
 	seeded bool
+
+	// drainSince is when the current run of budget-exhausting passes began; zero
+	// when no drain is running. Only paging counts, so a gate refusal is not a
+	// drain.
+	drainSince time.Time
+
+	// abandonAfter is how long a drain may run before the stale-dependents pass
+	// has found everything it is still working toward.
+	abandonAfter time.Duration
 }
 
 // cursorNameWaker is this waker's key in driver_cursors.
@@ -187,8 +196,9 @@ func newWaker(bh *Beehive) *waker {
 			Base: max(bh.wakePersistInterval, wakeRetryBase),
 			Max:  wakePersistRetryMax,
 		},
-		scanGate:    rategate.NewSingle(bh.wakeScanMinInterval),
-		persistGate: rategate.NewSingle(bh.wakePersistInterval),
+		scanGate:     rategate.NewSingle(bh.wakeScanMinInterval),
+		persistGate:  rategate.NewSingle(bh.wakePersistInterval),
+		abandonAfter: bh.staleDependentsInterval,
 	}
 }
 
@@ -356,9 +366,19 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 	if !dw.seeded {
 		return dw.seed(ctx)
 	}
-	// A defer, so every early return below — including the error path — still
-	// persists whatever earlier pages advanced the watermark to.
+	// A defer, so every early return below — including the error path and the
+	// jump abandonIfOvertaken makes — still persists whatever the watermark
+	// reached. It must stay in scan: in scanPages it would run before the jump.
 	defer dw.persist(ctx)
+	if result := dw.scanPages(ctx); result != scanMore {
+		return result
+	}
+	return dw.abandonIfOvertaken(ctx)
+}
+
+// scanPages reads up to wakeScanPagesPerPass pages, returning scanMore when the
+// budget rather than the log is what stopped it.
+func (dw *waker) scanPages(ctx context.Context) scanResult {
 	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
 		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
@@ -382,6 +402,35 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 		}
 	}
 	return scanMore
+}
+
+// abandonIfOvertaken decides whether a drain still earns the connection it holds.
+// Once one has run for abandonAfter, the stale-dependents pass has swept every
+// dependent the remaining pages would wake, so the waker jumps to the log's mark
+// and leaves that range to the pass.
+func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
+	now := dw.now()
+	if dw.drainSince.IsZero() {
+		dw.drainSince = now
+		return scanMore
+	}
+	drained := now.Sub(dw.drainSince)
+	if drained < dw.abandonAfter {
+		return scanMore
+	}
+	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			dw.bh.log().WarnContext(ctx, "reading the write log's mark failed; the drain continues",
+				"watermark", dw.watermark, "err", err)
+		}
+		return scanFailed
+	}
+	dw.bh.log().WarnContext(ctx, "the dependency waker's backlog outlasted the stale-dependents cadence; skipping to the write log's mark, and that pass delivers the wakes in between",
+		"watermark", dw.watermark, "mark", mark, "drained", drained)
+	dw.watermark = mark
+	dw.drainSince = time.Time{}
+	return scanIdle
 }
 
 // persist writes the watermark through cursors when it has advanced since the
