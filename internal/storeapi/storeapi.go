@@ -259,6 +259,12 @@ type EdgesAddResult struct {
 	// From is the source object's GroupKind. Edges are cross-kind, so a caller
 	// routing a requeue to fromID cannot assume its own kind.
 	From GroupKind
+	// To is the target object's GroupKind, for a caller routing a requeue to
+	// the other end.
+	To GroupKind
+	// ToDeleting reports whether the target was deletion-pending when the edge
+	// landed.
+	ToDeleting bool
 	// ReconcileOwedStamped reports whether this call incremented fromID's
 	// reconcile_owed (i.e. created a new non-self depends_on edge).
 	ReconcileOwedStamped bool
@@ -523,6 +529,9 @@ type Store interface {
 	// dependency set cannot speak for a new target). The stamp is
 	// unconditional on the caller and independent of whether fromID's kind has
 	// a controller. See docs/adr/2026-07-29-stamp-every-new-dependency-edge.md.
+	//
+	// The result also reports both endpoints' GroupKinds and whether toID was
+	// deletion-pending, all read by the endpoint check inside that same unit.
 	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 
 	// EdgesDelete removes the (fromID, toID, relation) edge; removing a missing

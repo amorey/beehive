@@ -35,6 +35,10 @@ import (
 
 var testGK = beehive.GroupKind{Group: "", Kind: "Greeting"}
 
+// otherTestGK is a second kind, for assertions that must not confuse the two
+// ends of a cross-kind edge.
+var otherTestGK = beehive.GroupKind{Group: "", Kind: "Other"}
+
 func newTestStore(t *testing.T) beehive.Store {
 	t.Helper()
 	store, err := OpenMemory()
@@ -3938,25 +3942,48 @@ func TestRefsAddNonexistentEndpoint(t *testing.T) {
 	assert.Equal(t, 0, countEdges(t, store, 9999, a.ID, "depends_on"))
 }
 
-// TestRefsAddReportsEndpoints pins the one thing the endpoint check reports back:
-// the source's GroupKind. The edge is cross-kind, so a caller routing a wake to
-// fromID cannot assume its own kind, and it must come from the same round-trip as
-// the insert.
+// TestRefsAddReportsEndpoints pins what the endpoint check reports back: both
+// endpoints' GroupKinds. The edge is cross-kind, so a caller routing work to
+// either end cannot assume its own kind, and it must come from the same
+// round-trip as the insert. The two ends are different kinds here, so confusing
+// them fails.
 func TestRefsAddReportsEndpoints(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	a := newRefObject(t, store)
-	b := newRefObject(t, store)
+	b := newKindObject(t, store, otherTestGK)
 
 	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
-	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "fromID's kind")
+	assert.Equal(t, testGK, res.From, "fromID's kind")
+	assert.Equal(t, otherTestGK, res.To, "toID's kind")
+	assert.False(t, res.ToDeleting, "a live target")
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "this call created the edge")
 
 	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
-	assert.Equal(t, beehive.GroupKind{Group: testGK.Group, Kind: testGK.Kind}, res.From, "re-declare reports it too")
+	assert.Equal(t, testGK, res.From, "re-declare reports it too")
+	assert.Equal(t, otherTestGK, res.To)
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge already existed; the insert was a no-op")
+}
+
+// TestRefsAddReportsADeletingTarget pins the lifecycle bit an owner edge needs:
+// a child created under an owner whose cascade already ran must push that owner,
+// and this is what tells the caller to.
+func TestRefsAddReportsADeletingTarget(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	child := newRefObject(t, store)
+	owner := newRefObject(t, store)
+
+	marked, err := store.DeletionRequestsCreate(ctx, testGK, owner.ID)
+	require.NoError(t, err)
+	require.True(t, marked)
+
+	res, err := store.EdgesAdd(ctx, child.ID, owner.ID, "owned_by")
+	require.NoError(t, err)
+	assert.True(t, res.ToDeleting, "the owner is deletion-pending")
+	assert.False(t, res.ReconcileOwedStamped, "owned_by still stamps nothing")
 }
 
 // moveTarget writes to the object so its resource_version advances, for tests
