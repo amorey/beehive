@@ -59,10 +59,8 @@ const (
 	// The stale-dependents pass is the waker's backstop; its cadence is set by
 	// acceptable staleness after a crash, not by cost.
 	defaultStaleDependentsInterval = 60 * time.Second
-	// The client's watch surface polls, so this is the latency a subscriber sees.
-	defaultWatchPollInterval = 1 * time.Second
-	// The watch tail reads on a commit wake, so this floor is not the latency
-	// of a local write — it bounds staleness for what a wake cannot cover.
+	// A watch reads on a commit wake, so this floor is not the latency of a
+	// local write — it bounds staleness for what a wake cannot cover.
 	defaultWatchFloorInterval = 30 * time.Second
 	// Floors the gap between two wake-driven drains, so a write stream cannot
 	// make its kind's tailer hold the single connection back from the writers.
@@ -96,7 +94,6 @@ type Beehive struct {
 	wakeScanMinInterval     time.Duration
 	wakePersistInterval     time.Duration
 	staleDependentsInterval time.Duration
-	watchPollInterval       time.Duration
 	watchFloorInterval      time.Duration
 	watchScanMinInterval    time.Duration
 	concurrency             int // default worker count for all controllers; 0/1 = single-threaded
@@ -127,6 +124,8 @@ type Beehive struct {
 
 	waker *waker
 
+	// eventWriteHub is a message hub for object-scoped event writes.
+	eventWriteHub eventWriteHub
 	// kindWriteHub is a message hub for GroupKind-scoped writes
 	kindWriteHub kindWriteHub
 
@@ -343,6 +342,7 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// and never partially. Which one wins is unspecified and nothing here needs
 	// it pinned, since every stream is ending.
 	bh.kindWriteHub.Close()
+	bh.eventWriteHub.Close()
 
 	// The watch tailers are not counted in wg: each ends with its own last
 	// subscriber, or with the hub close above. SchedulesWatch streams
@@ -364,12 +364,12 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
 		wakePersistInterval:     defaultWakePersistInterval,
 		minRequeueInterval:      defaultMinRequeueInterval,
-		watchPollInterval:       defaultWatchPollInterval,
 		watchFloorInterval:      defaultWatchFloorInterval,
 		watchScanMinInterval:    defaultWatchScanMinInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),
+		eventWriteHub:           newEventWriteHub(),
 		kindWriteHub:            newKindWriteHub(),
 	}
 	for _, o := range opts {
@@ -515,6 +515,15 @@ func (bh *Beehive) signalRequeueManyNow(ctx context.Context, refs []ObjectRef) {
 func (bh *Beehive) signalKindWritten(ctx context.Context, gk GroupKind) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		_ = bh.kindWriteHub.Send(gk) // ErrClosed after stop; nothing is left to wake
+	})
+}
+
+// signalEventsWritten wakes id's event readers once an event write to it
+// commits. Same commit semantics as signalKindWritten, and the same reason it
+// carries no value: a reader reads its position from the store.
+func (bh *Beehive) signalEventsWritten(ctx context.Context, id ObjectID) {
+	bh.store.AfterCommit(ctx, func(context.Context) {
+		_ = bh.eventWriteHub.Send(id) // ErrClosed after stop; nothing is left to wake
 	})
 }
 

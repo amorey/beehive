@@ -169,30 +169,6 @@ func TestWithGCIntervalRejectsNonPositive(t *testing.T) {
 	}
 }
 
-// TestWatchPollIntervalRejectsNonPositive pins the other mandatory interval,
-// which is mandatory for a different reason than GC's. The watch poll is not a
-// backstop but the delivery mechanism itself, so a watch that never polls is a
-// stream that never emits — there is nothing such a value could mean.
-func TestWatchPollIntervalRejectsNonPositive(t *testing.T) {
-	for _, d := range []time.Duration{0, -time.Second} {
-		t.Run(d.String(), func(t *testing.T) {
-			bh := &Beehive{watchPollInterval: time.Minute}
-			err := withWatchPollInterval(d)(bh)
-			require.ErrorIs(t, err, ErrInvalidOption)
-			assert.Contains(t, err.Error(), "withWatchPollInterval", "name the option that was misused")
-			assert.Equal(t, time.Minute, bh.watchPollInterval, "a rejected option must not have written")
-
-			// Checked before the target switch, like WithGCInterval: a value that means
-			// nothing at one call site means nothing at any of them.
-			require.ErrorIs(t, withWatchPollInterval(d)(&reconciler{}), ErrInvalidOption)
-			require.ErrorIs(t, withWatchPollInterval(d)("unrelated"), ErrInvalidOption)
-
-			_, err = New(&fakeStore{}, withWatchPollInterval(d))
-			require.ErrorIs(t, err, ErrInvalidOption)
-		})
-	}
-}
-
 // TestWatchFloorIntervalRejectsNonPositive pins that the floor cannot be
 // disabled. A disabled floor would still deliver this process's own writes —
 // the wake covers those — but silently drop what only the floor covers: a

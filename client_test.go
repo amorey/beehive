@@ -2690,30 +2690,28 @@ func TestClientGetLatestEvent(t *testing.T) {
 }
 
 // EventsWatch streams live runs as public Events and, like Watch, requires a
-// registered controller.
+// registered controller. The write here goes straight through the Store, so it
+// publishes no wake: what delivers it is the floor tick, which is the pull path
+// every push in this system is allowed to be a shortcut for.
 func TestClientWatchEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store)
+	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	ch, err := client.EventsWatch(ctx, obj.ID)
+	stream, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
 	err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
-	select {
-	case ev := <-ch:
-		assert.Equal(t, "ProbeFailed", ev.Reason)
-		assert.Equal(t, EventWarning, ev.Type)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for event")
-	}
+	ev := recv(t, stream.Events)
+	assert.Equal(t, "ProbeFailed", ev.Reason)
+	assert.Equal(t, EventWarning, ev.Type)
 
 	unregistered := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Unregistered"})
 	_, err = unregistered.EventsWatch(ctx, obj.ID)

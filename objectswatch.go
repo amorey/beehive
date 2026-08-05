@@ -74,9 +74,9 @@ func resolveWatch(opts []WatchOption) watchConfig {
 	return cfg
 }
 
-// watchFloor returns the object tail's floor interval, with a fallback for the
-// same reason as watchPoll: a zero would make the tailer's timer fire in a
-// loop.
+// watchFloor returns the interval a watch reads at without a wake. The fallback
+// covers a Beehive built field by field in a test: a zero would make the timer
+// fire in a loop.
 func (bh *Beehive) watchFloor() time.Duration {
 	if bh.watchFloorInterval <= 0 {
 		return defaultWatchFloorInterval

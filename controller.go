@@ -134,13 +134,17 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 			return err
 		}
 	}
-	return c.bh.store.EventsAdd(ctx, c.gk, id, storeapi.Event{
+	if err := c.bh.store.EventsAdd(ctx, c.gk, id, storeapi.Event{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,
 		Message:  event.Message,
 		Detail:   detail,
-	})
+	}); err != nil {
+		return err
+	}
+	c.bh.signalEventsWritten(ctx, id)
+	return nil
 }
 
 // Clearing the last finalizer on a deleting row pushes the collect it unblocks;

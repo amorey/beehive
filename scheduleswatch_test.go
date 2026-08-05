@@ -79,11 +79,11 @@ func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 
 // pushOnlyClient builds a Beehive whose watch poll is set an hour out, so no
 // tick can fire inside a test and the only path from the queue to a stream is
-// the hub. The option refuses a non-positive interval, so this is how the poll
+// the hub. The option refuses a non-positive interval, so this is how the tick
 // is taken out of the picture.
 func pushOnlyClient(t *testing.T) (context.Context, *Beehive, Client[cSpec, cStatus], *reconciler) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchPollInterval(time.Hour))
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)

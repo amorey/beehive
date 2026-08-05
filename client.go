@@ -169,11 +169,14 @@ type Client[Spec, Status any] interface {
 	// EventsList returns id's event-log runs, newest-first, filtered by opts.
 	// Reads by id, not kind-scoped. An empty log is an empty slice.
 	EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
-	// EventsWatch streams id's event log: the runs matching opts, then whatever
-	// the log grows by, until ctx is cancelled. Requires a registered
-	// controller and polls, so a run extended several times within one interval
-	// is delivered once, carrying its latest state.
-	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+	// EventsWatch streams id's event log: a snapshot of the runs matching opts,
+	// the position it was read at, and the runs the log grows by above it. An
+	// extend re-samples ResourceVersion, so a run that grew is delivered again
+	// carrying its latest state. WithEventsResumeFrom starts above a position
+	// instead of snapshotting; one retention has passed is ErrWatchTooOld and
+	// one above the log's head is ErrWatchTooNew. Requires a registered
+	// controller.
+	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 	// Get loads id, or returns ErrNotFound. Kind-scoped: another kind's row is
 	// not found. The read half of a read-modify-write, whose write half is
 	// Update.
