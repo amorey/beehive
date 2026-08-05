@@ -23,9 +23,9 @@ import (
 	"github.com/amorey/gobus"
 )
 
-// waker requeues the dependents of everything that changed: each tick scans the
-// store's write log from a watermark and wakes what it finds. One per control
-// plane; only the waker goroutine touches its fields.
+// waker requeues the dependents of everything that changed: each commit wakes a
+// scan of the store's write log from a watermark. One per control plane; only
+// the waker goroutine touches its fields.
 //
 // It is an optimisation, not a guarantee — the stale-dependents pass
 // (staleDependentsRun) is what makes a dependency wake certain, so a wake lost
@@ -116,10 +116,11 @@ const wakeScanPageCap = 256
 // does — shorter waits, not less total work.
 const wakeScanPagesPerPass = 4
 
-// run drives the waker for the life of the control plane: a commit wakes it,
-// and the interval is the floor behind that. A non-positive interval turns it
-// off, wake included — the reconcile_owed stamp and the stale-dependents pass
-// still cover correctness.
+// run drives the waker for the life of the control plane. It is wake-driven and
+// has no tick: an idle waker arms nothing and reads nothing, and the
+// stale-dependents pass is what bounds a wake nobody published — a second
+// process writing the same store publishes to a hub of its own. See
+// docs/adr/2026-08-05-the-waker-is-wake-driven.md.
 func (dw *waker) run(ctx context.Context) {
 	// No registered controllers means nowhere to queue anything.
 	if len(dw.bh.order) == 0 || dw.bh.wakerOff {
@@ -138,8 +139,8 @@ func (dw *waker) run(ctx context.Context) {
 
 	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
 	defer timer.Stop()
-	// The instant timer.C is set to fire, zero when it has fired and not been
-	// re-armed. A wake that would only push it later leaves it alone.
+	// The instant timer.C is set to fire, zero when nothing is armed. A wake
+	// that would only push it later leaves it alone.
 	var armedFor time.Time
 
 	backingOff := false
@@ -162,6 +163,9 @@ func (dw *waker) run(ctx context.Context) {
 		now := dw.now()
 		var next time.Duration
 		next, backingOff = dw.pass(ctx, now, backingOff)
+		if next == wakeIdle {
+			continue // nothing to look again for: block until the next commit
+		}
 		// A wake that only re-arms the timer later than it already fires buys
 		// nothing, and under a sustained stream the loop turns at commit rate.
 		if at := now.Add(next); armedFor.IsZero() || at.Before(armedFor) {
@@ -174,13 +178,6 @@ func (dw *waker) run(ctx context.Context) {
 // newWaker builds a waker over bh's cadences. Call it after the options are
 // applied: the gates take their intervals here, so one built earlier would hold
 // the defaults whatever the caller asked for.
-//
-// The scan floor is clamped to the wake floor. It is meant to sit an order of
-// magnitude under it — a limit on how often a wake may drive a scan, not on how
-// often one happens — so a scan floor above the wake interval would delay a
-// scan past the tick that is supposed to bound the worst case. The two are
-// configured independently, and a short wake interval is the ordinary case in
-// tests.
 func newWaker(bh *Beehive) *waker {
 	cursors, _ := bh.store.(DriverCursorer)
 	return &waker{
@@ -188,7 +185,7 @@ func newWaker(bh *Beehive) *waker {
 		cursors:     cursors,
 		now:         time.Now,
 		retry:       driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
-		scanGate:    rategate.New[struct{}](min(bh.wakeScanMinInterval, bh.wakeInterval)),
+		scanGate:    rategate.New[struct{}](bh.wakeScanMinInterval),
 		persistGate: rategate.New[struct{}](bh.wakePersistInterval),
 	}
 }
@@ -199,7 +196,6 @@ func newWaker(bh *Beehive) *waker {
 // scan has no new one. Split from run so the rate tests drive it at instants of
 // their own choosing.
 func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time.Duration, bool) {
-	floor := dw.bh.wakeInterval
 	if opensAt, held := dw.scanGate.Allow(wakerGateKey, now); held {
 		// Re-arming for what is left of the throttle is what remembers the
 		// wake: the scan that runs then reads its position from the store.
@@ -216,12 +212,14 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 	}
 	dw.retry.Reset()
 	if result == scanMore {
-		if throttle := dw.scanGate.Interval(); throttle > 0 {
-			return throttle, false // keep draining, at the throttle's rate
-		}
+		return dw.scanGate.Interval(), false // keep draining, at the throttle's rate
 	}
-	return floor, false
+	return wakeIdle, false
 }
+
+// wakeIdle is pass's answer for "no reason to look again": the loop arms
+// nothing and blocks until the next commit.
+const wakeIdle time.Duration = -1
 
 // scanResult says what a pass found. The run loop dispatches on it: how soon to
 // look again, and whether to drop the wakes arriving meanwhile.

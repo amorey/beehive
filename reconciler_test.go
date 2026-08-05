@@ -446,6 +446,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	store.resetLooked()
 	err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
+	bh.signalKindWritten(ctx, gk) // a raw store write publishes no wake of its own
 	store.waitLooked(t)
 	close(proceed)
 
@@ -529,6 +530,7 @@ func TestDependencyRequeueRaceOnOutOfBandDeclare(t *testing.T) {
 	store.resetLooked()
 	err = store.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
+	bh.signalKindWritten(ctx, gk) // a raw store write publishes no wake of its own
 	store.waitLooked(t)
 	// target is the application's read of the target, taken before the change
 	// above — so the version it carries is the one the decision to depend was
@@ -2634,13 +2636,13 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, fu
 	ctx := context.Background()
 	store := &seedProbeStore{Store: newClientTestStore(t), seeded: make(chan struct{}, 8)}
 
-	// The dependency waker is the only driver under test here, so it runs fast
-	// while everything else is pushed out of the way. The re-enqueue floor goes
-	// too: it absorbs an enqueue into an alarm that fires a second later, which
-	// would reach the dependent after the change and prove nothing about what
-	// woke it.
+	// The dependency waker is the only driver under test here, so its scans run
+	// unthrottled while everything else is pushed out of the way. The re-enqueue
+	// floor goes too: it absorbs an enqueue into an alarm that fires a second
+	// later, which would reach the dependent after the change and prove nothing
+	// about what woke it.
 	bh := newTestBeehive(t, store, WithGCInterval(time.Hour),
-		withDependencyWakeInterval(fastTick), withMinRequeueInterval(0))
+		withWakeScanMinInterval(0), withMinRequeueInterval(0))
 	observer := &depObserver{store: store, seen: make(chan depObservation, 64)}
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, observer,
 		WithFullPassInterval(0),
@@ -2878,6 +2880,9 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 
 	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
+	// The waker is wake-driven, and a write made straight to the store announces
+	// nothing — this is what a write through the client publishes for itself.
+	bh.signalKindWritten(ctx, clientOnlyGK)
 	observer.release()
 
 	awaitTargetAbove(t, observer.seen, dep.ID, at,
@@ -2905,6 +2910,9 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 
 	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
+	// The waker is wake-driven, and a write made straight to the store announces
+	// nothing — this is what a write through the client publishes for itself.
+	bh.signalKindWritten(ctx, clientOnlyGK)
 	observer.release()
 
 	awaitTargetAbove(t, observer.seen, dep.ID, at,
@@ -3460,14 +3468,14 @@ func (c *cycleController) Reconcile(ctx context.Context, cc ControllerClient[cSt
 // re-enqueue floor is what bounds the loop — see the cycle item in docs/TODO.md,
 // which this does not fix, only rate-limits.
 //
-// The waker runs far below the floor here, so the wake path is not the limiter.
+// The waker scans unthrottled here, so the wake path is not the limiter.
 func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ctrl := &cycleController{first: newSignal(), hot: newSignal()}
 	bh := newTestBeehive(t, newClientTestStore(t),
-		withDependencyWakeInterval(time.Millisecond),
+		withWakeScanMinInterval(0),
 		withMinRequeueInterval(hotLoopWindow))
 	cc, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)

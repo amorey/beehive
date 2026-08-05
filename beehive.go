@@ -43,22 +43,18 @@ const (
 	// Free pages the GC sweeper releases per tick (~4MB/30s at ~3.7µs a page).
 	// Not an option: there is no measurement a caller could tune it against.
 	freePagesPerSweep = 1000
-	// The dependency-wake scan costs nothing in a quiet system, so it runs an
-	// order of magnitude more often than the passes that scale with object count.
-	defaultWakeInterval = 1 * time.Second
-
 	// defaultWakeScanMinInterval floors the gap between two wake-driven scans.
-	// An order of magnitude under defaultWakeInterval: it is what a chain hop
-	// costs, and what bounds the loop's duty cycle under a sustained write
-	// stream. See docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
+	// It is what a chain hop costs, and what bounds the loop's duty cycle under
+	// a sustained write stream. See
+	// docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
 	defaultWakeScanMinInterval = 100 * time.Millisecond
 	// defaultWakePersistInterval floors the waker's cursor write, which lands on
 	// the connection every commit needs. It is the unit wakePersistRetryCap
 	// counts in.
 	defaultWakePersistInterval = 1 * time.Second
 	// defaultMinRequeueInterval floors the gap between two dispatches of one
-	// object. It matches defaultWakeInterval, which is what bounds a dependency
-	// cycle today; raising one without the other changes that bound.
+	// object. It matches the dependency waker's scan floor, which is what bounds
+	// a dependency cycle today; raising one without the other changes that bound.
 	defaultMinRequeueInterval = 1 * time.Second
 	// The stale-dependents pass is the waker's backstop; its cadence is set by
 	// acceptable staleness after a crash, not by cost.
@@ -94,7 +90,6 @@ type Beehive struct {
 	minRequeueInterval      time.Duration
 	fullPassInterval        time.Duration
 	gcInterval              time.Duration
-	wakeInterval            time.Duration
 	wakeScanMinInterval     time.Duration
 	wakePersistInterval     time.Duration
 	staleDependentsInterval time.Duration
@@ -362,7 +357,6 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		fullPassInterval:        defaultFullPassInterval,
 		gcInterval:              defaultGCInterval,
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
-		wakeInterval:            defaultWakeInterval,
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
 		wakePersistInterval:     defaultWakePersistInterval,
 		minRequeueInterval:      defaultMinRequeueInterval,

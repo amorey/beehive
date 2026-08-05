@@ -330,22 +330,10 @@ func TestWithMinRequeueIntervalDispatch(t *testing.T) {
 func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t),
 		withWakeScanMinInterval(time.Minute),
-		withDependencyWakeInterval(time.Minute), // the scan floor is clamped to it
 		withWakePersistInterval(time.Hour))
 
 	assert.Equal(t, time.Minute, bh.waker.scanGate.Interval(), "the option must reach the scan gate")
 	assert.Equal(t, time.Hour, bh.waker.persistGate.Interval(), "and the persist interval the persist gate")
-}
-
-// The scan floor limits how often a wake may drive a scan; it is not a cadence
-// of its own. Left above the wake interval it would delay a scan past the tick
-// that bounds the worst case — which is every test that runs the waker fast and
-// leaves the scan floor at its default.
-func TestNewClampsTheScanFloorToTheWakeInterval(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t), withDependencyWakeInterval(5*time.Millisecond))
-
-	assert.Equal(t, 5*time.Millisecond, bh.waker.scanGate.Interval(),
-		"the default scan floor is longer than this wake interval, so the wake interval wins")
 }
 
 // A non-positive interval turns the throttle off rather than holding forever,

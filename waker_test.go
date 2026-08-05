@@ -35,7 +35,7 @@ import (
 // connection every writer shares.
 func TestStartWithNoControllersSkipsWaker(t *testing.T) {
 	store := &replayStore{rows: replayRows(1)}
-	bh := newTestBeehive(t, store, withDependencyWakeInterval(fastTick))
+	bh := newTestBeehive(t, store)
 
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -64,7 +64,6 @@ func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconcil
 	// limit switched off, which is not what production does.
 	bh := &Beehive{
 		store: store, reconcilers: rs, order: order,
-		wakeInterval:            defaultWakeInterval,
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
 		wakePersistInterval:     defaultWakePersistInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,
@@ -164,7 +163,7 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 
 	inner := &replayStore{rows: replayRows(1), listed: newSignal()}
 	store := &seedProbeStore{Store: inner, seeded: make(chan struct{}, 8)}
-	bh := newTestBeehive(t, store, withDependencyWakeInterval(time.Hour))
+	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 
@@ -216,20 +215,80 @@ func TestAClientWriteWakesTheWakersSubscription(t *testing.T) {
 	assert.Equal(t, clientOnlyGK, ev.Key)
 }
 
-// The wake is an optimisation over the tick, so a Beehive assembled without a
-// hub — every waker test above — still scans on its floor.
+// The wake is the waker's only cadence, so a Beehive assembled without a hub —
+// every waker test above — still runs, but on the eager first pass alone. The
+// stale-dependents pass is what covers it from there.
 func TestWakerRunsWithoutAWriteHub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	store := &replayStore{rows: replayRows(1), listed: newSignal()}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	dw.bh.wakeInterval = fastTick // the floor is read per pass, so this one still takes
+	dw.seeded = true
 
 	done := make(chan struct{})
 	go func() { defer close(done); dw.run(ctx) }()
 
-	store.listed.wait(t, "the waker to scan on its floor with no hub to wake it")
+	store.listed.wait(t, "the eager first pass")
+	cancel()
+	waitClosed(t, done, "the waker to stop")
+}
+
+// The waker holds no timer of its own while it is idle: with nothing to drive
+// it but a commit, the scans are exactly the ones this test caused — the eager
+// first pass and one per wake.
+func TestIdleWakerIssuesNoQueries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	widget := GroupKind{Kind: "Widget"}
+	store := &replayStore{lists: make(chan struct{}, 8)}
+	// No throttle, so every wake drives a scan of its own rather than folding
+	// into the one before it.
+	bh := newTestBeehive(t, store, withWakeScanMinInterval(0))
+	_, err := Register(bh, widget, &reconcileCapture{})
+	require.NoError(t, err)
+	bh.waker.seeded = true
+
+	done := make(chan struct{})
+	go func() { defer close(done); bh.waker.run(ctx) }()
+
+	// One wake at a time: the hub holds one slot per receiver, so two sends the
+	// waker has not read yet collapse into one.
+	waitClosed(t, chanAfter(store.lists, 1), "the eager first pass")
+	for range 2 {
+		require.NoError(t, bh.kindWriteHub.Send(widget))
+		waitClosed(t, chanAfter(store.lists, 1), "a scan for the wake")
+	}
+
+	cancel()
+	waitClosed(t, done, "the waker to stop")
+	assert.Len(t, store.pages, 3, "nothing but a wake reads the store")
+}
+
+// The retry is the only way back from a failed scan: backingOff drops the wakes
+// arriving meanwhile, and nothing ticks. No wake is sent here at all.
+func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &replayStore{
+		rows:         replayRows(1),
+		err:          errBoom,
+		healFromCall: 2,
+		lists:        make(chan struct{}, 8),
+	}
+	// The ladder is capped at the stale-dependents cadence, which is what makes
+	// the retry here fast enough to wait on.
+	bh := newTestBeehive(t, store, withStaleDependentsInterval(fastTick))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	require.NoError(t, err)
+	bh.waker.seeded = true
+
+	done := make(chan struct{})
+	go func() { defer close(done); bh.waker.run(ctx) }()
+
+	waitClosed(t, chanAfter(store.lists, 2), "the waker to retry the scan that failed")
 	cancel()
 	waitClosed(t, done, "the waker to stop")
 }
@@ -243,7 +302,7 @@ func TestWakerRunsWithoutAWriteHub(t *testing.T) {
 // first and the close ends the loop second.
 func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
 	store := &replayStore{rows: replayRows(3), err: errBoom, listed: newSignal()}
-	bh := newTestBeehive(t, store, withDependencyWakeInterval(time.Hour))
+	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 	// Past the seed, so the first pass is a scan — and it fails.
@@ -266,7 +325,7 @@ func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
 // only closes the hub after — so drive it directly, or the test pins nothing.
 func TestWakerClosedHubArmReturns(t *testing.T) {
 	store := &replayStore{rows: replayRows(1)}
-	bh := newTestBeehive(t, store, withDependencyWakeInterval(time.Hour))
+	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 
@@ -284,11 +343,11 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	widget := GroupKind{Kind: "Widget"}
 	ctx := context.Background()
 
-	t.Run("a quiet pass waits the floor", func(t *testing.T) {
+	t.Run("a quiet pass arms nothing", func(t *testing.T) {
 		dw, clk, _ := seededWaker(&replayStore{}, widget)
 
 		next, backingOff := dw.pass(ctx, clk.now(), false)
-		assert.Equal(t, defaultWakeInterval, next)
+		assert.Equal(t, wakeIdle, next, "a drained log gives the loop no reason to look again")
 		assert.False(t, backingOff)
 	})
 
@@ -375,7 +434,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		assert.True(t, backingOff, "a refused pass decides nothing about the store's health")
 	})
 
-	t.Run("a disabled throttle drains at the floor", func(t *testing.T) {
+	t.Run("a disabled throttle drains without pausing", func(t *testing.T) {
 		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
 		dw, _, _ := seededWaker(store, widget)
 		// Rebuilt, not just re-set: the gates take their intervals at
@@ -385,7 +444,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		dw.now, dw.seeded = clk.now, true
 
 		next, _ := dw.pass(ctx, clk.now(), false)
-		assert.Equal(t, defaultWakeInterval, next, "with no throttle to re-arm at, today's behaviour")
+		assert.Zero(t, next, "with no throttle to wait out, the backlog is drained at once")
 	})
 }
 
@@ -935,12 +994,11 @@ func TestWakePersistRetrySkips(t *testing.T) {
 	assert.Equal(t, wakePersistRetryCap, wakePersistRetrySkips(1000), "however long the streak runs")
 }
 
-// The cursor write is floored by a cadence of its own rather than by the tick:
-// it is what wakePersistRetryCap counts in, so it must not move when the tick
-// does.
+// The cursor write is floored by a cadence of its own: it is the unit
+// wakePersistRetryCap counts in, so it must not move when the scan floor does.
 func TestWakerPersistFloorIsItsOwnCadence(t *testing.T) {
 	dw, _ := wakerOver(&replayStore{}, GroupKind{Kind: "Widget"})
-	dw.bh.wakeInterval = time.Hour
+	dw.bh.wakeScanMinInterval = time.Hour
 
 	assert.Equal(t, defaultWakePersistInterval, newWaker(dw.bh).persistGate.Interval())
 }

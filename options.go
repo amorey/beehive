@@ -286,19 +286,6 @@ func withDependencyWakerOff() Option {
 	}
 }
 
-// withDependencyWakeInterval sets how often the dependency waker scans the
-// write log. Global (a depends_on edge may point at a kind with no controller)
-// and meaningful only at New. Unexported: it is the cheapest driver and already
-// the shortest cadence, so there is nothing to tune it toward.
-func withDependencyWakeInterval(d time.Duration) Option {
-	return func(target any) error {
-		if t, ok := target.(*Beehive); ok {
-			t.wakeInterval = d
-		}
-		return nil
-	}
-}
-
 // withWakeScanMinInterval floors the gap between two wake-driven scans of the
 // write log; <= 0 turns the floor off. Global and meaningful only at New.
 // Unexported: it trades dependency-wake latency against how much of the single

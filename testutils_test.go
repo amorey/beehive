@@ -203,7 +203,7 @@ func fast(opts ...Option) []Option {
 	return append([]Option{
 		withOwedPassInterval(fastTick),
 		WithGCInterval(fastTick),
-		withDependencyWakeInterval(fastTick),
+		withWakeScanMinInterval(0),
 		withMinRequeueInterval(fastTick),
 		withStaleDependentsInterval(staleDependentsTick),
 		withWatchPollInterval(fastTick),
@@ -550,6 +550,7 @@ type replayStore struct {
 	pages   [][2]int64    // (afterRV, limit) per call
 	read    int           // rows actually served, across every page
 	listed  *signal       // fires on the first page request, when set
+	lists   chan struct{} // one token per page request, when set: "and again"
 	err     error
 	seedErr error
 
@@ -559,6 +560,9 @@ type replayStore struct {
 	// default) means err, when set, applies to every call, as before this field
 	// existed.
 	failFromCall int
+	// healFromCall stops err applying from the given call onward, for a test
+	// that scripts a store recovering from an outage.
+	healFromCall int
 }
 
 func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
@@ -578,12 +582,29 @@ func (s *replayStore) cursors() []int64 {
 	return out
 }
 
+// failing says whether this call — the one already recorded in pages — is
+// scripted to fail.
+func (s *replayStore) failing() bool {
+	switch {
+	case s.err == nil:
+		return false
+	case s.failFromCall > 0 && len(s.pages) < s.failFromCall:
+		return false
+	case s.healFromCall > 0 && len(s.pages) >= s.healFromCall:
+		return false
+	}
+	return true
+}
+
 func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
 	if s.listed != nil {
 		s.listed.fire()
 	}
-	if s.err != nil && (s.failFromCall == 0 || len(s.pages) >= s.failFromCall) {
+	if s.lists != nil {
+		s.lists <- struct{}{}
+	}
+	if s.failing() {
 		return nil, s.err
 	}
 	var out []ObjectWrite
