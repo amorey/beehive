@@ -71,9 +71,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   are rate-limited (`internal/rategate`), and the waker's
   cursor write keeps a floor of its own so a faster loop is not a faster write.
   A drain that pages without a break for one stale-dependents interval **stops and
-  jumps to the write log's mark**: past that point the backstop has already swept
-  what the remaining pages would wake, so the drain is holding the connection for
-  nothing. The skipped range is that pass's to deliver.
+  jumps to the write log's mark** — the backstop has already swept that range.
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
   [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md),

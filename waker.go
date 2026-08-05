@@ -29,7 +29,8 @@ import (
 //
 // It is an optimisation, not a guarantee — the stale-dependents pass
 // (staleDependentsRun) is what makes a dependency wake certain, so a wake lost
-// here costs latency, never divergence.
+// here costs latency, never divergence. A drain that pass has overtaken is handed
+// to it outright; see abandonAfter.
 //
 // The scan is store-wide, not per kind: a depends_on edge can point at a
 // client-only kind no per-kind query would name.
@@ -83,7 +84,8 @@ type waker struct {
 	drainSince time.Time
 
 	// abandonAfter is how long a drain may run before the stale-dependents pass
-	// has found everything it is still working toward.
+	// has found everything it is still working toward — the same boundary
+	// retry.Max takes, for the same reason. Non-positive drains unbounded.
 	abandonAfter time.Duration
 }
 
@@ -366,17 +368,18 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 	if !dw.seeded {
 		return dw.seed(ctx)
 	}
-	// A defer, so every early return below — including the error path and the
-	// jump abandonIfOvertaken makes — still persists whatever the watermark
-	// reached. It must stay in scan: in scanPages it would run before the jump.
+	// A defer, so every early return below — including the error path — still
+	// persists whatever the watermark reached. It must stay in scan: in scanPages
+	// it would run before the jump.
 	defer dw.persist(ctx)
-	// Anything but scanMore means paging stopped for a reason of its own, which
-	// ends the drain: only continuous paging holds the connection.
-	if result := dw.scanPages(ctx); result != scanMore {
-		dw.drainSince = time.Time{}
-		return result
+	result := dw.scanPages(ctx)
+	if result == scanMore {
+		result = dw.abandonIfOvertaken(ctx)
 	}
-	return dw.abandonIfOvertaken(ctx)
+	if result != scanMore {
+		dw.drainSince = time.Time{} // only an unbroken drain holds the connection
+	}
+	return result
 }
 
 // scanPages reads up to wakeScanPagesPerPass pages, returning scanMore when the
@@ -407,19 +410,16 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 	return scanMore
 }
 
-// abandonIfOvertaken decides whether a drain still earns the connection it holds.
-// Once one has run for abandonAfter, the stale-dependents pass has swept every
-// dependent the remaining pages would wake, so the waker jumps to the log's mark
-// and leaves that range to the pass. See
-// docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md.
+// abandonIfOvertaken jumps the watermark to the write log's mark once a drain has
+// run for abandonAfter, leaving the range it skips to the stale-dependents pass.
+// See docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md.
 func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	if dw.abandonAfter <= 0 {
 		return scanMore // no threshold, no backstop to be overtaken by
 	}
 	now := dw.now()
 	if dw.drainSince.IsZero() {
-		dw.drainSince = now
-		return scanMore
+		dw.drainSince = now // this pass is the drain's first
 	}
 	drained := now.Sub(dw.drainSince)
 	if drained < dw.abandonAfter {
@@ -427,21 +427,21 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	}
 	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
-		// Not scanFailed: no wake depends on this read, and backing off would
-		// drop the wakes arriving meanwhile. The drain carries on and the next
-		// pass tries again — drainSince still holds.
+		// Not scanFailed: no wake depends on this read, and backing off would drop
+		// the wakes arriving meanwhile. Restarting the window is what paces the
+		// retry — held here, a full-budget pass would re-read at the wake rate.
 		if ctx.Err() == nil {
-			dw.bh.log().WarnContext(ctx, "reading the write log's mark failed; the drain continues and the next pass retries",
+			dw.bh.log().WarnContext(ctx, "reading the write log's mark failed; the drain continues and a later pass retries the skip",
 				"watermark", dw.watermark, "err", err)
 		}
+		dw.drainSince = now
 		return scanMore
 	}
 	dw.bh.log().WarnContext(ctx, "the dependency waker's backlog outlasted the stale-dependents cadence; skipping to the write log's mark, and that pass delivers the wakes in between",
 		"watermark", dw.watermark, "mark", mark, "drained", drained)
-	// max, not assignment: the mark folds in no horizon, so a trimmed log reads
-	// below the watermark and a fully trimmed one reads 0.
+	// The mark folds in no horizon: a trimmed log reads below the watermark, a
+	// fully trimmed one reads 0.
 	dw.watermark = max(dw.watermark, mark)
-	dw.drainSince = time.Time{}
 	return scanIdle
 }
 

@@ -66,8 +66,12 @@ already scanned and replay the whole log.
 
 **A failed mark read is not `scanFailed`.** No wake depends on that read, and
 `scanFailed` arms the retry backoff, which drops the wakes arriving meanwhile. The
-pass returns `scanMore` with `drainSince` intact, so the next one retries the
-abandon.
+pass returns `scanMore` and restarts the window instead. Holding `drainSince` there
+would have been the obvious choice and is the wrong one: the next full-budget pass
+is already past the threshold, so a read that keeps failing would be retried at the
+wake rate — 10 full-log `MAX()` scans a second on the connection this change exists
+to relieve, each with a warn line. Restarting the window costs one delayed shed and
+paces both to once per threshold window.
 
 `scan` keeps its `defer dw.persist(ctx)` above the split. In `scanPages` it would
 run before the jump and persist the pre-jump watermark, and a restart would
@@ -88,8 +92,13 @@ RESTRICT`, so a target with live `depends_on` edges cannot be physically deleted
 and the waker finds nothing there either. Relaxing that constraint would turn this
 abandon into a hole.
 
-Under sustained shedding the warn line lands once per threshold window, which is
-the rate that makes it diagnosable without becoming noise.
+Both warn lines — the shed and the failed mark read — land at most once per
+threshold window, which is the rate that makes them diagnosable without becoming
+noise.
+
+`scan` owns the drain's end (`drainSince` cleared on any result but `scanMore`) and
+`abandonIfOvertaken` owns where its window starts. Splitting the two writers the
+other way — clearing inside the jump — put the same invariant in two functions.
 
 `BenchmarkWakerScanRateUnderSustainedWrites` is unaffected: its harness resets the
 watermark per iteration, and the one extra `ObjectWritesMaxVersionAll` an abandon

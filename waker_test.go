@@ -140,7 +140,7 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 	})
 
 	t.Run("a full page budget", func(t *testing.T) {
-		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
+		store := &replayStore{rows: replayRows(wakeFullBudget + 5)}
 		dw, _, _ := seededWaker(store, widget)
 
 		assert.Equal(t, scanMore, dw.scan(context.Background()), "stopping at the budget leaves work behind")
@@ -376,7 +376,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	})
 
 	t.Run("more work re-arms at the throttle, not the floor", func(t *testing.T) {
-		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
+		store := &replayStore{rows: replayRows(wakeFullBudget + 5)}
 		dw, clk, _ := seededWaker(store, widget)
 
 		next, _ := dw.pass(ctx, clk.now(), false)
@@ -469,7 +469,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	})
 
 	t.Run("a disabled throttle drains without pausing", func(t *testing.T) {
-		store := &replayStore{rows: replayRows(wakeScanPagesPerPass*wakeScanPageCap + 5)}
+		store := &replayStore{rows: replayRows(wakeFullBudget + 5)}
 		dw, _, _ := seededWaker(store, widget)
 		// Rebuilt, not just re-set: the gates take their intervals at
 		// construction, which is what keeps an option from being ignored.
@@ -952,20 +952,23 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 		"the dependent of the write made while the process was down is woken on the first scan back")
 }
 
+// wakeFullBudget is how many rows one full-budget pass reads.
+const wakeFullBudget = wakeScanPagesPerPass * wakeScanPageCap
+
 // One tick reads at most wakeScanPagesPerPass pages, so a long backlog cannot
 // monopolise the single connection the reconcile loops need too. The remainder
 // is not lost: the cursor persists at whatever this tick reached, and the next
 // tick resumes there rather than re-reading it.
 func TestWakerStopsAtThePageBudget(t *testing.T) {
-	total := wakeScanPagesPerPass*wakeScanPageCap + 5
+	total := wakeFullBudget + 5
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(total)}}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 	dw.seeded = true
 
 	dw.scan(context.Background())
 	assert.Len(t, store.pages, wakeScanPagesPerPass, "the tick stops at the page budget")
-	assert.EqualValues(t, wakeScanPagesPerPass*wakeScanPageCap, dw.watermark)
-	assert.Equal(t, []int64{wakeScanPagesPerPass * wakeScanPageCap}, store.setCalls,
+	assert.EqualValues(t, wakeFullBudget, dw.watermark)
+	assert.Equal(t, []int64{wakeFullBudget}, store.setCalls,
 		"progress within the budget is still persisted")
 
 	dw.scan(context.Background())
@@ -979,7 +982,7 @@ func TestWakerAbandonsADrainTheBackstopOvertook(t *testing.T) {
 	const mark int64 = 9000
 	const drains = 3
 	store := &cursorStore{replayStore: replayStore{
-		rows: replayRows(drains * wakeScanPagesPerPass * wakeScanPageCap), seed: mark,
+		rows: replayRows(drains * wakeFullBudget), seed: mark,
 	}}
 	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
 	dw.abandonAfter = (drains - 1) * defaultWakePersistInterval
@@ -998,25 +1001,22 @@ func TestWakerAbandonsADrainTheBackstopOvertook(t *testing.T) {
 		"the jump is persisted, so a restart does not re-drain what it skipped")
 }
 
-// wakeFullBudget is how many rows one full-budget pass reads.
-const wakeFullBudget = wakeScanPagesPerPass * wakeScanPageCap
-
 // Only continuous paging counts toward the threshold: a pass that caught up ends
 // the drain, so a later one starts its own clock rather than inheriting an old
 // drain's.
 func TestWakerDrainStreakResetsOnAShortPage(t *testing.T) {
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(wakeFullBudget), seed: 9000}}
 	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
-	dw.abandonAfter = defaultWakePersistInterval
+	dw.abandonAfter = defaultStaleDependentsInterval
 
 	require.Equal(t, scanMore, dw.scan(context.Background()), "a full budget starts a drain")
 	store.rows = replayRows(wakeFullBudget + 5)
 	require.Equal(t, scanIdle, dw.scan(context.Background()), "and a short page ends it")
 
 	clk.advance(dw.abandonAfter)
-	store.rows = replayRows(wakeFullBudget + 5 + wakeFullBudget)
+	store.rows = replayRows(2*wakeFullBudget + 5)
 	assert.Equal(t, scanMore, dw.scan(context.Background()), "so this drain is new, not overtaken")
-	assert.EqualValues(t, wakeFullBudget+5+wakeFullBudget, dw.watermark, "the watermark paged rather than jumped")
+	assert.EqualValues(t, 2*wakeFullBudget+5, dw.watermark, "the watermark paged rather than jumped")
 }
 
 // A failed page ends the drain too: the retry backoff paces what happens next, so
@@ -1028,7 +1028,7 @@ func TestWakerDrainStreakResetsOnAFailedPage(t *testing.T) {
 		err: errBoom, failFromCall: wakeScanPagesPerPass + 1, healFromCall: wakeScanPagesPerPass + 2,
 	}}
 	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
-	dw.abandonAfter = defaultWakePersistInterval
+	dw.abandonAfter = defaultStaleDependentsInterval
 
 	require.Equal(t, scanMore, dw.scan(context.Background()))
 	require.Equal(t, scanFailed, dw.scan(context.Background()))
@@ -1057,13 +1057,13 @@ func TestWakerWithNoThresholdNeverAbandons(t *testing.T) {
 
 // The mark read decides where to skip to, and no wake depends on it. So a failure
 // there is not scanFailed — that would arm the retry backoff and drop the wakes
-// arriving meanwhile over a read the drain does not need. The drain just carries on
-// and the next pass tries again.
+// arriving meanwhile over a read the drain does not need. The drain carries on, and
+// the window restarts so the retry costs one read a window rather than one a pass.
 func TestWakerAbandonRetriesAFailedMarkRead(t *testing.T) {
 	const mark int64 = 9000
-	store := &cursorStore{replayStore: replayStore{rows: replayRows(3 * wakeFullBudget), seed: mark}}
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(4 * wakeFullBudget), seed: mark}}
 	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
-	dw.abandonAfter = defaultWakePersistInterval
+	dw.abandonAfter = defaultStaleDependentsInterval
 
 	require.Equal(t, scanMore, dw.scan(context.Background()))
 	clk.advance(dw.abandonAfter)
@@ -1073,7 +1073,10 @@ func TestWakerAbandonRetriesAFailedMarkRead(t *testing.T) {
 	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark, "having paged its budget as usual")
 
 	store.seedErr = nil
-	assert.Equal(t, scanIdle, dw.scan(context.Background()), "and the next pass abandons")
+	require.Equal(t, scanMore, dw.scan(context.Background()), "the next pass pages rather than re-reading the mark")
+
+	clk.advance(dw.abandonAfter)
+	assert.Equal(t, scanIdle, dw.scan(context.Background()), "and a window on, the skip is retried")
 	assert.Equal(t, mark, dw.watermark)
 }
 
@@ -1083,7 +1086,7 @@ func TestWakerAbandonRetriesAFailedMarkRead(t *testing.T) {
 func TestWakerAbandonHoldsTheWatermarkWhenTheMarkIsLower(t *testing.T) {
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(2 * wakeFullBudget), seed: 5}}
 	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
-	dw.abandonAfter = defaultWakePersistInterval
+	dw.abandonAfter = defaultStaleDependentsInterval
 
 	require.Equal(t, scanMore, dw.scan(context.Background()))
 	clk.advance(dw.abandonAfter)

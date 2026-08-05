@@ -614,9 +614,12 @@ func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64,
 	if s.failing() {
 		return nil, s.err
 	}
-	var out []ObjectWrite
+	out := make([]ObjectWrite, 0, min(limit, len(s.rows)))
 	for _, r := range s.rows {
-		if r.ResourceVersion > afterRV && len(out) < limit {
+		if len(out) == limit {
+			break
+		}
+		if r.ResourceVersion > afterRV {
 			out = append(out, r)
 		}
 	}
