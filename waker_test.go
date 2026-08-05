@@ -1039,6 +1039,21 @@ func TestWakerDrainStreakResetsOnAFailedPage(t *testing.T) {
 	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark)
 }
 
+// ObjectWritesMaxVersionAll is a bare MAX with no horizon folded in, so a trimmed
+// log answers below the watermark — and a fully trimmed one answers 0. The jump
+// must never take the watermark backwards onto rows it already scanned.
+func TestWakerAbandonHoldsTheWatermarkWhenTheMarkIsLower(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(2 * wakeFullBudget), seed: 5}}
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = defaultWakePersistInterval
+
+	require.Equal(t, scanMore, dw.scan(context.Background()))
+	clk.advance(dw.abandonAfter)
+
+	assert.Equal(t, scanIdle, dw.scan(context.Background()), "the drain is still abandoned")
+	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark, "but the watermark holds")
+}
+
 // The threshold is the backstop's own cadence: past it, the sweep has found
 // everything the drain is still working toward.
 func TestWakerAbandonAfterIsTheBackstopCadence(t *testing.T) {

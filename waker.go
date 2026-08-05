@@ -431,7 +431,9 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	}
 	dw.bh.log().WarnContext(ctx, "the dependency waker's backlog outlasted the stale-dependents cadence; skipping to the write log's mark, and that pass delivers the wakes in between",
 		"watermark", dw.watermark, "mark", mark, "drained", drained)
-	dw.watermark = mark
+	// max, not assignment: the mark folds in no horizon, so a trimmed log reads
+	// below the watermark and a fully trimmed one reads 0.
+	dw.watermark = max(dw.watermark, mark)
 	dw.drainSince = time.Time{}
 	return scanIdle
 }
