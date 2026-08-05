@@ -61,8 +61,7 @@ func TestFinalizersDeletePushesTheCollect(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
 }
 
-// The three gates that decline the push: a live target, an edge that was never
-// there, and a dependent already finalizing (whose edge blocks nothing). Pushing on a live object in
+// Every neighbour of that transition owes nothing. Pushing on a live object in
 // particular would collect-probe every finalizer removal in the system.
 func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 	tests := []struct {
