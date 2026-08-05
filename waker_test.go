@@ -76,7 +76,7 @@ func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconcil
 // seed, with a clock it drives by hand.
 func seededWaker(store Store, kinds ...GroupKind) (*waker, *fakeClock, map[GroupKind]*reconciler) {
 	dw, rs := wakerOver(store, kinds...)
-	clk := fakeClockOn(dw)
+	clk := fakeClockOn(&dw.now)
 	dw.seeded = true
 	return dw, clk, rs
 }
@@ -419,7 +419,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 
 	t.Run("a throttled pass keeps a failure's backoff", func(t *testing.T) {
 		dw, _, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
-		clk := fakeClockOn(dw)
+		clk := fakeClockOn(&dw.now)
 
 		_, backingOff := dw.pass(ctx, clk.now(), false)
 		require.True(t, backingOff, "the scan failed")
@@ -474,8 +474,9 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		// Rebuilt, not just re-set: the gates take their intervals at
 		// construction, which is what keeps an option from being ignored.
 		dw.bh.wakeScanMinInterval = 0
-		dw, clk := newWaker(dw.bh), fakeClockOn(dw)
-		dw.now, dw.seeded = clk.now, true
+		dw = newWaker(dw.bh)
+		clk := fakeClockOn(&dw.now) // after the rebuild, or it clocks the discarded waker
+		dw.seeded = true
 
 		next, _ := dw.pass(ctx, clk.now(), false)
 		assert.Zero(t, next, "with no throttle to wait out, the backlog is drained at once")
@@ -925,7 +926,7 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 	store.deps = map[ObjectID][]ObjectRef{1: {{ID: 7, Kind: "Widget"}}}
 
 	first, rsFirst := wakerOver(store, widget)
-	clk := fakeClockOn(first)
+	clk := fakeClockOn(&first.now)
 	require.NotEqual(t, scanFailed, first.seed(context.Background()))
 	// A write lands while the first process is up; its scan finds and persists it.
 	clk.advance(defaultWakePersistInterval) // a floor on from the seed's own write
@@ -1055,7 +1056,7 @@ func TestWakerRetriesPersistOnAFailedWrite(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	clk := fakeClockOn(dw)
+	clk := fakeClockOn(&dw.now)
 	dw.bh.logger = logger
 	dw.seeded = true
 
@@ -1079,7 +1080,7 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	store := &cursorStore{replayStore: replayStore{rows: replayRows(3)}, setErr: errBoom}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	clk := fakeClockOn(dw)
+	clk := fakeClockOn(&dw.now)
 	dw.bh.logger = logger
 	dw.seeded = true
 

@@ -339,6 +339,20 @@ func withWatchPollInterval(d time.Duration) Option {
 	}
 }
 
+// withWatchScanMinInterval floors the gap between two wake-driven drains of a
+// kind's write log; <= 0 turns the floor off. Global and meaningful only at New.
+// Unexported: it trades watch latency against how much of the single connection
+// a tailer holds under a sustained write stream, which is a measurement rather
+// than a preference.
+func withWatchScanMinInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.watchScanMinInterval = d
+		}
+		return nil
+	}
+}
+
 // withWatchFloorInterval sets how often a kind's tailer reads the log without
 // a wake. The wake covers this process's own writes; the floor covers what a
 // wake cannot — a writer in another process, a failed step, a retention trim.

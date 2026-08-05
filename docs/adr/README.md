@@ -31,6 +31,7 @@ directory of archaeology.
 - [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [One tailer per kind, woken by the commit path, above a floor tick](2026-08-03-watch-shared-tail.md)
+- [The object tail floors the gap between wake-driven drains](2026-08-05-the-object-tail-throttles-its-drains.md)
 - [The stale-dependents pass scans from a cursor over target versions](2026-08-03-stale-dependents-cursor.md)
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)

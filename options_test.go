@@ -349,6 +349,24 @@ func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {
 	require.NoError(t, withWakeScanMinInterval(time.Second)("unrelated"))
 }
 
+// The tail's throttle is a floor, not a mandatory cadence: turning it off
+// leaves the floor tick and the wake, so nothing is dropped, only unpaced.
+func TestWithWatchScanMinIntervalDisablesTheThrottle(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := newTestBeehive(t, newClientTestStore(t), withWatchScanMinInterval(d))
+			assert.Equal(t, d, bh.watchScanMinInterval)
+		})
+	}
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchScanMinInterval(time.Minute))
+	assert.Equal(t, time.Minute, bh.watchScanMinInterval)
+
+	// Targets the option doesn't recognize are silently ignored.
+	require.NoError(t, withWatchScanMinInterval(time.Second)(&reconciler{}))
+	require.NoError(t, withWatchScanMinInterval(time.Second)("unrelated"))
+}
+
 // Register seeds the queue's floor from the New-level default, and a per-kind
 // option overrides it.
 func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {

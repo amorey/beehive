@@ -1593,6 +1593,293 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 	assert.Equal(t, obj.ID, ev.Key)
 }
 
+// pausedTailer builds a tailer and never starts it, so a test drives pass by
+// hand.
+func pausedTailer(t *testing.T, bh *Beehive, gk GroupKind) *objectTailer {
+	t.Helper()
+	tailer, err := newObjectTailer(context.Background(), bh, gk)
+	require.NoError(t, err)
+	t.Cleanup(tailer.close)
+	return tailer
+}
+
+// pacedTailer is pausedTailer over a store, on a clock the test drives and a
+// floor far enough away to tell the throttle's answers from it.
+func pacedTailer(t *testing.T, store Store, throttle time.Duration) (*objectTailer, *fakeClock) {
+	t.Helper()
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour), withWatchScanMinInterval(throttle))
+	tailer := pausedTailer(t, bh, clientTestGK)
+	return tailer, fakeClockOn(&tailer.now)
+}
+
+// seedWriteLog writes n objects straight to the store, so the log grows without
+// publishing wakes of its own.
+func seedWriteLog(t *testing.T, ctx context.Context, store Store, n int) {
+	t.Helper()
+	spec, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	for i := range n {
+		_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+			Name: fmt.Sprintf("seed-%d", i),
+			Spec: spec,
+		})
+		require.NoError(t, err)
+	}
+}
+
+// pass is the loop's decision, split out so the cadence is asserted without
+// waiting on it.
+func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	t.Run("a drained log re-arms at the floor", func(t *testing.T) {
+		bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+		tailer := pausedTailer(t, bh, clientTestGK)
+
+		next, backingOff, done := tailer.pass(ctx, tailer.now(), false)
+		assert.Equal(t, time.Hour, next)
+		assert.False(t, backingOff)
+		assert.False(t, done)
+	})
+
+	t.Run("a failed drain climbs the retry ladder and drops wakes", func(t *testing.T) {
+		bh := newTestBeehive(t, &failGateStore{Store: newClientTestStore(t)}, withWatchFloorInterval(time.Hour))
+		tailer := pausedTailer(t, bh, clientTestGK)
+
+		next, backingOff, done := tailer.pass(ctx, tailer.now(), false)
+		assert.Equal(t, watchRetryBase, next, "the retry is the only reason to look again")
+		assert.True(t, backingOff, "a live writer must not keep a failing store re-reading")
+		assert.False(t, done)
+
+		next, _, _ = tailer.pass(ctx, tailer.now(), true)
+		assert.Equal(t, 2*watchRetryBase, next, "a second failure waits longer")
+	})
+
+	t.Run("a trimmed cursor ends the tailer", func(t *testing.T) {
+		store := newClientTestStore(t)
+		bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+		client := NewClient[cSpec, cStatus](bh, clientTestGK)
+		tailer := pausedTailer(t, bh, clientTestGK)
+
+		for i := range 3 {
+			mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
+		}
+		// Retention overtakes the cursor the tailer started from.
+		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		require.NoError(t, err)
+
+		_, _, done := tailer.pass(ctx, tailer.now(), false)
+		assert.True(t, done, "there is no single subscriber to hand the error to")
+		assert.ErrorIs(t, tailer.failure(), ErrWatchTooOld)
+	})
+}
+
+// The throttle bounds how much of the single connection a tailer holds away
+// from the writers waking it. It is a floor on drain starts, not on delivery:
+// a refused wake is remembered by the re-arm, since the drain that runs then
+// reads its position from the store.
+func TestTailerPassPacesTheLoop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	const throttle = 100 * time.Millisecond
+	paced := func(t *testing.T) (*objectTailer, *countingTailStore, *fakeClock) {
+		t.Helper()
+		store := &countingTailStore{Store: newClientTestStore(t)}
+		tailer, clk := pacedTailer(t, store, throttle)
+		return tailer, store, clk
+	}
+
+	t.Run("a throttled pass waits out the throttle and reads nothing", func(t *testing.T) {
+		tailer, store, clk := paced(t)
+
+		tailer.pass(ctx, clk.now(), false)
+		reads := store.positionReads.Load()
+
+		clk.advance(throttle / 4)
+		next, _, _ := tailer.pass(ctx, clk.now(), false)
+		assert.Equal(t, 3*throttle/4, next, "re-armed for what is left of the throttle")
+		assert.Equal(t, reads, store.positionReads.Load(), "and the refused pass read nothing")
+	})
+
+	// The property that lets the loop re-arm unconditionally: every refusal
+	// inside one window returns a shorter remainder, so a commit stream cannot
+	// push the deadline out.
+	t.Run("refusals return a strictly decreasing remainder", func(t *testing.T) {
+		tailer, _, clk := paced(t)
+
+		tailer.pass(ctx, clk.now(), false)
+		last := throttle
+		for range 3 {
+			clk.advance(throttle / 8)
+			next, _, _ := tailer.pass(ctx, clk.now(), false)
+			assert.Less(t, next, last)
+			last = next
+		}
+	})
+
+	t.Run("the first wake after a quiet period is eager", func(t *testing.T) {
+		tailer, store, clk := paced(t)
+
+		tailer.pass(ctx, clk.now(), false)
+		reads := store.positionReads.Load()
+
+		clk.advance(throttle)
+		tailer.pass(ctx, clk.now(), false)
+		assert.Equal(t, reads+1, store.positionReads.Load(), "an idle-to-active transition pays no added latency")
+	})
+
+	// The retry timer armed before a failure can fire inside the throttle
+	// window; answering "not backing off" there would hand a degraded store back
+	// to the wakes at the throttle's rate.
+	t.Run("a throttled pass carries backingOff through", func(t *testing.T) {
+		tailer, _, clk := paced(t)
+
+		tailer.pass(ctx, clk.now(), false)
+		clk.advance(throttle / 4)
+		_, backingOff, _ := tailer.pass(ctx, clk.now(), true)
+		assert.True(t, backingOff)
+	})
+
+	// A negative interval is a disabled throttle, not a sentinel: reporting
+	// "finished" through the delay would kill every subscriber on the kind.
+	t.Run("a non-positive interval disables the throttle", func(t *testing.T) {
+		for _, d := range []time.Duration{0, -time.Second} {
+			t.Run(d.String(), func(t *testing.T) {
+				store := &countingTailStore{Store: newClientTestStore(t)}
+				tailer, clk := pacedTailer(t, store, d)
+				reads := store.positionReads.Load()
+
+				for range 3 {
+					_, _, done := tailer.pass(ctx, clk.now(), false)
+					require.False(t, done)
+				}
+				assert.Equal(t, reads+3, store.positionReads.Load(), "every pass drains")
+			})
+		}
+	})
+}
+
+// A budget bounds one drain, so a resume after a long gap cannot hold the
+// single connection for as long as the backlog is deep. The remainder rides the
+// cursor to the next drain, which the throttle paces.
+func TestTailerStopsAtThePageBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	const throttle = 100 * time.Millisecond
+	const backlog = tailPageCap + 88
+
+	store := newClientTestStore(t)
+	tailer, clk := pacedTailer(t, store, throttle)
+	tailer.pagesPerDrain = 1
+	rx := tailer.hub.Receiver()
+	defer rx.Close()
+
+	seedWriteLog(t, ctx, store, backlog)
+
+	next, _, _ := tailer.pass(ctx, clk.now(), false)
+	assert.Equal(t, throttle, next, "more work re-arms at the throttle, not the floor")
+	assert.Len(t, drainedIDs(rx), tailPageCap, "one drain reads its budget and stops")
+
+	// A budget of zero would read nothing and still report more, turning the
+	// loop forever without draining. Only a sweep can set one.
+	tailer.pagesPerDrain = 0
+	more, err := tailer.drain(ctx)
+	require.NoError(t, err)
+	assert.False(t, more, "a zero budget reads a page rather than spinning")
+
+	// The remainder is delivered by the next drain, in version order.
+	clk.advance(throttle)
+	next, _, _ = tailer.pass(ctx, clk.now(), false)
+	assert.Equal(t, time.Hour, next, "a drained log re-arms at the floor")
+	assert.Len(t, drainedIDs(rx), backlog-tailPageCap)
+}
+
+// The pacing tests drive pass by hand, so this is the one that runs the loop
+// with the throttle on: a refusal must re-arm, or the write that arrived inside
+// the window is never read. The floor is out of reach, so only the wake and the
+// throttle's own re-arm can deliver the second write.
+func TestTailerDeliversAWriteThatLandsInsideTheThrottle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t),
+		withWatchFloorInterval(time.Hour), withWatchScanMinInterval(50*time.Millisecond))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, rx := startTailer(t, bh, clientTestGK)
+
+	// The first drain is eager and admits the gate.
+	first := mustCreate(t, ctx, client, "eager", cSpec{})
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, first.ID, ev.Key)
+
+	// The second lands inside the window, so its wake is refused; the re-arm is
+	// the only thing that comes back for it.
+	second := mustCreate(t, ctx, client, "throttled", cSpec{})
+	ev, err = rx.RecvContext(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, second.ID, ev.Key)
+}
+
+// slowListStore spends clock on every page, so a drain has a duration to
+// measure.
+type slowListStore struct {
+	Store
+	clk     *fakeClock
+	perPage time.Duration
+}
+
+func (s *slowListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	s.clk.advance(s.perPage)
+	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+}
+
+// The throttle floors drain *starts*. Re-arming a budget-stopped drain for a
+// whole interval would measure from its end instead, costing a resume its own
+// duration of throughput on the path the budget exists to bound.
+func TestTailerResumeWaitsOutOnlyTheRestOfTheThrottle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	const throttle = 100 * time.Millisecond
+	for _, tc := range []struct {
+		name    string
+		perPage time.Duration
+		want    time.Duration
+	}{
+		{"a drain inside the window waits out the rest", throttle / 4, 3 * throttle / 4},
+		{"a drain past the window waits not at all", 2 * throttle, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &slowListStore{Store: newClientTestStore(t), perPage: tc.perPage}
+			tailer, clk := pacedTailer(t, store, throttle)
+			tailer.pagesPerDrain = 1
+			store.clk = clk
+
+			// Written above the tailer's starting cursor, so one page leaves more.
+			seedWriteLog(t, ctx, store, tailPageCap+1)
+
+			next, _, _ := tailer.pass(ctx, tailer.now(), false)
+			assert.Equal(t, tc.want, next)
+		})
+	}
+}
+
+// drainedIDs takes everything the fan-out is holding, in delivery order.
+func drainedIDs(rx *conflate.Receiver[ObjectID, rawChange]) []ObjectID {
+	var ids []ObjectID
+	for {
+		ev, err := rx.TryRecv()
+		if err != nil {
+			return ids
+		}
+		ids = append(ids, ev.Key)
+	}
+}
+
 // gateAheadStore reports a log position with no entries behind it — a Store
 // that folds a wider counter into the position, or trims between the two
 // reads.
@@ -1622,7 +1909,9 @@ func TestTailerStepToleratesAGateAheadOfTheLog(t *testing.T) {
 	tailer.cursor = 0
 
 	// Through drain, which is where the gate lives.
-	require.NoError(t, tailer.drain(ctx))
+	more, err := tailer.drain(ctx)
+	require.NoError(t, err)
+	assert.False(t, more)
 	assert.Zero(t, tailer.cursor, "a drain that found nothing must not advance")
 }
 
@@ -1652,7 +1941,8 @@ func TestTailerStepReportsAFailedGateRead(t *testing.T) {
 	defer tailer.close()
 
 	at := tailer.cursor
-	assert.ErrorIs(t, tailer.drain(ctx), errBoom)
+	_, err = tailer.drain(ctx)
+	assert.ErrorIs(t, err, errBoom)
 	assert.Equal(t, at, tailer.cursor, "a failed gate must not advance the cursor")
 }
 
@@ -1725,8 +2015,7 @@ func TestWatchOnAnUnstartedBeehiveEndsWithItsCaller(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	watchCtx, endWatch := context.WithCancel(ctx)
@@ -2209,8 +2498,7 @@ func TestWatchGoroutinesDrainOnStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 
 	var streams []<-chan ObjectChange[cSpec, cStatus]
 	for _, kind := range []string{"A", "B", "C"} {
@@ -2761,8 +3049,7 @@ func TestWatchEndsWithErrStoppedOnStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, live, err := client.WatchList(ctx)
@@ -2869,8 +3156,7 @@ func TestStopToleratesConcurrentCommitWakes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh, err := New(newClientTestStore(t), withWatchFloorInterval(time.Hour))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 
 	var senders sync.WaitGroup
 	bad := make(chan error, 16)
@@ -2989,8 +3275,7 @@ func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
 			defer cancel()
 
 			store := tc.store(newClientTestStore(t))
-			bh, err := New(store, withWatchFloorInterval(time.Hour))
-			require.NoError(t, err)
+			bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 			mustCreate(t, ctx, client, "w1", cSpec{})
 
