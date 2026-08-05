@@ -13,6 +13,14 @@ record in one file. A driver in a second file finds it. A third file decides wha
 happens after a restart. If you read only one of them, the system looks more
 push-driven than it is.
 
+**Everything here assumes one process running one `Beehive` as the store's only
+writer.** A write issued by a second process, by a second `Beehive`, or straight
+to the `Store` behind a running one owes nothing under this map: it reaches no
+push path at all, and the pull passes that would find it anyway are backstops
+against lost pushes rather than a contract covering writes beehive never saw
+commit. See
+[one process, one Beehive](adr/2026-08-05-one-process-one-beehive-sole-writer.md).
+
 **Keep this document in step with the code.** When you add a way for work to be
 owed, add it here. Give its record, its driver, and its restart behaviour. Do not
 list gaps here. A gap belongs in [`TODO.md`](TODO.md), linked from the case it
@@ -23,8 +31,8 @@ affects.
 Two words are used throughout this document. They have exact meanings.
 
 **Pull** means a driver runs on a timer. The driver reads the store. It finds work
-that a write left behind. A pull needs no help from the writer. It works after a
-restart, and it works when another process made the write.
+that a write left behind. A pull needs no help from the writer, so it works after a
+restart and it works when the push was lost.
 
 **Push** means a write starts the work itself, at commit time. A push holds no
 state in the store. It puts an object in a work queue in memory.
@@ -270,8 +278,10 @@ object's re-enqueue floor rather than dispatched at once. The stamp is durable, 
 the owed pass carries the dependent either way.
 
 The push does not cover two cases. A source whose kind has no reconciler is not
-enqueued. A declaration made from another process, or through the embedder's own
-`Store`, is not enqueued. Both keep the stamp and wait for the pull.
+enqueued; it keeps the stamp and waits for the pull. A declaration made from
+another process, or through the embedder's own `Store`, is not enqueued either —
+but that is an [unsupported](adr/2026-08-05-one-process-one-beehive-sole-writer.md)
+shape rather than a covered one.
 
 **Pull:** `reconciler.enqueueReconcileOwed` calls `ReconcileOwedListIDs`, every 30
 seconds. `ReconcileOwedDecrement` drains the count in `typedController.reconcile`.
@@ -325,9 +335,10 @@ a burst collapses into one wake and a lost one costs only latency. Wake-driven s
 are floored at 100ms, and dropped while a failed scan is backing off.
 See [the ADR](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md).
 
-**Pull:** none. The waker holds no timer while it is idle, so a write this process
+**Pull:** none. The waker holds no timer while it is idle. A write this beehive
 did not publish — a second process, or a write issued straight to the `Store` —
-reaches its dependents through case 8 rather than here.
+is [unsupported](adr/2026-08-05-one-process-one-beehive-sole-writer.md) and has no
+trigger here; case 8 finds it in practice but promises nothing about it.
 See [the ADR](adr/2026-08-05-the-waker-is-wake-driven.md).
 
 A failed page holds the cursor, and the retry — `driver.Backoff` from 100ms up to

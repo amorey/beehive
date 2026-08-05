@@ -78,11 +78,12 @@ no backstop at all.
 Two properties hold here and nowhere else in the system.
 
 **The hub sees every writer that exists.** Push in beehive is registered above
-the store, so a hub normally sees a write only if it went through this process,
-while a poll scans the store and also sees a second process or the embedder
-writing through the `Store` they own. That gap is structural and no care at the
-notify sites closes it. The schedule has no such gap: `workQueue` is unexported,
-process-local, and owned by one reconciler.
+the store, so a hub normally sees a write only if it went through this
+`Beehive`, while a poll scans the store and sees the row however it got there —
+a GC path, a store call made below the hook, a publish that was lost. That gap
+is structural and no care at the notify sites closes it. The schedule has no
+such gap: `workQueue` is unexported, process-local, and owned by one reconciler,
+and it is never backed by the store at all.
 
 **Every move is reported from one type.** `gauge` owns the two maps the watch
 reports on, and each of its mutators returns whether the observable schedule
