@@ -47,6 +47,34 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
 }
 
+// finalizerPushFixture registers a no-op controller and hands back its client,
+// its ControllerClient and its reconciler, for the tests that assert what a
+// finalizer removal queues. The loops are never started: the queue is the
+// observation, not a reconcile.
+func finalizerPushFixture(t *testing.T) (Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
+	t.Helper()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+	return NewClient[cSpec, cStatus](bh, clientTestGK), cc, r
+}
+
+// Clearing the last finalizer is the one route out of a finalizer-blocked
+// collect, so it pushes rather than waiting out a GC tick.
+func TestFinalizersDeletePushesTheCollect(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := finalizerPushFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "f"))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+}
+
 // TestWriteStampsSchemaVersions verifies the lazy stamp-on-write half of the
 // migrator model: with a migrator registered, a spec write (Create) stamps the
 // migrator's current spec version and a controller status write stamps its

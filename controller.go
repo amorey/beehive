@@ -143,9 +143,19 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 	return err
 }
 
+// FinalizersDelete pushes the collect the removal unblocks. Immediate: the gate
+// is a transition that lands once per object, so cancelling a pending alarm can
+// never become a repeat. The push is a probe — gcCollect still re-checks the
+// RESTRICT block a referrer holds.
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
-	_, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
-	return c.wakeAfter(ctx, err)
+	clearedLast, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
+	if err := c.wakeAfter(ctx, err); err != nil {
+		return err
+	}
+	if clearedLast {
+		c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
+	}
+	return nil
 }
 
 // DependenciesAdd is one store call, not a composition: the edge and the durable
