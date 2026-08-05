@@ -118,6 +118,96 @@ func TestSweepFreePages(t *testing.T) {
 	})
 }
 
+// owedClearStore records the keep set each reclaim sweep passes down.
+type owedClearStore struct {
+	Store
+	kept chan []GroupKind
+	err  error
+}
+
+func (s *owedClearStore) ReconcileOwedSweep(_ context.Context, keep []GroupKind) (int, error) {
+	select {
+	case s.kept <- keep:
+	default:
+	}
+	return 0, s.err
+}
+
+// The reclaim keeps exactly the kinds that have a reconcile loop to drain their
+// count.
+func TestSweepReconcileOwedKeepsRegisteredKinds(t *testing.T) {
+	store := &owedClearStore{Store: &fakeStore{}, kept: make(chan []GroupKind, 4)}
+	bh := newTestBeehive(t, store)
+	widget, drone := GroupKind{Kind: "Widget"}, GroupKind{Kind: "Drone"}
+	registerNoop[tSpec, tStatus](t, bh, widget)
+	registerNoop[tSpec, tStatus](t, bh, drone)
+
+	bh.reconcileOwedSweep(context.Background())
+
+	assert.ElementsMatch(t, []GroupKind{widget, drone}, recv(t, store.kept))
+}
+
+// A failed reclaim must not cost the tick: the sweeps after it still run.
+func TestSweepReconcileOwedFailureIsNotFatal(t *testing.T) {
+	owed := &owedClearStore{Store: &fakeStore{}, kept: make(chan []GroupKind, 4), err: errBoom}
+	store := &freePagesStore{Store: owed, called: make(chan int, 4)}
+	bh := newTestBeehive(t, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go bh.gcSweeperRun(ctx)
+
+	assert.Empty(t, recv(t, owed.kept), "no controllers registered, so nothing is kept")
+	assert.Equal(t, freePagesPerSweep, recv(t, store.called), "the sweep after it still runs")
+}
+
+// The reclaim runs on every GC tick, so emitting would wake every tailer and the
+// dependency waker for a write no consumer can act on. The control write after
+// the sweep is what makes the absence assertable: an emitting reclaim would put
+// the swept object ahead of it in the stream.
+func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
+	swept := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "swept"})
+	target := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "target"})
+	// The production stamp: a new depends_on edge owes swept a reconcile no loop
+	// will ever run.
+	_, err := bh.store.EdgesAdd(ctx, swept.ID, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+
+	_, ch, err := loose.WatchList(ctx)
+	require.NoError(t, err)
+
+	bh.reconcileOwedSweep(ctx)
+	control := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "control"})
+
+	ev := recv(t, ch)
+	assert.Equal(t, control.ID, ev.Object.ID, "the reclaim must not reach the change stream")
+}
+
+// A Beehive with no controllers at all reclaims every count: the counts here are
+// left by a prior process, and nothing in this one consumes them.
+func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
+	from := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "from"})
+	to := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "to"})
+	res, err := bh.store.EdgesAdd(ctx, from.ID, to.ID, RelationDependsOn)
+	require.NoError(t, err)
+	require.True(t, res.ReconcileOwedStamped, "the edge must owe a reconcile to begin with")
+
+	bh.reconcileOwedSweep(ctx)
+
+	raw, err := store.ObjectsGet(ctx, from.ID)
+	require.NoError(t, err)
+	assert.Zero(t, raw.ReconcileOwed, "no reconcile loop can drain it, so the sweep does")
+}
+
 // The GC sweeper's three steps run together on every tick, so a store that grows a
 // freelist through the first two gets it drained by the third without a cadence of
 // its own.

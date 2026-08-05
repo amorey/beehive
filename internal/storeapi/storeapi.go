@@ -199,8 +199,8 @@ type RawObject struct {
 	ResourceVersion     int64      `json:"resourceVersion"`
 	DeletionRequestedAt *time.Time `json:"deletionRequestedAt,omitempty"`
 	// ReconcileOwed is the objects.reconcile_owed count; 0 means none. Store-
-	// owned: moved only by EdgesAdd's stamp, ReconcileOwedStamp and
-	// ReconcileOwedDecrement.
+	// owned: moved only by EdgesAdd's stamp, ReconcileOwedStamp,
+	// ReconcileOwedDecrement and ReconcileOwedSweep.
 	ReconcileOwed int64       `json:"reconcileOwed"`
 	Finalizers    []string    `json:"finalizers"`
 	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
@@ -574,6 +574,12 @@ type Store interface {
 	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
 	// store's own listing, which spans every registered kind in one page.
 	ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error
+
+	// ReconcileOwedSweep zeroes reconcile_owed for every object whose kind is not
+	// in keep, and returns how many rows it cleared. An empty keep clears every
+	// nonzero row. Bumps no resource_version and appends no write-log entry.
+	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
+	ReconcileOwedSweep(ctx context.Context, keep []GroupKind) (int, error)
 
 	// ResourceVersionsMaxIssued returns the highest resource version issued. It
 	// reads the sequence, not a table, so retention cannot lower it. It moves

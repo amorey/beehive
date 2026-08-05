@@ -929,6 +929,30 @@ func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.Ob
 	return err
 }
 
+// reconcileOwedSweepQuery builds the reclaim. The test that pins its query plan
+// calls this too, so the plan it pins is the one that runs.
+func reconcileOwedSweepQuery(keep []storeapi.GroupKind) (string, []any) {
+	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
+	q := `UPDATE objects SET reconcile_owed = 0 WHERE reconcile_owed != 0`
+	if len(keep) == 0 {
+		return q, nil // NOT IN (VALUES) is a syntax error, and nothing is kept
+	}
+	values, args := kindTuples(keep)
+	return q + ` AND ("group", kind) NOT IN (VALUES ` + values + `)`, args
+}
+
+// ReconcileOwedSweep zeroes the owed count outside keep in one no-emit UPDATE
+// (contract on storeapi.Store).
+func (s *sqliteStore) ReconcileOwedSweep(ctx context.Context, keep []storeapi.GroupKind) (int, error) {
+	q, args := reconcileOwedSweepQuery(keep)
+	res, err := s.conn(ctx).ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected() // modernc caches the count; RowsAffected never errors
+	return int(n), nil
+}
+
 // ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs
 // on the owed-wake count; the decrement floors at 0 (contract on storeapi.Store).
 //
@@ -977,13 +1001,10 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, after, nil
 	}
+	values, kindArgs := kindTuples(kinds)
 	args := make([]any, 0, len(kinds)*2+5)
 	args = append(args, after.TargetVersion, after.TargetID, after.DependentID, through)
-	tuples := make([]string, len(kinds))
-	for i, gk := range kinds {
-		tuples[i] = "(?, ?)"
-		args = append(args, gk.Group, gk.Kind)
-	}
+	args = append(args, kindArgs...)
 	args = append(args, limit)
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
@@ -994,7 +1015,7 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
 		   AND t.resource_version <= ?
 		   AND e.from_id != e.to_id
-		   AND (d."group", d.kind) IN (VALUES `+strings.Join(tuples, ", ")+`)
+		   AND (d."group", d.kind) IN (VALUES `+values+`)
 		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
 		 ORDER BY t.resource_version, t.id, e.from_id
 		 LIMIT ?`, args...)
@@ -2728,4 +2749,16 @@ func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKin
 // placeholders builds "?, ?, ?" for an IN list of n values.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
+}
+
+// kindTuples builds "(?, ?), (?, ?)" for a VALUES list of kinds, with the args
+// to fill it. Empty kinds yields an empty string, which no caller may emit.
+func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
+	tuples := make([]string, len(kinds))
+	args := make([]any, 0, len(kinds)*2)
+	for i, gk := range kinds {
+		tuples[i] = "(?, ?)"
+		args = append(args, gk.Group, gk.Kind)
+	}
+	return strings.Join(tuples, ", "), args
 }
