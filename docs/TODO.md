@@ -31,10 +31,10 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   new edge, a dropped one, or the `dependency_watermarks` clear that rides a new
   one. One place pays for it: a collect unblocked by `DependenciesDelete` dropping
   the last referrer, which waits for the next GC tick with nothing able to signal it
-  (route 3 of case 11 in [`reconcile-triggers.md`](reconcile-triggers.md)). Route 1
-  of that case, the cleared finalizer, now pushes, which removes the most common
-  reason anyone would notice this one. Route 2 is a different problem — see the
-  entry below.
+  (route 3 of case 11 in [`reconcile-triggers.md`](reconcile-triggers.md)). It is the
+  only route of that case left: routes 1 and 2, the cleared finalizer and the last
+  child's removal, both push now, which removes the common reasons anyone would
+  notice this one.
 
   **The stale-dependents pass no longer pays.** Its scan is bounded by a cursor
   over target `resource_version`, which an edge write also cannot move — but a
@@ -66,25 +66,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   Deferred because the one consumer left is route 3 of case 11, where the cost is a
   single GC tick of latency on a deletion. Build the counter only when a second
   consumer appears, or when that latency is measured to matter.
-
-- **A collect unblocked by its last child's removal waits for a sweep, because the
-  ref that would route the signal dies with the child** — route 2 of case 11 in
-  [`reconcile-triggers.md`](reconcile-triggers.md). Unlike route 3 this is not edge
-  invisibility: the child's physical delete does append a write-log entry, carrying a
-  row image. What is missing is the owner's identity. `edges.from_id` is `ON DELETE
-  CASCADE`, so the child's `owned_by` edge is gone inside SQLite by the time anything
-  reads the log, and `gcCollect` notes it in place: *"Deleting the row drops its
-  outgoing edges (ON DELETE CASCADE), which may unblock a target the sweeper retries
-  on its next tick."*
-
-  **The fix is a reverse-edge lookup before the delete**, inside `gcCollect`'s
-  transaction, pushing the owner it finds the way the cascade already pushes the
-  children it marks. It needs no new store surface and no counter.
-
-  Deferred because it puts a query on every physical delete — the one path in the
-  system that is pure teardown — to save one GC tick on a case that already resolves
-  itself. Build it if a deep owner tree's teardown latency is measured to matter, or
-  alongside route 3, since the two share a consumer and a test.
 
 - **A dependency cycle of length ≥ 2 never converges** — rate-limited, not fixed.
   The self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`. Two

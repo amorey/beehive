@@ -645,6 +645,22 @@ func TestPublishRepeatedAddSendsOnce(t *testing.T) {
 	assert.Len(t, tx.taken(), 1)
 }
 
+// Forgetting an id whose only schedule is a pending alarm — a RequeueAfter whose
+// row the collect removed — drops that alarm, which is a move the gauge reports.
+// With the id also dirty the dirty entry outranks the alarm and nothing moves.
+func TestPublishForgetSendsTheDroppedAlarm(t *testing.T) {
+	q, tx := publishingQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	before := len(tx.taken())
+
+	q.forget(1)
+
+	sent := tx.taken()
+	require.Len(t, sent, before+1)
+	assert.Equal(t, ObjectID(1), sent[before].ID)
+	assert.Zero(t, q.scheduleAt(1), "nothing is left scheduled for a collected id")
+}
+
 // done moves an id between processing and items, which the gauge does not read.
 func TestPublishDoneSendsNothing(t *testing.T) {
 	q, tx := publishingQueue()

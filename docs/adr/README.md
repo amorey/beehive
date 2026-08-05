@@ -26,7 +26,7 @@ directory of archaeology.
 - [The work queue floors how often one object is dispatched](2026-08-04-work-queue-re-enqueue-floor.md)
 - [A delete request pushes its own collect, for a registered kind only](2026-08-04-a-delete-request-pushes-its-own-collect.md)
 - [A cleared finalizer pushes its own collect](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
-- [A cleared finalizer pushes its own collect](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
+- [A physical delete pushes the owner it was blocking](2026-08-05-a-physical-delete-pushes-its-owner.md)
 - [A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
 - [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
