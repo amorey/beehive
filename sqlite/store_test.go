@@ -3518,6 +3518,26 @@ func TestReconcileOwedClearSkipsKeptKinds(t *testing.T) {
 	assert.Zero(t, reconcileOwed(t, store, loose.ID), "a client-only kind's count is reclaimed")
 }
 
+// TestReconcileOwedClearCountsRowsCleared pins the return value the sweeper logs:
+// rows cleared, not rows scanned, and 0 once there is nothing left to reclaim.
+func TestReconcileOwedClearCountsRowsCleared(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	for range 3 {
+		obj := newKindObject(t, store, clientOnlyGK)
+		require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
+	}
+	newKindObject(t, store, clientOnlyGK) // owes nothing, so it is not counted
+
+	cleared, err := store.ReconcileOwedClear(ctx, []beehive.GroupKind{testGK})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), cleared)
+
+	cleared, err = store.ReconcileOwedClear(ctx, []beehive.GroupKind{testGK})
+	require.NoError(t, err)
+	assert.Zero(t, cleared, "a second sweep finds nothing to clear")
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.
