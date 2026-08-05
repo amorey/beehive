@@ -257,9 +257,6 @@ var errNoRowImage = errors.New("beehive: delete log entry carries no row image")
 // beyond a full page is read by the next step, not deferred.
 const tailPageCap = 512
 
-// tailGateKey is the scan gate's only key: the gate is per tailer.
-var tailGateKey = struct{}{}
-
 // defaultTailPagesPerDrain bounds one drain, so a resume after a long gap
 // cannot monopolise the single connection. The remainder is read by the next
 // drain, which the throttle paces.
@@ -318,7 +315,7 @@ type objectTailer struct {
 	// which is the single goroutine rategate requires.
 	floor    time.Duration
 	retry    driver.Backoff
-	scanGate *rategate.Gate[struct{}]
+	scanGate *rategate.Single
 	// now is replaced only before run starts; run's goroutine reads it.
 	now func() time.Time
 	// pagesPerDrain bounds one drain; a field so a benchmark can sweep it.
@@ -344,7 +341,7 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 		kindWrites: written,
 		floor:      bh.watchFloor(),
 		retry:      bh.watchBackoff(),
-		scanGate:   rategate.New[struct{}](bh.watchScanMinInterval),
+		scanGate:   rategate.NewSingle(bh.watchScanMinInterval),
 		now:        time.Now,
 
 		pagesPerDrain: defaultTailPagesPerDrain,
@@ -465,7 +462,7 @@ func (t *objectTailer) pass(ctx context.Context, now time.Time, backingOff bool)
 	// its position from the store. backingOff is carried rather than cleared, or
 	// a retry timer firing inside the window would clear it.
 	// See docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md.
-	if opensAt, held := t.scanGate.Allow(tailGateKey, now); held {
+	if opensAt, held := t.scanGate.Allow(now); held {
 		return opensAt.Sub(now), backingOff, false
 	}
 

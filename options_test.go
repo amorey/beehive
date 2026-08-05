@@ -340,9 +340,9 @@ func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
 func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(0))
 
-	_, held := bh.waker.scanGate.Allow(wakerGateKey, time.Now())
+	_, held := bh.waker.scanGate.Allow(time.Now())
 	require.False(t, held)
-	_, held = bh.waker.scanGate.Allow(wakerGateKey, time.Now())
+	_, held = bh.waker.scanGate.Allow(time.Now())
 	assert.False(t, held, "a disabled throttle holds nothing, however often it is asked")
 
 	// A target the option doesn't recognize is silently ignored.

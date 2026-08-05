@@ -15,8 +15,12 @@
 // Package rategate holds a key for a fixed interval after it acts. It owns no
 // timer and starts no goroutine: the caller arms its own. Every method mutates,
 // reads included, so the lock the caller covers it with must be an exclusive
-// one. Instants given to one Gate should be non-decreasing; going backwards
+// one. Instants given to one gate should be non-decreasing; going backwards
 // costs retention, never a wrong answer.
+//
+// Two shapes: Gate holds a key space, and Single holds one instant for a caller
+// with one thing to floor — same methods without the key, and no map or
+// eviction queue behind them.
 package rategate
 
 import (

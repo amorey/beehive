@@ -49,12 +49,12 @@ type waker struct {
 	// persistGate floors the cursor write. Without it a wake-driven pass would
 	// write the cursor at the wake rate, on the one connection every commit
 	// needs.
-	persistGate *rategate.Gate[struct{}]
+	persistGate *rategate.Single
 
 	// scanGate floors wake-driven scans, so a sustained write stream cannot
 	// hold the connection at the full paging budget. Eager after a quiet
 	// period, so an idle-to-active transition adds no latency.
-	scanGate *rategate.Gate[struct{}]
+	scanGate *rategate.Single
 
 	// watermark is the highest resource_version this waker has processed. The
 	// cursor is store-wide, always increasing and never reused, so "everything
@@ -77,10 +77,6 @@ type waker struct {
 	// that, because an empty store's cursor really is zero.
 	seeded bool
 }
-
-// wakerGateKey is the single key the waker's rate gates hold: the limits are
-// per waker, not per object.
-var wakerGateKey = struct{}{}
 
 // cursorNameWaker is this waker's key in driver_cursors.
 const cursorNameWaker = "dependency_waker"
@@ -191,8 +187,8 @@ func newWaker(bh *Beehive) *waker {
 			Base: max(bh.wakePersistInterval, wakeRetryBase),
 			Max:  wakePersistRetryMax,
 		},
-		scanGate:    rategate.New[struct{}](bh.wakeScanMinInterval),
-		persistGate: rategate.New[struct{}](bh.wakePersistInterval),
+		scanGate:    rategate.NewSingle(bh.wakeScanMinInterval),
+		persistGate: rategate.NewSingle(bh.wakePersistInterval),
 	}
 }
 
@@ -202,7 +198,7 @@ func newWaker(bh *Beehive) *waker {
 // scan has no new one. Split from run so the rate tests drive it at instants of
 // their own choosing.
 func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time.Duration, bool) {
-	if opensAt, held := dw.scanGate.Allow(wakerGateKey, now); held {
+	if opensAt, held := dw.scanGate.Allow(now); held {
 		// Re-arming for what is left of the throttle is what remembers the
 		// wake: the scan that runs then reads its position from the store.
 		//
@@ -238,7 +234,7 @@ func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
 		return 0, false
 	}
 	wait := dw.persistOpensAt.Sub(now)
-	if opensAt, held := dw.persistGate.OpensAt(wakerGateKey, now); held {
+	if opensAt, held := dw.persistGate.OpensAt(now); held {
 		wait = max(wait, opensAt.Sub(now))
 	}
 	return max(wait, wakeRetryBase), true
@@ -399,7 +395,7 @@ func (dw *waker) persist(ctx context.Context) {
 		return
 	}
 	now := dw.now()
-	if _, held := dw.persistGate.Allow(wakerGateKey, now); held {
+	if _, held := dw.persistGate.Allow(now); held {
 		return
 	}
 	if now.Before(dw.persistOpensAt) {
