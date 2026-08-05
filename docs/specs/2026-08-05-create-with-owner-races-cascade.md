@@ -167,8 +167,11 @@ Notes that belong in the code as at most one line each, and in the ADR in full:
   a lock and nothing else. It does **not** bound an owner sitting in backoff —
   `requeueNow` stops the timer and clears the alarm before `addLocked`
   (`workqueue.go:290`), and `isQueued` is false for an id whose only state is a
-  pending alarm. So an owner whose `gcCollect` keeps failing has its backoff ladder
-  reset by every such create. State it this way in the ADR; do not claim coalescing
+  pending alarm. So an owner whose `gcCollect` keeps failing re-runs at the create
+  rate instead of on its retry schedule. What a repeat push discards is the pending
+  *wait*, not the ladder: `requeueNow` never reads `backoffFor`, which only a
+  successful reconcile clears, so the delay goes on doubling while nothing waits it
+  out. State it this way in the ADR; do not claim coalescing
   covers it. **The physical-delete push carries the identical residual** through the
   same `requeueNow`, which is why this is a property of the push primitive rather
   than a reason to reject this design — but the physical-delete ADR's coalescing
