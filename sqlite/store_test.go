@@ -4291,6 +4291,42 @@ func TestDeleteRefReportsNothingForADeletingSource(t *testing.T) {
 		"EdgesHasIncoming already discounts this edge, so dropping it unblocks nothing")
 }
 
+// The probe runs after the DELETE has already landed, so it can find an endpoint
+// gone. Nothing is left to push, and that is not an error. Foreign keys are off
+// for the insert because the schema is what normally makes this unreachable.
+func TestDeleteRefReportsNothingWhenAnEndpointIsGone(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `PRAGMA foreign_keys=off`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx,
+		`INSERT INTO edges (from_id, to_id, relation) VALUES (9001, 9002, 'depends_on')`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `PRAGMA foreign_keys=on`)
+	require.NoError(t, err)
+
+	res, err := store.EdgesDelete(ctx, 9001, 9002, "depends_on")
+	require.NoError(t, err)
+	assert.False(t, res.Unblocked)
+	assert.Equal(t, 0, countEdges(t, store, 9001, 9002, "depends_on"), "the edge still goes")
+}
+
+// A failed probe is reported even though the DELETE is already durable here:
+// inside an ambient Within the caller's rollback unwinds it, and a retry then
+// pushes properly. Renaming objects fails the probe and nothing before it.
+func TestDeleteRefProbeError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
+	_, err := store.db.ExecContext(ctx, `ALTER TABLE objects RENAME TO objects_hidden`)
+	require.NoError(t, err)
+
+	_, err = store.EdgesDelete(ctx, a.ID, b.ID, "depends_on")
+	assert.Error(t, err)
+}
+
 func TestDeleteRefJoinsTransaction(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
