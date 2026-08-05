@@ -21,9 +21,10 @@ import "context"
 // cascades deletion to owned children, then removes the row once no finalizers
 // and no incoming edges remain.
 //
-// The children this call marks are enqueued at commit; everything else it
-// touched waits for the sweeper's next tick. See
-// docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md.
+// The children this call marks and the owners its delete unblocks are enqueued
+// at commit; everything else it touched waits for the sweeper's next tick. See
+// docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md and
+// docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md.
 //
 // Watches are woken separately, and on a wider gate than the push: once per
 // child kind returned, marked or not. A mark and the physical delete are the
@@ -86,12 +87,29 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 			return nil
 		}
 
-		// Deleting the row drops its outgoing edges (ON DELETE CASCADE), which may
-		// unblock a target the sweeper retries on its next tick.
+		// Read before the delete: edges.from_id is ON DELETE CASCADE. owned_by
+		// only: EdgesHasIncoming discounts depends_on from a deleting source.
+		owners, err := bh.store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
+		if err != nil {
+			return err
+		}
+		// Only a deletion-pending owner was blocked by this row; pushing a live one
+		// would spin, since requeueNow bypasses the re-enqueue floor.
+		var blocked []ObjectRef
+		for _, owner := range owners {
+			meta, err := bh.store.ObjectsGetMeta(ctx, owner.ID)
+			if err != nil {
+				return err
+			}
+			if meta.DeletionRequestedAt != nil {
+				blocked = append(blocked, owner)
+			}
+		}
 		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
 			return err
 		}
 		bh.signalKindWritten(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind})
+		bh.signalRequeueManyNow(ctx, blocked)
 		deleted = true
 		return nil
 	})

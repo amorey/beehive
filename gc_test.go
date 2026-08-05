@@ -130,6 +130,26 @@ func waitForDeletions(t *testing.T, w <-chan ObjectChange[cSpec, cStatus], want 
 	}
 }
 
+// waitForDeletionRequest blocks until id is reported deletion-pending, which is
+// how a test observes that a cascade marked it.
+func waitForDeletionRequest(t *testing.T, w <-chan ObjectChange[cSpec, cStatus], id ObjectID) {
+	t.Helper()
+	timeout := time.After(testTimeout)
+	for {
+		select {
+		case ev, ok := <-w:
+			if !ok {
+				t.Fatal("watch channel closed before the deletion request")
+			}
+			if ev.Object.ID == id && ev.Object.DeletionRequestedAt != nil {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for %d to be marked", id)
+		}
+	}
+}
+
 // collectFakeStore drives collect's transaction body with controllable results
 // so each store-call error branch can be exercised in isolation. ObjectsGetMeta
 // returns a finalizing object (so collect proceeds past the live-object guard);
@@ -137,20 +157,33 @@ func waitForDeletions(t *testing.T, w <-chan ObjectChange[cSpec, cStatus], want 
 // runs fn inline (from the embedded fakeStore), so all of collect runs here.
 type collectFakeStore struct {
 	fakeStore
-	finalizers      []string // on the collected object
-	getMetaErr      error    // ObjectsGetMeta
-	markErr         error    // DeletionRequestsCreateFromOwner
-	dropDependsErr  error    // EdgesDeleteFinalizingDependsOn
-	hasEdges        bool     // EdgesHasIncoming result
-	hasEdgesErr     error    // EdgesHasIncoming error
-	deleteObjectErr error    // ObjectsDelete error
+	finalizers      []string             // on the collected object
+	getMetaErr      error                // ObjectsGetMeta, for the collected object
+	markErr         error                // DeletionRequestsCreateFromOwner
+	dropDependsErr  error                // EdgesDeleteFinalizingDependsOn
+	hasEdges        bool                 // EdgesHasIncoming result
+	hasEdgesErr     error                // EdgesHasIncoming error
+	owners          []storeapi.ObjectRef // EdgesListOutgoingByRelation result
+	listOwnersErr   error                // EdgesListOutgoingByRelation error
+	ownerMetaErr    error                // ObjectsGetMeta, for an owner row
+	deleteObjectErr error                // ObjectsDelete error
 }
 
+// collectedID is the object every collectFakeStore test collects; any other id
+// reaching the fake is one of its owners.
+const collectedID ObjectID = 1
+
 func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawObject, error) {
+	now := time.Now()
+	if id != collectedID {
+		if s.ownerMetaErr != nil {
+			return nil, s.ownerMetaErr
+		}
+		return &RawObject{ID: id, DeletionRequestedAt: &now}, nil
+	}
 	if s.getMetaErr != nil {
 		return nil, s.getMetaErr
 	}
-	now := time.Now()
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
 func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
@@ -162,37 +195,55 @@ func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, Objec
 func (s *collectFakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return s.hasEdges, s.hasEdgesErr
 }
+func (s *collectFakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+	return s.owners, s.listOwnersErr
+}
 func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	return s.deleteObjectErr
 }
 
 func TestCollectGetObjectMetaError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{getMetaErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDeletionRequestsCreateFromOwnerError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{markErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDropDependsRefsError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{dropDependsErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectHasIncomingRefsError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{hasEdgesErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectListOwnersError(t *testing.T) {
+	bh := newTestBeehive(t, &collectFakeStore{listOwnersErr: errBoom})
+	_, err := bh.gcCollect(context.Background(), collectedID)
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestCollectOwnerMetaError(t *testing.T) {
+	bh := newTestBeehive(t, &collectFakeStore{
+		owners:       []storeapi.ObjectRef{{ID: 2, Kind: "Owner"}},
+		ownerMetaErr: errBoom,
+	})
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
 func TestCollectDeleteObjectError(t *testing.T) {
 	bh := newTestBeehive(t, &collectFakeStore{deleteObjectErr: errBoom})
-	_, err := bh.gcCollect(context.Background(), 1)
+	_, err := bh.gcCollect(context.Background(), collectedID)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -425,6 +476,180 @@ func TestCascadePushesOnlyNewlyMarkedChildren(t *testing.T) {
 	_, err = bh.gcCollect(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.Empty(t, queuedIDs(r.work), "the re-cascade stamped nothing, so it queues nothing")
+}
+
+// Removing the last child unblocks the owner's RESTRICT, and the owned_by edge
+// that names the owner dies with the child, so the push has to happen here.
+func TestPhysicalDeletePushesItsOwner(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, client.Delete(ctx, child.ID))
+	drainQueue(r.work)
+
+	gone, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+	assert.Equal(t, []ObjectID{owner.ID}, queuedIDs(r.work), "the owner it unblocked is queued")
+}
+
+// The owner's own delete push leaves an alarm pending, so a throttled push would
+// be absorbed and every level of the tree would wait out the floor.
+func TestPhysicalDeletePushBeatsAPendingAlarm(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, client.Delete(ctx, child.ID))
+	drainQueue(r.work)
+	// Long enough that the alarm firing on its own would be the test hanging,
+	// not the assertion passing.
+	r.work.addAfter(owner.ID, time.Hour, alarmBackoff)
+
+	_, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{owner.ID}, queuedIDs(r.work), "the delete beats the backoff alarm")
+}
+
+// A live owner is blocked by nothing, and requeueNow bypasses the floor: pushing
+// one would let a controller that replaces an owned child each pass spin.
+func TestPhysicalDeletePushesNoLiveOwner(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, child.ID))
+	drainQueue(r.work)
+
+	gone, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+	assert.Empty(t, queuedIDs(r.work), "the owner is alive, so it was never blocked")
+}
+
+// A blocked collect deletes no row, so it unblocks nobody and pushes nothing.
+func TestPhysicalDeletePushesNothingWhenBlocked(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"},
+		WithOwner(owner.ID), WithFinalizers("f"))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, client.Delete(ctx, child.ID))
+	drainQueue(r.work)
+
+	gone, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	require.False(t, gone, "the finalizer blocks the delete")
+	assert.Empty(t, queuedIDs(r.work))
+}
+
+func TestPhysicalDeletePushesNothingForAnOrphan(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "orphan"})
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	gone, err := bh.gcCollect(ctx, obj.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+	assert.Empty(t, queuedIDs(r.work))
+}
+
+// owned_by is cross-kind, so the push routes by the owner's GroupKind.
+func TestPhysicalDeletePushesAcrossKinds(t *testing.T) {
+	ctx := context.Background()
+	bh, client, ownerR := cascadeFixture(t)
+	childGK := GroupKind{Kind: "CollectChild"}
+	registerNoop[cSpec, cStatus](t, bh, childGK)
+	childR, ok := bh.reconcilerFor(childGK)
+	require.True(t, ok)
+	childClient := NewClient[cSpec, cStatus](bh, childGK)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, childClient, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	require.NoError(t, childClient.Delete(ctx, child.ID))
+	drainQueue(ownerR.work)
+	drainQueue(childR.work)
+
+	_, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{owner.ID}, queuedIDs(ownerR.work), "the owner's own kind is queued")
+	assert.Empty(t, queuedIDs(childR.work), "the child's kind is not")
+}
+
+// A client-only owner resolves to no reconciler; the sweeper stays its route.
+func TestPhysicalDeleteSkipsClientOnlyOwner(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+	ownerClient := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "UnregisteredOwner"})
+
+	owner := mustCreate(t, ctx, ownerClient, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	require.NoError(t, ownerClient.Delete(ctx, owner.ID))
+	require.NoError(t, client.Delete(ctx, child.ID))
+	drainQueue(r.work)
+
+	gone, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+	assert.Empty(t, queuedIDs(r.work))
+}
+
+// Create writes one owned_by edge, so a second owner has to be added through the
+// store. The state is reachable there, and it is the only cover the loop gets.
+func TestPhysicalDeletePushesEveryOwner(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	ownerA := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	ownerB := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(ownerA.ID))
+	require.NoError(t, addEdge(ctx, bh.store, child.ID, ownerB.ID, RelationOwnedBy))
+
+	require.NoError(t, client.Delete(ctx, ownerA.ID))
+	require.NoError(t, client.Delete(ctx, ownerB.ID))
+	require.NoError(t, client.Delete(ctx, child.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []ObjectID{ownerA.ID, ownerB.ID}, queuedIDs(r.work))
+}
+
+// EdgesHasIncoming already discounts a depends_on edge from a deletion-pending
+// source, so dropping one unblocks nothing and its target must not be pushed.
+func TestPhysicalDeleteQueuesNoDependsOnTarget(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, addEdge(ctx, bh.store, dependent.ID, target.ID, RelationDependsOn))
+
+	require.NoError(t, client.Delete(ctx, dependent.ID))
+	drainQueue(r.work)
+
+	gone, err := bh.gcCollect(ctx, dependent.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+	assert.Empty(t, queuedIDs(r.work))
 }
 
 func TestCollectDeletesOwnerAfterChildGone(t *testing.T) {
@@ -930,6 +1155,70 @@ func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 	_, err = store.FinalizersDelete(ctx, clientTestGK, obj.ID, "f")
 	require.NoError(t, err)
 	waitForDeletions(t, w, obj.ID)
+}
+
+// With the sweeper stopped and the periodic passes off, pushes are the only
+// route: the delete push finds the owner blocked, the cascade push collects the
+// child, and the child's removal is what dispatches the owner again.
+func TestIntegrationLastChildCollectsItsOwnerWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withoutGCSweeper(),
+	)...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	waitForDeletions(t, w, child.ID, owner.ID)
+}
+
+// The pull path under this push: the child's finalizer keeps its own collect from
+// running, so removing it through the store issues no push. The owed pass is off
+// too, or it would dispatch the still-unsettled owner and stand in for the sweep.
+func TestIntegrationLastChildCollectsItsOwnerWithoutThePush(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+	)...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"},
+		WithOwner(owner.ID), WithFinalizers("f"))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// Wait for the cascade's mark, or the direct delete could beat the owner's
+	// first collect and leave the owner's own delete push as the collector.
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	waitForDeletionRequest(t, w, child.ID)
+	require.NoError(t, store.ObjectsDelete(ctx, child.ID))
+	waitForDeletions(t, w, owner.ID)
 }
 
 // TestGCSweepsOnItsOwnInterval pins that garbage collection has a cadence of its
