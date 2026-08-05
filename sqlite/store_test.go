@@ -3557,6 +3557,30 @@ func TestReconcileOwedClearWithNoKeptKinds(t *testing.T) {
 	assert.Zero(t, reconcileOwed(t, store, b.ID))
 }
 
+// TestReconcileOwedClearIsNoEmit pins the reclaim out of the change stream. It
+// runs on every GC tick, so emitting would wake every tailer and the dependency
+// waker for a write no consumer can act on.
+func TestReconcileOwedClearIsNoEmit(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newKindObject(t, store, clientOnlyGK)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
+	before, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	writesBefore, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	require.NoError(t, err)
+
+	_, err = store.ReconcileOwedClear(ctx, nil)
+	require.NoError(t, err)
+
+	after, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "the reclaim issues no resource version")
+	writesAfter, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	require.NoError(t, err)
+	assert.Len(t, writesAfter, len(writesBefore), "the reclaim appends no write-log entry")
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.
