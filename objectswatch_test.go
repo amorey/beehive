@@ -1019,6 +1019,56 @@ func TestKindWriteHubPublishesOnCreate(t *testing.T) {
 	assert.Equal(t, clientTestGK, ev.Key)
 }
 
+// The waker watches across every kind, because a depends_on edge may point at
+// a kind it cannot name.
+func TestKindWriteHubWatchAcrossTakesAnyKind(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t))
+	rx, ok := bh.kindWriteHub.WatchAcross()
+	require.True(t, ok)
+	defer rx.Close()
+
+	other := GroupKind{Group: "test", Kind: "Unwatched"}
+	require.NoError(t, bh.kindWriteHub.Send(other))
+
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, other, ev.Key, "the event names the kind that moved")
+}
+
+// One slot, so a burst across kinds is one wake. The waker re-reads its
+// position from the store, so N wakes for N kinds would be N passes finding
+// what one pass already found.
+func TestKindWriteHubWatchAcrossCollapsesABurst(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t))
+	rx, ok := bh.kindWriteHub.WatchAcross()
+	require.True(t, ok)
+	defer rx.Close()
+
+	for _, kind := range []string{"A", "B", "C"} {
+		require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: kind}))
+	}
+
+	ev, err := rx.TryRecv()
+	require.NoError(t, err)
+	assert.Equal(t, GroupKind{Kind: "C"}, ev.Key, "the slot names the last kind to land")
+
+	_, err = rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "and the burst left nothing behind it")
+}
+
+// A Beehive built field by field has no hub, and the waker falls back to its
+// floor tick there rather than dereferencing nil.
+func TestKindWriteHubWatchAcrossReportsAZeroHub(t *testing.T) {
+	var zero kindWriteHub
+
+	rx, ok := zero.WatchAcross()
+	assert.False(t, ok)
+	assert.Nil(t, rx)
+}
+
 // Every path that appends an object_writes entry wakes the kind. The rows are
 // the store's write-log call sites, not the public verbs: ConditionsSet and
 // ConditionsDelete reach the log through bumpObject, which a verb-derived

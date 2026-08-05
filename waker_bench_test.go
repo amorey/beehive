@@ -106,6 +106,96 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 	}
 }
 
+// BenchmarkWakerScanRateUnderSustainedWrites measures what one wake-driven pass
+// costs. That is what wakeScanMinInterval has to be set against: the throttle
+// bounds passes per second, and a pass's cost times that rate is the share of
+// the single connection the waker holds away from the writers generating the
+// wakes.
+//
+// Reads and cursor writes are reported separately on purpose. Every read
+// competes for connection time; the cursor write competes for the write lock,
+// which is what the commits themselves need.
+//
+// The three backlogs are the three shapes a wake finds:
+//
+//   - quiet: nothing above the watermark, which is what most wakes find. One
+//     empty listing, no edges lookup, no cursor write.
+//   - one-page: an ordinary burst.
+//   - full-budget: a resume, where the pass stops at wakeScanPagesPerPass and
+//     the loop re-arms at the throttle rather than the floor.
+func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
+	ctx := context.Background()
+	for _, backlog := range []struct {
+		name string
+		rows int
+	}{
+		{"quiet", 0},
+		{"one-page", wakeScanPageCap},
+		{"full-budget", wakeScanPagesPerPass * wakeScanPageCap},
+	} {
+		b.Run(backlog.name, func(b *testing.B) {
+			store := benchWakeLog(b, backlog.rows)
+			dw, _ := wakerOver(store, clientTestGK)
+			clk := fakeClockOn(dw)
+			require.NotEqual(b, scanFailed, dw.seed(ctx))
+			resume := dw.watermark - int64(backlog.rows)
+
+			store.reads, store.cursorWrites = 0, 0
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// Timed: two int64 stores are far below the noise, and
+				// StopTimer/StartTimer would cost two stop-the-worlds a pass.
+				dw.watermark, dw.persisted = resume, resume
+
+				dw.pass(ctx, clk.now(), false)
+				clk.advance(defaultWakeScanMinInterval) // the rate the throttle allows
+			}
+			b.StopTimer()
+
+			b.ReportMetric(float64(store.reads)/float64(b.N), "reads/pass")
+			b.ReportMetric(float64(store.cursorWrites)/float64(b.N), "cursor-writes/pass")
+		})
+	}
+}
+
+// benchWakeLog builds a store whose write log holds rows entries above the
+// waker's seed point, each with dependents to wake, and counts what a pass
+// costs it.
+//
+// The graph is benchStaleGraph's: same shape, and its watermark backfill writes
+// no write-log entry, so the log still holds exactly one row per object.
+func benchWakeLog(b *testing.B, rows int) *wakeCountingStore {
+	b.Helper()
+	store, _ := benchStaleGraph(b, max(rows, 1))
+	cursors, ok := store.(DriverCursorer)
+	require.True(b, ok, "the waker's cursor path needs a store that can persist one")
+	return &wakeCountingStore{Store: store, DriverCursorer: cursors}
+}
+
+// wakeCountingStore counts what one pass costs the store, split the way the
+// waker's two kinds of query are paid for.
+type wakeCountingStore struct {
+	Store
+	DriverCursorer
+	reads        int
+	cursorWrites int
+}
+
+func (s *wakeCountingStore) ObjectWritesListSinceAll(ctx context.Context, after int64, limit int) ([]ObjectWrite, error) {
+	s.reads++
+	return s.Store.ObjectWritesListSinceAll(ctx, after, limit)
+}
+
+func (s *wakeCountingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+	s.reads++
+	return s.Store.EdgesGroupIncomingByID(ctx, ids, rel)
+}
+
+func (s *wakeCountingStore) DriverCursorsSet(ctx context.Context, name string, at int64) error {
+	s.cursorWrites++
+	return s.DriverCursorer.DriverCursorsSet(ctx, name, at)
+}
+
 // benchSpec returns a spec no row has held. A byte-identical write is a no-op
 // that issues no version, which would leave the sweep nothing to find.
 func benchSpec() []byte {

@@ -30,6 +30,11 @@ with a slow floor tick behind the wake.**
   tailer reads its own cursor from the store. So the hub is
   `watch.Hub[GroupKind, struct{}]` with no `Accept` gate, and a burst collapses
   into one pending wake because a receiver holds one slot, not a queue.
+
+  The hub has a second kind of subscriber since
+  [the waker's commit wake](2026-08-05-a-commit-wakes-the-dependency-waker.md):
+  one `WatchAcross` receiver, watching every key rather than one. It is not a
+  tailer and enqueues reconciles rather than feeding watch subscribers.
   `gobus/watch` is a state bus and this is a signal; the fit is close enough
   (keyed, coalescing, one receiver per kind) that a bus of its own has to earn a
   second caller first.

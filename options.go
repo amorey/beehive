@@ -288,6 +288,20 @@ func withDependencyWakeInterval(d time.Duration) Option {
 	}
 }
 
+// withWakeScanMinInterval floors the gap between two wake-driven scans of the
+// write log; <= 0 turns the floor off. Global and meaningful only at New.
+// Unexported: it trades dependency-wake latency against how much of the single
+// connection the waker holds under a sustained write stream, which is a
+// measurement rather than a preference.
+func withWakeScanMinInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.wakeScanMinInterval = d
+		}
+		return nil
+	}
+}
+
 // withStaleDependentsInterval sets how often the stale-dependents pass
 // re-derives which dependents a dependency has moved under. Global and
 // meaningful only at New. Unexported because it is the backstop that makes a

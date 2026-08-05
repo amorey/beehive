@@ -56,6 +56,16 @@ func (h watchHub[K, V]) watch(k K, initial V) (*watch.Receiver[K, V], bool) {
 	return h.hub.Watch(k, initial), true
 }
 
+// watchAcross registers a receiver for every key. One slot like any other
+// receiver, so a burst across keys collapses to one value. Zero hub as in
+// watch.
+func (h watchHub[K, V]) watchAcross(initial V) (*watch.Receiver[K, V], bool) {
+	if h.hub == nil {
+		return nil, false
+	}
+	return h.hub.WatchAcross(initial), true
+}
+
 // Close ends the sender; see the type's doc for why it is never the hub.
 // Idempotent, and a no-op on the zero hub.
 func (h watchHub[K, V]) Close() {

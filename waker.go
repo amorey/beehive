@@ -16,8 +16,11 @@ package beehive
 
 import (
 	"context"
+	"time"
 
 	"github.com/amorey/beehive/internal/driver"
+	"github.com/amorey/beehive/internal/rategate"
+	"github.com/amorey/gobus"
 )
 
 // waker requeues the dependents of everything that changed: each tick scans the
@@ -36,6 +39,19 @@ type waker struct {
 	// cursors persists the watermark across restarts when the store supports it;
 	// nil means every restart reseeds from ObjectWritesMaxVersionAll.
 	cursors DriverCursorer
+
+	// now is the waker's only clock, so the rate tests drive it by hand.
+	now func() time.Time
+
+	// persistGate floors the cursor write at the wake interval. Without it a
+	// wake-driven pass would write the cursor at the wake rate, on the one
+	// connection every commit needs.
+	persistGate *rategate.Gate[struct{}]
+
+	// scanGate floors wake-driven scans, so a sustained write stream cannot
+	// hold the connection at the full paging budget. Eager after a quiet
+	// period, so an idle-to-active transition adds no latency.
+	scanGate *rategate.Gate[struct{}]
 
 	// watermark is the highest resource_version this waker has processed. The
 	// cursor is store-wide, always increasing and never reused, so "everything
@@ -57,6 +73,10 @@ type waker struct {
 	seeded bool
 }
 
+// wakerGateKey is the single key the waker's rate gates hold: the limits are
+// per waker, not per object.
+var wakerGateKey = struct{}{}
+
 // cursorNameWaker is this waker's key in driver_cursors.
 const cursorNameWaker = "dependency_waker"
 
@@ -65,48 +85,157 @@ const cursorNameWaker = "dependency_waker"
 const noStoredCursor = int64(-1)
 
 // wakePersistRetryCap bounds the backoff between retries of a failing cursor
-// write, in persists sat out — a minute at the default wake interval.
+// write, in persists sat out — a minute at the default wake interval. It reads
+// as seconds only because persistGate floors a persist *attempt* at that
+// interval, which is why the gate is consulted before the skip ladder.
 const wakePersistRetryCap = 60
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
 // trips on the store's single connection.
 const wakeScanPageCap = 256
 
-// wakeScanPagesPerTick bounds one tick's scan so resuming after a long gap
+// wakeScanPagesPerPass bounds one pass's scan so resuming after a long gap
 // cannot monopolise the single connection. The remainder rides the in-memory
-// watermark to the next tick.
-const wakeScanPagesPerTick = 16
+// watermark to the next pass.
+//
+// Four, not sixteen, because a wake-driven pass can run ten times a second:
+// BenchmarkWakerScanRateUnderSustainedWrites measures a full-budget pass at
+// ~4ms against ~16ms, so a writer waits behind a hold a quarter as long. The
+// budget and the throttle multiply, so a resume drains 2.5x faster than one
+// pass per second could and holds a larger share of the connection while it
+// does — shorter waits, not less total work.
+const wakeScanPagesPerPass = 4
 
-// run drives the waker for the life of the control plane. A non-positive
-// interval turns it off — the reconcile_owed stamp and the stale-dependents
-// pass still cover correctness.
+// run drives the waker for the life of the control plane: a commit wakes it,
+// and the interval is the floor behind that. A non-positive interval turns it
+// off, wake included — the reconcile_owed stamp and the stale-dependents pass
+// still cover correctness.
 func (dw *waker) run(ctx context.Context) {
 	// No registered controllers means nowhere to queue anything.
-	if len(dw.bh.order) == 0 {
+	if len(dw.bh.order) == 0 || dw.bh.wakeInterval <= 0 {
 		return
 	}
-	driver.Run(ctx, dw.bh.wakeInterval, func(ctx context.Context) bool {
-		dw.scan(ctx)
-		return true
-	})
+	// Subscribed before the first pass, for newObjectTailer's reason: a write
+	// landing between the subscribe and the seed read would be missed by both.
+	// Every kind, because an edge can point at one the waker cannot name. A nil
+	// channel blocks forever, which is the floor-only fallback for a Beehive
+	// assembled without a hub.
+	var written <-chan gobus.Event[GroupKind, struct{}]
+	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
+		defer rx.Close()
+		written = rx.Chan()
+	}
+
+	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
+	defer timer.Stop()
+	// The instant timer.C is set to fire, zero when it has fired and not been
+	// re-armed. A wake that would only push it later leaves it alone.
+	var armedFor time.Time
+
+	backingOff := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, open := <-written:
+			if !open {
+				return // only stop closes the hub, and the waker has nobody to tell
+			}
+			// Consumed rather than skipped, so the closed arm above stays live.
+			if backingOff {
+				continue
+			}
+		case <-timer.C:
+			armedFor = time.Time{} // fired: nothing is armed until the Rearm below
+		}
+
+		now := dw.now()
+		var next time.Duration
+		next, backingOff = dw.pass(ctx, now, backingOff)
+		// A wake that only re-arms the timer later than it already fires buys
+		// nothing, and under a sustained stream the loop turns at commit rate.
+		if at := now.Add(next); armedFor.IsZero() || at.Before(armedFor) {
+			driver.Rearm(timer, next)
+			armedFor = at
+		}
+	}
 }
+
+// newWaker builds a waker over bh's cadences. Call it after the options are
+// applied: the gates take their intervals here, so one built earlier would hold
+// the defaults whatever the caller asked for.
+//
+// The scan floor is clamped to the wake floor. It is meant to sit an order of
+// magnitude under it — a limit on how often a wake may drive a scan, not on how
+// often one happens — so a scan floor above the wake interval would delay a
+// scan past the tick that is supposed to bound the worst case. The two are
+// configured independently, and a short wake interval is the ordinary case in
+// tests.
+func newWaker(bh *Beehive) *waker {
+	cursors, _ := bh.store.(DriverCursorer)
+	return &waker{
+		bh:          bh,
+		cursors:     cursors,
+		now:         time.Now,
+		scanGate:    rategate.New[struct{}](min(bh.wakeScanMinInterval, bh.wakeInterval)),
+		persistGate: rategate.New[struct{}](bh.wakeInterval),
+	}
+}
+
+// pass is one turn of the run loop: scan under the throttle, and report how
+// long to wait and whether to drop the wakes arriving meanwhile. backingOff is
+// the loop's current answer to that, carried in because a pass that does not
+// scan has no new one. Split from run so the rate tests drive it at instants of
+// their own choosing.
+func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time.Duration, bool) {
+	floor := dw.bh.wakeInterval
+	if opensAt, held := dw.scanGate.Allow(wakerGateKey, now); held {
+		// Re-arming for what is left of the throttle is what remembers the
+		// wake: the scan that runs then reads its position from the store.
+		//
+		// backingOff is carried through rather than cleared: the floor timer
+		// armed before a failure fires inside the throttle window, and
+		// answering "not backing off" there would hand a degraded store back to
+		// the wakes at the throttle's rate.
+		return opensAt.Sub(now), backingOff
+	}
+	switch dw.scan(ctx) {
+	case scanMore:
+		if throttle := dw.scanGate.Interval(); throttle > 0 {
+			return throttle, false // keep draining, at the throttle's rate
+		}
+	case scanFailed:
+		return floor, true
+	}
+	return floor, false
+}
+
+// scanResult says what a pass found. The run loop dispatches on it: how soon to
+// look again, and whether to drop the wakes arriving meanwhile.
+type scanResult uint8
+
+const (
+	scanIdle   scanResult = iota // nothing above the watermark
+	scanMore                     // work remains: the page budget stopped the scan, or a seed resumed below the mark
+	scanFailed                   // a read failed, so the watermark is held for the next pass
+)
 
 // seed sets the starting watermark: the persisted cursor when the store has
 // one, otherwise the write log's current high-water mark (so the first scan
 // reports changes from startup, not all history). It persists the seed point so
 // a run that never sees a write still leaves its successor somewhere to resume.
-// On failure the waker stays unseeded and the next tick retries; a change
+// On failure the waker stays unseeded and the next pass retries; a change
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
-func (dw *waker) seed(ctx context.Context) bool {
+func (dw *waker) seed(ctx context.Context) scanResult {
 	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return false // shutdown, not a loss
+			return scanFailed // shutdown, not a loss
 		}
-		dw.bh.log().WarnContext(ctx, "dependency waker could not read the store's write cursor; retrying on the next tick, and changes made before it are not replayed",
+		dw.bh.log().WarnContext(ctx, "dependency waker could not read the store's write cursor; retrying on the next pass, and changes made before it are not replayed",
 			"err", err)
-		return false
+		return scanFailed
 	}
 
 	var stored int64
@@ -114,11 +243,11 @@ func (dw *waker) seed(ctx context.Context) bool {
 	if dw.cursors != nil {
 		if stored, ok, err = dw.cursors.DriverCursorsGet(ctx, cursorNameWaker); err != nil {
 			if ctx.Err() != nil {
-				return false
+				return scanFailed
 			}
-			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next tick",
+			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next pass",
 				"err", err)
-			return false
+			return scanFailed
 		}
 	}
 
@@ -138,7 +267,14 @@ func (dw *waker) seed(ctx context.Context) bool {
 	// a write would otherwise leave its successor to skip everything committed
 	// in between. No-op when the row already covers the watermark.
 	dw.persist(ctx)
-	return true
+
+	// A resume below the mark has a backlog waiting, and making the loop wait a
+	// floor for its first page is the one case where a restart is slower than a
+	// steady state.
+	if watermark < mark {
+		return scanMore
+	}
+	return scanIdle
 }
 
 // resumeWatermark decides where seed resumes from; pure so the clamp is
@@ -157,38 +293,39 @@ func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 // scan runs one pass: everything above the watermark, a page at a time. The
 // cursor advances per page — pages come back in resource_version order, so a
 // page that succeeded means everything below it is done. A failed page holds
-// the cursor and the next tick re-reads it.
-func (dw *waker) scan(ctx context.Context) {
-	// Seeding on this tick sets the cursor and nothing more.
+// the cursor and the next pass re-reads it.
+func (dw *waker) scan(ctx context.Context) scanResult {
+	// Seeding on this pass sets the cursor and nothing more, which is what
+	// keeps a wake from turning a failed seed into a scan.
 	if !dw.seeded {
-		dw.seed(ctx)
-		return
+		return dw.seed(ctx)
 	}
 	// A defer, so every early return below — including the error path — still
 	// persists whatever earlier pages advanced the watermark to.
 	defer dw.persist(ctx)
-	for pages := 0; pages < wakeScanPagesPerTick; pages++ {
+	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
 		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
-				return // shutdown cancelled this read
+				return scanFailed // shutdown cancelled this read
 			}
-			dw.bh.log().WarnContext(ctx, "scanning for changed dependencies failed; the wakes are still owed and the next tick retries them",
+			dw.bh.log().WarnContext(ctx, "scanning for changed dependencies failed; the wakes are still owed and the next pass retries them",
 				"watermark", dw.watermark, "err", err)
-			return
+			return scanFailed
 		}
 		if len(page) == 0 {
-			return
+			return scanIdle
 		}
 		if !dw.dependentsWake(ctx, page) {
-			return
+			return scanFailed
 		}
 		if len(page) < wakeScanPageCap {
 			// Nothing was above this page when the store answered; anything
-			// since belongs to the next tick.
-			return
+			// since belongs to the next pass.
+			return scanIdle
 		}
 	}
+	return scanMore
 }
 
 // persist writes the watermark through cursors when it has advanced since the
@@ -199,6 +336,12 @@ func (dw *waker) scan(ctx context.Context) {
 func (dw *waker) persist(ctx context.Context) {
 	// ctx.Err() checked here so a shutdown mid-scan isn't logged as a failure.
 	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
+		return
+	}
+	// Ahead of the skip ladder, not just ahead of the write: a gate below it
+	// would let refused passes burn skips at the wake rate, which is what turns
+	// wakePersistRetryCap from a minute into a handful of seconds.
+	if _, held := dw.persistGate.Allow(wakerGateKey, dw.now()); held {
 		return
 	}
 	if dw.persistSkips > 0 {

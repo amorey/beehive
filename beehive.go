@@ -47,6 +47,11 @@ const (
 	// order of magnitude more often than the passes that scale with object count.
 	defaultWakeInterval = 1 * time.Second
 
+	// defaultWakeScanMinInterval floors the gap between two wake-driven scans.
+	// An order of magnitude under defaultWakeInterval: it is what a chain hop
+	// costs, and what bounds the loop's duty cycle under a sustained write
+	// stream. See docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md.
+	defaultWakeScanMinInterval = 100 * time.Millisecond
 	// defaultMinRequeueInterval floors the gap between two dispatches of one
 	// object. It matches defaultWakeInterval, which is what bounds a dependency
 	// cycle today; raising one without the other changes that bound.
@@ -85,6 +90,7 @@ type Beehive struct {
 	fullPassInterval        time.Duration
 	gcInterval              time.Duration
 	wakeInterval            time.Duration
+	wakeScanMinInterval     time.Duration
 	staleDependentsInterval time.Duration
 	watchPollInterval       time.Duration
 	watchFloorInterval      time.Duration
@@ -351,6 +357,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		gcInterval:              defaultGCInterval,
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeInterval:            defaultWakeInterval,
+		wakeScanMinInterval:     defaultWakeScanMinInterval,
 		minRequeueInterval:      defaultMinRequeueInterval,
 		watchPollInterval:       defaultWatchPollInterval,
 		watchFloorInterval:      defaultWatchFloorInterval,
@@ -359,13 +366,14 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		migrators:               make(map[GroupKind]Migrator),
 		kindWriteHub:            newKindWriteHub(),
 	}
-	cursors, _ := s.(DriverCursorer)
-	bh.waker = &waker{bh: bh, cursors: cursors}
 	for _, o := range opts {
 		if err := o(bh); err != nil {
 			return nil, err
 		}
 	}
+	// After the options: the waker reads its cadences at construction, so
+	// building it above would capture the defaults and ignore them.
+	bh.waker = newWaker(bh)
 	return bh, nil
 }
 

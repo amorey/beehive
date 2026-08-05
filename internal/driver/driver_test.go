@@ -27,6 +27,28 @@ const (
 	testTimeout = 2 * time.Second
 )
 
+// Rearm's whole job is that a timer already fired, or fired and was drained,
+// still fires again at the new delay.
+func TestRearmFiresAtTheNewDelay(t *testing.T) {
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+
+	Rearm(timer, fastTick)
+	select {
+	case <-timer.C:
+	case <-time.After(testTimeout):
+		t.Fatal("rearmed timer never fired")
+	}
+
+	// Again, on a timer that has already fired and been drained.
+	Rearm(timer, fastTick)
+	select {
+	case <-timer.C:
+	case <-time.After(testTimeout):
+		t.Fatal("rearmed timer never fired a second time")
+	}
+}
+
 // A step that reports false ends the driver, whichever tick it happens on. The
 // watches rely on it to stop a poll goroutine whose subscriber has gone away, and
 // that decision is almost never made on the first pass.

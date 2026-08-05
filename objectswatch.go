@@ -147,6 +147,13 @@ func (h kindWriteHub) Watch(gk GroupKind) (*watch.Receiver[GroupKind, struct{}],
 	return h.watch(gk, struct{}{})
 }
 
+// WatchAcross registers a receiver for every kind, for the dependency waker:
+// its cursor is store-wide, and an edge can point at a kind no per-kind watch
+// would name.
+func (h kindWriteHub) WatchAcross() (*watch.Receiver[GroupKind, struct{}], bool) {
+	return h.watchAcross(struct{}{})
+}
+
 // tailerFor returns the kind's tailer with a subscriber lease held on it,
 // starting one on the kind's first watch. Every caller owes exactly one
 // release.
@@ -431,8 +438,7 @@ func (t *objectTailer) run() {
 			retry.Reset()
 			backingOff = false
 		}
-		timer.Stop()
-		timer.Reset(next)
+		driver.Rearm(timer, next)
 	}
 }
 

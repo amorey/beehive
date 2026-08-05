@@ -239,6 +239,21 @@ func tailerCount(bh *Beehive) int {
 	return len(bh.tailers)
 }
 
+// fakeClock is a clock a test drives by hand, for the wall-clock rate limits
+// the suite must not sleep on.
+type fakeClock struct{ at time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.at }
+func (c *fakeClock) advance(d time.Duration) { c.at = c.at.Add(d) }
+
+// fakeClockOn gives dw a fakeClock and returns it. Shared with the waker
+// benchmarks, which pace their passes the same way.
+func fakeClockOn(dw *waker) *fakeClock {
+	clk := &fakeClock{at: time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)}
+	dw.now = clk.now
+	return clk
+}
+
 // mustCreate creates one object and fails the test if the create errors — the
 // shape of the great majority of test creates, which only want a row to exist
 // before they assert on something else.

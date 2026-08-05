@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -2592,16 +2593,20 @@ var clientOnlyGK = GroupKind{Kind: "Config"}
 // beyond the test — so the only thing that can requeue D is the dependency
 // waker. The GC sweeper's interval cannot be disabled, so it is set long enough
 // to never fire on its own; tests that need a sweep drive it directly.
-func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, chan *Object[tSpec, tStatus], func()) {
+func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, func()) {
 	t.Helper()
 	ctx := context.Background()
 	store := &seedProbeStore{Store: newClientTestStore(t), seeded: make(chan struct{}, 8)}
 
 	// The dependency waker is the only driver under test here, so it runs fast
-	// while everything else is pushed out of the way.
-	bh := newTestBeehive(t, store, WithGCInterval(time.Hour), withDependencyWakeInterval(fastTick))
-	reconciled := make(chan *Object[tSpec, tStatus], 16)
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{ch: reconciled},
+	// while everything else is pushed out of the way. The re-enqueue floor goes
+	// too: it absorbs an enqueue into an alarm that fires a second later, which
+	// would reach the dependent after the change and prove nothing about what
+	// woke it.
+	bh := newTestBeehive(t, store, WithGCInterval(time.Hour),
+		withDependencyWakeInterval(fastTick), withMinRequeueInterval(0))
+	observer := &depObserver{store: store, seen: make(chan depObservation, 64)}
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, observer,
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
 		WithStartupFullPass(false))
@@ -2616,7 +2621,193 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, chan *Object[tSp
 	// nothing else would find it either. Waiting makes "the waker was watching"
 	// a fact rather than a bet on goroutine scheduling.
 	waitClosed(t, chanAfter(store.seeded, 1), "the waker to seed its watermark")
-	return bh, store, reconciled, func() { _ = stop(ctx) }
+	return bh, store, observer, func() {
+		observer.release() // a test that failed early may still hold one parked
+		_ = stop(ctx)
+	}
+}
+
+// depObservation is one reconcile of the dependent, and the version of the
+// target it read while running.
+//
+// The version is what makes these tests mean anything. A create enqueues its
+// own object, so a reconcile of the dependent is always in flight nearby, and
+// an assertion that waits for "a reconcile happened" is satisfied by that one —
+// every test here passed with its mutation deleted before the version was
+// carried through.
+//
+// release is non-nil exactly when this reconcile is parked, waiting to be let
+// go. A reconcile already running when parking was armed carries nil, and must
+// not be mistaken for one that can be released.
+type depObservation struct {
+	id       ObjectID
+	targetRV int64
+	release  chan struct{}
+}
+
+// depObserver reconciles the dependent by reading its target, so a test can
+// wait for the reconcile that saw a particular version of it. target is set
+// once the object exists and read on the reconcile goroutine.
+//
+// It can also park a reconcile after that read: see settle.
+type depObserver struct {
+	store  Store
+	target atomic.Int64
+	seen   chan depObservation
+
+	// mu guards the parking state. A reconcile takes its channel under the same
+	// lock release closes them under, so it either parks on one that will be
+	// closed or does not park at all — never on one nobody holds. Every release
+	// is a close, so no path here can block.
+	mu      sync.Mutex
+	parking bool
+	parked  map[chan struct{}]struct{}
+}
+
+func (c *depObserver) Reconcile(ctx context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	obs := depObservation{id: obj.ID, release: c.parkChan()}
+	if id := ObjectID(c.target.Load()); id != 0 {
+		switch raw, err := c.store.ObjectsGet(ctx, id); {
+		case err == nil:
+			obs.targetRV = raw.ResourceVersion
+		case !errors.Is(err, ErrNotFound):
+			return Result{}, err
+		}
+	}
+	c.seen <- obs
+	if obs.release != nil {
+		<-obs.release
+	}
+	return Result{}, nil
+}
+
+// parkChan hands this reconcile the channel it will wait on, or nil when
+// parking is off.
+func (c *depObserver) parkChan() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.parking {
+		return nil
+	}
+	ch := make(chan struct{})
+	c.parked[ch] = struct{}{}
+	return ch
+}
+
+// unpark lets one parked reconcile finish.
+func (c *depObserver) unpark(ch chan struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, held := c.parked[ch]; held {
+		delete(c.parked, ch)
+		close(ch)
+	}
+}
+
+// release stops parking and frees everything parked. Both halves matter: an
+// assertion can succeed while a dispatch is still parked, because the
+// observation is sent before the park — and a worker left parked blocks the
+// beehive's drain until its deadline. Idempotent, so the fixture can call it
+// for a test that failed early.
+func (c *depObserver) release() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.parking = false
+	for ch := range c.parked {
+		delete(c.parked, ch)
+		close(ch)
+	}
+}
+
+// settle drives the dependent until nothing else is queued for it and leaves
+// the last reconcile parked inside its dispatch. What the test does next
+// therefore races nothing: one object is dispatched at a time, so while this
+// reconcile is held no other can read the target, and the queue behind it is
+// empty. Call release once the change under test has landed.
+//
+// It returns the target's version as of that moment. An observation above it
+// can only have come from a dispatch enqueued after the change.
+func (c *depObserver) settle(t *testing.T, ctx context.Context, bh *Beehive, client Client[tSpec, tStatus], id, target ObjectID) int64 {
+	t.Helper()
+	r, ok := bh.reconcilerFor(GroupKind{Kind: "Widget"})
+	require.True(t, ok)
+
+	c.target.Store(int64(target))
+	c.mu.Lock()
+	c.parking, c.parked = true, map[chan struct{}]struct{}{}
+	c.mu.Unlock()
+
+	require.NoError(t, client.Requeue(ctx, id))
+	for {
+		// Parked, not merely reconciled: a pass already running when parking
+		// was armed is holding nothing, and treating it as held would leave the
+		// queue free to dispatch again behind the test's back.
+		obs := awaitParked(t, c.seen, id)
+		if !queuedFor(r.work, id) {
+			break // parked, with nothing behind it
+		}
+		c.unpark(obs.release) // let it finish so the queued one runs and parks
+	}
+
+	raw, err := c.store.ObjectsGet(ctx, target)
+	require.NoError(t, err)
+	return raw.ResourceVersion
+}
+
+// queuedFor reports whether id is owed another dispatch. Both halves are
+// needed: an add that arrives while id is being processed does not queue it, it
+// marks the gauge dirty, and done re-queues it from there. Checking only items
+// reads a parked reconcile with an add behind it as "nothing pending", which is
+// how a test built on this went flaky.
+//
+// Read under the queue's own lock, and meaningful only while a reconcile of id
+// is parked: nothing else can move it then.
+func queuedFor(q *workQueue, id ObjectID) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, dirty := q.gauge.dirty[id]; dirty {
+		return true
+	}
+	return slices.Contains(q.items, id)
+}
+
+// awaitParked waits for a reconcile of id that is parked, and returns it.
+func awaitParked(t *testing.T, ch chan depObservation, id ObjectID) depObservation {
+	t.Helper()
+	for {
+		select {
+		case obs := <-ch:
+			if obs.id == id && obs.release != nil {
+				return obs
+			}
+		case <-time.After(testTimeout):
+			t.Fatal("the dependent's requeued pass did not park")
+		}
+	}
+}
+
+// awaitTargetAbove waits for a reconcile of id that read the target at a
+// version above rv — that is, one that observed the change under test rather
+// than a reconcile queued before it.
+func awaitTargetAbove(t *testing.T, ch chan depObservation, id ObjectID, rv int64, msg string) {
+	t.Helper()
+	awaitObservation(t, ch, msg, func(obs depObservation) bool {
+		return obs.id == id && obs.targetRV > rv
+	})
+}
+
+func awaitObservation(t *testing.T, ch chan depObservation, msg string, want func(depObservation) bool) {
+	t.Helper()
+	for {
+		select {
+		case obs := <-ch:
+			if want(obs) {
+				return
+			}
+		case <-time.After(testTimeout):
+			t.Fatal(msg)
+		}
+	}
 }
 
 // seedProbeStore signals when the waker reads the store-wide cursor. In this
@@ -2633,24 +2824,6 @@ func (s *seedProbeStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, 
 	return at, err
 }
 
-// settleFirstPass drives the one reconcile these fixtures cannot get any other
-// way. They disable every periodic driver but the waker, so nothing lists a newly
-// created object: the startup owed pass ran before it existed, and no write
-// schedules a pass. Requeue is the supported way to reconcile by hand in exactly that
-// configuration, and using it here is what keeps the baseline from being a race
-// with the reconciler goroutine's own startup.
-func settleFirstPass(t *testing.T, client Client[tSpec, tStatus], ch chan *Object[tSpec, tStatus], id ObjectID) {
-	t.Helper()
-	require.NoError(t, client.Requeue(context.Background(), id))
-	awaitReconcile(t, ch, id, "the dependent's requeued first pass did not run")
-}
-
-// awaitReconcile waits for a reconcile of id, ignoring any others.
-func awaitReconcile(t *testing.T, ch chan *Object[tSpec, tStatus], id ObjectID, msg string) {
-	t.Helper()
-	awaitMatch(t, ch, func(obj *Object[tSpec, tStatus]) bool { return obj.ID == id }, msg)
-}
-
 // TestClientOnlyTargetWakesDependent is the defect: a depends_on edge may point
 // at an object of a kind with no controller, and a per-registered-kind waker
 // never observes it. Not a dropped wake — none is ever attempted, so no amount
@@ -2658,19 +2831,20 @@ func awaitReconcile(t *testing.T, ch chan *Object[tSpec, tStatus], id ObjectID, 
 // dependent must still be requeued when its client-only target changes.
 func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	ctx := context.Background()
-	bh, store, reconciled, stop := newClientOnlyTargetFixture(t)
+	bh, store, observer, stop := newClientOnlyTargetFixture(t)
 	defer stop()
 
 	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
 	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
 	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnlyGK), "target-a", tSpec{})
-	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	at := observer.settle(t, ctx, bh, depClient, dep.ID, target.ID)
 
 	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
+	observer.release()
 
-	awaitReconcile(t, reconciled, dep.ID,
+	awaitTargetAbove(t, observer.seen, dep.ID, at,
 		"the dependent was never woken: its target's kind has no controller, so no waker observed the change")
 }
 
@@ -2681,22 +2855,23 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 // client-only kind.
 func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	ctx := context.Background()
-	bh, store, reconciled, stop := newClientOnlyTargetFixture(t)
+	bh, store, observer, stop := newClientOnlyTargetFixture(t)
 	defer stop()
 
 	depClient := NewClient[tSpec, tStatus](bh, GroupKind{Kind: "Widget"})
 	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
-	settleFirstPass(t, depClient, reconciled, dep.ID)
 
 	// The kind's first object is born after Start, so nothing observable at
 	// subscribe time could have named it.
 	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnlyGK), "target-b", tSpec{})
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	at := observer.settle(t, ctx, bh, depClient, dep.ID, target.ID)
 
 	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
+	observer.release()
 
-	awaitReconcile(t, reconciled, dep.ID,
+	awaitTargetAbove(t, observer.seen, dep.ID, at,
 		"the dependent was never woken for a target kind whose first object appeared after Start")
 }
 
@@ -2710,7 +2885,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 // running process.
 func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	ctx := context.Background()
-	bh, store, reconciled, stop := newClientOnlyTargetFixture(t)
+	bh, store, observer, stop := newClientOnlyTargetFixture(t)
 	defer stop()
 
 	widget := GroupKind{Kind: "Widget"}
@@ -2718,11 +2893,13 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 	dep := mustCreate(t, ctx, depClient, uniqueName(), tSpec{})
 	targetClient := NewClient[tSpec, tStatus](bh, clientOnlyGK)
 	target := mustCreate(t, ctx, targetClient, uniqueName(), tSpec{})
-	settleFirstPass(t, depClient, reconciled, dep.ID)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+	at := observer.settle(t, ctx, bh, depClient, dep.ID, target.ID)
 
 	require.NoError(t, targetClient.Delete(ctx, target.ID))
-	awaitReconcile(t, reconciled, dep.ID,
+	observer.release()
+
+	awaitTargetAbove(t, observer.seen, dep.ID, at,
 		"the dependent was never woken by its target's tombstone, so nothing can drop the edge that RESTRICT-blocks collection")
 
 	// The wake is only half the story: with the edge dropped, the target must

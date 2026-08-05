@@ -56,6 +56,15 @@ func TickerChan(d time.Duration) (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
+// Rearm resets t to fire d from now, for a wake-driven loop that re-arms one
+// timer after every pass. Safe on a timer that is still running, one that has
+// fired, and one whose value was never received: since Go 1.23 the timer
+// channel is unbuffered, so Reset cannot leave a stale value behind.
+func Rearm(t *time.Timer, d time.Duration) {
+	t.Stop()
+	t.Reset(d)
+}
+
 // Backoff is the retry delay a wake-driven driver uses when a step fails: it
 // doubles from Base and is capped at Max, which is the driver's own floor
 // cadence. The zero value is unusable — Base must be positive.

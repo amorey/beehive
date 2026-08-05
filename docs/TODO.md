@@ -641,18 +641,119 @@ here shrinks to a pointer.
   rate-limited while writes continue. That trades a bounded delay for connection
   headroom exactly where per-write latency is already dominated by queueing.
 
-  Deferred because the tailer is demand-scoped: it runs only while something watches,
-  and a caller that opened a watch has asked for the latency. The
-  [commit-wake spec](specs/03-waker-commit-wake.md) needs the same limit for the
-  dependency waker, where the same loop runs unconditionally for the life of the
-  process and the trade comes out the other way. Revisit when the two are compared
-  side by side, or if a watched kind under heavy write load is measured to slow its
-  own writers. Whatever is built should be shared: two wake-driven drivers throttling
-  on different curves would be a tuning accident, the same reasoning
-  `Beehive.watchBackoff` already applies to the retry ladder.
+  **The shared limit now exists and the tailer has not adopted it.** The dependency
+  waker took `rategate.Allow` for exactly this, floored at
+  `wakeScanMinInterval` — see
+  [the ADR](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md). It went there
+  first because that loop runs unconditionally for the life of the process, where
+  the tailer is demand-scoped: it runs only while something watches, and a caller
+  that opened a watch has asked for the latency. Adopting it here is a gate, a
+  constant and the `Allow`/`Rearm` pair the waker's loop already uses. Revisit if a
+  watched kind under heavy write load is measured to slow its own writers.
 
   Tripwire: none pins the current cadence. `TestTailerDeliversOnWake` asserts that a
   wake delivers, not how soon, and `TestTailerDrainsBurstAbovePageCap` and
   `TestWatchLoadsAreBatchedPerDrain` assert what a drain *reads*, not how soon the
   next one may start. A throttle under the tests' failsafe timeouts would trip none
   of them — which is itself worth knowing before adding one.
+
+- **The dependency waker's 1s pass is a heartbeat with nothing to find** — known,
+  not fixed, and now that the commit wake has
+  [shipped](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md) it is the one
+  loop in the system that runs unconditionally for the life of the process
+  without anything demanding it. In a healthy single-process beehive a lost push
+  is close to impossible by construction — the subscription is registered before
+  the seed read, the hub closes only at stop, and one slot per receiver means a
+  burst cannot drop one — so essentially every tick is a quiet pass: one
+  `ObjectWritesListSinceAll` that comes back empty, measured at ~21µs by
+  `BenchmarkWakerScanRateUnderSustainedWrites`. That is 86,400 queries a day of
+  insurance against an event the push path makes very hard to arrange.
+
+  **The proposal is to arm the timer only when there is a reason to look again**,
+  leaving the waker wake-driven: `scanIdle` re-arms nothing and the loop blocks on
+  the wake channel, `scanMore` keeps the throttle re-arm, and `scanFailed` re-arms
+  a retry. The eager first pass stays — it seeds, and a restart still resumes from
+  the persisted cursor on it rather than on a tick.
+
+  **The failure retry is the coupling that has to move first.** `backingOff` drops
+  arriving wakes, and today only the floor timer clears it, so a `scanFailed` that
+  re-arms nothing wedges the waker until the process restarts. It needs its own
+  delay — `driver.Backoff`, as `objectTailer` already uses — and that timer is
+  conditional rather than a heartbeat, so it does not reintroduce what this
+  removes. Two smaller ones follow: `wakeInterval` also sets the cursor-write
+  floor (and through it what `wakePersistRetryCap` means in seconds), which wants
+  its own constant; and `wakeInterval <= 0` currently means "no waker at all",
+  so a tick that becomes optional needs to be a knob of its own rather than that
+  sentinel.
+
+  **What it gives up is the multi-process case, and that is the decision to make
+  deliberately.** `signalKindWritten` publishes to an in-process hub, so a second
+  process writing the same store produces no wake here: the tick is that
+  deployment's only dependency-wake path, and its cadence is that deployment's
+  latency. An opt-in periodic pass, off by default, is the shape that keeps both
+  — but defaulting every embedded single-process beehive to a 1s loop to serve it
+  is the trade worth naming. Correctness is unaffected either way: the
+  stale-dependents pass (60s, cannot be disabled) derives staleness rather than
+  replaying a cursor, so it finds a superset of what the waker finds, and
+  `reconcile_owed` outlives the queue behind it.
+
+  Note the corollary for any interim tuning: a floor at or above
+  `staleDependentsInterval` is strictly redundant, since the backstop runs at that
+  cadence and finds more. The tick only earns its keep strictly faster than 60s.
+
+  Tripwire: none pins the cadence. `TestWakerScansWhenAWriteCommits` and
+  `TestClientOnlyTargetWakesDependent` assert that a wake and a tick each reach
+  the dependent, not that the tick runs at all, so removing it would trip neither.
+  What a change here must add is the pair nothing covers today: that a failed scan
+  recovers with no heartbeat behind it, and that an idle beehive issues no waker
+  queries at all.
+
+- **`rategate`'s eviction copies the whole live set, and only runs on `Admit`** —
+  known, not fixed, and unmeasured at the cardinality where it would matter. The
+  package holds each key for a fixed interval and bounds its map by *admissions
+  within one interval* rather than by the key space, which is the invariant a
+  per-key limiter map usually gets wrong. Three things about how it does that are
+  worth revisiting, in this order:
+
+  **The compaction is O(live) per eviction round.** `evict` ends with
+  `append(g.order[:0], g.order[i:]...)`, which copies the entire live tail
+  whenever even one entry has expired, and it runs on every `Admit`. That is O(n)
+  per admission where it should be amortised O(1). For the work queue's gate
+  (interval 1s, key `ObjectID`, entry 8 + 24 bytes), 1,000 distinct objects
+  dispatched per second is ~32KB copied per admission, ≈32MB/s of memmove;
+  10,000/s is ≈3.2GB/s, which is not survivable. What keeps it off the floor
+  today is that the store's single connection cannot feed reconciles at that
+  rate — a coincidental bound with a narrower margin than it looks. **The fix is
+  a head index** slid forward on eviction, compacting only when it passes half
+  the slice; same semantics, no API change.
+
+  **Memory is reclaimed only inside `Admit`.** A kind that dispatches ten thousand
+  objects and then goes quiet holds their records until its next admission, which
+  may never come. It cannot grow past one interval's admissions, so this is
+  retention rather than a leak, but nothing returns it. `OpensAt` could evict
+  opportunistically without breaking its documented "records nothing" contract —
+  evicting is not recording.
+
+  **Each entry carries a `time.Time` twice**, in the map value and the queue
+  entry: 24 bytes each, and the `loc` pointer is the only part of this package
+  the GC has to trace. An internal monotonic int64 would halve it. Micro, and
+  last.
+
+  Deferred because nothing here is on a measured path. The one benchmark that
+  touches the package — `BenchmarkWakerScanRateUnderSustainedWrites` — drives the
+  waker's gates, which hold a single key each and so exercise none of this; the
+  ~40ns alloc-free `Admit` recorded during review was that same single-key case.
+  **The missing evidence is a benchmark of the work queue's gate at 1k and 10k
+  distinct keys per interval**, and it should come before the fix rather than
+  after it.
+
+  Related, and cheaper: the waker holds two single-key gates
+  (`scanGate`, `persistGate`) that each carry a map and an eviction queue for one
+  key. A `rategate.Single` — one instant, no map, `Allow(now)` — would drop both,
+  and a third single-key consumer would settle it. Note that none of this is an
+  argument for a token bucket: a per-key `rate.Limiter` map inherits the same key
+  space and usually ships no eviction at all.
+
+  Tripwire: none. `internal/rategate`'s tests pin semantics — hold, expiry,
+  re-admission, `Forget` — and say nothing about cost, so every change proposed
+  here would keep them green.
