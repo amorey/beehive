@@ -30,24 +30,23 @@ import (
 // registered controller: there is no reconcile loop to schedule against.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// ErrWatchTooOld ends a watch whose unread log entries retention has already
-// removed. The stream cannot continue truthfully, so it reports this on a Failed
-// change and closes; the caller answers by subscribing again for a fresh
-// snapshot.
-var ErrWatchTooOld = errors.New("beehive: watch is below the write log's retention horizon")
+// ErrWatchTooOld ends a watch whose unread entries retention has already
+// removed — the object write log for Watch/WatchList, the event log for
+// EventsWatch. The stream cannot continue truthfully, so it reports this and
+// closes; the caller answers by subscribing again for a fresh snapshot.
+var ErrWatchTooOld = errors.New("beehive: watch is below the log's retention horizon")
 
-// ErrWatchTooNew ends a resume whose position is above everything the kind's
-// log has held, which means the position did not come from this store — a
-// restored backup or a swapped file restarts the sequence. Reported on a Failed
-// change like ErrWatchTooOld, and answered the same way: subscribe again
-// without WithResumeFrom. Unreported, such a stream says "caught up" and then
-// drops every change until the sequence climbs past the position.
-var ErrWatchTooNew = errors.New("beehive: watch resumes above the write log's head")
+// ErrWatchTooNew ends a resume whose position is above everything the log has
+// held, which means the position did not come from this store — a restored
+// backup or a swapped file restarts the sequence. Answered the same way as
+// ErrWatchTooOld: subscribe again without the resume option. Unreported, such a
+// stream says "caught up" and then drops everything until the sequence climbs
+// past the position.
+var ErrWatchTooNew = errors.New("beehive: watch resumes above the log's head")
 
-// ErrStopped ends a watch whose Beehive has stopped, reported on a Failed
-// change like ErrWatchTooOld. It is what separates shutdown from the caller
-// cancelling: resubscribing answers ErrWatchTooOld and cannot answer this one,
-// since a stopped Beehive does not start again.
+// ErrStopped ends a watch whose Beehive has stopped. It is what separates
+// shutdown from the caller cancelling: resubscribing answers ErrWatchTooOld and
+// cannot answer this one, since a stopped Beehive does not start again.
 var ErrStopped = errors.New("beehive: the beehive has stopped")
 
 // GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
@@ -169,11 +168,14 @@ type Client[Spec, Status any] interface {
 	// EventsList returns id's event-log runs, newest-first, filtered by opts.
 	// Reads by id, not kind-scoped. An empty log is an empty slice.
 	EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
-	// EventsWatch streams id's event log: the runs matching opts, then whatever
-	// the log grows by, until ctx is cancelled. Requires a registered
-	// controller and polls, so a run extended several times within one interval
-	// is delivered once, carrying its latest state.
-	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+	// EventsWatch streams id's event log: a snapshot of the runs matching opts,
+	// the position it was read at, and the runs the log grows by above it. An
+	// extend re-samples ResourceVersion, so a run that grew is delivered again
+	// carrying its latest state. WithEventsResumeFrom starts above a position
+	// instead of snapshotting; one retention has passed is ErrWatchTooOld and
+	// one above the log's head is ErrWatchTooNew. Requires a registered
+	// controller.
+	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 	// Get loads id, or returns ErrNotFound. Kind-scoped: another kind's row is
 	// not found. The read half of a read-modify-write, whose write half is
 	// Update.
@@ -895,7 +897,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 // EventsList reads id's runs and maps them to public Events. Reads by id, not
 // kind-scoped, like the ref lookups.
 func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts))
+	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts).query)
 	if err != nil {
 		return nil, err
 	}
@@ -932,8 +934,7 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	return out
 }
 
-// eventFromRaw maps a raw event row to the public Event, dropping the
-// store-only resource_version cursor.
+// eventFromRaw maps a raw event row to the public Event.
 func eventFromRaw(raw storeapi.Event) Event {
 	return Event{
 		ID:       raw.ID,
@@ -946,6 +947,8 @@ func eventFromRaw(raw storeapi.Event) Event {
 		Count:    raw.Count,
 		FirstAt:  raw.FirstAt,
 		LastAt:   raw.LastAt,
+
+		ResourceVersion: raw.ResourceVersion,
 	}
 }
 

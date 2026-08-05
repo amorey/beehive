@@ -57,12 +57,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`WithFullPassInterval`, off by default), the GC sweeper (`WithGCInterval`,
   **cannot be disabled**), the dependency waker (write log, **wake-driven, no
   tick**), the stale-dependents pass (60s, **cannot be disabled**), the object
-  watch tail (`withWatchFloorInterval`, 30s, with a commit wake in front) and
-  the event watch poll (1s). Only `WithFullPassInterval` and `WithGCInterval`
+  watch tail and the event watch (both `withWatchFloorInterval`, 30s, each with
+  a commit wake in front). Only `WithFullPassInterval` and `WithGCInterval`
   are public; the other cadences are unexported options only tests reach, and
   `Client.Requeue` is the public way to beat one. **No reconcile may depend on
   either full pass** — both scale with the object count. The schedule watch is
-  the one push exception (see below); the tail's commit wake is not, because its
+  the one push exception (see below); the two watch wakes are not, because their
   floor tick stays. **The waker is the exception to the cadence, not to the
   record**: it still reads the write log, but only a commit makes it look, and
   what entitles it to that is the stale-dependents pass finding a superset of
@@ -166,9 +166,25 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   drain is bounded by a page budget, so a write stream cannot make a tailer hold
   the single connection away from the writers waking it; the first drain after a
   quiet period is still eager.
-  `EventsWatch` still polls and diffs, gated on `EventsMaxVersion`.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
+- **The event watch reads one object's log above a cursor, one reader per
+  watch** (`eventswatch.go`). An extend re-samples `events.resource_version`, so
+  "runs above the cursor" is exactly what changed and the old `seen`/`EventID`
+  diff is gone. `EventsAdd`'s commit wakes it through `eventWriteHub` (keyed by
+  id, not kind); the floor tick covers a foreign writer. Nothing is shared — the
+  read is already per object and already indexed — so there is no lease
+  machinery, and no merge either: the stream is unbuffered, so a consumer that
+  stops reading pins the cursor, which is what makes `ErrWatchTooOld` reachable
+  live. `EventsSnapshot` reads runs and position in one transaction, because two
+  reads either drop a write or deliver it twice. **A read must not imply an
+  absence it cannot vouch for**: `events_horizon` records what retention trimmed,
+  per `(object, category)` to match the ring cap's partition, and a resume below
+  it is refused rather than answered; a *collected* object ends its streams with
+  `ErrNotFound`, since its log and its horizon cascade away together. The horizon
+  is only as good as the sweep's `last_at` clock, and it errs toward
+  over-reporting.
+  → [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on
@@ -179,11 +195,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
-  eight users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  nine users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
   delete-request enqueue, the cleared-finalizer enqueue (all shared via
   `Beehive.signalRequeueNow` and `signalRequeueThrottled`), the GC cascade's own
-  hook, the physical delete's owner push (both `signalRequeueManyNow`), and
-  `signalKindWritten` — which feeds the watch tailers and the dependency waker.
+  hook, the physical delete's owner push (both `signalRequeueManyNow`),
+  `signalKindWritten` — which feeds the watch tailers and the dependency waker —
+  and `signalEventsWritten`, which feeds one object's event readers.
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
   [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
@@ -252,7 +269,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Events are an append-only log, aggregated into runs** per (object,
   category), extended when `(type, reason)` matches. Reads live on `Client`;
   retention runs in the GC sweeper. "Event" means this log and nothing else.
-  → [ADR](docs/adr/2026-07-27-events-api.md)
+  `Store.EventsAdd` returns `error` alone — the watch builds its delta from a
+  cursor, not from the write's result.
+  → [ADR](docs/adr/2026-07-27-events-api.md),
+  [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
 - **The schedule watch is an in-memory gauge and the one watch with no tick at
   all**: the `workQueue` publishes each move of its `gauge` to a `gobus/watch`
   hub. Sound only because the queue is unexported and process-local and the

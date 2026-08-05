@@ -74,9 +74,9 @@ func resolveWatch(opts []WatchOption) watchConfig {
 	return cfg
 }
 
-// watchFloor returns the object tail's floor interval, with a fallback for the
-// same reason as watchPoll: a zero would make the tailer's timer fire in a
-// loop.
+// watchFloor returns the interval a watch reads at without a wake. The fallback
+// covers a Beehive built field by field in a test: a zero would make the timer
+// fire in a loop.
 func (bh *Beehive) watchFloor() time.Duration {
 	if bh.watchFloorInterval <= 0 {
 		return defaultWatchFloorInterval
@@ -126,27 +126,13 @@ func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID)
 	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
 }
 
-// kindWriteHub tells a kind's tailer that the kind moved. Keyed by GroupKind,
-// one slot per receiver: a burst of commits collapses into one pending signal,
-// and a publish that lands mid-read waits in the slot. The signal carries no
-// value — the tailer reads its position from the store — so no Accept gate is
-// set and every send is taken. Close, and the zero value, come from watchHub.
+// kindWriteHub tells a kind's tailer that the kind moved.
 // See docs/adr/2026-08-03-watch-shared-tail.md.
 type kindWriteHub struct {
-	watchHub[GroupKind, struct{}]
+	signalHub[GroupKind]
 }
 
-func newKindWriteHub() kindWriteHub {
-	return kindWriteHub{watchHub[GroupKind, struct{}]{hub: watch.New[GroupKind, struct{}]()}}
-}
-
-func (h kindWriteHub) Send(gk GroupKind) error { return h.send(gk, struct{}{}) }
-
-// Watch registers a receiver for gk. Registration is the baseline and the bus
-// never delivers it back, so a receiver reads only writes that follow it.
-func (h kindWriteHub) Watch(gk GroupKind) (*watch.Receiver[GroupKind, struct{}], bool) {
-	return h.watch(gk, struct{}{})
-}
+func newKindWriteHub() kindWriteHub { return kindWriteHub{newSignalHub[GroupKind]()} }
 
 // WatchAcross registers a receiver for every kind, for the dependency waker:
 // its cursor is store-wide, and an edge can point at a kind no per-kind watch
@@ -247,6 +233,15 @@ func horizonErr(gk GroupKind, what string, cursor, trimmedThrough int64) error {
 	}
 	return fmt.Errorf("%w: %s/%s trimmed through %d, %s was at %d",
 		ErrWatchTooOld, gk.Group, gk.Kind, trimmedThrough, what, cursor)
+}
+
+// tooNewErr returns ErrWatchTooNew when cursor sits above everything the log
+// has held, else nil. what names the log for the message.
+func tooNewErr(what string, cursor, head int64) error {
+	if cursor <= head {
+		return nil
+	}
+	return fmt.Errorf("%w: %s resumed at %d, past its log's %d", ErrWatchTooNew, what, cursor, head)
 }
 
 // errNoRowImage marks a delete log entry with no row image to build the
@@ -411,45 +406,15 @@ func (t *objectTailer) run() {
 	defer t.close()
 
 	ctx := t.ctx
-	written := t.kindWrites.Chan()
-	timer := time.NewTimer(t.floor)
-	defer timer.Stop()
-
-	// backingOff drops commit wakes until the retry timer fires. A wake carries
-	// no information — the drain reads its position from the store — so dropping
-	// one loses nothing, and the timer reads the log either way. Honouring one
-	// would void the backoff exactly when it is needed: a commit landing during
-	// a failed drain refills the wake slot, so a live writer would keep a
-	// degraded store re-reading as fast as it can fail.
-	backingOff := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-written:
-			if !ok {
-				// Only stop closes the wake hub — the last subscriber leaving
-				// comes through ctx above — so this is shutdown, and saying so
-				// is what keeps a closed stream distinguishable from a
-				// cancelled one.
-				err := error(ErrStopped)
-				t.failed.Store(&err)
-				return
-			}
-			// Consumed rather than ignored, so the closed arm above stays live.
-			if backingOff {
-				continue
-			}
-		case <-timer.C:
-		}
-
-		next, stillBackingOff, done := t.pass(ctx, t.now(), backingOff)
-		if done {
-			return
-		}
-		backingOff = stillBackingOff
-		driver.Rearm(timer, next)
-	}
+	runWatchLoop(ctx, t.kindWrites.Chan(), t.floor, func() {
+		// Only stop closes the wake hub — the last subscriber leaving comes
+		// through ctx — so this is shutdown, and saying so is what keeps a closed
+		// stream distinguishable from a cancelled one.
+		err := error(ErrStopped)
+		t.failed.Store(&err)
+	}, func(backingOff bool) (time.Duration, bool, bool) {
+		return t.pass(ctx, t.now(), backingOff)
+	})
 }
 
 // pass is one turn of the run loop: drain, then report how long to wait,
@@ -921,9 +886,8 @@ func (c *clientImpl[Spec, Status]) replay(
 				}
 				continue
 			}
-			if cursor > at {
-				return 0, fmt.Errorf("%w: %s/%s resumed at %d, past the log's %d",
-					ErrWatchTooNew, c.gk.Group, c.gk.Kind, cursor, at), false
+			if err := tooNewErr(c.gk.Group+"/"+c.gk.Kind, cursor, at); err != nil {
+				return 0, err, false
 			}
 			return cursor, nil, true
 		}

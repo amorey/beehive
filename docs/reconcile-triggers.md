@@ -651,8 +651,10 @@ Each item below looks like a trigger. None of them is one.
   waker skips the self-edge on purpose. A spec write already leaves the object
   unsettled, and a status write came from the pass that just ran. Test:
   `TestWakerSkipsTheSelfEdge`.
-- **`EventsAdd` wakes nothing.** It bumps no object `resource_version`. That is also
-  what makes it the one write that is safe inside a dependency cycle.
+- **`EventsAdd` wakes no reconcile.** It bumps no object `resource_version` and
+  appends no write-log entry, which is what makes it the one write that is safe
+  inside a dependency cycle. It does wake the object's own event readers, through
+  a hub of its own — that is a watch delivery, not a trigger.
 - **A schedule change wakes nothing.** `SchedulesWatch` reports an in-memory gauge.
   It bumps no generation and no `resource_version`. It is delivered by a push hub
   rather than by a poll. That changes how a subscriber learns of it. It changes
@@ -661,8 +663,8 @@ Each item below looks like a trigger. None of them is one.
   tailers and the dependency waker. The tailer half never enqueues a reconcile; the
   waker half does, and it is case 6. Do not confuse the tailer with the push paths in
   section 1.
-- **`EventsWatch` wakes nothing.** It polls the event log for subscribers. It
-  enqueues no reconcile.
+- **`EventsWatch` wakes nothing.** It reads one object's event log above a cursor
+  for its subscriber. It enqueues no reconcile.
 - **An object of a client-only kind is never reconciled.** It has no reconcile loop.
   An unsettled spec on one is inert. Only its deletion is acted on, by the sweeper.
 - **A queued id whose row is gone is a successful no-op**, not a retry. `ObjectsGet`

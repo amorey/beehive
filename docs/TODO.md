@@ -7,20 +7,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 Once we decide to build one, the entry here shrinks to a pointer at the work, and
 moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
-- **Do not remove `EventsAdd`'s return value, even though the write-shapes
-  rule says to** — a deliberate exception, recorded so nobody applies the
-  rule mechanically. `Store.EventsAdd` returns a run that no caller reads
-  today, which by the
-  [write-shapes ADR](adr/2026-07-30-store-write-shapes.md) means it should
-  return `error` alone.
-
-  An events push path builds its delta from exactly that return value. The
-  store already computes the run to write it, so returning it costs nothing
-  and saves the push path a read. Tidying it away now would have to be
-  undone.
-
-  Revisit only if an events push path is ruled out for good.
-
 - **An edge write is invisible to every cursor in the system, and the fix is one
   counter rather than a log** — known, not fixed, and recorded here mostly to
   settle the question it keeps raising: whether `edges` writes belong in
@@ -611,21 +597,63 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   to the child — which would make the logged value correct by construction, and
   would also fix `DependentsList`/`DependenciesList`, which have the same hole.
 
-- **`EventsWatch` did not follow the object watches onto the write log** — so
-  two watch surfaces on the same `Client` now behave differently for reasons a
-  caller cannot see. Object watches return a snapshot plus a stream, resume
-  from a `resource_version`, and end with `ErrWatchTooOld` when their entries
-  are trimmed. `EventsWatch` still polls, diffs by `EventID`, hands its initial
-  runs back through the channel, and cannot resume.
+- **Event retention has never been audited end to end, and its shape is not
+  derivable from the code** — the reason this entry exists rather than a fix.
+  `WithEventRetention(perObject, maxAge)` is one global setting enforced by one
+  sweep, but the two bounds are different in kind: `maxAge` is a flat cutoff over
+  the table, and `perObject` is a ring counted per `(object, category)`. Nothing
+  in the option's name or its godoc says the cap's unit is a timeline rather than
+  an object, and a reader who does not already know the category rule reads
+  `perObject` as exactly what it says.
 
-  The asymmetry is not obviously wrong — an event log has no tombstones, so
-  absence is not a change, and the poll-and-diff it uses is sound. But the
-  argument for splitting the snapshot out ("am I synced?" should be a value, not
-  a guess) applies to events unchanged, and a caller reading both surfaces has
-  to hold two models.
+  It has grown a second consumer since: `events_horizon` is keyed to match the
+  ring's partition, because a horizon has to describe what the trim actually
+  deleted or a resume is refused for a hole in a timeline it never read (see
+  [the ADR](adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)). So the
+  cap's granularity is now load-bearing for the watch contract, not only for what
+  survives in the log.
 
-  Worth doing when events grow a consumer that needs to resume — a UI that
-  reconnects, or an exporter. The work is mostly mechanical; the real decision
-  is whether events get a retention horizon of their own, since
-  `WithEventRetention` already trims runs out from under a reader with no way to
-  tell them.
+  What the audit has to settle, in order: what an event log is *for* here — a
+  bounded ring per timeline, or a recent-activity window; whether the category
+  partition earns its place in retention at all, given that it exists for run
+  aggregation and was inherited by the cap rather than chosen for it; whether
+  `perObject` should be renamed for whatever unit survives; and whether either
+  bound should be on by default, since today both are off and an event log with
+  no retention grows forever. The entry below is one concrete outcome it might
+  reach.
+
+  Worth doing before the first release, because `WithEventRetention` is public
+  API and the horizon key is on disk.
+
+- **Dropping the per-timeline cap in favour of `maxAge` alone would simplify
+  three layers at once** — considered and not taken, recorded so the trade is not
+  re-derived from scratch. Retention would become one time cutoff: the window
+  function goes (with the double predicate scan it costs the sweep, since the
+  horizon write and the delete each evaluate it), `events_horizon` collapses to a
+  scalar or a per-object row, `EventsListSince`'s `category` parameter goes with
+  it, and `WithEventRetention` becomes a single duration that no longer implies a
+  size bound it would not have.
+
+  **What it gives up is the only bound that holds under a flapping controller.**
+  `maxAge` bounds age, not size: a controller emitting a distinct `(type, reason)`
+  per reconcile appends a run per reconcile, so inside the window the log grows
+  with reconcile *rate*, where the ring keeps it proportional to the object count.
+  That is the failure mode an event log meets first, and the reason both bounds
+  exist.
+
+  Do it if the audit above decides events are a recent-activity window rather than
+  a bounded ring. Do not do it as a simplification on its own: the complexity it
+  removes is mostly the horizon's, and the horizon is what stops a resume implying
+  an absence it cannot vouch for.
+
+- **A kind-wide event watch does not exist, so a panel over N objects runs N
+  readers** — known, not fixed. `EventsWatch` is per object, and each stream is
+  its own receiver, goroutine, timer and gate over its own cursor (see
+  [the ADR](adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)). That is
+  cheaper than the poll it replaced at any fan-out, and still linear in streams.
+
+  A shared reader would need what the object tail has — one cursor per kind and a
+  fan-out — which the events log cannot serve today: it is indexed by object, not
+  by kind, so a kind-wide tail has no seek to ride. Revisit when a consumer holds
+  enough streams for the goroutine count to matter, and expect it to need an index
+  before it needs an API.

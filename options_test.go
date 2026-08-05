@@ -40,23 +40,27 @@ func TestWithFullPassIntervalDispatch(t *testing.T) {
 // set is the zero query (every run for the object).
 func TestResolveEvents(t *testing.T) {
 	since := time.Now()
-	q := resolveEvents([]EventOption{
+	cfg := resolveEvents([]EventOption{
 		WithEventCategory("connection"),
 		WithEventType(EventWarning),
 		WithEventReason("ProbeFailed"),
 		WithEventLimit(5),
 		WithEventsSince(since),
+		WithEventsResumeFrom(42),
 	})
-	require.NotNil(t, q.Category)
-	assert.Equal(t, "connection", *q.Category)
-	assert.Equal(t, "Warning", q.Type)
-	assert.Equal(t, "ProbeFailed", q.Reason)
-	assert.Equal(t, 5, q.Limit)
-	assert.Equal(t, since, q.Since)
+	require.NotNil(t, cfg.query.Category)
+	assert.Equal(t, "connection", *cfg.query.Category)
+	assert.Equal(t, "Warning", cfg.query.Type)
+	assert.Equal(t, "ProbeFailed", cfg.query.Reason)
+	assert.Equal(t, 5, cfg.query.Limit)
+	assert.Equal(t, since, cfg.query.Since)
+	require.NotNil(t, cfg.resumeFrom)
+	assert.Equal(t, int64(42), *cfg.resumeFrom)
 
 	empty := resolveEvents(nil)
-	assert.Nil(t, empty.Category, "no category filter unless requested")
-	assert.Zero(t, empty.Limit)
+	assert.Nil(t, empty.query.Category, "no category filter unless requested")
+	assert.Zero(t, empty.query.Limit)
+	assert.Nil(t, empty.resumeFrom, "a snapshot unless a resume is asked for")
 }
 
 func TestWithEventRetentionDispatch(t *testing.T) {
@@ -160,30 +164,6 @@ func TestWithGCIntervalRejectsNonPositive(t *testing.T) {
 
 			// And it surfaces from New, which is where a real caller meets it.
 			_, err = New(&fakeStore{}, WithGCInterval(d))
-			require.ErrorIs(t, err, ErrInvalidOption)
-		})
-	}
-}
-
-// TestWatchPollIntervalRejectsNonPositive pins the other mandatory interval,
-// which is mandatory for a different reason than GC's. The watch poll is not a
-// backstop but the delivery mechanism itself, so a watch that never polls is a
-// stream that never emits — there is nothing such a value could mean.
-func TestWatchPollIntervalRejectsNonPositive(t *testing.T) {
-	for _, d := range []time.Duration{0, -time.Second} {
-		t.Run(d.String(), func(t *testing.T) {
-			bh := &Beehive{watchPollInterval: time.Minute}
-			err := withWatchPollInterval(d)(bh)
-			require.ErrorIs(t, err, ErrInvalidOption)
-			assert.Contains(t, err.Error(), "withWatchPollInterval", "name the option that was misused")
-			assert.Equal(t, time.Minute, bh.watchPollInterval, "a rejected option must not have written")
-
-			// Checked before the target switch, like WithGCInterval: a value that means
-			// nothing at one call site means nothing at any of them.
-			require.ErrorIs(t, withWatchPollInterval(d)(&reconciler{}), ErrInvalidOption)
-			require.ErrorIs(t, withWatchPollInterval(d)("unrelated"), ErrInvalidOption)
-
-			_, err = New(&fakeStore{}, withWatchPollInterval(d))
 			require.ErrorIs(t, err, ErrInvalidOption)
 		})
 	}
