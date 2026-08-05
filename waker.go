@@ -423,11 +423,14 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	}
 	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
+		// Not scanFailed: no wake depends on this read, and backing off would
+		// drop the wakes arriving meanwhile. The drain carries on and the next
+		// pass tries again — drainSince still holds.
 		if ctx.Err() == nil {
-			dw.bh.log().WarnContext(ctx, "reading the write log's mark failed; the drain continues",
+			dw.bh.log().WarnContext(ctx, "reading the write log's mark failed; the drain continues and the next pass retries",
 				"watermark", dw.watermark, "err", err)
 		}
-		return scanFailed
+		return scanMore
 	}
 	dw.bh.log().WarnContext(ctx, "the dependency waker's backlog outlasted the stale-dependents cadence; skipping to the write log's mark, and that pass delivers the wakes in between",
 		"watermark", dw.watermark, "mark", mark, "drained", drained)

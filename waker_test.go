@@ -1039,6 +1039,28 @@ func TestWakerDrainStreakResetsOnAFailedPage(t *testing.T) {
 	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark)
 }
 
+// The mark read decides where to skip to, and no wake depends on it. So a failure
+// there is not scanFailed — that would arm the retry backoff and drop the wakes
+// arriving meanwhile over a read the drain does not need. The drain just carries on
+// and the next pass tries again.
+func TestWakerAbandonRetriesAFailedMarkRead(t *testing.T) {
+	const mark int64 = 9000
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3 * wakeFullBudget), seed: mark}}
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = defaultWakePersistInterval
+
+	require.Equal(t, scanMore, dw.scan(context.Background()))
+	clk.advance(dw.abandonAfter)
+
+	store.seedErr = errBoom
+	assert.Equal(t, scanMore, dw.scan(context.Background()), "the drain continues rather than backing off")
+	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark, "having paged its budget as usual")
+
+	store.seedErr = nil
+	assert.Equal(t, scanIdle, dw.scan(context.Background()), "and the next pass abandons")
+	assert.Equal(t, mark, dw.watermark)
+}
+
 // ObjectWritesMaxVersionAll is a bare MAX with no horizon folded in, so a trimmed
 // log answers below the watermark — and a fully trimmed one answers 0. The jump
 // must never take the watermark backwards onto rows it already scanned.
