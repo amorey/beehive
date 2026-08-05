@@ -3581,6 +3581,29 @@ func TestReconcileOwedClearIsNoEmit(t *testing.T) {
 	assert.Len(t, writesAfter, len(writesBefore), "the reclaim appends no write-log entry")
 }
 
+// The reclaim runs on every GC tick and has no equality constraint to drive the
+// planner, so the partial index is a preference rather than a certainty. Pin it:
+// without it the sweep is a full table scan of objects on every tick. Keep the
+// queries aligned with ReconcileOwedClear.
+func TestReconcileOwedClearUsesThePartialIndex(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	for _, tc := range []struct {
+		name, query string
+		args        []any
+	}{
+		{"keeping kinds", `UPDATE objects SET reconcile_owed = 0 WHERE reconcile_owed != 0
+			AND ("group", kind) NOT IN (VALUES (?, ?))`, []any{"", "Greeting"}},
+		{"keeping none", `UPDATE objects SET reconcile_owed = 0 WHERE reconcile_owed != 0`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := queryPlan(t, store, tc.query, tc.args...)
+			assert.Contains(t, plan, "idx_objects_reconcile_owed",
+				"the reclaim must read the partial index, not scan objects:\n"+plan)
+		})
+	}
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.
