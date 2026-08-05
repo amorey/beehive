@@ -370,7 +370,10 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 	// jump abandonIfOvertaken makes — still persists whatever the watermark
 	// reached. It must stay in scan: in scanPages it would run before the jump.
 	defer dw.persist(ctx)
+	// Anything but scanMore means paging stopped for a reason of its own, which
+	// ends the drain: only continuous paging holds the connection.
 	if result := dw.scanPages(ctx); result != scanMore {
+		dw.drainSince = time.Time{}
 		return result
 	}
 	return dw.abandonIfOvertaken(ctx)

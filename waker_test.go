@@ -998,6 +998,47 @@ func TestWakerAbandonsADrainTheBackstopOvertook(t *testing.T) {
 		"the jump is persisted, so a restart does not re-drain what it skipped")
 }
 
+// wakeFullBudget is how many rows one full-budget pass reads.
+const wakeFullBudget = wakeScanPagesPerPass * wakeScanPageCap
+
+// Only continuous paging counts toward the threshold: a pass that caught up ends
+// the drain, so a later one starts its own clock rather than inheriting an old
+// drain's.
+func TestWakerDrainStreakResetsOnAShortPage(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(wakeFullBudget), seed: 9000}}
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = defaultWakePersistInterval
+
+	require.Equal(t, scanMore, dw.scan(context.Background()), "a full budget starts a drain")
+	store.rows = replayRows(wakeFullBudget + 5)
+	require.Equal(t, scanIdle, dw.scan(context.Background()), "and a short page ends it")
+
+	clk.advance(dw.abandonAfter)
+	store.rows = replayRows(wakeFullBudget + 5 + wakeFullBudget)
+	assert.Equal(t, scanMore, dw.scan(context.Background()), "so this drain is new, not overtaken")
+	assert.EqualValues(t, wakeFullBudget+5+wakeFullBudget, dw.watermark, "the watermark paged rather than jumped")
+}
+
+// A failed page ends the drain too: the retry backoff paces what happens next, so
+// nothing is holding the connection at the paging budget.
+func TestWakerDrainStreakResetsOnAFailedPage(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{
+		rows: replayRows(wakeFullBudget), seed: 9000,
+		// The first page of the second pass, and only that one.
+		err: errBoom, failFromCall: wakeScanPagesPerPass + 1, healFromCall: wakeScanPagesPerPass + 2,
+	}}
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = defaultWakePersistInterval
+
+	require.Equal(t, scanMore, dw.scan(context.Background()))
+	require.Equal(t, scanFailed, dw.scan(context.Background()))
+
+	clk.advance(dw.abandonAfter)
+	store.rows = replayRows(2 * wakeFullBudget)
+	assert.Equal(t, scanMore, dw.scan(context.Background()), "the drain that failed does not count toward this one")
+	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark)
+}
+
 // The threshold is the backstop's own cadence: past it, the sweep has found
 // everything the drain is still working toward.
 func TestWakerAbandonAfterIsTheBackstopCadence(t *testing.T) {
