@@ -707,3 +707,53 @@ here shrinks to a pointer.
   What a change here must add is the pair nothing covers today: that a failed scan
   recovers with no heartbeat behind it, and that an idle beehive issues no waker
   queries at all.
+
+- **`rategate`'s eviction copies the whole live set, and only runs on `Admit`** —
+  known, not fixed, and unmeasured at the cardinality where it would matter. The
+  package holds each key for a fixed interval and bounds its map by *admissions
+  within one interval* rather than by the key space, which is the invariant a
+  per-key limiter map usually gets wrong. Three things about how it does that are
+  worth revisiting, in this order:
+
+  **The compaction is O(live) per eviction round.** `evict` ends with
+  `append(g.order[:0], g.order[i:]...)`, which copies the entire live tail
+  whenever even one entry has expired, and it runs on every `Admit`. That is O(n)
+  per admission where it should be amortised O(1). For the work queue's gate
+  (interval 1s, key `ObjectID`, entry 8 + 24 bytes), 1,000 distinct objects
+  dispatched per second is ~32KB copied per admission, ≈32MB/s of memmove;
+  10,000/s is ≈3.2GB/s, which is not survivable. What keeps it off the floor
+  today is that the store's single connection cannot feed reconciles at that
+  rate — a coincidental bound with a narrower margin than it looks. **The fix is
+  a head index** slid forward on eviction, compacting only when it passes half
+  the slice; same semantics, no API change.
+
+  **Memory is reclaimed only inside `Admit`.** A kind that dispatches ten thousand
+  objects and then goes quiet holds their records until its next admission, which
+  may never come. It cannot grow past one interval's admissions, so this is
+  retention rather than a leak, but nothing returns it. `OpensAt` could evict
+  opportunistically without breaking its documented "records nothing" contract —
+  evicting is not recording.
+
+  **Each entry carries a `time.Time` twice**, in the map value and the queue
+  entry: 24 bytes each, and the `loc` pointer is the only part of this package
+  the GC has to trace. An internal monotonic int64 would halve it. Micro, and
+  last.
+
+  Deferred because nothing here is on a measured path. The one benchmark that
+  touches the package — `BenchmarkWakerScanRateUnderSustainedWrites` — drives the
+  waker's gates, which hold a single key each and so exercise none of this; the
+  ~40ns alloc-free `Admit` recorded during review was that same single-key case.
+  **The missing evidence is a benchmark of the work queue's gate at 1k and 10k
+  distinct keys per interval**, and it should come before the fix rather than
+  after it.
+
+  Related, and cheaper: the waker holds two single-key gates
+  (`scanGate`, `persistGate`) that each carry a map and an eviction queue for one
+  key. A `rategate.Single` — one instant, no map, `Allow(now)` — would drop both,
+  and a third single-key consumer would settle it. Note that none of this is an
+  argument for a token bucket: a per-key `rate.Limiter` map inherits the same key
+  space and usually ships no eviction at all.
+
+  Tripwire: none. `internal/rategate`'s tests pin semantics — hold, expiry,
+  re-admission, `Forget` — and say nothing about cost, so every change proposed
+  here would keep them green.
