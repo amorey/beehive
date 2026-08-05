@@ -624,35 +624,3 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   is whether events get a retention horizon of their own, since
   `WithEventRetention` already trims runs out from under a reader with no way to
   tell them.
-
-- **`rategate` holds three single-key gates that each carry a map** — the waker's
-  `scanGate` and `persistGate` (`waker.go`) and the object tail's `scanGate`
-  (`objectswatch.go`, one per watched kind) hold one key apiece, so each pays a
-  map and an eviction queue to track a single instant. A `rategate.Single` — one
-  instant, no map, `Allow(now)` — would drop all three, and the
-  `struct{}{}` sentinel each declares with it. **The third consumer has now
-  arrived**, which is the evidence the shape was waiting on; the cost is still a
-  fixed handful of bytes per beehive rather than anything that scales.
-
-  Note that none of this is an argument for a token bucket: a per-key
-  `rate.Limiter` map inherits the same key space and usually ships no eviction at
-  all.
-
-  The rest of this item is done. `evict` slides a head index and compacts only
-  when it passes half the slice, so an eviction round is amortised O(1) instead
-  of copying the live tail per `Admit`, and clears the slots the move vacates so
-  a pointer-bearing `K` is not held live by the backing array; `OpensAt` evicts
-  too (evicting is not
-  recording), so a caller that reads and stops admitting still reclaims; instants
-  are an int64 offset from a `base` anchored on first use, which halves an entry
-  and leaves the package with no pointer for the GC to trace — `time.Time.Sub`
-  saturates at ±292 years rather than reporting that it could not answer, so a
-  stamp that saturates re-anchors and the interval arithmetic saturates too,
-  every wrap in that range failing a floor *open*; a queue that drains
-  past `shrinkAt` hands its arrays back, since neither a map nor a slice shrinks
-  on its own. `rategate_bench_test.go` is the evidence that was missing —
-  `BenchmarkGateAdmitDistinctKeys` at 1/1k/10k distinct keys per interval went
-  56/675/8743ns to 52/69/87ns, and building a 10k live set allocates 1.28MB
-  where it allocated 2.78MB. Steady-state `Admit` is alloc-free at every
-  cardinality. Peak queue capacity is now ~2x the live set rather than exactly
-  it, which the halved entry more than pays for.
