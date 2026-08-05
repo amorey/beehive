@@ -199,8 +199,8 @@ type RawObject struct {
 	ResourceVersion     int64      `json:"resourceVersion"`
 	DeletionRequestedAt *time.Time `json:"deletionRequestedAt,omitempty"`
 	// ReconcileOwed is the objects.reconcile_owed count; 0 means none. Store-
-	// owned: moved only by EdgesAdd's stamp, ReconcileOwedStamp and
-	// ReconcileOwedDecrement.
+	// owned: moved only by EdgesAdd's stamp, ReconcileOwedStamp,
+	// ReconcileOwedDecrement and ReconcileOwedClear.
 	ReconcileOwed int64       `json:"reconcileOwed"`
 	Finalizers    []string    `json:"finalizers"`
 	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none

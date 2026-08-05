@@ -1,8 +1,8 @@
 # Reclaim a client-only dependent's `reconcile_owed` count
 
-- **Status:** Approved, not implemented. Supersedes the deferral recorded in the
-  "client-only dependent's `reconcile_owed` count is never reclaimed" entry in
-  [`../TODO.md`](../TODO.md), which is deleted when this lands.
+- **Status:** Implemented. The rationale now lives in
+  [the ADR](../adr/2026-08-05-reclaim-a-client-only-owed-count.md); this spec is
+  kept as the record of how the design was reached.
 - **Date:** 2026-08-05
 
 ## Problem

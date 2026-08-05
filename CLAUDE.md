@@ -234,9 +234,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   sweeper covers client-only kinds. Both are idempotent. A delete request, a
   cascade and a physical delete each enqueue at commit for a registered kind, so a
   cascade advances a level per commit and unwinds a level per commit; a client-only
-  level still costs a sweep.
+  level still costs a sweep. **The sweeper also reclaims `reconcile_owed` for
+  kinds with no reconcile loop**, which nothing else drains — safe because the
+  count is redundant with the dependency watermark `EdgesAdd` clears, so a
+  cursor-0 sweep in a later process re-derives it. The clear is no-emit.
   → [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
-  [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md)
+  [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
+  [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration
   is). The sweeper drains the freelist through `FreePagesReleaser`, gated on a
