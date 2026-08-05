@@ -23,23 +23,19 @@ import (
 
 	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/rategate"
-	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/gobus/watch"
 )
 
 // This file is the event watch: one reader per watch, over its own cursor into
-// one object's log. An EventsAdd commit wakes it, and the floor tick covers a
-// write this process did not publish. Nothing is shared, so none of the object
-// tail's lease machinery appears here — the read is already per object and
-// already indexed.
+// one object's log, woken by the write's own commit.
+// See docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md.
 
-// eventPageCap caps one read of the log: one object's runs, against the object
-// tail's 512 write-log entries.
-const eventPageCap = 256
-
-// eventPagesPerDrain bounds one drain, so a resume after a long gap cannot
-// monopolise the single connection. The rest is read by the next drain.
-const eventPagesPerDrain = 2
+const (
+	eventPageCap = 256
+	// eventPagesPerDrain bounds one drain, so a resume after a long gap cannot
+	// monopolise the single connection. The rest is read by the next drain.
+	eventPagesPerDrain = 2
+)
 
 // EventStream is a live view of one object's event log: the runs matching the
 // query as of the subscribe, the position they were read at, and what the log
@@ -71,24 +67,12 @@ func (s *EventStream) fail(err error) { s.failed.Store(&err) }
 
 // eventWriteHub tells an object's event readers that its log moved. Keyed by id,
 // not by kind: the read is per object, so a kind-wide signal would wake every
-// event reader of that kind on every write. The signal carries no value — a
-// reader reads its position from the store — so a burst collapses into one
-// pending slot, as kindWriteHub's does.
+// event reader of that kind on every write.
 type eventWriteHub struct {
-	watchHub[ObjectID, struct{}]
+	signalHub[ObjectID]
 }
 
-func newEventWriteHub() eventWriteHub {
-	return eventWriteHub{watchHub[ObjectID, struct{}]{hub: watch.New[ObjectID, struct{}]()}}
-}
-
-func (h eventWriteHub) Send(id ObjectID) error { return h.send(id, struct{}{}) }
-
-// Watch registers a receiver for id. Registration is the baseline and the bus
-// never delivers it back, so a receiver reads only writes that follow it.
-func (h eventWriteHub) Watch(id ObjectID) (*watch.Receiver[ObjectID, struct{}], bool) {
-	return h.watch(id, struct{}{})
-}
+func newEventWriteHub() eventWriteHub { return eventWriteHub{newSignalHub[ObjectID]()} }
 
 // EventsWatch streams id's event log. See the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error) {
@@ -147,7 +131,7 @@ type eventReader struct {
 // start makes the reads a caller learns about synchronously: the kind check, and
 // then either the snapshot or the resume's own first look at the log.
 func (r *eventReader) start(ctx context.Context) error {
-	if _, err := r.checkKind(ctx); err != nil {
+	if err := r.checkKind(ctx); err != nil {
 		return err
 	}
 	if r.cfg.resumeFrom == nil {
@@ -168,23 +152,24 @@ func (r *eventReader) start(ctx context.Context) error {
 	return nil
 }
 
-// checkKind scopes the read to this client's kind, as the object watches do. An
-// id that holds no object yet is ordinary for a watch opened ahead of the thing
-// it is about, and reports notYet; another kind's id is ErrNotFound for good,
-// since an id belongs to one kind for life.
-func (r *eventReader) checkKind(ctx context.Context) (notYet bool, err error) {
+// checkKind scopes the read to this client's kind, as the object watches do, and
+// sets resolved when it answers. An id that holds no object yet leaves it unset
+// rather than failing — ordinary for a watch opened ahead of the thing it is
+// about — where another kind's id is ErrNotFound for good, an id belonging to
+// one kind for life.
+func (r *eventReader) checkKind(ctx context.Context) error {
 	raw, err := r.bh.store.ObjectsGetMeta(ctx, r.id)
 	if errors.Is(err, ErrNotFound) {
-		return true, nil
+		return nil
 	}
 	if err != nil {
-		return false, err
+		return err
 	}
 	if raw.Group != r.gk.Group || raw.Kind != r.gk.Kind {
-		return false, fmt.Errorf("%w: %d belongs to another kind", ErrNotFound, r.id)
+		return fmt.Errorf("%w: %d belongs to another kind", ErrNotFound, r.id)
 	}
 	r.resolved = true
-	return false, nil
+	return nil
 }
 
 // checkResume refuses a position the log cannot serve: below the horizon it has
@@ -192,7 +177,9 @@ func (r *eventReader) checkKind(ctx context.Context) (notYet bool, err error) {
 // unreported, the second holds the cursor above every later run and drops them
 // all silently.
 func (r *eventReader) checkResume(ctx context.Context, at int64) error {
-	runs, trimmed, err := r.bh.store.EventsListSince(ctx, r.id, r.cfg.query.Category, at, eventPageCap)
+	// One row: this asks whether anything is above the position, and run reads
+	// the page itself.
+	runs, trimmed, err := r.bh.store.EventsListSince(ctx, r.id, r.cfg.query.Category, at, 1)
 	if err != nil {
 		return err
 	}
@@ -209,52 +196,21 @@ func (r *eventReader) checkResume(ctx context.Context, at int64) error {
 	if err != nil {
 		return err
 	}
-	if head = max(head, trimmed); at > head {
-		return fmt.Errorf("%w: object %d resumed at %d, past its log's %d",
-			ErrWatchTooNew, r.id, at, head)
-	}
-	return nil
+	return tooNewErr(fmt.Sprintf("object %d", r.id), at, max(head, trimmed))
 }
 
 // run tails the log until the caller lets go. A commit wakes it; the floor tick
 // covers what a wake cannot.
 func (r *eventReader) run(ctx context.Context) {
+	// LIFO: the receiver leaves the hub, then the caller sees the stream end.
 	defer close(r.out)
 	defer r.written.Close()
 
-	timer := time.NewTimer(r.floor)
-	defer timer.Stop()
-
-	// backingOff drops commit wakes until the retry timer fires, for the reason
-	// objectTailer.run records: a wake carries no information, and honouring one
-	// would let a live writer keep a degraded store re-reading as fast as it can
-	// fail.
-	backingOff := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-r.written.Chan():
-			if !ok {
-				// Only Stop closes the hub — the caller letting go comes through ctx
-				// above — so this is shutdown, and saying so is what keeps a closed
-				// stream distinguishable from a cancelled one.
-				r.stream.fail(ErrStopped)
-				return
-			}
-			if backingOff {
-				continue
-			}
-		case <-timer.C:
-		}
-
-		next, stillBackingOff, done := r.pass(ctx, r.now(), backingOff)
-		if done {
-			return
-		}
-		backingOff = stillBackingOff
-		driver.Rearm(timer, next)
-	}
+	runWatchLoop(ctx, r.written.Chan(), r.floor,
+		func() { r.stream.fail(ErrStopped) },
+		func(backingOff bool) (time.Duration, bool, bool) {
+			return r.pass(ctx, r.now(), backingOff)
+		})
 }
 
 // pass is one turn of the loop: drain, then report how long to wait, whether to
@@ -272,8 +228,6 @@ func (r *eventReader) pass(ctx context.Context, now time.Time, backingOff bool) 
 	case ctx.Err() != nil:
 		return 0, false, true // the caller let go mid-read or mid-send
 	case isTerminalWatchErr(err):
-		// Something no later read can take back: retention passed the cursor, or
-		// the object was collected and its log went with it.
 		r.stream.fail(err)
 		return 0, false, true
 	default:
@@ -285,8 +239,7 @@ func (r *eventReader) pass(ctx context.Context, now time.Time, backingOff bool) 
 	if !more {
 		return r.floor, false, false
 	}
-	// Minus the drain that just ran, since the gate opened before it: re-arming
-	// for a whole interval would pace a backlog end-to-start.
+	// Minus the drain that just ran, since the gate opened before it.
 	return max(0, r.gate.Interval()-r.now().Sub(now)), false, false
 }
 
@@ -301,8 +254,7 @@ func isTerminalWatchErr(err error) bool {
 // bool reports whether the budget stopped it with work still above the cursor.
 func (r *eventReader) drain(ctx context.Context) (more bool, err error) {
 	if !r.resolved {
-		notYet, err := r.checkKind(ctx)
-		if err != nil || notYet {
+		if err := r.checkKind(ctx); err != nil || !r.resolved {
 			return false, err
 		}
 	}
@@ -329,7 +281,7 @@ func (r *eventReader) step(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	for _, raw := range page {
-		if !matchesEventQuery(r.cfg.query, raw) {
+		if !r.cfg.query.Matches(raw) {
 			continue
 		}
 		if !sendOrDone(ctx, r.out, eventFromRaw(raw)) {
@@ -342,21 +294,4 @@ func (r *eventReader) step(ctx context.Context) (int, error) {
 		r.cursor = page[len(page)-1].ResourceVersion
 	}
 	return len(page), nil
-}
-
-// matchesEventQuery applies the caller's filters to a run the page carried. The
-// page itself is unfiltered, so the cursor advances by what the log did rather
-// than by what this watch asked for.
-func matchesEventQuery(q storeapi.EventQuery, e RawEvent) bool {
-	switch {
-	case q.Category != nil && e.Category != *q.Category:
-		return false
-	case q.Type != "" && e.Type != q.Type:
-		return false
-	case q.Reason != "" && e.Reason != q.Reason:
-		return false
-	case !q.Since.IsZero() && e.LastAt.Before(q.Since):
-		return false
-	}
-	return true
 }

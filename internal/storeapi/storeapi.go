@@ -153,6 +153,27 @@ type EventQuery struct {
 	Limit    int       // 0 = no limit; else the newest N runs
 }
 
+// Matches reports whether e satisfies q's filters. The event watch reads an
+// unfiltered page — so its cursor advances by what the log did, not by what the
+// caller asked for — and applies this to what it delivers. Limit is not a
+// predicate and is not applied here.
+//
+// Since compares in milliseconds because that is the column's resolution, and a
+// store filtering in SQL truncates the bound the same way.
+func (q EventQuery) Matches(e Event) bool {
+	switch {
+	case q.Category != nil && e.Category != *q.Category:
+		return false
+	case q.Type != "" && e.Type != q.Type:
+		return false
+	case q.Reason != "" && e.Reason != q.Reason:
+		return false
+	case !q.Since.IsZero() && e.LastAt.UnixMilli() < q.Since.UnixMilli():
+		return false
+	}
+	return true
+}
+
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON; the store never inspects them.
 // The json tags are a durable format, not decoration: a delete entry in the

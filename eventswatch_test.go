@@ -447,3 +447,30 @@ func TestEventsWatchLeavesNothingBehind(t *testing.T) {
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Unheard"}))
 	assert.NoError(t, bh.eventWriteHub.Send(obj.ID))
 }
+
+// The snapshot and the tail agree on a sub-millisecond Since. last_at holds
+// milliseconds, so both sides truncate the bound: comparing at full precision
+// on one side only would drop from the stream a run the snapshot delivered.
+func TestEventsWatchSinceAgreesAtSubMillisecond(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, _, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+
+	opened, err := client.EventsWatch(ctx, obj.ID)
+	require.NoError(t, err)
+	require.Len(t, opened.Runs, 1)
+	// Inside the run's own millisecond, above it by less than the column holds.
+	since := opened.Runs[0].LastAt.Add(500 * time.Microsecond)
+
+	filtered, err := client.EventsWatch(ctx, obj.ID, WithEventsSince(since))
+	require.NoError(t, err)
+	assert.Len(t, filtered.Runs, 1, "the snapshot's SQL truncates the bound")
+
+	// The same run down the tail, which a resume below it replays.
+	resumed, err := client.EventsWatch(ctx, obj.ID, WithEventsSince(since), WithEventsResumeFrom(0))
+	require.NoError(t, err)
+	assert.Equal(t, "Probing", recv(t, resumed.Events).Reason, "and the tail agrees with it")
+}
