@@ -35,10 +35,6 @@ import (
 
 var testGK = beehive.GroupKind{Group: "", Kind: "Greeting"}
 
-// otherTestGK is a second kind, for assertions that must not confuse the two
-// ends of a cross-kind edge.
-var otherTestGK = beehive.GroupKind{Group: "", Kind: "Other"}
-
 func newTestStore(t *testing.T) beehive.Store {
 	t.Helper()
 	store, err := OpenMemory()
@@ -3950,20 +3946,21 @@ func TestRefsAddNonexistentEndpoint(t *testing.T) {
 func TestRefsAddReportsEndpoints(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
+	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
 	a := newRefObject(t, store)
-	b := newKindObject(t, store, otherTestGK)
+	b := newKindObject(t, store, otherGK)
 
 	res, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
 	assert.Equal(t, testGK, res.From, "fromID's kind")
-	assert.Equal(t, otherTestGK, res.To, "toID's kind")
+	assert.Equal(t, otherGK, res.To, "toID's kind")
 	assert.False(t, res.ToDeleting, "a live target")
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "this call created the edge")
 
 	res, err = store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
 	assert.Equal(t, testGK, res.From, "re-declare reports it too")
-	assert.Equal(t, otherTestGK, res.To)
+	assert.Equal(t, otherGK, res.To)
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge already existed; the insert was a no-op")
 }
 
