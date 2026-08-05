@@ -38,7 +38,7 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly four push paths that cause a reconcile. All use
+There are exactly five push paths that cause a reconcile. All use
 `Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
@@ -48,14 +48,15 @@ can be read.
 | A new edge enqueues the edge's source | `ControllerClient.DependenciesAdd` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
+| A cleared finalizer enqueues its own object | `ControllerClient.FinalizersDelete` | the object whose block it lifted | the store reports `clearedLast` |
 
-Three of the four are immediate: their gate is a store write that lands once, so
+Four of the five are immediate: their gate is a store write that lands once, so
 they carry new information and cancel a pending alarm rather than being absorbed by
 one. The new edge is the exception, and it is throttled because a controller can
 declare the same edge on every pass, so it goes through `work.add` and respects the
 source's backoff ladder and re-enqueue floor.
 → [the floor ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
-Cases 1, 5, 9 and 10 describe them in full.
+Cases 1, 5, 9, 10 and 11 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
 own hook, and a client-only kind resolves to none. So a client-only object waits for
@@ -508,15 +509,27 @@ Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChil
 ### 11. A blocked collect retries by staying in the listing
 
 A collect is blocked when finalizers are still pending, or when `EdgesHasIncoming`
-reports a referrer under RESTRICT. Nothing signals the unblocking. An owner freed by
-its last child's removal, or by a `DependenciesDelete`, is simply still
-deletion-pending when the next sweep runs.
+reports a referrer under RESTRICT. Three routes lead out of one, and **only the
+finalizer pushes**: `ControllerClient.FinalizersDelete` enqueues the object at commit
+when it cleared the last finalizer from a deletion-pending row (`clearedLast`). The other two are edge writes — the last child's removal and a
+`DependenciesDelete` — which bump no `resource_version` and append no write-log
+entry, so no cursor in the system can see them and an owner they free is simply still
+deletion-pending when the next sweep runs. See
+[the ADR](adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md) and the edge
+entry in [`TODO.md`](TODO.md).
+
+The push is a probe, not a verdict: `gcCollect` re-checks the RESTRICT block, and the
+sweep remains the route after a crash.
 
 Every block is temporary by construction. The one block that was not is a finalizer
 on a client-only kind, which no `FinalizersDelete` can reach. That is now rejected at
 create time. Thus a sweep always has a route to progress.
 
-Tests: `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
+Tests: `TestFinalizersDeletePushesTheCollect`,
+`TestFinalizersDeletePushesNothingOtherwise`,
+`TestIntegrationClearedFinalizerCollectsWithoutASweep`,
+`TestIntegrationClearedFinalizerCollectsWithoutThePush`,
+`TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
 `TestIntegrationGCDeleteDependencyUnblocksTarget`,
 `TestClientCreateRejectsFinalizersOnUnregisteredKind`.
 

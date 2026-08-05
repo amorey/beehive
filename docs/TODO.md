@@ -29,9 +29,12 @@ here shrinks to a pointer.
   `EdgesAdd` and `EdgesDelete` bump no `resource_version` and append no write-log
   entry, because a ref is not a field of the object. So no log cursor can see a
   new edge, a dropped one, or the `dependency_watermarks` clear that rides a new
-  one. One place pays for it: a deletion unblocked by `DependenciesDelete` waits
-  for the next GC tick with nothing able to signal it (case 11 in
-  [`reconcile-triggers.md`](reconcile-triggers.md)).
+  one. Two places pay for it, both in case 11 of
+  [`reconcile-triggers.md`](reconcile-triggers.md): a deletion unblocked by
+  `DependenciesDelete`, and one unblocked by its last child's removal. Both wait for
+  the next GC tick with nothing able to signal them. The third route out of a blocked
+  collect — the cleared finalizer — now pushes, which removes the most common reason
+  anyone would notice these two.
 
   **The stale-dependents pass no longer pays.** Its scan is bounded by a cursor
   over target `resource_version`, which an edge write also cannot move — but a
@@ -60,9 +63,10 @@ here shrinks to a pointer.
   watch noise, and the cascade needs no trigger, because a cascade that removes
   edges also collects an object and that already appends.
 
-  Deferred because the one consumer left is case 11, where the cost is a single GC
-  tick of latency on a deletion. Build the counter only when a second consumer
-  appears, or when that latency is measured to matter.
+  Deferred because the consumers left are the two edge-driven routes of case 11,
+  where the cost is a single GC tick of latency on a deletion. Build the counter only
+  when a consumer outside that case appears, or when the latency is measured to
+  matter.
 
 - **A dependency cycle of length ≥ 2 never converges** — rate-limited, not fixed.
   The self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`. Two

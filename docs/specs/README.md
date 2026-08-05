@@ -26,14 +26,15 @@ What the property does not supply is latency. A timer decides when work starts, 
 the interval is the floor, even when the writer and the controller are in one
 process and the store already knows the answer at commit time.
 
-Today four writes beat the timer, and one commit signal wakes a driver. A spec write enqueues its own object, a new
-`depends_on` edge enqueues the edge's source, a delete request enqueues its own
-object, and a cascade enqueues the children it marked. All run on
+Today five writes beat the timer, and one commit signal wakes a driver. A spec write
+enqueues its own object, a new `depends_on` edge enqueues the edge's source, a delete
+request enqueues its own object, a cascade enqueues the children it marked, and a
+cleared last finalizer enqueues the object it unblocked. All run on
 `Store.AfterCommit`. Every other route waits for a tick:
 
-| Route | Latency today | Spec |
+| Route | Latency today | Where |
 |---|---|---|
-| A blocked collect was unblocked | ≤30s | [04](04-finalizer-unblock-push.md) |
+| A blocked collect was unblocked by an edge write — the last child removed, or a dropped dependency | ≤30s | [`TODO.md`](../TODO.md), edge invisibility |
 
 The stale-dependents pass is absent from that table on purpose. It runs every 60
 seconds and it cannot be pushed. It answers "which dependents failed to observe a
@@ -87,11 +88,15 @@ waker tick per hop, so a chain of depth D settled in D seconds. It copied
 across every kind of the hub that already fed the tailers, and added the two rate
 limits that removing a tick's own pacing required.
 
-### 4. [Finalizer unblock push](04-finalizer-unblock-push.md)
+### 4. Finalizer unblock push — **shipped**
 
-The last GC interval on the deletion path. Smallest win, and the one with a half
-that stays deferred, because an edge write is invisible to every cursor in the
-system.
+→ [ADR](../adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
+
+The last GC interval on the deletion path a commit could close. The two edge-driven
+routes out of a blocked collect stay deferred, because an edge write is invisible to
+every cursor in the system.
+
+With it, `specs/` is empty. The next entry starts a new list.
 
 ## Out of scope
 
