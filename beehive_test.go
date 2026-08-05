@@ -181,6 +181,27 @@ func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
 	assert.Equal(t, control.ID, ev.Object.ID, "the reclaim must not reach the change stream")
 }
 
+// A Beehive with no controllers at all reclaims every count, which is the arm
+// that drops the NOT IN clause. The counts here are left by a prior process:
+// nothing in this one consumes them.
+func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	loose := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnlyDep"})
+	from := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "from"})
+	to := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "to"})
+	res, err := bh.store.EdgesAdd(ctx, from.ID, to.ID, RelationDependsOn)
+	require.NoError(t, err)
+	require.True(t, res.ReconcileOwedStamped, "the edge must owe a reconcile to begin with")
+
+	bh.reconcileOwedReclaimSweep(ctx)
+
+	raw, err := store.ObjectsGet(ctx, from.ID)
+	require.NoError(t, err)
+	assert.Zero(t, raw.ReconcileOwed, "no reconcile loop can drain it, so the sweep does")
+}
+
 // The GC sweeper's three steps run together on every tick, so a store that grows a
 // freelist through the first two gets it drained by the third without a cadence of
 // its own.
