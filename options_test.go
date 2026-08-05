@@ -40,23 +40,27 @@ func TestWithFullPassIntervalDispatch(t *testing.T) {
 // set is the zero query (every run for the object).
 func TestResolveEvents(t *testing.T) {
 	since := time.Now()
-	q := resolveEvents([]EventOption{
+	cfg := resolveEvents([]EventOption{
 		WithEventCategory("connection"),
 		WithEventType(EventWarning),
 		WithEventReason("ProbeFailed"),
 		WithEventLimit(5),
 		WithEventsSince(since),
+		WithEventsResumeFrom(42),
 	})
-	require.NotNil(t, q.Category)
-	assert.Equal(t, "connection", *q.Category)
-	assert.Equal(t, "Warning", q.Type)
-	assert.Equal(t, "ProbeFailed", q.Reason)
-	assert.Equal(t, 5, q.Limit)
-	assert.Equal(t, since, q.Since)
+	require.NotNil(t, cfg.query.Category)
+	assert.Equal(t, "connection", *cfg.query.Category)
+	assert.Equal(t, "Warning", cfg.query.Type)
+	assert.Equal(t, "ProbeFailed", cfg.query.Reason)
+	assert.Equal(t, 5, cfg.query.Limit)
+	assert.Equal(t, since, cfg.query.Since)
+	require.NotNil(t, cfg.resumeFrom)
+	assert.Equal(t, int64(42), *cfg.resumeFrom)
 
 	empty := resolveEvents(nil)
-	assert.Nil(t, empty.Category, "no category filter unless requested")
-	assert.Zero(t, empty.Limit)
+	assert.Nil(t, empty.query.Category, "no category filter unless requested")
+	assert.Zero(t, empty.query.Limit)
+	assert.Nil(t, empty.resumeFrom, "a snapshot unless a resume is asked for")
 }
 
 func TestWithEventRetentionDispatch(t *testing.T) {

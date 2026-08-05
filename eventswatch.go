@@ -46,7 +46,7 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}
-	q := resolveEvents(opts)
+	q := resolveEvents(opts).query
 	out := make(chan Event)
 	seen := make(map[EventID]int64)
 	// The log's high-water mark as of the last listing; an empty log reads 0

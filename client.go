@@ -895,7 +895,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 // EventsList reads id's runs and maps them to public Events. Reads by id, not
 // kind-scoped, like the ref lookups.
 func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts))
+	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts).query)
 	if err != nil {
 		return nil, err
 	}
@@ -932,8 +932,7 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	return out
 }
 
-// eventFromRaw maps a raw event row to the public Event, dropping the
-// store-only resource_version cursor.
+// eventFromRaw maps a raw event row to the public Event.
 func eventFromRaw(raw storeapi.Event) Event {
 	return Event{
 		ID:       raw.ID,
@@ -946,6 +945,8 @@ func eventFromRaw(raw storeapi.Event) Event {
 		Count:    raw.Count,
 		FirstAt:  raw.FirstAt,
 		LastAt:   raw.LastAt,
+
+		ResourceVersion: raw.ResourceVersion,
 	}
 }
 
