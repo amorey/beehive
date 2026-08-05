@@ -224,9 +224,12 @@ func drainRecv[E any, R interface{ TryRecv() (E, error) }](rx R) {
 // newTestBeehive is New with the test's own error handling. A watch tailer ends
 // with its last subscriber, so a test that watches owes no teardown here — the
 // watch's own context is what ends it.
+// The tail's throttle is off unless a test asks for it: it is far above
+// fastTick, so an enabled throttle would refuse the floor ticks the watch tests
+// deliver on. Prepended, so a test's own option still wins.
 func newTestBeehive(t *testing.T, store Store, opts ...Option) *Beehive {
 	t.Helper()
-	bh, err := New(store, opts...)
+	bh, err := New(store, append([]Option{withWatchScanMinInterval(0)}, opts...)...)
 	require.NoError(t, err)
 	return bh
 }
@@ -246,11 +249,11 @@ type fakeClock struct{ at time.Time }
 func (c *fakeClock) now() time.Time          { return c.at }
 func (c *fakeClock) advance(d time.Duration) { c.at = c.at.Add(d) }
 
-// fakeClockOn gives dw a fakeClock and returns it. Shared with the waker
-// benchmarks, which pace their passes the same way.
-func fakeClockOn(dw *waker) *fakeClock {
+// fakeClockOn points now at a fakeClock and returns it. Every driver that
+// paces itself takes its clock this way, so they share one epoch.
+func fakeClockOn(now *func() time.Time) *fakeClock {
 	clk := &fakeClock{at: time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)}
-	dw.now = clk.now
+	*now = clk.now
 	return clk
 }
 

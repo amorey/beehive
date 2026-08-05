@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -60,14 +61,20 @@ func BenchmarkWritesUnderWatch(b *testing.B) {
 		// is written a sixteenth as often but every kind holds a tailer.
 		{"16-kinds-one-watcher-each", 16, 1},
 	}
-	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			benchWritesUnderWatch(b, tc.kinds, tc.watchers)
+	// Both throttle settings in one run, so the writer-side effect of the floor
+	// is a comparison rather than a checkout of the parent commit.
+	for _, throttle := range []time.Duration{0, defaultWatchScanMinInterval} {
+		b.Run("throttle="+throttle.String(), func(b *testing.B) {
+			for _, tc := range cases {
+				b.Run(tc.name, func(b *testing.B) {
+					benchWritesUnderWatch(b, tc.kinds, tc.watchers, throttle)
+				})
+			}
 		})
 	}
 }
 
-func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int) {
+func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, throttle time.Duration) {
 	b.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -76,7 +83,7 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	bh, err := New(store)
+	bh, err := New(store, withWatchScanMinInterval(throttle))
 	require.NoError(b, err)
 
 	clients := make([]Client[cSpec, cStatus], kinds)
@@ -126,4 +133,75 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int) {
 
 	cancel()
 	watchers.Wait()
+}
+
+// BenchmarkTailerDrainRateUnderSustainedWrites measures what one wake-driven
+// drain costs. That is what the throttle and the page budget are set against:
+// the throttle bounds drains per second, and a drain's cost times that rate is
+// the share of the single connection the tailer holds away from the writers
+// generating the wakes.
+//
+// The duty cycle a pair (budget, interval) buys is drain/(drain+interval), so
+// the budget is picked as the largest whose full-budget drain leaves that under
+// the target. The backlogs are the three shapes a wake finds: quiet is the
+// common one — a scalar read and no listing — and full-budget is a resume,
+// where the drain stops at the budget and the loop re-arms at the throttle.
+func BenchmarkTailerDrainRateUnderSustainedWrites(b *testing.B) {
+	ctx := context.Background()
+	for _, budget := range []int{1, 2, 4, 8} {
+		b.Run("budget="+strconv.Itoa(budget), func(b *testing.B) {
+			for _, backlog := range []struct {
+				name string
+				rows int
+			}{
+				{"quiet", 0},
+				{"one-page", tailPageCap},
+				{"full-budget", budget * tailPageCap},
+			} {
+				b.Run(backlog.name, func(b *testing.B) {
+					store, err := sqlite.Open(filepath.Join(b.TempDir(), "bench.db"))
+					require.NoError(b, err)
+					defer store.Close()
+
+					bh, err := New(store, withWatchScanMinInterval(0))
+					require.NoError(b, err)
+					tailer, err := newObjectTailer(ctx, bh, clientTestGK)
+					require.NoError(b, err)
+					defer tailer.close()
+					tailer.pagesPerDrain = budget
+
+					rx := tailer.hub.Receiver()
+					defer rx.Close()
+					go func() {
+						for {
+							if _, err := rx.RecvContext(ctx); err != nil {
+								return
+							}
+						}
+					}()
+
+					spec, err := json.Marshal(cSpec{})
+					require.NoError(b, err)
+					for i := range backlog.rows {
+						_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+							Name: "backlog-" + strconv.Itoa(i),
+							Spec: spec,
+						})
+						require.NoError(b, err)
+					}
+					resume := tailer.cursor
+
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						// Timed: one int64 store is far below the noise, and
+						// StopTimer/StartTimer would cost two stop-the-worlds a drain.
+						tailer.cursor = resume
+						if _, err := tailer.drain(ctx); err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		})
+	}
 }

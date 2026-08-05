@@ -64,6 +64,9 @@ const (
 	// The watch tail reads on a commit wake, so this floor is not the latency
 	// of a local write — it bounds staleness for what a wake cannot cover.
 	defaultWatchFloorInterval = 30 * time.Second
+	// Floors the gap between two wake-driven drains, so a write stream cannot
+	// make its kind's tailer hold the single connection back from the writers.
+	defaultWatchScanMinInterval = 100 * time.Millisecond
 	// The first retry after a failed tail step; it doubles up to the floor.
 	watchRetryBase = 100 * time.Millisecond
 )
@@ -95,6 +98,7 @@ type Beehive struct {
 	staleDependentsInterval time.Duration
 	watchPollInterval       time.Duration
 	watchFloorInterval      time.Duration
+	watchScanMinInterval    time.Duration
 	concurrency             int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper. Zero on both
 	// disables the sweep.
@@ -362,6 +366,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		minRequeueInterval:      defaultMinRequeueInterval,
 		watchPollInterval:       defaultWatchPollInterval,
 		watchFloorInterval:      defaultWatchFloorInterval,
+		watchScanMinInterval:    defaultWatchScanMinInterval,
 		staleDependentsInterval: defaultStaleDependentsInterval,
 		reconcilers:             make(map[GroupKind]*reconciler),
 		migrators:               make(map[GroupKind]Migrator),

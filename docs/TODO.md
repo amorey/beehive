@@ -644,48 +644,14 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   `WithEventRetention` already trims runs out from under a reader with no way to
   tell them.
 
-- **The object watch tail has no minimum interval between wake-driven drains** —
-  known, not fixed, and a duty-cycle question rather than a query-count one.
-  `objectTailer.run` re-arms its floor timer after every drain, but nothing bounds
-  how soon the *next* drain may start: a commit landing during a drain refills the
-  wake slot, so the loop goes straight around. Under a sustained write load to a
-  watched kind the tailer therefore reads as fast as the store can answer, and every
-  one of those reads holds the single connection that writers need.
-
-  **It is not spinning on nothing.** `drain`'s position read is the quiet-wake gate —
-  a wake with nothing behind it costs one scalar query and no listing — and page
-  batching means a burst of 256 writes is read by one drain rather than 256. So the
-  cost per write *falls* as the rate rises. What does not fall is the fraction of
-  time the tailer is running, and that is the part that competes with writers.
-
-  **The fix is a floor between wake-driven drains** — eager on the first wake after
-  a quiet period, so an idle-to-write transition keeps its zero added latency, then
-  rate-limited while writes continue. That trades a bounded delay for connection
-  headroom exactly where per-write latency is already dominated by queueing.
-
-  **The shared limit now exists and the tailer has not adopted it.** The dependency
-  waker took `rategate.Allow` for exactly this, floored at
-  `wakeScanMinInterval` — see
-  [the ADR](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md). It went there
-  first because that loop runs unconditionally for the life of the process, where
-  the tailer is demand-scoped: it runs only while something watches, and a caller
-  that opened a watch has asked for the latency. Adopting it here is a gate, a
-  constant and the `Allow`/`Rearm` pair the waker's loop already uses. Revisit if a
-  watched kind under heavy write load is measured to slow its own writers.
-
-  Tripwire: none pins the current cadence. `TestTailerDeliversOnWake` asserts that a
-  wake delivers, not how soon, and `TestTailerDrainsBurstAbovePageCap` and
-  `TestWatchLoadsAreBatchedPerDrain` assert what a drain *reads*, not how soon the
-  next one may start. A throttle under the tests' failsafe timeouts would trip none
-  of them — which is itself worth knowing before adding one.
-
-- **`rategate` holds two single-key gates that each carry a map** — the waker's
-  `scanGate` and `persistGate` (`waker.go`) hold one key apiece, so each pays a
+- **`rategate` holds three single-key gates that each carry a map** — the waker's
+  `scanGate` and `persistGate` (`waker.go`) and the object tail's `scanGate`
+  (`objectswatch.go`, one per watched kind) hold one key apiece, so each pays a
   map and an eviction queue to track a single instant. A `rategate.Single` — one
-  instant, no map, `Allow(now)` — would drop both. Left alone until a third
-  single-key consumer settles the shape; two is thin evidence for a second type,
-  and the cost is a fixed handful of bytes per beehive rather than anything that
-  scales.
+  instant, no map, `Allow(now)` — would drop all three, and the
+  `struct{}{}` sentinel each declares with it. **The third consumer has now
+  arrived**, which is the evidence the shape was waiting on; the cost is still a
+  fixed handful of bytes per beehive rather than anything that scales.
 
   Note that none of this is an argument for a token bucket: a per-key
   `rate.Limiter` map inherits the same key space and usually ships no eviction at

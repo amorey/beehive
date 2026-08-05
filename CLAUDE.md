@@ -152,9 +152,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   the same lock the registry moves under, which is what closes the teardown
   race. Presence in the registry is not health: a tailer that reset stays there
   until its subscribers release, so `tailerFor` checks both or a resubscribe
-  rejoins the tailer that just failed. `EventsWatch` still polls and diffs,
-  gated on `EventsMaxVersion`.
-  → [ADR](docs/adr/2026-08-03-watch-shared-tail.md)
+  rejoins the tailer that just failed. **Every drain start is floored**
+  (`internal/rategate`, 100ms) — a floor tick takes the slot the same as a wake,
+  so a commit landing just after one waits out the rest of the window — and one
+  drain is bounded by a page budget, so a write stream cannot make a tailer hold
+  the single connection away from the writers waking it; the first drain after a
+  quiet period is still eager.
+  `EventsWatch` still polls and diffs, gated on `EventsMaxVersion`.
+  → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
+  [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on

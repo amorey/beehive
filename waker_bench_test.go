@@ -136,7 +136,7 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 		b.Run(backlog.name, func(b *testing.B) {
 			store := benchWakeLog(b, backlog.rows)
 			dw, _ := wakerOver(store, clientTestGK)
-			clk := fakeClockOn(dw)
+			clk := fakeClockOn(&dw.now)
 			require.NotEqual(b, scanFailed, dw.seed(ctx))
 			resume := dw.watermark - int64(backlog.rows)
 

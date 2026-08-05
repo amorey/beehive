@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/driver"
+	"github.com/amorey/beehive/internal/rategate"
 	"github.com/amorey/gobus/conflate"
 	"github.com/amorey/gobus/watch"
 )
@@ -256,6 +257,19 @@ var errNoRowImage = errors.New("beehive: delete log entry carries no row image")
 // beyond a full page is read by the next step, not deferred.
 const tailPageCap = 512
 
+// tailGateKey is the scan gate's only key: the gate is per tailer.
+var tailGateKey = struct{}{}
+
+// defaultTailPagesPerDrain bounds one drain, so a resume after a long gap
+// cannot monopolise the single connection. The remainder is read by the next
+// drain, which the throttle paces.
+//
+// Two, not the waker's four: a tail page is 512 rows against 256, and costs a
+// batched object read and a fan-out on top of the listing.
+// BenchmarkTailerDrainRateUnderSustainedWrites measures ~3.6ms a page, so two
+// pages behind a 100ms floor holds the connection under 7% of the time.
+const defaultTailPagesPerDrain = 2
+
 // changeType maps a log op to what a subscriber is told. A soft delete is a
 // WriteUpdate, so a finalizing object reports Modified; Deleted means the row
 // is gone. Coalescing promotes Modified to Added when the run began with a
@@ -300,6 +314,15 @@ type objectTailer struct {
 	refs int
 	// cursor is only touched by run.
 	cursor int64
+	// floor, retry and scanGate are only touched by run and the pass it calls,
+	// which is the single goroutine rategate requires.
+	floor    time.Duration
+	retry    driver.Backoff
+	scanGate *rategate.Gate[struct{}]
+	// now is replaced only before run starts; run's goroutine reads it.
+	now func() time.Time
+	// pagesPerDrain bounds one drain; a field so a benchmark can sweep it.
+	pagesPerDrain int
 	// failed records why the fan-out closed, for subscribers to report. Written
 	// before the sender closes, read after.
 	failed atomic.Pointer[error]
@@ -319,6 +342,12 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 		gk:         gk,
 		hub:        conflate.New[ObjectID](mergeRawChange),
 		kindWrites: written,
+		floor:      bh.watchFloor(),
+		retry:      bh.watchBackoff(),
+		scanGate:   rategate.New[struct{}](bh.watchScanMinInterval),
+		now:        time.Now,
+
+		pagesPerDrain: defaultTailPagesPerDrain,
 	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)
@@ -386,11 +415,9 @@ func (t *objectTailer) run() {
 
 	ctx := t.ctx
 	written := t.kindWrites.Chan()
-	floor := t.bh.watchFloor()
-	timer := time.NewTimer(floor)
+	timer := time.NewTimer(t.floor)
 	defer timer.Stop()
 
-	retry := t.bh.watchBackoff()
 	// backingOff drops commit wakes until the retry timer fires. A wake carries
 	// no information — the drain reads its position from the store — so dropping
 	// one loses nothing, and the timer reads the log either way. Honouring one
@@ -419,58 +446,88 @@ func (t *objectTailer) run() {
 		case <-timer.C:
 		}
 
-		next := floor
-		if err := t.drain(ctx); err != nil {
-			// The cursor is shared, so a trimmed cursor ends every subscriber:
-			// skipping past the horizon would silently drop changes for all of
-			// them, and there is no single subscriber to hand the error to.
-			// The next watch starts a fresh tailer.
-			if errors.Is(err, ErrWatchTooOld) {
-				t.bh.log().Warn("watch tail fell below the retention horizon; ending its subscribers",
-					"kind", t.gk.Kind, "err", err)
-				t.failed.Store(&err)
-				return
-			}
-			t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
-			next = retry.Next()
-			backingOff = true
-		} else {
-			retry.Reset()
-			backingOff = false
+		next, stillBackingOff, done := t.pass(ctx, t.now(), backingOff)
+		if done {
+			return
 		}
+		backingOff = stillBackingOff
 		driver.Rearm(timer, next)
 	}
 }
 
-// drain reads pages until one comes back short, so a burst that collapsed into
-// one wake is read in full. The page length is the stop test: it says exactly
-// when the log is drained, and a second position read would cost an extra
-// query for the same answer.
+// pass is one turn of the run loop: drain, then report how long to wait,
+// whether to drop the wakes arriving meanwhile, and whether the tailer is
+// finished. backingOff is the loop's current answer to the second, carried in
+// because a pass that does not drain has no new one. Split from run so the
+// cadence is testable without waiting on it.
+func (t *objectTailer) pass(ctx context.Context, now time.Time, backingOff bool) (next time.Duration, stillBackingOff, done bool) {
+	// A refused wake is remembered by the re-arm: the drain that runs then reads
+	// its position from the store. backingOff is carried rather than cleared, or
+	// a retry timer firing inside the window would clear it.
+	// See docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md.
+	if opensAt, held := t.scanGate.Allow(tailGateKey, now); held {
+		return opensAt.Sub(now), backingOff, false
+	}
+
+	more, err := t.drain(ctx)
+	if err != nil {
+		// The cursor is shared, so a trimmed cursor ends every subscriber:
+		// skipping past the horizon would silently drop changes for all of them,
+		// and there is no single subscriber to hand the error to. The next watch
+		// starts a fresh tailer.
+		if errors.Is(err, ErrWatchTooOld) {
+			t.bh.log().Warn("watch tail fell below the retention horizon; ending its subscribers",
+				"kind", t.gk.Kind, "err", err)
+			t.failed.Store(&err)
+			return 0, false, true
+		}
+		t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
+		return t.retry.Next(), true, false
+	}
+
+	t.retry.Reset()
+	if !more {
+		return t.floor, false, false
+	}
+	// Minus the drain that just ran, since the gate opened before it: re-arming
+	// for a whole interval would pace a resume end-to-start.
+	return max(0, t.scanGate.Interval()-t.now().Sub(now)), false, false
+}
+
+// drain reads pages until one comes back short or the budget is spent, so a
+// burst that collapsed into one wake is read in full but a backlog is not. The
+// page length is the stop test: it says exactly when the log is drained, and a
+// second position read would cost an extra query for the same answer.
 //
 // The position check is that read, and it runs once here rather than once per
 // page. It is the quiet-wake gate — a wake with nothing behind it costs one
 // scalar query and no listing — but a full page is already proof there is more,
 // so paying it per page would buy an answer the page length just gave, on the
 // store's single connection.
-func (t *objectTailer) drain(ctx context.Context) error {
+// The bool reports whether the budget stopped it with work still above the
+// cursor.
+func (t *objectTailer) drain(ctx context.Context) (more bool, err error) {
 	at, err := t.bh.store.ObjectWritesMaxVersion(ctx, t.gk)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// The position includes the retention horizon, so it only rises: test with
 	// >, and an unmoved position means nothing was written.
 	if at <= t.cursor {
-		return nil
+		return false, nil
 	}
-	for {
+	// max: a zero budget would read nothing and still report more, turning the
+	// loop forever without draining.
+	for range max(1, t.pagesPerDrain) {
 		n, err := t.step(ctx)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if n < tailPageCap {
-			return nil
+			return false, nil
 		}
 	}
+	return true, nil
 }
 
 // step reads one page of the kind's log above the cursor, publishes what it
