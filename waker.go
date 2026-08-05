@@ -43,6 +43,11 @@ type waker struct {
 	// now is the waker's only clock, so the rate tests drive it by hand.
 	now func() time.Time
 
+	// retry is the delay after a failed scan. The waker has no other reason to
+	// look again on its own, so a pass that fails without re-arming this would
+	// wedge until the next commit wake — which backingOff drops.
+	retry driver.Backoff
+
 	// persistGate floors the cursor write at the wake interval. Without it a
 	// wake-driven pass would write the cursor at the wake rate, on the one
 	// connection every commit needs.
@@ -89,6 +94,11 @@ const noStoredCursor = int64(-1)
 // as seconds only because persistGate floors a persist *attempt* at that
 // interval, which is why the gate is consulted before the skip ladder.
 const wakePersistRetryCap = 60
+
+// wakeRetryBase is the first delay after a failed scan; it doubles up to the
+// stale-dependents cadence, past which a retry only re-derives what that pass
+// has already found.
+const wakeRetryBase = 100 * time.Millisecond
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
 // trips on the store's single connection.
@@ -177,6 +187,7 @@ func newWaker(bh *Beehive) *waker {
 		bh:          bh,
 		cursors:     cursors,
 		now:         time.Now,
+		retry:       driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
 		scanGate:    rategate.New[struct{}](min(bh.wakeScanMinInterval, bh.wakeInterval)),
 		persistGate: rategate.New[struct{}](bh.wakeInterval),
 	}
@@ -199,13 +210,15 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 		// the wakes at the throttle's rate.
 		return opensAt.Sub(now), backingOff
 	}
-	switch dw.scan(ctx) {
-	case scanMore:
+	result := dw.scan(ctx)
+	if result == scanFailed {
+		return dw.retry.Next(), true
+	}
+	dw.retry.Reset()
+	if result == scanMore {
 		if throttle := dw.scanGate.Interval(); throttle > 0 {
 			return throttle, false // keep draining, at the throttle's rate
 		}
-	case scanFailed:
-		return floor, true
 	}
 	return floor, false
 }

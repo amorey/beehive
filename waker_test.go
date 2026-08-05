@@ -64,8 +64,9 @@ func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconcil
 	// limit switched off, which is not what production does.
 	bh := &Beehive{
 		store: store, reconcilers: rs, order: order,
-		wakeInterval:        defaultWakeInterval,
-		wakeScanMinInterval: defaultWakeScanMinInterval,
+		wakeInterval:            defaultWakeInterval,
+		wakeScanMinInterval:     defaultWakeScanMinInterval,
+		staleDependentsInterval: defaultStaleDependentsInterval,
 	}
 	bh.waker = newWaker(bh)
 	return bh.waker, rs
@@ -322,12 +323,38 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		assert.Equal(t, defaultWakeScanMinInterval, next, "a resume drains at the throttle's rate")
 	})
 
-	t.Run("a failed pass waits the floor and drops wakes", func(t *testing.T) {
-		dw, clk, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
+	t.Run("a failed pass climbs its own retry ladder and drops wakes", func(t *testing.T) {
+		store := &replayStore{rows: replayRows(3), err: errBoom}
+		dw, clk, _ := seededWaker(store, widget)
 
 		next, backingOff := dw.pass(ctx, clk.now(), false)
-		assert.Equal(t, defaultWakeInterval, next)
+		assert.Equal(t, wakeRetryBase, next, "the retry is the waker's only reason to look again")
 		assert.True(t, backingOff, "a live writer must not keep a degraded store re-reading as fast as it can fail")
+
+		clk.advance(defaultWakeScanMinInterval)
+		next, _ = dw.pass(ctx, clk.now(), true)
+		assert.Equal(t, 2*wakeRetryBase, next, "a second failure waits longer")
+
+		store.err = nil
+		clk.advance(defaultWakeScanMinInterval)
+		_, backingOff = dw.pass(ctx, clk.now(), true)
+		require.False(t, backingOff)
+		store.err = errBoom
+		clk.advance(defaultWakeScanMinInterval)
+		next, _ = dw.pass(ctx, clk.now(), false)
+		assert.Equal(t, wakeRetryBase, next, "a scan that worked resets the ladder")
+	})
+
+	t.Run("the retry ladder is capped by the backstop's cadence", func(t *testing.T) {
+		dw, clk, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
+
+		var last time.Duration
+		for range 20 {
+			last, _ = dw.pass(ctx, clk.now(), false)
+			clk.advance(defaultWakeScanMinInterval)
+		}
+		assert.Equal(t, defaultStaleDependentsInterval, last,
+			"past the stale-dependents pass a retry finds a subset of what the backstop already found")
 	})
 
 	t.Run("a throttled pass keeps a failure's backoff", func(t *testing.T) {
