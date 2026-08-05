@@ -75,6 +75,36 @@ func TestFinalizersDeletePushesTheCollect(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
 }
 
+// Every neighbour of that transition owes nothing. Pushing on a live object in
+// particular would collect-probe every finalizer removal in the system.
+func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
+	tests := []struct {
+		name       string
+		finalizers []string
+		deleting   bool
+		remove     string
+	}{
+		{"live object", []string{"f"}, false, "f"},
+		{"finalizers remain", []string{"f", "g"}, true, "f"},
+		{"absent finalizer", []string{"f"}, true, "missing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			client, cc, r := finalizerPushFixture(t)
+
+			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(tt.finalizers...))
+			if tt.deleting {
+				require.NoError(t, client.Delete(ctx, obj.ID))
+			}
+			drainQueue(r.work)
+
+			require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, tt.remove))
+			assert.Empty(t, queuedIDs(r.work))
+		})
+	}
+}
+
 // TestWriteStampsSchemaVersions verifies the lazy stamp-on-write half of the
 // migrator model: with a migrator registered, a spec write (Create) stamps the
 // migrator's current spec version and a controller status write stamps its
