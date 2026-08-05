@@ -27,37 +27,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// depDroppingController models a dependent that outlives its target: it depends
-// on targetID and, the moment that target starts finalizing, releases the edge
-// (DependenciesDelete) so the target can be collected. The dependent itself is
-// never deleted.
-type depDroppingController struct {
-	mu       sync.Mutex
-	reader   Client[cSpec, cStatus]
-	depID    ObjectID
-	targetID ObjectID
-}
-
-func (c *depDroppingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
-	c.mu.Lock()
-	reader, depID, targetID := c.reader, c.depID, c.targetID
-	c.mu.Unlock()
-	if obj.ID != depID {
-		return Result{}, nil // only the dependent acts
-	}
-	target, err := reader.Get(ctx, targetID)
-	if errors.Is(err, ErrNotFound) {
-		return Result{}, nil // target already gone
-	}
-	if err != nil {
-		return Result{}, err
-	}
-	if target.DeletionRequestedAt != nil {
-		return Result{}, cc.DependenciesDelete(ctx, depID, targetID)
-	}
-	return Result{}, nil
-}
-
 // finalizerClearingController clears finalizer (if it holds one) the moment an
 // object is finalizing, so GC can then remove the row. With no finalizer it is a
 // pure no-op reconciler — exactly what a cascade-only owner needs.
@@ -1015,15 +984,55 @@ func TestGCSweepLogsCollectFailure(t *testing.T) {
 	})
 }
 
-func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
+// depReleaseController models a dependent that outlives its target: it releases
+// the depends_on edge once the target is finalizing, on its own pass and never
+// on a wake of its own, so a test can order the release after a blocked collect.
+// It reports each pass over a finalizing target on passes.
+type depReleaseController struct {
+	mu       sync.Mutex
+	reader   Client[cSpec, cStatus]
+	depID    ObjectID
+	targetID ObjectID
+	passes   chan ObjectID
+}
+
+func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+	c.mu.Lock()
+	reader, depID, targetID := c.reader, c.depID, c.targetID
+	c.mu.Unlock()
+	if obj.ID == targetID && obj.DeletionRequestedAt != nil {
+		c.passes <- obj.ID
+	}
+	if obj.ID != depID {
+		return Result{}, nil
+	}
+	target, err := reader.Get(ctx, targetID)
+	if errors.Is(err, ErrNotFound) {
+		return Result{}, nil // already collected
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	if target.DeletionRequestedAt == nil {
+		return Result{}, nil
+	}
+	return Result{}, cc.DependenciesDelete(ctx, depID, targetID)
+}
+
+// With the sweeper stopped, the waker off and every periodic pass parked, the
+// drop's own push is the only thing left that can collect the target.
+func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withStaleDependentsInterval(time.Hour),
+		withDependencyWakerOff(),
+		withoutGCSweeper(),
+	)...)
 
-	// Full pass disabled: when the dependent releases its depends_on edge, that ref
-	// removal must wake the target directly — there's no backstop to re-check it.
-	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
-
-	ctrl := &depDroppingController{}
+	ctrl := &depReleaseController{passes: make(chan ObjectID, 8)}
 	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1049,14 +1058,63 @@ func TestIntegrationGCDeleteDependencyUnblocksTarget(t *testing.T) {
 	require.NoError(t, err)
 	defer stop(ctx)
 
-	// Deleting the target wakes the dependent (depends_on waker); the dependent
-	// drops the edge, which must then wake the target so GC removes it.
+	// The delete's own push reconciles the target, where the live edge blocks the
+	// collect. Waiting for that pass to go idle is what leaves the drop's push as
+	// the only thing that can collect: an in-flight pass would do it instead.
 	require.NoError(t, client.Delete(ctx, target.ID))
+	awaitPass(t, ctrl.passes, target.ID)
+	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
+
+	// Only now does the dependent release the edge.
+	require.NoError(t, client.Requeue(ctx, dep.ID))
 	waitForDeletions(t, w, target.ID)
 
 	// The dependent is untouched.
 	_, err = client.Get(ctx, dep.ID)
 	require.NoError(t, err)
+}
+
+// awaitPass blocks until a controller reports a pass over id.
+func awaitPass(t *testing.T, passes <-chan ObjectID, id ObjectID) {
+	t.Helper()
+	for {
+		select {
+		case got := <-passes:
+			if got == id {
+				return
+			}
+		case <-time.After(testTimeout):
+			t.Fatalf("timed out waiting for a reconcile of %d", id)
+		}
+	}
+}
+
+// The pull path under that push: dropping the edge through the store issues no
+// push, leaving the sweeper's tick as the only collector.
+func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, target.ID))
+	_, err = store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	waitForDeletions(t, w, target.ID)
 }
 
 // siblingFinalizerClearingController clears finalizer on targetID — never on the

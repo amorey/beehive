@@ -905,6 +905,18 @@ func runCommitRollback(t *testing.T, body func(t *testing.T, commit bool)) {
 // queuedIDs snapshots q's dispatchable items, for tests that assert on which
 // objects a write woke. Reading items directly (rather than draining) leaves the
 // queue untouched, so a test can check it repeatedly.
+// awaitQueueIdle blocks until id is neither queued nor in flight, so a following
+// step cannot be served by a pass that was already running.
+func awaitQueueIdle(t *testing.T, q *workQueue, id ObjectID) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		_, busy := q.processing[id]
+		return !busy && !slices.Contains(q.items, id)
+	}, testTimeout, time.Millisecond, "object %d never went idle", id)
+}
+
 func queuedIDs(q *workQueue) []ObjectID {
 	q.mu.Lock()
 	defer q.mu.Unlock()
