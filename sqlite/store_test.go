@@ -4221,6 +4221,94 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 	probe.expectNone()
 }
 
+// markDeleting stamps deletion_requested_at, which is what makes an object
+// collectable and what the EdgesDelete gates read on both endpoints.
+func markDeleting(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
+	t.Helper()
+	changed, err := store.DeletionRequestsCreate(context.Background(), testGK, id)
+	require.NoError(t, err)
+	require.True(t, changed)
+}
+
+func TestDeleteRefReportsTheUnblockedTarget(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dependent := newRefObject(t, store)
+	target := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, dependent.ID, target.ID, "depends_on"))
+	markDeleting(t, store, target.ID)
+
+	res, err := store.EdgesDelete(ctx, dependent.ID, target.ID, "depends_on")
+	require.NoError(t, err)
+	assert.True(t, res.Unblocked, "a live dependent's edge was RESTRICT-blocking the target's collect")
+	assert.Equal(t, testGK, res.To, "the push needs the target's kind; edges are cross-kind")
+}
+
+func TestDeleteRefReportsNothingForAMissingEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dependent := newRefObject(t, store)
+	target := newRefObject(t, store)
+	markDeleting(t, store, target.ID)
+
+	// Never declared, and declared-then-dropped: neither removes anything, so
+	// neither can have lifted a block.
+	res, err := store.EdgesDelete(ctx, dependent.ID, target.ID, "depends_on")
+	require.NoError(t, err)
+	assert.False(t, res.Unblocked)
+
+	require.NoError(t, addEdge(ctx, store, dependent.ID, target.ID, "depends_on"))
+	require.NoError(t, dropEdge(ctx, store, dependent.ID, target.ID, "depends_on"))
+	res, err = store.EdgesDelete(ctx, dependent.ID, target.ID, "depends_on")
+	require.NoError(t, err)
+	assert.False(t, res.Unblocked, "the second drop removed nothing")
+}
+
+func TestDeleteRefReportsNothingForALiveTarget(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dependent := newRefObject(t, store)
+	target := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, dependent.ID, target.ID, "depends_on"))
+
+	res, err := store.EdgesDelete(ctx, dependent.ID, target.ID, "depends_on")
+	require.NoError(t, err)
+	assert.False(t, res.Unblocked, "a live target has no collect to unblock")
+}
+
+func TestDeleteRefReportsNothingForADeletingSource(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	dependent := newRefObject(t, store)
+	target := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, dependent.ID, target.ID, "depends_on"))
+	markDeleting(t, store, target.ID)
+	markDeleting(t, store, dependent.ID)
+
+	res, err := store.EdgesDelete(ctx, dependent.ID, target.ID, "depends_on")
+	require.NoError(t, err)
+	assert.False(t, res.Unblocked,
+		"EdgesHasIncoming already discounts this edge, so dropping it unblocks nothing")
+}
+
+func TestDeleteRefJoinsTransaction(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	a := newRefObject(t, store)
+	b := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
+
+	sentinel := errors.New("rollback")
+	err := store.Within(ctx, func(ctx context.Context) error {
+		if err := dropEdge(ctx, store, a.ID, b.ID, "depends_on"); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	require.ErrorIs(t, err, sentinel)
+	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "the rollback restores the edge")
+}
+
 func TestRefsAddJoinsTransaction(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()

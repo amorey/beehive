@@ -2215,12 +2215,46 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 }
 
 // EdgesDelete removes a (from_id, to_id, relation) edge; an absent edge is a
-// silent no-op. Like EdgesAdd it bumps nothing and joins the ambient transaction.
+// silent no-op. Like EdgesAdd it bumps nothing and joins the ambient
+// transaction. Unblocked reports that the removal lifted a RESTRICT block: the
+// edge was there, the target is deletion-pending and the source is not — the
+// last condition because EdgesHasIncoming already discounts an edge from a
+// deletion-pending source.
 func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesDeleteResult, error) {
-	_, err := s.conn(ctx).ExecContext(ctx,
+	res, err := s.conn(ctx).ExecContext(ctx,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		fromID, toID, string(relation))
-	return storeapi.EdgesDeleteResult{}, err
+	if err != nil {
+		return storeapi.EdgesDeleteResult{}, err
+	}
+	// modernc caches the count and cannot fail here; a wrong count would
+	// silently skip the caller's push.
+	if n, _ := res.RowsAffected(); n == 0 {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	// Both endpoints in one row, as EdgesAdd does. Deliberately outside a
+	// transaction of its own: it would hold the single connection across a
+	// BEGIN..COMMIT on a path a controller walks every pass, and no interleaving
+	// gives a wrong answer here — a target collected in the gap has no collect
+	// left to push. See docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
+	var out storeapi.EdgesDeleteResult
+	var unblocked int
+	err = s.conn(ctx).QueryRowContext(ctx, `
+		SELECT t."group", t.kind,
+		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
+		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
+		toID, fromID).Scan(&out.To.Group, &out.To.Kind, &unblocked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	if err != nil {
+		return storeapi.EdgesDeleteResult{}, err
+	}
+	if unblocked == 0 {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	out.Unblocked = true
+	return out, nil
 }
 
 // EdgesListIncoming returns the objects pointing at toID through relation, joining edges
