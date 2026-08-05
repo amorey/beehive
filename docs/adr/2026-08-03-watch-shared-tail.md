@@ -85,13 +85,11 @@ either way. Revisit if the table test ever fails to catch a new verb.
 ### Why the tick stays, at 30s
 
 The [drivers ADR](2026-07-28-periodic-scan-drivers.md) says a poll may be
-removed only when its hub observes every writer. This tail does not qualify: a
-second process over the same file, or a second `Beehive` over one store, writes
-through its own hooks, and this process's watchers never hear about it.
-Dropping the tick would narrow a public API from "a watch observes writes to
-the store" to "a watch observes writes made through this `Beehive`". So the
-tick drops from 1s to a 30s floor (`withWatchFloorInterval`) instead of going
-away:
+removed only when its hub observes every writer. This tail does not qualify: the
+wake rides on a hook that a failed publish, a retention trim, or a read error
+can leave the watcher behind on, and the tick is what re-derives from the store
+rather than from a signal. So the tick drops from 1s to a 30s floor
+(`withWatchFloorInterval`) instead of going away:
 
 - Almost all of the query savings remain — one read of one number per kind per
   30s, against one per watch per second.

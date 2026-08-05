@@ -43,6 +43,14 @@ go test -run '^$' -bench . -benchtime 1x ./   # smoke: compiles and runs each on
 
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.
 
+- **One process, one `Beehive`, and it is the store's only writer.** Two
+  processes over one file, two `Beehive` values over one store, and any
+  out-of-band access to the database while a `Beehive` runs — an external tool,
+  or a `Store` call behind the running `Beehive`'s back — are all **unsupported**,
+  not degraded. Restarts are supported and are not what this excludes; the
+  constraint is on *concurrent* access. Documented, not enforced. Do not justify
+  a driver, a tick or a backstop by "a second process could write the store", and
+  do not accept a bug report whose repro needs one. → [ADR](docs/adr/2026-08-05-one-process-one-beehive-sole-writer.md)
 - **Nothing store-backed is pushed, and every driver over the store is a
   periodic scan except the waker** (`internal/driver`). Seven drivers: the owed
   pass (unsettled specs plus `reconcile_owed`, per-kind, 30s), the full pass
@@ -58,9 +66,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   floor tick stays. **The waker is the exception to the cadence, not to the
   record**: it still reads the write log, but only a commit makes it look, and
   what entitles it to that is the stale-dependents pass finding a superset of
-  what it finds. So a write this process did not publish — a second process, or
-  one issued straight to the `Store` — reaches its dependents in 60s rather than
-  on a tick. Both wakes are rate-limited (`internal/rategate`), and the waker's
+  what it finds. A write this beehive did not publish reaches its dependents on
+  no schedule this package promises — it is out of scope, not slow. Both wakes
+  are rate-limited (`internal/rategate`), and the waker's
   cursor write keeps a floor of its own so a faster loop is not a faster write.
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
@@ -290,14 +298,22 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
     write an ADR and leave one line: `// See docs/adr/<file>.`
   - Don't restate what the next line does, and don't argue that the code is
     correct — state the constraint and stop.
-- **Commits are terse conventional commits.** `type(scope): subject` —
+- **Commits are terse conventional commits, written for a human reader.**
+  `type(scope): subject` —
   `feat`/`fix`/`perf`/`refactor`/`test`/`docs`/`chore`, scope only when it adds
   information (`sqlite`, `edges`, `watch`), `!` for a breaking change. Subject
   is imperative, lower-case, no period, ≤72 chars, and says what the change
   does, not how (`feat(edges): enqueue an edge's source when the declaration
   commits`). No body unless the why isn't obvious from the diff — then 1–3
   plain sentences, no bullet lists; rationale longer than that is an ADR the
-  body links.
+  body links. Optimise for someone reading `git log`: the subject is the whole
+  message for most commits, so spend its budget on what changed, never on
+  restating the diff or padding the format.
+- **Pull requests follow
+  [`.github/pull_request_template.md`](.github/pull_request_template.md)**: keep
+  its sections (`Summary` for the why, `Key Changes` for the what, `Checklist`),
+  and lead the title with the template's emoji for the change type — 🎣 bug fix,
+  🐋 new feature, 📜 documentation, ✨ general improvement.
 - **Stubs are explicit**: `panic("not implemented: <name>")`; stub options
   return `nil` and are marked `(stub: not yet wired up)`.
 - **Design rationale goes in an ADR**, not here. See

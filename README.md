@@ -11,6 +11,20 @@
 
 Beehive is an embedded control plane for Go apps, backed by a durable store. With Beehive, you define desired state as objects and register controllers that reconcile actual state toward it. The system is self-healing which means it converges on restart, tolerates missed events, and handles cascading dependencies without controllers calling each other. The architecture is heavily influenced by Kubernetes and takes inspiration from the stigmergic cooperation of bees in a beehive.
 
+### Scope: one process, one `Beehive`, no out-of-band access
+
+Beehive is **embedded**, and that is a constraint as much as a description. A store is owned by **one process running one `Beehive`, which is its only writer.** Specifically, and none of these are supported:
+
+- **Two processes over one database file.** The work queue and its per-object dispatch floors, the schedule gauge, and every commit-time wake are in memory and private to one `Beehive`; the dependency waker's scan cursor is a single shared row that two wakers would consume out from under each other; `Register` is process-local, so each process knows only its own kinds.
+- **Two `Beehive` values over one store, even in the same process.** Same reason: what would have to be shared is per-`Beehive`, not per-process.
+- **Out-of-band access to the database while a `Beehive` is running.** Every write goes through that `Beehive`'s `Client`, `ControllerClient` or GC path. This rules out an external tool writing the file, and it rules out calling the `Store` directly behind the running `Beehive` — even though you opened that `Store` yourself to pass to `New`. Reading out of band is outside the contract too: invariants hold across the transactions beehive issues, so an outside reader can catch a row mid-cascade.
+
+**Restarts are supported and are not what this excludes.** Stopping a `Beehive` and starting another over the same store — a crash, a redeploy, a new binary — is the case the durable records exist for, and it converges. The constraint is on *concurrent* access, not on succession.
+
+This is documented, not enforced: beehive takes no lock and will not tell you that you have broken the rule. Behaviour under a violation is undefined — usually extra latency, since the pull passes are level-triggered and re-derive from current state, but nothing analyses the combination and nothing tests it.
+
+→ [ADR: one process, one Beehive, and it is the store's only writer](docs/adr/2026-08-05-one-process-one-beehive-sole-writer.md)
+
 ## Quickstart
 
 ```go
@@ -64,8 +78,8 @@ func main() {
   defer store.Close()
 
   bh, _ := beehive.New(store)
-  // Register returns the kind's ControllerClient for out-of-band status writes
-  // from your own goroutines (background work belongs to the app, not beehive);
+  // Register returns the kind's ControllerClient for status writes from outside
+  // a reconcile (background work belongs to the app, not beehive);
   // ignore it if Reconcile is your only writer.
   _, _ = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 
@@ -540,7 +554,7 @@ one, ch, err := client.Watch(ctx, id)
 
 **Subscribe, then act.** The snapshot is read *before either returns*, so a change you make after subscribing is always in the stream — delete an object on the next line and its `Deleted` will come. If that read fails you get the error rather than a stream, since a watch with no snapshot could not report that delete. The stream carries changes strictly above `snap.ResourceVersion`: no overlap with the snapshot, no gap between them. That is also what makes "have I caught up?" a value rather than a guess — you hold the starting state before you read the first change.
 
-Both **share one reader per kind.** However many watches a kind has, one tailer reads its write-log position, and only a position that moved costs anything more: the entries above the cursor, then one batched read of the objects they name. A commit wakes that tailer, and a 30s floor tick covers what a wake cannot — a second process writing to the same store, a failed read, a retention trim. That reader lives exactly as long as the kind has watches — the first one starts it, the last one to end takes it down — so cancelling a watch releases everything it held, on a `Beehive` you started or one you never did. Three things follow, and they are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
+Both **share one reader per kind.** However many watches a kind has, one tailer reads its write-log position, and only a position that moved costs anything more: the entries above the cursor, then one batched read of the objects they name. A commit wakes that tailer, and a 30s floor tick covers what a wake cannot — a failed read, a retention trim. That reader lives exactly as long as the kind has watches — the first one starts it, the last one to end takes it down — so cancelling a watch releases everything it held, on a `Beehive` you started or one you never did. Three things follow, and they are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
 - **Changes collapse together.** Several writes to one object produce one change carrying current state. An object created *and* updated before you read reports `Added`, since it was not in your snapshot — and an `Added` may repeat for an object your snapshot already held, so treat it as "here is this object" rather than "this object is new".
 - **Order holds per object, not across objects.** Each object's latest state arrives once, newest wins. Nothing is dropped: a delete always arrives, even for an object you never saw created.
@@ -707,7 +721,7 @@ func WithWriteLogRetention(perKind int, maxAge time.Duration) Option // write-lo
 
 `WithFinalizers` is the one create option that needs a kind **this process has registered a controller for**; otherwise the call fails with `ErrInvalidOption`. Only `ControllerClient.FinalizersDelete` can clear a finalizer, and it folds the calling controller's own kind into the write — so a client-only kind's finalizer is removable by nothing, and the row would stay deletion-pending forever while its `owned_by` edge blocks its owner's delete.
 
-The check is **process-local and evaluated at call time**, since the store records no registrations: it also refuses a create issued before this process's own `Register`, and one from a process that never registers the kind even if another over the same store does. Register the kind first, from whichever process creates these rows. It runs before any store work and only when the option is used, so an ordinary create on a client-only kind is unaffected — and like every other create-option check it is eager, so `GetOrCreate` rejects it on the found branch too rather than only when a row is really inserted.
+The check is **process-local and evaluated at call time**, since the store records no registrations: it refuses a create issued before this process's own `Register`. Register the kind first. It runs before any store work and only when the option is used, so an ordinary create on a client-only kind is unaffected — and like every other create-option check it is eager, so `GetOrCreate` rejects it on the found branch too rather than only when a row is really inserted.
 
 `WithOnCreate` is the safe way to run a side effect only if the row is really created — an external call, an in-memory counter. It waits for the *outermost* commit, so it runs once and never after a rollback; it is the only thing in beehive deferred that way. `Create` always fires it, `GetOrCreate` only when it inserts. Prefer it to branching on `GetOrCreate`'s `created` bool, which is returned synchronously: inside an enclosing `ControllerClient.Within` that bool is set before the transaction commits, so acting on it fires your side effect for a row a rollback may still discard.
 
@@ -719,7 +733,7 @@ Every call that **creates** the edge records, durably and atomically with the ed
 
 There is nothing else to pass: the call takes no version claim, because nothing conditions on one. An earlier design stamped the wake only when the target had moved past the version the caller read, which made the claim load-bearing and left one interleaving stranded; with the stamp unconditional, a claim would be dead weight in every caller's hands, so it was removed rather than kept as decoration.
 
-**A dependency wake is a guarantee, not a best effort.** The scan above is fast and lives in memory, so a crash, a restart, or a process that never ran one can drop a wake — and a dependent that has already settled is invisible to every listing of owed work, because its own generation never moved. So beehive records, on each successful reconcile of an object that has dependencies, the store-wide write cursor that pass observed; a slower pass (60s) then enqueues every dependent whose targets have moved past it. Nothing about that is bookkeeping you can lose: it compares current state, so it recovers a wake lost by any means. A failed reconcile records nothing and is therefore found again. What you get is a wake as soon as the target's write commits, and within a minute in every case — including one written by another process, or straight to the `Store` behind this `Beehive`'s back.
+**A dependency wake is a guarantee, not a best effort.** The scan above is fast and lives in memory, so a crash or a restart can drop a wake — and a dependent that has already settled is invisible to every listing of owed work, because its own generation never moved. So beehive records, on each successful reconcile of an object that has dependencies, the store-wide write cursor that pass observed; a slower pass (60s) then enqueues every dependent whose targets have moved past it. Nothing about that is bookkeeping you can lose: it compares current state, so it recovers a wake lost by any means. A failed reconcile records nothing and is therefore found again. What you get, for a write made through this `Beehive`, is a wake as soon as the target's write commits, and within a minute even if that wake is lost. A write beehive never saw commit — from another process, or issued straight to the `Store` behind its back — is [outside the supported scope](#scope-one-process-one-beehive-no-out-of-band-access) and carries no wake guarantee at all.
 
 → [ADR: stamp every new dependency edge](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md), for how the count is kept atomic with the edge and why the stamp is unconditional on the claim. The waker itself is [a periodic scan of the write log](docs/adr/2026-07-28-periodic-scan-drivers.md), and the backstop under it is [dependency watermarks](docs/adr/2026-07-29-dependency-watermarks.md).
 

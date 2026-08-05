@@ -156,13 +156,14 @@ read *two* rows (`ObjectWritesMaxVersion` and `DriverCursorsGet`) inside
 `Start`'s critical section instead of one, which is the same hesitation that
 item already records, doubled.
 
-**Multi-process sharing one database file degrades to the backstop, not to
-breakage.** Two processes would share the cursor row, each consuming pages the
-other then never sees, and each queues only its own registered kinds — so a
-change whose only dependent is registered in the other process can be scanned
-away. Nothing here claims that configuration works today, so this is a
-documented constraint rather than a regression: each process still runs its own
-stale-dependents pass, so a stolen page costs 60s rather than forever.
+**Multi-process sharing one database file is unsupported, and this cursor is one
+of the reasons.** Two processes would share the one cursor row, each consuming
+pages the other then never sees, and each queues only its own registered kinds —
+so a change whose only dependent is registered in the other process is scanned
+away. The stale-dependents pass would usually cover it, but nothing here relies
+on that and nothing tests it. The store is owned by one process running one
+`Beehive`; see
+[one process, one Beehive](2026-08-05-one-process-one-beehive-sole-writer.md).
 
 **Cost is otherwise unchanged in the common case.** A quiet store writes
 nothing; a normally-running process writes one small row per tick that actually
