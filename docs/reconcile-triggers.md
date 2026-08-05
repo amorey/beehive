@@ -37,7 +37,7 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly five push paths that cause a reconcile. All use
+There are exactly six push paths that cause a reconcile. All use
 `Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
@@ -48,13 +48,21 @@ can be read.
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 | A cleared finalizer enqueues its own object | `ControllerClient.FinalizersDelete` | the object whose block it lifted | the store reports `clearedLast` |
+| A physical delete enqueues the owners it unblocked | `Beehive.gcCollect` | each deletion-pending owner of the deleted row | the owner's `deletion_requested_at` |
 
-Four of the five are immediate: their gate is a store write that lands once, so
+Five of the six are immediate: their gate is a store write that lands once, so
 they carry new information and cancel a pending alarm rather than being absorbed by
 one. The new edge is the exception, and it is throttled because a controller can
 declare the same edge on every pass, so it goes through `work.add` and respects the
 source's backoff ladder and re-enqueue floor.
 → [the floor ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
+
+The physical delete is the one push gated on a *different* object than the one it
+enqueues, and the one whose fan-out is N→1 — N children converging on one owner. Its
+gate reads the owner rather than the write's own result, because the delete itself
+lands once per *row* and rows are unbounded: an ungated push would let a controller
+that replaces an owned child each pass drive itself, with the floor bypassed.
+→ [its ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md).
 Cases 1, 5, 9, 10 and 11 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
@@ -455,10 +463,10 @@ Cases 9, 10 and 11 share one record and one driver.
 
 **Record:** `deletion_requested_at`.
 
-**Push:** two, both registered-kind only (cases 9 and 10). A client-only object is
-marked and left to the sweeper: `deletionAdvance` collects one directly, and running
-that from a commit hook would put the whole subtree below it on the caller's
-goroutine.
+**Push:** four, all registered-kind only (cases 9, 10, and 11's routes 1 and 2). A
+client-only object is marked and left to the sweeper: `deletionAdvance` collects one
+directly, and running that from a commit hook would put the whole subtree below it
+on the caller's goroutine.
 
 **Pull:** `Beehive.deletionPendingSweep` calls `DeletionRequestsList`, which is
 kind-agnostic. `deletionAdvance` routes each result. A registered kind is
@@ -514,22 +522,30 @@ Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChil
 ### 11. A blocked collect retries by staying in the listing
 
 A collect is blocked when finalizers are still pending, or when `EdgesHasIncoming`
-reports a referrer under RESTRICT. Three routes lead out of one, and **only the first
-pushes**:
+reports a referrer under RESTRICT. Three routes lead out of one, and **the first two
+push**:
 
 1. **The last finalizer was cleared.** `ControllerClient.FinalizersDelete` enqueues
    the object at commit, gated on the store reporting `clearedLast`. →
    [the ADR](adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md).
-2. **The last child was removed.** The child's physical delete does append a
-   write-log entry, but the owner's identity does not survive it: `edges.from_id` is
-   `ON DELETE CASCADE`, so the `owned_by` edge is gone before anything reads the log.
-   Signalling it needs a reverse-edge lookup before the delete.
+2. **The last child was removed.** `gcCollect` reads the dying row's `owned_by`
+   edges before deleting it — after that the owner is unnameable, since
+   `edges.from_id` is `ON DELETE CASCADE` — and enqueues the deletion-pending ones
+   at commit. Two filters, both load-bearing: the relation, because
+   `EdgesHasIncoming` already discounts a `depends_on` edge from a deletion-pending
+   source, so those targets are not blocked; and the owner's own
+   `deletion_requested_at`, because a live owner was never blocked and pushing one
+   would spin. →
+   [the ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md).
 3. **`DependenciesDelete` dropped the last referrer.** An edge write bumps no
    `resource_version` and appends no write-log entry, so no cursor in the system can
    see it at all.
 
-Routes 2 and 3 wait for the next sweep, and each has its own entry in
-[`TODO.md`](TODO.md) — they are different problems with different fixes, not one gap.
+Route 3 waits for the next sweep; its entry in [`TODO.md`](TODO.md) has the fix.
+
+The push is a probe about *which* referrer went, not a verdict: route 2 pushes every
+deletion-pending owner without checking that this child was the last one, and
+`gcCollect` re-checks the block itself.
 
 The push is a probe, not a verdict: `gcCollect` re-checks the RESTRICT block, and the
 sweep remains the route after a crash.
@@ -542,6 +558,13 @@ Tests: `TestFinalizersDeletePushesTheCollect`,
 `TestFinalizersDeletePushesNothingOtherwise`,
 `TestIntegrationClearedFinalizerCollectsWithoutASweep`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
+`TestPhysicalDeletePushesItsOwner`, `TestPhysicalDeletePushBeatsAPendingAlarm`,
+`TestPhysicalDeletePushesNoLiveOwner`, `TestPhysicalDeletePushesNothingWhenBlocked`,
+`TestPhysicalDeletePushesNothingForAnOrphan`,
+`TestPhysicalDeletePushesAcrossKinds`, `TestPhysicalDeleteSkipsClientOnlyOwner`,
+`TestPhysicalDeletePushesEveryOwner`, `TestPhysicalDeleteQueuesNoDependsOnTarget`,
+`TestIntegrationLastChildCollectsItsOwnerWithoutASweep`,
+`TestIntegrationLastChildCollectsItsOwnerWithoutThePush`,
 `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
 `TestIntegrationGCDeleteDependencyUnblocksTarget`,
 `TestClientCreateRejectsFinalizersOnUnregisteredKind`.
