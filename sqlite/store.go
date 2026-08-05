@@ -1595,10 +1595,9 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 	return evID, typ, reason, true, nil
 }
 
-func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) (*storeapi.Event, error) {
+func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) error {
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
-	var result *storeapi.Event
-	err := s.Within(ctx, func(ctx context.Context) error {
+	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary; events carries no group/kind to fold in.
 		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
@@ -1614,28 +1613,23 @@ func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id s
 		if err != nil {
 			return err
 		}
-		var row *sql.Row
 		if hasLatest && latestType == ev.Type && latestReason == ev.Reason {
 			// Extend: bump count and window end, re-sample message/detail, advance rv.
-			row = c.QueryRowContext(ctx, `
+			_, err = c.ExecContext(ctx, `
 				UPDATE events SET count = count + 1, last_at = ?, message = ?,
 					detail = ?, resource_version = ?
-				WHERE id = ?
-				RETURNING `+eventColumns, now, ev.Message, jsonText(ev.Detail), rv, latestID)
-		} else {
-			// New run (empty timeline or key changed): count 1, point window.
-			row = c.QueryRowContext(ctx, `
-				INSERT INTO events
-					(object_id, category, type, reason, message, detail,
-					 count, first_at, last_at, resource_version)
-				VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-				RETURNING `+eventColumns,
-				id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
+				WHERE id = ?`, now, ev.Message, jsonText(ev.Detail), rv, latestID)
+			return err
 		}
-		result, err = scanEvent(row)
+		// New run (empty timeline or key changed): count 1, point window.
+		_, err = c.ExecContext(ctx, `
+			INSERT INTO events
+				(object_id, category, type, reason, message, detail,
+				 count, first_at, last_at, resource_version)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+			id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
 		return err
 	})
-	return result, err
 }
 
 // scanEvents decodes all rows of a query into a value slice, closing rows.

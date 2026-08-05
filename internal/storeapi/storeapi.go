@@ -352,7 +352,7 @@ type Store interface {
 	// appended with Count 1. Only ev's Category, Type, Reason, Message and
 	// Detail are read. Scoped to gk: wrong kind → ErrWrongKind, missing id →
 	// ErrNotFound.
-	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
+	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) error
 
 	// EventsGetLatest returns the most recent run in id's category timeline, or
 	// nil if none. Reads by id only (not kind-scoped).

@@ -50,18 +50,27 @@ func newEventObject(t *testing.T, store beehive.Store) storeapi.ObjectID {
 	return newRefObject(t, store).ID
 }
 
+// addEvent records an event and returns the run it landed in, which is what the
+// store no longer hands back.
+func addEvent(t *testing.T, store beehive.Store, id storeapi.ObjectID, ev storeapi.Event) *storeapi.Event {
+	t.Helper()
+	require.NoError(t, store.EventsAdd(context.Background(), testGK, id, ev))
+	run, err := store.EventsGetLatest(context.Background(), id, ev.Category)
+	require.NoError(t, err)
+	require.NotNil(t, run)
+	return run
+}
+
 // A first emission starts a run: count 1, a collapsed window, an assigned id and
 // resource_version.
 func TestAddEventStartsRun(t *testing.T) {
 	store := newTestStore(t)
-	ctx := context.Background()
 	id := newEventObject(t, store)
 
-	e, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{
+	e := addEvent(t, store, id, storeapi.Event{
 		Category: "connection", Type: "Warning", Reason: "ProbeFailed",
 		Message: "i/o timeout", Detail: []byte(`{"attempt":1}`),
 	})
-	require.NoError(t, err)
 	assert.NotZero(t, e.ID)
 	assert.Equal(t, id, e.ObjectID)
 	assert.Equal(t, "connection", e.Category)
@@ -79,19 +88,16 @@ func TestAddEventStartsRun(t *testing.T) {
 // and Message/Detail are re-sampled to the latest occurrence.
 func TestAddEventExtendsRun(t *testing.T) {
 	store := newTestStore(t)
-	ctx := context.Background()
 	id := newEventObject(t, store)
 
-	first, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{
+	first := addEvent(t, store, id, storeapi.Event{
 		Category: "connection", Type: "Warning", Reason: "ProbeFailed",
 		Message: "timeout", Detail: []byte(`{"n":1}`),
 	})
-	require.NoError(t, err)
-	second, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{
+	second := addEvent(t, store, id, storeapi.Event{
 		Category: "connection", Type: "Warning", Reason: "ProbeFailed",
 		Message: "still down", Detail: []byte(`{"n":2}`),
 	})
-	require.NoError(t, err)
 
 	assert.Equal(t, first.ID, second.ID, "same run extended, not a new row")
 	assert.Equal(t, 2, second.Count)
@@ -106,23 +112,19 @@ func TestAddEventExtendsRun(t *testing.T) {
 // rather than extending — the contiguous-run boundary.
 func TestAddEventNewRunOnKeyChange(t *testing.T) {
 	store := newTestStore(t)
-	ctx := context.Background()
 	id := newEventObject(t, store)
 
 	base := func(typ, reason string) storeapi.Event {
 		return storeapi.Event{Category: "connection", Type: typ, Reason: reason}
 	}
 
-	a, err := store.EventsAdd(ctx, testGK, id, base("Warning", "ProbeFailed"))
-	require.NoError(t, err)
+	a := addEvent(t, store, id, base("Warning", "ProbeFailed"))
 
-	b, err := store.EventsAdd(ctx, testGK, id, base("Warning", "TLSHandshake"))
-	require.NoError(t, err)
+	b := addEvent(t, store, id, base("Warning", "TLSHandshake"))
 	assert.NotEqual(t, a.ID, b.ID, "reason change starts a new run")
 	assert.Equal(t, 1, b.Count)
 
-	c, err := store.EventsAdd(ctx, testGK, id, base("Normal", "TLSHandshake"))
-	require.NoError(t, err)
+	c := addEvent(t, store, id, base("Normal", "TLSHandshake"))
 	assert.NotEqual(t, b.ID, c.ID, "type change starts a new run")
 	assert.Equal(t, 1, c.Count)
 }
@@ -137,12 +139,9 @@ func TestAddEventCategoriesIndependent(t *testing.T) {
 	conn := storeapi.Event{Category: "connection", Type: "Warning", Reason: "ProbeFailed"}
 	sync := storeapi.Event{Category: "sync", Type: "Normal", Reason: "Synced"}
 
-	conn1, err := store.EventsAdd(ctx, testGK, id, conn)
-	require.NoError(t, err)
-	_, err = store.EventsAdd(ctx, testGK, id, sync) // interleaved other-category event
-	require.NoError(t, err)
-	conn2, err := store.EventsAdd(ctx, testGK, id, conn)
-	require.NoError(t, err)
+	conn1 := addEvent(t, store, id, conn)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, sync)) // interleaved other category
+	conn2 := addEvent(t, store, id, conn)
 
 	assert.Equal(t, conn1.ID, conn2.ID, "interleaved other-category event must not break this run")
 	assert.Equal(t, 2, conn2.Count)
@@ -157,10 +156,10 @@ func TestAddEventScoped(t *testing.T) {
 
 	ev := storeapi.Event{Category: "connection", Type: "Normal", Reason: "OK"}
 
-	_, err := store.EventsAdd(ctx, beehive.GroupKind{Kind: "Other"}, id, ev)
+	err := store.EventsAdd(ctx, beehive.GroupKind{Kind: "Other"}, id, ev)
 	assert.ErrorIs(t, err, storeapi.ErrWrongKind)
 
-	_, err = store.EventsAdd(ctx, testGK, 999999, ev)
+	err = store.EventsAdd(ctx, testGK, 999999, ev)
 	assert.ErrorIs(t, err, storeapi.ErrNotFound)
 }
 
@@ -172,8 +171,7 @@ func TestListEventsOrdersNewestFirst(t *testing.T) {
 	id := newEventObject(t, store)
 
 	rec := func(typ, reason string) {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: typ, Reason: reason})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: typ, Reason: reason}))
 	}
 	rec("Normal", "Connected")     // A
 	rec("Warning", "TLSHandshake") // B
@@ -197,8 +195,7 @@ func TestListEventsFilters(t *testing.T) {
 	id := newEventObject(t, store)
 
 	rec := func(cat, typ, reason string) {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: cat, Type: typ, Reason: reason})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: cat, Type: typ, Reason: reason}))
 	}
 	rec("connection", "Warning", "ProbeFailed")
 	rec("connection", "Normal", "Connected")
@@ -258,8 +255,7 @@ func TestGetLatestEvent(t *testing.T) {
 	assert.Nil(t, got, "empty timeline is nil, not an error")
 
 	rec := func(cat, typ, reason string) {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: cat, Type: typ, Reason: reason})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: cat, Type: typ, Reason: reason}))
 	}
 	rec("connection", "Warning", "ProbeFailed")
 	rec("connection", "Normal", "Connected")
@@ -287,8 +283,7 @@ func TestSweepEventsCapN(t *testing.T) {
 	id := newEventObject(t, store)
 
 	for _, r := range []string{"R1", "R2", "R3", "R4"} { // 4 distinct runs
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r}))
 	}
 
 	deleted, err := store.EventsSweep(ctx, 2, 0)
@@ -311,8 +306,7 @@ func TestSweepEventsCapNPartitions(t *testing.T) {
 	b := newEventObject(t, store)
 
 	rec := func(id storeapi.ObjectID, cat, reason string) {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: cat, Type: "Normal", Reason: reason})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: cat, Type: "Normal", Reason: reason}))
 	}
 	rec(a, "connection", "F1") // object a, connection flaps 3 runs
 	rec(a, "connection", "F2")
@@ -347,14 +341,12 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	ctx := context.Background()
 	id := newEventObject(t, store)
 
-	old, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Old"})
-	require.NoError(t, err)
-	_, err = store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "New"})
-	require.NoError(t, err)
+	old := addEvent(t, store, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "Old"})
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "New"}))
 
 	// Age the first run's window into the past directly — no clock injection needed.
 	s := store.(*sqliteStore)
-	_, err = s.db.ExecContext(ctx, `UPDATE events SET last_at = ? WHERE id = ?`,
+	_, err := s.db.ExecContext(ctx, `UPDATE events SET last_at = ? WHERE id = ?`,
 		toMillis(time.Now().UTC().Add(-2*time.Hour)), old.ID)
 	require.NoError(t, err)
 
@@ -375,10 +367,8 @@ func TestEventsListSinceIsTheTail(t *testing.T) {
 	ctx := context.Background()
 	id := newEventObject(t, store)
 
-	first, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R1"})
-	require.NoError(t, err)
-	second, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "R2"})
-	require.NoError(t, err)
+	first := addEvent(t, store, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R1"})
+	second := addEvent(t, store, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "R2"})
 
 	got, _, err := store.EventsListSince(ctx, id, nil, 0, 10)
 	require.NoError(t, err)
@@ -392,8 +382,7 @@ func TestEventsListSinceIsTheTail(t *testing.T) {
 	assert.Equal(t, "R2", got[0].Reason, "the cursor excludes what it has seen")
 
 	// An extend lifts R2 above the cursor that already covered it.
-	extended, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "R2"})
-	require.NoError(t, err)
+	extended := addEvent(t, store, id, storeapi.Event{Category: "c", Type: "Warning", Reason: "R2"})
 	got, _, err = store.EventsListSince(ctx, id, nil, second.ResourceVersion, 10)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
@@ -418,10 +407,8 @@ func TestEventsSnapshotCarriesItsPosition(t *testing.T) {
 	assert.Empty(t, runs)
 	assert.Zero(t, at, "an empty log reads position 0")
 
-	_, err = store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: "R1"})
-	require.NoError(t, err)
-	last, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Warning", Reason: "R2"})
-	require.NoError(t, err)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: "R1"}))
+	last := addEvent(t, store, id, storeapi.Event{Category: "sync", Type: "Warning", Reason: "R2"})
 
 	runs, at, err = store.EventsSnapshot(ctx, id, storeapi.EventQuery{})
 	require.NoError(t, err)
@@ -451,12 +438,10 @@ func TestEventsListSinceReportsTheHorizon(t *testing.T) {
 	id := newEventObject(t, store)
 
 	for _, r := range []string{"C1", "C2"} {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: r})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: r}))
 	}
-	_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "S1"})
-	require.NoError(t, err)
-	_, err = store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "S1"}))
+	_, err := store.EventsSweep(ctx, 1, 0)
 	require.NoError(t, err)
 	trimmed := eventHorizon(t, store, id, "connection")
 	require.NotZero(t, trimmed)
@@ -516,14 +501,12 @@ func TestSweepEventsRecordsHorizonPerTimeline(t *testing.T) {
 
 	var trimmed int64
 	for _, r := range []string{"C1", "C2", "C3"} {
-		e, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: r})
-		require.NoError(t, err)
+		e := addEvent(t, store, id, storeapi.Event{Category: "connection", Type: "Normal", Reason: r})
 		if r == "C2" {
 			trimmed = e.ResourceVersion // the highest version the cap will drop
 		}
 	}
-	_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "S1"})
-	require.NoError(t, err)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "sync", Type: "Normal", Reason: "S1"}))
 
 	deleted, err := store.EventsSweep(ctx, 1, 0)
 	require.NoError(t, err)
@@ -540,8 +523,7 @@ func TestSweepEventsHorizonOnlyRises(t *testing.T) {
 	id := newEventObject(t, store)
 
 	for _, r := range []string{"R1", "R2", "R3"} {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r}))
 	}
 	_, err := store.EventsSweep(ctx, 1, 0)
 	require.NoError(t, err)
@@ -566,8 +548,7 @@ func TestDeleteObjectCascadesEventHorizon(t *testing.T) {
 	id := newEventObject(t, store)
 
 	for _, r := range []string{"R1", "R2"} {
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r}))
 	}
 	_, err := store.EventsSweep(ctx, 1, 0)
 	require.NoError(t, err)
@@ -583,8 +564,7 @@ func TestDeleteObjectCascadesEvents(t *testing.T) {
 	ctx := context.Background()
 	id := newEventObject(t, store)
 
-	_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "X"})
-	require.NoError(t, err)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "X"}))
 	require.NoError(t, store.ObjectsDelete(ctx, id))
 
 	got, err := store.EventsList(ctx, id, storeapi.EventQuery{})
@@ -623,7 +603,7 @@ func TestAddEventStoreErrors(t *testing.T) {
 		store := newRawStore(t)
 		id := newEventObject(t, store)
 		dropSeq(t, store)
-		_, err := store.EventsAdd(ctx, testGK, id, ev)
+		err := store.EventsAdd(ctx, testGK, id, ev)
 		require.Error(t, err)
 	})
 
@@ -631,20 +611,7 @@ func TestAddEventStoreErrors(t *testing.T) {
 		store := newRawStore(t)
 		id := newEventObject(t, store)
 		dropEventsTable(t, store)
-		_, err := store.EventsAdd(ctx, testGK, id, ev)
-		require.Error(t, err)
-	})
-
-	t.Run("written row fails to scan", func(t *testing.T) {
-		store := newRawStore(t)
-		id := newEventObject(t, store)
-		_, err := store.EventsAdd(ctx, testGK, id, ev)
-		require.NoError(t, err)
-		breakEventRowRead(t, store)
-		// Same key → the key-only probe still reads the run (it ignores first_at),
-		// so EXTEND updates it and RETURNINGs the full row whose now-NULL first_at
-		// → scan fails.
-		_, err = store.EventsAdd(ctx, testGK, id, ev)
+		err := store.EventsAdd(ctx, testGK, id, ev)
 		require.Error(t, err)
 	})
 }
@@ -664,10 +631,9 @@ func TestListEventsStoreErrors(t *testing.T) {
 	t.Run("row fails to scan", func(t *testing.T) {
 		store := newRawStore(t)
 		id := newEventObject(t, store)
-		_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
-		require.NoError(t, err)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"}))
 		breakEventRowRead(t, store)
-		_, err = store.EventsList(ctx, id, storeapi.EventQuery{})
+		_, err := store.EventsList(ctx, id, storeapi.EventQuery{})
 		require.Error(t, err)
 	})
 }
@@ -691,9 +657,8 @@ func TestEventsMaxVersion(t *testing.T) {
 
 	add := func(id storeapi.ObjectID, category, reason string) int64 {
 		t.Helper()
-		ev, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{
+		ev := addEvent(t, store, id, storeapi.Event{
 			Category: category, Type: "Normal", Reason: reason})
-		require.NoError(t, err)
 		return ev.ResourceVersion
 	}
 
@@ -730,7 +695,7 @@ func TestEventsMaxVersionFallsWhenTheNewestRunGoes(t *testing.T) {
 	id := newEventObject(t, store)
 
 	for _, reason := range []string{"A", "B"} {
-		_, err := store.EventsAdd(ctx, testGK, id,
+		err := store.EventsAdd(ctx, testGK, id,
 			storeapi.Event{Category: "c", Type: "Normal", Reason: reason})
 		require.NoError(t, err)
 	}
@@ -924,10 +889,9 @@ func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)
 	id := newEventObject(t, store)
-	_, err := store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"})
-	require.NoError(t, err)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"}))
 	breakEventRowRead(t, store)
-	_, err = store.EventsGetLatest(ctx, id, "c")
+	_, err := store.EventsGetLatest(ctx, id, "c")
 	require.Error(t, err)
 }
 
@@ -5946,7 +5910,7 @@ func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
 	before := cursorNow(t, store)
 	require.Equal(t, obj.ResourceVersion, before, "the mark is the newest object write")
 
-	_, err := store.EventsAdd(ctx, testGK, obj.ID, storeapi.Event{
+	err := store.EventsAdd(ctx, testGK, obj.ID, storeapi.Event{
 		Type: "Normal", Reason: "Probed",
 	})
 	require.NoError(t, err)
@@ -6515,7 +6479,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "event appended",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				_, err := store.EventsAdd(ctx, testGK, obj.ID, storeapi.Event{
+				err := store.EventsAdd(ctx, testGK, obj.ID, storeapi.Event{
 					Category: "c", Type: "Normal", Reason: "R",
 				})
 				require.NoError(t, err)
