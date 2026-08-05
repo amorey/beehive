@@ -15,9 +15,8 @@ push-driven than it is.
 
 **Keep this document in step with the code.** When you add a way for work to be
 owed, add it here. Give its record, its driver, and its restart behaviour. Do not
-list gaps here. A gap we chose not to close belongs in [`TODO.md`](TODO.md), and one
-we intend to close belongs in [`specs/`](specs/README.md); link either from the case
-it affects.
+list gaps here. A gap belongs in [`TODO.md`](TODO.md), linked from the case it
+affects.
 
 ## 1. Push and pull
 
@@ -509,14 +508,22 @@ Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChil
 ### 11. A blocked collect retries by staying in the listing
 
 A collect is blocked when finalizers are still pending, or when `EdgesHasIncoming`
-reports a referrer under RESTRICT. Three routes lead out of one, and **only the
-finalizer pushes**: `ControllerClient.FinalizersDelete` enqueues the object at commit
-when it cleared the last finalizer from a deletion-pending row (`clearedLast`). The other two are edge writes — the last child's removal and a
-`DependenciesDelete` — which bump no `resource_version` and append no write-log
-entry, so no cursor in the system can see them and an owner they free is simply still
-deletion-pending when the next sweep runs. See
-[the ADR](adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md) and the edge
-entry in [`TODO.md`](TODO.md).
+reports a referrer under RESTRICT. Three routes lead out of one, and **only the first
+pushes**:
+
+1. **The last finalizer was cleared.** `ControllerClient.FinalizersDelete` enqueues
+   the object at commit, gated on the store reporting `clearedLast`. →
+   [the ADR](adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md).
+2. **The last child was removed.** The child's physical delete does append a
+   write-log entry, but the owner's identity does not survive it: `edges.from_id` is
+   `ON DELETE CASCADE`, so the `owned_by` edge is gone before anything reads the log.
+   Signalling it needs a reverse-edge lookup before the delete.
+3. **`DependenciesDelete` dropped the last referrer.** An edge write bumps no
+   `resource_version` and appends no write-log entry, so no cursor in the system can
+   see it at all.
+
+Routes 2 and 3 wait for the next sweep, and each has its own entry in
+[`TODO.md`](TODO.md) — they are different problems with different fixes, not one gap.
 
 The push is a probe, not a verdict: `gcCollect` re-checks the RESTRICT block, and the
 sweep remains the route after a crash.
