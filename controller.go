@@ -180,11 +180,21 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 	return nil
 }
 
-// DependenciesDelete drops the edge and schedules nothing: a finalizing toID is
-// already in the GC sweeper's listing, and the next tick finds the block gone.
+// DependenciesDelete drops the edge, and pushes toID's collect when the drop is
+// what lifted its RESTRICT block. Immediate, because the target is finalizing
+// and a throttled push would be absorbed by the alarm its own delete armed. The
+// store's gates bound this to once per edge; the sweep remains the backstop.
+// See docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
 func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
-	_, err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
-	return err
+	res, err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
+	if err != nil {
+		return err
+	}
+	if res.Unblocked {
+		// Routed by res.To: the edge is cross-kind.
+		c.bh.signalRequeueNow(ctx, ObjectRef{ID: toID, Group: res.To.Group, Kind: res.To.Kind})
+	}
+	return nil
 }
 
 // The ref reads below are plain edge queries with no kind scoping: a controller

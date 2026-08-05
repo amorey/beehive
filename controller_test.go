@@ -1067,6 +1067,125 @@ func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 }
 
+// dropFixture is a registered kind with its client, controller client and
+// reconciler: enough to declare a dependency and watch what dropping it queues.
+func dropFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
+	t.Helper()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc, mustReconciler(t, bh, clientTestGK)
+}
+
+// Dropping the last live referrer is one of the routes out of a RESTRICT-blocked
+// collect, so it pushes rather than waiting out a GC tick.
+func TestDependenciesDeletePushesTheBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := dropFixture(t)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work))
+}
+
+// Every neighbour of that transition owes nothing.
+func TestDependenciesDeletePushesNothingOtherwise(t *testing.T) {
+	tests := []struct {
+		name            string
+		declare         bool
+		deleteTarget    bool
+		deleteDependent bool
+	}{
+		{name: "live target", declare: true},
+		{name: "missing edge", deleteTarget: true},
+		{name: "finalizing dependent", declare: true, deleteTarget: true, deleteDependent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, client, cc, r := dropFixture(t)
+
+			target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+			dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+			if tt.declare {
+				require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+			}
+			if tt.deleteTarget {
+				require.NoError(t, client.Delete(ctx, target.ID))
+			}
+			if tt.deleteDependent {
+				require.NoError(t, client.Delete(ctx, dependent.ID))
+			}
+			drainQueue(r.work)
+
+			require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+			assert.Empty(t, queuedIDs(r.work))
+		})
+	}
+}
+
+// The edge is cross-kind, so the push routes by the target's kind rather than
+// the controller's own.
+func TestDependenciesDeletePushesAcrossKinds(t *testing.T) {
+	ctx := context.Background()
+	bh, client, cc, depR := dropFixture(t)
+	targetGK := GroupKind{Kind: "DropTarget"}
+	registerNoop[cSpec, cStatus](t, bh, targetGK)
+	targetR := mustReconciler(t, bh, targetGK)
+	targetClient := NewClient[cSpec, cStatus](bh, targetGK)
+
+	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	drainQueue(depR.work)
+	drainQueue(targetR.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(targetR.work), "the target's own kind is queued")
+	assert.Empty(t, queuedIDs(depR.work), "the dependent's kind is not")
+}
+
+// The target is finalizing, so it already carries an alarm from its own delete
+// push; an absorbed push would wait out the ladder the sweep was going to beat.
+func TestDependenciesDeletePushBeatsAPendingAlarm(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := dropFixture(t)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+	// Long enough that the alarm firing on its own would be the test hanging,
+	// not the assertion passing.
+	r.work.addAfter(target.ID, time.Hour, alarmBackoff)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work), "the drop beats the backoff alarm")
+}
+
+// A client-only target resolves to no reconciler; the sweeper stays its route.
+func TestDependenciesDeleteSkipsClientOnlyTarget(t *testing.T) {
+	ctx := context.Background()
+	bh, client, cc, r := dropFixture(t)
+	targetClient := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "UnregisteredTarget"})
+
+	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Empty(t, queuedIDs(r.work))
+}
+
 func TestControllerClientReadEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
