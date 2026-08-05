@@ -357,6 +357,13 @@ content and handshake-only paths of `ObjectsUpdateStatus`, `ConditionsSet`,
 `ConditionsDelete`, `FinalizersDelete`, `markForDeletion`, and the cascade mark.
 `EventsAdd` is the one write that does not bump it. That is by design.
 
+This list is scoped to writes on a target that can still be depended on.
+`ObjectsDelete` also draws a version and appends a write-log entry, but a physical
+delete removes the row, and `edges.to_id` is `ON DELETE RESTRICT` — so a deleted
+target structurally cannot have a live `depends_on` edge pointing at it left to wake.
+The write-log entry it leaves is bookkeeping, not a wake; the actual notification for
+a delete is the owner push in case 11.
+
 A target of a **client-only kind** is covered. The scan is store-wide for exactly
 this reason.
 
@@ -586,9 +593,14 @@ failed while servicing a wake keeps its `reconcile_owed` count, because
 `runWorker` calls `workQueue.addAfter`.
 
 A chain of these on a settled object is the one case with no durable record at all.
-It does not survive a restart, and no driver brings it back. See
-[`TODO.md`](TODO.md). The open question there is whether a self-polling controller
-should be written this way, or should own its own ticker and call `Client.Requeue`.
+It does not survive a restart, and no driver brings it back. **This is accepted, not
+planned work: beehive will not add a durable form of `RequeueAfter`.** A
+`RequeueAfter` chain is a controller's private timer, not a fact about the object,
+and persisting it would mean a row per poll on the single connection —
+exactly the cost `reconcile_owed` exists to avoid. See [`TODO.md`](TODO.md) for the
+full reasoning. The open question left there is narrower: whether a self-polling
+controller should be written this way at all, or should own its own ticker and call
+`Client.Requeue`, or should enable `WithFullPassInterval` instead.
 
 Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 `TestTypedControllerReconcileDropsRequeueWhenCollected`.
