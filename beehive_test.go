@@ -152,6 +152,21 @@ func TestSweepReconcileOwedKeepsRegisteredKinds(t *testing.T) {
 	assert.ElementsMatch(t, []GroupKind{widget, drone}, recv(t, store.kept))
 }
 
+// A failed reclaim must not cost the tick: the sweeps after it still run, and the
+// next tick retries. Nothing is incorrect while a count goes unreclaimed.
+func TestSweepReconcileOwedFailureIsNotFatal(t *testing.T) {
+	owed := &owedClearStore{Store: &fakeStore{}, kept: make(chan []GroupKind, 4), err: errBoom}
+	store := &freePagesStore{Store: owed, called: make(chan int, 4)}
+	bh := newTestBeehive(t, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go bh.gcSweeperRun(ctx)
+
+	assert.Empty(t, recv(t, owed.kept), "no controllers registered, so nothing is kept")
+	assert.Equal(t, freePagesPerSweep, recv(t, store.called), "the sweep after it still runs")
+}
+
 // The reclaim runs on every GC tick, so emitting would wake every tailer and the
 // dependency waker for a write no consumer can act on. The control write after
 // the sweep is what makes the absence assertable: an emitting reclaim would put
