@@ -1006,6 +1006,28 @@ func TestEventsListSinceAboveTheHeadIsQuiet(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, page)
 	assert.NotZero(t, trimmed, "the horizon still comes back on an empty page")
+
+	// And it is still the caller's timeline that answers, not the object's: an
+	// empty page reads the horizon on its own, where a page carries it along.
+	quiet := "quiet"
+	_, trimmed, err = store.EventsListSince(ctx, id, &quiet, 1<<40, 10)
+	require.NoError(t, err)
+	assert.Zero(t, trimmed, "a timeline that lost nothing")
+}
+
+// A broken horizon table fails the read rather than reporting 0, which would
+// say "nothing was trimmed" on a store that cannot answer — the one thing the
+// horizon exists to prevent. The page's own subquery reads it too, so that is
+// where a dropped table is caught.
+func TestEventsListSinceSurfacesAHorizonFault(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	id := newEventObject(t, store)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE events_horizon`)
+	require.NoError(t, err)
+
+	_, _, err = store.EventsListSince(ctx, id, nil, 0, 10)
+	require.Error(t, err)
 }
 
 // The name is required, and the schema is what says so. No Go path can express a

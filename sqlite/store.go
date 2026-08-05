@@ -1743,15 +1743,12 @@ func (s *sqliteStore) EventsListSince(
 		if len(runs) > 0 {
 			return nil // the rows carried the horizon subquery
 		}
-		if trimmed, err = s.eventHorizon(ctx, id, category); err != nil {
+		// No rows carried it, so read it on its own. A horizon proves the object
+		// was there; without one, an empty page still has to tell "quiet" from
+		// "collected" — a log that cascaded with its row is not "no events".
+		if trimmed, err = s.eventHorizon(ctx, id, category); err != nil || trimmed > 0 {
 			return err
 		}
-		if trimmed > 0 {
-			return nil // a horizon proves the object was there
-		}
-		// An empty page over an object that is gone is not "no events": the log
-		// cascaded with the row, and no later read brings it back. Three columns,
-		// no blobs — this runs on every quiet drain of every live stream.
 		return s.checkObjectExists(ctx, id)
 	})
 	if err != nil {
