@@ -548,6 +548,13 @@ type Store interface {
 	// ordered by id — the inverse of EdgesListIncoming.
 	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
+	// ReconcileOwedClear zeroes reconcile_owed for every object whose kind is
+	// not in keep, and returns how many rows it cleared. An empty keep clears
+	// every nonzero row: with no reconcilers, nothing consumes a count. Bumps no
+	// resource_version and appends no write-log entry.
+	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
+	ReconcileOwedClear(ctx context.Context, keep []GroupKind) (int64, error)
+
 	// ReconcileOwedDecrement subtracts observed from id's reconcile_owed,
 	// floored at 0. Callers pass the count they loaded, not 1: one pass
 	// answers every wake outstanding at its load, and increments landing after

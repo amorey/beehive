@@ -3486,6 +3486,38 @@ func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
 	assert.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
 }
 
+// clientOnlyGK is a kind no reconcile loop covers, so its owed count is the
+// reclaim's target.
+var clientOnlyGK = beehive.GroupKind{Group: "", Kind: "ClientOnly"}
+
+// newKindObject is newRefObject for a kind other than testGK.
+func newKindObject(t *testing.T, store beehive.Store, gk beehive.GroupKind) *beehive.RawObject {
+	t.Helper()
+	obj, err := store.ObjectsCreate(context.Background(), gk, beehive.ObjectsCreateInput{
+		Name: uniqueName(),
+		Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	return obj
+}
+
+// TestReconcileOwedClearSkipsKeptKinds pins the reclaim's predicate: a kind with
+// no reconcile loop has its count zeroed, a kind in keep is left alone.
+func TestReconcileOwedClearSkipsKeptKinds(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	kept := newRefObject(t, store)
+	loose := newKindObject(t, store, clientOnlyGK)
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, kept.ID))
+	require.NoError(t, store.ReconcileOwedIncrement(ctx, loose.ID))
+
+	_, err := store.ReconcileOwedClear(ctx, []beehive.GroupKind{testGK})
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), reconcileOwed(t, store, kept.ID), "a kind with a reconcile loop keeps its count")
+	assert.Zero(t, reconcileOwed(t, store, loose.ID), "a client-only kind's count is reclaimed")
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.

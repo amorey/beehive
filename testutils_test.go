@@ -372,6 +372,13 @@ func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef,
 func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
+
+// ReconcileOwedClear answers 0 like the listings around it: the GC sweeper calls
+// it every tick, so a panic would break every Start.
+func (s *fakeStore) ReconcileOwedClear(context.Context, []GroupKind) (int64, error) {
+	return 0, nil
+}
+
 func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
 	panic("not implemented: fakeStore.ReconcileOwedDecrement")
 }

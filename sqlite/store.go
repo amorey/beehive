@@ -929,6 +929,27 @@ func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.Ob
 	return err
 }
 
+// ReconcileOwedClear zeroes the owed count outside keep in one no-emit UPDATE
+// (contract on storeapi.Store).
+func (s *sqliteStore) ReconcileOwedClear(ctx context.Context, keep []storeapi.GroupKind) (int64, error) {
+	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
+	q := `UPDATE objects SET reconcile_owed = 0 WHERE reconcile_owed != 0`
+	args := make([]any, 0, len(keep)*2)
+	if len(keep) > 0 {
+		tuples := make([]string, len(keep))
+		for i, gk := range keep {
+			tuples[i] = "(?, ?)"
+			args = append(args, gk.Group, gk.Kind)
+		}
+		q += ` AND ("group", kind) NOT IN (VALUES ` + strings.Join(tuples, ", ") + `)`
+	}
+	res, err := s.conn(ctx).ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs
 // on the owed-wake count; the decrement floors at 0 (contract on storeapi.Store).
 //
