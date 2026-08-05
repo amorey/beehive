@@ -146,9 +146,14 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 - **A waker resuming a very stale cursor can scan at full budget for minutes, and
   nothing decides that draining is no longer worth it** — known, not fixed, and
   deliberately unbounded rather than bounded by a guess. After a long enough
-  downtime, `seed` resumes a cursor far behind the write log and every tick reads
-  its full `wakeScanPagesPerTick` budget until it catches up: 32 queries a second
-  on the one connection the reconcile loops share, potentially for minutes.
+  downtime, `seed` resumes a cursor far behind the write log, and each re-armed
+  pass reads its full `wakeScanPagesPerPass` budget (4 pages of `wakeScanPageCap`,
+  256 rows each) until it catches up. `scanGate` floors passes at
+  `wakeScanMinInterval` (100ms) apart, so a resume runs at up to 40 queries a
+  second on the one connection the reconcile loops share, potentially for minutes.
+  (This used to be a tick-driven budget of 32 queries a second; the wake-driven
+  refactor replaced the tick with `scanGate`'s floor, which is what actually paces
+  it today.)
 
   **The obvious bound is the one that was removed, and it must not come back in that
   form.** Capping `max - stored` at seed reads a `resource_version` distance, but
@@ -158,7 +163,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   motivation for it — a database file swapped for a larger one — does not exist: a
   stored cursor lives in the database it describes.)
 
-  **A measured bound would work.** Count consecutive ticks that exhausted the page
+  **A measured bound would work.** Count consecutive passes that exhausted the page
   budget, and past some number of them stop draining and jump to a fresh
   `ObjectWritesMaxVersion`. That counts paging actually done, in the right unit and
   immune to event traffic. The natural threshold is one `staleDependentsInterval`
@@ -533,9 +538,9 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
   **Several components budget their work against one connection**, and their
   reasoning would have to be re-read rather than assumed: the waker's page budget
-  exists so a resume "cannot monopolise the single connection" (`waker.go:72`, `:76`,
-  `:240`), the tailer reads "one after another on the single connection"
-  (`objectswatch.go:462`), and `workqueue.go:421` reasons about a deadlock on it.
+  exists so a resume "cannot monopolise the single connection" (`waker.go:101`, `:105`,
+  `:428`), the tailer reads "one after another on the single connection"
+  (`objectswatch.go:583`), and `workqueue.go` reasons about a deadlock on it.
   This also changes the premise of the page-cache item below, which discounts a
   larger cache because "the store is one connection, so a larger cache is not shared
   across concurrent readers the way the advice assumes".
