@@ -23,6 +23,7 @@ directory of archaeology.
 
 ## Index
 
+- [One process, one Beehive, and it is the store's only writer](2026-08-05-one-process-one-beehive-sole-writer.md)
 - [The work queue floors how often one object is dispatched](2026-08-04-work-queue-re-enqueue-floor.md)
 - [A delete request pushes its own collect, for a registered kind only](2026-08-04-a-delete-request-pushes-its-own-collect.md)
 - [A cleared finalizer pushes its own collect](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)

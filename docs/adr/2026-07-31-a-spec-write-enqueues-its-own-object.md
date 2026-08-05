@@ -124,11 +124,12 @@ the hook is a no-op.
 - **The examples' `Client.Requeue` calls are no longer required for a create.**
   They are left in place, because they still demonstrate the API and still bound
   the case where the enqueue is lost.
-- **A write outside this process is unaffected.** The hook is registered in the
-  beehive layer, so a writer holding the `Store` directly, or a second process on
-  the same database, still waits for the owed pass. That is the same boundary every
-  in-process signal in beehive has, and the reason the scans remain what guarantees
-  convergence.
+- **A write that does not go through this `Beehive` gets no push.** The hook is
+  registered in the beehive layer, so a writer holding the `Store` directly, or a
+  second process on the same database, is not enqueued here. Both are
+  [unsupported](2026-08-05-one-process-one-beehive-sole-writer.md) rather than
+  slow — the scans that would eventually pick such a write up are the reason the
+  symptom is latency, not the reason the shape is allowed.
 
 ## Extension: a new dependency edge enqueues its source
 

@@ -34,22 +34,28 @@ that finds a superset of what the waker finds and cannot be disabled — so the
 rule holds where it matters, one level down.
 
 **One value in beehive is pushed, and it is the one that never reaches the
-store.** The schedule gauge is the work queue's memory, so no second process and
-no embedder can move it: its hub sees every writer that exists, which no
-store-backed hub can. It therefore has a push path and no poll at all. The
-criterion, so it is an exception and not a loophole: a poll may go only when its
-hub can observe every writer, and when the notify is derived from the state
-rather than asserted at each site. Every driver in the table below fails the first
-test by construction, because a second process can always write to the store. See
+store.** The schedule gauge is the work queue's memory, so no embedder can move
+it: its hub sees every writer that exists, which no store-backed hub can. It
+therefore has a push path and no poll at all. The criterion, so it is an
+exception and not a loophole: a poll may go only when its hub can observe every
+writer, and when the notify is derived from the state rather than asserted at
+each site. Every driver in the table below fails the first test by construction,
+because a write can always reach the store without passing the hub — a GC path,
+a store call the beehive itself makes, a write whose publish is lost. See
 [the schedule-watch ADR](2026-07-27-schedule-watch.md).
 
 **A wake in front of a scan is a weaker claim, and the watch tail has one.**
-A commit publishes its kind to a process-local hub, so a local write reaches
-subscribers without waiting for a tick. That hub sees only this process's
-writers, which is exactly why the scan stays: the floor tick covers a second
-process over the same file, a failed read, and a retention trim. The tail is a
-driver with a wake, not an exception to the rule.
-→ [ADR](2026-08-03-watch-shared-tail.md).
+A commit publishes its kind to a process-local hub, so a write made through this
+`Beehive` reaches subscribers without waiting for a tick. The scan stays because
+the hub is not the only route a change can take: the floor tick covers a failed
+read and a retention trim. The tail is a driver with a wake, not an exception to
+the rule. → [ADR](2026-08-03-watch-shared-tail.md).
+
+*(Amended 2026-08-05.)* Earlier text here justified the floor ticks partly by "a
+second process writing the same store". That configuration is unsupported and
+the justification is withdrawn; every tick above stands on its remaining
+reasons. See
+[one process, one Beehive](2026-08-05-one-process-one-beehive-sole-writer.md).
 
 | Driver | What it scans | Paced by | Default |
 | --- | --- | --- | --- |

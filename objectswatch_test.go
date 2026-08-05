@@ -1516,25 +1516,6 @@ func TestMergeRawChangeKeepsThePendingValueOnAStaleSend(t *testing.T) {
 	}
 }
 
-// A writer in another Beehive publishes no wake here, so only the floor tick
-// makes its write visible. Same store, second Beehive.
-func TestTailerFloorTickPicksUpAForeignWrite(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
-	_, rx := startTailer(t, bh, clientTestGK)
-
-	foreign, err := New(store)
-	require.NoError(t, err)
-	obj := mustCreate(t, ctx, NewClient[cSpec, cStatus](foreign, clientTestGK), "foreign", cSpec{})
-
-	ev, err := rx.RecvContext(ctx)
-	require.NoError(t, err, "a write through another Beehive was never picked up")
-	assert.Equal(t, obj.ID, ev.Key)
-}
-
 // A failed step costs a retry, not the stream: the cursor did not advance, so
 // the entries are still there to read.
 func TestTailerRetriesAfterAFailedStep(t *testing.T) {

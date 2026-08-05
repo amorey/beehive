@@ -89,17 +89,19 @@ nothing else. Two writers it no longer hears:
 - a second process writing the same store, and
 - a write issued straight to the `Store` behind the beehive's back.
 
-Both were previously covered by the tick, at its cadence. They are now covered
-by the stale-dependents pass at 60s, which derives staleness from watermarks
-rather than replaying a cursor and so finds a superset of what the waker finds —
-with `reconcile_owed` stamped before the enqueue, so a finding outlives the
-queue. Correctness is unaffected; the multi-process deployment's dependency
-latency goes from 1s to 60s.
+**Both are unsupported configurations, not degraded ones** — see
+[one process, one Beehive](2026-08-05-one-process-one-beehive-sole-writer.md),
+which is what this section is really describing. The tick previously covered
+them incidentally, at its cadence. Losing that coverage costs nothing beehive
+promises. In practice the stale-dependents pass still finds them at 60s, since
+it derives staleness from watermarks rather than replaying a cursor and so finds
+a superset of what the waker finds — but that is a property of the backstop, not
+a guarantee extended to writes beehive never saw commit.
 
-An opt-in periodic pass, off by default, would keep both. It is not built: the
-knob would exist for a deployment shape this package does not otherwise serve,
-and the honest fix for that shape is a store-backed wake rather than a tick
-whose cadence *is* the latency target.
+An opt-in periodic pass, off by default, would restore the incidental coverage.
+It is not built: the knob would exist for a deployment shape this package does
+not serve, and the honest fix for that shape is a store-backed wake rather than
+a tick whose cadence *is* the latency target.
 
 ## Consequences
 

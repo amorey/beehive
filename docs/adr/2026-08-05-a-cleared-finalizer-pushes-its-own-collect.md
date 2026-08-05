@@ -56,8 +56,8 @@ The push is redundant in the shape both `examples/cascade` controllers use — a
 controller clearing its own object's last finalizer during that object's pass,
 where the tail `gcCollect` collects it in the same pass. It is load-bearing when
 the clear lands outside a pass over the object it frees: on a sibling, or between
-a load and a delete request from another process. The redundant case now costs
-nothing, because that is the dispatch `forget` drops.
+a load and a delete request issued from elsewhere in this process. The redundant
+case now costs nothing, because that is the dispatch `forget` drops.
 
 Routes 2 and 3 still wait for a sweep. `WithGCInterval` cannot be disabled, so
 every block keeps a tick behind it, which is also what covers route 1 after a
