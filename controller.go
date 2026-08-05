@@ -144,7 +144,8 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 }
 
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
-	return c.wakeAfter(ctx, c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer))
+	_, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
+	return c.wakeAfter(ctx, err)
 }
 
 // DependenciesAdd is one store call, not a composition: the edge and the durable

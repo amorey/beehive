@@ -375,9 +375,10 @@ type Store interface {
 	EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
 
 	// FinalizersDelete removes finalizer from id's list. A real removal bumps
-	// ResourceVersion; a missing one does nothing. Scoped to gk: wrong kind →
-	// ErrWrongKind, missing id → ErrNotFound. Returns no row.
-	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) error
+	// ResourceVersion; a missing one does nothing. clearedLast reports that this
+	// call removed the last finalizer from a deletion-pending row. Scoped to gk:
+	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
+	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (clearedLast bool, err error)
 
 	// ObjectsCreate inserts a new object of kind gk. The store assigns ID and
 	// ResourceVersion and sets Generation to 1.

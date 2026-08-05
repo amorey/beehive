@@ -1812,7 +1812,8 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 
 	// Removing a present finalizer is a real change: only that finalizer drops,
 	// resource_version bumps, and watchers see a Modified event.
-	require.NoError(t, store.FinalizersDelete(ctx, testGK, created.ID, "a"))
+	_, err = store.FinalizersDelete(ctx, testGK, created.ID, "a")
+	require.NoError(t, err)
 	got, err := store.ObjectsGet(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, got.Finalizers)
@@ -1843,7 +1844,8 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	// Removing a finalizer that isn't present changes nothing: the list is intact,
 	// resource_version is unbumped, and no event fires (a watcher would otherwise
 	// see a spurious diff).
-	require.NoError(t, store.FinalizersDelete(ctx, testGK, created.ID, "missing"))
+	_, err = store.FinalizersDelete(ctx, testGK, created.ID, "missing")
+	require.NoError(t, err)
 	got, err := store.ObjectsGet(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a"}, got.Finalizers)
@@ -1853,8 +1855,46 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 
 func TestDeleteFinalizerMissingObject(t *testing.T) {
 	store := newTestStore(t)
-	err := store.FinalizersDelete(context.Background(), testGK, 999, "a")
+	_, err := store.FinalizersDelete(context.Background(), testGK, 999, "a")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
+}
+
+// clearedLast is the gate behind the collect push, so it must be true for the one
+// transition that frees a blocked collect and false for every neighbour of it.
+func TestDeleteFinalizerReportsClearedLast(t *testing.T) {
+	tests := []struct {
+		name       string
+		finalizers []string
+		deleting   bool
+		remove     string
+		want       bool
+	}{
+		{"last on a deleting object", []string{"a"}, true, "a", true},
+		{"not the last on a deleting object", []string{"a", "b"}, true, "a", false},
+		{"last on a live object", []string{"a"}, false, "a", false},
+		{"absent on a deleting object", []string{"a"}, true, "missing", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+
+			created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+				Name:       uniqueName(),
+				Spec:       []byte(`{}`),
+				Finalizers: tt.finalizers,
+			})
+			require.NoError(t, err)
+			if tt.deleting {
+				_, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
+				require.NoError(t, err)
+			}
+
+			clearedLast, err := store.FinalizersDelete(ctx, testGK, created.ID, tt.remove)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, clearedLast)
+		})
+	}
 }
 
 func TestListOutgoingRefs(t *testing.T) {
@@ -4569,7 +4609,7 @@ func TestDeleteFinalizerResourceVersionError(t *testing.T) {
 	require.NoError(t, err)
 	dropSeq(t, store)
 
-	err = store.FinalizersDelete(ctx, testGK, obj.ID, "f")
+	_, err = store.FinalizersDelete(ctx, testGK, obj.ID, "f")
 	require.Error(t, err)
 }
 
@@ -6242,7 +6282,8 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 				return obj
 			},
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				require.NoError(t, store.FinalizersDelete(ctx, testGK, obj.ID, "f"))
+				_, err := store.FinalizersDelete(ctx, testGK, obj.ID, "f")
+				require.NoError(t, err)
 			},
 			logs: true,
 		},

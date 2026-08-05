@@ -402,7 +402,7 @@ func (s *fakeStore) ObjectsUpdateSpecByName(context.Context, GroupKind, string, 
 func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
 	panic("not implemented: fakeStore.UpdateStatus")
 }
-func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) error {
+func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (bool, error) {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
 func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (bool, error) {
