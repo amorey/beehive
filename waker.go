@@ -412,6 +412,9 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 // dependent the remaining pages would wake, so the waker jumps to the log's mark
 // and leaves that range to the pass.
 func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
+	if dw.abandonAfter <= 0 {
+		return scanMore // no threshold, no backstop to be overtaken by
+	}
 	now := dw.now()
 	if dw.drainSince.IsZero() {
 		dw.drainSince = now

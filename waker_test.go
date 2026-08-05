@@ -1039,6 +1039,22 @@ func TestWakerDrainStreakResetsOnAFailedPage(t *testing.T) {
 	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark)
 }
 
+// withStaleDependentsInterval validates a positive interval, but only a Beehive
+// from New goes through it — a whitebox test assembles the struct. A zero threshold
+// there must mean "drain as it always did", not "shed the whole backlog on the
+// second pass".
+func TestWakerWithNoThresholdNeverAbandons(t *testing.T) {
+	store := &cursorStore{replayStore: replayStore{rows: replayRows(3 * wakeFullBudget), seed: 9000}}
+	dw, clk, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = 0
+
+	for i := range 3 {
+		assert.Equal(t, scanMore, dw.scan(context.Background()), "pass %d keeps draining", i)
+		clk.advance(time.Hour)
+	}
+	assert.EqualValues(t, 3*wakeFullBudget, dw.watermark, "every row was paged, none skipped")
+}
+
 // The mark read decides where to skip to, and no wake depends on it. So a failure
 // there is not scanFailed — that would arm the retry backoff and drop the wakes
 // arriving meanwhile over a read the drain does not need. The drain just carries on
