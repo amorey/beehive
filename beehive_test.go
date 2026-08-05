@@ -118,6 +118,40 @@ func TestSweepFreePages(t *testing.T) {
 	})
 }
 
+// owedClearStore records the keep set each reclaim sweep passes down.
+type owedClearStore struct {
+	Store
+	kept chan []GroupKind
+	err  error
+}
+
+func (s *owedClearStore) ReconcileOwedClear(_ context.Context, keep []GroupKind) (int64, error) {
+	select {
+	case s.kept <- keep:
+	default:
+	}
+	if s.err != nil {
+		return 0, s.err
+	}
+	return int64(len(keep)), nil
+}
+
+// The reclaim keeps exactly the kinds that have a reconcile loop to drain their
+// count; every other kind's count is owed to nobody.
+func TestSweepReconcileOwedKeepsRegisteredKinds(t *testing.T) {
+	store := &owedClearStore{Store: &fakeStore{}, kept: make(chan []GroupKind, 4)}
+	bh := newTestBeehive(t, store)
+	widget, drone := GroupKind{Kind: "Widget"}, GroupKind{Kind: "Drone"}
+	_, err := Register(bh, widget, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+	_, err = Register(bh, drone, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	bh.reconcileOwedReclaimSweep(context.Background())
+
+	assert.ElementsMatch(t, []GroupKind{widget, drone}, recv(t, store.kept))
+}
+
 // The GC sweeper's three steps run together on every tick, so a store that grows a
 // freelist through the first two gets it drained by the third without a cadence of
 // its own.
