@@ -1,0 +1,94 @@
+# The dependency waker is wake-driven and has no tick
+
+- **Status:** Accepted — implemented in `waker.go`, `beehive.go`, `options.go`.
+- **Date:** 2026-08-05
+
+## Context
+
+[A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
+put a push in front of the waker's 1s scan and kept the tick as the floor behind
+it. That left the tick a heartbeat with nothing to find. In a single-process
+beehive a lost wake is close to impossible by construction — the subscription is
+registered before the seed read, the hub closes only at stop, and one slot per
+receiver means a burst cannot drop one — so essentially every tick was a quiet
+pass: one `ObjectWritesListSinceAll` that comes back empty, ~21µs by
+`BenchmarkWakerScanRateUnderSustainedWrites`. 86,400 queries a day of insurance
+against an event the push path makes very hard to arrange.
+
+The tick also only earned its keep strictly faster than 60s: at or above
+`staleDependentsInterval` it is redundant, because the backstop runs at that
+cadence and finds a superset of what a cursor replay finds.
+
+## Decision
+
+**Arm a timer only when there is a reason to look again.** `pass` answers
+`wakeIdle` after a scan that drained the log, and `run` arms nothing and blocks
+on the wake. `scanMore` re-arms at the scan throttle; `scanFailed` re-arms the
+retry. The eager first pass stays — it seeds, and a restart resumes from the
+persisted cursor there rather than on a tick.
+
+### The failure retry moved first, and is the only timer left
+
+`backingOff` *drops* arriving wakes, so a degraded store cannot be re-read as
+fast as it can fail. The floor timer used to be what cleared it; with no floor,
+a failed pass that re-armed nothing would wedge the waker for the life of the
+process. `waker.retry` is a `driver.Backoff` — `wakeRetryBase` (100ms), doubling,
+capped at `staleDependentsInterval` — the ladder `objectTailer` already uses. It
+is conditional rather than periodic, so it does not reintroduce what this
+removes, and the cap is where a retry stops being worth making: past it the
+backstop has already swept.
+
+### Two knobs the tick was standing in for
+
+`wakeInterval` also floored the cursor write, and through it decided what
+`wakePersistRetryCap` meant in seconds. That floor is now
+`wakePersistInterval` (1s, unchanged in value). And `wakeInterval <= 0` used to
+mean "no waker at all", which needed to stop being a cadence: `withDependencyWakerOff`
+says it directly.
+
+The scan floor is no longer clamped to anything. `wakeScanMinInterval` was
+clamped to the tick because a scan floor above the tick would delay a scan past
+the bound the tick was there to provide; with no tick it is the waker's only
+cadence and stands on its own.
+
+### What this gives up: a wake nobody published
+
+`signalKindWritten` publishes to an in-process hub, so the waker sees a write
+made **through this process's `Client`, `ControllerClient` or GC path** and
+nothing else. Two writers it no longer hears:
+
+- a second process writing the same store, and
+- a write issued straight to the `Store` behind the beehive's back.
+
+Both were previously covered by the tick, at its cadence. They are now covered
+by the stale-dependents pass at 60s, which derives staleness from watermarks
+rather than replaying a cursor and so finds a superset of what the waker finds —
+with `reconcile_owed` stamped before the enqueue, so a finding outlives the
+queue. Correctness is unaffected; the multi-process deployment's dependency
+latency goes from 1s to 60s.
+
+An opt-in periodic pass, off by default, would keep both. It is not built: the
+knob would exist for a deployment shape this package does not otherwise serve,
+and the honest fix for that shape is a store-backed wake rather than a tick
+whose cadence *is* the latency target.
+
+## Consequences
+
+- **An idle beehive issues no waker queries and holds no waker timer.**
+  `TestIdleWakerIssuesNoQueries` pins it: after the eager first pass the scans
+  are exactly one per commit wake.
+- **A failed scan recovers on its own.** `TestWakerRecoversFromAFailedScanWithoutATick`
+  runs with nothing behind the waker at all — no wake is sent — so only the
+  retry can produce the second read.
+- **`defaultMinRequeueInterval` no longer matches a waker cadence.** It bounds a
+  dependency cycle, and the constant it was set against is gone; it stands on
+  its own reasoning now (see
+  [the floor ADR](2026-08-04-work-queue-re-enqueue-floor.md)).
+- **The waker is the first store-backed driver with no periodic scan.** The
+  schedule watch was already an exception, but on the grounds that its gauge
+  never reaches the store — this one reads the store and still has no tick. See
+  the amendment in
+  [the drivers ADR](2026-07-28-periodic-scan-drivers.md).
+- **A test that changes an object by writing to the `Store` directly must
+  publish the wake itself.** Three did; they call `bh.signalKindWritten` where a
+  client write would have.

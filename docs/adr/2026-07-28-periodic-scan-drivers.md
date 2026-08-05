@@ -1,7 +1,9 @@
 # Every driver is a periodic scan of the store, on its own cadence
 
-- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `objectswatch.go`, `eventswatch.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md). **The stale-dependents pass gained a cursor on 2026-08-03**; it is still a scan. See [the cursor ADR](2026-08-03-stale-dependents-cursor.md).
-- **Date:** 2026-07-28; watch tail and stale-dependents cursor amended 2026-08-03
+- **Status:** Accepted — implemented in `internal/driver`, `beehive.go`, `reconciler.go`, `waker.go`, `objectswatch.go`, `eventswatch.go`, `gc.go`, `options.go`. **The object watches gained a commit wake and a 30s floor on 2026-08-03**; they are still scans, not an exception. See [the shared-tail ADR](2026-08-03-watch-shared-tail.md). **The stale-dependents pass gained a cursor on 2026-08-03**; it is still a scan. See [the cursor ADR](2026-08-03-stale-dependents-cursor.md). **The dependency
+waker lost its tick on 2026-08-05**; it is the one store-backed driver that is
+not a periodic scan. See [the wake-driven ADR](2026-08-05-the-waker-is-wake-driven.md).
+- **Date:** 2026-07-28; watch tail and stale-dependents cursor amended 2026-08-03; waker amended 2026-08-05
 
 This record is the *why*. For the case-by-case map of what each driver actually
 covers — every trigger, where it is recorded, which driver finds it, whether it
@@ -23,6 +25,13 @@ Nothing **store-backed** is pushed. Every driver over the store is a periodic
 scan, and the observable each one
 reads is the column the write already moved. A write's durable trace **is** its
 notification.
+
+*(Amended 2026-08-05.)* The dependency waker is the one exception, and it is an
+exception to the *cadence* rather than to the record: it still reads the write
+log and still enqueues from what it finds there, but only a commit makes it
+look. What entitles it to that is the stale-dependents pass, a periodic scan
+that finds a superset of what the waker finds and cannot be disabled — so the
+rule holds where it matters, one level down.
 
 **One value in beehive is pushed, and it is the one that never reaches the
 store.** The schedule gauge is the work queue's memory, so no second process and
@@ -47,7 +56,7 @@ driver with a wake, not an exception to the rule.
 | Owed pass | unsettled specs, `reconcile_owed` | `withOwedPassInterval` (per-kind, unexported) | 30s |
 | Full pass | every object of the kind | `WithFullPassInterval` (per-kind) | 0 (off) |
 | GC sweeper | `deletion_requested_at`, event retention, then free pages | `WithGCInterval` (global) | 30s |
-| Dependency waker | `resource_version` above a scan watermark | `withDependencyWakeInterval` (global, unexported) | 1s |
+| Dependency waker | `resource_version` above a scan watermark | a commit wake; no tick | — |
 | Stale dependents | targets above each dependent's watermark | `withStaleDependentsInterval` (global, unexported) | 60s |
 | Client watch | the kind's write log, above one shared cursor | `withWatchFloorInterval` (global, unexported), plus a commit wake | 30s |
 | Event watch | one object's event log, diffed against last reported | `withWatchPollInterval` (global, unexported) | 1s |
@@ -55,11 +64,11 @@ driver with a wake, not an exception to the rule.
 They are separate cadences because they are separate jobs with sharply different
 cost curves, and one interval governing several would mean tuning any of them moves
 the rest. They share two loop shapes in `internal/driver`: `driver.Run` (one cadence with
-an eager first pass — the GC sweeper, the waker, the stale-dependents pass, each
-event watch) and `driver.TickerChan`
+an eager first pass — the GC sweeper, the stale-dependents pass, each event
+watch) and `driver.TickerChan`
 (a nil channel for a disabled cadence, for the reconciler's select over the owed
-*and* full passes). The object tailer is the one loop outside them: it selects
-over its wake, its floor timer and its context, so neither shape fits. Keeping them together is what makes "a non-positive interval
+*and* full passes). The object tailer and the waker are the loops outside them: each selects over
+its wake, a timer and its context, so neither shape fits. Keeping them together is what makes "a non-positive interval
 disables this driver" one answer rather than one per driver.
 
 ### The stale-dependents pass re-derives what the waker may have missed
@@ -120,12 +129,12 @@ its cursor from `ObjectWritesMaxVersion` at startup — so the first scan report
 changes from startup, and everything below the seed is the startup pass's ground —
 then pages everything above it through the wake path, advancing per page. A page is
 complete up to its own last row, so the cursor advances by that row; a failed scan
-or lookup leaves it where it was, and the next tick re-reads exactly what is still
+or lookup leaves it where it was, and the next pass re-reads exactly what is still
 owed.
 
 This is the one driver whose cost is bounded by what *changed* rather than by what
-exists, which is why it runs an order of magnitude more often than the passes
-beside it, and why a dropped wake needs no full pass to repair. A settled dependent
+exists, which is why it can run on every commit rather than on a cadence
+of its own, and why a dropped wake needs no full pass to repair. A settled dependent
 is invisible to every owed-work listing, because its own generation never moved;
 re-reading the change that stranded it is the only thing that can find it.
 
@@ -215,7 +224,7 @@ leave subscribers stale for good.
 `WithFullPassInterval` and `WithGCInterval` are exported. The owed pass, the
 dependency waker, the stale-dependents pass, the watch tail and the event poll
 keep their options unexported — `withOwedPassInterval`,
-`withDependencyWakeInterval`, `withStaleDependentsInterval`,
+`withWakeScanMinInterval`, `withStaleDependentsInterval`,
 `withWatchFloorInterval`, `withWatchPollInterval` — reachable from the package's
 own tests and nowhere else.
 

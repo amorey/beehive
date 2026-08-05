@@ -2,7 +2,9 @@
 
 - **Status:** Accepted — implemented in `waker.go`, `objectswatch.go`,
   `watchhub.go`, `internal/rategate/rategate.go`, `internal/driver/driver.go`.
-- **Date:** 2026-08-05
+  **The floor tick was removed on 2026-08-05**: the wake is now the waker's only
+  cadence. See [the wake-driven ADR](2026-08-05-the-waker-is-wake-driven.md).
+- **Date:** 2026-08-05; floor tick removed the same day
 
 ## Context
 
@@ -48,24 +50,14 @@ process, so the hub is never idle and `Send`'s lock-free empty-hub path is never
 taken. A beehive with no watches now pays a hub mutex and one offer per commit.
 That is the price of an unconditional subscriber, not of the bus.
 
-### The floor tick stays, so this is a driver with a wake in front
+### The wake is the only cadence
 
-`wakeInterval` still bounds the worst case, a non-positive interval still turns
-the waker off — wake included — and the stale-dependents pass is still the
-guarantee underneath. A wake is an optimisation twice over: the waker is already
-an optimisation over that pass, so a lost wake costs latency against a lost
-tick, which costs latency against a lost sweep.
-
-**The floor is also the failure retry, and that is what makes raising it more
-than a cadence change.** A failed scan sets `backingOff`, which *drops* arriving
-wakes so a live writer cannot keep a degraded store re-reading as fast as it can
-fail — and the only thing that clears it is the floor timer. So lengthening
-`wakeInterval` lengthens how long a transient store error suppresses dependency
-propagation entirely, which at seconds is recovery and at a minute is an outage
-the push cannot shorten. Split the retry onto its own backoff before raising it;
-`objectTailer` already uses `driver.Backoff` for exactly this, and the flat
-floor here is only defensible while it *is* the ladder's terminal value. See the
-entry in [`TODO.md`](../TODO.md).
+*(Amended 2026-08-05.)* This ADR shipped with `wakeInterval` as the floor behind
+the wake. That tick is gone: a pass that drains the log arms nothing, and a
+failed scan re-arms `waker.retry` rather than the floor — which is what used to
+clear `backingOff`. The stale-dependents pass is still the guarantee underneath,
+and it is now the only thing covering a write this process did not publish. See
+[the wake-driven ADR](2026-08-05-the-waker-is-wake-driven.md).
 
 The closed-hub arm in `run` is a safety net rather than the normal exit: `stop`
 cancels `runCtx` and waits on the WaitGroup the waker is in, closing the hub
@@ -77,18 +69,14 @@ only after, so `ctx.Done()` wins except when the drain hits its deadline.
 only pacing would otherwise let a sustained write stream hold the connection at
 the full paging budget. `rategate` is eager after a quiet period, so an
 idle-to-active transition pays no added latency and only a sustained stream is
-paced. The value is a constant rather than a fraction of `wakeInterval`:
-deriving it would tie wake latency to a floor we want free to raise.
+paced. The value is a constant rather than a fraction of the floor: deriving it
+would have tied wake latency to a cadence we wanted free to raise.
 
-**It is clamped to `wakeInterval` all the same.** The scan floor limits how
-often a *wake* may drive a scan; it is not a cadence of its own. Above the wake
-interval it would delay a scan past the tick that bounds the worst case — and
-the two are configured independently, so a short wake interval leaving the scan
-floor at its default is the ordinary case in tests rather than a
-misconfiguration. A clamp is not a derivation: the constant stays free to be
-tuned under the floor, and only the incoherent range is cut off.
+*(Amended 2026-08-05.)* It was clamped to the floor tick, because a scan floor
+above it would have delayed a scan past the bound the tick provided. With no
+tick it is the waker's only cadence and the clamp is gone.
 
-**The cursor write is floored at `wakeInterval`.** `scan` persists on the way
+**The cursor write is floored at `wakePersistInterval` (1s).** `scan` persists on the way
 out whenever the watermark moved, which under a sustained stream is every pass —
 so a 10×-faster loop would have meant a 10×-faster `DriverCursorsSet`. Every
 other cost here is a read competing for connection time; this one is a bare
@@ -134,8 +122,8 @@ and keeps a restart with a backlog from waiting a floor for its first page.
   propagates in D commits, bounded below by the work queue's re-enqueue floor
   rather than by the waker.
 - `defaultMinRequeueInterval` is what bounds a dependency cycle now that the
-  tick does not. It was set to `defaultWakeInterval` for this change; **raising
-  either constant needs this ADR re-read first.**
+  tick does not. It was set to the waker's 1s cadence for this change; **raising
+  it needs this ADR re-read first.**
 - The waker has one clock, `waker.now`, so the rate tests drive it by hand
   rather than sleeping. `run` reads it and hands `pass` an explicit instant;
   `persist` reads it directly, because threading one through `scan` would have

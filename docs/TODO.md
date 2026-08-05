@@ -679,57 +679,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   next one may start. A throttle under the tests' failsafe timeouts would trip none
   of them — which is itself worth knowing before adding one.
 
-- **The dependency waker's 1s pass is a heartbeat with nothing to find** — known,
-  not fixed, and now that the commit wake has
-  [shipped](adr/2026-08-05-a-commit-wakes-the-dependency-waker.md) it is the one
-  loop in the system that runs unconditionally for the life of the process
-  without anything demanding it. In a healthy single-process beehive a lost push
-  is close to impossible by construction — the subscription is registered before
-  the seed read, the hub closes only at stop, and one slot per receiver means a
-  burst cannot drop one — so essentially every tick is a quiet pass: one
-  `ObjectWritesListSinceAll` that comes back empty, measured at ~21µs by
-  `BenchmarkWakerScanRateUnderSustainedWrites`. That is 86,400 queries a day of
-  insurance against an event the push path makes very hard to arrange.
-
-  **The proposal is to arm the timer only when there is a reason to look again**,
-  leaving the waker wake-driven: `scanIdle` re-arms nothing and the loop blocks on
-  the wake channel, `scanMore` keeps the throttle re-arm, and `scanFailed` re-arms
-  a retry. The eager first pass stays — it seeds, and a restart still resumes from
-  the persisted cursor on it rather than on a tick.
-
-  **The failure retry is the coupling that has to move first.** `backingOff` drops
-  arriving wakes, and today only the floor timer clears it, so a `scanFailed` that
-  re-arms nothing wedges the waker until the process restarts. It needs its own
-  delay — `driver.Backoff`, as `objectTailer` already uses — and that timer is
-  conditional rather than a heartbeat, so it does not reintroduce what this
-  removes. Two smaller ones follow: `wakeInterval` also sets the cursor-write
-  floor (and through it what `wakePersistRetryCap` means in seconds), which wants
-  its own constant; and `wakeInterval <= 0` currently means "no waker at all",
-  so a tick that becomes optional needs to be a knob of its own rather than that
-  sentinel.
-
-  **What it gives up is the multi-process case, and that is the decision to make
-  deliberately.** `signalKindWritten` publishes to an in-process hub, so a second
-  process writing the same store produces no wake here: the tick is that
-  deployment's only dependency-wake path, and its cadence is that deployment's
-  latency. An opt-in periodic pass, off by default, is the shape that keeps both
-  — but defaulting every embedded single-process beehive to a 1s loop to serve it
-  is the trade worth naming. Correctness is unaffected either way: the
-  stale-dependents pass (60s, cannot be disabled) derives staleness rather than
-  replaying a cursor, so it finds a superset of what the waker finds, and
-  `reconcile_owed` outlives the queue behind it.
-
-  Note the corollary for any interim tuning: a floor at or above
-  `staleDependentsInterval` is strictly redundant, since the backstop runs at that
-  cadence and finds more. The tick only earns its keep strictly faster than 60s.
-
-  Tripwire: none pins the cadence. `TestWakerScansWhenAWriteCommits` and
-  `TestClientOnlyTargetWakesDependent` assert that a wake and a tick each reach
-  the dependent, not that the tick runs at all, so removing it would trip neither.
-  What a change here must add is the pair nothing covers today: that a failed scan
-  recovers with no heartbeat behind it, and that an idle beehive issues no waker
-  queries at all.
-
 - **`rategate`'s eviction copies the whole live set, and only runs on `Admit`** —
   known, not fixed, and unmeasured at the cardinality where it would matter. The
   package holds each key for a fixed interval and bounds its map by *admissions
