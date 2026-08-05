@@ -17,9 +17,9 @@ package beehive
 import "github.com/amorey/gobus/watch"
 
 // watchHub holds what every gobus/watch hub in this package does the same way,
-// so the rules below are stated once rather than per hub. The two callers —
-// kindWriteHub and the work queue's scheduleHub — differ in key, value and
-// accept rule, and share nothing else.
+// so the rules below are stated once rather than per hub. Its callers —
+// signalHub's two users and the work queue's scheduleHub — differ in key, value
+// and accept rule, and share nothing else.
 //
 // **Close closes the sender, never the hub**, and both halves of that matter.
 // Hub.Close is a hard tear-down with no drain, so a receiver can lose its last
@@ -72,4 +72,24 @@ func (h watchHub[K, V]) Close() {
 	if h.hub != nil {
 		h.hub.Sender().Close()
 	}
+}
+
+// signalHub is a watchHub carrying no value: the key moved, and a receiver reads
+// what changed from the store. One slot per receiver, so a burst under one key
+// collapses into one pending signal and a publish landing mid-read waits in the
+// slot. No Accept gate is set, so every send is taken.
+type signalHub[K comparable] struct {
+	watchHub[K, struct{}]
+}
+
+func newSignalHub[K comparable]() signalHub[K] {
+	return signalHub[K]{watchHub[K, struct{}]{hub: watch.New[K, struct{}]()}}
+}
+
+func (h signalHub[K]) Send(k K) error { return h.send(k, struct{}{}) }
+
+// Watch registers a receiver for k. Registration is the baseline and the bus
+// never delivers it back, so a receiver reads only writes that follow it.
+func (h signalHub[K]) Watch(k K) (*watch.Receiver[K, struct{}], bool) {
+	return h.watch(k, struct{}{})
 }

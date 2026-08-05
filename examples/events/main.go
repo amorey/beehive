@@ -20,7 +20,7 @@
 // identical outcomes coalesce into runs, so a flapping cluster produces the
 // aggregated, newest-first timeline a panel renders:
 //
-//	Create(spec) -> prober EventsAdd×N -> Client.EventsList -> render
+//	Create(spec) -> prober EventsAdd×N -> Client.EventsWatch -> render, then resume
 //
 // Run it with `go run ./examples/events/main.go`.
 package main
@@ -108,11 +108,22 @@ func main() {
 	probe(beehive.EventWarning, "ProbeFailed", "i/o timeout", ProbeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18)
 	probe(beehive.EventNormal, "Connected", "", nil, 4)
 
-	panel, err := client.EventsList(ctx, cluster.ID, beehive.WithEventCategory("connection"))
+	stream, err := client.EventsWatch(ctx, cluster.ID, beehive.WithEventCategory("connection"))
 	exitOnErr(err)
 
 	fmt.Println("connection-health panel (newest first):")
-	renderPanel(panel)
+	renderPanel(stream.Runs)
+
+	// A panel reconnects, and resumes from what it last rendered rather than
+	// re-reading the log. The probe below arrives on its own commit.
+	resumed, err := client.EventsWatch(ctx, cluster.ID,
+		beehive.WithEventCategory("connection"),
+		beehive.WithEventsResumeFrom(stream.ResourceVersion))
+	exitOnErr(err)
+
+	probe(beehive.EventWarning, "ProbeFailed", "i/o timeout", nil, 1)
+	fmt.Println("\nlive, resumed above the snapshot:")
+	renderPanel([]beehive.Event{<-resumed.Events})
 }
 
 // renderPanel prints each run as one line: last-seen time, ✓/✗, reason, count,

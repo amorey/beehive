@@ -206,7 +206,6 @@ func fast(opts ...Option) []Option {
 		withWakeScanMinInterval(0),
 		withMinRequeueInterval(fastTick),
 		withStaleDependentsInterval(staleDependentsTick),
-		withWatchPollInterval(fastTick),
 		withWatchFloorInterval(fastTick),
 	}, opts...)
 }
@@ -426,11 +425,17 @@ func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
-func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, RawEvent) (*RawEvent, error) {
+func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, RawEvent) error {
 	panic("not implemented: fakeStore.EventsAdd")
 }
 func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
 	panic("not implemented: fakeStore.EventsList")
+}
+func (s *fakeStore) EventsListSince(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.EventsListSince")
+}
+func (s *fakeStore) EventsSnapshot(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.EventsSnapshot")
 }
 func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
 	panic("not implemented: fakeStore.EventsMaxVersion")
@@ -1156,11 +1161,10 @@ type pollProbeStore struct {
 	// listed fires after a listing returns, so a test can cancel knowing the read
 	// already succeeded and the goroutine is on its way to the send.
 	listed chan struct{}
-	// eventsListed is the event watch's equivalent of listed; metaRead, eventsMarked
-	// and eventsFailed cover the reads a tick makes before it gets there. A quiet
-	// tick stops at eventsMarked, which is what makes it the event watch's clock.
+	// eventsListed is the event reader's equivalent of tailed, and eventsFailed
+	// its failure counterpart; metaRead covers the kind check a pass makes while
+	// the id is still unassigned, which is the only clock an unresolved stream has.
 	eventsListed chan struct{}
-	eventsMarked chan struct{}
 	metaRead     chan struct{}
 	eventsFailed chan struct{}
 	// byIDs records the id batches the tail read, so a test can assert it read
@@ -1169,14 +1173,17 @@ type pollProbeStore struct {
 	// tailed fires after the tail's own listing of the write log returns.
 	tailed chan struct{}
 	// forceTrimmed overrides the horizon the tail's listing reports, so a test
-	// can sit exactly on the boundary without staging real retention.
-	forceTrimmed atomic.Int64
-	listErr      atomic.Bool
-	listIDsErr   atomic.Bool
-	getErr       atomic.Bool
-	eventsErr    atomic.Bool
-	markErr      atomic.Bool
-	metaErr      atomic.Bool
+	// can sit exactly on the boundary without staging real retention;
+	// forceEventTrimmed is its counterpart for the event log.
+	forceTrimmed      atomic.Int64
+	forceEventTrimmed atomic.Int64
+	listErr           atomic.Bool
+	listIDsErr        atomic.Bool
+	getErr            atomic.Bool
+	eventsErr         atomic.Bool
+	eventsSnapErr     atomic.Bool
+	markErr           atomic.Bool
+	metaErr           atomic.Bool
 }
 
 func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
@@ -1264,25 +1271,36 @@ func (s *pollProbeStore) ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawO
 	return s.Store.ObjectsGetMeta(ctx, id)
 }
 
-// EventsMaxVersion is the event watch's gate read, so it signals on every call —
-// error or not — the way ObjectsGetMeta does. It is the only store read a quiet
-// tick makes, so a test counting it is counting ticks.
+// EventsListSince is the event reader's own page read: it carries eventsErr and
+// signals after the read, which is the seam the cancellation test needs — past
+// it the only thing left that can observe a cancelled context is the send.
+func (s *pollProbeStore) EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
+	if s.eventsErr.Load() {
+		probeSignal(s.eventsFailed)
+		return nil, 0, errBoom
+	}
+	page, trimmed, err := s.Store.EventsListSince(ctx, id, category, afterRV, limit)
+	if forced := s.forceEventTrimmed.Load(); forced > 0 {
+		trimmed = forced
+	}
+	probeSignal(s.eventsListed)
+	return page, trimmed, err
+}
+
+// EventsSnapshot and EventsMaxVersion are the reads only the subscribe path
+// makes, each with its own fault so a test can drive one at a time.
+func (s *pollProbeStore) EventsSnapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
+	if s.eventsSnapErr.Load() {
+		return nil, 0, errBoom
+	}
+	return s.Store.EventsSnapshot(ctx, id, q)
+}
+
 func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
-	defer probeSignal(s.eventsMarked)
 	if s.markErr.Load() {
 		return 0, errBoom
 	}
 	return s.Store.EventsMaxVersion(ctx, id)
-}
-
-func (s *pollProbeStore) EventsList(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, error) {
-	if s.eventsErr.Load() {
-		probeSignal(s.eventsFailed)
-		return nil, errBoom
-	}
-	out, err := s.Store.EventsList(ctx, id, q)
-	probeSignal(s.eventsListed)
-	return out, err
 }
 
 // watchFixture wires a Beehive with one registered kind over a probe store — the
@@ -1296,7 +1314,6 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 		polled:       make(chan struct{}, 256),
 		listed:       make(chan struct{}, 256),
 		eventsListed: make(chan struct{}, 256),
-		eventsMarked: make(chan struct{}, 256),
 		metaRead:     make(chan struct{}, 256),
 		eventsFailed: make(chan struct{}, 256),
 		byIDs:        make(chan []ObjectID, 256),

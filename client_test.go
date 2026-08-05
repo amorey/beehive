@@ -2593,7 +2593,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
-	_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	plain, err := client.Get(ctx, obj.ID)
@@ -2619,9 +2619,9 @@ func TestClientListLoadsEvents(t *testing.T) {
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
-	_, err := store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	err := store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
-	_, err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
+	err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
 	require.NoError(t, err)
 
 	objs, err := client.List(ctx, LoadEvents())
@@ -2647,7 +2647,7 @@ func TestClientListEvents(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	rec := func(cat, typ, reason string) {
-		_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
+		err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
 		require.NoError(t, err)
 	}
 	rec("connection", "Warning", "ProbeFailed")
@@ -2676,7 +2676,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	_, err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	got, ok, err := client.EventsGetLatest(ctx, obj.ID, "connection")
@@ -2690,30 +2690,28 @@ func TestClientGetLatestEvent(t *testing.T) {
 }
 
 // EventsWatch streams live runs as public Events and, like Watch, requires a
-// registered controller.
+// registered controller. The write here goes straight through the Store, so it
+// publishes no wake: what delivers it is the floor tick, which is the pull path
+// every push in this system is allowed to be a shortcut for.
 func TestClientWatchEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store)
+	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	ch, err := client.EventsWatch(ctx, obj.ID)
+	stream, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	_, err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
-	select {
-	case ev := <-ch:
-		assert.Equal(t, "ProbeFailed", ev.Reason)
-		assert.Equal(t, EventWarning, ev.Type)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for event")
-	}
+	ev := recv(t, stream.Events)
+	assert.Equal(t, "ProbeFailed", ev.Reason)
+	assert.Equal(t, EventWarning, ev.Type)
 
 	unregistered := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Unregistered"})
 	_, err = unregistered.EventsWatch(ctx, obj.ID)

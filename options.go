@@ -98,43 +98,59 @@ func resolveRequeue(opts []RequeueOption) requeueOptions {
 	return o
 }
 
-// EventOption filters a Client.EventsList / EventsWatch read.
-type EventOption func(*storeapi.EventQuery)
+// EventOption configures a Client.EventsList / EventsWatch read.
+type EventOption func(*eventConfig)
+
+// eventConfig is what the event options fold into: the store query every read
+// takes, plus the stream position only a watch reads.
+type eventConfig struct {
+	query storeapi.EventQuery
+	// resumeFrom is the position to stream above, or nil to take a snapshot.
+	resumeFrom *int64
+}
 
 // WithEventCategory restricts a read to a single timeline. The category "" is
 // the default timeline (distinct from "no filter", the absence of this option).
 func WithEventCategory(category string) EventOption {
-	return func(q *storeapi.EventQuery) { q.Category = &category }
+	return func(c *eventConfig) { c.query.Category = &category }
 }
 
 // WithEventType restricts a read to one severity (Normal or Warning).
 func WithEventType(t EventType) EventOption {
-	return func(q *storeapi.EventQuery) { q.Type = string(t) }
+	return func(c *eventConfig) { c.query.Type = string(t) }
 }
 
 // WithEventReason restricts a read to runs with the given reason.
 func WithEventReason(reason string) EventOption {
-	return func(q *storeapi.EventQuery) { q.Reason = reason }
+	return func(c *eventConfig) { c.query.Reason = reason }
 }
 
-// WithEventLimit caps a read to the newest n runs. On EventsWatch it bounds
-// every poll, so the stream reports only runs inside that window.
+// WithEventLimit caps a read to the newest n runs. On EventsWatch it bounds the
+// snapshot only: a tail has no end to count back from.
 func WithEventLimit(n int) EventOption {
-	return func(q *storeapi.EventQuery) { q.Limit = n }
+	return func(c *eventConfig) { c.query.Limit = n }
 }
 
 // WithEventsSince restricts a read to runs still active at or after t (LastAt >= t).
 func WithEventsSince(t time.Time) EventOption {
-	return func(q *storeapi.EventQuery) { q.Since = t }
+	return func(c *eventConfig) { c.query.Since = t }
 }
 
-// resolveEvents folds the per-call options into a single store event query.
-func resolveEvents(opts []EventOption) storeapi.EventQuery {
-	var q storeapi.EventQuery
+// WithEventsResumeFrom streams the runs above rv instead of taking a snapshot.
+// EventsWatch only — the other reads ignore it, the way an Option ignores a
+// target it does not recognise. A position retention has passed ends the stream
+// with ErrWatchTooOld, answered by subscribing again without this option.
+func WithEventsResumeFrom(rv int64) EventOption {
+	return func(c *eventConfig) { c.resumeFrom = &rv }
+}
+
+// resolveEvents folds the per-call options into one config.
+func resolveEvents(opts []EventOption) eventConfig {
+	var c eventConfig
 	for _, o := range opts {
-		o(&q)
+		o(&c)
 	}
-	return q
+	return c
 }
 
 // createOptions collects the per-object settings the create-time options apply.
@@ -317,27 +333,6 @@ func withStaleDependentsInterval(d time.Duration) Option {
 	}
 }
 
-// withWatchPollInterval sets how often EventsWatch polls. Global and
-// meaningful only at New; the object watches subscribe to their kind's tail
-// instead (see withWatchFloorInterval), and SchedulesWatch takes no tick at
-// all. Unexported: watch latency and resolution are part of the stream's
-// documented contract. It is both the latency a subscriber sees and the
-// resolution — changes within one interval coalesce, and an object created and
-// deleted inside one is never reported. Cannot be disabled: d <= 0 is rejected
-// with ErrInvalidOption, since a watch that never polls is a stream that never
-// delivers.
-func withWatchPollInterval(d time.Duration) Option {
-	return func(target any) error {
-		if d <= 0 {
-			return fmt.Errorf("%w: withWatchPollInterval needs a positive interval, got %s", ErrInvalidOption, d)
-		}
-		if t, ok := target.(*Beehive); ok {
-			t.watchPollInterval = d
-		}
-		return nil
-	}
-}
-
 // withWatchScanMinInterval floors the gap between two wake-driven drains of a
 // kind's write log; <= 0 turns the floor off. Global and meaningful only at New.
 // Unexported: it trades watch latency against how much of the single connection
@@ -352,11 +347,11 @@ func withWatchScanMinInterval(d time.Duration) Option {
 	}
 }
 
-// withWatchFloorInterval sets how often a kind's tailer reads the log without
-// a wake. The wake covers writes made through this Beehive; the floor covers
-// what a wake cannot — a failed step, a retention trim.
-// Global and meaningful only at New, unexported for the same reason as
-// withWatchPollInterval. Cannot be disabled: d <= 0 is rejected with
+// withWatchFloorInterval sets how often a watch reads without a wake — a kind's
+// tailer, and an object's event reader. The wake covers writes made through this
+// Beehive; the floor covers what a wake cannot — a failed step, a retention
+// trim. Global and meaningful only at New, and unexported because watch latency
+// is part of the stream's contract. Cannot be disabled: d <= 0 is rejected with
 // ErrInvalidOption.
 func withWatchFloorInterval(d time.Duration) Option {
 	return func(target any) error {

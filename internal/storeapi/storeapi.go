@@ -153,6 +153,27 @@ type EventQuery struct {
 	Limit    int       // 0 = no limit; else the newest N runs
 }
 
+// Matches reports whether e satisfies q's filters. The event watch reads an
+// unfiltered page — so its cursor advances by what the log did, not by what the
+// caller asked for — and applies this to what it delivers. Limit is not a
+// predicate and is not applied here.
+//
+// Since compares in milliseconds because that is the column's resolution, and a
+// store filtering in SQL truncates the bound the same way.
+func (q EventQuery) Matches(e Event) bool {
+	switch {
+	case q.Category != nil && e.Category != *q.Category:
+		return false
+	case q.Type != "" && e.Type != q.Type:
+		return false
+	case q.Reason != "" && e.Reason != q.Reason:
+		return false
+	case !q.Since.IsZero() && e.LastAt.UnixMilli() < q.Since.UnixMilli():
+		return false
+	}
+	return true
+}
+
 // RawObject is the untyped row below the generic boundary. Spec and Status are
 // opaque JSON; the store never inspects them.
 // The json tags are a durable format, not decoration: a delete entry in the
@@ -352,7 +373,7 @@ type Store interface {
 	// appended with Count 1. Only ev's Category, Type, Reason, Message and
 	// Detail are read. Scoped to gk: wrong kind → ErrWrongKind, missing id →
 	// ErrNotFound.
-	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) (*Event, error)
+	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) error
 
 	// EventsGetLatest returns the most recent run in id's category timeline, or
 	// nil if none. Reads by id only (not kind-scoped).
@@ -361,6 +382,23 @@ type Store interface {
 	// EventsList returns id's event runs matching q, newest first (by LastAt,
 	// then id). The zero EventQuery returns every run. Not kind-scoped.
 	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
+
+	// EventsListSince returns id's runs above afterRV, oldest first, at most
+	// limit of them, with the retention horizon (0 when nothing was trimmed). An
+	// extend re-samples ResourceVersion, so the page is exactly what changed. The
+	// page is unfiltered and spans every category; category selects only which
+	// horizon is reported, nil meaning the max across the object's timelines.
+	// ErrNotFound when id holds no object: its log cascaded away with it, so an
+	// empty page there is not "no events".
+	EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
+		[]Event, int64, error)
+
+	// EventsSnapshot returns id's runs matching q and the log position the
+	// listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what EventsMaxVersion reports — the object's
+	// whole log, not the query's — so a filtered watch resumes above what it
+	// could not see. Not kind-scoped; an unknown id reads as no runs at 0.
+	EventsSnapshot(ctx context.Context, id ObjectID, q EventQuery) ([]Event, int64, error)
 
 	// EventsMaxVersion returns the highest ResourceVersion over id's event
 	// runs, 0 when there are none (unknown id included). Spans every category
