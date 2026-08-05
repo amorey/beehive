@@ -105,6 +105,53 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 	}
 }
 
+// The push rides AfterCommit, so an unwound frame discards it with its writes —
+// including a nested frame whose error the caller swallows, where the outer
+// transaction still commits.
+func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
+	ctx := context.Background()
+	client, cc, r := finalizerPushFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
+		err := cc.Within(ctx, func(ctx context.Context) error {
+			require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "f"))
+			return errBoom
+		})
+		require.ErrorIs(t, err, errBoom)
+		return nil // swallowed: the outer frame commits
+	}))
+
+	assert.Empty(t, queuedIDs(r.work))
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"f"}, got.Finalizers, "the savepoint unwound the removal too")
+}
+
+// A rejected write pushes nothing: the kind check fires before the gate is even
+// consulted.
+func TestFinalizersDeletePushesNothingOnWrongKind(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	gadgetGK := GroupKind{Kind: "Gadget"}
+	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
+	gadgetR, ok := bh.reconcilerFor(gadgetGK)
+	require.True(t, ok)
+
+	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
+	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
+	require.NoError(t, gadgets.Delete(ctx, gadget.ID))
+	drainQueue(gadgetR.work)
+
+	require.ErrorIs(t, cc.FinalizersDelete(ctx, gadget.ID, "f"), ErrWrongKind)
+	assert.Empty(t, queuedIDs(gadgetR.work))
+}
+
 // TestWriteStampsSchemaVersions verifies the lazy stamp-on-write half of the
 // migrator model: with a migrator registered, a spec write (Create) stamps the
 // migrator's current spec version and a controller status write stamps its
