@@ -434,7 +434,9 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 			dw.bh.log().WarnContext(ctx, "reading the write log's mark failed; the drain continues and a later pass retries the skip",
 				"watermark", dw.watermark, "err", err)
 		}
-		dw.drainSince = now
+		// Dated after the read, not from now above: a read that blocked longer than
+		// the window would otherwise leave the retry unpaced.
+		dw.drainSince = dw.now()
 		return scanMore
 	}
 	dw.bh.log().WarnContext(ctx, "the dependency waker's backlog outlasted the stale-dependents cadence; skipping to the write log's mark, and that pass delivers the wakes in between",

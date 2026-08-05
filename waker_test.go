@@ -1080,6 +1080,42 @@ func TestWakerAbandonRetriesAFailedMarkRead(t *testing.T) {
 	assert.Equal(t, mark, dw.watermark)
 }
 
+// slowMarkStore fails the mark read after holding the clock for hold, which is what
+// makes the restarted window's start instant observable.
+type slowMarkStore struct {
+	*cursorStore
+	clk       *fakeClock
+	hold      time.Duration
+	markReads int
+}
+
+func (s *slowMarkStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+	s.markReads++
+	s.clk.advance(s.hold)
+	return 0, errBoom
+}
+
+// The restarted window runs from after the failed read, not from before it: a read
+// that blocked longer than a window would otherwise leave the retry unpaced, which
+// is the per-pass re-reading the restart exists to stop.
+func TestWakerAbandonPacesFromAfterTheFailedMarkRead(t *testing.T) {
+	inner := &cursorStore{replayStore: replayStore{rows: replayRows(3 * wakeFullBudget), seed: 9000}}
+	dw, clk, _ := seededWaker(inner, GroupKind{Kind: "Widget"})
+	dw.abandonAfter = defaultStaleDependentsInterval
+	store := &slowMarkStore{cursorStore: inner, clk: clk, hold: 2 * dw.abandonAfter}
+	dw.bh.store = store
+
+	require.Equal(t, scanMore, dw.scan(context.Background()))
+	clk.advance(dw.abandonAfter)
+	require.Equal(t, scanMore, dw.scan(context.Background()), "the failing read does not back off")
+	require.Equal(t, 1, store.markReads)
+
+	// The read itself consumed two windows, so a window dated before it would be
+	// spent already and this pass would read the mark again.
+	assert.Equal(t, scanMore, dw.scan(context.Background()))
+	assert.Equal(t, 1, store.markReads, "the retry waits out a window measured from after the read")
+}
+
 // ObjectWritesMaxVersionAll is a bare MAX with no horizon folded in, so a trimmed
 // log answers below the watermark — and a fully trimmed one answers 0. The jump
 // must never take the watermark backwards onto rows it already scanned.
