@@ -3604,6 +3604,14 @@ func TestReconcileOwedClearUsesThePartialIndex(t *testing.T) {
 	}
 }
 
+func TestReconcileOwedClearQueryError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+
+	_, err := store.ReconcileOwedClear(context.Background(), nil)
+	require.Error(t, err)
+}
+
 // TestReconcileOwedStampRecordsFindings pins the second producer of owed work.
 // The stale-dependents pass enqueues in memory, and a restart loses that; the
 // stamp is what survives.
