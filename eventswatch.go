@@ -31,10 +31,10 @@ import (
 // See docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md.
 
 const (
-	eventPageCap = 256
-	// eventPagesPerDrain bounds one drain, so a resume after a long gap cannot
-	// monopolise the single connection. The rest is read by the next drain.
-	eventPagesPerDrain = 2
+	defaultEventPageCap = 256
+	// defaultEventPagesPerDrain bounds one drain, so a resume after a long gap
+	// cannot monopolise the single connection. The rest is read by the next drain.
+	defaultEventPagesPerDrain = 2
 )
 
 // EventStream is a live view of one object's event log: the runs matching the
@@ -97,6 +97,9 @@ func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID,
 		retry:   c.bh.watchBackoff(),
 		floor:   c.bh.watchFloor(),
 		now:     time.Now,
+
+		pageCap:       defaultEventPageCap,
+		pagesPerDrain: defaultEventPagesPerDrain,
 	}
 	if err := r.start(ctx); err != nil {
 		written.Close() // owed by every path that returns without a stream
@@ -126,6 +129,10 @@ type eventReader struct {
 	retry    driver.Backoff
 	floor    time.Duration
 	now      func() time.Time
+	// pageCap and pagesPerDrain bound one drain; fields so a test can reach the
+	// budget without staging a full page.
+	pageCap       int
+	pagesPerDrain int
 }
 
 // start makes the reads a caller learns about synchronously: the kind check, and
@@ -258,12 +265,13 @@ func (r *eventReader) drain(ctx context.Context) (more bool, err error) {
 			return false, err
 		}
 	}
-	for range eventPagesPerDrain {
+	// max: a zero budget would read nothing and still report more.
+	for range max(1, r.pagesPerDrain) {
 		n, err := r.step(ctx)
 		if err != nil {
 			return false, err
 		}
-		if n < eventPageCap {
+		if n < r.pageCap {
 			return false, nil
 		}
 	}
@@ -273,7 +281,7 @@ func (r *eventReader) drain(ctx context.Context) (more bool, err error) {
 // step reads one page of the log above the cursor, delivers what the caller
 // asked for, and returns the page length.
 func (r *eventReader) step(ctx context.Context) (int, error) {
-	page, trimmed, err := r.bh.store.EventsListSince(ctx, r.id, r.cfg.query.Category, r.cursor, eventPageCap)
+	page, trimmed, err := r.bh.store.EventsListSince(ctx, r.id, r.cfg.query.Category, r.cursor, r.pageCap)
 	if err != nil {
 		return 0, err
 	}

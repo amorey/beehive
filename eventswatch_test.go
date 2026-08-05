@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive/internal/rategate"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -473,4 +475,137 @@ func TestEventsWatchSinceAgreesAtSubMillisecond(t *testing.T) {
 	resumed, err := client.EventsWatch(ctx, obj.ID, WithEventsSince(since), WithEventsResumeFrom(0))
 	require.NoError(t, err)
 	assert.Equal(t, "Probing", recv(t, resumed.Events).Reason, "and the tail agrees with it")
+}
+
+// Every read the subscribe makes can fail, and each fails the call rather than
+// handing back a stream that ends immediately.
+func TestEventsWatchReportsSubscribeReadFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+
+	t.Run("kind check", func(t *testing.T) {
+		store.metaErr.Store(true)
+		defer store.metaErr.Store(false)
+		_, err := client.EventsWatch(ctx, obj.ID)
+		assert.ErrorIs(t, err, errBoom)
+	})
+
+	t.Run("snapshot", func(t *testing.T) {
+		store.eventsSnapErr.Store(true)
+		defer store.eventsSnapErr.Store(false)
+		_, err := client.EventsWatch(ctx, obj.ID)
+		assert.ErrorIs(t, err, errBoom)
+	})
+
+	t.Run("resume page", func(t *testing.T) {
+		store.eventsErr.Store(true)
+		defer store.eventsErr.Store(false)
+		_, err := client.EventsWatch(ctx, obj.ID, WithEventsResumeFrom(0))
+		assert.ErrorIs(t, err, errBoom)
+	})
+
+	t.Run("resume head", func(t *testing.T) {
+		// Only a resume with nothing above it reads the mark at all.
+		store.markErr.Store(true)
+		defer store.markErr.Store(false)
+		_, err := client.EventsWatch(ctx, obj.ID, WithEventsResumeFrom(1<<40))
+		assert.ErrorIs(t, err, errBoom)
+	})
+}
+
+// Retention overtaking a live stream ends it: the reader's cursor is below what
+// the log can still serve, so continuing would skip runs silently.
+func TestEventsWatchEndsWhenRetentionPassesALiveStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	stream, err := client.EventsWatch(ctx, obj.ID)
+	require.NoError(t, err)
+
+	// Forced rather than swept, so the horizon crosses this reader's cursor at a
+	// moment the test picks; the next wake is what makes it look.
+	store.forceEventTrimmed.Store(1 << 40)
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+
+	waitClosed(t, closedWhenDrained(stream.Events), "the stream to end below the horizon")
+	assert.ErrorIs(t, stream.Err(), ErrWatchTooOld)
+}
+
+// A watch needs the hub New builds: Send and Close no-op on the zero value, but
+// a receiver has to be tied to a hub, so the subscribe reports it.
+func TestEventsWatchOnABeehiveNotBuiltByNewFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Registered by hand: Register itself needs the maps New builds, and what is
+	// under test is the hub, not the registry.
+	bh := &Beehive{
+		store:       newClientTestStore(t),
+		reconcilers: map[GroupKind]*reconciler{clientTestGK: {}},
+	}
+	// The siblings still tolerate the zero hub, which is what makes Watch the
+	// odd one.
+	require.NoError(t, bh.eventWriteHub.Send(1))
+	require.NotPanics(t, bh.eventWriteHub.Close)
+
+	_, err := NewClient[cSpec, cStatus](bh, clientTestGK).EventsWatch(ctx, 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "built by New")
+}
+
+// The drain floor paces a reader the same way the object tail's does: a pass
+// inside the window reads nothing and reports when the window opens, and a
+// drain that spends its page budget re-arms for the remainder rather than for a
+// whole interval.
+func TestEventReaderPacesItsDrains(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bh, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	for _, reason := range []string{"R1", "R2"} {
+		require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
+	}
+
+	clk := &fakeClock{at: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
+	r := &eventReader{
+		bh: bh, gk: clientTestGK, id: obj.ID,
+		out:    make(chan Event, 8), // buffered: nothing here reads the stream
+		stream: &EventStream{},
+		gate:   rategate.NewSingle(time.Second),
+		retry:  bh.watchBackoff(),
+		floor:  time.Minute,
+		now:    clk.now,
+		// One run per page and one page per drain, so two runs are one page more
+		// than the budget covers.
+		pageCap: 1, pagesPerDrain: 1,
+		resolved: true,
+	}
+
+	next, backingOff, done := r.pass(ctx, clk.now(), false)
+	require.False(t, done)
+	assert.False(t, backingOff)
+	assert.Equal(t, time.Second, next, "budget spent with more above the cursor: the throttle's remainder")
+
+	next, _, done = r.pass(ctx, clk.now(), false)
+	require.False(t, done)
+	assert.Equal(t, time.Second, next, "a pass inside the window waits it out")
+
+	clk.advance(time.Second)
+	next, _, done = r.pass(ctx, clk.now(), false)
+	require.False(t, done)
+	assert.Equal(t, time.Second, next, "a full page is proof of more, so the pacing holds")
+	assert.Len(t, r.out, 2, "both runs delivered, one drain each")
+
+	clk.advance(time.Second)
+	next, _, done = r.pass(ctx, clk.now(), false)
+	require.False(t, done)
+	assert.Equal(t, r.floor, next, "a short page is the drained signal: back to the floor")
 }

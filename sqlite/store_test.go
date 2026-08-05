@@ -916,6 +916,98 @@ func TestSweepEventsExecErrors(t *testing.T) {
 	})
 }
 
+// blockEventDeletes makes any DELETE on events fail, so the sweep's horizon
+// write lands and only the delete behind it faults.
+func blockEventDeletes(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(),
+		`CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+		 BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	require.NoError(t, err)
+}
+
+// EventsSweep surfaces a delete fault that the horizon write did not see.
+func TestSweepEventsDeleteFailsAfterTheHorizon(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	id := newEventObject(t, store)
+	for _, r := range []string{"R1", "R2"} {
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r}))
+	}
+	blockEventDeletes(t, store)
+
+	_, err := store.EventsSweep(ctx, 1, 0)
+	require.Error(t, err)
+
+	// The horizon write rolls back with it: the transaction is what keeps a
+	// horizon from claiming a trim that never happened.
+	assert.Zero(t, eventHorizon(t, store, id, "c"))
+}
+
+// EventsSnapshot and EventsListSince surface a fault from either half of the
+// read they wrap.
+func TestEventsReadsSurfaceStoreErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("snapshot listing fails", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		dropEventsTable(t, store)
+		_, _, err := store.EventsSnapshot(ctx, id, storeapi.EventQuery{})
+		require.Error(t, err)
+	})
+
+	t.Run("page fails", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		dropEventsTable(t, store)
+		_, _, err := store.EventsListSince(ctx, id, nil, 0, 10)
+		require.Error(t, err)
+	})
+
+	t.Run("page row fails to scan", func(t *testing.T) {
+		store := newRawStore(t)
+		id := newEventObject(t, store)
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"}))
+		breakEventRowRead(t, store)
+		_, _, err := store.EventsListSince(ctx, id, nil, 0, 10)
+		require.Error(t, err)
+	})
+}
+
+// A non-positive limit reads nothing rather than reaching SQLite as an
+// unbounded LIMIT -1, the same as the write log's tail.
+func TestEventsListSinceRejectsANonPositiveLimit(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	id := newEventObject(t, store)
+	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: "R"}))
+
+	page, trimmed, err := store.EventsListSince(ctx, id, nil, 0, 0)
+
+	require.NoError(t, err)
+	assert.Empty(t, page)
+	assert.Zero(t, trimmed)
+}
+
+// A recorded horizon proves the object was there, so an empty page above the
+// head is answered without the existence probe behind it.
+func TestEventsListSinceAboveTheHeadIsQuiet(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	id := newEventObject(t, store)
+	for _, r := range []string{"R1", "R2"} {
+		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.Event{Category: "c", Type: "Normal", Reason: r}))
+	}
+	_, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+
+	page, trimmed, err := store.EventsListSince(ctx, id, nil, 1<<40, 10)
+	require.NoError(t, err)
+	assert.Empty(t, page)
+	assert.NotZero(t, trimmed, "the horizon still comes back on an empty page")
+}
+
 // The name is required, and the schema is what says so. No Go path can express a
 // NULL name any more — ObjectsCreateInput.Name is a string — so this reaches past
 // the store to the column itself. That is the point: without it the NOT NULL reads

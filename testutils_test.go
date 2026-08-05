@@ -1173,13 +1173,17 @@ type pollProbeStore struct {
 	// tailed fires after the tail's own listing of the write log returns.
 	tailed chan struct{}
 	// forceTrimmed overrides the horizon the tail's listing reports, so a test
-	// can sit exactly on the boundary without staging real retention.
-	forceTrimmed atomic.Int64
-	listErr      atomic.Bool
-	listIDsErr   atomic.Bool
-	getErr       atomic.Bool
-	eventsErr    atomic.Bool
-	metaErr      atomic.Bool
+	// can sit exactly on the boundary without staging real retention;
+	// forceEventTrimmed is its counterpart for the event log.
+	forceTrimmed      atomic.Int64
+	forceEventTrimmed atomic.Int64
+	listErr           atomic.Bool
+	listIDsErr        atomic.Bool
+	getErr            atomic.Bool
+	eventsErr         atomic.Bool
+	eventsSnapErr     atomic.Bool
+	markErr           atomic.Bool
+	metaErr           atomic.Bool
 }
 
 func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
@@ -1276,8 +1280,27 @@ func (s *pollProbeStore) EventsListSince(ctx context.Context, id ObjectID, categ
 		return nil, 0, errBoom
 	}
 	page, trimmed, err := s.Store.EventsListSince(ctx, id, category, afterRV, limit)
+	if forced := s.forceEventTrimmed.Load(); forced > 0 {
+		trimmed = forced
+	}
 	probeSignal(s.eventsListed)
 	return page, trimmed, err
+}
+
+// EventsSnapshot and EventsMaxVersion are the reads only the subscribe path
+// makes, each with its own fault so a test can drive one at a time.
+func (s *pollProbeStore) EventsSnapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
+	if s.eventsSnapErr.Load() {
+		return nil, 0, errBoom
+	}
+	return s.Store.EventsSnapshot(ctx, id, q)
+}
+
+func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+	if s.markErr.Load() {
+		return 0, errBoom
+	}
+	return s.Store.EventsMaxVersion(ctx, id)
 }
 
 // watchFixture wires a Beehive with one registered kind over a probe store — the
