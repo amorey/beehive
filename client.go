@@ -388,9 +388,14 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string
 		if err != nil {
 			return nil, err
 		}
-		// Routed by res.To: the edge is cross-kind, so the owner need not share
-		// this client's kind.
-		c.bh.signalRequeueNow(ctx, ObjectRef{ID: *co.owner, Group: res.To.Group, Kind: res.To.Kind})
+		// An owner whose cascade already ran would not see this child until the
+		// sweeper's next tick. A live owner is never pushed: it was waiting on
+		// nothing, and requeueNow bypasses the re-enqueue floor. Routed by
+		// res.To, since the edge is cross-kind.
+		// See docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md.
+		if res.ToDeleting {
+			c.bh.signalRequeueNow(ctx, ObjectRef{ID: *co.owner, Group: res.To.Group, Kind: res.To.Kind})
+		}
 	}
 	return raw, nil
 }
