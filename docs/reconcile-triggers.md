@@ -349,7 +349,17 @@ See [the ADR](adr/2026-08-05-the-waker-is-wake-driven.md).
 
 A failed page holds the cursor, and the retry — `driver.Backoff` from 100ms up to
 the stale-dependents cadence — reads the same range again. A failed edges lookup
-does the same. The self-edge is skipped. A wake that arrives during a reconcile
+does the same. The self-edge is skipped.
+
+**A drain gives up once case 8 has overtaken it.** One pass reads at most
+`wakeScanPagesPerPass` pages; a pass that spends the whole budget is a drain, and a
+run of them unbroken for `staleDependentsInterval` jumps the watermark to
+`ObjectWritesMaxVersionAll` instead of paging on. Case 8's first sweep of the
+process covers every dependent in the store, so past that point the pages left
+would wake work it has already found. The skipped range reaches its dependents
+through case 8. Anything but a full budget — a short page, an empty one, a failure —
+ends the drain, so this needs an unbroken one.
+See [the ADR](adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md). A wake that arrives during a reconcile
 is held by the `workQueue` dirty bit, and `done` dispatches it again.
 
 **Restart:** covered by case 8. This mechanism resumes rather than always reseeding.
@@ -386,7 +396,9 @@ this reason.
 
 **Tests:** `TestWakerScanWakesDependentsByTheirOwnKind`,
 `TestWakerSeedsFromTheStoredCursor`, `TestWakerHoldsTheWatermarkOnLookupFailure`,
-`TestWakerSkipsTheSelfEdge`, `TestClientOnlyTargetWakesDependent`.
+`TestWakerSkipsTheSelfEdge`, `TestClientOnlyTargetWakesDependent`,
+`TestWakerAbandonsADrainTheBackstopOvertook`,
+`TestWakerDrainStreakResetsOnAShortPage`.
 
 ### 7. The watermark clear on a new edge
 

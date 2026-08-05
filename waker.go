@@ -410,7 +410,8 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 // abandonIfOvertaken decides whether a drain still earns the connection it holds.
 // Once one has run for abandonAfter, the stale-dependents pass has swept every
 // dependent the remaining pages would wake, so the waker jumps to the log's mark
-// and leaves that range to the pass.
+// and leaves that range to the pass. See
+// docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md.
 func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	if dw.abandonAfter <= 0 {
 		return scanMore // no threshold, no backstop to be overtaken by

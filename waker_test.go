@@ -1104,8 +1104,8 @@ func TestWakerAbandonAfterIsTheBackstopCadence(t *testing.T) {
 // However far behind a stored cursor is, seed resumes from it: the distance is
 // in resource_version units, which EventsAdd inflates without adding anything
 // this scan would read, so no threshold over it could say whether the gap is
-// worth draining. wakeScanPagesPerPass is what bounds the cost instead, per
-// tick, whatever the gap holds.
+// worth draining. What bounds the cost instead is the page budget per pass, and
+// abandonAfter once the drain has run long enough to be overtaken.
 func TestWakerResumesAnEnormousBacklog(t *testing.T) {
 	const mark = 50_000_000
 	store := &cursorStore{
