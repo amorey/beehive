@@ -676,6 +676,40 @@ func TestOwnedObjectsWatchListReportsAnUndecodableCollectedChild(t *testing.T) {
 	assert.Nil(t, ev.Object, "the body is quarantined, the removal is not")
 }
 
+// A resume replays the gap scoped the same way a live stream is, collected
+// children included.
+func TestOwnedObjectsWatchListResumesFromAPosition(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, bh, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	other := mustCreate(t, ctx, client, "other", cSpec{})
+
+	snap, _, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	// All of this lands in the gap the resume below has to replay.
+	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
+	mustCreate(t, ctx, client, "orphan", cSpec{})
+	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"}, WithOwner(owner.ID))
+	doomed := mustCreate(t, ctx, client, "doomed", cSpec{Val: "b"}, WithOwner(owner.ID))
+	require.NoError(t, client.Delete(ctx, doomed.ID))
+	gone, err := bh.gcCollect(ctx, doomed.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+
+	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
+	require.NoError(t, err)
+
+	first := recv(t, ch)
+	assert.Equal(t, Added, first.Type)
+	assert.Equal(t, mine.ID, first.Object.ID, "the siblings outside the scope are not replayed")
+
+	second := recv(t, ch)
+	assert.Equal(t, Deleted, second.Type)
+	assert.Equal(t, doomed.ID, second.ID)
+}
+
 // An owner with no children yet is not an error: a watch is opened before the
 // children it is waiting for exist.
 func TestOwnedObjectsWatchListOverAChildlessOwnerStaysQuiet(t *testing.T) {

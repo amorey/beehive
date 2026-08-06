@@ -961,7 +961,9 @@ func (c *clientImpl[Spec, Status]) replay(
 			// every object in the page to deliver at most one.
 			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *scope.only })
 		}
-		raws, err := collectChanges(ctx, c.bh, c.gk, page, false)
+		// An owner scope cannot narrow the page first — ownership is not in the
+		// log — so it reads the page back in full and filters after.
+		raws, err := collectChanges(ctx, c.bh, c.gk, page, scope.ownedBy != nil)
 		if err != nil {
 			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
 				return 0, nil, false

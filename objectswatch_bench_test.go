@@ -47,19 +47,24 @@ func BenchmarkWritesUnderWatch(b *testing.B) {
 	cases := []struct {
 		name     string
 		kinds    int
-		watchers int // per kind
+		watchers int  // per kind
+		scoped   bool // watch one owner's children rather than the kind
 	}{
 		// The baseline: no tailer exists, so the wake hits the idle fast path.
-		{"no-watcher", 1, 0},
+		{"no-watcher", 1, 0, false},
 		// One tailer reading beside the writer. The delta from the baseline is
 		// the whole cost of the wake.
-		{"one-watcher", 1, 1},
+		{"one-watcher", 1, 1, false},
 		// The PR's central claim: watches on a kind share one tailer, so this
 		// should cost what one-watcher costs, not 64 times it.
-		{"64-watchers-one-kind", 1, 64},
+		{"64-watchers-one-kind", 1, 64, false},
 		// Read load scales with watched kinds. Writes round-robin, so each kind
 		// is written a sixteenth as often but every kind holds a tailer.
-		{"16-kinds-one-watcher-each", 16, 1},
+		{"16-kinds-one-watcher-each", 16, 1, false},
+		// An owner-scoped watch arms the tailer's owner lookup, so every drain
+		// costs one batched edge read on top. The delta from one-watcher is that
+		// read.
+		{"one-owner-scoped-watcher", 1, 1, true},
 	}
 	// Both throttle settings in one run, so the writer-side effect of the floor
 	// is a comparison rather than a checkout of the parent commit.
@@ -67,14 +72,14 @@ func BenchmarkWritesUnderWatch(b *testing.B) {
 		b.Run("throttle="+throttle.String(), func(b *testing.B) {
 			for _, tc := range cases {
 				b.Run(tc.name, func(b *testing.B) {
-					benchWritesUnderWatch(b, tc.kinds, tc.watchers, throttle)
+					benchWritesUnderWatch(b, tc.kinds, tc.watchers, tc.scoped, throttle)
 				})
 			}
 		})
 	}
 }
 
-func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, throttle time.Duration) {
+func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool, throttle time.Duration) {
 	b.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -93,12 +98,26 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, throttle ti
 		gk := GroupKind{Kind: "Bench" + strconv.Itoa(k)}
 		clients[k] = NewClient[cSpec, cStatus](bh, gk)
 
-		obj, err := clients[k].Create(ctx, "bench", cSpec{Val: "0"})
+		var opts []Option
+		var ownerID ObjectID
+		if scoped {
+			owner, err := clients[k].Create(ctx, "owner", cSpec{Val: "0"})
+			require.NoError(b, err)
+			ownerID = owner.ID
+			opts = append(opts, WithOwner(ownerID))
+		}
+		obj, err := clients[k].Create(ctx, "bench", cSpec{Val: "0"}, opts...)
 		require.NoError(b, err)
 		ids[k] = obj.ID
 
 		for range watchersPerKind {
-			_, ch, err := clients[k].WatchList(ctx)
+			watch := clients[k].WatchList
+			if scoped {
+				watch = func(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[cSpec, cStatus], <-chan ObjectChange[cSpec, cStatus], error) {
+					return clients[k].OwnedObjectsWatchList(ctx, ownerID, opts...)
+				}
+			}
+			_, ch, err := watch(ctx)
 			require.NoError(b, err)
 			watchers.Add(1)
 			// Drain, or the fan-out coalesces into a slot nobody empties and
