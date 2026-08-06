@@ -134,6 +134,15 @@ type watchScope struct {
 	ownedBy *ObjectID // one owner's children
 }
 
+// holds reports whether ch is in scope. The owner is resolved by the tailer, so
+// this decides membership per change rather than per key.
+func (s watchScope) holds(ch rawChange) bool {
+	if s.ownedBy == nil {
+		return true
+	}
+	return ch.Owner != nil && ch.Owner.ID == *s.ownedBy
+}
+
 // snapshot reads the watch's starting state, at the position its stream begins
 // above.
 func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, scope watchScope) ([]*RawObject, int64, error) {
@@ -723,7 +732,7 @@ func (c *clientImpl[Spec, Status]) tailStream(
 			}
 			floor = at
 		}
-		c.consume(ctx, work, tailer, rx, mig, cfg, floor, out)
+		c.consume(ctx, work, tailer, rx, mig, cfg, scope, floor, out)
 	}()
 	return snap, out, nil
 }
@@ -767,6 +776,7 @@ func (c *clientImpl[Spec, Status]) consume(
 	rx *conflate.Receiver[ObjectID, rawChange],
 	mig Migrator,
 	cfg watchConfig,
+	scope watchScope,
 	floor int64,
 	out chan<- ObjectChange[Spec, Status],
 ) {
@@ -778,7 +788,7 @@ func (c *clientImpl[Spec, Status]) consume(
 			c.endStream(ctx, tailer, nil, out)
 			return
 		}
-		changes, ok := c.decodeBatch(work, drainPending(ev.Value, rx), mig, cfg, floor)
+		changes, ok := c.decodeBatch(work, drainPending(ev.Value, rx), mig, cfg, scope, floor)
 		if !ok {
 			c.endStream(ctx, tailer, nil, out) // the tailer stopped under a retry
 			return
@@ -833,9 +843,10 @@ func (c *clientImpl[Spec, Status]) decodeBatch(
 	batch []rawChange,
 	mig Migrator,
 	cfg watchConfig,
+	scope watchScope,
 	floor int64,
 ) ([]ObjectChange[Spec, Status], bool) {
-	changes, loaded := c.decodeChanges(batch, mig, cfg, floor)
+	changes, loaded := c.decodeChanges(batch, mig, cfg, scope, floor)
 	retry := c.bh.watchBackoff()
 	for {
 		err := c.loadListRelated(ctx, loaded, cfg.loads)
@@ -857,13 +868,14 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 	batch []rawChange,
 	mig Migrator,
 	cfg watchConfig,
+	scope watchScope,
 	floor int64,
 ) ([]ObjectChange[Spec, Status], []*Object[Spec, Status]) {
 	changes := make([]ObjectChange[Spec, Status], 0, len(batch))
 	// Deleted objects have no relations to load: the edges went with the row.
 	var loaded []*Object[Spec, Status]
 	for _, raw := range batch {
-		if raw.ResourceVersion <= floor {
+		if raw.ResourceVersion <= floor || !scope.holds(raw) {
 			continue
 		}
 		obj, err := rawToTyped[Spec, Status](raw.Object, mig)
@@ -955,7 +967,7 @@ func (c *clientImpl[Spec, Status]) replay(
 			continue
 		}
 		retry.Reset()
-		changes, ok := c.decodeBatch(ctx, raws, mig, cfg, cursor)
+		changes, ok := c.decodeBatch(ctx, raws, mig, cfg, scope, cursor)
 		if !ok {
 			return 0, nil, false
 		}

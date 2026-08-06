@@ -580,6 +580,48 @@ func TestOwnedObjectsWatchListSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 	assert.GreaterOrEqual(t, snap.ResourceVersion, mine.ResourceVersion)
 }
 
+// A child created after the snapshot arrives as Added. This is the case a
+// denormalised owner column gets wrong: the create's log entry is appended
+// before its owner edge exists.
+func TestOwnedObjectsWatchListDeliversALaterChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	child := mustCreate(t, ctx, client, "child", cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	assert.Equal(t, Added, ev.Type)
+	assert.Equal(t, child.ID, ev.Object.ID)
+}
+
+// Everything outside the scope is silent: another owner's child, and an object
+// with no owner at all.
+func TestOwnedObjectsWatchListIgnoresWhatItDoesNotOwn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	other := mustCreate(t, ctx, client, "other", cSpec{})
+
+	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
+	mustCreate(t, ctx, client, "orphan", cSpec{})
+	// Written last, so anything ahead of it in the stream is a leak.
+	mine := mustCreate(t, ctx, client, "mine", cSpec{}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	assert.Equal(t, mine.ID, ev.Object.ID, "only the owner's own child is delivered")
+}
+
 // An owner with no children yet is not an error: a watch is opened before the
 // children it is waiting for exist.
 func TestOwnedObjectsWatchListOverAChildlessOwnerStaysQuiet(t *testing.T) {
