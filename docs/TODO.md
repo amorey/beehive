@@ -245,7 +245,11 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
 - **Reads and writes share one connection, so a live watch slows the write path** —
   known, not fixed, and deferred on the safety property it trades away rather than
-  on the size of the win. `OpenPool` sets `journal_mode(WAL)`, which lets one writer
+  on the size of the win. Written up in
+  [`docs/specs/2026-08-05-sqlite-read-pool.md`](specs/2026-08-05-sqlite-read-pool.md),
+  which carries the design, the feasibility probe's results and the acceptance
+  criteria; the sketch below is the summary.
+  `OpenPool` sets `journal_mode(WAL)`, which lets one writer
   and many readers run at the same time. Then `sqlite.Open` passes `maxConns = 1`, so
   every read queues behind every write in Go's pool and that concurrency is unused.
   The limit is `database/sql`, not SQLite.
@@ -276,6 +280,14 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   connection selection happens, so the change is a sibling `s.read(ctx)` returning
   the read pool, plus moving the read-only methods onto it.
 
+  **Not all of them are bare reads.** Four read-only methods wrap themselves in
+  `Within` — `EventsSnapshot`, `EventsListSince`, `ObjectWritesListSince` and the
+  `snapshot` behind `ObjectWritesSnapshot*` — because each pairs two reads that must
+  agree. `s.read(ctx)` returns the ambient transaction, so for those it is a no-op,
+  and they are the page reads in the tailer and event-watch drains. The split needs a
+  read-side transaction (`s.readWithin`, a DEFERRED tx on the read pool) or it moves
+  only the scalar gates.
+
   **What makes this more than a refactor.** Today a read issued outside the
   transaction while inside one deadlocks: it waits for the connection the
   transaction holds. That is loud and deterministic, and it is stated as a
@@ -286,13 +298,15 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   The tests would not exercise the new path. `OpenMemory` uses `file::memory:`, which
   is per-connection, so a second pool there is a different and empty database. The
   read pool has to fall back to the write pool in memory, which means the suite keeps
-  today's semantics and only on-disk runs cover the split.
+  today's semantics and only on-disk runs cover the split. The spec's answer is a
+  file-backed constructor plus a suite-level switch, so the integration suite runs a
+  second time on disk.
 
   **Several components budget their work against one connection**, and their
   reasoning would have to be re-read rather than assumed: the waker's page budget
-  exists so a resume "cannot monopolise the single connection" (`waker.go:101`, `:105`,
-  `:428`), the tailer reads "one after another on the single connection"
-  (`objectswatch.go:583`), and `workqueue.go` reasons about a deadlock on it.
+  exists so a resume "cannot monopolise the single connection" (`waker.go:122`, `:126`,
+  `:588`), the tailer reads "one after another on the single connection"
+  (`objectswatch.go:596`), and `workqueue.go` reasons about a deadlock on it.
   This also changes the premise of the page-cache item below, which discounts a
   larger cache because "the store is one connection, so a larger cache is not shared
   across concurrent readers the way the advice assumes".
@@ -306,7 +320,10 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
 - **The page cache and `mmap_size` are untuned, and it is unclear whether tuning them
   buys anything here** — known, not fixed. `OpenPool` sets five pragmas and leaves
-  SQLite's stock ~2MB cache and disabled memory mapping alone.
+  SQLite's stock ~2MB cache and disabled memory mapping alone. Carried as the
+  follow-on section of
+  [`docs/specs/2026-08-05-sqlite-read-pool.md`](specs/2026-08-05-sqlite-read-pool.md),
+  which changes this item's premise.
 
   Two things make this less obviously a win than the standard advice suggests. We run
   on `modernc.org/sqlite`, a pure-Go translation rather than a cgo binding, so whether
