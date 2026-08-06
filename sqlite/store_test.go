@@ -3937,6 +3937,17 @@ func TestDeleteFinalizerReadsNoBlobBesidesTheList(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
+// The finalizer list is the one blob this write does read, so an undecodable one
+// fails it. Stated as its own case because the alternative — treating a list that
+// will not decode as empty — would clear finalizers off a row nobody can read.
+func TestDeleteFinalizerRefusesAnUndecodableList(t *testing.T) {
+	store := newRawStore(t)
+	id := insertBadFinalizersRow(t, store, testGK)
+
+	_, err := store.FinalizersDelete(context.Background(), testGK, id, "a")
+	require.Error(t, err)
+}
+
 // The counter bump is the one statement in a deletion mark that runs after the row
 // was already stamped, so it is a distinct failure from the mark itself. Blocking it
 // must roll the whole thing back rather than leaving a row stamped with a version the
