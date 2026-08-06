@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -710,38 +711,58 @@ func TestOwnedObjectsListWatchResumesFromAPosition(t *testing.T) {
 	assert.Equal(t, doomed.ID, second.ID)
 }
 
-// A nil owner means "unowned" and "not resolved" alike, and only the first is
-// legitimate. The second silently drops the change forever, so it announces
-// itself: this is the sticky owner gate's continuous assertion, in place of one
-// test of one interleaving.
-func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
+// The warning is the one signal that would catch a soundness break in the owner
+// gate, so it must fire on an unresolved change and stay silent on an unowned
+// one — a kind holding both shapes would otherwise warn on every standalone
+// write and make the signal worthless.
+func TestAScopedWatchAnnouncesOnlyAnUnresolvedOwner(t *testing.T) {
+	ctx := context.Background()
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh := newTestBeehive(t, newClientTestStore(t))
+	bh.logger = logger
+	client := NewClient[cSpec, cStatus](bh, clientTestGK).(*clientImpl[cSpec, cStatus])
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	spec, err := json.Marshal(cSpec{Val: "a"})
+	require.NoError(t, err)
+	row := func(id ObjectID) *RawObject {
+		return &RawObject{ID: id, Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: spec}
+	}
+
+	// Same shape to a subscriber — a nil Owner — and only the first is a fault.
+	cfg := watchConfig{scope: watchScope{ownedBy: &owner.ID}}
+	changes, _ := client.decodeChanges([]rawChange{
+		{ID: 1, Op: WriteUpdate, ResourceVersion: 1, Object: row(1)},
+		{ID: 2, Op: WriteUpdate, ResourceVersion: 2, Object: row(2), OwnerResolved: true},
+	}, bh.migratorFor(clientTestGK), cfg, 0)
+
+	assert.Empty(t, changes, "neither belongs to the owner")
+	assert.Equal(t, 1, strings.Count(buf.String(), "unresolved owner"),
+		"the unresolved change warns, the unowned one does not")
+}
+
+// A scoped watch knows the owner, but only a caller that asked for it gets it
+// loaded: the snapshot and the stream of one call must agree on what a relation
+// accessor answers.
+func TestOwnedObjectsListWatchLeavesAnUnaskedRelationUnloaded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	logger, buf := captureLogger(slog.LevelWarn)
-	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
-	bh := newTestBeehive(t, store, fast()...)
-	bh.logger = logger
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	first := mustCreate(t, ctx, client, "first", cSpec{}, WithOwner(owner.ID))
 
-	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	snap, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID, WithLoads(LoadDependencies()))
 	require.NoError(t, err)
+	require.Len(t, snap.Objects, 1)
+	require.Equal(t, first.ID, snap.Objects[0].ID)
+	_, _, err = snap.Objects[0].Owner()
+	require.ErrorIs(t, err, ErrNotLoaded, "the snapshot loaded only what was asked for")
 
-	store.blind.Store(true)
-	dropped := mustCreate(t, ctx, client, "dropped", cSpec{}, WithOwner(owner.ID))
-	// The blinded lookup is the drain that carried the create, so by the time it
-	// fires that change has been resolved to nothing.
-	waitClosed(t, chanAfter(store.failed, 1), "the drain that cannot resolve an owner")
-
-	// A second child, resolvable, is the barrier: receiving it proves the batch
-	// holding the first has been through decodeChanges.
-	store.blind.Store(false)
-	delivered := mustCreate(t, ctx, client, "delivered", cSpec{}, WithOwner(owner.ID))
+	mustCreate(t, ctx, client, "second", cSpec{}, WithOwner(owner.ID))
 
 	ev := recv(t, ch)
-	assert.Equal(t, delivered.ID, ev.Object.ID)
-	assert.NotEqual(t, dropped.ID, ev.Object.ID, "an unresolved change is not delivered")
-	assert.Contains(t, buf.String(), "unresolved owner")
+	_, _, err = ev.Object.Owner()
+	assert.ErrorIs(t, err, ErrNotLoaded, "and so does the stream, or one call answers two ways")
 }
 
 // A scoped watch already knows every delivered object's owner — matching on it
@@ -1105,28 +1126,21 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	assert.Contains(t, buf.String(), "Watch")
 }
 
-// edgelessStore refuses the batched relation read the eager loaders and the
-// owner-scoped tailer share: broken errors it, so a watch that asked for
-// relations cannot quietly deliver objects without them, and blind answers it
-// empty, which is what an owner gate that failed to arm looks like from a
-// subscriber's side.
+// edgelessStore fails the batched relation read the eager loaders and the
+// owner-scoped tailer share, so neither can quietly deliver objects without the
+// relations it promised.
 type edgelessStore struct {
 	Store
 	broken atomic.Bool
-	blind  atomic.Bool
 	// failed fires after a refused load, so a test can wait for the tail to have
 	// met the failure instead of watching a log buffer race.
 	failed chan struct{}
 }
 
 func (s *edgelessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
-	switch {
-	case s.broken.Load():
+	if s.broken.Load() {
 		probeSignal(s.failed)
 		return nil, errBoom
-	case s.blind.Load() && r == RelationOwnedBy:
-		probeSignal(s.failed)
-		return nil, nil
 	}
 	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
 }

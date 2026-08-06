@@ -59,9 +59,13 @@ from different pages read at different times, so it is immutability doing the
 work, not a shared read. That also covers the flag flipping between two pages —
 `next` is the one carrying an owner.
 
-Because a nil `Owner` is overloaded, `decodeChanges` warns when a scoped
-subscriber sees one. It is the continuous form of the gate argument above, and
-what would catch a change that breaks either leg.
+Because a nil `Owner` is overloaded — "unowned" and "never looked up" are the
+same value — `rawChange` carries `OwnerResolved` beside it, and `decodeChanges`
+warns on an unresolved change rather than on a nil one. That distinction is the
+signal's whole worth: gated on nil, a kind holding both owned and standalone
+objects would warn on every write to a standalone one, and routine noise is
+exactly what makes the one signal that would catch a soundness break worthless.
+It is the continuous form of the gate argument above.
 
 ## The invariant
 

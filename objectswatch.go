@@ -326,6 +326,9 @@ type rawChange struct {
 	// Owner is the object's current owner, nil when it has none. Resolved only
 	// while the tailer has an owner-scoped subscriber; see objectTailer.ownerScoped.
 	Owner *ObjectRef
+	// OwnerResolved says whether Owner was looked up at all, so a nil Owner can
+	// be read as "unowned" rather than "never asked".
+	OwnerResolved bool
 }
 
 // objectTailer is one kind's shared log reader: it owns the kind's cursor,
@@ -645,6 +648,7 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 			ResourceVersion: w.ResourceVersion,
 			Object:          raw,
 			Owner:           owner,
+			OwnerResolved:   withOwners,
 		})
 	}
 	return changes, nil
@@ -884,10 +888,11 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 			continue
 		}
 		if owner := cfg.scope.ownedBy; owner != nil && (raw.Owner == nil || raw.Owner.ID != *owner) {
-			// A nil owner means "unowned" and "not resolved" alike, and the second
-			// would drop this change for good. The gate is armed before a scoped
-			// subscriber registers precisely so it cannot happen.
-			if raw.Owner == nil {
+			// An unresolved change is dropped for good, and the gate is armed before
+			// a scoped subscriber registers precisely so it cannot happen. Gated on
+			// OwnerResolved, not on a nil Owner: an unowned object is nil too, and a
+			// kind holding both shapes would warn on every write to a standalone one.
+			if !raw.OwnerResolved {
 				c.bh.log().Warn("beehive: dropping a change with an unresolved owner",
 					"op", "Watch", "group", c.gk.Group, "kind", c.gk.Kind,
 					"id", raw.ID, "resourceVersion", raw.ResourceVersion)
@@ -914,7 +919,7 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 			Object:          obj,
 		})
 		if raw.Op != WriteDelete && cfg.loads != 0 {
-			if cfg.scope.ownedBy != nil {
+			if cfg.scope.ownedBy != nil && cfg.loads&LoadOwnerBit != 0 {
 				// A scoped change reached here only by matching, so its owner is
 				// known and re-reading the edge would repeat the tailer's query.
 				obj.owner, obj.loaded = raw.Owner, obj.loaded|LoadOwnerBit
