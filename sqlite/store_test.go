@@ -6012,6 +6012,50 @@ func TestABareReadDoesNotWaitForAWriter(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+// The reads that wrap themselves are the page reads in the watch drains, so
+// they have to reach the read pool too — s.read alone leaves them on the write
+// connection, where they wait out every writer.
+func TestTheSelfWrappingReadsDoNotWaitForAWriter(t *testing.T) {
+	store := newFileRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.EventsAdd(ctx, testGK, obj.ID, storeapi.EventsAddInput{
+		Category: "Health", Type: "Normal", Reason: "Ready",
+	}))
+
+	writing, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- store.Within(ctx, func(ctx context.Context) error {
+			_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+			close(writing)
+			<-release
+			return err
+		})
+	}()
+	<-writing
+
+	reads := map[string]func() error{
+		"ObjectWritesListSince": func() error { _, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 8); return err },
+		"ObjectWritesSnapshot":  func() error { _, _, err := store.ObjectWritesSnapshot(ctx, testGK); return err },
+		"EventsSnapshot":        func() error { _, _, err := store.EventsSnapshot(ctx, obj.ID, storeapi.EventQuery{}); return err },
+		"EventsListSince":       func() error { _, _, err := store.EventsListSince(ctx, obj.ID, nil, 0, 8); return err },
+	}
+	for name, read := range reads {
+		result := make(chan error, 1)
+		go func() { result <- read() }()
+		select {
+		case err := <-result:
+			require.NoError(t, err, name)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s queued behind the writer", name)
+		}
+	}
+
+	close(release)
+	require.NoError(t, <-done)
+}
+
 // readWithin is what gives a multi-statement read one snapshot without taking
 // the write lock: two reads either side of a commit must agree, and the commit
 // must not have waited on them.

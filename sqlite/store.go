@@ -1848,7 +1848,7 @@ func (s *sqliteStore) EventsSnapshot(
 ) ([]storeapi.Event, int64, error) {
 	var runs []storeapi.Event
 	var at int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.readWithin(ctx, func(ctx context.Context) error {
 		var err error
 		if runs, err = s.EventsList(ctx, id, q); err != nil {
 			return err
@@ -1875,7 +1875,7 @@ func (s *sqliteStore) EventsListSince(
 	}
 	var runs []storeapi.Event
 	var trimmed int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.readWithin(ctx, func(ctx context.Context) error {
 		var err error
 		if runs, trimmed, err = s.eventPage(ctx, id, category, afterRV, limit); err != nil {
 			return err
@@ -2815,7 +2815,7 @@ func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.Gro
 	}
 	var writes []storeapi.ObjectWrite
 	var trimmed int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.readWithin(ctx, func(ctx context.Context) error {
 		var err error
 		if writes, trimmed, err = s.writeLogPage(ctx, gk, afterRV, limit); err != nil {
 			return err
@@ -3013,7 +3013,7 @@ func (s *sqliteStore) snapshot(
 ) ([]*storeapi.RawObject, int64, error) {
 	var rows []*storeapi.RawObject
 	var at int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.readWithin(ctx, func(ctx context.Context) error {
 		var err error
 		if rows, err = list(ctx); err != nil {
 			return err
