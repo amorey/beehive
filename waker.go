@@ -76,6 +76,10 @@ type waker struct {
 	persistRetry    driver.Backoff
 	persistOpensAt  time.Time
 
+	// trimBaseline is the highest retention horizon already reported, so one
+	// boundary costs one log line however many pages it spans.
+	trimBaseline int64
+
 	// seeded says watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero.
 	seeded bool
@@ -370,6 +374,14 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 		persisted = stored
 	}
 
+	// Against stored, not the watermark: the clamp above lowers the watermark, so
+	// comparing against it would report a span this waker had in fact processed.
+	processed := mark
+	if ok {
+		processed = stored
+	}
+	dw.noteTrim(ctx, processed, trimmed)
+
 	dw.watermark, dw.persisted, dw.seeded = watermark, persisted, true
 
 	// Persist the seed point now: a process that seeds and stops without seeing
@@ -400,6 +412,18 @@ func resumeWatermark(stored int64, ok bool, mark, trimmedThrough int64) int64 {
 		return max(mark, trimmedThrough)
 	}
 	return max(min(stored, mark), trimmedThrough)
+}
+
+// noteTrim reports the entries retention deleted before this waker read them,
+// once per boundary. processed is the position known scanned, which is not
+// always the watermark — see seed.
+func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) {
+	if trimmedThrough <= max(processed, dw.trimBaseline) {
+		return
+	}
+	dw.bh.log().WarnContext(ctx, "retention trimmed the write log below the dependency waker's cursor; the dependents of the changes in between are left to the stale-dependents pass",
+		"watermark", processed, "trimmedThrough", trimmedThrough)
+	dw.trimBaseline = trimmedThrough
 }
 
 // scan runs one pass: everything above the watermark, a page at a time. The

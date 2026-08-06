@@ -576,6 +576,45 @@ func TestWakerSeedsFromTheStoredCursor(t *testing.T) {
 	assert.Equal(t, []int64{200}, store.cursors(), "the first scan resumes at the stored cursor")
 }
 
+// A cursor below the horizon lost the entries in between: retention deleted them
+// before this waker read them, so their dependents were never woken here. The
+// span is reported, and the resume skips the range rather than replaying a log
+// that no longer holds it.
+func TestWakerReportsATrimmedSpanAtSeed(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{
+		replayStore: replayStore{seed: 500, trimmed: 450, rows: replayRows(3)},
+		stored:      map[string]int64{cursorNameWaker: 400},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	dw.seed(context.Background())
+
+	assert.EqualValues(t, 450, dw.watermark, "the resume skips what was trimmed")
+	assert.Contains(t, buf.String(), "trimmed")
+	assert.Contains(t, buf.String(), "watermark=400", "the span starts at the cursor, not at the clamp")
+	assert.Contains(t, buf.String(), "trimmedThrough=450")
+}
+
+// The clamp lowers the watermark below the horizon on every restart of a store
+// whose log was trimmed empty, so comparing the horizon against the watermark
+// would report a span this waker had in fact processed.
+func TestWakerReportsNothingWhenTheClampLowersTheWatermark(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{
+		replayStore: replayStore{seed: 0, trimmed: 900}, // the log is trimmed away entirely
+		stored:      map[string]int64{cursorNameWaker: 950},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	require.Equal(t, scanIdle, dw.seed(context.Background()))
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+
+	assert.Empty(t, buf.String(), "this waker processed past the horizon; nothing was skipped")
+}
+
 // Retention trims the write log's tail, so the mark can legitimately sit below a
 // cursor the waker really did process. A stored cursor above the mark is
 // therefore not evidence of a swapped or truncated database, and clamping to the
