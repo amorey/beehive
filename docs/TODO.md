@@ -7,28 +7,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 Once we decide to build one, the entry here shrinks to a pointer at the work, and
 moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
-- **`edges` writes do not belong in `object_writes`** — not a defect; recorded to
-  settle a question that keeps coming back. `EdgesAdd` and `EdgesDelete` bump no
-  `resource_version` and append no write-log entry, because a ref is not a field of
-  the object. Both cover themselves instead: a new edge stamps `reconcile_owed`
-  inside `EdgesAdd`, and a dropped one reports the RESTRICT block it lifted as
-  `EdgesDeleteResult.Unblocked`
-  ([ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md)). No cursor is
-  asked to see either.
-
-  **Recording them in `object_writes` would be wrong on four counts.**
-  `edges.from_id` is `ON DELETE CASCADE`, so collecting an object removes its
-  outgoing edges inside SQLite with no Go code on the path — a faithful log would
-  need a trigger, or would under-record exactly the case a log exists to make
-  recoverable. The tail emits one change per entry, so an edge add would deliver a
-  `Modified` to every subscriber of the dependent's kind for an object whose spec,
-  status and conditions are identical, and whose refs are not even in the
-  delivered object unless the caller asked for them. Retention is bounded and the
-  horizon moves, so an entry could never replace `EdgesAdd`'s `reconcile_owed`
-  stamp — it would be a second, weaker record of the same fact. And it would cost
-  a `resource_version` and an append for each edge write, on a path that is free
-  today, which a controller re-declaring its edge set every pass pays per pass.
-
 - **Marking a referrer deletion-pending unblocks its target, and nothing signals
   it** — a real gap, one GC interval of latency, no divergence.
 

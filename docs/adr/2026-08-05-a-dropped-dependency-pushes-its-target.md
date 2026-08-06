@@ -113,8 +113,19 @@ object it marked. That target waits for the sweep. See `docs/TODO.md`.
 
 - **A monotonic edge epoch**, the direction previously on record. Rejected above:
   wrong instrument for a latency problem.
-- **Recording edge writes in `object_writes`.** Rejected on four counts that
-  still hold; they are in `docs/TODO.md`.
+- **Recording edge writes in `object_writes`.** Rejected on four counts.
+  `edges.from_id` is `ON DELETE CASCADE`, so collecting an object removes its
+  outgoing edges inside SQLite with no Go code on the path — a faithful log
+  would need a trigger, or would under-record exactly the case a log exists to
+  make recoverable. The tail emits one change per entry, so an edge add would
+  deliver a `Modified` to every subscriber of the dependent's kind for an
+  object whose spec, status and conditions are identical, and whose refs are
+  not even in the delivered object unless the caller asked for them. Retention
+  is bounded and the horizon moves, so an entry could never replace
+  `EdgesAdd`'s `reconcile_owed` stamp — it would be a second, weaker record of
+  the same fact. And it would cost a `resource_version` and an append for each
+  edge write, on a path that is free today, which a controller re-declaring
+  its edge set every pass pays per pass.
 - **Gating on `EdgesHasIncoming`** so the push fires only for the genuinely last
   referrer. Rejected: a query on every drop to save a dispatch the collect
   already re-derives.
