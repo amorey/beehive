@@ -39,6 +39,7 @@ directory of archaeology.
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [One tailer per kind, woken by the commit path, above a floor tick](2026-08-03-watch-shared-tail.md)
 - [The object tail floors the gap between wake-driven drains](2026-08-05-the-object-tail-throttles-its-drains.md)
+- [An owner-scoped watch resolves ownership from current state](2026-08-06-owner-scoped-watches.md)
 - [The event watch reads from a cursor, and a commit wakes it](2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
 - [The stale-dependents pass scans from a cursor over target versions](2026-08-03-stale-dependents-cursor.md)
 - [Reclaim a client-only object's reconcile_owed count](2026-08-05-reclaim-a-client-only-owed-count.md)

@@ -309,22 +309,20 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   work in a *different* transaction from the change that owes it — the answer is
   `synchronous=FULL`, and that is the tripwire to watch for.
 
-- **Owner-scoped watches** — wanted, deliberately out of the first write-log
-  design ([ADR](adr/2026-08-02-object-write-log.md)). `OwnedObjectsList` has a
-  typed, batched read but no watch counterpart, so a subscriber that wants one
-  owner's children watches the whole kind and filters client-side.
+- **A dependent- or dependency-scoped watch does not exist** — the half of the
+  owner-scoped work that was not taken. Owner scope shipped
+  ([ADR](adr/2026-08-06-owner-scoped-watches.md)) by resolving ownership from
+  current state, which is sound only because an `owned_by` edge is written at
+  create and removed at collect, both of them logged writes to the child.
 
-  The obvious implementation is wrong. Denormalising `owner_id` into
-  `object_writes` filters on ownership *as of the write*, and ownership can
-  change afterwards: a re-parented object keeps arriving on its old owner's
-  stream and never appears on its new one, until something writes to it again.
-  Confirming each entry against current state costs a read per entry, which is
-  most of what the index was there to buy.
+  `depends_on` has neither property: `DependenciesAdd`/`DependenciesRemove`
+  mutate edges freely, and `EdgesAdd`/`EdgesDelete` bump nothing, so an edge
+  change is invisible to the tail. A scoped watch there needs the edge write to
+  become a write to its source first — which is a change to what the write log
+  means, not a filter over it.
 
-  Worth doing when someone has a real fan-out of children per owner. The design
-  choice to settle first is whether an ownership change should itself be a write
-  to the child — which would make the logged value correct by construction, and
-  would also fix `DependentsList`/`DependenciesList`, which have the same hole.
+  Worth doing when someone has a real fan-out of dependents per target. Settle
+  the edge-write question before anything else: it is the whole of the work.
 
 - **Event retention has never been audited end to end, and its shape is not
   derivable from the code** — the reason this entry exists rather than a fix.
