@@ -51,7 +51,7 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 // collect, so it pushes rather than waiting out a GC tick.
 func TestFinalizersDeletePushesTheCollect(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -77,7 +77,7 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			client, cc, r := specWriteFixture(t)
+			_, client, cc, r := specWriteFixture(t)
 
 			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(tt.finalizers...))
 			if tt.deleting {
@@ -96,7 +96,7 @@ func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
 // transaction still commits.
 func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
 	require.NoError(t, client.Delete(ctx, obj.ID))
@@ -1054,8 +1054,8 @@ type failEdgesDeleteStore struct {
 	fakeStore
 }
 
-func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
-	return errBoom
+func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+	return storeapi.EdgesDeleteResult{}, errBoom
 }
 
 // TestControllerClientDeleteDependencyDeleteRefError covers the EdgesDelete failure
@@ -1065,6 +1065,116 @@ func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
 	err := cc.DependenciesDelete(context.Background(), 1, 2)
 	require.ErrorIs(t, err, errBoom)
+}
+
+// Dropping the last live referrer is one of the routes out of a RESTRICT-blocked
+// collect, so it pushes rather than waiting out a GC tick.
+func TestDependenciesDeletePushesTheBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work))
+}
+
+// The three gates that decline the push: a live target, an edge that was never
+// there, and a dependent already finalizing (whose edge blocks nothing).
+func TestDependenciesDeletePushesNothingOtherwise(t *testing.T) {
+	tests := []struct {
+		name            string
+		declare         bool
+		deleteTarget    bool
+		deleteDependent bool
+	}{
+		{name: "live target", declare: true},
+		{name: "missing edge", deleteTarget: true},
+		{name: "finalizing dependent", declare: true, deleteTarget: true, deleteDependent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, client, cc, r := specWriteFixture(t)
+
+			target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+			dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+			if tt.declare {
+				require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+			}
+			if tt.deleteTarget {
+				require.NoError(t, client.Delete(ctx, target.ID))
+			}
+			if tt.deleteDependent {
+				require.NoError(t, client.Delete(ctx, dependent.ID))
+			}
+			drainQueue(r.work)
+
+			require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+			assert.Empty(t, queuedIDs(r.work))
+		})
+	}
+}
+
+// The edge is cross-kind, so the push routes by the target's kind rather than
+// the controller's own.
+func TestDependenciesDeletePushesAcrossKinds(t *testing.T) {
+	ctx := context.Background()
+	bh, client, cc, depR := specWriteFixture(t)
+	targetGK := GroupKind{Kind: "DropTarget"}
+	registerNoop[cSpec, cStatus](t, bh, targetGK)
+	targetR := mustReconciler(t, bh, targetGK)
+	targetClient := NewClient[cSpec, cStatus](bh, targetGK)
+
+	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	drainQueue(depR.work)
+	drainQueue(targetR.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(targetR.work), "the target's own kind is queued")
+	assert.Empty(t, queuedIDs(depR.work), "the dependent's kind is not")
+}
+
+// The target is finalizing, so it already carries an alarm from its own delete
+// push; an absorbed push would wait out the ladder the sweep was going to beat.
+func TestDependenciesDeletePushBeatsAPendingAlarm(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+	// Long enough that the alarm firing on its own would be the test hanging,
+	// not the assertion passing.
+	r.work.addAfter(target.ID, time.Hour, alarmBackoff)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work), "the drop beats the backoff alarm")
+}
+
+// A client-only target resolves to no reconciler; the sweeper stays its route.
+func TestDependenciesDeleteSkipsClientOnlyTarget(t *testing.T) {
+	ctx := context.Background()
+	bh, client, cc, r := specWriteFixture(t)
+	targetClient := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "UnregisteredTarget"})
+
+	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Empty(t, queuedIDs(r.work))
 }
 
 func TestControllerClientReadEdges(t *testing.T) {

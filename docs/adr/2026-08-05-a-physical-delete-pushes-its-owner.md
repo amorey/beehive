@@ -65,9 +65,10 @@ A self `owned_by` edge is unreachable here: `owned_by` is never discounted, so a
 owning itself is blocked forever and never reaches `ObjectsDelete`. It is also not
 constructible through the public API, where `WithOwner` is a create option.
 
-Route 3 of case 11 — `DependenciesDelete` dropping the last referrer — is untouched.
-That is edge invisibility, and the signal it needs is a "something moved" bit rather
-than an identity. See `docs/TODO.md`.
+Route 3 of case 11 — `DependenciesDelete` dropping the last referrer — is untouched
+here, and closed separately by
+[its own ADR](2026-08-05-a-dropped-dependency-pushes-its-target.md), which reports
+the lifted block from the edge write rather than inferring it from a cursor.
 
 ### Alternatives considered
 

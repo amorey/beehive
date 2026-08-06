@@ -2215,12 +2215,55 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 }
 
 // EdgesDelete removes a (from_id, to_id, relation) edge; an absent edge is a
-// silent no-op. Like EdgesAdd it bumps nothing and joins the ambient transaction.
-func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) error {
-	_, err := s.conn(ctx).ExecContext(ctx,
+// silent no-op. Like EdgesAdd it bumps nothing and joins the ambient
+// transaction. Unblocked reports that the removal lifted a RESTRICT block: the
+// edge was there, the target is deletion-pending and the source is not — the
+// last condition because EdgesHasIncoming already discounts an edge from a
+// deletion-pending source.
+func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesDeleteResult, error) {
+	res, err := s.conn(ctx).ExecContext(ctx,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		fromID, toID, string(relation))
-	return err
+	if err != nil {
+		return storeapi.EdgesDeleteResult{}, err
+	}
+	// modernc caches the count and cannot fail here; a wrong count would
+	// silently skip the caller's push.
+	if n, _ := res.RowsAffected(); n == 0 {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	// Unblocked is a depends_on verdict: the source-side discount below is the one
+	// EdgesHasIncoming gives that relation and no other.
+	if relation != storeapi.RelationDependsOn {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	// Both endpoints in one row, as EdgesAdd does. No transaction of its own. The
+	// gap costs at most a push: a source marked deletion-pending inside it reads
+	// as "was already discounted", and the target waits for the sweep. See
+	// docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
+	//
+	// A failure here is reported, not swallowed. Inside an ambient Within the
+	// caller's rollback unwinds the DELETE, so a retry re-runs cleanly and
+	// pushes. Outside one the DELETE stands and the retry removes nothing, so
+	// the report costs the push, not the collect: the sweeper is the route, and
+	// it cannot be turned off.
+	var to storeapi.GroupKind
+	var unblocked int
+	err = s.conn(ctx).QueryRowContext(ctx, `
+		SELECT t."group", t.kind,
+		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
+		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
+		toID, fromID).Scan(&to.Group, &to.Kind, &unblocked)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil // an endpoint went in the gap: nothing left to push
+		}
+		return storeapi.EdgesDeleteResult{}, err
+	}
+	if unblocked == 0 {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	return storeapi.EdgesDeleteResult{To: to, Unblocked: true}, nil
 }
 
 // EdgesListIncoming returns the objects pointing at toID through relation, joining edges
