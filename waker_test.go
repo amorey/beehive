@@ -154,6 +154,37 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 	})
 }
 
+// Priming is what Start does before it returns, and the order inside it is the
+// whole design: the waker has no tick, so a commit landing before the subscribe
+// wakes nothing at all.
+func TestWakerPrimeSubscribesBeforeItSeeds(t *testing.T) {
+	store := &subscribeProbe{Store: &replayStore{seed: 500}}
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	require.NoError(t, err)
+	store.dw = bh.waker
+
+	bh.waker.prime(context.Background())
+	defer bh.waker.teardown()
+
+	assert.True(t, store.subscribed, "a write committed during the seed read must still find a listener")
+	require.True(t, bh.waker.seeded)
+	assert.EqualValues(t, 500, bh.waker.watermark)
+}
+
+// subscribeProbe reports whether the waker was listening for wakes by the time
+// its seed read ran.
+type subscribeProbe struct {
+	Store
+	dw         *waker
+	subscribed bool
+}
+
+func (s *subscribeProbe) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
+	s.subscribed = s.dw.written != nil
+	return s.Store.ObjectWritesMaxVersionAll(ctx)
+}
+
 // What the seed in Start left behind decides the loop's opening move. The gate
 // is seeded rather than the primed value, so a waker nobody primed retries
 // instead of reading scanResult's zero value as "caught up" and idling forever.
@@ -194,13 +225,14 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 
+	// Priming is what Start does, and it subscribes before it seeds — so once it
+	// returns, "the waker was listening" is a fact rather than a bet on
+	// scheduling. A send with no receiver reaches nobody, and there is no replay.
+	bh.waker.prime(ctx)
+	waitClosed(t, chanAfter(store.seeded, 1), "the waker to seed its watermark")
+
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(ctx) }()
-
-	// The seed read follows the subscribe, so waiting for it makes "the waker
-	// was listening" a fact rather than a bet on scheduling. A send with no
-	// receiver reaches nobody, and there is no replay.
-	waitClosed(t, chanAfter(store.seeded, 1), "the waker to seed its watermark")
 
 	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Unwatched"}),
 		"any kind wakes it: the scan is store-wide")
@@ -243,27 +275,33 @@ func TestAClientWriteWakesTheWakersSubscription(t *testing.T) {
 }
 
 // The wake is the waker's only cadence, so a Beehive assembled without a hub —
-// every waker test above — still runs, but on the eager first pass alone. The
-// stale-dependents pass is what covers it from there.
+// every waker test above — drains whatever its seed found and then idles for
+// good. The stale-dependents pass is what covers it from there.
 func TestWakerRunsWithoutAWriteHub(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := &replayStore{rows: replayRows(1), lists: make(chan struct{}, 8)}
+	// A stored cursor below the mark, so the seed leaves a backlog: without one
+	// there is nothing this waker could ever be driven by.
+	store := &cursorStore{
+		replayStore: replayStore{seed: 500, rows: replayRows(1), lists: make(chan struct{}, 8)},
+		stored:      map[string]int64{cursorNameWaker: 200},
+	}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
-	dw.seeded = true
+	dw.prime(ctx)
+	require.Equal(t, scanMore, dw.primed)
 
 	done := make(chan struct{})
 	go func() { defer close(done); dw.run(ctx) }()
 
-	waitClosed(t, chanAfter(store.lists, 1), "the eager first pass")
+	waitClosed(t, chanAfter(store.lists, 1), "the drain the seed asked for")
 	cancel()
 	waitClosed(t, done, "the waker to stop")
 }
 
 // The waker holds no timer of its own while it is idle: with nothing to drive
-// it but a commit, the scans are exactly the ones this test caused — the eager
-// first pass and one per wake.
+// it but a commit, the scans are exactly the ones this test caused — one per
+// wake, and none at all before the first.
 func TestIdleWakerIssuesNoQueries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -275,14 +313,13 @@ func TestIdleWakerIssuesNoQueries(t *testing.T) {
 	bh := newTestBeehive(t, store, withWakeScanMinInterval(0))
 	_, err := Register(bh, widget, &reconcileCapture{})
 	require.NoError(t, err)
-	bh.waker.seeded = true
+	bh.waker.prime(ctx)
 
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(ctx) }()
 
 	// One wake at a time: the hub holds one slot per receiver, so two sends the
 	// waker has not read yet collapse into one.
-	waitClosed(t, chanAfter(store.lists, 1), "the eager first pass")
 	for range 2 {
 		require.NoError(t, bh.kindWriteHub.Send(widget))
 		waitClosed(t, chanAfter(store.lists, 1), "a scan for the wake")
@@ -290,11 +327,12 @@ func TestIdleWakerIssuesNoQueries(t *testing.T) {
 
 	cancel()
 	waitClosed(t, done, "the waker to stop")
-	assert.Len(t, store.pages, 3, "nothing but a wake reads the store")
+	assert.Len(t, store.pages, 2, "nothing but a wake reads the store")
 }
 
 // The retry is the only way back from a failed scan: backingOff drops the wakes
-// arriving meanwhile, and nothing ticks. No wake is sent here at all.
+// arriving meanwhile, and nothing ticks. One wake causes the failure, and no
+// second one is sent — the recovery is the retry's doing alone.
 func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -310,11 +348,12 @@ func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
 	bh := newTestBeehive(t, store, withStaleDependentsInterval(fastTick))
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
-	bh.waker.seeded = true
+	bh.waker.prime(ctx)
 
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(ctx) }()
 
+	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Widget"}))
 	waitClosed(t, chanAfter(store.lists, 2), "the waker to retry the scan that failed")
 	cancel()
 	waitClosed(t, done, "the waker to stop")
@@ -330,16 +369,20 @@ func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
 func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
 	store := &replayStore{rows: replayRows(3), err: errBoom, lists: make(chan struct{}, 8)}
 	bh := newTestBeehive(t, store)
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	widget := GroupKind{Kind: "Widget"}
+	_, err := Register(bh, widget, &reconcileCapture{})
 	require.NoError(t, err)
-	// Past the seed, so the first pass is a scan — and it fails.
-	bh.waker.seeded = true
+	bh.waker.prime(context.Background())
 
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(context.Background()) }()
+
+	// The first wake drives a scan — and it fails, which is what starts the
+	// backoff the second wake below must not break into.
+	require.NoError(t, bh.kindWriteHub.Send(widget))
 	waitClosed(t, chanAfter(store.lists, 1), "the waker's first scan")
 
-	require.NoError(t, bh.kindWriteHub.Send(GroupKind{Kind: "Widget"}))
+	require.NoError(t, bh.kindWriteHub.Send(widget))
 	bh.kindWriteHub.Close()
 	waitClosed(t, done, "the waker to stop")
 
@@ -355,6 +398,7 @@ func TestWakerClosedHubArmReturns(t *testing.T) {
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
+	bh.waker.prime(context.Background())
 
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(context.Background()) }()
@@ -892,8 +936,10 @@ func TestWakerDisabledByOption(t *testing.T) {
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
 	require.NoError(t, withDependencyWakerOff()(dw.bh))
 
+	dw.prime(context.Background())
 	dw.run(context.Background()) // returns immediately; a running waker would block
 
+	assert.False(t, dw.seeded, "a disabled waker does not read the store to seed")
 	assert.Empty(t, store.pages, "a disabled waker never scans")
 }
 

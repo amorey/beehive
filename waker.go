@@ -21,11 +21,13 @@ import (
 	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/rategate"
 	"github.com/amorey/gobus"
+	"github.com/amorey/gobus/watch"
 )
 
 // waker requeues the dependents of everything that changed: each commit wakes a
 // scan of the store's write log from a watermark. One per control plane; only
-// the waker goroutine touches its fields.
+// prime and the waker goroutine touch its fields, and prime runs before that
+// goroutine exists.
 //
 // It is an optimisation, not a guarantee — the stale-dependents pass
 // (staleDependentsRun) is what makes a dependency wake certain, so a wake lost
@@ -82,6 +84,11 @@ type waker struct {
 	// from.
 	primed scanResult
 
+	// written carries the commit wakes; rx is what closes it. nil when the
+	// Beehive was assembled without a hub, which blocks forever.
+	written <-chan gobus.Event[GroupKind, struct{}]
+	rx      *watch.Receiver[GroupKind, struct{}]
+
 	// drainSince is when the current run of budget-exhausting passes began; zero
 	// when no drain is running. Only paging counts, so a gate refusal is not a
 	// drain.
@@ -133,33 +140,34 @@ const wakeScanPagesPerPass = 4
 // not publish is left to the stale-dependents pass. See
 // docs/adr/2026-08-05-the-waker-is-wake-driven.md.
 func (dw *waker) run(ctx context.Context) {
-	// No registered controllers means nowhere to queue anything.
-	if len(dw.bh.order) == 0 || dw.bh.wakerOff {
+	if dw.off() {
 		return
 	}
-	// Subscribed before the first pass, for newObjectTailer's reason: a write
-	// landing between the subscribe and the seed read would be missed by both.
-	// Every kind, because an edge can point at one the waker cannot name. A nil
-	// channel blocks forever, so a Beehive assembled without a hub seeds and
-	// then waits out its context.
-	var written <-chan gobus.Event[GroupKind, struct{}]
-	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
-		defer rx.Close()
-		written = rx.Chan()
-	}
+	defer dw.teardown()
 
-	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	// The instant timer.C is set to fire, zero when nothing is armed. A wake
 	// that would only push it later leaves it alone.
 	var armedFor time.Time
 
-	backingOff := false
+	// Opened from what prime's seed left behind rather than from an eager pass:
+	// a seeded waker that is caught up has nothing to read until a commit says
+	// so. An unseeded one drops wakes until its retry fires, as any failed pass
+	// does.
+	backingOff := !dw.seeded
+	if wait := dw.primedWait(); wait == wakeIdle {
+		timer.Stop()
+	} else {
+		driver.Rearm(timer, wait)
+		armedFor = dw.now().Add(wait)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case _, open := <-written:
+		case _, open := <-dw.written:
 			if !open {
 				return // only stop closes the hub, and the waker has nobody to tell
 			}
@@ -185,6 +193,37 @@ func (dw *waker) run(ctx context.Context) {
 			driver.Rearm(timer, next)
 			armedFor = now.Add(next)
 		}
+	}
+}
+
+// off reports that this beehive has no use for a waker: no registered
+// controllers means nowhere to queue anything.
+func (dw *waker) off() bool { return len(dw.bh.order) == 0 || dw.bh.wakerOff }
+
+// prime subscribes to the commit wakes and seeds the watermark. Start calls it
+// before it returns, so both precede every write a caller could make. A failed
+// seed leaves the waker unseeded, which run retries.
+//
+// Subscribe first, and not only for newObjectTailer's reason that a write
+// between the two would be missed by both: the waker has no tick, so a commit
+// landing before the subscribe wakes nothing at all. Every kind, because an edge
+// can point at one the waker cannot name.
+func (dw *waker) prime(ctx context.Context) {
+	if dw.off() {
+		return
+	}
+	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
+		dw.rx, dw.written = rx, rx.Chan()
+	}
+	dw.primed = dw.seed(ctx)
+}
+
+// teardown ends the wake subscription. Idempotent, so an aborted Start and a
+// returning run can both call it.
+func (dw *waker) teardown() {
+	if dw.rx != nil {
+		dw.rx.Close()
+		dw.rx, dw.written = nil, nil
 	}
 }
 
