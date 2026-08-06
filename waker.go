@@ -454,7 +454,7 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 // budget rather than the log is what stopped it.
 func (dw *waker) scanPages(ctx context.Context) scanResult {
 	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
-		page, _, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
+		page, trimmed, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
 				return scanFailed // shutdown cancelled this read
@@ -463,6 +463,9 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 				"watermark", dw.watermark, "err", err)
 			return scanFailed
 		}
+		// Before the page is consumed: a backlog drains past the boundary, so a
+		// check made after would find the watermark already above it.
+		dw.noteTrim(ctx, dw.watermark, trimmed)
 		if len(page) == 0 {
 			return scanIdle
 		}

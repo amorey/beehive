@@ -615,6 +615,46 @@ func TestWakerReportsNothingWhenTheClampLowersTheWatermark(t *testing.T) {
 	assert.Empty(t, buf.String(), "this waker processed past the horizon; nothing was skipped")
 }
 
+// A waker whose scans have been failing sits still while retention keeps
+// trimming, so the boundary rises under a live cursor too — and the page it
+// finally reads is the one that says so. One line per boundary, not one per page.
+func TestWakerReportsATrimmedSpanOnce(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &replayStore{rows: replayRows(2*wakeScanPageCap + 1), trimmed: 450}
+	dw, _, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	require.Equal(t, scanIdle, dw.scan(context.Background()), "several pages, one scan")
+	require.Equal(t, 1, strings.Count(buf.String(), "trimmedThrough=450"))
+
+	buf.Reset()
+	dw.watermark = 0 // fall behind again, under a boundary that has not moved
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Empty(t, buf.String(), "the same boundary is reported once, not once per pass")
+
+	store.trimmed = 900
+	dw.watermark = 0
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Contains(t, buf.String(), "trimmedThrough=900", "a boundary that rises is a new loss")
+}
+
+// An untrimmed log reports 0, and a boundary the waker has already scanned past
+// cost it nothing — equality included, since the next unread entry is above it.
+func TestWakerReportsNothingOnAnUntrimmedLog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &replayStore{rows: replayRows(3)}
+	dw, _, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	require.Empty(t, buf.String(), "nothing has been trimmed")
+
+	store.trimmed = 3 // exactly the watermark: the next unread entry is 4
+	dw.watermark = 3
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Empty(t, buf.String(), "a cursor on the boundary has lost nothing")
+}
+
 // Retention trims the write log's tail, so the mark can legitimately sit below a
 // cursor the waker really did process. A stored cursor above the mark is
 // therefore not evidence of a swapped or truncated database, and clamping to the
