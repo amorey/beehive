@@ -430,7 +430,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 		assert.Equal(t, wakeRetryBase, next, "a scan that worked resets the ladder")
 	})
 
-	t.Run("the retry ladder is capped by the backstop's cadence", func(t *testing.T) {
+	t.Run("the retry ladder is capped by its own constant", func(t *testing.T) {
 		dw, clk, _ := seededWaker(&replayStore{rows: replayRows(3), err: errBoom}, widget)
 
 		var last time.Duration
@@ -438,8 +438,7 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 			last, _ = dw.pass(ctx, clk.now(), false)
 			clk.advance(defaultWakeScanMinInterval)
 		}
-		assert.Equal(t, defaultStaleDependentsInterval, last,
-			"past the stale-dependents pass a retry finds a subset of what the backstop already found")
+		assert.Equal(t, wakeRetryMax, last, "a failing scan settles at a cadence the store is sized for")
 	})
 
 	t.Run("a throttled pass keeps a failure's backoff", func(t *testing.T) {
@@ -1310,6 +1309,34 @@ func TestWakerDrainStreakResetsOnAFailedPage(t *testing.T) {
 	store.rows = replayRows(2 * wakeFullBudget)
 	assert.Equal(t, scanMore, dw.scan(context.Background()), "the drain that failed does not count toward this one")
 	assert.EqualValues(t, 2*wakeFullBudget, dw.watermark)
+}
+
+// The waker takes two boundaries from the Beehive, and only one of them is the
+// stale-dependents cadence. The abandon jump is sound *because* that pass has
+// already swept the range it skips, so it tracks the option however long it is.
+// A retry ladder capped there would instead wedge the waker for that long on a
+// transient store error, with backingOff dropping every wake meanwhile.
+func TestWakerRetryCapIsNotTheBackstopsCadence(t *testing.T) {
+	ctx := context.Background()
+	bh := &Beehive{
+		store:                   &replayStore{rows: replayRows(3), err: errBoom},
+		wakeScanMinInterval:     defaultWakeScanMinInterval,
+		wakePersistInterval:     defaultWakePersistInterval,
+		staleDependentsInterval: time.Hour,
+	}
+	dw := newWaker(bh)
+	clk := fakeClockOn(&dw.now)
+	dw.seeded = true
+
+	assert.Equal(t, time.Hour, dw.abandonAfter, "the abandon window is the backstop's, by argument")
+
+	var next time.Duration
+	for range 20 {
+		next, _ = dw.pass(ctx, clk.now(), false)
+		clk.advance(defaultWakeScanMinInterval)
+	}
+	assert.Equal(t, wakeRetryMax, next)
+	assert.Less(t, next, bh.staleDependentsInterval, "recovery must not lengthen with the backstop")
 }
 
 // withStaleDependentsInterval validates a positive interval, but only a Beehive

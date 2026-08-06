@@ -94,8 +94,8 @@ type waker struct {
 	drainSince time.Time
 
 	// abandonAfter is how long a drain may run before the stale-dependents pass
-	// has found everything it is still working toward — the same boundary
-	// retry.Max takes, for the same reason. Non-positive drains unbounded.
+	// has found everything it is still working toward, so it is that pass's
+	// cadence and no other. Non-positive drains unbounded.
 	abandonAfter time.Duration
 }
 
@@ -112,11 +112,16 @@ const noStoredCursor = int64(-1)
 // for as long as it stays broken.
 const wakePersistRetryMax = time.Minute
 
-// wakeRetryBase is the first delay after a failed scan; it doubles up to the
-// stale-dependents cadence, past which a retry only re-derives what that pass
-// has already found. A failed pass must re-arm it: backingOff drops the wakes
+// wakeRetryBase is the first delay after a failed scan; it doubles up to
+// wakeRetryMax. A failed pass must re-arm it: backingOff drops the wakes
 // arriving meanwhile, so nothing else would look again.
 const wakeRetryBase = 100 * time.Millisecond
+
+// wakeRetryMax caps that ladder. Not the stale-dependents cadence, which the
+// embedder sizes for battery: a transient store error would then wedge the
+// waker — and every wake arriving meanwhile — for minutes.
+// See docs/adr/2026-08-06-driver-cadences-are-configurable.md.
+const wakeRetryMax = 30 * time.Second
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
 // trips on the store's single connection.
@@ -238,13 +243,16 @@ func newWaker(bh *Beehive) *waker {
 		bh:      bh,
 		cursors: cursors,
 		now:     time.Now,
-		retry:   driver.Backoff{Base: wakeRetryBase, Max: bh.staleDependentsInterval},
+		retry:   driver.Backoff{Base: wakeRetryBase, Max: wakeRetryMax},
 		persistRetry: driver.Backoff{
 			Base: max(bh.wakePersistInterval, wakeRetryBase),
 			Max:  wakePersistRetryMax,
 		},
-		scanGate:     rategate.NewSingle(bh.wakeScanMinInterval),
-		persistGate:  rategate.NewSingle(bh.wakePersistInterval),
+		scanGate:    rategate.NewSingle(bh.wakeScanMinInterval),
+		persistGate: rategate.NewSingle(bh.wakePersistInterval),
+		// Tracks the backstop's cadence by argument, not by shared default: the
+		// jump is sound only because that pass has swept the range. See
+		// docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md.
 		abandonAfter: bh.staleDependentsInterval,
 	}
 }
