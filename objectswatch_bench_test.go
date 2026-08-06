@@ -114,7 +114,7 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 			var ch <-chan ObjectChange[cSpec, cStatus]
 			var err error
 			if scoped {
-				_, ch, err = clients[k].OwnedObjectsWatchList(ctx, ownerID)
+				_, ch, err = clients[k].OwnedObjectsListWatch(ctx, ownerID)
 			} else {
 				_, ch, err = clients[k].WatchList(ctx)
 			}

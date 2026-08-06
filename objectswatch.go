@@ -132,9 +132,9 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	return snap, ch, nil
 }
 
-// OwnedObjectsWatchList streams the objects of this client's kind owned by
+// OwnedObjectsListWatch streams the objects of this client's kind owned by
 // ownerID. See the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) OwnedObjectsWatchList(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) OwnedObjectsListWatch(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	// Ownership is not in the log, so unlike Watch this cannot filter the fan-out
 	// by key: the tailer resolves each change's owner and the subscriber matches
 	// on it. See docs/adr/2026-08-06-owner-scoped-watches.md.

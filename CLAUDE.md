@@ -185,7 +185,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
-- **`OwnedObjectsWatchList` scopes a watch to one owner's children, and reads
+- **`OwnedObjectsListWatch` scopes a watch to one owner's children, and reads
   ownership from current state.** Never from the log: a create's entry is
   appended *before* its `owned_by` edge, in the same transaction, so a
   denormalised `owner_id` would be NULL on the write that matters most. The

@@ -6,7 +6,7 @@
 ## Context
 
 `OwnedObjectsList` reads one owner's children in a batched query. Its watch
-counterpart, `OwnedObjectsWatchList`, has to answer the same question of a
+counterpart, `OwnedObjectsListWatch`, has to answer the same question of a
 change stream: is this object one of ownerID's children?
 
 The write log records what changed, not what it belonged to. The obvious fix —

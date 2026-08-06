@@ -561,7 +561,7 @@ func TestWatchListReturnsASnapshot(t *testing.T) {
 
 // An owner-scoped snapshot holds that owner's children and nothing else — not a
 // sibling owner's, and not an unowned object.
-func TestOwnedObjectsWatchListSnapshotsOnlyTheOwnersChildren(t *testing.T) {
+func TestOwnedObjectsListWatchSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
@@ -572,7 +572,7 @@ func TestOwnedObjectsWatchListSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
 	mustCreate(t, ctx, client, "orphan", cSpec{})
 
-	snap, _, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	snap, _, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	require.Len(t, snap.Objects, 1)
@@ -583,14 +583,14 @@ func TestOwnedObjectsWatchListSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 // A child created after the snapshot arrives as Added. This is the case a
 // denormalised owner column gets wrong: the create's log entry is appended
 // before its owner edge exists.
-func TestOwnedObjectsWatchListDeliversALaterChild(t *testing.T) {
+func TestOwnedObjectsListWatchDeliversALaterChild(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	child := mustCreate(t, ctx, client, "child", cSpec{Val: "a"}, WithOwner(owner.ID))
@@ -602,7 +602,7 @@ func TestOwnedObjectsWatchListDeliversALaterChild(t *testing.T) {
 
 // Everything outside the scope is silent: another owner's child, and an object
 // with no owner at all.
-func TestOwnedObjectsWatchListIgnoresWhatItDoesNotOwn(t *testing.T) {
+func TestOwnedObjectsListWatchIgnoresWhatItDoesNotOwn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
@@ -610,7 +610,7 @@ func TestOwnedObjectsWatchListIgnoresWhatItDoesNotOwn(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
 
-	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
@@ -625,14 +625,14 @@ func TestOwnedObjectsWatchListIgnoresWhatItDoesNotOwn(t *testing.T) {
 // A collected child is still the owner's. Its owned_by edge cascades away with
 // the row, so the scope is decided from the log entry's image — the only place
 // the owner survives.
-func TestOwnedObjectsWatchListReportsACollectedChild(t *testing.T) {
+func TestOwnedObjectsListWatchReportsACollectedChild(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_, bh, client, _ := watchFixture(t)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	child := mustCreate(t, ctx, client, "child", cSpec{Val: "final"}, WithOwner(owner.ID))
 
-	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, child.ID))
@@ -652,7 +652,7 @@ func TestOwnedObjectsWatchListReportsACollectedChild(t *testing.T) {
 // A collected child whose spec cannot be decoded is still reported: the scope
 // comes off the resolved owner, not off the object that failed to decode, so
 // quarantining the body must not also drop the removal.
-func TestOwnedObjectsWatchListReportsAnUndecodableCollectedChild(t *testing.T) {
+func TestOwnedObjectsListWatchReportsAnUndecodableCollectedChild(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store, _, client, _ := watchFixture(t)
@@ -665,7 +665,7 @@ func TestOwnedObjectsWatchListReportsAnUndecodableCollectedChild(t *testing.T) {
 	_, err = store.EdgesAdd(ctx, poison.ID, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 
-	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
@@ -678,14 +678,14 @@ func TestOwnedObjectsWatchListReportsAnUndecodableCollectedChild(t *testing.T) {
 
 // A resume replays the gap scoped the same way a live stream is, collected
 // children included.
-func TestOwnedObjectsWatchListResumesFromAPosition(t *testing.T) {
+func TestOwnedObjectsListWatchResumesFromAPosition(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_, bh, client, _ := watchFixture(t)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
 
-	snap, _, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	snap, _, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	// All of this lands in the gap the resume below has to replay.
@@ -698,7 +698,7 @@ func TestOwnedObjectsWatchListResumesFromAPosition(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, gone)
 
-	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
 	require.NoError(t, err)
 
 	first := recv(t, ch)
@@ -724,7 +724,7 @@ func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
 	store.blind.Store(true)
@@ -746,7 +746,7 @@ func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
 
 // A scoped watch already knows every delivered object's owner — matching on it
 // is how the object got here — so LoadOwner costs it no second query.
-func TestOwnedObjectsWatchListLoadsTheOwnerItAlreadyResolved(t *testing.T) {
+func TestOwnedObjectsListWatchLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := &countingLoadStore{Store: newClientTestStore(t)}
@@ -754,7 +754,7 @@ func TestOwnedObjectsWatchListLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	snap, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID, WithLoads(LoadOwner()))
+	snap, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID, WithLoads(LoadOwner()))
 	require.NoError(t, err)
 	require.Empty(t, snap.Objects)
 	before := store.relationReads.Load()
@@ -772,14 +772,14 @@ func TestOwnedObjectsWatchListLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 
 // An owner with no children yet is not an error: a watch is opened before the
 // children it is waiting for exist.
-func TestOwnedObjectsWatchListOverAChildlessOwnerStaysQuiet(t *testing.T) {
+func TestOwnedObjectsListWatchOverAChildlessOwnerStaysQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	snap, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	snap, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.Empty(t, snap.Objects)
 	assert.NotZero(t, snap.ResourceVersion)
