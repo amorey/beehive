@@ -1349,30 +1349,39 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary while doubling as the compare's load.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// Scoped read enforces the kind boundary while doubling as the compare's load
+		// — four columns, not the row: the spec blob and the finalizer list are no
+		// part of a status write.
+		var (
+			generation    int64
+			observedGen   sql.NullInt64
+			storedVersion int
+			storedStatus  []byte
+		)
+		if err := s.selectScoped(ctx, gk, id,
+			`generation, observed_generation, schema_version_status, status`,
+			&generation, &observedGen, &storedVersion, &storedStatus); err != nil {
 			return err
 		}
 		// A controller can only have observed a generation that exists; recording a
 		// future one would falsely settle the object once its spec caught up. An
 		// older value is fine (spec changed mid-reconcile).
-		if obj.Generation < observedGeneration {
+		if generation < observedGeneration {
 			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
-				storeapi.ErrObservedGenerationFuture, observedGeneration, obj.Generation, id)
+				storeapi.ErrObservedGenerationFuture, observedGeneration, generation, id)
 		}
 		// Never downward — see stampVersion.
-		stamp, err := stampVersion(obj.StatusVersion, statusVersion)
+		stamp, err := stampVersion(storedVersion, statusVersion)
 		if err != nil {
 			return err
 		}
-		if stamp == obj.StatusVersion && bytes.Equal(obj.Status, status) {
+		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			// Content no-op: write only the bookkeeping, and only if it would move.
 			// >=, not ==: a report at or below the recorded generation would roll
 			// observed_generation backwards, re-unsettling a converged object. (The
 			// content path below deliberately does not clamp: there the stale
 			// reporter overwrote the content, and unsettling gets it re-derived.)
-			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
+			settled := observedGen.Valid && observedGen.Int64 >= observedGeneration
 			if settled {
 				return nil
 			}

@@ -3431,6 +3431,16 @@ func insertBadFinalizersRow(t *testing.T, store *sqliteStore, gk beehive.GroupKi
 	return beehive.ObjectID(id)
 }
 
+// hideObjectColumn renames a column out from under the statements that name it,
+// so any read still selecting it fails to prepare. The probe for a column whose
+// content cannot be made undecodable the way finalizers can.
+func hideObjectColumn(t *testing.T, store *sqliteStore, column string) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(),
+		fmt.Sprintf(`ALTER TABLE objects RENAME COLUMN %s TO %s_hidden`, column, column))
+	require.NoError(t, err)
+}
+
 func TestWithinBeginTxError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
@@ -3838,6 +3848,37 @@ func TestConditionWritesReadNoBlobToGateOnKind(t *testing.T) {
 	assert.ErrorIs(t, store.ConditionsSet(ctx, beehive.GroupKind{Kind: "Other"}, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}), beehive.ErrWrongKind)
 	assert.ErrorIs(t, store.ConditionsDelete(ctx, testGK, 999999, "Ready"), beehive.ErrNotFound)
+}
+
+// A status write reads six columns of the row it writes, and neither the spec nor
+// the finalizer list is one of them. Both probes at once: a finalizers blob that
+// fails to decode and a spec column no statement can name.
+func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	id := insertBadFinalizersRow(t, store, testGK) // generation 1, no status, unsettled
+	hideObjectColumn(t, store, "spec")
+
+	status := []byte(`{"msg":"hi"}`)
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 0, status, 0),
+		"the content branch")
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 1, status, 0),
+		"identical bytes, handshake advancing")
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 1, status, 0),
+		"identical bytes at a recorded generation: nothing written")
+
+	var obs int64
+	var stored string
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT observed_generation, status FROM objects WHERE id = ?`, id).Scan(&obs, &stored))
+	assert.Equal(t, int64(1), obs)
+	assert.JSONEq(t, `{"msg":"hi"}`, stored)
+
+	// The gates still answer from the columns it does read.
+	assert.ErrorIs(t, store.ObjectsUpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, 1, status, 0),
+		beehive.ErrWrongKind)
+	assert.ErrorIs(t, store.ObjectsUpdateStatus(ctx, testGK, id, 99, status, 0),
+		beehive.ErrObservedGenerationFuture)
 }
 
 // The counter bump is the one statement in a deletion mark that runs after the row
