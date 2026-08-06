@@ -155,8 +155,8 @@ func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawO
 	}
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
-	return nil, s.markErr
+func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
+	return storeapi.DeletionCascadeResult{}, s.markErr
 }
 func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
 	return s.dropDependsErr

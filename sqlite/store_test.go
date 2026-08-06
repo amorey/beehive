@@ -1995,8 +1995,8 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	// First cascade marks both children (one write each) and returns both.
 	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
-	require.Len(t, got, 2)
-	assert.True(t, got[0].Marked && got[1].Marked, "this call stamped both")
+	require.Len(t, got.Children, 2)
+	assert.True(t, got.Children[0].Marked && got.Children[1].Marked, "this call stamped both")
 	probe.expectWrites(2)
 	a1, err := store.ObjectsGetMeta(ctx, childA)
 	require.NoError(t, err)
@@ -2009,8 +2009,8 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	// nothing — no resource_version churn, and nothing new in the write log.
 	got2, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
-	require.Len(t, got2, 2)
-	assert.False(t, got2[0].Marked || got2[1].Marked, "the repeat stamped neither")
+	require.Len(t, got2.Children, 2)
+	assert.False(t, got2.Children[0].Marked || got2.Children[1].Marked, "the repeat stamped neither")
 	probe.expectNone()
 	a2, err := store.ObjectsGetMeta(ctx, childA)
 	require.NoError(t, err)
@@ -2382,6 +2382,30 @@ func TestDeletionRequestReportsTheTargetItUnblocks(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Marked)
 	assert.Equal(t, []beehive.ObjectID{target.ID}, refIDs(res.Unblocked))
+}
+
+// A cascade marks children the same way a delete marks one object, so it lifts
+// the same RESTRICTs and owes the same report — one query for the whole level.
+func TestCascadeReportsTheTargetsItsChildrenUnblock(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	child := newRefObject(t, store)
+	target := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, child.ID, target.ID, beehive.RelationDependsOn))
+	_, err := store.DeletionRequestsCreate(ctx, testGK, target.ID)
+	require.NoError(t, err)
+
+	res, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, res.Children, 1)
+	assert.Equal(t, []beehive.ObjectID{target.ID}, refIDs(res.Unblocked))
+
+	// The re-cascade marks nothing, so it lifted nothing.
+	res, err = store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, res.Unblocked, "a child already deleting discounted its edge long ago")
 }
 
 // A self-edge blocks nothing — the object's own mark already queues it — so
@@ -5249,6 +5273,14 @@ func TestDeletionRequestsCreateFromOwnerChildMarkError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// A failed read leaves the mark unpushed, and every chunk after it unread.
+func TestUnblockedTargetsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.unblockedTargets(context.Background(), []storeapi.ObjectID{1})
+	require.Error(t, err)
+}
+
 func TestListOutgoingRefsDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
@@ -5569,7 +5601,7 @@ func TestDeletionRequestsCreateFromOwnerWritesInVersionOrder(t *testing.T) {
 
 	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
-	require.Len(t, got, 3)
+	require.Len(t, got.Children, 3)
 
 	// Every version the cascade wrote, as a scan returns them.
 	var versions []int64

@@ -2020,7 +2020,7 @@ func (s *sqliteStore) requestDeletion(
 		}
 		// Inside the mark's transaction: the discount that lifts the block is
 		// the mark itself, so the read cannot see a state the mark did not make.
-		res.Unblocked, err = s.unblockedTargets(ctx, res.ID)
+		res.Unblocked, err = s.unblockedTargets(ctx, []storeapi.ObjectID{res.ID})
 		return err
 	})
 	if err != nil {
@@ -2029,18 +2029,38 @@ func (s *sqliteStore) requestDeletion(
 	return res, nil
 }
 
-// unblockedTargets returns the deletion-pending objects fromID points at through
-// depends_on. Sound only for a fromID this transaction just marked: that mark is
-// what makes EdgesHasIncoming discount the edge and lift the target's RESTRICT.
-// The self-edge is excluded — the object's own mark already queues it.
-func (s *sqliteStore) unblockedTargets(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+// unblockedTargets returns the deletion-pending objects fromIDs point at through
+// depends_on. Sound only for ids this transaction just marked: that mark is what
+// makes EdgesHasIncoming discount the edge and lift the target's RESTRICT. A self
+// edge is excluded — the object's own mark already queues it — and a target two
+// sources share is repeated, which the work queue coalesces. Chunked under
+// idChunkSize.
+func (s *sqliteStore) unblockedTargets(ctx context.Context, fromIDs []storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+	var out []storeapi.ObjectRef
+	for start := 0; start < len(fromIDs); start += idChunkSize {
+		refs, err := s.unblockedTargetsChunk(ctx, fromIDs[start:min(start+idChunkSize, len(fromIDs))])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, refs...)
+	}
+	return out, nil
+}
+
+func (s *sqliteStore) unblockedTargetsChunk(ctx context.Context, fromIDs []storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+	args := make([]any, 0, len(fromIDs)+1)
+	placeholders := make([]string, len(fromIDs))
+	for i, id := range fromIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, string(storeapi.RelationDependsOn))
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ? AND r.relation = ?
+		WHERE r.from_id IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
 		  AND o.deletion_requested_at IS NOT NULL
-		  AND o.id <> r.from_id`+edgeOrderByTarget,
-		fromID, string(storeapi.RelationDependsOn))
+		  AND o.id <> r.from_id`+edgeOrderByTarget, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2066,28 +2086,28 @@ func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk store
 // DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children,
 // returning every owned child, deleting or not, each flagged with whether this
 // call stamped it. A re-cascade over an already-deleting subtree is a lone SELECT.
-func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.DeletionCascadeChild, error) {
+func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) (storeapi.DeletionCascadeResult, error) {
 	// Self-wrapped: several children each draw a version, and publication is in
 	// commit order only inside Within.
-	var out []storeapi.DeletionCascadeChild
+	var res storeapi.DeletionCascadeResult
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		out, err = s.deletionRequestsCreateFromOwner(ctx, ownerID)
+		res, err = s.deletionRequestsCreateFromOwner(ctx, ownerID)
 		return err
 	})
 	if err != nil {
-		return nil, err
+		return storeapi.DeletionCascadeResult{}, err
 	}
-	return out, nil
+	return res, nil
 }
 
-func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) ([]storeapi.DeletionCascadeChild, error) {
+func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) (storeapi.DeletionCascadeResult, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, ownerID, string(storeapi.RelationOwnedBy))
 	if err != nil {
-		return nil, err
+		return storeapi.DeletionCascadeResult{}, err
 	}
 	type child struct {
 		ref      storeapi.ObjectRef
@@ -2106,7 +2126,8 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	_ = rows.Err()
 	rows.Close() // free the single-conn pool before the per-child writes below
 
-	out := make([]storeapi.DeletionCascadeChild, 0, len(children))
+	res := storeapi.DeletionCascadeResult{Children: make([]storeapi.DeletionCascadeChild, 0, len(children))}
+	var markedIDs []storeapi.ObjectID
 	for _, ch := range children {
 		var marked bool
 		if !ch.deleting {
@@ -2117,12 +2138,19 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 			// serialize the two.
 			var err error
 			if _, marked, err = s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
-				return nil, err
+				return storeapi.DeletionCascadeResult{}, err
 			}
 		}
-		out = append(out, storeapi.DeletionCascadeChild{Marked: marked, Ref: ch.ref})
+		if marked {
+			markedIDs = append(markedIDs, ch.ref.ID)
+		}
+		res.Children = append(res.Children, storeapi.DeletionCascadeChild{Marked: marked, Ref: ch.ref})
 	}
-	return out, nil
+	// One query for the level, and only for the children this call marked: a
+	// child already deleting discounted its edges on the pass that marked it.
+	// Tail call: the caller zeroes res on error.
+	res.Unblocked, err = s.unblockedTargets(ctx, markedIDs)
+	return res, err
 }
 
 func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) error {

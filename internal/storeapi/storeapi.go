@@ -253,6 +253,16 @@ type DeletionCascadeChild struct {
 	Ref    ObjectRef
 }
 
+// DeletionCascadeResult is what a caller needs to follow up on a cascade.
+type DeletionCascadeResult struct {
+	// Children is every owned child, marked by this call or already deleting.
+	Children []DeletionCascadeChild
+	// Unblocked are the deletion-pending objects the children marked by this
+	// call point at through depends_on, flat across children because a caller
+	// pushes them as one batch. See DeletionRequestResult.Unblocked.
+	Unblocked []ObjectRef
+}
+
 // DeletionRequestResult is what a caller needs to follow up on a deletion mark.
 type DeletionRequestResult struct {
 	// ID is the row that was marked, which the name-keyed sibling resolves.
@@ -392,7 +402,7 @@ type Store interface {
 	// DeletionRequestsCreateFromOwner requests deletion of every object owned by
 	// ownerID and returns them all. Writes only to children not already
 	// deletion-pending, so repeating over a deleting subtree costs one read.
-	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) ([]DeletionCascadeChild, error)
+	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) (DeletionCascadeResult, error)
 
 	// DeletionRequestsList returns every deletion-pending object of every
 	// kind, each with its GroupKind, so the global GC sweeper can route
