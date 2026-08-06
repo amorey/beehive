@@ -23,8 +23,9 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"io/fs"
 	"log/slog"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1923,36 +1924,57 @@ func TestClientListOwnedObjectsUnknownOwner(t *testing.T) {
 // would appear; see docs/adr/2026-08-06-owner-scoped-watches.md before adding
 // one.
 func TestOwnedByIsWrittenInOnePlace(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	require.NoError(t, err)
-
+	// The whole module, not just this package: Store is implemented in sqlite/,
+	// where an owned_by write would be just as invisible to a scoped watch.
 	var sites []string
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-			continue
+	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
 		}
-		file, err := parser.ParseFile(token.NewFileSet(), e.Name(), nil, 0)
-		require.NoError(t, err)
-
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
 		var fn string
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.FuncDecl:
 				fn = node.Name.Name
 			case *ast.CallExpr:
+				// Delete as well as Add: both are public Store members taking any
+				// relation, so either can move an owned_by edge.
 				sel, ok := node.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "EdgesAdd" || len(node.Args) == 0 {
+				if !ok || len(node.Args) == 0 {
 					return true
 				}
-				if last, ok := node.Args[len(node.Args)-1].(*ast.Ident); ok && last.Name == "RelationOwnedBy" {
-					sites = append(sites, e.Name()+":"+fn)
+				if sel.Sel.Name != "EdgesAdd" && sel.Sel.Name != "EdgesDelete" {
+					return true
+				}
+				if relationName(node.Args[len(node.Args)-1]) == "RelationOwnedBy" {
+					sites = append(sites, path+":"+fn)
 				}
 			}
 			return true
 		})
-	}
+		return nil
+	}))
 
 	assert.Equal(t, []string{"client.go:insertObject"}, sites)
+}
+
+// relationName reads the relation constant out of a call argument, spelled bare
+// inside this package and qualified as storeapi.X everywhere else.
+func relationName(arg ast.Expr) string {
+	switch e := arg.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return e.Sel.Name
+	}
+	return ""
 }
 
 // ownedObjectsErrorStore errors on the batched owned-children read.
