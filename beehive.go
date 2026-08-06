@@ -181,6 +181,11 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	// subscription precedes every commit that could wake it. A failed seed does
 	// not abort startup — the waker is an optimisation, and run retries it.
 	bh.waker.prime(startCtx)
+	if err := startCtx.Err(); err != nil {
+		bh.waker.teardown()
+		cancel()
+		return nil, fmt.Errorf("beehive: start aborted: %w", err)
+	}
 
 	// None of the goroutines below need ordering against each other: the waker
 	// took its ordering above, and the stale-dependents pass reads current
