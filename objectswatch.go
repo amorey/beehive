@@ -287,6 +287,9 @@ type rawChange struct {
 	ResourceVersion int64
 	// Object is the row as read back, or the log entry's row image for a delete.
 	Object *RawObject
+	// Owner is the object's current owner, nil when it has none. Resolved only
+	// while the tailer has an owner-scoped subscriber; see objectTailer.ownerScoped.
+	Owner *ObjectRef
 }
 
 // objectTailer is one kind's shared log reader: it owns the kind's cursor,
@@ -304,6 +307,11 @@ type objectTailer struct {
 	// refs counts live subscribers. Guarded by bh.tailMu, which is also what
 	// makes "in bh.tailers" and "refs > 0" the same condition.
 	refs int
+	// ownerScoped turns on the per-page owner lookup. Set before a scoped
+	// subscriber registers, and never cleared: a change published without an
+	// owner while one is live would be dropped silently.
+	// See docs/adr/2026-08-06-owner-scoped-watches.md.
+	ownerScoped atomic.Bool
 	// cursor is only touched by run.
 	cursor int64
 	// floor, retry and scanGate are only touched by run and the pass it calls,
@@ -506,7 +514,7 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	changes, err := collectChanges(ctx, t.bh, t.gk, page)
+	changes, err := collectChanges(ctx, t.bh, t.gk, page, t.ownerScoped.Load())
 	if err != nil {
 		return 0, err
 	}
@@ -521,8 +529,9 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 
 // collectChanges coalesces a log page to the last entry per object and reads the
 // current state of everything still live, in one batch. Shared by the tailer and
-// by a resume's replay.
-func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []ObjectWrite) ([]rawChange, error) {
+// by a resume's replay. withOwners resolves each change's current owner, for an
+// owner-scoped subscriber to filter on.
+func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []ObjectWrite, withOwners bool) ([]rawChange, error) {
 	// The page arrives ascending and resource_version is the log's primary
 	// key, so keeping each id's highest-version entry preserves write order
 	// without a sort.
@@ -561,6 +570,15 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 		byID[raw.ID] = raw
 	}
 
+	// Only the live ids: a collected object's edges cascaded away, so it takes
+	// its owner off the log entry's row image instead.
+	var owners map[ObjectID][]ObjectRef
+	if withOwners {
+		if owners, err = bh.store.EdgesGroupOutgoingByID(ctx, live, RelationOwnedBy); err != nil {
+			return nil, err
+		}
+	}
+
 	changes := make([]rawChange, 0, len(order))
 	for _, w := range order {
 		raw := w.Final
@@ -579,11 +597,16 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 			continue
 		}
 		op := coalesceOp(first[w.ID], w.Op)
+		var owner *ObjectRef
+		if refs := owners[w.ID]; len(refs) > 0 {
+			owner = &refs[0]
+		}
 		changes = append(changes, rawChange{
 			ID:              w.ID,
 			Op:              op,
 			ResourceVersion: w.ResourceVersion,
 			Object:          raw,
+			Owner:           owner,
 		})
 	}
 	return changes, nil
@@ -898,7 +921,7 @@ func (c *clientImpl[Spec, Status]) replay(
 			// every object in the page to deliver at most one.
 			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *only })
 		}
-		raws, err := collectChanges(ctx, c.bh, c.gk, page)
+		raws, err := collectChanges(ctx, c.bh, c.gk, page, false)
 		if err != nil {
 			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
 				return 0, nil, false

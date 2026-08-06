@@ -2464,13 +2464,66 @@ func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 
 	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
-	changes, err := collectChanges(ctx, bh, clientTestGK, page)
+	changes, err := collectChanges(ctx, bh, clientTestGK, page, false)
 	require.NoError(t, err)
 
 	require.Len(t, changes, 2, "five writes to two objects collapse to two changes")
 	assert.Equal(t, second.ID, changes[0].ID, "write order, not id order")
 	assert.Equal(t, first.ID, changes[1].ID)
 	assert.Contains(t, string(changes[1].Object.Spec), "first3", "current state, not a superseded one")
+}
+
+// Ownership is resolved from current state, not from the log entry: the create
+// entry is appended before the owner edge is written, in the same transaction,
+// so an entry that carries an owner would carry none for the write that matters
+// most.
+func TestOnePageResolvesCurrentOwners(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	require.NoError(t, err)
+	changes, err := collectChanges(ctx, bh, clientTestGK, page, true)
+	require.NoError(t, err)
+
+	require.Len(t, changes, 2)
+	byID := map[ObjectID]rawChange{changes[0].ID: changes[0], changes[1].ID: changes[1]}
+	require.NotNil(t, byID[child.ID].Owner)
+	assert.Equal(t, owner.ID, byID[child.ID].Owner.ID)
+	assert.Nil(t, byID[owner.ID].Owner, "an unowned object reports no owner")
+}
+
+// The lookup is a whole extra query per page, so a kind nobody watches by owner
+// must not pay for it.
+func TestOnePageSkipsTheOwnerLookupWhenUnscoped(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &countingLoadStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	require.NoError(t, err)
+	before := store.relationReads.Load()
+
+	changes, err := collectChanges(ctx, bh, clientTestGK, page, false)
+	require.NoError(t, err)
+	assert.Equal(t, before, store.relationReads.Load(), "no owner lookup without a scoped watch")
+	for _, ch := range changes {
+		assert.Nil(t, ch.Owner)
+	}
+
+	_, err = collectChanges(ctx, bh, clientTestGK, page, true)
+	require.NoError(t, err)
+	assert.Equal(t, before+1, store.relationReads.Load(), "one lookup for the whole page")
 }
 
 // Stop drains every watch: each stream closes, and no tailer goroutine outlives
