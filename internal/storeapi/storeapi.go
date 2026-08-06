@@ -669,10 +669,9 @@ type Store interface {
 	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
 	// horizon rides the rows, and ObjectWritesMaxVersionAll answers it alone.
 	//
-	// Unlike ObjectWritesListSince this need not be atomic. It carries no row
-	// images, and a horizon that rose between two reads means entries really were
-	// trimmed unread — the page bounds what was live at its own instant, and
-	// versions only ever rise.
+	// Unlike ObjectWritesListSince the page and the horizon need not be read
+	// atomically: a horizon that rose in between means entries really were trimmed
+	// unread.
 	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at

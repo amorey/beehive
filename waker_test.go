@@ -593,7 +593,7 @@ func TestWakerReportsATrimmedSpanAtSeed(t *testing.T) {
 
 	assert.EqualValues(t, 450, dw.watermark, "the resume skips what was trimmed")
 	assert.Contains(t, buf.String(), "trimmed")
-	assert.Contains(t, buf.String(), "watermark=400", "the span starts at the cursor, not at the clamp")
+	assert.Contains(t, buf.String(), "cursor=400", "the span starts at the stored cursor, not at the clamp")
 	assert.Contains(t, buf.String(), "trimmedThrough=450")
 }
 
@@ -653,6 +653,21 @@ func TestWakerReportsNothingOnAnUntrimmedLog(t *testing.T) {
 	dw.watermark = 3
 	require.Equal(t, scanIdle, dw.scan(context.Background()))
 	assert.Empty(t, buf.String(), "a cursor on the boundary has lost nothing")
+}
+
+// A waker with no stored cursor starts at the log's head, so a trim that predates
+// its seed skipped nothing it was ever going to scan.
+func TestWakerReportsNothingWithoutAStoredCursor(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &replayStore{seed: 0, trimmed: 900} // trimmed empty before this run began
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+
+	require.Equal(t, scanIdle, dw.seed(context.Background()))
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+
+	assert.EqualValues(t, 900, dw.watermark, "it still resumes above what was trimmed")
+	assert.Empty(t, buf.String(), "but nothing was skipped to report")
 }
 
 // Retention trims the write log's tail, so the mark can legitimately sit below a

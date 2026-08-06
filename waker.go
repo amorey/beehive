@@ -376,11 +376,10 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 
 	// Against stored, not the watermark: the clamp above lowers the watermark, so
 	// comparing against it would report a span this waker had in fact processed.
-	processed := mark
+	// No stored cursor, no report — this run owes nothing from before its own seed.
 	if ok {
-		processed = stored
+		dw.noteTrim(ctx, stored, trimmed)
 	}
-	dw.noteTrim(ctx, processed, trimmed)
 
 	dw.watermark, dw.persisted, dw.seeded = watermark, persisted, true
 
@@ -422,7 +421,7 @@ func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) 
 		return
 	}
 	dw.bh.log().WarnContext(ctx, "retention trimmed the write log below the dependency waker's cursor; the dependents of the changes in between are left to the stale-dependents pass",
-		"watermark", processed, "trimmedThrough", trimmedThrough)
+		"cursor", processed, "trimmedThrough", trimmedThrough)
 	dw.trimBaseline = trimmedThrough
 }
 

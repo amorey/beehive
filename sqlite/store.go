@@ -1080,9 +1080,8 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 // that compares them needs both at one instant.
 func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, int64, error) {
 	var at, trimmed int64
-	err := s.conn(ctx).QueryRowContext(ctx, `
-		SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0),
-		       coalesce((SELECT MAX(trimmed_through) FROM object_writes_horizon), 0)`).
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), `+writeLogHorizonAll).
 		Scan(&at, &trimmed)
 	return at, trimmed, err
 }
@@ -1102,8 +1101,7 @@ func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int6
 		return nil, 0, nil
 	}
 	rows, err := s.conn(ctx).QueryContext(ctx, `
-		SELECT `+writeLogColumns+`,
-		       coalesce((SELECT MAX(trimmed_through) FROM object_writes_horizon), 0)
+		SELECT `+writeLogColumns+`, `+writeLogHorizonAll+`
 		  FROM object_writes
 		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
 		afterRV, limit)
@@ -1112,6 +1110,10 @@ func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int6
 	}
 	return scanWriteLog(rows, limit)
 }
+
+// writeLogHorizonAll is the store-wide retention horizon as a scalar subquery:
+// the deepest trim over any kind, 0 when nothing has been trimmed.
+const writeLogHorizonAll = `coalesce((SELECT MAX(trimmed_through) FROM object_writes_horizon), 0)`
 
 // writeLogColumns is the canonical select list for a log entry; scanWriteLog
 // reads them in order. Exactly the columns idx_object_writes_kind carries, so a

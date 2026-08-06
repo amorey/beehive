@@ -3682,12 +3682,7 @@ func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, issued, "a create takes a version")
 
-	// Age the log out from under the sweep, which is what an idle store past its
-	// retention window sees.
-	_, err = store.db.ExecContext(ctx, `UPDATE object_writes SET written_at = 0`)
-	require.NoError(t, err)
-	_, err = store.ObjectWritesSweep(ctx, 0, time.Hour)
-	require.NoError(t, err)
+	ageOutWriteLog(t, store)
 
 	logged, _, err := store.ObjectWritesMaxVersionAll(ctx)
 	require.NoError(t, err)
