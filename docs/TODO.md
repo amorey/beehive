@@ -59,7 +59,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
 - **A failed seed still reseeds at the mark as of its retry** — the remainder of
   the startup seed race, after
-  [seeding moved into `Start`](docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md)
+  [seeding moved into `Start`](adr/2026-08-06-the-waker-seeds-before-start-returns.md)
   closed the scheduling half. `prime` cannot fail startup, so a failed read leaves
   the waker unseeded and `run` retries on the backoff (100ms, doubling). With a
   stored cursor the retry resumes there and nothing is skipped; **without one — a
