@@ -36,10 +36,12 @@ import (
 // The store is on disk, not OpenMemory, because the scan is what is being
 // measured and only a file database pages it in.
 func BenchmarkEventsSweep(b *testing.B) {
-	for _, overCap := range []int{0, 1, 64} {
-		b.Run(fmt.Sprintf("over-cap=%d", overCap), func(b *testing.B) {
-			benchEventsSweep(b, 512, overCap)
-		})
+	for _, timelines := range []int{512, 4096} {
+		for _, overCap := range []int{0, 64} {
+			b.Run(fmt.Sprintf("timelines=%d/over-cap=%d", timelines, overCap), func(b *testing.B) {
+				benchEventsSweep(b, timelines, overCap)
+			})
+		}
 	}
 }
 
