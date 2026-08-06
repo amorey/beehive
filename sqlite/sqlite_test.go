@@ -64,15 +64,60 @@ func TestOpenMemorySetsAutoVacuum(t *testing.T) {
 }
 
 // TestOpenApplyError covers the error path in open() by passing a closed *sql.DB
-// to open so Apply fails and the DB is closed inside open.
+// to open so Apply fails and both pools are closed inside open.
 func TestOpenApplyError(t *testing.T) {
 	// Pass a DB that has already been closed — Apply will fail to create tables.
 	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
 	require.NoError(t, err)
 	db.Close()
 
-	_, err = open(db)
+	_, err = open(db, db)
 	require.Error(t, err)
+}
+
+// TestOpenBuildsAReadPool: on disk the read pool is a second, query_only pool
+// that sees committed data and refuses writes.
+func TestOpenBuildsAReadPool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	store, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+
+	require.NotSame(t, store.db, store.readDB)
+
+	_, err = store.db.Exec(`UPDATE resource_version_seq SET value = 7 WHERE id = 1`)
+	require.NoError(t, err)
+	var v int64
+	require.NoError(t, store.readDB.QueryRow(`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&v))
+	assert.Equal(t, int64(7), v)
+
+	_, err = store.readDB.Exec(`UPDATE resource_version_seq SET value = 9 WHERE id = 1`)
+	assert.Error(t, err, "the read pool must refuse a write")
+}
+
+// TestOpenMemoryAliasesTheReadPool: file::memory: is per-connection, so a second
+// pool there would be a different, empty database.
+func TestOpenMemoryAliasesTheReadPool(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+	assert.Same(t, store.db, store.readDB)
+}
+
+// TestCloseClosesBothPools, including the aliased in-memory case, where the
+// second close must not report on a handle already closed.
+func TestCloseClosesBothPools(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	store, err := Open(path)
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+	assert.Error(t, store.db.Ping())
+	assert.Error(t, store.readDB.Ping())
+
+	mem, err := OpenMemory()
+	require.NoError(t, err)
+	require.NoError(t, mem.Close())
+	assert.NoError(t, mem.Close(), "Close is idempotent")
 }
 
 // The schema is amended in place until the first release, so `sqlite/migrations/`

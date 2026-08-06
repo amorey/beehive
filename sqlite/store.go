@@ -52,6 +52,10 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
+	// readDB serves reads issued outside a transaction. query_only and wider than
+	// one connection; aliases db in memory.
+	readDB *sql.DB
+
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
 	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
@@ -64,6 +68,12 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
+	// Readers first, then the writer.
+	if s.readDB != s.db {
+		if err := s.readDB.Close(); err != nil {
+			return err
+		}
+	}
 	return s.db.Close()
 }
 

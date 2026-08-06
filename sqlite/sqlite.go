@@ -21,6 +21,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"runtime"
 	"time"
 
 	"github.com/amorey/beehive/internal/sqlitemigrate"
@@ -30,10 +31,22 @@ import (
 //go:embed migrations
 var migrations embed.FS
 
+// readPoolConns caps the read pool. A constant, not an option: there is no
+// measurement behind a knob yet.
+func readPoolConns() int {
+	return min(4, runtime.GOMAXPROCS(0))
+}
+
 // Open opens (or creates) a Beehive SQLite database at path,
 // running any pending schema migrations before returning.
+//
+// Reads that are not inside a transaction run on a second, query_only pool, so
+// they do not queue behind writes. See docs/adr/2026-08-06-a-read-pool-beside-the-write-pool.md.
 func Open(path string) (*sqliteStore, error) {
-	return open(sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}))
+	return open(
+		sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}),
+		sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: readPoolConns(), QueryOnly: true}),
+	)
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
@@ -41,21 +54,29 @@ func Open(path string) (*sqliteStore, error) {
 //
 // auto_vacuum matches OpenPool: it cannot change after the first table exists,
 // so a test database on another mode would silently skip FreePagesRelease.
+// file::memory: is per-connection, so a second pool here would be a different,
+// empty database: the read pool is the write pool.
 func OpenMemory() (*sqliteStore, error) {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
-	return open(db)
+	return open(db, db)
 }
 
-func open(db *sql.DB) (*sqliteStore, error) {
-	if _, err := sqlitemigrate.Apply(context.Background(), db, migrations, "migrations"); err != nil {
-		db.Close()
+// open takes both pools already built — DSN knowledge belongs to sqlitemigrate.
+// Only the write pool runs Apply. read may alias write.
+func open(write, read *sql.DB) (*sqliteStore, error) {
+	if _, err := sqlitemigrate.Apply(context.Background(), write, migrations, "migrations"); err != nil {
+		write.Close()
+		if read != write {
+			read.Close()
+		}
 		return nil, err
 	}
 	return &sqliteStore{
-		db: db,
+		db:     write,
+		readDB: read,
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),

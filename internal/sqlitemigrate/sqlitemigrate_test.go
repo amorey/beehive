@@ -203,6 +203,27 @@ func TestOpenPoolQueryOnly(t *testing.T) {
 	assert.Equal(t, 0, n)
 }
 
+// TestOpenPoolQueryOnlyRecoversWAL is why the reader pool is query_only rather
+// than mode=ro: it must open a database no writer of its own has touched, and
+// read through a -wal left hot by an unclean close.
+func TestOpenPoolQueryOnlyRecoversWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	w := OpenPool(path, PoolOptions{MaxConns: 1})
+	_, err := w.Exec(`CREATE TABLE a(id INTEGER PRIMARY KEY)`)
+	require.NoError(t, err)
+	_, err = w.Exec(`INSERT INTO a (id) VALUES (1),(2),(3)`)
+	require.NoError(t, err)
+	// Deliberately not closed: no checkpoint runs, so the -wal stays hot.
+	t.Cleanup(func() { w.Close() })
+	require.FileExists(t, path+"-wal")
+
+	r := OpenPool(path, PoolOptions{MaxConns: 2, QueryOnly: true})
+	t.Cleanup(func() { r.Close() })
+	var n int
+	require.NoError(t, r.QueryRow(`SELECT count(*) FROM a`).Scan(&n))
+	assert.Equal(t, 3, n)
+}
+
 // TestOpenPoolSetsAutoVacuum pins the one pragma that cannot be changed later:
 // auto_vacuum is written to the file header when the first table is created, and
 // switching it afterwards costs a full VACUUM rewrite. Applying migrations first is
