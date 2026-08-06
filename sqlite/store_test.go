@@ -3881,6 +3881,44 @@ func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 		beehive.ErrObservedGenerationFuture)
 }
 
+// Clearing a finalizer needs the list and whether the object is deletion-pending,
+// and nothing else off the row. The spec and status columns are hidden to say so:
+// the write still lands and clearedLast still reports the transition.
+func TestDeleteFinalizerReadsNoBlobBesidesTheList(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+
+	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Name:       uniqueName(),
+		Spec:       []byte(`{}`),
+		Finalizers: []string{"a", "b"},
+	})
+	require.NoError(t, err)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	require.NoError(t, err)
+	hideObjectColumn(t, store, "spec")
+	hideObjectColumn(t, store, "status")
+
+	clearedLast, err := store.FinalizersDelete(ctx, testGK, created.ID, "a")
+	require.NoError(t, err)
+	assert.False(t, clearedLast, "b is still held")
+
+	clearedLast, err = store.FinalizersDelete(ctx, testGK, created.ID, "b")
+	require.NoError(t, err)
+	assert.True(t, clearedLast, "the last finalizer off a deleting object")
+
+	var finalizers string
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT finalizers FROM objects WHERE id = ?`, created.ID).Scan(&finalizers))
+	assert.JSONEq(t, `[]`, finalizers)
+
+	// The gates still answer from the columns it does read.
+	_, err = store.FinalizersDelete(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, "a")
+	assert.ErrorIs(t, err, beehive.ErrWrongKind)
+	_, err = store.FinalizersDelete(ctx, testGK, 999999, "a")
+	assert.ErrorIs(t, err, beehive.ErrNotFound)
+}
+
 // The counter bump is the one statement in a deletion mark that runs after the row
 // was already stamped, so it is a distinct failure from the mark itself. Blocking it
 // must roll the whole thing back rather than leaving a row stamped with a version the

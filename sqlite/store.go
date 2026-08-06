@@ -1933,17 +1933,27 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 	// Within keeps the read-modify-write of the finalizer list atomic.
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary while loading the finalizer list.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// Scoped read enforces the kind boundary while loading the finalizer list —
+		// the list and the deletion flag are the whole of what this write reads, and
+		// the flag is wanted as a bool, so the column never leaves SQLite as a clock.
+		var (
+			raw             []byte
+			deletionPending bool
+		)
+		if err := s.selectScoped(ctx, gk, id,
+			`finalizers, deletion_requested_at IS NOT NULL`, &raw, &deletionPending); err != nil {
 			return err
 		}
-		remaining, removed := removeFinalizer(obj.Finalizers, finalizer)
+		var held []string
+		if err := json.Unmarshal(raw, &held); err != nil {
+			return err
+		}
+		remaining, removed := removeFinalizer(held, finalizer)
 		// Absent finalizer: nothing changed, no bump.
 		if !removed {
 			return nil
 		}
-		clearedLast = len(remaining) == 0 && obj.DeletionRequestedAt != nil
+		clearedLast = len(remaining) == 0 && deletionPending
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
