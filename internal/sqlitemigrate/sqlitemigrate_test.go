@@ -25,6 +25,7 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	_ "modernc.org/sqlite"
@@ -173,9 +174,33 @@ func TestApplyRejectsBadFilename(t *testing.T) {
 
 func TestOpenPool(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	db := OpenPool(path, 1)
+	db := OpenPool(path, PoolOptions{MaxConns: 1})
 	t.Cleanup(func() { db.Close() })
 	require.NoError(t, db.Ping())
+}
+
+// TestOpenPoolQueryOnly pins both halves of the reader pool's DSN. query_only
+// refuses the write; the absent _txlock is what lets BeginTx open a DEFERRED
+// read transaction instead of grabbing a write lock it cannot have.
+func TestOpenPoolQueryOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	w := OpenPool(path, PoolOptions{MaxConns: 1})
+	t.Cleanup(func() { w.Close() })
+	_, err := w.Exec(`CREATE TABLE a(id INTEGER PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	r := OpenPool(path, PoolOptions{MaxConns: 2, QueryOnly: true})
+	t.Cleanup(func() { r.Close() })
+
+	_, err = r.Exec(`INSERT INTO a (id) VALUES (1)`)
+	require.Error(t, err, "query_only must refuse a write")
+
+	tx, err := r.Begin()
+	require.NoError(t, err, "without _txlock=immediate a read pool BeginTx is DEFERRED")
+	t.Cleanup(func() { tx.Rollback() })
+	var n int
+	require.NoError(t, tx.QueryRow(`SELECT count(*) FROM a`).Scan(&n))
+	assert.Equal(t, 0, n)
 }
 
 // TestOpenPoolSetsAutoVacuum pins the one pragma that cannot be changed later:
@@ -184,7 +209,7 @@ func TestOpenPool(t *testing.T) {
 // the point — the mode has to survive the CREATE TABLEs, not just the open.
 func TestOpenPoolSetsAutoVacuum(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	db := OpenPool(path, 1)
+	db := OpenPool(path, PoolOptions{MaxConns: 1})
 	t.Cleanup(func() { db.Close() })
 
 	fsys := fstest.MapFS{"m/0001_init.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE a(id INTEGER PRIMARY KEY)`)}}

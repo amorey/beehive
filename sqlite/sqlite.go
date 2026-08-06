@@ -33,7 +33,7 @@ var migrations embed.FS
 // Open opens (or creates) a Beehive SQLite database at path,
 // running any pending schema migrations before returning.
 func Open(path string) (*sqliteStore, error) {
-	return open(sqlitemigrate.OpenPool(path, 1))
+	return open(sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}))
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;

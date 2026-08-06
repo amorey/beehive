@@ -32,12 +32,23 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// PoolOptions configures OpenPool. The zero value is a one-connection writer
+// pool.
+type PoolOptions struct {
+	// MaxConns caps the pool: 1 for a writer pool, larger for a WAL reader pool.
+	MaxConns int
+
+	// QueryOnly opens a WAL reader pool. It sets query_only, so a write fails
+	// loudly rather than landing, and drops _txlock, so BeginTx opens a DEFERRED
+	// read transaction instead of grabbing a write lock it cannot have.
+	QueryOnly bool
+}
+
 // OpenPool opens a modernc-sqlite pool at path with Beehive's PRAGMAs baked
 // into the DSN — WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys on,
-// auto_vacuum=INCREMENTAL, immediate txlock. maxConns caps the pool: 1 for a
-// writer pool, larger for a WAL reader pool. Run Apply against the result.
+// auto_vacuum=INCREMENTAL, immediate txlock. Run Apply against a writer pool.
 // See docs/adr/2026-07-29-auto-vacuum-incremental.md.
-func OpenPool(path string, maxConns int) *sql.DB {
+func OpenPool(path string, opts PoolOptions) *sql.DB {
 	// auto_vacuum MUST be set on the DSN, never in a migration: SQLite ignores
 	// the pragma on a non-empty database and inside a transaction, both of
 	// which a migration is. On an existing NONE database it is a silent no-op.
@@ -46,11 +57,18 @@ func OpenPool(path string, maxConns int) *sql.DB {
 		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=foreign_keys(on)" +
-		"&_pragma=auto_vacuum(incremental)" +
-		"&_txlock=immediate"
+		"&_pragma=auto_vacuum(incremental)"
+	if opts.QueryOnly {
+		// query_only, not mode=ro: a read-only connection cannot recover the
+		// -wal/-shm files, so mode=ro fails on a database no writer has opened
+		// yet and after an unclean close.
+		dsn += "&_pragma=query_only(true)"
+	} else {
+		dsn += "&_txlock=immediate"
+	}
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", dsn)
-	db.SetMaxOpenConns(maxConns)
+	db.SetMaxOpenConns(opts.MaxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return db
 }
