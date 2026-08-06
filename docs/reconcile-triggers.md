@@ -368,9 +368,11 @@ See [the ADR](adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md).
 `seed` reads a cursor the waker persisted in `driver_cursors` and resumes there,
 instead of at `ObjectWritesMaxVersionAll`. It runs inside `Start`, before any caller
 can write, and a resume below the mark is what arms the first pass back — so a change
-committed while the process was down is scanned without waiting for a commit. A cursor older than the write
-log's retention resumes above the horizon instead, with one warning naming the
-skipped span: those entries are gone, and their dependents are case 8's.
+committed while the process was down is scanned without waiting for a commit. A cursor
+older than the write log's retention is warned about once, naming the skipped span:
+those entries are gone, and their dependents are case 8's. The resume point is the
+clamp either way — the horizon is a max over kinds, so it cannot say the range below
+it is empty.
 See [the ADR](adr/2026-08-06-the-waker-seeds-before-start-returns.md) and
 [the ADR](adr/2026-08-06-the-waker-sees-a-retention-trim.md).
 

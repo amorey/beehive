@@ -22,7 +22,7 @@ report, not the wake.
 
 ## Decision
 
-**Report the horizon on both store-wide reads, and resume above it.**
+**Report the horizon on both store-wide reads, and use it for nothing else.**
 
 `ObjectWritesMaxVersionAll` returns `(at, trimmedThrough)`. `at` keeps its bare
 `MAX(resource_version)` semantics — `abandonIfOvertaken` depends on a trimmed log
@@ -30,8 +30,8 @@ reading *below* the watermark — so the horizon rides beside it rather than fol
 in. `ObjectWritesListSinceAll` carries the horizon as a trailing column on the
 page's own statement.
 
-`resumeWatermark` takes the horizon and never resumes below it, and `noteTrim`
-warns once per boundary.
+`noteTrim` warns once per boundary. The resume point is unchanged: see "the
+horizon cannot move a cursor" below.
 
 ### The report compares against the stored cursor, not the watermark
 
@@ -58,23 +58,26 @@ means entries really were trimmed unread. An empty page reports 0 rather than
 paying for a second read; `ObjectWritesMaxVersionAll` is what answers the boundary
 alone, and `seed` is where that matters.
 
-### The horizon is the deepest trim over any kind
+### The horizon detects a loss; it cannot move a cursor
 
-The waker's cursor is store-wide and monotonic, so a watermark of W means nothing
-above W was processed for any kind, and a kind whose `trimmed_through` exceeds W
-had entries deleted unread. A `MAX` over the horizon table is therefore exact
-rather than conservative — no false positive, and no true gap escaping under a
-shallower kind.
+A `MAX` over the horizon table is exact **for detection**. The waker's cursor is
+store-wide and monotonic, so a cursor at W means nothing above W was processed for
+any kind, and a kind whose `trimmed_through` exceeds W had entries deleted unread.
+No false positive, and no true gap escaping under a shallower kind.
 
-### No mid-scan jump, and no forced sweep
+It says nothing about the range being *empty*, and the difference is not academic:
+`ObjectWritesSweep`'s count bound caps each kind to its newest N entries, so a
+chatty kind can be trimmed through 1000 while a quiet one still holds an unread
+entry at 500. A store-wide maximum of 1000 proves entries below it were deleted —
+not which ones. **Skipping to it would drop that surviving entry for good.**
 
-An earlier draft also jumped the watermark to the horizon when a scan ran out of
-readable log. It is redundant: the trimmed span holds no entries to skip, the
-repeat report is already prevented by `trimBaseline`, and a cursor left lagging is
-raised by `resumeWatermark` at the next seed. A field and two guarded call sites
-for no observable difference.
+So the horizon moves no cursor anywhere. `resumeWatermark` keeps the clamp it
+always had, and neither the seed nor a scan jumps. An earlier draft did both;
+`TestWakerResumeKeepsEntriesBelowTheHorizon` is the guard.
 
-Forcing an out-of-band stale-dependents sweep on detection was also dropped. It
+### No forced sweep
+
+Forcing an out-of-band stale-dependents sweep on detection was dropped too. It
 buys nothing on the resume path — that pass's eager first sweep already covers
 every dependent in the store — and at most one interval on the stalled path, in
 exchange for a wake channel between two drivers that are otherwise independent.
@@ -87,8 +90,8 @@ exchange for a wake channel between two drivers that are otherwise independent.
 - **A clamped resume reports nothing.**
   `TestWakerReportsNothingWhenTheClampLowersTheWatermark` is the regression guard;
   it is the common case, not the rare one.
-- **A resume never replays a range retention deleted.** `TestResumeWatermark`
-  covers the horizon in both branches.
+- **A resume is unchanged by any of this.** It still clamps to the log's mark,
+  and an entry a shallower kind kept below the horizon is still scanned.
 - **The quiet pass is still one statement.** Nothing about the wake-driven cost
   argument changes.
 - **Latency is unchanged.** This is an observability change: the wakes in the

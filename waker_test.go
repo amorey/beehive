@@ -591,7 +591,7 @@ func TestWakerReportsATrimmedSpanAtSeed(t *testing.T) {
 
 	dw.seed(context.Background())
 
-	assert.EqualValues(t, 450, dw.watermark, "the resume skips what was trimmed")
+	assert.EqualValues(t, 400, dw.watermark, "reported, but the resume still starts at the cursor")
 	assert.Contains(t, buf.String(), "trimmed")
 	assert.Contains(t, buf.String(), "cursor=400", "the span starts at the stored cursor, not at the clamp")
 	assert.Contains(t, buf.String(), "trimmedThrough=450")
@@ -655,6 +655,30 @@ func TestWakerReportsNothingOnAnUntrimmedLog(t *testing.T) {
 	assert.Empty(t, buf.String(), "a cursor on the boundary has lost nothing")
 }
 
+// The horizon is a maximum over kinds, and the per-kind count bound trims a chatty
+// kind far deeper than a quiet one: kind A trimmed through 1000 while kind B still
+// holds an unread entry at 500. So the horizon proves entries below it were
+// deleted, never that the whole range is gone — resuming above it would skip B's
+// surviving entry for good.
+func TestWakerResumeKeepsEntriesBelowTheHorizon(t *testing.T) {
+	store := &cursorStore{
+		replayStore: replayStore{
+			seed:    500,
+			trimmed: 1000, // a chatty kind, trimmed well past what a quiet one still holds
+			rows:    []ObjectWrite{{ID: 1, ResourceVersion: 500}},
+		},
+		stored: map[string]int64{cursorNameWaker: 400},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+
+	require.Equal(t, scanMore, dw.seed(context.Background()))
+	require.EqualValues(t, 400, dw.watermark, "the clamp decides the resume point, not the horizon")
+
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Equal(t, 1, store.read, "the entry that survived the trim is still scanned")
+	assert.EqualValues(t, 500, dw.watermark)
+}
+
 // A waker with no stored cursor starts at the log's head, so a trim that predates
 // its seed skipped nothing it was ever going to scan.
 func TestWakerReportsNothingWithoutAStoredCursor(t *testing.T) {
@@ -666,8 +690,7 @@ func TestWakerReportsNothingWithoutAStoredCursor(t *testing.T) {
 	require.Equal(t, scanIdle, dw.seed(context.Background()))
 	require.Equal(t, scanIdle, dw.scan(context.Background()))
 
-	assert.EqualValues(t, 900, dw.watermark, "it still resumes above what was trimmed")
-	assert.Empty(t, buf.String(), "but nothing was skipped to report")
+	assert.Empty(t, buf.String(), "nothing was skipped to report")
 }
 
 // Retention trims the write log's tail, so the mark can legitimately sit below a
@@ -1299,30 +1322,24 @@ func TestWakerResumesAnEnormousBacklog(t *testing.T) {
 }
 
 // resumeWatermark's cases, exercised directly rather than through seed and a
-// store double: no stored cursor, one at or past the mark, one below it, and a
-// horizon that raises any of them.
+// store double: no stored cursor, one at or past the mark, and one below it.
 func TestResumeWatermark(t *testing.T) {
 	cases := []struct {
-		name    string
-		stored  int64
-		ok      bool
-		mark    int64
-		trimmed int64
-		want    int64
+		name   string
+		stored int64
+		ok     bool
+		mark   int64
+		want   int64
 	}{
-		{"no stored cursor", 0, false, 500, 0, 500},
-		{"stored cursor at the mark", 500, true, 500, 0, 500},
-		{"stored cursor past the mark: clamp", 600, true, 500, 0, 500},
-		{"stored cursor below the mark: resume", 400, true, 500, 0, 400},
-		{"stored cursor far below the mark: still resume", 1, true, 50_000_000, 0, 1},
-		{"below the horizon: resume above what was trimmed", 400, true, 500, 450, 450},
-		{"horizon below the resume point: no effect", 400, true, 500, 300, 400},
-		{"log trimmed empty: the horizon is all that is left", 400, true, 0, 900, 900},
-		{"no stored cursor, log trimmed empty", 0, false, 0, 900, 900},
+		{"no stored cursor", 0, false, 500, 500},
+		{"stored cursor at the mark", 500, true, 500, 500},
+		{"stored cursor past the mark: clamp", 600, true, 500, 500},
+		{"stored cursor below the mark: resume", 400, true, 500, 400},
+		{"stored cursor far below the mark: still resume", 1, true, 50_000_000, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.want, resumeWatermark(c.stored, c.ok, c.mark, c.trimmed))
+			assert.Equal(t, c.want, resumeWatermark(c.stored, c.ok, c.mark))
 		})
 	}
 }

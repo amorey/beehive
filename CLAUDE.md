@@ -132,8 +132,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   The cursor persists via the optional `DriverCursorer`; it is an optimisation
   over the stale-dependents pass, never a guarantee. **Both store-wide reads
   report the retention horizon** beside their value rather than folded in — the
-  abandon jump needs the bare mark — so a resume never replays a trimmed range and
-  a cursor below the boundary is warned about once instead of skipping silently.
+  abandon jump needs the bare mark — so a cursor below the boundary is warned about
+  once instead of skipping silently. The horizon **moves no cursor**: it is a max
+  over kinds, and the per-kind count bound trims a chatty kind past entries a quiet
+  one still holds, so it proves a loss without bounding an empty range.
   → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md),
   [ADR](docs/adr/2026-08-06-the-waker-sees-a-retention-trim.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),

@@ -127,7 +127,8 @@ trimBaseline int64
 ```
 
 **`seed`** reads both values, and `resumeWatermark` takes the horizon so the clamp
-stays pure and testable:
+stays pure and testable — **superseded, see revision note 3: the horizon moves no
+cursor, and this signature was reverted**:
 
 ```go
 func resumeWatermark(stored int64, ok bool, mark, trimmedThrough int64) int64 {
@@ -255,8 +256,8 @@ Existing tripwires that must keep passing unchanged:
 
 ## Revision notes
 
-Three things changed after the first draft was checked against the code, the
-third during implementation:
+Four things changed after the first draft was checked against the code, the last
+two during and after implementation:
 
 1. **The report gate.** Comparing the horizon against `dw.watermark` alone is a
    false positive on every restart of a store whose log was trimmed empty, because
@@ -267,7 +268,15 @@ third during implementation:
    exists for row images the store-wide read does not carry, and the fallback would
    add a second statement to the quiet pass that runs per commit. The authoritative
    horizon read moved to `ObjectWritesMaxVersionAll`, which `seed` already calls.
-3. **The mid-scan jump was dropped.** With `resumeWatermark` raising at seed and
+3. **The horizon moves no cursor at all.** Both the mid-scan jump and the resume
+   raise were wrong, for the same reason found in review: the horizon is a `MAX`
+   over kinds, and `ObjectWritesSweep`'s per-kind count bound trims a chatty kind
+   past entries a quiet one still holds. A store-wide horizon of 1000 does not mean
+   the range below it is empty, so resuming there drops a surviving entry at 500 for
+   good. `resumeWatermark` keeps its original three-argument clamp;
+   `TestWakerResumeKeepsEntriesBelowTheHorizon` guards it. The horizon is now used
+   for the report and nothing else.
+4. **The mid-scan jump was dropped**, before the above was found. With `resumeWatermark` raising at seed and
    `trimBaseline` deduping the report, jumping the watermark to the horizon on an
    idle scan changes nothing observable: the trimmed span holds no entries to skip,
    and a lagging cursor is raised at the next seed. `TestWakerResyncsPastATrimmedSpan`

@@ -78,8 +78,8 @@ transaction and taking the `resource_version` that write was assigned.
   trimmed empty reports 0 against a tail parked higher and lists on every tick —
   on the kind that writes least.
 - **The store-wide reads report the horizon beside their value** rather than
-  folding it in, since `abandonIfOvertaken` needs the bare mark. The waker uses it
-  to resume above a trimmed span and to report one
+  folding it in, since `abandonIfOvertaken` needs the bare mark. The waker reports
+  a trimmed span with it, and moves no cursor by it
   ([ADR](2026-08-06-the-waker-sees-a-retention-trim.md)).
 
 The count bound trims one statement per kind rather than one subquery per row.

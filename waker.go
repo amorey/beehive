@@ -364,7 +364,7 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 		}
 	}
 
-	watermark := resumeWatermark(stored, ok, mark, trimmed)
+	watermark := resumeWatermark(stored, ok, mark)
 
 	// persisted tracks the row, not the resume point: after a clamp the row sits
 	// above the watermark, and tracking the watermark would retry a doomed write
@@ -377,6 +377,7 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 	// Against stored, not the watermark: the clamp above lowers the watermark, so
 	// comparing against it would report a span this waker had in fact processed.
 	// No stored cursor, no report — this run owes nothing from before its own seed.
+	// Reporting is all the horizon is good for here; see resumeWatermark.
 	if ok {
 		dw.noteTrim(ctx, stored, trimmed)
 	}
@@ -404,13 +405,15 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 // re-derives are idempotent, and the stale-dependents pass is the guarantee
 // either way.
 //
-// Never below trimmedThrough, whichever branch: entries at or under the horizon
-// are gone, so resuming there replays a range that no longer exists.
-func resumeWatermark(stored int64, ok bool, mark, trimmedThrough int64) int64 {
+// The retention horizon is deliberately not consulted. It is a maximum over
+// kinds, and the per-kind count bound trims a chatty kind past entries a quiet
+// one still holds, so resuming above it would skip those for good. It says
+// entries below it were deleted, never that the range is empty.
+func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 	if !ok {
-		return max(mark, trimmedThrough)
+		return mark
 	}
-	return max(min(stored, mark), trimmedThrough)
+	return min(stored, mark)
 }
 
 // noteTrim reports the entries retention deleted before this waker read them,
