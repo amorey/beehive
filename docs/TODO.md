@@ -57,51 +57,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   Tripwire: `TestAddDependencyAcceptsCycle` asserts that cycle-closing and
   self edges are both accepted today — exactly what such a guard would change.
 
-- **The waker's startup seed race costs latency, not convergence** — known, no longer
-  a correctness hole, and narrower than it was since the waker started persisting its
-  cursor (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)). `Start` launches
-  the waker with `bh.wg.Go` and returns; `seed` runs whenever the Go runtime first
-  schedules that goroutine, and `driver.Run`'s eager first step is a seed that returns
-  without scanning. Nothing orders those against `Start`'s return, so a caller that
-  writes target T as soon as `Start` hands back its stop func can commit T's new
-  version *below* the watermark the waker then takes. A failed seed is the same hole by
-  another route: the next tick seeds from the cursor as of *then*, so everything
-  committed in between is below the watermark and never scanned.
-
-  **The race is now much narrower.** Once the waker has persisted a cursor, `seed`
-  resumes from it rather than from `ObjectWritesMaxVersion`, and a write racing
-  `Start`'s return lands *above* that stored cursor — scanned on the next tick, not
-  skipped. What still reopens the original window is a seed that falls back to
-  `max`: a store with no `DriverCursorer`, or the first start of a fresh one.
-
-  Either way that change is never read by any scan — and a settled dependent D of T is
-  invisible to every owed-work listing, since D's own generation never moved and
-  nothing stamped `reconcile_owed`. **What closes it is the stale-dependents pass**,
-  which derives staleness from `dependency_watermarks` rather than from anything the
-  waker recorded (see [the ADR](docs/adr/2026-07-29-dependency-watermarks.md)). Its
-  cursor does not narrow this case: the racing write bumps T's `resource_version`, so T
-  sits inside the range the next sweep reads. So D
-  converges within one stale-pass interval instead of never, and what is left here is
-  60 seconds of latency where the waker promises one.
-
-  **The fix is still to seed synchronously in `Start`**, under `startCtx`, before the
-  reconcile loops are launched: the watermark then provably precedes every write any
-  caller could make, because no caller holds the stop func yet. Not done because a
-  synchronous seed now reads *two* rows inside `Start`'s critical section rather than
-  one, which only sharpens the hesitation recorded above about putting a store read
-  there at all (see [the ADR](docs/adr/2026-07-30-durable-waker-cursor.md)), and
-  because the answer to "does a failed seed abort startup" has to be no, which means
-  keeping the retry-on-next-tick path alive rather than replacing it. Worth doing on
-  latency grounds, but no longer urgent and now bounded to a smaller case.
-
-  **Tripwires.** `TestWakerSeedsFromTheWriteLogMax` pins that the first scan on a store
-  with no stored cursor starts at the write log's max; `TestWakerSeedsFromTheStoredCursor`
-  pins that a store with one resumes from it instead. `TestWakerRetriesSeedOnTheNextTick`
-  and `TestWakerRetriesSeedOnAFailedCursorRead` are the ones that constrain the fix: a
-  seed that fails, on either read, must leave the waker unseeded and scanning nothing,
-  so a synchronous seed in `Start` must fall back to that path rather than returning an
-  error.
-
 - **The waker cannot tell that retention trimmed the log out from under its
   cursor** — known, not fixed, and latency rather than divergence. The per-kind
   read reports the boundary: `ObjectWritesListSince` returns `trimmedThrough`,

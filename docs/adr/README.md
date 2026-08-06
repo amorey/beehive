@@ -32,6 +32,7 @@ directory of archaeology.
 - [A create under a deleting owner pushes that owner's collect](2026-08-05-a-create-pushes-a-deleting-owners-collect.md)
 - [A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
 - [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
+- [The dependency waker subscribes and seeds before Start returns](2026-08-06-the-waker-seeds-before-start-returns.md)
 - [The dependency waker abandons a drain the stale-dependents pass has overtaken](2026-08-05-the-waker-abandons-an-overtaken-drain.md)
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [One tailer per kind, woken by the commit path, above a floor tick](2026-08-03-watch-shared-tail.md)
