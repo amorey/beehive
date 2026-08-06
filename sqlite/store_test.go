@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,6 +60,15 @@ func addEvent(t *testing.T, store beehive.Store, id storeapi.ObjectID, in storea
 	require.NoError(t, err)
 	require.NotNil(t, run)
 	return run
+}
+
+// ageRun pushes a run's window end into the past, which is what maxAge reads.
+// Direct SQL: the store owns the clock, so there is nothing to inject.
+func ageRun(t *testing.T, store beehive.Store, run int64, by time.Duration) {
+	t.Helper()
+	_, err := store.(*sqliteStore).db.ExecContext(context.Background(),
+		`UPDATE events SET last_at = ? WHERE id = ?`, toMillis(time.Now().UTC().Add(-by)), run)
+	require.NoError(t, err)
 }
 
 // A first emission starts a run: count 1, a collapsed window, an assigned id and
@@ -276,7 +286,7 @@ func TestGetLatestEvent(t *testing.T) {
 	assert.Nil(t, got, "unknown category is nil")
 }
 
-// EventsSweep caps each timeline to the newest perObject runs.
+// EventsSweep caps each timeline to the newest perTimeline runs.
 func TestSweepEventsCapN(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -344,11 +354,7 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	old := addEvent(t, store, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Old"})
 	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Warning", Reason: "New"}))
 
-	// Age the first run's window into the past directly — no clock injection needed.
-	s := store.(*sqliteStore)
-	_, err := s.db.ExecContext(ctx, `UPDATE events SET last_at = ? WHERE id = ?`,
-		toMillis(time.Now().UTC().Add(-2*time.Hour)), old.ID)
-	require.NoError(t, err)
+	ageRun(t, store, old.ID, 2*time.Hour)
 
 	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
 	require.NoError(t, err)
@@ -358,6 +364,114 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "New", got[0].Reason, "the run within maxAge is kept")
+}
+
+// The cap counts runs, not occurrences: an extend grows a run in place, so a
+// timeline repeating one (type, reason) never reaches the cap however many
+// events it records.
+func TestSweepEventsCapNCountsRuns(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for range 5 {
+		require.NoError(t, store.EventsAdd(ctx, testGK, id,
+			storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Same"}))
+	}
+
+	deleted, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Zero(t, deleted, "one run, at the cap")
+
+	got, err := store.EventsList(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, 5, got[0].Count, "the occurrences are unbounded")
+}
+
+// maxAge is a cutoff over the whole table where the cap partitions: a quiet
+// timeline the cap would keep still loses runs that aged out.
+func TestSweepEventsMaxAgeSpansTimelines(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	quiet := addEvent(t, store, id, storeapi.EventsAddInput{Category: "quiet", Type: "Normal", Reason: "Q1"})
+	chatty := addEvent(t, store, id, storeapi.EventsAddInput{Category: "chatty", Type: "Normal", Reason: "C1"})
+	ageRun(t, store, quiet.ID, 2*time.Hour)
+	ageRun(t, store, chatty.ID, 2*time.Hour)
+
+	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted, "both timelines aged out, cap or no cap")
+}
+
+// A sweep trims at most eventCapBudget timelines, so one sweep cannot hold the
+// write connection for an unbounded backlog. What it leaves is picked up by the
+// next sweep, and the horizon only rises in between.
+func TestSweepEventsCapIsProgressive(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	timelines := eventCapBudget + 2
+	for c := range timelines {
+		for _, r := range []string{"R1", "R2"} {
+			require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{
+				Category: strconv.Itoa(c), Type: "Normal", Reason: r,
+			}))
+		}
+	}
+
+	deleted, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, eventCapBudget, deleted, "one sweep trims up to the budget")
+
+	deleted, err = store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted, "the next sweep finishes the backlog")
+
+	deleted, err = store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Zero(t, deleted, "nothing left over cap")
+}
+
+// The horizon covers every run a sweep removed: each deleted version is at or
+// below its own timeline's trimmed_through, so no trimmed run sits above the
+// mark a resume is checked against.
+func TestSweepEventsHorizonCoversEveryTrimmedRun(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	byRV := map[int64]string{} // version → category, for what the sweep removes
+	for _, cat := range []string{"a", "b"} {
+		for _, r := range []string{"R1", "R2", "R3"} {
+			e := addEvent(t, store, id, storeapi.EventsAddInput{Category: cat, Type: "Normal", Reason: r})
+			byRV[e.ResourceVersion] = cat
+		}
+	}
+	// Age one run so both bounds trim in the same sweep.
+	aged := addEvent(t, store, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Old"})
+	byRV[aged.ResourceVersion] = "c"
+	ageRun(t, store, aged.ID, 2*time.Hour)
+
+	_, err := store.EventsSweep(ctx, 1, time.Hour)
+	require.NoError(t, err)
+
+	survived := map[int64]bool{}
+	runs, err := store.EventsList(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	for _, r := range runs {
+		survived[r.ResourceVersion] = true
+	}
+	for rv, cat := range byRV {
+		if survived[rv] {
+			continue
+		}
+		assert.LessOrEqual(t, rv, eventHorizon(t, store, id, cat),
+			"trimmed run %d in %q sits above its horizon", rv, cat)
+	}
 }
 
 // EventsListSince pages the log above a cursor, oldest-first. An extend
@@ -731,6 +845,17 @@ func TestEventsMaxVersionStoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The cap's candidate query runs on every sweep, over every timeline, so it must
+// ride an index rather than sort. Two indexes lead on (object_id, category) and
+// either will do; what must not appear is a TEMP B-TREE, which means the group
+// by is sorting the whole table, or a table scan, which means reading every
+// blob to count rows.
+func TestEventsSweepSelectsCandidatesByIndex(t *testing.T) {
+	plan := queryPlan(t, newTestStore(t).(*sqliteStore), eventCapCandidates, 1, 1)
+	assert.Contains(t, plan, "COVERING INDEX", "plan:\n"+plan)
+	assert.NotContains(t, plan, "TEMP B-TREE", "plan:\n"+plan)
+}
+
 // EventsMaxVersion is the gate EventsWatch pays on every quiet tick, so it must be
 // answered from idx_events_object_rv alone. COVERING is the whole assertion: with
 // only idx_events_object_cat the plan still names an index, but resource_version is
@@ -927,6 +1052,29 @@ func TestSweepEventsExecErrors(t *testing.T) {
 		_, err := store.EventsSweep(ctx, 0, time.Hour)
 		require.Error(t, err)
 	})
+
+	t.Run("candidate row fails to scan", func(t *testing.T) {
+		store := newRawStore(t)
+		breakTimelineScan(t, store)
+		_, err := store.EventsSweep(ctx, 1, 0)
+		require.Error(t, err)
+	})
+}
+
+// breakTimelineScan replaces events with a table holding a non-numeric
+// object_id, so the cap's candidate query still runs and every row it returns
+// fails in the scan loop rather than at QueryContext. The column is indexed, so
+// STRICT and the index rule out mutating it in place the way breakEventRowRead
+// does; two rows share a timeline so the HAVING clause selects it.
+func breakTimelineScan(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `DROP TABLE events`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `
+		CREATE TABLE events (object_id TEXT NOT NULL, category TEXT NOT NULL);
+		INSERT INTO events (object_id, category) VALUES ('x', 'c'), ('x', 'c')`)
+	require.NoError(t, err)
 }
 
 // blockEventDeletes makes any DELETE on events fail, so the sweep's horizon

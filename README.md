@@ -619,7 +619,9 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 
 `WithWriteLogRetention` bounds the object write log, which is what the watches tail and what a resume reads. It looks like `WithEventRetention` and defaults the other way: an event is written when a controller chooses to write one, while a log entry lands on **every** object write — and a status write bumps `resource_version`, so the log grows at reconcile rate whether or not you opt in. Hence a 24h default rather than unbounded. The value is a resume window before it is a storage bound: it is how long a subscriber may be disconnected and still resume instead of resyncing. It also governs how long a collected object's final state lives on, since the delete entry carries the row image a `Deleted` change reports.
 
-`WithEventRetention` bounds the log per `(object, category)`: a ring that keeps the newest N runs in each timeline, so a flapping timeline can't evict a quiet one on the same object, plus an optional maximum age. The GC sweeper enforces it, and deleting an object deletes its events.
+`WithEventRetention` bounds the log per `(object, category)`: a ring that keeps the newest N **runs** in each timeline — runs, not occurrences, since an extend grows a run in place — so a flapping timeline can't evict a quiet one on the same object. `maxAge` is the other bound, and it is a different kind of thing: a flat cutoff on a run's *end*, across every timeline, so a run that keeps being extended never ages out. Both are off by default, which leaves the log unbounded; the GC sweeper enforces whichever you set, on its own interval, so a burst can sit above the cap until the next sweep. Deleting an object deletes its events.
+
+→ [ADR: event retention](docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md), for why the cap counts runs per timeline and why neither bound is on by default.
 
 → [ADR: the events API](docs/adr/2026-07-27-events-api.md), for the run-aggregation rule, why `Detail` stays off the generic boundary, and the watch-surface naming.
 
@@ -712,7 +714,7 @@ func WithGCInterval(d time.Duration) Option        // how often to collect dead 
 func WithStartupFullPass(enabled bool) Option      // also re-dispatch settled objects once at startup (default: false, off)
 func WithMaxRetryInterval(d time.Duration) Option  // cap on exponential backoff after Reconcile errors (default: 30s)
 func WithMigrator(m Migrator) Option               // attach a schema-version Migrator for the kind (Register only)
-func WithEventRetention(perObject int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring + optional age bound (0 = no age bound)
+func WithEventRetention(perTimeline int, maxAge time.Duration) Option // event-log retention: per-(object,category) cap-N ring of runs + optional age bound (0 = unbounded)
 func WithWriteLogRetention(perKind int, maxAge time.Duration) Option // write-log retention: per-(group,kind) cap-N ring + age bound (default: 24h, no count bound)
 ```
 

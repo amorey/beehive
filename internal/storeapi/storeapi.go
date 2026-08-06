@@ -464,10 +464,12 @@ type Store interface {
 	EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error)
 
 	// EventsSweep trims the event log to the retention bounds and returns how
-	// many runs it deleted. perObject > 0 caps each (object, category)
-	// timeline to its newest perObject runs; maxAge > 0 drops runs with LastAt
-	// older than that. A zero bound is skipped. Global, not per-kind.
-	EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error)
+	// many runs it deleted. perTimeline > 0 caps each (object, category)
+	// timeline to its newest perTimeline runs; maxAge > 0 drops runs with
+	// LastAt older than that. A zero bound is skipped. Global, not per-kind.
+	// An implementation MAY bound the work of one call, converging over
+	// sweeps, so a return does not imply every bound is met.
+	EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration) (int, error)
 
 	// FinalizersDelete removes finalizer from id's list. A real removal bumps
 	// ResourceVersion; a missing one does nothing. clearedLast reports that this

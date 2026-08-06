@@ -59,5 +59,6 @@ directory of archaeology.
 - [A nested Within is a rollback boundary (SAVEPOINT)](2026-07-29-nested-within-savepoints.md)
 - [Secondary lookups (owner/dependencies/dependents/owned)](2026-07-27-secondary-lookups.md)
 - [Events API](2026-07-27-events-api.md)
+- [Event retention is a ring per timeline, and it is off by default](2026-08-06-event-retention-is-a-ring-per-timeline.md)
 - [Schedule watch](2026-07-27-schedule-watch.md)
 - [NounsVerb method naming and the watch return shape](2026-07-27-noun-verb-naming.md)

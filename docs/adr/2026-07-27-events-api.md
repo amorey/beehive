@@ -52,9 +52,9 @@ half of this ADR is superseded by
 also covers the retention horizon a resume is checked against. What stays true here
 is the log itself: the run aggregation, the category partition, and `Detail`.
 
-Retention runs in `gcSweeperRun`: a per-`(object, category)` cap-N ring plus optional
-`maxAge` (`WithEventRetention`). `events.object_id` is `FK … ON DELETE CASCADE`, so
-object deletion cascades the log.
+Retention runs in `gcSweeperRun` and has its own record —
+[event retention is a ring per timeline](2026-08-06-event-retention-is-a-ring-per-timeline.md).
+`events.object_id` is `FK … ON DELETE CASCADE`, so object deletion cascades the log.
 
 Store set: `EventsAdd` / `EventsGetLatest` / `EventsList` / `EventsListSince` /
 `EventsMaxVersion` / `EventsSnapshot` / `EventsSweep`. The store has no event watch:

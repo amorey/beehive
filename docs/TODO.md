@@ -400,55 +400,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   take the first owner. Fixing those two alone would place multi-owner semantics
   in a fourth spot while `Owner()` still returns one.
 
-- **Event retention has never been audited end to end, and its shape is not
-  derivable from the code** — the reason this entry exists rather than a fix.
-  `WithEventRetention(perObject, maxAge)` is one global setting enforced by one
-  sweep, but the two bounds are different in kind: `maxAge` is a flat cutoff over
-  the table, and `perObject` is a ring counted per `(object, category)`. Nothing
-  in the option's name or its godoc says the cap's unit is a timeline rather than
-  an object, and a reader who does not already know the category rule reads
-  `perObject` as exactly what it says.
-
-  It has grown a second consumer since: `events_horizon` is keyed to match the
-  ring's partition, because a horizon has to describe what the trim actually
-  deleted or a resume is refused for a hole in a timeline it never read (see
-  [the ADR](adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)). So the
-  cap's granularity is now load-bearing for the watch contract, not only for what
-  survives in the log.
-
-  What the audit has to settle, in order: what an event log is *for* here — a
-  bounded ring per timeline, or a recent-activity window; whether the category
-  partition earns its place in retention at all, given that it exists for run
-  aggregation and was inherited by the cap rather than chosen for it; whether
-  `perObject` should be renamed for whatever unit survives; and whether either
-  bound should be on by default, since today both are off and an event log with
-  no retention grows forever. The entry below is one concrete outcome it might
-  reach.
-
-  Worth doing before the first release, because `WithEventRetention` is public
-  API and the horizon key is on disk.
-
-- **Dropping the per-timeline cap in favour of `maxAge` alone would simplify
-  three layers at once** — considered and not taken, recorded so the trade is not
-  re-derived from scratch. Retention would become one time cutoff: the window
-  function goes (with the double predicate scan it costs the sweep, since the
-  horizon write and the delete each evaluate it), `events_horizon` collapses to a
-  scalar or a per-object row, `EventsListSince`'s `category` parameter goes with
-  it, and `WithEventRetention` becomes a single duration that no longer implies a
-  size bound it would not have.
-
-  **What it gives up is the only bound that holds under a flapping controller.**
-  `maxAge` bounds age, not size: a controller emitting a distinct `(type, reason)`
-  per reconcile appends a run per reconcile, so inside the window the log grows
-  with reconcile *rate*, where the ring keeps it proportional to the object count.
-  That is the failure mode an event log meets first, and the reason both bounds
-  exist.
-
-  Do it if the audit above decides events are a recent-activity window rather than
-  a bounded ring. Do not do it as a simplification on its own: the complexity it
-  removes is mostly the horizon's, and the horizon is what stops a resume implying
-  an absence it cannot vouch for.
-
 - **A kind-wide event watch does not exist, so a panel over N objects runs N
   readers** — known, not fixed. `EventsWatch` is per object, and each stream is
   its own receiver, goroutine, timer and gate over its own cursor (see

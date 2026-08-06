@@ -203,6 +203,31 @@ func TestEventsWatchResumeBelowTheHorizonIsRefused(t *testing.T) {
 	assert.ErrorIs(t, err, ErrWatchTooOld)
 }
 
+// Type, reason and time filter client-side, so the horizon cannot account for
+// them: a resume is refused for a trim of runs the filter would have dropped.
+// Over-reporting is the safe direction — the alternative is vouching for an
+// absence the store never checked.
+func TestEventsWatchHorizonIgnoresClientSideFilters(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, _, client, cc := watchFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	stream, err := client.EventsWatch(ctx, obj.ID, WithEventReason("Wanted"))
+	require.NoError(t, err)
+	checkpoint := stream.ResourceVersion
+
+	for _, reason := range []string{"Unwanted", "Newer"} {
+		require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
+	}
+	_, err = store.EventsSweep(ctx, 1, 0) // "Unwanted" goes — a run this reader filtered out
+	require.NoError(t, err)
+
+	_, err = client.EventsWatch(ctx, obj.ID, WithEventReason("Wanted"), WithEventsResumeFrom(checkpoint))
+	assert.ErrorIs(t, err, ErrWatchTooOld)
+}
+
 // A trim on one timeline says nothing about another: the horizon is keyed the
 // way the ring cap partitions, so a chatty category cannot refuse a quiet one.
 func TestEventsWatchHorizonIsPerTimeline(t *testing.T) {
