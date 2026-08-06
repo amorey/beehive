@@ -15,7 +15,9 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"io/fs"
 	"path/filepath"
@@ -119,6 +121,35 @@ func TestCloseClosesBothPools(t *testing.T) {
 	require.NoError(t, mem.Close())
 	assert.NoError(t, mem.Close(), "Close is idempotent")
 }
+
+// A reader that fails to close must not stop the writer closing: a Close that
+// reports an error and leaves a pool holding the file is worse than either.
+func TestCloseClosesTheWriterWhenTheReaderFails(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+
+	bad := sql.OpenDB(failCloseConnector{})
+	require.NoError(t, bad.Ping()) // open the connection Close will fail on
+	store.readDB = bad
+
+	assert.Error(t, store.Close(), "the reader's failure is reported")
+	assert.Error(t, store.db.Ping(), "and the writer is closed anyway")
+}
+
+// failCloseConnector yields one connection whose Close fails, so *sql.DB.Close
+// reports an error.
+type failCloseConnector struct{}
+
+func (failCloseConnector) Connect(context.Context) (driver.Conn, error) {
+	return failCloseConn{}, nil
+}
+func (failCloseConnector) Driver() driver.Driver { return nil }
+
+type failCloseConn struct{}
+
+func (failCloseConn) Close() error                        { return errors.New("close failed") }
+func (failCloseConn) Begin() (driver.Tx, error)           { return nil, errors.New("unused") }
+func (failCloseConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
 
 // The schema is amended in place until the first release, so `sqlite/migrations/`
 // holds exactly one file — see the amend-in-place ADR. This is the tripwire on that

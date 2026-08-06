@@ -68,13 +68,13 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
-	// Readers first, then the writer.
+	// Readers first, then the writer, and the writer closes whatever the readers
+	// reported — a returned error must not leave a pool holding the file.
+	var readErr error
 	if s.readDB != s.db {
-		if err := s.readDB.Close(); err != nil {
-			return err
-		}
+		readErr = s.readDB.Close()
 	}
-	return s.db.Close()
+	return errors.Join(readErr, s.db.Close())
 }
 
 // Drain floor: release only past both an absolute size and a share of the file.
