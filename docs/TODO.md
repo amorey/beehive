@@ -145,6 +145,43 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   or fold into the next break that touches these types. `EventsAddInput` (2026-08-06)
   was not that break: it added an alias rather than touching any of these four.
 
+- **`List` in a method name may be saying what the return type already says** —
+  proposed, not decided, and pre-release or never. `OwnedList` → `Owned`,
+  `OwnedObjectsList` → `OwnedObjects`, `OwnedObjectsListWatch` →
+  `OwnedObjectsWatch`, `EventsList` → `Events`, `EdgesListIncoming` →
+  `EdgesIncoming`: twenty distinct method names across `Client`,
+  `ControllerClient` and `Store`.
+
+  **The argument is already in the naming ADR, applied to a different surface.**
+  `Object`'s relation accessors dropped their verbs — `GetOwner`/`ListDependencies`
+  became `Owner()`/`Dependencies()` — because "the `Get`/`List` cardinality signal
+  moves to the return type, which already carried it"
+  ([ADR](adr/2026-07-27-noun-verb-naming.md)). A plural noun returning a slice has
+  said "many" twice before `List` says it a third time.
+
+  What has to be answered is why that reasoning stopped at `Object`. The honest
+  distinction is that those are pure accessors over already-loaded state, while
+  `Client.OwnedObjects(ctx, id)` takes a context and issues a query — and a bare
+  noun on a method that does I/O reads like a field, which hides the cost at the
+  call site. That is the case to make or reject, and it is not obviously wrong
+  either way.
+
+  **The bare family cannot follow.** `Client`'s own CRUD omits the prefix, so
+  `List` has no noun to fall back on, and `WatchList` cannot become `Watch` —
+  taken by the single-object watch. The rule would have to read "drop the verb on
+  a prefixed family, keep it where the family is the receiver", which is a second
+  exception stacked on the omit-the-prefix one. Whether that is one convention or
+  two is the thing to settle before touching a single name.
+
+  Two more loose ends. Whether `Get` goes too (`OwnersGet` → `Owner`), which reads
+  well but gives the client the same spelling as `Object.Owner()` for a different
+  operation — and if it stays, cardinality is signalled asymmetrically. And a few
+  names get worse rather than better: `ObjectsListIDs` → `ObjectsIDs` wants to be
+  `ObjectIDs`, which breaks the plural-prefix rule to fix the reading.
+
+  Worth doing before the first release or not at all: every one is public API, the
+  rename is the entire cost, and it is the kind of change that never gets cheaper.
+
 - **A cascade draws one resource version per child** — known, not fixed, and all that
   is left of the write-shapes pass's tail. Every other narrow-question write is
   settled: the ones that report no row answer from metadata (`checkObjectScoped`),
