@@ -6012,6 +6012,79 @@ func TestABareReadDoesNotWaitForAWriter(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+// readWithin is what gives a multi-statement read one snapshot without taking
+// the write lock: two reads either side of a commit must agree, and the commit
+// must not have waited on them.
+func TestReadWithinHoldsOneSnapshot(t *testing.T) {
+	store := newFileRawStore(t)
+	ctx := context.Background()
+	newRefObject(t, store)
+
+	require.NoError(t, store.readWithin(ctx, func(ctx context.Context) error {
+		before, err := store.ObjectsList(ctx, testGK)
+		require.NoError(t, err)
+
+		newRefObject(t, store) // commits on the write pool, mid-snapshot
+
+		after, err := store.ObjectsList(ctx, testGK)
+		require.NoError(t, err)
+		assert.Len(t, after, len(before), "the snapshot must not move under the read")
+		return nil
+	}))
+
+	all, err := store.ObjectsList(ctx, testGK)
+	require.NoError(t, err)
+	assert.Len(t, all, 2, "and the commit landed")
+}
+
+// A read nested in a caller's transaction joins it rather than opening a second
+// one, so it still sees writes that transaction has not committed.
+func TestReadWithinJoinsTheAmbientTransaction(t *testing.T) {
+	store := newFileRawStore(t)
+
+	require.NoError(t, store.Within(context.Background(), func(ctx context.Context) error {
+		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: uniqueName(),
+			Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		return store.readWithin(ctx, func(ctx context.Context) error {
+			got, err := store.ObjectsGet(ctx, obj.ID)
+			require.NoError(t, err)
+			assert.Equal(t, obj.ID, got.ID)
+			return nil
+		})
+	}))
+}
+
+// The read frame is resolved by conn as well as read, so a write inside
+// readWithin fails on the query_only pool instead of landing on the write pool
+// outside the snapshot.
+func TestReadWithinRefusesAWrite(t *testing.T) {
+	store := newFileRawStore(t)
+
+	err := store.readWithin(context.Background(), func(ctx context.Context) error {
+		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: uniqueName(),
+			Spec: []byte(`{}`),
+		})
+		return err
+	})
+	require.Error(t, err)
+}
+
+// A read registers no hooks and AfterCommit has no error to return, so a hook on
+// a read frame is a bug that must be loud rather than silently dropped or run.
+func TestAfterCommitPanicsOnAReadFrame(t *testing.T) {
+	store := newFileRawStore(t)
+
+	err := store.readWithin(context.Background(), func(ctx context.Context) error {
+		assert.Panics(t, func() { store.AfterCommit(ctx, func(context.Context) {}) })
+		return nil
+	})
+	require.NoError(t, err)
+}
+
 // A failed COMMIT is reported to the caller rather than swallowed. The rollback
 // deferred inside Within is a no-op by then, so nothing else can report it: a
 // caller that saw a nil error here would believe writes landed that did not.

@@ -169,6 +169,10 @@ type txFrame struct {
 type txState struct {
 	tx *sql.Tx
 
+	// readOnly marks a readWithin frame: its tx is on the query_only pool, so a
+	// write reaching it fails rather than landing, and it owes no hooks.
+	readOnly bool
+
 	// mu guards against a Within fn fanning calls across goroutines; AfterCommit
 	// and bare reads stay legal concurrently.
 	mu    sync.Mutex
@@ -507,6 +511,32 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	return nil
 }
 
+// readWithin runs fn inside one read snapshot on the read pool, for a read that
+// spans several statements and needs them to agree. It joins the ambient
+// transaction instead if ctx carries a live one, so a read nested in a caller's
+// Within still sees that transaction's uncommitted writes.
+//
+// fn must not write: the frame it installs is resolved by conn as well as read,
+// so a write inside fn fails on the query_only pool rather than landing on the
+// write pool outside the snapshot.
+func (s *sqliteStore) readWithin(ctx context.Context, fn func(ctx context.Context) error) error {
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		return s.Within(ctx, fn)
+	}
+
+	tx, err := s.readDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	st := &txState{tx: tx, readOnly: true}
+	defer st.close()
+	defer tx.Rollback() // no-op once Commit succeeds
+	if err := fn(context.WithValue(ctx, txKey{}, &txFrame{st: st})); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // AfterCommit defers fn to the outermost transaction's commit. Outside a
 // transaction — or once the commit has drained the queue — fn runs inline:
 // "after the commit" is satisfied by running now.
@@ -517,6 +547,10 @@ func (s *sqliteStore) AfterCommit(ctx context.Context, fn func(context.Context))
 		return
 	}
 	st := fr.st
+	if st.readOnly {
+		// Nothing committed, so neither running fn nor dropping it is right.
+		panic("beehive/sqlite: AfterCommit inside readWithin")
+	}
 	// Strip the transaction: by hook time the *sql.Tx is committed, so a store
 	// call joining it would fail. A hook that writes gets a fresh transaction.
 	hookCtx := context.WithValue(ctx, txKey{}, nil)
