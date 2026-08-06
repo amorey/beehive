@@ -656,24 +656,49 @@ func asNameTaken(err error) error {
 	return err
 }
 
+// selectScoped reads id's row through the kind gate, binding only the columns
+// the caller names into dest, in order; empty cols is the gate alone. The one
+// place ErrNotFound and ErrWrongKind are decided for a write that needs part of
+// a row rather than all of it.
+func (s *sqliteStore) selectScoped(
+	ctx context.Context,
+	gk storeapi.GroupKind,
+	id storeapi.ObjectID,
+	cols string,
+	dest ...any,
+) error {
+	q := `SELECT "group", kind FROM objects WHERE id = ?`
+	if cols != "" {
+		q = `SELECT "group", kind, ` + cols + ` FROM objects WHERE id = ?`
+	}
+	var group, kind string
+	err := s.conn(ctx).QueryRowContext(ctx, q, id).
+		Scan(append([]any{&group, &kind}, dest...)...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeapi.ErrNotFound // bare, like scanObject's
+	}
+	if err != nil {
+		return err
+	}
+	return gateKind(gk, id, group, kind)
+}
+
+// gateKind reports whether the row's own group/kind is gk's: ErrWrongKind if not.
+func gateKind(gk storeapi.GroupKind, id storeapi.ObjectID, group, kind string) error {
+	if group != gk.Group || kind != gk.Kind {
+		return fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
+			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
+	}
+	return nil
+}
+
 // probeObjectScoped answers "does id exist, is it gk's, and is it
 // deletion-pending?" from three columns — no blobs, no finalizer unmarshal. Same
 // errors as a scoped read: ErrNotFound, ErrWrongKind.
 func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (deletionPending bool, err error) {
-	var group, kind string
 	var deletionAt sql.NullInt64
-	err = s.conn(ctx).QueryRowContext(ctx,
-		`SELECT "group", kind, deletion_requested_at FROM objects WHERE id = ?`, id).
-		Scan(&group, &kind, &deletionAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, storeapi.ErrNotFound // bare, like scanObject's
-	}
-	if err != nil {
+	if err := s.selectScoped(ctx, gk, id, `deletion_requested_at`, &deletionAt); err != nil {
 		return false, err
-	}
-	if group != gk.Group || kind != gk.Kind {
-		return false, fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
-			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
 	}
 	return deletionAt.Valid, nil
 }
@@ -691,8 +716,7 @@ func (s *sqliteStore) checkObjectExists(ctx context.Context, id storeapi.ObjectI
 
 // checkObjectScoped is probeObjectScoped for callers that only need the gate.
 func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
-	_, err := s.probeObjectScoped(ctx, gk, id)
-	return err
+	return s.selectScoped(ctx, gk, id, ``)
 }
 
 // getObjectRow reads the objects row without assembling conditions.
@@ -709,9 +733,8 @@ func (s *sqliteStore) getObjectRowScoped(ctx context.Context, gk storeapi.GroupK
 	if err != nil {
 		return nil, err
 	}
-	if obj.Group != gk.Group || obj.Kind != gk.Kind {
-		return nil, fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
-			storeapi.ErrWrongKind, id, obj.Group, obj.Kind, gk.Group, gk.Kind)
+	if err := gateKind(gk, id, obj.Group, obj.Kind); err != nil {
+		return nil, err
 	}
 	return obj, nil
 }
@@ -1330,30 +1353,39 @@ func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.Group
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary while doubling as the compare's load.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// Scoped read enforces the kind boundary while doubling as the compare's load
+		// — four columns, not the row: the spec blob and the finalizer list are no
+		// part of a status write.
+		var (
+			generation    int64
+			observedGen   sql.NullInt64
+			storedVersion int
+			storedStatus  []byte
+		)
+		if err := s.selectScoped(ctx, gk, id,
+			`generation, observed_generation, schema_version_status, status`,
+			&generation, &observedGen, &storedVersion, &storedStatus); err != nil {
 			return err
 		}
 		// A controller can only have observed a generation that exists; recording a
 		// future one would falsely settle the object once its spec caught up. An
 		// older value is fine (spec changed mid-reconcile).
-		if obj.Generation < observedGeneration {
+		if generation < observedGeneration {
 			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
-				storeapi.ErrObservedGenerationFuture, observedGeneration, obj.Generation, id)
+				storeapi.ErrObservedGenerationFuture, observedGeneration, generation, id)
 		}
 		// Never downward — see stampVersion.
-		stamp, err := stampVersion(obj.StatusVersion, statusVersion)
+		stamp, err := stampVersion(storedVersion, statusVersion)
 		if err != nil {
 			return err
 		}
-		if stamp == obj.StatusVersion && bytes.Equal(obj.Status, status) {
+		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			// Content no-op: write only the bookkeeping, and only if it would move.
 			// >=, not ==: a report at or below the recorded generation would roll
 			// observed_generation backwards, re-unsettling a converged object. (The
 			// content path below deliberately does not clamp: there the stale
 			// reporter overwrote the content, and unsettling gets it re-derived.)
-			settled := obj.ObservedGeneration != nil && *obj.ObservedGeneration >= observedGeneration
+			settled := observedGen.Valid && observedGen.Int64 >= observedGeneration
 			if settled {
 				return nil
 			}
@@ -1419,7 +1451,7 @@ func (s *sqliteStore) loadConditions(ctx context.Context, id storeapi.ObjectID) 
 }
 
 // scanCondition decodes one condition row (conditionColumns order). The liveness
-// downgrade is applied by read-path callers, not here, so getCondition's no-op
+// downgrade is applied by read-path callers, not here, so the write path's no-op
 // comparison sees stored truth.
 func scanCondition(sc scanner) (storeapi.ObjectID, storeapi.Condition, error) {
 	var (
@@ -1451,7 +1483,7 @@ func (s *sqliteStore) livenessStale(cond *storeapi.Condition) bool {
 }
 
 // downgradeLiveness surfaces a stale liveness condition as Unknown on the read
-// path — not in getCondition, whose no-op comparison must see stored truth.
+// path — never on the write path, whose no-op comparison must see stored truth.
 func (s *sqliteStore) downgradeLiveness(cond *storeapi.Condition) {
 	if s.livenessStale(cond) {
 		cond.Status = "Unknown"
@@ -1468,18 +1500,47 @@ func (s *sqliteStore) attachConditions(ctx context.Context, obj *storeapi.RawObj
 	return obj, nil
 }
 
-// getCondition returns id's condition of type condType, or nil if absent.
-func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, condType string) (*storeapi.Condition, error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT `+conditionColumns+` FROM conditions WHERE object_id = ? AND type = ?`, id, condType)
-	_, cond, err := scanCondition(row)
+// conditionSetLoad answers ConditionsSet's kind gate and its no-op comparison in
+// one statement, keyed on the same object. The condition columns are NULL when
+// there is none; status is NOT NULL wherever a row exists, so it marks presence.
+// transitioned_at is absent deliberately: the upsert decides it in SQL.
+const conditionSetLoad = `
+	SELECT o."group", o.kind, c.status, c.reason, c.message, c.liveness, c.updated_at
+	  FROM objects o
+	  LEFT JOIN conditions c ON c.object_id = o.id AND c.type = ?
+	 WHERE o.id = ?`
+
+// loadForConditionSet runs conditionSetLoad: the scope error, then the stored
+// condition or nil. Stored truth, undowngraded — see downgradeLiveness.
+func (s *sqliteStore) loadForConditionSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.Condition, error) {
+	var (
+		group, kind             string
+		status, reason, message sql.NullString
+		liveness                sql.NullBool
+		updatedAt               sql.NullInt64
+	)
+	err := s.conn(ctx).QueryRowContext(ctx, conditionSetLoad, condType, id).
+		Scan(&group, &kind, &status, &reason, &message, &liveness, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, storeapi.ErrNotFound // bare, like scanObject's
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &cond, nil
+	if err := gateKind(gk, id, group, kind); err != nil {
+		return nil, err
+	}
+	if !status.Valid {
+		return nil, nil
+	}
+	return &storeapi.Condition{
+		Type:      condType,
+		Status:    status.String,
+		Reason:    reason.String,
+		Message:   message.String,
+		Liveness:  liveness.Bool,
+		UpdatedAt: fromMillis(updatedAt.Int64),
+	}, nil
 }
 
 // bumpObject advances id's resource_version — the visibility half of the
@@ -1516,13 +1577,10 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 	// Within keeps the condition write and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Metadata-only gate: clean ErrNotFound/ErrWrongKind instead of an FK
-		// violation, and no row read on a path that reports none.
-		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
-			return err
-		}
-		// No-op suppression: an identical condition leaves resource_version alone.
-		existing, err := s.getCondition(ctx, id, cond.Type)
+		// One read: a metadata-only gate — clean ErrNotFound/ErrWrongKind instead of
+		// an FK violation, no blob decoded — joined to the stored condition, since
+		// no-op suppression needs it and both key on the same object.
+		existing, err := s.loadForConditionSet(ctx, gk, id, cond.Type)
 		if err != nil {
 			return err
 		}
@@ -1647,8 +1705,9 @@ func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id s
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary; events carries no group/kind to fold in.
-		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
+		// Metadata-only gate: events carries no group/kind to fold in, and an event
+		// write reports no row, so it reads none.
+		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		rv, err := nextResourceVersion(ctx, c)
@@ -1905,17 +1964,27 @@ func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKin
 	// Within keeps the read-modify-write of the finalizer list atomic.
 	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary while loading the finalizer list.
-		obj, err := s.getObjectRowScoped(ctx, gk, id)
-		if err != nil {
+		// Scoped read enforces the kind boundary while loading the finalizer list —
+		// the list and the deletion flag are the whole of what this write reads, and
+		// the flag is wanted as a bool, so the column never leaves SQLite as a clock.
+		var (
+			raw             []byte
+			deletionPending bool
+		)
+		if err := s.selectScoped(ctx, gk, id,
+			`finalizers, deletion_requested_at IS NOT NULL`, &raw, &deletionPending); err != nil {
 			return err
 		}
-		remaining, removed := removeFinalizer(obj.Finalizers, finalizer)
+		var held []string
+		if err := json.Unmarshal(raw, &held); err != nil {
+			return err
+		}
+		remaining, removed := removeFinalizer(held, finalizer)
 		// Absent finalizer: nothing changed, no bump.
 		if !removed {
 			return nil
 		}
-		clearedLast = len(remaining) == 0 && obj.DeletionRequestedAt != nil
+		clearedLast = len(remaining) == 0 && deletionPending
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
 			return err

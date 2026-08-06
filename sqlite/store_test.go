@@ -884,6 +884,19 @@ func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
 	}
 }
 
+// ConditionsSet's kind gate and its no-op comparison key on the same object, so
+// they are one read rather than two round trips on the single connection — and the
+// join has to ride a primary key on each side or the fold costs more than it saves.
+func TestConditionSetLoadsTheGateAndTheConditionTogether(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, conditionSetLoad, "Ready", int64(1))
+	assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
+		"objects must be reached by rowid:\n"+plan)
+	assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
+		"conditions must be reached through its primary key:\n"+plan)
+}
+
 // EventsGetLatest surfaces a scan fault on the current run.
 func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()
@@ -3431,6 +3444,16 @@ func insertBadFinalizersRow(t *testing.T, store *sqliteStore, gk beehive.GroupKi
 	return beehive.ObjectID(id)
 }
 
+// hideObjectColumn renames a column out from under the statements that name it,
+// so any read still selecting it fails to prepare. The probe for a column whose
+// content cannot be made undecodable the way finalizers can.
+func hideObjectColumn(t *testing.T, store *sqliteStore, column string) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(),
+		fmt.Sprintf(`ALTER TABLE objects RENAME COLUMN %s TO %s_hidden`, column, column))
+	require.NoError(t, err)
+}
+
 func TestWithinBeginTxError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
@@ -3820,12 +3843,13 @@ func TestDeletionRequestsCreateMarkError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// The condition mutators gate on kind, which is metadata, so they must not decode
-// the row to do it. A corrupt finalizers blob is the probe: it fails every full-row
-// read in the store, and neither of these writes touches finalizers. Sibling of
-// TestDeletionRequestsCreateReadsNoBlobOnEitherBranch — same rule, same class of
-// write, and before the gate was narrowed these two disagreed about it.
-func TestConditionWritesReadNoBlobToGateOnKind(t *testing.T) {
+// The condition mutators and EventsAdd gate on kind, which is metadata, so they
+// must not decode the row to do it. A corrupt finalizers blob is the probe: it
+// fails every full-row read in the store, and none of these writes touches
+// finalizers. Sibling of TestDeletionRequestsCreateReadsNoBlobOnEitherBranch —
+// same rule, same class of write, and before the gate was narrowed these
+// disagreed about it.
+func TestGatedWritesReadNoBlobToGateOnKind(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	id := insertBadFinalizersRow(t, store, testGK)
@@ -3833,11 +3857,95 @@ func TestConditionWritesReadNoBlobToGateOnKind(t *testing.T) {
 	require.NoError(t, store.ConditionsSet(ctx, testGK, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
 	require.NoError(t, store.ConditionsDelete(ctx, testGK, id, "Ready"))
+	require.NoError(t, store.EventsAdd(ctx, testGK, id,
+		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}))
 
 	// The gate still reports scope and existence, which is all it reads for.
 	assert.ErrorIs(t, store.ConditionsSet(ctx, beehive.GroupKind{Kind: "Other"}, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}), beehive.ErrWrongKind)
 	assert.ErrorIs(t, store.ConditionsDelete(ctx, testGK, 999999, "Ready"), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.EventsAdd(ctx, beehive.GroupKind{Kind: "Other"}, id,
+		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}), beehive.ErrWrongKind)
+}
+
+// A status write reads six columns of the row it writes, and neither the spec nor
+// the finalizer list is one of them. Both probes at once: a finalizers blob that
+// fails to decode and a spec column no statement can name.
+func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	id := insertBadFinalizersRow(t, store, testGK) // generation 1, no status, unsettled
+	hideObjectColumn(t, store, "spec")
+
+	status := []byte(`{"msg":"hi"}`)
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 0, status, 0),
+		"the content branch")
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 1, status, 0),
+		"identical bytes, handshake advancing")
+	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 1, status, 0),
+		"identical bytes at a recorded generation: nothing written")
+
+	var obs int64
+	var stored string
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT observed_generation, status FROM objects WHERE id = ?`, id).Scan(&obs, &stored))
+	assert.Equal(t, int64(1), obs)
+	assert.JSONEq(t, `{"msg":"hi"}`, stored)
+
+	// The gates still answer from the columns it does read.
+	assert.ErrorIs(t, store.ObjectsUpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, 1, status, 0),
+		beehive.ErrWrongKind)
+	assert.ErrorIs(t, store.ObjectsUpdateStatus(ctx, testGK, id, 99, status, 0),
+		beehive.ErrObservedGenerationFuture)
+}
+
+// Clearing a finalizer needs the list and whether the object is deletion-pending,
+// and nothing else off the row. The spec and status columns are hidden to say so:
+// the write still lands and clearedLast still reports the transition.
+func TestDeleteFinalizerReadsNoBlobBesidesTheList(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+
+	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		Name:       uniqueName(),
+		Spec:       []byte(`{}`),
+		Finalizers: []string{"a", "b"},
+	})
+	require.NoError(t, err)
+	_, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	require.NoError(t, err)
+	hideObjectColumn(t, store, "spec")
+	hideObjectColumn(t, store, "status")
+
+	clearedLast, err := store.FinalizersDelete(ctx, testGK, created.ID, "a")
+	require.NoError(t, err)
+	assert.False(t, clearedLast, "b is still held")
+
+	clearedLast, err = store.FinalizersDelete(ctx, testGK, created.ID, "b")
+	require.NoError(t, err)
+	assert.True(t, clearedLast, "the last finalizer off a deleting object")
+
+	var finalizers string
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT finalizers FROM objects WHERE id = ?`, created.ID).Scan(&finalizers))
+	assert.JSONEq(t, `[]`, finalizers)
+
+	// The gates still answer from the columns it does read.
+	_, err = store.FinalizersDelete(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, "a")
+	assert.ErrorIs(t, err, beehive.ErrWrongKind)
+	_, err = store.FinalizersDelete(ctx, testGK, 999999, "a")
+	assert.ErrorIs(t, err, beehive.ErrNotFound)
+}
+
+// The finalizer list is the one blob this write does read, so an undecodable one
+// fails it. Stated as its own case because the alternative — treating a list that
+// will not decode as empty — would clear finalizers off a row nobody can read.
+func TestDeleteFinalizerRefusesAnUndecodableList(t *testing.T) {
+	store := newRawStore(t)
+	id := insertBadFinalizersRow(t, store, testGK)
+
+	_, err := store.FinalizersDelete(context.Background(), testGK, id, "a")
+	require.Error(t, err)
 }
 
 // The counter bump is the one statement in a deletion mark that runs after the row
@@ -3856,6 +3964,27 @@ func TestDeletionRequestsCreateVersionDrawError(t *testing.T) {
 	reloaded, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, reloaded.DeletionRequestedAt, "the mark rolled back with the draw")
+}
+
+// selectScoped is the one place the kind gate lives, so its scope errors and its
+// column binding are pinned here rather than through each caller.
+func TestSelectScopedGatesAndReadsNamedColumns(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	var gen int64
+	var deletionAt sql.NullInt64
+	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID,
+		`generation, deletion_requested_at`, &gen, &deletionAt))
+	assert.Equal(t, obj.Generation, gen)
+	assert.False(t, deletionAt.Valid)
+
+	// No columns: the gate alone, which is what checkObjectScoped wants.
+	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID, ``))
+	assert.ErrorIs(t, store.selectScoped(ctx, testGK, 999999, ``), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.selectScoped(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, ``),
+		beehive.ErrWrongKind)
 }
 
 // checkObjectScoped resolves a zero-row mark or decrement, so it only ever runs
@@ -5043,16 +5172,19 @@ func TestConditionResourceVersionError(t *testing.T) {
 	assert.NotNil(t, findCondition(got.Conditions, "Ready"), "rolled-back ConditionsDelete must leave the condition in place")
 }
 
-func TestGetConditionScanError(t *testing.T) {
+// ConditionsSet's load is one statement over two tables, so a fault in either
+// fails the write before any of it lands. The conditions table goes rather than a
+// row corrupted: the load scans every condition column as nullable — it has to,
+// they are NULL whenever there is no condition — so no row content can fail it.
+func TestConditionsSetLoadError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	obj := newConditionObject(t, store, "getcond-corrupt")
+	obj := newConditionObject(t, store, "condload-broken")
 
-	breakConditionRowRead(t, store, obj.ID)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE conditions`)
+	require.NoError(t, err)
 
-	// The object row reads fine, but ConditionsSet's getCondition pre-read hits the
-	// unreadable row and fails before any write.
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
+	err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
 }
 

@@ -145,36 +145,21 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   or fold into the next break that touches these types. `EventsAddInput` (2026-08-06)
   was not that break: it added an alias rather than touching any of these four.
 
-- **Two writes still read the whole row to answer a narrow question** — known, not
-  fixed, and the tail of the write-shapes pass. Every write that reports *no* row now
-  answers from metadata alone: the deletion probes, `ReconcileOwedDecrement`'s fault
-  probe and both condition mutators' kind gates go through `checkObjectScoped`. What
-  is left is the pre-read on the two writes that genuinely need row *content*, and
-  those read more of it than they use — `ObjectsUpdateStatus` selects all 17 columns
-  (including `spec`, the largest, and it unmarshals `finalizers`) to read six;
-  `FinalizersDelete` needs three.
+- **A cascade draws one resource version per child** — known, not fixed, and all that
+  is left of the write-shapes pass's tail. Every other narrow-question write is
+  settled: the ones that report no row answer from metadata (`checkObjectScoped`),
+  the three that need row content read only the columns they use (`selectScoped`),
+  `ConditionsSet`'s gate and its no-op read are one `LEFT JOIN`, and a deletion mark
+  draws its version only once it knows it will stamp one — see
+  [the ADR](adr/2026-07-30-store-write-shapes.md).
 
-  One fold remains available on top of narrower `SELECT`s: `ConditionsSet` runs its
-  kind gate and `getCondition` as separate statements against the same key, which one
-  `LEFT JOIN` from `objects` to `conditions` collapses. Worth naming because
-  `ConditionsSet` is the hottest write in the system, nested inside the reconcile
-  transaction — though the gate is now two columns, so the fold saves a round trip
-  rather than a blob read.
-
-  Deferred as a family rather than piecemeal: each is a new hand-written `SELECT` list
-  or join that has to stay in step with `objectColumns` and `scanObject`, which is a
-  maintenance cost the write-shapes pass deliberately did not take on while it was
-  changing signatures. None of it changes a contract, so none of it needs a break.
-
-  **Not in this family any more**, both settled: the condition gates (now
-  `checkObjectScoped`) and the version drawn before a deletion mark knew it would
-  stamp one (now drawn lazily, so a guard-blocked mark writes no counter page —
-  pinned by `TestDeletionMarkDrawsAVersionOnlyWhenItStamps`). The one place a version
-  draw per row survives is `deletionRequestsCreateFromOwner`, which calls
-  `markForDeletion` per child, so an N-child cascade draws N versions where one
-  `value + N` draw would do. It only pays on children not already deleting — the
-  cascade skips the rest before calling — so the steady-state re-cascade is unaffected
-  and this is the first-pass cost of a large subtree only.
+  `deletionRequestsCreateFromOwner` calls `markForDeletion` per child, so an N-child
+  cascade draws N versions where one `value + N` draw would do. It only pays on
+  children not already deleting — the cascade skips the rest before calling — so the
+  steady-state re-cascade is unaffected and this is the first-pass cost of a large
+  subtree only. Worth doing when a cascade over a wide subtree shows up as write
+  cost; the per-child version is what the write log orders on, so a batched draw has
+  to hand each child its own value out of the range, not share one.
 
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.
