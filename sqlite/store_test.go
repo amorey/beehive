@@ -884,6 +884,19 @@ func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
 	}
 }
 
+// ConditionsSet's kind gate and its no-op comparison key on the same object, so
+// they are one read rather than two round trips on the single connection — and the
+// join has to ride a primary key on each side or the fold costs more than it saves.
+func TestConditionSetLoadsTheGateAndTheConditionTogether(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, conditionSetLoad, "Ready", int64(1))
+	assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
+		"objects must be reached by rowid:\n"+plan)
+	assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
+		"conditions must be reached through its primary key:\n"+plan)
+}
+
 // EventsGetLatest surfaces a scan fault on the current run.
 func TestGetLatestEventScanError(t *testing.T) {
 	ctx := context.Background()
@@ -5143,16 +5156,19 @@ func TestConditionResourceVersionError(t *testing.T) {
 	assert.NotNil(t, findCondition(got.Conditions, "Ready"), "rolled-back ConditionsDelete must leave the condition in place")
 }
 
-func TestGetConditionScanError(t *testing.T) {
+// ConditionsSet's load is one statement over two tables, so a fault in either
+// fails the write before any of it lands. The conditions table goes rather than a
+// row corrupted: the load scans every condition column as nullable — it has to,
+// they are NULL whenever there is no condition — so no row content can fail it.
+func TestConditionsSetLoadError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	obj := newConditionObject(t, store, "getcond-corrupt")
+	obj := newConditionObject(t, store, "condload-broken")
 
-	breakConditionRowRead(t, store, obj.ID)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE conditions`)
+	require.NoError(t, err)
 
-	// The object row reads fine, but ConditionsSet's getCondition pre-read hits the
-	// unreadable row and fails before any write.
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
+	err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
 }
 

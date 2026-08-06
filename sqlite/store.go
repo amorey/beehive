@@ -680,6 +680,11 @@ func (s *sqliteStore) selectScoped(
 	if err != nil {
 		return err
 	}
+	return gateKind(gk, id, group, kind)
+}
+
+// gateKind reports whether the row's own group/kind is gk's: ErrWrongKind if not.
+func gateKind(gk storeapi.GroupKind, id storeapi.ObjectID, group, kind string) error {
 	if group != gk.Group || kind != gk.Kind {
 		return fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
 			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
@@ -1447,7 +1452,7 @@ func (s *sqliteStore) loadConditions(ctx context.Context, id storeapi.ObjectID) 
 }
 
 // scanCondition decodes one condition row (conditionColumns order). The liveness
-// downgrade is applied by read-path callers, not here, so getCondition's no-op
+// downgrade is applied by read-path callers, not here, so the write path's no-op
 // comparison sees stored truth.
 func scanCondition(sc scanner) (storeapi.ObjectID, storeapi.Condition, error) {
 	var (
@@ -1479,7 +1484,7 @@ func (s *sqliteStore) livenessStale(cond *storeapi.Condition) bool {
 }
 
 // downgradeLiveness surfaces a stale liveness condition as Unknown on the read
-// path — not in getCondition, whose no-op comparison must see stored truth.
+// path — never on the write path, whose no-op comparison must see stored truth.
 func (s *sqliteStore) downgradeLiveness(cond *storeapi.Condition) {
 	if s.livenessStale(cond) {
 		cond.Status = "Unknown"
@@ -1496,18 +1501,47 @@ func (s *sqliteStore) attachConditions(ctx context.Context, obj *storeapi.RawObj
 	return obj, nil
 }
 
-// getCondition returns id's condition of type condType, or nil if absent.
-func (s *sqliteStore) getCondition(ctx context.Context, id storeapi.ObjectID, condType string) (*storeapi.Condition, error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT `+conditionColumns+` FROM conditions WHERE object_id = ? AND type = ?`, id, condType)
-	_, cond, err := scanCondition(row)
+// conditionSetLoad answers ConditionsSet's kind gate and its no-op comparison in
+// one statement, keyed on the same object. The condition columns are NULL when
+// there is none; status is NOT NULL wherever a row exists, so it marks presence.
+// transitioned_at is absent deliberately: the upsert decides it in SQL.
+const conditionSetLoad = `
+	SELECT o."group", o.kind, c.status, c.reason, c.message, c.liveness, c.updated_at
+	  FROM objects o
+	  LEFT JOIN conditions c ON c.object_id = o.id AND c.type = ?
+	 WHERE o.id = ?`
+
+// loadForConditionSet runs conditionSetLoad: the scope error, then the stored
+// condition or nil. Stored truth, undowngraded — see downgradeLiveness.
+func (s *sqliteStore) loadForConditionSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.Condition, error) {
+	var (
+		group, kind             string
+		status, reason, message sql.NullString
+		liveness                sql.NullBool
+		updatedAt               sql.NullInt64
+	)
+	err := s.conn(ctx).QueryRowContext(ctx, conditionSetLoad, condType, id).
+		Scan(&group, &kind, &status, &reason, &message, &liveness, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, storeapi.ErrNotFound // bare, like scanObject's
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &cond, nil
+	if err := gateKind(gk, id, group, kind); err != nil {
+		return nil, err
+	}
+	if !status.Valid {
+		return nil, nil
+	}
+	return &storeapi.Condition{
+		Type:      condType,
+		Status:    status.String,
+		Reason:    reason.String,
+		Message:   message.String,
+		Liveness:  liveness.Bool,
+		UpdatedAt: fromMillis(updatedAt.Int64),
+	}, nil
 }
 
 // bumpObject advances id's resource_version — the visibility half of the
@@ -1544,13 +1578,10 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 	// Within keeps the condition write and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Metadata-only gate: clean ErrNotFound/ErrWrongKind instead of an FK
-		// violation, and no row read on a path that reports none.
-		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
-			return err
-		}
-		// No-op suppression: an identical condition leaves resource_version alone.
-		existing, err := s.getCondition(ctx, id, cond.Type)
+		// One read: a metadata-only gate — clean ErrNotFound/ErrWrongKind instead of
+		// an FK violation, no blob decoded — joined to the stored condition, since
+		// no-op suppression needs it and both key on the same object.
+		existing, err := s.loadForConditionSet(ctx, gk, id, cond.Type)
 		if err != nil {
 			return err
 		}
