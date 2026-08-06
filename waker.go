@@ -84,10 +84,9 @@ type waker struct {
 	// from.
 	primed scanResult
 
-	// written carries the commit wakes; rx is what closes it. nil when the
-	// Beehive was assembled without a hub, which blocks forever.
-	written <-chan gobus.Event[GroupKind, struct{}]
-	rx      *watch.Receiver[GroupKind, struct{}]
+	// rx carries the commit wakes; nil when the Beehive was assembled without a
+	// hub.
+	rx *watch.Receiver[GroupKind, struct{}]
 
 	// drainSince is when the current run of budget-exhausting passes began; zero
 	// when no drain is running. Only paging counts, so a gate refusal is not a
@@ -145,20 +144,22 @@ func (dw *waker) run(ctx context.Context) {
 	}
 	defer dw.teardown()
 
+	// A nil channel blocks forever, so a Beehive assembled without a hub waits
+	// out its context.
+	var written <-chan gobus.Event[GroupKind, struct{}]
+	if dw.rx != nil {
+		written = dw.rx.Chan()
+	}
+
 	timer := time.NewTimer(0)
+	timer.Stop() // armed below only for what the seed left behind
 	defer timer.Stop()
 	// The instant timer.C is set to fire, zero when nothing is armed. A wake
 	// that would only push it later leaves it alone.
 	var armedFor time.Time
 
-	// Opened from what prime's seed left behind rather than from an eager pass:
-	// a seeded waker that is caught up has nothing to read until a commit says
-	// so. An unseeded one drops wakes until its retry fires, as any failed pass
-	// does.
-	backingOff := !dw.seeded
-	if wait := dw.primedWait(); wait == wakeIdle {
-		timer.Stop()
-	} else {
+	backingOff := !dw.seeded // an unseeded waker drops wakes until its retry fires
+	if wait := dw.primedWait(); wait != wakeIdle {
 		driver.Rearm(timer, wait)
 		armedFor = dw.now().Add(wait)
 	}
@@ -167,7 +168,7 @@ func (dw *waker) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case _, open := <-dw.written:
+		case _, open := <-written:
 			if !open {
 				return // only stop closes the hub, and the waker has nobody to tell
 			}
@@ -196,24 +197,23 @@ func (dw *waker) run(ctx context.Context) {
 	}
 }
 
-// off reports that this beehive has no use for a waker: no registered
-// controllers means nowhere to queue anything.
+// off reports that there is nowhere to queue a wake.
 func (dw *waker) off() bool { return len(dw.bh.order) == 0 || dw.bh.wakerOff }
 
 // prime subscribes to the commit wakes and seeds the watermark. Start calls it
-// before it returns, so both precede every write a caller could make. A failed
-// seed leaves the waker unseeded, which run retries.
+// before it returns, so both precede every write a caller could make; a failed
+// seed leaves the waker unseeded, which run retries. See
+// docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md.
 //
-// Subscribe first, and not only for newObjectTailer's reason that a write
-// between the two would be missed by both: the waker has no tick, so a commit
-// landing before the subscribe wakes nothing at all. Every kind, because an edge
-// can point at one the waker cannot name.
+// Subscribe before the seed: the waker has no tick, so a commit landing before
+// the subscribe wakes nothing at all. Every kind, because an edge can point at
+// one the waker cannot name.
 func (dw *waker) prime(ctx context.Context) {
 	if dw.off() {
 		return
 	}
 	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
-		dw.rx, dw.written = rx, rx.Chan()
+		dw.rx = rx
 	}
 	dw.primed = dw.seed(ctx)
 }
@@ -223,7 +223,7 @@ func (dw *waker) prime(ctx context.Context) {
 func (dw *waker) teardown() {
 	if dw.rx != nil {
 		dw.rx.Close()
-		dw.rx, dw.written = nil, nil
+		dw.rx = nil
 	}
 }
 
@@ -295,10 +295,9 @@ func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
 	return max(wait, wakeRetryBase), true
 }
 
-// primedWait is how long run waits before its first pass, from what the seed in
-// prime found. Gated on seeded, not on primed: scanIdle is scanResult's zero
-// value, so a waker nobody primed would otherwise read as caught up and idle
-// forever.
+// primedWait is how long run waits before its first pass, and climbs the retry
+// ladder when the seed did not land. Gated on seeded, not on primed: scanIdle is
+// scanResult's zero value.
 func (dw *waker) primedWait() time.Duration {
 	switch {
 	case !dw.seeded:

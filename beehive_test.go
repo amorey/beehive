@@ -395,7 +395,7 @@ func TestStartAbortsOnCancelledContext(t *testing.T) {
 // waker seeded on its own goroutine takes its mark whenever the runtime gets to
 // it, which is after the caller has already written.
 func TestStartSeedsTheWakerBeforeItReturns(t *testing.T) {
-	store := &wakerSeedStore{Store: &fakeStore{}, mark: 500}
+	store := &seedProbe{Store: &fakeStore{}, mark: 500}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -411,7 +411,7 @@ func TestStartSeedsTheWakerBeforeItReturns(t *testing.T) {
 // A store that cannot answer the seed read must not fail Start: the waker is an
 // optimisation over the stale-dependents pass, so an unseeded one costs latency.
 func TestStartSurvivesAFailedWakerSeed(t *testing.T) {
-	store := &wakerSeedStore{Store: &fakeStore{}, err: errBoom}
+	store := &seedProbe{Store: &fakeStore{}, err: errBoom}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -429,7 +429,7 @@ func TestStartSurvivesAFailedWakerSeed(t *testing.T) {
 // A waker with nothing to wake reads nothing at startup either.
 func TestStartSkipsPrimingADisabledWaker(t *testing.T) {
 	t.Run("turned off", func(t *testing.T) {
-		store := &wakerSeedStore{Store: &fakeStore{}}
+		store := &seedProbe{Store: &fakeStore{}}
 		bh := newTestBeehive(t, store, WithFullPassInterval(0), withDependencyWakerOff())
 		_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 		require.NoError(t, err)
@@ -442,7 +442,7 @@ func TestStartSkipsPrimingADisabledWaker(t *testing.T) {
 	})
 
 	t.Run("no controllers", func(t *testing.T) {
-		store := &wakerSeedStore{Store: &fakeStore{}}
+		store := &seedProbe{Store: &fakeStore{}}
 		bh := newTestBeehive(t, store)
 
 		stop, err := bh.Start(context.Background())
@@ -459,7 +459,7 @@ func TestStartSkipsPrimingADisabledWaker(t *testing.T) {
 func TestStartAbortsWhenTheStartContextIsCancelledDuringTheSeed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &wakerSeedStore{Store: &fakeStore{}, err: context.Canceled, onRead: cancel}
+	store := &seedProbe{Store: &fakeStore{}, err: context.Canceled, onRead: cancel}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -468,25 +468,7 @@ func TestStartAbortsWhenTheStartContextIsCancelledDuringTheSeed(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, stop, "no stop function on a failed Start")
 	assert.Equal(t, beehiveNew, bh.state)
-	assert.Nil(t, bh.waker.written, "an aborted start leaves no subscriber on the hub")
-}
-
-// wakerSeedStore answers the waker's seed read; what Start does with the answer
-// is the subject. Read on Start's goroutine, before any driver runs.
-type wakerSeedStore struct {
-	Store
-	mark   int64
-	err    error
-	onRead func() // runs inside the read, for a test that cancels mid-seed
-	reads  int
-}
-
-func (s *wakerSeedStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
-	s.reads++
-	if s.onRead != nil {
-		s.onRead()
-	}
-	return s.mark, s.err
+	assert.Nil(t, bh.waker.rx, "an aborted start leaves no subscriber on the hub")
 }
 
 func TestRegisterPropagatesOptionError(t *testing.T) {

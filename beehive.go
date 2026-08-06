@@ -171,20 +171,22 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	runCtx, cancel := context.WithCancel(context.Background())
 	bh.cancel = cancel
 
-	if err := startCtx.Err(); err != nil {
+	abort := func(err error) error {
+		bh.waker.teardown() // a no-op before prime
 		cancel()
-		return nil, fmt.Errorf("beehive: start aborted: %w", err)
+		return fmt.Errorf("beehive: start aborted: %w", err)
+	}
+	if err := startCtx.Err(); err != nil {
+		return nil, abort(err)
 	}
 
 	// Before the loops launch, and before any caller holds the stop func: the
-	// waker's watermark then precedes every write a caller could make, and its
-	// subscription precedes every commit that could wake it. A failed seed does
-	// not abort startup — the waker is an optimisation, and run retries it.
+	// watermark then precedes every write a caller could make, and the
+	// subscription every commit that could wake it. A failed seed is not a
+	// failed start.
 	bh.waker.prime(startCtx)
 	if err := startCtx.Err(); err != nil {
-		bh.waker.teardown()
-		cancel()
-		return nil, fmt.Errorf("beehive: start aborted: %w", err)
+		return nil, abort(err)
 	}
 
 	// None of the goroutines below need ordering against each other: the waker

@@ -158,31 +158,20 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 // whole design: the waker has no tick, so a commit landing before the subscribe
 // wakes nothing at all.
 func TestWakerPrimeSubscribesBeforeItSeeds(t *testing.T) {
-	store := &subscribeProbe{Store: &replayStore{seed: 500}}
+	store := &seedProbe{Store: &fakeStore{}, mark: 500}
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
-	store.dw = bh.waker
+
+	var subscribed bool
+	store.onRead = func() { subscribed = bh.waker.rx != nil }
 
 	bh.waker.prime(context.Background())
 	defer bh.waker.teardown()
 
-	assert.True(t, store.subscribed, "a write committed during the seed read must still find a listener")
+	assert.True(t, subscribed, "a write committed during the seed read must still find a listener")
 	require.True(t, bh.waker.seeded)
 	assert.EqualValues(t, 500, bh.waker.watermark)
-}
-
-// subscribeProbe reports whether the waker was listening for wakes by the time
-// its seed read ran.
-type subscribeProbe struct {
-	Store
-	dw         *waker
-	subscribed bool
-}
-
-func (s *subscribeProbe) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
-	s.subscribed = s.dw.written != nil
-	return s.Store.ObjectWritesMaxVersionAll(ctx)
 }
 
 // What the seed in Start left behind decides the loop's opening move. The gate
@@ -220,7 +209,8 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 	defer cancel()
 
 	inner := &replayStore{rows: replayRows(1), lists: make(chan struct{}, 8)}
-	store := &seedProbeStore{Store: inner, seeded: make(chan struct{}, 8)}
+	seeded := make(chan struct{}, 8)
+	store := &seedProbe{Store: inner, onRead: func() { probeSignal(seeded) }}
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
@@ -229,7 +219,7 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 	// returns, "the waker was listening" is a fact rather than a bet on
 	// scheduling. A send with no receiver reaches nobody, and there is no replay.
 	bh.waker.prime(ctx)
-	waitClosed(t, chanAfter(store.seeded, 1), "the waker to seed its watermark")
+	waitClosed(t, chanAfter(seeded, 1), "the waker to seed its watermark")
 
 	done := make(chan struct{})
 	go func() { defer close(done); bh.waker.run(ctx) }()

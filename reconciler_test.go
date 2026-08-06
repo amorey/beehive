@@ -2847,20 +2847,6 @@ func awaitObservation(t *testing.T, ch chan depObservation, msg string, want fun
 	}
 }
 
-// seedProbeStore signals when the waker reads the store-wide cursor. In this
-// fixture nothing else calls it: there are no client watches, and the reconcile
-// drivers list objects rather than versions.
-type seedProbeStore struct {
-	Store
-	seeded chan struct{}
-}
-
-func (s *seedProbeStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersionAll(ctx)
-	probeSignal(s.seeded)
-	return at, err
-}
-
 // TestClientOnlyTargetWakesDependent is the defect: a depends_on edge may point
 // at an object of a kind with no controller, and a per-registered-kind waker
 // never observes it. Not a dropped wake — none is ever attempted, so no amount

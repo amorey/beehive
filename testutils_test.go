@@ -552,6 +552,25 @@ func changedAt(versions ...int64) []ObjectWrite {
 	return refs
 }
 
+// seedProbe answers the waker's seed read itself — the wrapped store serves
+// everything else — and reports what it was asked. onRead runs inside the read,
+// for a test that needs to act at that instant.
+type seedProbe struct {
+	Store
+	mark   int64
+	err    error
+	onRead func()
+	reads  int
+}
+
+func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+	s.reads++
+	if s.onRead != nil {
+		s.onRead()
+	}
+	return s.mark, s.err
+}
+
 // replayStore serves ObjectWritesListSinceAll from a fixed set of rows, recording the
 // cursor and limit of every page it was asked for. It is the whole of what the
 // waker can see, so a test scripts a scan by setting rows and reads back what the
