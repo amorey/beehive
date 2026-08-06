@@ -98,7 +98,7 @@ func (bh *Beehive) watchBackoff() driver.Backoff {
 // WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	return c.tailStream(ctx, resolveWatch(opts), nil)
+	return c.tailStream(ctx, resolveWatch(opts), watchScope{})
 }
 
 // Watch streams changes to the single object id: an id that does not exist yet
@@ -107,7 +107,7 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	// The tail is shared per kind — the log has no index on object_id — so a
 	// single-object watch joins the kind's reader and filters the fan-out down
 	// to its own id.
-	list, ch, err := c.tailStream(ctx, resolveWatch(opts), &id)
+	list, ch, err := c.tailStream(ctx, resolveWatch(opts), watchScope{only: &id})
 	if err != nil {
 		return ObjectSnapshot[Spec, Status]{}, nil, err
 	}
@@ -118,10 +118,30 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	return snap, ch, nil
 }
 
-// snapshot reads the watch's starting state: one object, or the whole kind.
-func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID) ([]*RawObject, int64, error) {
-	if only != nil {
-		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *only)
+// OwnedObjectsWatchList streams the objects of this client's kind owned by
+// ownerID. See the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) OwnedObjectsWatchList(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+	// Ownership is not in the log, so unlike Watch this cannot filter the fan-out
+	// by key: the tailer resolves each change's owner and the subscriber matches
+	// on it. See docs/adr/2026-08-06-owner-scoped-watches.md.
+	return c.tailStream(ctx, resolveWatch(opts), watchScope{ownedBy: &ownerID})
+}
+
+// watchScope narrows a watch to part of its kind. At most one field is set; the
+// zero value is the whole kind.
+type watchScope struct {
+	only    *ObjectID // one object
+	ownedBy *ObjectID // one owner's children
+}
+
+// snapshot reads the watch's starting state, at the position its stream begins
+// above.
+func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, scope watchScope) ([]*RawObject, int64, error) {
+	switch {
+	case scope.only != nil:
+		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *scope.only)
+	case scope.ownedBy != nil:
+		return c.bh.store.ObjectWritesSnapshotByOwner(ctx, c.gk, *scope.ownedBy)
 	}
 	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
 }
@@ -624,7 +644,7 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 func (c *clientImpl[Spec, Status]) tailStream(
 	ctx context.Context,
 	cfg watchConfig,
-	only *ObjectID,
+	scope watchScope,
 ) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	var empty ObjectListSnapshot[Spec, Status]
 	tailer, err := c.bh.tailerFor(ctx, c.gk)
@@ -632,10 +652,16 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		return empty, nil, fmt.Errorf("beehive: watch on %s/%s: %w", c.gk.Group, c.gk.Kind, err)
 	}
 
+	if scope.ownedBy != nil {
+		// Before the receiver and the snapshot, or a change published in between
+		// would reach this subscriber with no owner and be dropped as another's.
+		tailer.ownerScoped.Store(true)
+	}
 	var opts []conflate.ReceiverOption[ObjectID, rawChange]
-	if only != nil {
-		// Bounds this subscriber's memory to one key.
-		opts = append(opts, tailer.hub.WithKeyFilter(func(k ObjectID) bool { return k == *only }))
+	if scope.only != nil {
+		// Bounds this subscriber's memory to one key. An owner scope has no such
+		// filter: which keys belong is what the watch is there to find out.
+		opts = append(opts, tailer.hub.WithKeyFilter(func(k ObjectID) bool { return k == *scope.only }))
 	}
 	rx := tailer.hub.Receiver(opts...)
 	// Owed by every path that returns without a stream: the receiver holds a key
@@ -655,7 +681,7 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		// moment earlier, in a second place the caller has to handle.
 		snap.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
 	} else {
-		raws, at, err := c.snapshot(ctx, only)
+		raws, at, err := c.snapshot(ctx, scope)
 		if err != nil {
 			abandon()
 			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
@@ -690,7 +716,7 @@ func (c *clientImpl[Spec, Status]) tailStream(
 
 		// One place sends the terminal Failed change; see endStream.
 		if cfg.resumeFrom != nil {
-			at, fail, ok := c.replay(work, mig, cfg, only, floor, out)
+			at, fail, ok := c.replay(work, mig, cfg, scope, floor, out)
 			if !ok {
 				c.endStream(ctx, tailer, fail, out)
 				return
@@ -875,7 +901,7 @@ func (c *clientImpl[Spec, Status]) replay(
 	ctx context.Context,
 	mig Migrator,
 	cfg watchConfig,
-	only *ObjectID,
+	scope watchScope,
 	from int64,
 	out chan<- ObjectChange[Spec, Status],
 ) (int64, error, bool) {
@@ -916,10 +942,10 @@ func (c *clientImpl[Spec, Status]) replay(
 		}
 		next := page[len(page)-1].ResourceVersion
 		full := len(page) == tailPageCap
-		if only != nil {
+		if scope.only != nil {
 			// Filter before the read: collectChanges would otherwise read back
 			// every object in the page to deliver at most one.
-			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *only })
+			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *scope.only })
 		}
 		raws, err := collectChanges(ctx, c.bh, c.gk, page, false)
 		if err != nil {

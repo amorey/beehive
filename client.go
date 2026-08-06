@@ -214,6 +214,12 @@ type Client[Spec, Status any] interface {
 	// List.
 	OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
 
+	// OwnedObjectsWatchList is OwnedObjectsList as a watch: a snapshot of
+	// ownerID's children of this kind, then every change to one of them. A child
+	// created under ownerID later arrives as Added and its collection as Deleted.
+	// Same options, errors and shared tailer as WatchList.
+	OwnedObjectsWatchList(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+
 	// OwnersGet returns id's owner, if it has one; ok is false with a nil error
 	// when it has none. The lazy counterpart to LoadOwner().
 	//

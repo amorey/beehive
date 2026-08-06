@@ -559,6 +559,43 @@ func TestWatchListReturnsASnapshot(t *testing.T) {
 	assert.Equal(t, after.ID, ev.Object.ID, "the stream carries only what the snapshot missed")
 }
 
+// An owner-scoped snapshot holds that owner's children and nothing else — not a
+// sibling owner's, and not an unowned object.
+func TestOwnedObjectsWatchListSnapshotsOnlyTheOwnersChildren(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	other := mustCreate(t, ctx, client, "other", cSpec{})
+	mine := mustCreate(t, ctx, client, "mine", cSpec{}, WithOwner(owner.ID))
+	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
+	mustCreate(t, ctx, client, "orphan", cSpec{})
+
+	snap, _, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	require.Len(t, snap.Objects, 1)
+	assert.Equal(t, mine.ID, snap.Objects[0].ID)
+	assert.GreaterOrEqual(t, snap.ResourceVersion, mine.ResourceVersion)
+}
+
+// An owner with no children yet is not an error: a watch is opened before the
+// children it is waiting for exist.
+func TestOwnedObjectsWatchListOverAChildlessOwnerStaysQuiet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	snap, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects)
+	assert.NotZero(t, snap.ResourceVersion)
+	assert.NotNil(t, ch)
+}
+
 // The tail reads what the log says changed, not the whole kind. That is the
 // whole point of the log: a tick costs what moved, not what exists.
 func TestObjectStreamTailsTheWriteLog(t *testing.T) {
