@@ -2384,6 +2384,20 @@ func TestDeletionRequestReportsTheTargetItUnblocks(t *testing.T) {
 	assert.Equal(t, []beehive.ObjectID{target.ID}, refIDs(res.Unblocked))
 }
 
+// A self-edge blocks nothing — the object's own mark already queues it — so
+// reporting it would push the same object twice, as the waker's skip avoids.
+func TestDeletionRequestReportsNoSelfEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, beehive.RelationDependsOn))
+
+	res, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.NoError(t, err)
+	require.True(t, res.Marked)
+	assert.Empty(t, res.Unblocked)
+}
+
 func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

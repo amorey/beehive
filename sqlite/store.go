@@ -2032,12 +2032,14 @@ func (s *sqliteStore) requestDeletion(
 // unblockedTargets returns the deletion-pending objects fromID points at through
 // depends_on. Sound only for a fromID this transaction just marked: that mark is
 // what makes EdgesHasIncoming discount the edge and lift the target's RESTRICT.
+// The self-edge is excluded — the object's own mark already queues it.
 func (s *sqliteStore) unblockedTargets(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ? AND r.relation = ?
-		  AND o.deletion_requested_at IS NOT NULL`+edgeOrderByTarget,
+		  AND o.deletion_requested_at IS NOT NULL
+		  AND o.id <> r.from_id`+edgeOrderByTarget,
 		fromID, string(storeapi.RelationDependsOn))
 	if err != nil {
 		return nil, err
