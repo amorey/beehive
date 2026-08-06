@@ -24,8 +24,9 @@ import (
 )
 
 // benchStaleEdgesPerObject is how many targets each object depends on, so the
-// graph carries twice the objects in edges — the shape docs/specs/
-// stale-dependents-cursor.md measured the uncursored scan against.
+// graph carries twice the objects in edges — the shape
+// docs/adr/2026-08-03-stale-dependents-cursor.md measured the uncursored scan
+// against.
 const benchStaleEdgesPerObject = 2
 
 // BenchmarkStaleDependentsSweep measures what one sweep of the stale-dependents
