@@ -72,13 +72,22 @@ is blocked-or-not *now*, and the push is a probe).
 **The last one is a real miss, and it is accepted.** If the *source* is marked
 deletion-pending in the gap, the read says "already discounted" and no push is
 issued — even though it was the removal of a then-live edge that lifted the
-block. The target waits for the next sweep. That is the pre-change behaviour for
-one interleaving: latency, never divergence, and `gcCollect` is unreachable from
-here in any case where the block is still up. The price of closing it is a
-transaction on every `DependenciesDelete`, including the far more common call
-that removes nothing at all. If that window is ever measured to matter, the fix
-is to transact only when `RowsAffected` is non-zero — which this shape cannot
-do, so it would mean probing first and paying the read on every call.
+block. A failed probe outside an ambient `Within` loses the push the same way,
+and worse: the `DELETE` stands, so the caller's retry removes nothing, reports
+nothing, and cannot recover it. Both are one-way — the push is gone, not
+deferred.
+
+**Neither can strand an object.** The target stays deletion-pending, which is a
+durable predicate the GC sweeper lists, and that sweeper cannot be disabled: a
+non-positive `WithGCInterval` is rejected. So the cost is bounded by one sweep
+interval — the pre-change behaviour, which is the same thing every push path here
+degrades to. Latency, never divergence.
+
+The price of closing it is a transaction on every `DependenciesDelete`, including
+the far more common call that removes nothing at all. If that window is ever
+measured to matter, the fix is to transact only when `RowsAffected` is non-zero —
+which this shape cannot do, so it would mean probing first and paying the read on
+every call.
 
 An ambient `Within` still takes both statements, so a caller that needs the pair
 atomic already has it.

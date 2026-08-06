@@ -2242,9 +2242,11 @@ func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.Obj
 	// as "was already discounted", and the target waits for the sweep. See
 	// docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
 	//
-	// A failure here is reported, not swallowed, even though the DELETE is
-	// already durable outside a transaction: inside an ambient Within the
-	// caller's rollback unwinds it, and a retry then pushes properly.
+	// A failure here is reported, not swallowed. Inside an ambient Within the
+	// caller's rollback unwinds the DELETE, so a retry re-runs cleanly and
+	// pushes. Outside one the DELETE stands and the retry removes nothing, so
+	// the report costs the push, not the collect: the sweeper is the route, and
+	// it cannot be turned off.
 	var to storeapi.GroupKind
 	var unblocked int
 	err = s.conn(ctx).QueryRowContext(ctx, `
