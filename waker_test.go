@@ -193,6 +193,18 @@ func TestWakerPrimedWait(t *testing.T) {
 		assert.Zero(t, dw.primedWait(), "a resume must not wait for a commit that may never come")
 	})
 
+	t.Run("an owed cursor write is a reason of its own", func(t *testing.T) {
+		// Caught up, so nothing else would arm: without this the seed point is
+		// retried only by a commit, and a successor that finds no row reseeds at
+		// the mark and skips everything committed while this process ran.
+		store := &cursorStore{replayStore: replayStore{seed: 500}, setErr: errBoom}
+		dw, _ := wakerOver(store, widget)
+		dw.prime(context.Background())
+		require.Equal(t, scanIdle, dw.primed)
+
+		assert.NotEqual(t, wakeIdle, dw.primedWait(), "the failed seed write must be retried")
+	})
+
 	t.Run("unseeded climbs the retry ladder", func(t *testing.T) {
 		dw, _ := wakerOver(&replayStore{}, widget)
 

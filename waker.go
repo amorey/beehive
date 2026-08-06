@@ -308,9 +308,13 @@ func (dw *waker) primedWait() time.Duration {
 		return dw.retry.Next()
 	case dw.primed == scanMore:
 		return 0
-	default:
-		return wakeIdle
 	}
+	// As pass does after a drained scan: a refused seed write leaves a successor
+	// to reseed at the mark, skipping everything committed while this process ran.
+	if wait, owed := dw.persistWait(dw.now()); owed {
+		return wait
+	}
+	return wakeIdle
 }
 
 // wakeIdle is pass's "no reason to look again": the loop arms nothing.

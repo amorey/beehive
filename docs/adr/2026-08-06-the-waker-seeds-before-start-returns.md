@@ -62,6 +62,12 @@ exactly when the owed pass and every reconcile loop want it. So `primedWait`
 answers from what `prime` left: `scanMore` drains at once, `wakeIdle` arms
 nothing, and an unseeded waker climbs the retry ladder.
 
+It ends in the same `persistWait` check `pass` makes, and for the reason
+[the wake-driven ADR](2026-08-05-the-waker-is-wake-driven.md) gives: a seed
+whose cursor write was refused is caught up, so nothing else would arm, and a
+successor that finds no row reseeds at the mark — skipping everything committed
+while this process ran. An idle waker that owes a cursor write is not idle.
+
 **The gate is `seeded`, not the primed value.** `scanIdle` is `scanResult`'s
 zero value, so a waker nobody primed would otherwise read as caught up and idle
 forever, arming nothing and never seeding. Gating on `seeded` collapses that
