@@ -366,8 +366,10 @@ See [the ADR](adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md).
 
 **Restart:** covered by case 8. This mechanism resumes rather than always reseeding.
 `seed` reads a cursor the waker persisted in `driver_cursors` and resumes there,
-instead of at `ObjectWritesMaxVersionAll`. Thus a change committed while the process
-was down is scanned on the eager first pass back.
+instead of at `ObjectWritesMaxVersionAll`. It runs inside `Start`, before any caller
+can write, and a resume below the mark is what arms the first pass back — so a change
+committed while the process was down is scanned without waiting for a commit.
+See [the ADR](adr/2026-08-06-the-waker-seeds-before-start-returns.md).
 
 Case 8 is still the guarantee. Three things bypass the cursor:
 
@@ -450,7 +452,7 @@ each object, and it stops itself.
 This is the backstop under case 6. It is the only mechanism here that records
 nothing. It asks current state whether each dependent has reconciled against its
 targets' latest versions. Thus it recovers a wake lost by any means: a crash, a
-startup seed race, a process with no waker, a write nobody published — a second
+failed seed, a process with no waker, a write nobody published — a second
 process, or one issued straight to the `Store` — or a defect in the wake path.
 
 **Record:** `dependency_watermarks.reconciled_against`, written by

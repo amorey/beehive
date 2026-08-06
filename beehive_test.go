@@ -390,6 +390,111 @@ func TestStartAbortsOnCancelledContext(t *testing.T) {
 	assert.Equal(t, beehiveNew, bh.state)
 }
 
+// The watermark is taken before Start hands back the stop func, so a write made
+// the instant it does lands above it. Nothing else can close that window: a
+// waker seeded on its own goroutine takes its mark whenever the runtime gets to
+// it, which is after the caller has already written.
+func TestStartSeedsTheWakerBeforeItReturns(t *testing.T) {
+	store := &seedProbe{Store: &fakeStore{}, mark: 500}
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	assert.True(t, bh.waker.seeded, "the waker must be seeded by the time a caller can write")
+	assert.EqualValues(t, 500, bh.waker.watermark)
+}
+
+// A store that cannot answer the seed read must not fail Start: the waker is an
+// optimisation over the stale-dependents pass, so an unseeded one costs latency.
+func TestStartSurvivesAFailedWakerSeed(t *testing.T) {
+	store := &seedProbe{Store: &fakeStore{}, err: errBoom}
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err, "a failed seed is not a failed start")
+	require.NotNil(t, stop)
+	// Stopped first, so the waker goroutine is done and its fields are settled.
+	require.NoError(t, stop(context.Background()))
+
+	assert.False(t, bh.waker.seeded, "an unseeded waker scans nothing until the seed lands")
+	assert.Positive(t, store.reads, "and the loop retried the seed rather than scanning from zero")
+}
+
+// A waker with nothing to wake reads nothing at startup either.
+func TestStartSkipsPrimingADisabledWaker(t *testing.T) {
+	t.Run("turned off", func(t *testing.T) {
+		store := &seedProbe{Store: &fakeStore{}}
+		bh := newTestBeehive(t, store, WithFullPassInterval(0), withDependencyWakerOff())
+		_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+		require.NoError(t, err)
+
+		stop, err := bh.Start(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stop(context.Background()))
+
+		assert.Zero(t, store.reads, "a disabled waker has no watermark to take")
+	})
+
+	t.Run("no controllers", func(t *testing.T) {
+		store := &seedProbe{Store: &fakeStore{}}
+		bh := newTestBeehive(t, store)
+
+		stop, err := bh.Start(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, stop(context.Background()))
+
+		assert.Zero(t, store.reads, "nothing registered, nowhere to queue a wake")
+	})
+}
+
+// The seed read is the one place Start can now notice a caller abandoning
+// startup. It aborts as it does for an already-cancelled context, and takes the
+// wake subscription back down with it.
+func TestStartAbortsWhenTheStartContextIsCancelledDuringTheSeed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &seedProbe{Store: &fakeStore{}, err: context.Canceled, onRead: cancel}
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, stop, "no stop function on a failed Start")
+	assert.Equal(t, beehiveNew, bh.state)
+	assert.Nil(t, bh.waker.rx, "an aborted start leaves no subscriber on the hub")
+}
+
+// An aborted Start leaves the Beehive startable, so the next attempt must seed
+// from scratch. Inheriting the last attempt's seed would leave a failed one
+// scanning from a watermark this attempt never read.
+func TestStartRePrimesAfterAnAbortedStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The seed itself succeeds; the abort is the caller cancelling around it.
+	store := &seedProbe{Store: &fakeStore{}, mark: 500, onRead: cancel}
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	_, err = bh.Start(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, bh.waker.seeded, "the first attempt did seed before the abort")
+
+	store.onRead, store.err = nil, errBoom
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stop(context.Background()))
+
+	assert.False(t, bh.waker.seeded, "a failed seed leaves nothing to scan from")
+}
+
 func TestRegisterPropagatesOptionError(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })

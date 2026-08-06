@@ -21,11 +21,13 @@ import (
 	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/rategate"
 	"github.com/amorey/gobus"
+	"github.com/amorey/gobus/watch"
 )
 
 // waker requeues the dependents of everything that changed: each commit wakes a
 // scan of the store's write log from a watermark. One per control plane; only
-// the waker goroutine touches its fields.
+// prime and the waker goroutine touch its fields, and prime runs before that
+// goroutine exists.
 //
 // It is an optimisation, not a guarantee — the stale-dependents pass
 // (staleDependentsRun) is what makes a dependency wake certain, so a wake lost
@@ -78,6 +80,10 @@ type waker struct {
 	// that, because an empty store's cursor really is zero.
 	seeded bool
 
+	// rx carries the commit wakes; nil when the Beehive was assembled without a
+	// hub.
+	rx *watch.Receiver[GroupKind, struct{}]
+
 	// drainSince is when the current run of budget-exhausting passes began; zero
 	// when no drain is running. Only paging counts, so a gate refusal is not a
 	// drain.
@@ -129,22 +135,23 @@ const wakeScanPagesPerPass = 4
 // not publish is left to the stale-dependents pass. See
 // docs/adr/2026-08-05-the-waker-is-wake-driven.md.
 func (dw *waker) run(ctx context.Context) {
-	// No registered controllers means nowhere to queue anything.
-	if len(dw.bh.order) == 0 || dw.bh.wakerOff {
+	// Above the off() check, which prime evaluates separately: a no-op on a nil
+	// rx, so it costs nothing to stop depending on the two agreeing.
+	defer dw.teardown()
+	if dw.off() {
 		return
 	}
-	// Subscribed before the first pass, for newObjectTailer's reason: a write
-	// landing between the subscribe and the seed read would be missed by both.
-	// Every kind, because an edge can point at one the waker cannot name. A nil
-	// channel blocks forever, so a Beehive assembled without a hub seeds and
-	// then waits out its context.
+
+	// A nil channel blocks forever, so a Beehive assembled without a hub waits
+	// out its context.
 	var written <-chan gobus.Event[GroupKind, struct{}]
-	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
-		defer rx.Close()
-		written = rx.Chan()
+	if dw.rx != nil {
+		written = dw.rx.Chan()
 	}
 
-	timer := time.NewTimer(0) // the eager first pass driver.Run gave us
+	// The eager first pass: prime seeded the watermark, so this one scans from
+	// it — or seeds again, if prime's read failed.
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	// The instant timer.C is set to fire, zero when nothing is armed. A wake
 	// that would only push it later leaves it alone.
@@ -181,6 +188,40 @@ func (dw *waker) run(ctx context.Context) {
 			driver.Rearm(timer, next)
 			armedFor = now.Add(next)
 		}
+	}
+}
+
+// off reports that there is nowhere to queue a wake.
+func (dw *waker) off() bool { return len(dw.bh.order) == 0 || dw.bh.wakerOff }
+
+// prime subscribes to the commit wakes and seeds the watermark. Start calls it
+// before it returns, so both precede every write a caller could make; a failed
+// seed leaves the waker unseeded, which run retries. See
+// docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md.
+//
+// Subscribe before the seed: the waker has no tick, so a commit landing before
+// the subscribe wakes nothing at all. Every kind, because an edge can point at
+// one the waker cannot name.
+func (dw *waker) prime(ctx context.Context) {
+	if dw.off() {
+		return
+	}
+	// An aborted Start leaves the Beehive startable, and this attempt's seed is
+	// the only one it may run on: inherited, a failed seed reads as caught up
+	// and arms no retry.
+	dw.seeded = false
+	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
+		dw.rx = rx
+	}
+	dw.seed(ctx)
+}
+
+// teardown ends the wake subscription. Idempotent, so an aborted Start and a
+// returning run can both call it.
+func (dw *waker) teardown() {
+	if dw.rx != nil {
+		dw.rx.Close()
+		dw.rx = nil
 	}
 }
 

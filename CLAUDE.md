@@ -70,6 +70,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   no schedule this package promises — it is out of scope, not slow. Both wakes
   are rate-limited (`internal/rategate`), and the waker's
   cursor write keeps a floor of its own so a faster loop is not a faster write.
+  **The subscription and the watermark are both taken inside `Start`**, in that
+  order, so no write a caller can make after `Start` returns is below the
+  watermark or unheard. A failed seed does not abort startup: the loop retries it
+  on the backoff, and with no stored cursor that retry reseeds at the mark as of
+  *then* — the one seed window left, and `docs/TODO.md` carries it.
   A drain that pages without a break for one stale-dependents interval **stops and
   jumps to the write log's mark** — the backstop has already swept that range. A
   failed mark read restarts that window rather than retrying per pass, so the bound
@@ -77,7 +82,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
   [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md),
-  [ADR](docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md). Every reconcile trigger
+  [ADR](docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md),
+  [ADR](docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
 - **The work queue floors how often one object is dispatched**, and a pending

@@ -490,7 +490,9 @@ func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
 func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
-	panic("not implemented: fakeStore.ObjectWritesListSinceAll")
+	// Empty rather than a panic: Start seeds the waker, so its eager first pass
+	// scans rather than seeding, and every Beehive whose waker runs reaches this.
+	return nil, nil
 }
 func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
@@ -550,6 +552,25 @@ func changedAt(versions ...int64) []ObjectWrite {
 		refs = append(refs, ObjectWrite{ID: ObjectID(i + 1), ResourceVersion: rv})
 	}
 	return refs
+}
+
+// seedProbe answers the waker's seed read itself — the wrapped store serves
+// everything else — and reports what it was asked. onRead runs inside the read,
+// for a test that needs to act at that instant.
+type seedProbe struct {
+	Store
+	mark   int64
+	err    error
+	onRead func()
+	reads  int
+}
+
+func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+	s.reads++
+	if s.onRead != nil {
+		s.onRead()
+	}
+	return s.mark, s.err
 }
 
 // replayStore serves ObjectWritesListSinceAll from a fixed set of rows, recording the

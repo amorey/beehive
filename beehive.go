@@ -154,7 +154,9 @@ func (bh *Beehive) log() *slog.Logger {
 // twice, or after stop, is an error.
 //
 // startCtx covers startup only; the long-lived loops end when the returned stop
-// is called.
+// is called. Startup reads the store to seed the dependency waker, so a startCtx
+// that expires while the store is busy fails the start — a store *error* there
+// does not, since the waker is an optimisation.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
@@ -171,14 +173,27 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	runCtx, cancel := context.WithCancel(context.Background())
 	bh.cancel = cancel
 
-	if err := startCtx.Err(); err != nil {
+	abort := func(err error) error {
+		bh.waker.teardown() // a no-op before prime
 		cancel()
-		return nil, fmt.Errorf("beehive: start aborted: %w", err)
+		return fmt.Errorf("beehive: start aborted: %w", err)
+	}
+	if err := startCtx.Err(); err != nil {
+		return nil, abort(err)
 	}
 
-	// None of the goroutines below need ordering against each other: the waker's
-	// first scan is bounded by a cursor read, and the stale-dependents pass reads
-	// current state, so nothing depends on when they happen to start.
+	// Before the loops launch, and before any caller holds the stop func: the
+	// watermark then precedes every write a caller could make, and the
+	// subscription every commit that could wake it. A failed seed is not a
+	// failed start.
+	bh.waker.prime(startCtx)
+	if err := startCtx.Err(); err != nil {
+		return nil, abort(err)
+	}
+
+	// None of the goroutines below need ordering against each other: the waker
+	// took its ordering above, and the stale-dependents pass reads current
+	// state, so nothing depends on when they happen to start.
 	bh.wg.Go(func() {
 		bh.waker.run(runCtx)
 	})

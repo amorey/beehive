@@ -2630,7 +2630,7 @@ var clientOnlyGK = GroupKind{Kind: "Config"}
 func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, func()) {
 	t.Helper()
 	ctx := context.Background()
-	store := &seedProbeStore{Store: newClientTestStore(t), seeded: make(chan struct{}, 8)}
+	store := newClientTestStore(t)
 
 	// The dependency waker is the only driver under test here, so its scans run
 	// unthrottled while everything else is pushed out of the way. The re-enqueue
@@ -2649,12 +2649,9 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, fu
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 
-	// Wait for the waker to take its cursor before returning. It seeds from the
-	// store's current version, so a write made before that read is *below* the
-	// watermark and is never scanned — and with the startup pass disabled here,
-	// nothing else would find it either. Waiting makes "the waker was watching"
-	// a fact rather than a bet on goroutine scheduling.
-	waitClosed(t, chanAfter(store.seeded, 1), "the waker to seed its watermark")
+	// No wait for the waker here: Start subscribes and seeds before it returns,
+	// so "the waker was watching" is already a fact. With the startup pass
+	// disabled, nothing else would find a write it missed.
 	return bh, store, observer, func() {
 		observer.release() // a test that failed early may still hold one parked
 		_ = stop(ctx)
@@ -2848,20 +2845,6 @@ func awaitObservation(t *testing.T, ch chan depObservation, msg string, want fun
 			t.Fatal(msg)
 		}
 	}
-}
-
-// seedProbeStore signals when the waker reads the store-wide cursor. In this
-// fixture nothing else calls it: there are no client watches, and the reconcile
-// drivers list objects rather than versions.
-type seedProbeStore struct {
-	Store
-	seeded chan struct{}
-}
-
-func (s *seedProbeStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersionAll(ctx)
-	probeSignal(s.seeded)
-	return at, err
 }
 
 // TestClientOnlyTargetWakesDependent is the defect: a depends_on edge may point
