@@ -3288,7 +3288,7 @@ type writeProbe struct {
 // what lands after this call.
 func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
+	rv, _, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return &writeProbe{t: t, store: store, rv: rv}
 }
@@ -3296,7 +3296,7 @@ func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 // writes returns everything above the cursor without moving it.
 func (p *writeProbe) writes() []storeapi.ObjectWrite {
 	p.t.Helper()
-	got, err := p.store.ObjectWritesListSinceAll(context.Background(), p.rv, 100)
+	got, _, err := p.store.ObjectWritesListSinceAll(context.Background(), p.rv, 100)
 	require.NoError(p.t, err)
 	return got
 }
@@ -3565,7 +3565,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
 	before, err := store.ResourceVersionsMaxIssued(ctx)
 	require.NoError(t, err)
-	writesBefore, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	writesBefore, _, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
 	require.NoError(t, err)
 
 	_, err = store.ReconcileOwedSweep(ctx, nil)
@@ -3574,7 +3574,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	after, err := store.ResourceVersionsMaxIssued(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "the reclaim issues no resource version")
-	writesAfter, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	writesAfter, _, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
 	require.NoError(t, err)
 	assert.Len(t, writesAfter, len(writesBefore), "the reclaim appends no write-log entry")
 }
@@ -3682,14 +3682,9 @@ func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, issued, "a create takes a version")
 
-	// Age the log out from under the sweep, which is what an idle store past its
-	// retention window sees.
-	_, err = store.db.ExecContext(ctx, `UPDATE object_writes SET written_at = 0`)
-	require.NoError(t, err)
-	_, err = store.ObjectWritesSweep(ctx, 0, time.Hour)
-	require.NoError(t, err)
+	ageOutWriteLog(t, store)
 
-	logged, err := store.ObjectWritesMaxVersionAll(ctx)
+	logged, _, err := store.ObjectWritesMaxVersionAll(ctx)
 	require.NoError(t, err)
 	require.Zero(t, logged, "the log is empty, so its max is back to 0")
 
@@ -5353,7 +5348,7 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 
 	// Everything above the first object's version, so `first` is excluded: the
 	// cursor is what the consumer already processed, not where it wants to start.
-	got, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 10)
+	got, _, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
 		{ID: second.ID, ResourceVersion: second.ResourceVersion,
@@ -5364,18 +5359,18 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 
 	// A limit truncates from the low end, so the caller can page forward by taking
 	// the last row's version as its next cursor.
-	page, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 1)
+	page, _, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	assert.Equal(t, second.ID, page[0].ID, "the oldest missed change comes first")
 
-	next, err := store.ObjectWritesListSinceAll(ctx, page[0].ResourceVersion, 1)
+	next, _, err := store.ObjectWritesListSinceAll(ctx, page[0].ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, next, 1)
 	assert.Equal(t, third.ID, next[0].ID, "paging forward from the last row's version")
 
 	// Caught up: nothing above the newest version.
-	none, err := store.ObjectWritesListSinceAll(ctx, third.ResourceVersion, 10)
+	none, _, err := store.ObjectWritesListSinceAll(ctx, third.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
@@ -5396,7 +5391,7 @@ func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 	gone := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
 
-	got, err := store.ObjectWritesListSinceAll(ctx, base.ResourceVersion, 10)
+	got, _, err := store.ObjectWritesListSinceAll(ctx, base.ResourceVersion, 10)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "the create and the collection of the second object")
 	assert.Equal(t, storeapi.WriteCreate, got[0].Op)
@@ -5409,8 +5404,55 @@ func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 func TestObjectWritesListSinceAllDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.ObjectWritesListSinceAll(context.Background(), 0, 10)
+	_, _, err := store.ObjectWritesListSinceAll(context.Background(), 0, 10)
 	require.Error(t, err)
+}
+
+// The page carries the horizon, so a consumer learns from the same read that its
+// cursor is below what retention removed. An empty page carries no rows and so
+// reports 0 — ObjectWritesMaxVersionAll is what answers the boundary alone.
+func TestObjectWritesListSinceAllReportsTheHorizon(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	old := newRefObject(t, store)
+	ageOutWriteLog(t, store)
+	fresh := newRefObject(t, store)
+
+	page, trimmed, err := store.ObjectWritesListSinceAll(ctx, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1, "only the write that survived the trim")
+	assert.Equal(t, fresh.ID, page[0].ID)
+	assert.Equal(t, old.ResourceVersion, trimmed, "and the boundary it was read above")
+
+	empty, trimmed, err := store.ObjectWritesListSinceAll(ctx, fresh.ResourceVersion, 10)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+	assert.Zero(t, trimmed, "no rows to carry it")
+}
+
+// The horizon is store-wide, so it is the deepest trim over any kind: the waker's
+// cursor is store-wide too, and an entry trimmed from any kind is one it never read.
+func TestObjectWritesListSinceAllHorizonIsTheMaxAcrossKinds(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	otherGK := beehive.GroupKind{Kind: "Other"}
+
+	newRefObject(t, store) // testGK, trimmed first and so the shallower horizon
+	ageOutWriteLog(t, store)
+	deeper, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(), Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	ageOutWriteLog(t, store)
+	newRefObject(t, store) // a live row, so the page has something to carry the horizon
+
+	_, trimmed, err := store.ObjectWritesListSinceAll(ctx, 0, 10)
+	require.NoError(t, err)
+	assert.Equal(t, deeper.ResourceVersion, trimmed, "the deeper of the two kinds")
+
+	_, markTrimmed, err := store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, trimmed, markTrimmed, "both reads agree")
 }
 
 // resource_version is monotonic in commit order, which is what makes it usable as
@@ -5453,7 +5495,7 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 	newRefObject(t, store)
 
 	for _, limit := range []int{0, -1} {
-		got, err := store.ObjectWritesListSinceAll(ctx, 0, limit)
+		got, _, err := store.ObjectWritesListSinceAll(ctx, 0, limit)
 		require.NoError(t, err)
 		assert.Empty(t, got, "limit %d asks for nothing, not for everything", limit)
 	}
@@ -5872,7 +5914,7 @@ func TestDriverCursorsSetKeysByName(t *testing.T) {
 // it — what a dependent records as its watermark.
 func cursorNow(t *testing.T, store beehive.Store) int64 {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
+	rv, _, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return rv
 }
@@ -6317,7 +6359,7 @@ func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, before, cursorNow(t, store), "an event write is not an object write")
-	writes, err := store.ObjectWritesListSinceAll(ctx, before, 10)
+	writes, _, err := store.ObjectWritesListSinceAll(ctx, before, 10)
 	require.NoError(t, err)
 	assert.Empty(t, writes, "and the listing agrees: nothing above the mark")
 }
@@ -6346,6 +6388,37 @@ func TestObjectWritesMaxVersionAllRisesOnCollection(t *testing.T) {
 	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
 
 	assert.Greater(t, cursorNow(t, store), second.ResourceVersion)
+}
+
+// ageOutWriteLog backdates every log entry and sweeps it, which is what an idle
+// store past its retention window reaches on its own.
+func ageOutWriteLog(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `UPDATE object_writes SET written_at = 0`)
+	require.NoError(t, err)
+	_, err = store.ObjectWritesSweep(context.Background(), 0, time.Hour)
+	require.NoError(t, err)
+}
+
+// The mark falls when retention trims, so on its own it cannot tell a caught-up
+// consumer from one whose history was deleted. The horizon beside it can: a
+// resume below it lost entries.
+func TestObjectWritesMaxVersionAllReportsTheHorizon(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	at, trimmed, err := store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	require.Equal(t, obj.ResourceVersion, at)
+	assert.Zero(t, trimmed, "nothing has been trimmed")
+
+	ageOutWriteLog(t, store)
+
+	at, trimmed, err = store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, at, "the log is empty, so its bare max is back to 0")
+	assert.Equal(t, obj.ResourceVersion, trimmed, "the horizon is the only record of what it held")
 }
 
 // ---------------------------------------------------------------------------

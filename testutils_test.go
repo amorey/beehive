@@ -489,10 +489,10 @@ func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) er
 func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
-func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
+func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error) {
 	// Empty rather than a panic: Start seeds the waker, so its eager first pass
 	// scans rather than seeding, and every Beehive whose waker runs reaches this.
-	return nil, nil
+	return nil, 0, nil
 }
 func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
@@ -511,10 +511,10 @@ func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int,
 	// Beehive whose GC sweeper ticks reaches this.
 	return 0, nil
 }
-func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.
-	return 0, nil
+	return 0, 0, nil
 }
 
 // depsStore serves a per-target dependent set from the waker's batched lookup
@@ -559,18 +559,19 @@ func changedAt(versions ...int64) []ObjectWrite {
 // for a test that needs to act at that instant.
 type seedProbe struct {
 	Store
-	mark   int64
-	err    error
-	onRead func()
-	reads  int
+	mark    int64
+	trimmed int64
+	err     error
+	onRead  func()
+	reads   int
 }
 
-func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	s.reads++
 	if s.onRead != nil {
 		s.onRead()
 	}
-	return s.mark, s.err
+	return s.mark, s.trimmed, s.err
 }
 
 // replayStore serves ObjectWritesListSinceAll from a fixed set of rows, recording the
@@ -580,7 +581,9 @@ func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
 type replayStore struct {
 	depsStore
 	rows    []ObjectWrite // every live row, in version order
-	seed    int64         // what ObjectWritesMaxVersionAll reports
+	seed    int64         // the mark ObjectWritesMaxVersionAll reports
+	trimmed int64         // the retention horizon both reads report
+	marks   int           // ObjectWritesMaxVersionAll calls
 	pages   [][2]int64    // (afterRV, limit) per call
 	read    int           // rows actually served, across every page
 	lists   chan struct{} // one token per page request, when set
@@ -598,11 +601,12 @@ type replayStore struct {
 	healFromCall int
 }
 
-func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+	s.marks++
 	if s.seedErr != nil {
-		return 0, s.seedErr
+		return 0, 0, s.seedErr
 	}
-	return s.seed, nil
+	return s.seed, s.trimmed, nil
 }
 
 // cursors returns the afterRV of every scan so far, which is how a test sees
@@ -629,11 +633,11 @@ func (s *replayStore) failing() bool {
 	return true
 }
 
-func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
 	probeSignal(s.lists)
 	if s.failing() {
-		return nil, s.err
+		return nil, 0, s.err
 	}
 	out := make([]ObjectWrite, 0, min(limit, len(s.rows)))
 	for _, r := range s.rows {
@@ -645,7 +649,10 @@ func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64,
 		}
 	}
 	s.read += len(out)
-	return out, nil
+	if len(out) == 0 {
+		return out, 0, nil // an empty page carries no horizon, as the store's does not
+	}
+	return out, s.trimmed, nil
 }
 
 // replayRows builds count live rows at versions 1..count.

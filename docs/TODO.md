@@ -84,42 +84,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   `TestWakerRetriesSeedOnAFailedCursorRead` pin that a failed seed leaves the
   waker unseeded and scanning nothing — the behaviour any fix here must keep.
 
-- **The waker cannot tell that retention trimmed the log out from under its
-  cursor** — known, not fixed, and latency rather than divergence. The per-kind
-  read reports the boundary: `ObjectWritesListSince` returns `trimmedThrough`,
-  and `ObjectWritesMaxVersion` folds the horizon in, which is how a watch tail
-  detects a cursor below it and ends its subscribers with `ErrWatchTooOld`. The
-  store-wide pair does neither. `ObjectWritesListSinceAll` returns entries and an
-  error, and `ObjectWritesMaxVersionAll` reads a bare `MAX(resource_version)` off
-  `object_writes` with no reference to `object_writes_horizon`.
-
-  So a waker that resumes a cursor below the horizon — a stored cursor older than
-  the write log's retention, 24h by default, after a downtime longer than that —
-  scans from that cursor and gets whatever survived the trim. `resumeWatermark`
-  clamps against `max`, which does not move down when retention trims the tail, so
-  the clamp cannot see it either. The entries between the cursor and the horizon
-  are silently skipped, and every dependent they would have woken is skipped with
-  them.
-
-  **Correctness is intact and that is why this is deferred:** those dependents are
-  found by the stale-dependents pass, which derives staleness from
-  `dependency_watermarks` and from `reconcile_owed`, neither of which the write
-  log's trim can touch. This path opens only after a restart, which is also when
-  that pass re-derives the whole graph from a cursor of 0. The cost is
-  up to one `staleDependentsInterval` of latency, on a path that only opens after
-  a downtime exceeding the write log's retention.
-
-  **The fix is to surface the horizon on the store-wide reads** and have `seed`
-  compare its resume point against it, as `objectTailer` does per kind. The waker
-  cannot answer a gap the way a tailer does — there are no subscribers to end, and
-  restarting from `max` is what it already does without a cursor — so the useful
-  behaviour is to log the skipped span and force one stale-dependents sweep rather
-  than wait for its tick. Not done because it widens `storeapi.Store` for a case
-  no deployment has hit, and because the same reasoning that makes the gap benign
-  makes the forced sweep an optimisation. Revisit when the store-wide reads are
-  next touched, or if a long outage is seen to leave dependents stale for a
-  minute after restart.
-
 - **A `RequeueAfter` chain does not survive a restart** — known, not fixed. The
   dependency-wake half is closed: staleness is re-derived from
   `dependency_watermarks`, so a wake lost with the process that owed it is found again

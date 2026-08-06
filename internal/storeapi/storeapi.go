@@ -663,18 +663,29 @@ type Store interface {
 	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for
-	// the dependency waker: an edge can point at a kind with no controller. It
-	// reports no horizon, because the waker's cursor is an optimisation over the
-	// stale-dependents pass rather than a guarantee.
-	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+	// the dependency waker: an edge can point at a kind with no controller.
+	// trimmedThrough is the horizon as of the page, over every kind, so afterRV <
+	// trimmedThrough means entries were trimmed unread; equality is fine, since
+	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
+	// horizon rides the rows, and ObjectWritesMaxVersionAll answers it alone.
+	//
+	// Unlike ObjectWritesListSince the page and the horizon need not be read
+	// atomically: a horizon that rose in between means entries really were trimmed
+	// unread.
+	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at
 	// or below it, and ObjectWritesListSince returns nothing above it.
 	ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error)
 
-	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind. Not
-	// monotonic — a delete lowers it — so consumers compare for inequality.
-	ObjectWritesMaxVersionAll(ctx context.Context) (int64, error)
+	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind, with
+	// the horizon reported beside it rather than folded in. at is the log's bare
+	// maximum, so it is not monotonic — a delete or a retention sweep lowers it —
+	// and consumers compare for inequality. trimmedThrough is the highest version
+	// retention has removed from any kind, 0 when nothing has been: at ==
+	// trimmedThrough == 0 is an empty log, and a cursor below trimmedThrough lost
+	// entries it never read.
+	ObjectWritesMaxVersionAll(ctx context.Context) (at int64, trimmedThrough int64, err error)
 
 	// ObjectWritesSnapshot returns every object of kind gk and the log position
 	// the listing is complete as of, read in one transaction so no write falls

@@ -34,6 +34,7 @@ directory of archaeology.
 - [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
 - [The dependency waker subscribes and seeds before Start returns](2026-08-06-the-waker-seeds-before-start-returns.md)
 - [The dependency waker abandons a drain the stale-dependents pass has overtaken](2026-08-05-the-waker-abandons-an-overtaken-drain.md)
+- [The dependency waker sees a retention trim under its cursor](2026-08-06-the-waker-sees-a-retention-trim.md)
 - [Object writes go to an append-only log, and watches tail it](2026-08-02-object-write-log.md)
 - [One tailer per kind, woken by the commit path, above a floor tick](2026-08-03-watch-shared-tail.md)
 - [The object tail floors the gap between wake-driven drains](2026-08-05-the-object-tail-throttles-its-drains.md)

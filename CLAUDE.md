@@ -130,8 +130,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   which would otherwise be retried only by a commit that may never come. Going
   idle **stops** the timer, or one already ready drives a pass nobody asked for.
   The cursor persists via the optional `DriverCursorer`; it is an optimisation
-  over the stale-dependents pass, never a guarantee.
+  over the stale-dependents pass, never a guarantee. **Both store-wide reads
+  report the retention horizon** beside their value rather than folded in — the
+  abandon jump needs the bare mark — so a cursor below the boundary is warned about
+  once instead of skipping silently. The horizon **moves no cursor**: it is a max
+  over kinds, and the per-kind count bound trims a chatty kind past entries a quiet
+  one still holds, so it proves a loss without bounding an empty range.
   → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md),
+  [ADR](docs/adr/2026-08-06-the-waker-sees-a-retention-trim.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
   [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md)
 - **Object writes are recorded in an append-only log** (`object_writes`), one

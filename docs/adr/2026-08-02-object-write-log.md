@@ -77,6 +77,10 @@ transaction and taking the `resource_version` that write was assigned.
   rises and the tick gate is `>` rather than `!=`. Without the fold, a kind
   trimmed empty reports 0 against a tail parked higher and lists on every tick —
   on the kind that writes least.
+- **The store-wide reads report the horizon beside their value** rather than
+  folding it in, since `abandonIfOvertaken` needs the bare mark. The waker reports
+  a trimmed span with it, and moves no cursor by it
+  ([ADR](2026-08-06-the-waker-sees-a-retention-trim.md)).
 
 The count bound trims one statement per kind rather than one subquery per row.
 Keyed on a literal kind the cutoff is uncorrelated, so SQLite evaluates it once
