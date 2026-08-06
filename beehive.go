@@ -154,7 +154,9 @@ func (bh *Beehive) log() *slog.Logger {
 // twice, or after stop, is an error.
 //
 // startCtx covers startup only; the long-lived loops end when the returned stop
-// is called.
+// is called. Startup reads the store to seed the dependency waker, so a startCtx
+// that expires while the store is busy fails the start — a store *error* there
+// does not, since the waker is an optimisation.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()

@@ -57,6 +57,33 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   Tripwire: `TestAddDependencyAcceptsCycle` asserts that cycle-closing and
   self edges are both accepted today — exactly what such a guard would change.
 
+- **A failed seed still reseeds at the mark as of its retry** — the remainder of
+  the startup seed race, after
+  [seeding moved into `Start`](docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md)
+  closed the scheduling half. `prime` cannot fail startup, so a failed read leaves
+  the waker unseeded and `run` retries on the backoff (100ms, doubling). With a
+  stored cursor the retry resumes there and nothing is skipped; **without one — a
+  fresh store, or a store with no `DriverCursorer` — it reads
+  `ObjectWritesMaxVersionAll` as of *then*, and a write committed in between is
+  below it.** `backingOff` is why a commit cannot shorten the window: an unseeded
+  waker drops wakes until its retry fires.
+
+  Latency, not divergence, for the usual reason: the stale-dependents pass derives
+  staleness from `dependency_watermarks` and the racing write bumps the target's
+  `resource_version`, so the next sweep lists the dependent. The cost is up to one
+  `staleDependentsInterval` where the waker promises one commit, on a path that
+  needs a store read to fail during startup.
+
+  **The fix is to make a failed seed hand its window to the backstop** — force one
+  stale-dependents sweep once the seed lands, rather than trying to reconstruct a
+  mark nobody read. That is the same remedy the retention entry below wants, so
+  build them together. Not done because the trigger is a failed read on a cold
+  path and the backstop already covers it.
+
+  Tripwires: `TestWakerRetriesSeedOnTheNextTick` and
+  `TestWakerRetriesSeedOnAFailedCursorRead` pin that a failed seed leaves the
+  waker unseeded and scanning nothing — the behaviour any fix here must keep.
+
 - **The waker cannot tell that retention trimmed the log out from under its
   cursor** — known, not fixed, and latency rather than divergence. The per-kind
   read reports the boundary: `ObjectWritesListSince` returns `trimmedThrough`,

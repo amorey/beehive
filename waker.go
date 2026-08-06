@@ -139,10 +139,12 @@ const wakeScanPagesPerPass = 4
 // not publish is left to the stale-dependents pass. See
 // docs/adr/2026-08-05-the-waker-is-wake-driven.md.
 func (dw *waker) run(ctx context.Context) {
+	// Above the off() check, which prime evaluates separately: a no-op on a nil
+	// rx, so it costs nothing to stop depending on the two agreeing.
+	defer dw.teardown()
 	if dw.off() {
 		return
 	}
-	defer dw.teardown()
 
 	// A nil channel blocks forever, so a Beehive assembled without a hub waits
 	// out its context.

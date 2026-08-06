@@ -72,8 +72,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   cursor write keeps a floor of its own so a faster loop is not a faster write.
   **The subscription and the watermark are both taken inside `Start`**, in that
   order, so no write a caller can make after `Start` returns is below the
-  watermark or unheard; a failed seed does not abort startup, and the run loop
-  retries it.
+  watermark or unheard. A failed seed does not abort startup: the loop retries it
+  on the backoff, and with no stored cursor that retry reseeds at the mark as of
+  *then* — the one seed window left, and `docs/TODO.md` carries it.
   A drain that pages without a break for one stale-dependents interval **stops and
   jumps to the write log's mark** — the backstop has already swept that range. A
   failed mark read restarts that window rather than retrying per pass, so the bound

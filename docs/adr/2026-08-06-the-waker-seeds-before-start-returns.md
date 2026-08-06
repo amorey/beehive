@@ -87,13 +87,23 @@ query on a store already busy at startup.
 
 ## Consequences
 
-**The seed race is closed, not narrowed.** This supersedes the "narrows to first
-run only" paragraph in [the durable-cursor ADR](2026-07-30-durable-waker-cursor.md),
-and the `docs/TODO.md` entry it belonged to is deleted. The hesitation that ADR
-recorded — a synchronous seed now reads *two* rows inside `Start`'s critical
-section rather than one — is what this decision accepts, and the answer to "does
-a failed seed abort startup" is no, which is why the retry-on-a-later-pass path
-stays.
+**The scheduling half of the seed race is closed.** No write a caller can make
+after `Start` returns is below a watermark this process took, or ahead of its
+subscription. This supersedes the "narrows to first run only" paragraph in
+[the durable-cursor ADR](2026-07-30-durable-waker-cursor.md). The hesitation that
+ADR recorded — a synchronous seed now reads *two* rows inside `Start`'s critical
+section rather than one — is what this decision accepts.
+
+**A failed seed keeps its own window, and it is the same window.** The answer to
+"does a failed seed abort startup" is no, so `run` retries roughly 100ms later —
+and with no stored cursor to resume from, that retry reads the mark as of
+*then*. A write committed in between is below it and reaches its dependents
+through the stale-dependents pass, not through the waker. `backingOff` is why a
+commit in that window does not shorten it: an unseeded waker drops wakes until
+its retry fires. This is narrower than what this ADR closes — it needs a failed
+store read *and* a store with no `DriverCursorer` or no cursor yet — but it is
+the same shape, so `docs/TODO.md` keeps an entry for it rather than claiming the
+race is gone.
 
 **`Start` blocks on the store, under `bh.mu`.** Two indexed reads and at most
 one cursor write. `Register`, `Stop` and a concurrent client write's commit
