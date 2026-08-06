@@ -2049,16 +2049,14 @@ func (s *sqliteStore) unblockedTargets(ctx context.Context, fromIDs []storeapi.O
 
 func (s *sqliteStore) unblockedTargetsChunk(ctx context.Context, fromIDs []storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	args := make([]any, 0, len(fromIDs)+1)
-	placeholders := make([]string, len(fromIDs))
-	for i, id := range fromIDs {
-		placeholders[i] = "?"
+	for _, id := range fromIDs {
 		args = append(args, id)
 	}
 	args = append(args, string(storeapi.RelationDependsOn))
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
+		WHERE r.from_id IN (`+placeholders(len(fromIDs))+`) AND r.relation = ?
 		  AND o.deletion_requested_at IS NOT NULL
 		  AND o.id <> r.from_id`+edgeOrderByTarget, args...)
 	if err != nil {

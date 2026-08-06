@@ -210,6 +210,18 @@ func fast(opts ...Option) []Option {
 	}, opts...)
 }
 
+// parked is fast with every periodic pass stopped, so a push is the only thing
+// left that can dispatch — which is what a "…WithoutASweep" test asserts.
+func parked(opts ...Option) []Option {
+	return fast(append([]Option{
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withStaleDependentsInterval(time.Hour),
+		withDependencyWakerOff(),
+		withoutGCSweeper(),
+	}, opts...)...)
+}
+
 // drainRecv discards whatever a bus receiver is holding, so the next Recv proves
 // something published after the drain.
 func drainRecv[E any, R interface{ TryRecv() (E, error) }](rx R) {

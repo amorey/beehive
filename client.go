@@ -866,21 +866,21 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	}
 	if res.Marked {
 		c.bh.signalKindWritten(ctx, c.gk)
-		c.signalDeletionRequested(ctx, id, res.Unblocked)
+		c.signalDeletionRequested(ctx, res)
 	}
 	return nil
 }
 
-// signalDeletionRequested enqueues id and the targets its mark unblocked, once
-// the mark commits. Callers pass only writes that actually stamped the row.
-func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, id ObjectID, unblocked []ObjectRef) {
+// signalDeletionRequested enqueues the marked object and the targets its mark
+// unblocked, once the mark commits. Callers pass only results that stamped a row.
+func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, res storeapi.DeletionRequestResult) {
 	// Not throttled: a delete carries new information, and the mark is once per
 	// object, so it cannot ride this on a repeat.
-	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: res.ID, Group: c.gk.Group, Kind: c.gk.Kind})
 	// A finalizing target already carries its own delete's alarm, which a
 	// throttled push would ride. See
 	// docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md.
-	c.bh.signalRequeueManyNow(ctx, unblocked)
+	c.bh.signalRequeueManyNow(ctx, res.Unblocked)
 }
 
 // DeleteByName is Delete keyed by name; the store resolves and marks in one
@@ -900,7 +900,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	if res.Marked {
 		c.bh.signalKindWritten(ctx, c.gk)
-		c.signalDeletionRequested(ctx, res.ID, res.Unblocked)
+		c.signalDeletionRequested(ctx, res)
 	}
 	return nil
 }

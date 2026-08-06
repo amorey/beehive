@@ -1060,13 +1060,7 @@ func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClien
 func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store, fast(
-		WithFullPassInterval(0),
-		withOwedPassInterval(time.Hour),
-		withStaleDependentsInterval(time.Hour),
-		withDependencyWakerOff(),
-		withoutGCSweeper(),
-	)...)
+	bh := newTestBeehive(t, store, parked()...)
 
 	ctrl := &depReleaseController{}
 	_, err := Register(bh, clientTestGK, ctrl)
@@ -1142,13 +1136,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store, fast(
-		WithFullPassInterval(0),
-		withOwedPassInterval(time.Hour),
-		withStaleDependentsInterval(time.Hour),
-		withDependencyWakerOff(),
-		withoutGCSweeper(),
-	)...)
+	bh := newTestBeehive(t, store, parked()...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1207,13 +1195,7 @@ func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
 func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store, fast(
-		WithFullPassInterval(0),
-		withOwedPassInterval(time.Hour),
-		withStaleDependentsInterval(time.Hour),
-		withDependencyWakerOff(),
-		withoutGCSweeper(),
-	)...)
+	bh := newTestBeehive(t, store, parked()...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)

@@ -2408,6 +2408,30 @@ func TestCascadeReportsTheTargetsItsChildrenUnblock(t *testing.T) {
 	assert.Empty(t, res.Unblocked, "a child already deleting discounted its edge long ago")
 }
 
+// A cascade level is unbounded, so the read chunks; every chunk's targets have to
+// survive into the one result.
+func TestCascadeReportsUnblockedTargetsAcrossChunks(t *testing.T) {
+	defer func(n int) { idChunkSize = n }(idChunkSize)
+	idChunkSize = 2 // 5 children -> 3 chunks (2, 2, 1)
+
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	var targets []beehive.ObjectID
+	for range 5 {
+		child, target := newRefObject(t, store), newRefObject(t, store)
+		require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+		require.NoError(t, addEdge(ctx, store, child.ID, target.ID, beehive.RelationDependsOn))
+		_, err := store.DeletionRequestsCreate(ctx, testGK, target.ID)
+		require.NoError(t, err)
+		targets = append(targets, target.ID)
+	}
+
+	res, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, targets, refIDs(res.Unblocked))
+}
+
 // A self-edge blocks nothing — the object's own mark already queues it — so
 // reporting it would push the same object twice, as the waker's skip avoids.
 func TestDeletionRequestReportsNoSelfEdge(t *testing.T) {

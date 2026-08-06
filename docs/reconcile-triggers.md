@@ -45,7 +45,7 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly eight push paths that cause a reconcile. All use
+There are exactly nine push paths that cause a reconcile. All use
 `Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
@@ -59,8 +59,9 @@ can be read.
 | A physical delete enqueues the owners it unblocked | `Beehive.gcCollect` | each deletion-pending owner of the deleted row | the owner's `deletion_requested_at` |
 | A dropped dependency enqueues the target it unblocked | `ControllerClient.DependenciesDelete` | the target of the dropped `depends_on` edge | `EdgesDeleteResult.Unblocked` |
 | A create under a deleting owner enqueues that owner | `clientImpl.insertObject` | the owner named by `WithOwner` | `EdgesAddResult.ToDeleting` |
+| A deletion mark enqueues the targets it unblocked | `clientImpl.signalDeletionRequested`, `Beehive.gcCollect` | each deletion-pending `depends_on` target of a row this call marked | `DeletionRequestResult.Unblocked`, `DeletionCascadeResult.Unblocked` |
 
-Seven of the eight are immediate: their gate is a store write that lands once, so
+Eight of the nine are immediate: their gate is a store write that lands once, so
 they carry new information and cancel a pending alarm rather than being absorbed by
 one. The new edge is the exception, and it is throttled because a controller can
 declare the same edge on every pass, so it goes through `work.add` and respects the
@@ -75,10 +76,13 @@ replaces an owned child each pass would drive the owner, with the floor bypassed
 → [the delete's ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
 [the create's](adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md).
 
-The dropped dependency is gated on *both* endpoints, which no other push is: the
-target because only a deletion-pending one was blocked, and the source because
-`EdgesHasIncoming` discounts an edge from a deletion-pending source, so dropping one
-lifts nothing. → [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
+The dropped dependency is gated on *both* endpoints: the target because only a
+deletion-pending one was blocked, and the source because `EdgesHasIncoming`
+discounts an edge from a deletion-pending source, so dropping one lifts nothing.
+→ [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md). The deletion
+mark reads the same pair from the other side — it *is* the source's mark, so only
+the target is left to filter, and the row it marked is what the mark itself
+enqueues. → [its ADR](adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md).
 Cases 1, 5, 9, 10, 11 and 12 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
