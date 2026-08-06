@@ -2889,6 +2889,14 @@ func (s *sqliteStore) ObjectWritesSnapshotByID(ctx context.Context, gk storeapi.
 	})
 }
 
+// ObjectWritesSnapshotByOwner reads one owner's children of gk. The listing is
+// already kind-scoped, so a foreign owner simply matches nothing.
+func (s *sqliteStore) ObjectWritesSnapshotByOwner(ctx context.Context, gk storeapi.GroupKind, ownerID storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
+	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+		return s.ObjectsListByIncomingEdge(ctx, gk, ownerID, storeapi.RelationOwnedBy)
+	})
+}
+
 func (s *sqliteStore) snapshot(
 	ctx context.Context,
 	gk storeapi.GroupKind,

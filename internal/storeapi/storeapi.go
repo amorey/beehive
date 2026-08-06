@@ -735,6 +735,12 @@ type Store interface {
 	// position — the kind's, because the stream that follows tails the kind.
 	ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
 
+	// ObjectWritesSnapshotByOwner is ObjectWritesSnapshot for one owner's
+	// children: the objects of kind gk with an owned_by edge to ownerID, and gk's
+	// log position. ownerID is not existence-checked and is typically another
+	// kind; no children reads empty.
+	ObjectWritesSnapshotByOwner(ctx context.Context, gk GroupKind, ownerID ObjectID) ([]*RawObject, int64, error)
+
 	// ObjectWritesSweep trims the write log to the retention bounds and returns
 	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
 	// its newest perKind entries; maxAge > 0 drops entries written more than

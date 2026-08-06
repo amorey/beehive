@@ -7477,6 +7477,49 @@ func TestObjectWritesSnapshotByIDReadsOneRow(t *testing.T) {
 	assert.Empty(t, foreign, "another kind cannot see this row")
 }
 
+// The owner-scoped snapshot reads one owner's children and reports the KIND's
+// position, for the same reason the by-id one does: the stream that follows it
+// tails the kind's log.
+func TestObjectWritesSnapshotByOwnerReadsOneOwnersChildren(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	other := newRefObject(t, store)
+	mine := newRefObject(t, store)
+	theirs := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, mine.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, theirs.ID, other.ID, beehive.RelationOwnedBy))
+
+	rows, at, err := store.ObjectWritesSnapshotByOwner(ctx, testGK, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, mine.ID, rows[0].ID)
+	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, position, at, "the kind's position, not this row's version")
+
+	foreign, _, err := store.ObjectWritesSnapshotByOwner(ctx, beehive.GroupKind{Kind: "Other"}, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, foreign, "another kind cannot see this row")
+}
+
+// An owner with no children, and an id that is no owner at all, both read empty
+// rather than erroring: a watch may be opened before the children exist.
+func TestObjectWritesSnapshotByOwnerFoldsAbsence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	childless := newRefObject(t, store)
+
+	rows, at, err := store.ObjectWritesSnapshotByOwner(ctx, testGK, childless.ID)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+	assert.NotZero(t, at)
+
+	rows, _, err = store.ObjectWritesSnapshotByOwner(ctx, testGK, 404)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
 // The tail reads the objects one batch named, in one query. A short result is
 // normal: an id collected between the log read and this one is simply absent,
 // and its delete arrives as a later entry.
