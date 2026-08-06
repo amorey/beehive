@@ -814,6 +814,31 @@ func TestEventsMaxVersionStoreError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The cap's candidate query runs on every sweep, over every timeline, so it must
+// ride an index rather than sort. Two indexes lead on (object_id, category) and
+// either will do; what must not appear is a TEMP B-TREE, which means the group
+// by is sorting the whole table, or a table scan, which means reading every
+// blob to count rows.
+func TestEventsSweepSelectsCandidatesByIndex(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	rows, err := store.db.QueryContext(context.Background(),
+		`EXPLAIN QUERY PLAN `+eventCapCandidates, 1)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notused, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+	assert.Contains(t, plan, "COVERING INDEX", "plan:\n"+plan)
+	assert.NotContains(t, plan, "TEMP B-TREE", "plan:\n"+plan)
+}
+
 // EventsMaxVersion is the gate EventsWatch pays on every quiet tick, so it must be
 // answered from idx_events_object_rv alone. COVERING is the whole assertion: with
 // only idx_events_object_cat the plan still names an index, but resource_version is

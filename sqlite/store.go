@@ -1907,15 +1907,7 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge t
 	// One transaction so both bounds see the same snapshot and land together.
 	err := s.Within(ctx, func(ctx context.Context) error {
 		if perTimeline > 0 {
-			// Rank runs newest-first per (object, category) and drop past the cap.
-			n, err := s.trimEvents(ctx, `id IN (
-				SELECT id FROM (
-					SELECT id, ROW_NUMBER() OVER (
-						PARTITION BY object_id, category
-						ORDER BY last_at DESC, id DESC) AS rn
-					FROM events
-				) WHERE rn > ?
-			)`, perTimeline)
+			n, err := s.trimEventsToCap(ctx, perTimeline)
 			if err != nil {
 				return err
 			}
@@ -1931,6 +1923,62 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge t
 		return nil
 	})
 	return total, err
+}
+
+// eventCapCandidates lists the timelines holding more than the cap. It rides
+// idx_events_object_cat, which leads on the grouping columns, so it is an
+// index-only pass rather than a sort of the table.
+const eventCapCandidates = `
+	SELECT object_id, category FROM events
+	 GROUP BY object_id, category HAVING COUNT(*) > ?`
+
+// trimEventsToCap deletes each over-cap timeline's oldest runs, one scoped
+// statement per timeline.
+//
+// Ranking the whole table in one statement would be shorter, but it scans every
+// run whether or not anything is over cap, twice — trimEvents evaluates its
+// predicate for the horizon and again for the delete — while holding the write
+// connection. Per timeline, both are seeks.
+func (s *sqliteStore) trimEventsToCap(ctx context.Context, cap int) (int, error) {
+	c := s.conn(ctx)
+	rows, err := c.QueryContext(ctx, eventCapCandidates, cap)
+	if err != nil {
+		return 0, err
+	}
+	var over []struct {
+		id       storeapi.ObjectID
+		category string
+	}
+	for rows.Next() {
+		var t struct {
+			id       storeapi.ObjectID
+			category string
+		}
+		if err := rows.Scan(&t.id, &t.category); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		over = append(over, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var total int
+	for _, t := range over {
+		// Newest-first, skip the cap, delete the rest: the same order the ring
+		// keeps, served by idx_events_object_cat.
+		n, err := s.trimEvents(ctx, `object_id = ? AND category = ? AND id IN (
+			SELECT id FROM events WHERE object_id = ? AND category = ?
+			 ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?)`,
+			t.id, t.category, t.id, t.category, cap)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // trimEvents deletes the runs matching where and raises each affected timeline's
