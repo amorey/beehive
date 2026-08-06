@@ -68,6 +68,12 @@ forever, arming nothing and never seeding. Gating on `seeded` collapses that
 case into the failed-seed one. A `scanUnprimed` sentinel was rejected: it adds a
 value `scan` never returns, for a state `seeded` already names.
 
+That gate only holds if a failed seed really does leave `seeded` false, which
+takes one line: an aborted `Start` leaves the Beehive startable, so `prime`
+clears the flag before seeding rather than inheriting the previous attempt's.
+Without it a retried `Start` whose seed fails reads as caught up and arms no
+retry.
+
 One eager query survives by design: a commit landing between the subscribe and
 the seed read fills the receiver's slot, so `run` consumes that wake and scans
 once, finding nothing. That is the price of subscribing first, and it is one

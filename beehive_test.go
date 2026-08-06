@@ -471,6 +471,32 @@ func TestStartAbortsWhenTheStartContextIsCancelledDuringTheSeed(t *testing.T) {
 	assert.Nil(t, bh.waker.rx, "an aborted start leaves no subscriber on the hub")
 }
 
+// An aborted Start leaves the Beehive startable, so the next attempt must seed
+// from scratch. Inheriting the last attempt's seed would let a failed one read
+// as caught up: primed says scanFailed, seeded still says true, and run arms no
+// retry.
+func TestStartRePrimesAfterAnAbortedStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The seed itself succeeds; the abort is the caller cancelling around it.
+	store := &seedProbe{Store: &fakeStore{}, mark: 500, onRead: cancel}
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
+	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	_, err = bh.Start(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, bh.waker.seeded, "the first attempt did seed before the abort")
+
+	store.onRead, store.err = nil, errBoom
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, stop(context.Background()))
+
+	assert.False(t, bh.waker.seeded, "a failed seed leaves nothing to scan from")
+	assert.NotEqual(t, wakeIdle, bh.waker.primedWait(), "and the loop must retry it")
+}
+
 func TestRegisterPropagatesOptionError(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })

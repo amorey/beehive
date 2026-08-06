@@ -212,6 +212,10 @@ func (dw *waker) prime(ctx context.Context) {
 	if dw.off() {
 		return
 	}
+	// An aborted Start leaves the Beehive startable, and this attempt's seed is
+	// the only one it may run on: inherited, a failed seed reads as caught up
+	// and arms no retry.
+	dw.seeded = false
 	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
 		dw.rx = rx
 	}
