@@ -63,9 +63,9 @@ query. A probe built on the read-path row readers would have kept the conditions
 saving and thrown the rest away.
 
 `checkObjectScoped` is the general form of that, not a one-off for the deletion pair:
-**a write that reports no row reads no row.** Both condition mutators gate on kind
-through it too, which is what stops a corrupt `finalizers` blob from failing a
-condition write that never touches finalizers — the inconsistency that gave the rule
+**a write that reports no row reads no row.** Both condition mutators and `EventsAdd`
+gate on kind through it too, which is what stops a corrupt `finalizers` blob from
+failing a write that never touches finalizers — the inconsistency that gave the rule
 away, since `DeletionRequestsCreate` already tolerated such a row.
 
 **A write that needs part of a row reads part of a row**, which is the same rule one

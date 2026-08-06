@@ -3843,12 +3843,13 @@ func TestDeletionRequestsCreateMarkError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// The condition mutators gate on kind, which is metadata, so they must not decode
-// the row to do it. A corrupt finalizers blob is the probe: it fails every full-row
-// read in the store, and neither of these writes touches finalizers. Sibling of
-// TestDeletionRequestsCreateReadsNoBlobOnEitherBranch — same rule, same class of
-// write, and before the gate was narrowed these two disagreed about it.
-func TestConditionWritesReadNoBlobToGateOnKind(t *testing.T) {
+// The condition mutators and EventsAdd gate on kind, which is metadata, so they
+// must not decode the row to do it. A corrupt finalizers blob is the probe: it
+// fails every full-row read in the store, and none of these writes touches
+// finalizers. Sibling of TestDeletionRequestsCreateReadsNoBlobOnEitherBranch —
+// same rule, same class of write, and before the gate was narrowed these
+// disagreed about it.
+func TestGatedWritesReadNoBlobToGateOnKind(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	id := insertBadFinalizersRow(t, store, testGK)
@@ -3856,11 +3857,15 @@ func TestConditionWritesReadNoBlobToGateOnKind(t *testing.T) {
 	require.NoError(t, store.ConditionsSet(ctx, testGK, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
 	require.NoError(t, store.ConditionsDelete(ctx, testGK, id, "Ready"))
+	require.NoError(t, store.EventsAdd(ctx, testGK, id,
+		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}))
 
 	// The gate still reports scope and existence, which is all it reads for.
 	assert.ErrorIs(t, store.ConditionsSet(ctx, beehive.GroupKind{Kind: "Other"}, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}), beehive.ErrWrongKind)
 	assert.ErrorIs(t, store.ConditionsDelete(ctx, testGK, 999999, "Ready"), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.EventsAdd(ctx, beehive.GroupKind{Kind: "Other"}, id,
+		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}), beehive.ErrWrongKind)
 }
 
 // A status write reads six columns of the row it writes, and neither the spec nor

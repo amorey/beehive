@@ -667,12 +667,12 @@ func (s *sqliteStore) selectScoped(
 	cols string,
 	dest ...any,
 ) error {
+	q := `SELECT "group", kind FROM objects WHERE id = ?`
 	if cols != "" {
-		cols = ", " + cols
+		q = `SELECT "group", kind, ` + cols + ` FROM objects WHERE id = ?`
 	}
 	var group, kind string
-	err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT "group", kind`+cols+` FROM objects WHERE id = ?`, id).
+	err := s.conn(ctx).QueryRowContext(ctx, q, id).
 		Scan(append([]any{&group, &kind}, dest...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeapi.ErrNotFound // bare, like scanObject's
@@ -733,9 +733,8 @@ func (s *sqliteStore) getObjectRowScoped(ctx context.Context, gk storeapi.GroupK
 	if err != nil {
 		return nil, err
 	}
-	if obj.Group != gk.Group || obj.Kind != gk.Kind {
-		return nil, fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
-			storeapi.ErrWrongKind, id, obj.Group, obj.Kind, gk.Group, gk.Kind)
+	if err := gateKind(gk, id, obj.Group, obj.Kind); err != nil {
+		return nil, err
 	}
 	return obj, nil
 }
@@ -1706,8 +1705,9 @@ func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id s
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary; events carries no group/kind to fold in.
-		if _, err := s.getObjectRowScoped(ctx, gk, id); err != nil {
+		// Metadata-only gate: events carries no group/kind to fold in, and an event
+		// write reports no row, so it reads none.
+		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
 		rv, err := nextResourceVersion(ctx, c)
