@@ -1137,6 +1137,108 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 	waitForDeletions(t, w, target.ID)
 }
 
+// Marking the last live referrer lifts the target's RESTRICT, and with every pass
+// parked the mark's own push is the only thing that can collect it.
+func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withStaleDependentsInterval(time.Hour),
+		withDependencyWakerOff(),
+		withoutGCSweeper(),
+	)...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The target's own delete push finds the live edge and leaves it blocked.
+	// Waiting for that pass to go idle leaves the dependent's mark as the only
+	// thing that can collect it.
+	require.NoError(t, client.Delete(ctx, target.ID))
+	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
+
+	require.NoError(t, client.Delete(ctx, dep.ID))
+	waitForDeletions(t, w, target.ID)
+}
+
+// The pull path under that push: marking the referrer through the store issues no
+// push, leaving the sweeper's tick as the only collector.
+func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, target.ID))
+	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, dep.ID)
+	require.NoError(t, err)
+	waitForDeletions(t, w, target.ID)
+}
+
+// The cascade marks referrers too, so the same push has to come from there.
+func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withStaleDependentsInterval(time.Hour),
+		withDependencyWakerOff(),
+		withoutGCSweeper(),
+	)...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, addEdge(ctx, store, child.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, target.ID))
+	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
+
+	// The owner's collect cascades to the child, whose mark lifts the block.
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	waitForDeletions(t, w, target.ID)
+}
+
 // siblingFinalizerClearingController clears finalizer on targetID — never on the
 // object it is reconciling — the moment that target is finalizing. It models the
 // case the tail gcCollect cannot serve: the clear lands outside any pass over the
