@@ -68,6 +68,22 @@ through it too, which is what stops a corrupt `finalizers` blob from failing a
 condition write that never touches finalizers — the inconsistency that gave the rule
 away, since `DeletionRequestsCreate` already tolerated such a row.
 
+**A write that needs part of a row reads part of a row**, which is the same rule one
+step further in. Three writes genuinely need row *content* and used to load all 17
+columns to get it: `ObjectsUpdateStatus` reads four (`generation`,
+`observed_generation`, `schema_version_status`, `status`), `FinalizersDelete` reads
+the list and whether the object is deletion-pending — as a bool, computed in SQL, so
+the clock never leaves SQLite — and `ConditionsSet` reads the stored condition. All
+three go through `selectScoped`, the generalisation of `checkObjectScoped`: the
+caller names its columns, the helper prepends the gate's own two and decides
+`ErrNotFound`/`ErrWrongKind`, so scope is settled in one place while the select list
+stays beside the variables it fills. `ConditionsSet` folds further — its gate and
+its no-op comparison key on the same object, so one `LEFT JOIN` from `objects` to
+`conditions` answers both, one round trip instead of two on the hottest write in the
+system. The drift these lists could have with `objectColumns` is not a correctness
+risk: an unknown column fails at prepare, loudly, and each narrow read is pinned by a
+test that hides the columns it must not touch.
+
 The same rule applied to the version draw. `markForDeletion` used to call
 `nextResourceVersion` — an `UPDATE` on `resource_version_seq` — *before* the `IS NULL`
 guard decided whether anything would be stamped, so a repeat delete committed a
