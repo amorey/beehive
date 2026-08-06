@@ -467,6 +467,8 @@ type Store interface {
 	// many runs it deleted. perTimeline > 0 caps each (object, category)
 	// timeline to its newest perTimeline runs; maxAge > 0 drops runs with
 	// LastAt older than that. A zero bound is skipped. Global, not per-kind.
+	// An implementation MAY bound the work of one call, converging over
+	// sweeps, so a return does not imply every bound is met.
 	EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration) (int, error)
 
 	// FinalizersDelete removes finalizer from id's list. A real removal bumps

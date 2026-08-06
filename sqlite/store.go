@@ -1925,61 +1925,61 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge t
 	return total, err
 }
 
-// eventCapCandidates lists the timelines holding more than the cap. It rides
-// idx_events_object_cat, which leads on the grouping columns, so it is an
-// index-only pass rather than a sort of the table.
+// eventCapCandidates lists the timelines over the cap, newest-first order
+// unneeded. Grouped on the columns idx_events_object_cat leads with, so it rides
+// the index rather than sorting the table.
 const eventCapCandidates = `
 	SELECT object_id, category FROM events
 	 GROUP BY object_id, category HAVING COUNT(*) > ?
 	 LIMIT ?`
 
 // eventCapBudget bounds the timelines one sweep trims: the scoped statements are
-// seeks, but an unbounded backlog of them holds the write connection. What is
-// left waits for the next sweep, which the horizon tolerates because it only
-// ever rises.
+// seeks, but a backlog of them still holds the write connection. The rest waits
+// for the next sweep. See docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md.
 const eventCapBudget = 256
 
-// trimEventsToCap deletes each over-cap timeline's oldest runs, one scoped
-// statement per timeline.
-//
-// Ranking the whole table in one statement would be shorter, but it scans every
-// run whether or not anything is over cap, twice — trimEvents evaluates its
-// predicate for the horizon and again for the delete — while holding the write
-// connection. Per timeline, both are seeks.
-func (s *sqliteStore) trimEventsToCap(ctx context.Context, cap int) (int, error) {
-	c := s.conn(ctx)
-	rows, err := c.QueryContext(ctx, eventCapCandidates, cap, eventCapBudget)
+// timeline is one (object, category) partition of the event log.
+type timeline struct {
+	id       storeapi.ObjectID
+	category string
+}
+
+// overCapTimelines reads the candidates in full: the trims that follow run on the
+// same connection, so the cursor must be closed before they start.
+func (s *sqliteStore) overCapTimelines(ctx context.Context, perTimeline int) ([]timeline, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, eventCapCandidates, perTimeline, eventCapBudget)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var over []struct {
-		id       storeapi.ObjectID
-		category string
-	}
+	defer rows.Close()
+
+	over := make([]timeline, 0, eventCapBudget)
 	for rows.Next() {
-		var t struct {
-			id       storeapi.ObjectID
-			category string
-		}
+		var t timeline
 		if err := rows.Scan(&t.id, &t.category); err != nil {
-			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		over = append(over, t)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	return over, rows.Err()
+}
+
+// trimEventsToCap deletes each over-cap timeline's oldest runs, one scoped
+// statement per timeline.
+func (s *sqliteStore) trimEventsToCap(ctx context.Context, perTimeline int) (int, error) {
+	over, err := s.overCapTimelines(ctx, perTimeline)
+	if err != nil {
 		return 0, err
 	}
 
 	var total int
 	for _, t := range over {
-		// Newest-first, skip the cap, delete the rest: the same order the ring
-		// keeps, served by idx_events_object_cat.
+		// Newest-first, skip the cap, delete the rest. The outer key predicate is
+		// what keeps both of trimEvents' statements on a seek.
 		n, err := s.trimEvents(ctx, `object_id = ? AND category = ? AND id IN (
 			SELECT id FROM events WHERE object_id = ? AND category = ?
 			 ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?)`,
-			t.id, t.category, t.id, t.category, cap)
+			t.id, t.category, t.id, t.category, perTimeline)
 		if err != nil {
 			return 0, err
 		}

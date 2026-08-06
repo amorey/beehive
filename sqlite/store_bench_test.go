@@ -25,16 +25,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// BenchmarkEventsSweep measures what the GC sweeper pays to enforce the event
-// cap, as a function of how much of the log is actually over it.
+// BenchmarkEventsSweep measures what enforcing the cap costs against log size
+// and against how much of the log is over it — the over-cap=0 rows are what a
+// sweeper on a converged log pays every tick, forever.
 //
-// The question is whether the sweep costs the size of the table or the size of
-// what it trims. The steady-state case is the one that matters for a default:
-// a sweeper running every 30s forever spends almost all of its runs finding
-// nothing to do, so "nothing over cap" is the cost a stock beehive pays.
-//
-// The store is on disk, not OpenMemory, because the scan is what is being
-// measured and only a file database pages it in.
+// The store is on disk, not OpenMemory: the read is what is being measured and
+// only a file database pages it in.
 func BenchmarkEventsSweep(b *testing.B) {
 	for _, timelines := range []int{512, 4096} {
 		for _, overCap := range []int{0, 64} {
@@ -49,14 +45,13 @@ func BenchmarkEventsSweep(b *testing.B) {
 // it, and sweeps. The trim is idempotent after the first iteration, so the
 // steady state is what repeats.
 func benchEventsSweep(b *testing.B, timelines, overCap int) {
-	b.Helper()
 	ctx := context.Background()
 
 	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
 	require.NoError(b, err)
 	defer store.Close()
 
-	const cap = 4
+	const perTimeline = 4
 	ids := make([]storeapi.ObjectID, timelines)
 	for i := range ids {
 		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
@@ -67,7 +62,7 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 		ids[i] = obj.ID
 
 		// A distinct reason per event, or the run extends instead of appending.
-		for r := range cap {
+		for r := range perTimeline {
 			require.NoError(b, store.EventsAdd(ctx, testGK, obj.ID, storeapi.EventsAddInput{
 				Category: "c", Type: "Normal", Reason: fmt.Sprintf("R%d", r),
 			}))
@@ -81,7 +76,7 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 
 	b.ResetTimer()
 	for range b.N {
-		_, err := store.EventsSweep(ctx, cap, 0)
+		_, err := store.EventsSweep(ctx, perTimeline, 0)
 		require.NoError(b, err)
 	}
 }

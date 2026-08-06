@@ -851,21 +851,7 @@ func TestEventsMaxVersionStoreError(t *testing.T) {
 // by is sorting the whole table, or a table scan, which means reading every
 // blob to count rows.
 func TestEventsSweepSelectsCandidatesByIndex(t *testing.T) {
-	store := newTestStore(t).(*sqliteStore)
-
-	rows, err := store.db.QueryContext(context.Background(),
-		`EXPLAIN QUERY PLAN `+eventCapCandidates, 1, 1)
-	require.NoError(t, err)
-	defer rows.Close()
-
-	var plan string
-	for rows.Next() {
-		var id, parent, notused int
-		var detail string
-		require.NoError(t, rows.Scan(&id, &parent, &notused, &detail))
-		plan += detail + "\n"
-	}
-	require.NoError(t, rows.Err())
+	plan := queryPlan(t, newTestStore(t).(*sqliteStore), eventCapCandidates, 1, 1)
 	assert.Contains(t, plan, "COVERING INDEX", "plan:\n"+plan)
 	assert.NotContains(t, plan, "TEMP B-TREE", "plan:\n"+plan)
 }
