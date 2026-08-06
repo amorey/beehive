@@ -14,9 +14,11 @@ get filled in as tests need them.
 
 Every example under `examples/` calls `Client.Requeue` after each create even
 though a spec write now enqueues its own object — `Requeue` is what the docs point
-callers at, and it covers a lost in-memory enqueue. `cascade` alone sets
-`WithGCInterval`, since collection is what it demonstrates. Leave the production
-defaults alone otherwise.
+callers at, and it covers a lost in-memory enqueue. `lowpower` is the one
+exception, and deliberately: it exists to show that the pushes alone carried the
+demo with every tick minutes away. `cascade` alone sets `WithGCInterval`, since
+collection is what it demonstrates, and `lowpower` sets every public cadence.
+Leave the production defaults alone otherwise.
 
 Latency here is a configured interval, not a push path. If a push path is ever
 added it belongs *above* this core; the
@@ -30,6 +32,7 @@ go vet ./...
 staticcheck -checks=all ./...   # CI runs this; -checks=all flags unused unexported code
 go run ./examples/greeting/main.go   # the end-to-end smoke target
 go run ./examples/events/main.go     # Events API demo: a connection-health panel
+go run ./examples/lowpower/main.go   # every public cadence at minutes; pushes carry it
 go test ./...
 go test -run TestName ./  # single test
 
@@ -57,10 +60,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`WithFullPassInterval`, off by default), the GC sweeper (`WithGCInterval`,
   **cannot be disabled**), the dependency waker (write log, **wake-driven, no
   tick**), the stale-dependents pass (60s, **cannot be disabled**), the object
-  watch tail and the event watch (both `withWatchFloorInterval`, 30s, each with
-  a commit wake in front). Only `WithFullPassInterval` and `WithGCInterval`
-  are public; the other cadences are unexported options only tests reach, and
-  `Client.Requeue` is the public way to beat one. **No reconcile may depend on
+  watch tail and the event watch (both `WithWatchFloorInterval`, 30s, each with
+  a commit wake in front). **Five cadences are public** — `WithGCInterval`,
+  `WithFullPassInterval`, `WithOwedPassInterval`, `WithStaleDependentsInterval`,
+  `WithWatchFloorInterval` — because every trigger pushes at commit, so what a
+  tick paces is recovery of a *lost* push rather than latency; only the full pass
+  may be disabled, and the defaults are unchanged. The floors on active work
+  (`minRequeueInterval`, the two scan floors, `wakePersistInterval`) stay
+  unexported, every retry ladder is capped on a constant of its own rather than
+  on one of these, and the GC sweeper's per-sweep budgets scale with its
+  interval. `Client.Requeue` is the public way to beat a cadence.
+  → [ADR](docs/adr/2026-08-06-driver-cadences-are-configurable.md) **No reconcile may depend on
   either full pass** — both scale with the object count. The schedule watch is
   the one push exception (see below); the two watch wakes are not, because their
   floor tick stays. **The waker is the exception to the cadence, not to the
@@ -124,10 +134,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   client-only kind). Cost is bounded by what changed. **A commit is the only
   thing that wakes it**: an idle waker arms no timer and issues no query, so a
   dependency chain propagates per commit. Two conditions re-arm its one timer,
-  neither periodic: a failed scan (`driver.Backoff`, 100ms up to the
-  stale-dependents cadence — without it a failed scan would wedge, since
-  `backingOff` drops arriving wakes) and a cursor row still below the watermark,
-  which would otherwise be retried only by a commit that may never come. Going
+  neither periodic: a failed scan (`driver.Backoff`, 100ms up to `wakeRetryMax`,
+  its own constant and not the backstop's cadence — without it a failed scan
+  would wedge, since `backingOff` drops arriving wakes) and a cursor row still
+  below the watermark, which would otherwise be retried only by a commit that may
+  never come. Going
   idle **stops** the timer, or one already ready drives a pass nobody asked for.
   The cursor persists via the optional `DriverCursorer`; it is an optimisation
   over the stale-dependents pass, never a guarantee. **Both store-wide reads
