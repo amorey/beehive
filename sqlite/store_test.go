@@ -1052,6 +1052,29 @@ func TestSweepEventsExecErrors(t *testing.T) {
 		_, err := store.EventsSweep(ctx, 0, time.Hour)
 		require.Error(t, err)
 	})
+
+	t.Run("candidate row fails to scan", func(t *testing.T) {
+		store := newRawStore(t)
+		breakTimelineScan(t, store)
+		_, err := store.EventsSweep(ctx, 1, 0)
+		require.Error(t, err)
+	})
+}
+
+// breakTimelineScan replaces events with a table holding a non-numeric
+// object_id, so the cap's candidate query still runs and every row it returns
+// fails in the scan loop rather than at QueryContext. The column is indexed, so
+// STRICT and the index rule out mutating it in place the way breakEventRowRead
+// does; two rows share a timeline so the HAVING clause selects it.
+func breakTimelineScan(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := store.db.ExecContext(ctx, `DROP TABLE events`)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `
+		CREATE TABLE events (object_id TEXT NOT NULL, category TEXT NOT NULL);
+		INSERT INTO events (object_id, category) VALUES ('x', 'c'), ('x', 'c')`)
+	require.NoError(t, err)
 }
 
 // blockEventDeletes makes any DELETE on events fail, so the sweep's horizon
