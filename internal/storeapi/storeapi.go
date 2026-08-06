@@ -269,9 +269,11 @@ type EdgesDeleteResult struct {
 	// To is the target's GroupKind, needed to route a requeue to it. Edges are
 	// cross-kind. Zero unless Unblocked.
 	To GroupKind
-	// Unblocked reports that this call removed an edge holding a RESTRICT
-	// block: the target is deletion-pending and the source is not. A probe, not
-	// a verdict — it does not check that this was the target's last referrer.
+	// Unblocked reports that this call removed a depends_on edge holding a
+	// RESTRICT block: the target is deletion-pending and the source is not. A
+	// probe, not a verdict — it does not check that this was the target's last
+	// referrer, and a source marked between the removal and the read reads as
+	// already discounted, which costs the push and not the collect.
 	Unblocked bool
 }
 
@@ -524,11 +526,11 @@ type Store interface {
 	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 
 	// EdgesDelete removes the (fromID, toID, relation) edge; removing a missing
-	// one does nothing. Bumps no version. Reports whether the removal lifted a
-	// *depends_on* RESTRICT block, so a caller can push the target's collect —
-	// Unblocked reads the source's own deletion mark, which only discounts a
-	// depends_on edge. An owned_by edge always counts, so dropping one may lift
-	// a block this reports as false.
+	// one does nothing. Bumps no version. For a depends_on edge it reports
+	// whether the removal lifted a RESTRICT block, so a caller can push the
+	// target's collect; Unblocked is never set for any other relation, because
+	// the source-side condition behind it is the discount EdgesHasIncoming
+	// gives depends_on alone.
 	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
 
 	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID

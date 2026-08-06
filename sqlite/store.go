@@ -2232,8 +2232,14 @@ func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.Obj
 	if n, _ := res.RowsAffected(); n == 0 {
 		return storeapi.EdgesDeleteResult{}, nil
 	}
-	// Both endpoints in one row, as EdgesAdd does. No transaction of its own; the
-	// gap admits no wrong answer. See
+	// Unblocked is a depends_on verdict: the source-side discount below is the one
+	// EdgesHasIncoming gives that relation and no other.
+	if relation != storeapi.RelationDependsOn {
+		return storeapi.EdgesDeleteResult{}, nil
+	}
+	// Both endpoints in one row, as EdgesAdd does. No transaction of its own. The
+	// gap costs at most a push: a source marked deletion-pending inside it reads
+	// as "was already discounted", and the target waits for the sweep. See
 	// docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
 	//
 	// A failure here is reported, not swallowed, even though the DELETE is

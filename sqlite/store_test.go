@@ -4291,6 +4291,22 @@ func TestDeleteRefReportsNothingForADeletingSource(t *testing.T) {
 		"EdgesHasIncoming already discounts this edge, so dropping it unblocks nothing")
 }
 
+// owned_by is never discounted by EdgesHasIncoming, so the source-side condition
+// behind Unblocked does not describe it. The edge still goes.
+func TestDeleteRefReportsNothingForAnOwnedByEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	child := newRefObject(t, store)
+	owner := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	markDeleting(t, store, owner.ID)
+
+	res, err := store.EdgesDelete(ctx, child.ID, owner.ID, beehive.RelationOwnedBy)
+	require.NoError(t, err)
+	assert.False(t, res.Unblocked)
+	assert.Equal(t, 0, countEdges(t, store, child.ID, owner.ID, string(beehive.RelationOwnedBy)))
+}
+
 // The probe runs after the DELETE has already landed, so it can find an endpoint
 // gone. Nothing is left to push, and that is not an error. Foreign keys are off
 // for the insert because the schema is what normally makes this unreachable.

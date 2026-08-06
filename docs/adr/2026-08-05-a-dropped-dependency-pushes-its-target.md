@@ -29,7 +29,10 @@ target with `signalRequeueNow` when it reports `Unblocked`.
 **`Unblocked` is three facts, one field**: an edge was really removed, the target
 is deletion-pending, and the source is not. Only the conjunction is read, so only
 the conjunction is returned — see the
-[write-shapes ADR](2026-07-30-store-write-shapes.md).
+[write-shapes ADR](2026-07-30-store-write-shapes.md). It is reported for
+`depends_on` and nothing else: the source-side fact below is the discount
+`EdgesHasIncoming` gives that relation alone, so the same verdict over `owned_by`
+would be answering a question nobody asked with a rule that does not hold there.
 
 - *An edge was removed*, from `RowsAffected`, bounds the push to once per edge
   ever created, matching `EdgesAdd`'s edge-new gate. A controller may call
@@ -58,13 +61,27 @@ absorbed push would buy nothing over the sweep it was meant to beat.
 non-zero `RowsAffected` costs the second query, which reads both endpoints in one
 row. Wrapping the pair would hold the store's sole connection across a
 `BEGIN`…`COMMIT` for a call that is one statement today, on a path a controller
-walks every pass. What the transaction would buy is the guarantee that the second
-query finds its rows, and every way it can miss them is benign: the sweeper
-collected the target in the gap (no row left to collect), the source was
-physically deleted (its edge was already discounted), or the target was marked
-deletion-pending in the gap (it is blocked-or-not *now*, and the push is a
-probe). Nothing un-deletes a row, so the window admits no wrong answer. An
-ambient `Within` still takes both statements.
+walks every pass.
+
+What the transaction would buy is a result derived atomically with the removal.
+Three of the four things that can happen in the gap are benign: the sweeper
+collected the target (no row left to collect), the source was physically deleted
+(its edge was already discounted), or the target was marked deletion-pending (it
+is blocked-or-not *now*, and the push is a probe).
+
+**The last one is a real miss, and it is accepted.** If the *source* is marked
+deletion-pending in the gap, the read says "already discounted" and no push is
+issued — even though it was the removal of a then-live edge that lifted the
+block. The target waits for the next sweep. That is the pre-change behaviour for
+one interleaving: latency, never divergence, and `gcCollect` is unreachable from
+here in any case where the block is still up. The price of closing it is a
+transaction on every `DependenciesDelete`, including the far more common call
+that removes nothing at all. If that window is ever measured to matter, the fix
+is to transact only when `RowsAffected` is non-zero — which this shape cannot
+do, so it would mean probing first and paying the read on every call.
+
+An ambient `Within` still takes both statements, so a caller that needs the pair
+atomic already has it.
 
 ## Consequences
 
