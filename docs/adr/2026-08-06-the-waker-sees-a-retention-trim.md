@@ -39,9 +39,10 @@ horizon cannot move a cursor" below.
 retention case makes it do: a waker that processed through 950 against a log
 trimmed empty resumes at 0. Comparing a horizon of 900 against that watermark
 reports a span nothing skipped, on every restart, and with a real gap at 400 it
-reports 0–900 instead of 400–900. So `noteTrim` takes the position known
-*processed* — the stored cursor at seed, the watermark during a scan — and
-`trimBaseline` keeps a boundary that spans many pages to one line.
+reports 0–900 instead of 400–900. So `noteTrim` compares against — and logs — the
+highest position known *processed*: `trimBaseline`, which `seed` sets from the
+stored cursor, against the watermark a scan has reached. `trimBaseline` also keeps
+a boundary that spans many pages to one line.
 
 ### The list read is one statement, and needs no transaction
 

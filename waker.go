@@ -424,11 +424,15 @@ func resumeWatermark(stored int64, ok bool, mark int64) int64 {
 // once per boundary. processed is the position known scanned, which is not
 // always the watermark — see seed.
 func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) {
-	if trimmedThrough <= max(processed, dw.trimBaseline) {
+	// The baseline, not processed: seed's clamp leaves the watermark below what
+	// this waker really scanned, so logging that would name a span far wider than
+	// the one lost.
+	cursor := max(processed, dw.trimBaseline)
+	if trimmedThrough <= cursor {
 		return
 	}
 	dw.bh.log().WarnContext(ctx, "retention trimmed the write log below the dependency waker's cursor; the dependents of the changes in between are left to the stale-dependents pass",
-		"cursor", processed, "trimmedThrough", trimmedThrough)
+		"cursor", cursor, "trimmedThrough", trimmedThrough)
 	dw.trimBaseline = trimmedThrough
 }
 

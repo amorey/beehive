@@ -276,8 +276,11 @@ three during and after implementation:
    good. `resumeWatermark` keeps its original three-argument clamp;
    `TestWakerResumeKeepsEntriesBelowTheHorizon` guards it. The horizon is now used
    for the report and nothing else.
-4. **The mid-scan jump was dropped**, before the above was found.
-5. **An empty page reads the horizon on its own**, gated on the watermark. The
+4. **The mid-scan jump was dropped**, before the above was found — at the time
+   because it changed nothing observable, and moot since: note 3 means the horizon
+   moves no cursor at all. `TestWakerResyncsPastATrimmedSpan` and
+   `TestWakerHoldsTheWatermarkWhileDraining` were dropped with it.
+5. **An empty page reads the horizon on its own**, uncached. The
    spec's "an empty page reports 0" left the fully-trimmed backlog — case 2's
    worst form — silent, since no row survives to carry the horizon. Measured, the
    supplementary read is ~13µs, and at the 100ms scan floor that is ~0.13ms of the
@@ -285,8 +288,4 @@ three during and after implementation:
    nowhere. Two attempts to cache it (keyed on the watermark, then invalidated on
    failure too) were both wrong: retention advances on a clock the waker does not
    observe, so neither a still watermark nor a page's horizon from an earlier pass
-   says where the boundary is now. With `resumeWatermark` raising at seed and
-   `trimBaseline` deduping the report, jumping the watermark to the horizon on an
-   idle scan changes nothing observable: the trimmed span holds no entries to skip,
-   and a lagging cursor is raised at the next seed. `TestWakerResyncsPastATrimmedSpan`
-   and `TestWakerHoldsTheWatermarkWhileDraining` were dropped with it.
+   says where the boundary is now.

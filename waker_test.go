@@ -681,7 +681,7 @@ func TestWakerResumeKeepsEntriesBelowTheHorizon(t *testing.T) {
 
 // A stalled waker whose backlog retention removed entirely reads an empty page,
 // which carries no horizon — so the loss would go unreported unless the pass asks
-// for it. It asks once per watermark, not once per wake.
+// for it on its own.
 func TestWakerReportsAFullyTrimmedBacklog(t *testing.T) {
 	logger, buf := captureLogger(slog.LevelWarn)
 	store := &replayStore{seed: 400, trimmed: 900} // every entry above the cursor is gone
@@ -698,6 +698,28 @@ func TestWakerReportsAFullyTrimmedBacklog(t *testing.T) {
 	require.Equal(t, scanIdle, dw.scan(context.Background()))
 	assert.Equal(t, 2, store.marks, "and asks again, since retention moves on its own")
 	assert.Empty(t, buf.String(), "but the boundary has not moved, so there is nothing new to say")
+}
+
+// The span is reported from what this waker scanned, which after a clamped resume
+// is the stored cursor rather than the watermark — the same reason seed compares
+// against it. Naming the watermark would report a whole log's worth of loss for a
+// gap of ten entries.
+func TestWakerReportsTheSpanFromWhatItProcessed(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &cursorStore{
+		replayStore: replayStore{seed: 0, trimmed: 900}, // the log is trimmed away entirely
+		stored:      map[string]int64{cursorNameWaker: 950},
+	}
+	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	require.Equal(t, scanIdle, dw.seed(context.Background()))
+	require.Zero(t, dw.watermark, "clamped to the mark of an emptied log")
+
+	store.trimmed = 960 // retention takes ten more entries this waker never read
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+
+	assert.Contains(t, buf.String(), "cursor=950", "the span starts where this waker stopped")
+	assert.Contains(t, buf.String(), "trimmedThrough=960")
 }
 
 // A pass stops on its page budget with the backlog still unread, and retention can
