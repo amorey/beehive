@@ -80,10 +80,6 @@ type waker struct {
 	// that, because an empty store's cursor really is zero.
 	seeded bool
 
-	// primed is what the seed in prime found, and what run's first turn starts
-	// from.
-	primed scanResult
-
 	// rx carries the commit wakes; nil when the Beehive was assembled without a
 	// hub.
 	rx *watch.Receiver[GroupKind, struct{}]
@@ -153,19 +149,15 @@ func (dw *waker) run(ctx context.Context) {
 		written = dw.rx.Chan()
 	}
 
+	// The eager first pass: prime seeded the watermark, so this one scans from
+	// it — or seeds again, if prime's read failed.
 	timer := time.NewTimer(0)
-	timer.Stop() // armed below only for what the seed left behind
 	defer timer.Stop()
 	// The instant timer.C is set to fire, zero when nothing is armed. A wake
 	// that would only push it later leaves it alone.
 	var armedFor time.Time
 
-	backingOff := !dw.seeded // an unseeded waker drops wakes until its retry fires
-	if wait := dw.primedWait(); wait != wakeIdle {
-		driver.Rearm(timer, wait)
-		armedFor = dw.now().Add(wait)
-	}
-
+	backingOff := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -221,7 +213,7 @@ func (dw *waker) prime(ctx context.Context) {
 	if rx, ok := dw.bh.kindWriteHub.WatchAcross(); ok {
 		dw.rx = rx
 	}
-	dw.primed = dw.seed(ctx)
+	dw.seed(ctx)
 }
 
 // teardown ends the wake subscription. Idempotent, so an aborted Start and a
@@ -299,24 +291,6 @@ func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
 		wait = max(wait, opensAt.Sub(now))
 	}
 	return max(wait, wakeRetryBase), true
-}
-
-// primedWait is how long run waits before its first pass, and climbs the retry
-// ladder when the seed did not land. Gated on seeded, not on primed: scanIdle is
-// scanResult's zero value.
-func (dw *waker) primedWait() time.Duration {
-	switch {
-	case !dw.seeded:
-		return dw.retry.Next()
-	case dw.primed == scanMore:
-		return 0
-	}
-	// As pass does after a drained scan: a refused seed write leaves a successor
-	// to reseed at the mark, skipping everything committed while this process ran.
-	if wait, owed := dw.persistWait(dw.now()); owed {
-		return wait
-	}
-	return wakeIdle
 }
 
 // wakeIdle is pass's "no reason to look again": the loop arms nothing.

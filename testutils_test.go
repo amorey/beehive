@@ -490,7 +490,9 @@ func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
 func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
-	panic("not implemented: fakeStore.ObjectWritesListSinceAll")
+	// Empty rather than a panic: Start seeds the waker, so its eager first pass
+	// scans rather than seeding, and every Beehive whose waker runs reaches this.
+	return nil, nil
 }
 func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")

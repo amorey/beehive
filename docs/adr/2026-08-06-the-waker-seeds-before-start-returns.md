@@ -53,37 +53,26 @@ it, so it tears the subscription back down and returns that error.
 store takes one `DriverCursorsSet` for the seed point. A store that refuses it
 warns and startup continues.
 
-### run opens from what the seed found, not from an eager pass
+### run keeps its eager first pass
 
-`run` used to open with `time.NewTimer(0)`, whose only job was to seed. With the
-seed already done, an unconditional first pass would spend an
-`ObjectWritesListSinceAll` that comes back empty, on the single connection,
-exactly when the owed pass and every reconcile loop want it. So `primedWait`
-answers from what `prime` left: `scanMore` drains at once, `wakeIdle` arms
-nothing, and an unseeded waker climbs the retry ladder.
+`run` opens with `time.NewTimer(0)` as it always did. That pass used to be the
+seed; now the seed is already done, so it is an ordinary scan from the watermark
+`prime` took — or, when prime's read failed, the seed retried at once.
 
-It ends in the same `persistWait` check `pass` makes, and for the reason
-[the wake-driven ADR](2026-08-05-the-waker-is-wake-driven.md) gives: a seed
-whose cursor write was refused is caught up, so nothing else would arm, and a
-successor that finds no row reseeds at the mark — skipping everything committed
-while this process ran. An idle waker that owes a cursor write is not idle.
+It was tempting to skip it: on a caught-up seed it spends an
+`ObjectWritesListSinceAll` that comes back empty. A decision function answering
+"how long before the first pass" from what the seed found was written, reviewed,
+and removed again. It bought ~21µs and one scan-floor window of first-wake
+latency, once per process, and it cost a second copy of decisions `pass` already
+makes — a copy that was wrong twice before it was deleted. The eager pass reaches
+the same four answers with no new code: a caught-up scan goes idle, a backlog
+drains, a failed seed retries on the backoff ladder, and a refused cursor write
+re-arms through `persistWait`.
 
-**The gate is `seeded`, not the primed value.** `scanIdle` is `scanResult`'s
-zero value, so a waker nobody primed would otherwise read as caught up and idle
-forever, arming nothing and never seeding. Gating on `seeded` collapses that
-case into the failed-seed one. A `scanUnprimed` sentinel was rejected: it adds a
-value `scan` never returns, for a state `seeded` already names.
-
-That gate only holds if a failed seed really does leave `seeded` false, which
-takes one line: an aborted `Start` leaves the Beehive startable, so `prime`
-clears the flag before seeding rather than inheriting the previous attempt's.
-Without it a retried `Start` whose seed fails reads as caught up and arms no
-retry.
-
-One eager query survives by design: a commit landing between the subscribe and
-the seed read fills the receiver's slot, so `run` consumes that wake and scans
-once, finding nothing. That is the price of subscribing first, and it is one
-query on a store already busy at startup.
+**A failed seed must still leave `seeded` false**, which takes one line: an
+aborted `Start` leaves the Beehive startable, so `prime` clears the flag before
+seeding rather than inheriting the previous attempt's. Without it a retried
+`Start` whose seed fails scans from a watermark it never read.
 
 ## Consequences
 
@@ -116,10 +105,6 @@ waiting on the lock never also holds the connection `prime` is waiting for.
 goroutine; `run` on its own. They are ordered by `Start` launching the second
 after the first returns, and nothing else may touch them.
 
-**A Beehive with no hub now idles after its seed** rather than running one eager
-pass. Nothing depended on that pass; the stale-dependents pass covers such a
-process as it always did.
-
 ### Tests
 
 `TestStartSeedsTheWakerBeforeItReturns` and `TestWakerPrimeSubscribesBeforeItSeeds`
@@ -127,7 +112,8 @@ are the deterministic pins, one per half. `TestStartSurvivesAFailedWakerSeed`
 pins that a store error is not a startup error, and
 `TestWakerRetriesSeedOnTheNextTick` / `TestWakerRetriesSeedOnAFailedCursorRead`
 — the tripwires the deleted TODO entry named — still pin the retry path that
-answer depends on. `TestWakerPrimedWait` covers the three opening states.
+answer depends on. `TestStartRePrimesAfterAnAbortedStart` pins the `seeded`
+reset.
 
 **There is deliberately no end-to-end test of the race itself.** Any wait
 between `Start` and the racing write closes the window under the old code, and

@@ -423,7 +423,7 @@ func TestStartSurvivesAFailedWakerSeed(t *testing.T) {
 	require.NoError(t, stop(context.Background()))
 
 	assert.False(t, bh.waker.seeded, "an unseeded waker scans nothing until the seed lands")
-	assert.Equal(t, scanFailed, bh.waker.primed, "which is what run's retry ladder is for")
+	assert.Positive(t, store.reads, "and the loop retried the seed rather than scanning from zero")
 }
 
 // A waker with nothing to wake reads nothing at startup either.
@@ -472,9 +472,8 @@ func TestStartAbortsWhenTheStartContextIsCancelledDuringTheSeed(t *testing.T) {
 }
 
 // An aborted Start leaves the Beehive startable, so the next attempt must seed
-// from scratch. Inheriting the last attempt's seed would let a failed one read
-// as caught up: primed says scanFailed, seeded still says true, and run arms no
-// retry.
+// from scratch. Inheriting the last attempt's seed would leave a failed one
+// scanning from a watermark this attempt never read.
 func TestStartRePrimesAfterAnAbortedStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -494,7 +493,6 @@ func TestStartRePrimesAfterAnAbortedStart(t *testing.T) {
 	require.NoError(t, stop(context.Background()))
 
 	assert.False(t, bh.waker.seeded, "a failed seed leaves nothing to scan from")
-	assert.NotEqual(t, wakeIdle, bh.waker.primedWait(), "and the loop must retry it")
 }
 
 func TestRegisterPropagatesOptionError(t *testing.T) {
