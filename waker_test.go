@@ -679,6 +679,39 @@ func TestWakerResumeKeepsEntriesBelowTheHorizon(t *testing.T) {
 	assert.EqualValues(t, 500, dw.watermark)
 }
 
+// A stalled waker whose backlog retention removed entirely reads an empty page,
+// which carries no horizon — so the loss would go unreported unless the pass asks
+// for it. It asks once per watermark, not once per wake.
+func TestWakerReportsAFullyTrimmedBacklog(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &replayStore{seed: 400, trimmed: 900} // every entry above the cursor is gone
+	dw, _, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	dw.watermark = 400
+
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Contains(t, buf.String(), "cursor=400")
+	assert.Contains(t, buf.String(), "trimmedThrough=900")
+	require.Equal(t, 1, store.marks, "one supplementary read, on the page that could not carry it")
+
+	buf.Reset()
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Equal(t, 1, store.marks, "a quiet pass at the same watermark asks again for nothing")
+	assert.Empty(t, buf.String())
+}
+
+// The supplementary read is skipped when the page itself carried the horizon: it
+// was read at the same instant as the rows, so it already answers for the
+// watermark they moved it to.
+func TestWakerSkipsTheHorizonReadAfterAPageCarriedIt(t *testing.T) {
+	store := &replayStore{rows: replayRows(3), trimmed: 2}
+	dw, _, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	require.EqualValues(t, 3, dw.watermark)
+	assert.Zero(t, store.marks, "the page answered for the watermark it produced")
+}
+
 // A waker with no stored cursor starts at the log's head, so a trim that predates
 // its seed skipped nothing it was ever going to scan.
 func TestWakerReportsNothingWithoutAStoredCursor(t *testing.T) {

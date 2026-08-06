@@ -80,6 +80,11 @@ type waker struct {
 	// boundary costs one log line however many pages it spans.
 	trimBaseline int64
 
+	// horizonAt is the watermark the horizon was last known for. An empty page
+	// carries no horizon, so it has to be read on its own; this keeps a run of
+	// quiet passes from paying for that read more than once.
+	horizonAt int64
+
 	// seeded says watermark holds a real cursor. "watermark != 0" cannot say
 	// that, because an empty store's cursor really is zero.
 	seeded bool
@@ -243,6 +248,7 @@ func newWaker(bh *Beehive) *waker {
 			Base: max(bh.wakePersistInterval, wakeRetryBase),
 			Max:  wakePersistRetryMax,
 		},
+		horizonAt:    noStoredCursor, // no watermark yet, so nothing is known for one
 		scanGate:     rategate.NewSingle(bh.wakeScanMinInterval),
 		persistGate:  rategate.NewSingle(bh.wakePersistInterval),
 		abandonAfter: bh.staleDependentsInterval,
@@ -383,6 +389,7 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 	}
 
 	dw.watermark, dw.persisted, dw.seeded = watermark, persisted, true
+	dw.horizonAt = watermark // the read above answered for it
 
 	// Persist the seed point now: a process that seeds and stops without seeing
 	// a write would otherwise leave its successor to skip everything committed
@@ -428,6 +435,23 @@ func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) 
 	dw.trimBaseline = trimmedThrough
 }
 
+// noteTrimIdle reads the horizon an empty page could not carry, once per
+// watermark: a waker stalled until retention removed every entry above its cursor
+// reads nothing but empty pages, and the loss would otherwise go unreported.
+//
+// Supplementary — a failure is not a failed scan, since no wake depends on it.
+func (dw *waker) noteTrimIdle(ctx context.Context) {
+	if dw.horizonAt == dw.watermark {
+		return
+	}
+	_, trimmed, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	if err != nil {
+		return
+	}
+	dw.horizonAt = dw.watermark
+	dw.noteTrim(ctx, dw.watermark, trimmed)
+}
+
 // scan runs one pass: everything above the watermark, a page at a time. The
 // cursor advances per page — pages come back in resource_version order, so a
 // page that succeeded means everything below it is done. A failed page holds
@@ -469,11 +493,15 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 		// check made after would find the watermark already above it.
 		dw.noteTrim(ctx, dw.watermark, trimmed)
 		if len(page) == 0 {
+			dw.noteTrimIdle(ctx)
 			return scanIdle
 		}
 		if !dw.dependentsWake(ctx, page) {
 			return scanFailed
 		}
+		// The page's horizon was read at the same instant as its rows, so it
+		// answers for the watermark they just moved to.
+		dw.horizonAt = dw.watermark
 		if len(page) < wakeScanPageCap {
 			// Nothing was above this page when the store answered; anything
 			// since belongs to the next pass.

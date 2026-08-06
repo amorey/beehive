@@ -256,8 +256,8 @@ Existing tripwires that must keep passing unchanged:
 
 ## Revision notes
 
-Four things changed after the first draft was checked against the code, the last
-two during and after implementation:
+Five things changed after the first draft was checked against the code, the last
+three during and after implementation:
 
 1. **The report gate.** Comparing the horizon against `dw.watermark` alone is a
    false positive on every restart of a store whose log was trimmed empty, because
@@ -276,7 +276,12 @@ two during and after implementation:
    good. `resumeWatermark` keeps its original three-argument clamp;
    `TestWakerResumeKeepsEntriesBelowTheHorizon` guards it. The horizon is now used
    for the report and nothing else.
-4. **The mid-scan jump was dropped**, before the above was found. With `resumeWatermark` raising at seed and
+4. **The mid-scan jump was dropped**, before the above was found.
+5. **An empty page reads the horizon on its own**, gated on the watermark. The
+   spec's "an empty page reports 0" left the fully-trimmed backlog — case 2's
+   worst form — silent, since no row survives to carry the horizon. Measured, the
+   supplementary read is ~13µs against the empty page's ~29µs, so it is paid once
+   per watermark rather than per pass. With `resumeWatermark` raising at seed and
    `trimBaseline` deduping the report, jumping the watermark to the horizon on an
    idle scan changes nothing observable: the trimmed span holds no entries to skip,
    and a lagging cursor is raised at the next seed. `TestWakerResyncsPastATrimmedSpan`

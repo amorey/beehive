@@ -583,6 +583,7 @@ type replayStore struct {
 	rows    []ObjectWrite // every live row, in version order
 	seed    int64         // the mark ObjectWritesMaxVersionAll reports
 	trimmed int64         // the retention horizon both reads report
+	marks   int           // ObjectWritesMaxVersionAll calls
 	pages   [][2]int64    // (afterRV, limit) per call
 	read    int           // rows actually served, across every page
 	lists   chan struct{} // one token per page request, when set
@@ -601,6 +602,7 @@ type replayStore struct {
 }
 
 func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+	s.marks++
 	if s.seedErr != nil {
 		return 0, 0, s.seedErr
 	}

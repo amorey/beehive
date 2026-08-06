@@ -54,9 +54,22 @@ that opens after 24h of downtime.
 
 Reading page and horizon unsynchronized loses nothing: the page bounds what was
 live at its own instant and versions only rise, so a horizon that rose in between
-means entries really were trimmed unread. An empty page reports 0 rather than
-paying for a second read; `ObjectWritesMaxVersionAll` is what answers the boundary
-alone, and `seed` is where that matters.
+means entries really were trimmed unread.
+
+### An empty page pays for the horizon once per watermark
+
+An empty page carries no row to carry the horizon, and that is exactly the case a
+stalled waker hits once retention has removed *every* entry above its cursor — the
+loss it most needs to report. So `noteTrimIdle` reads `ObjectWritesMaxVersionAll`
+on its own there, gated on `horizonAt`: the watermark that read already answered
+for.
+
+Gated, because on this machine the empty page costs ~29µs and the extra read
+~13µs — a 45% surcharge on the pass that runs per commit, to re-ask a question
+whose answer cannot have changed while the watermark stands still. `seed` sets
+`horizonAt` from its own mark read, and a non-empty page sets it too (its horizon
+was read at the same instant as its rows), so the steady state pays nothing and a
+run of quiet passes pays once.
 
 ### The horizon detects a loss; it cannot move a cursor
 
@@ -92,7 +105,8 @@ exchange for a wake channel between two drivers that are otherwise independent.
   it is the common case, not the rare one.
 - **A resume is unchanged by any of this.** It still clamps to the log's mark,
   and an entry a shallower kind kept below the horizon is still scanned.
-- **The quiet pass is still one statement.** Nothing about the wake-driven cost
-  argument changes.
+- **The quiet pass is still one statement** in the steady state, and two on the
+  first empty page after the watermark moves. `TestWakerSkipsTheHorizonReadAfterAPageCarriedIt`
+  pins the gate; `TestWakerReportsAFullyTrimmedBacklog` pins the case it exists for.
 - **Latency is unchanged.** This is an observability change: the wakes in the
   skipped span were, and still are, delivered by the stale-dependents pass.
