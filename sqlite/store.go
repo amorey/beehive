@@ -2238,6 +2238,15 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if err != nil {
 		return err
 	}
+	// The owner edge cascades with the row, so the image is the last place it can
+	// be recorded — an owner-scoped watch reads a collected child's owner here.
+	owners, err := s.EdgesListOutgoingByRelation(ctx, id, storeapi.RelationOwnedBy)
+	if err != nil {
+		return err
+	}
+	if len(owners) > 0 {
+		image.Owner = &owners[0]
+	}
 	// Conditions, events and edges cascade. No zero-row check: the read above
 	// already returned ErrNotFound for an id this transaction cannot see.
 	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {

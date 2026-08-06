@@ -215,8 +215,12 @@ type RawObject struct {
 	ReconcileOwed int64       `json:"reconcileOwed"`
 	Finalizers    []string    `json:"finalizers"`
 	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
-	CreatedAt     time.Time   `json:"createdAt"`
-	UpdatedAt     time.Time   `json:"updatedAt"`
+	// Owner is set only on a delete entry's row image, where the owned_by edge
+	// has already cascaded away. Nil on a row read from objects, which resolves
+	// its owner through EdgesListOutgoingByRelation like any other relation.
+	Owner     *ObjectRef `json:"owner,omitempty"`
+	CreatedAt time.Time  `json:"createdAt"`
+	UpdatedAt time.Time  `json:"updatedAt"`
 }
 
 // ReconcileLoad is everything one reconcile pass needs from its opening read.

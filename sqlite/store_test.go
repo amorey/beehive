@@ -7265,6 +7265,7 @@ func TestWriteLogImageCoversRawObject(t *testing.T) {
 		DeletionRequestedAt: ptr(time.UnixMilli(2).UTC()), ReconcileOwed: 1,
 		Finalizers: []string{"f"},
 		Conditions: []storeapi.Condition{{Type: "Ready", Status: "True"}},
+		Owner:      &beehive.ObjectRef{ID: 8, Group: "acme.com", Kind: "Gadget"},
 		CreatedAt:  time.UnixMilli(3).UTC(), UpdatedAt: time.UnixMilli(4).UTC(),
 	}
 	v := reflect.ValueOf(full)
@@ -7625,6 +7626,40 @@ func TestObjectWritesListSinceAttachesImages(t *testing.T) {
 	require.Equal(t, storeapi.WriteDelete, last.Op)
 	require.NotNil(t, last.Final)
 	assert.Equal(t, gone.Name, last.Final.Name)
+}
+
+// The image carries the owner, which the edge cannot: it cascades away with the
+// row, so an owner-scoped watch has nowhere else to learn a collected child's
+// owner from.
+func TestObjectsDeleteImageCarriesTheOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	child := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, store.ObjectsDelete(ctx, child.ID))
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	last := page[len(page)-1]
+	require.Equal(t, storeapi.WriteDelete, last.Op)
+	require.NotNil(t, last.Final.Owner)
+	assert.Equal(t, owner.ID, last.Final.Owner.ID)
+}
+
+// An unowned object's image says so, rather than leaving a caller to guess
+// whether the owner was absent or unread.
+func TestObjectsDeleteImageLeavesAnUnownedObjectsOwnerNil(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	last := page[len(page)-1]
+	require.NotNil(t, last.Final)
+	assert.Nil(t, last.Final.Owner)
 }
 
 // A non-positive limit reads nothing rather than reaching SQLite as an unbounded
