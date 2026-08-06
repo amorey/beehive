@@ -61,6 +61,15 @@ func addEvent(t *testing.T, store beehive.Store, id storeapi.ObjectID, in storea
 	return run
 }
 
+// ageRun pushes a run's window end into the past, which is what maxAge reads.
+// Direct SQL: the store owns the clock, so there is nothing to inject.
+func ageRun(t *testing.T, store beehive.Store, run int64, by time.Duration) {
+	t.Helper()
+	_, err := store.(*sqliteStore).db.ExecContext(context.Background(),
+		`UPDATE events SET last_at = ? WHERE id = ?`, toMillis(time.Now().UTC().Add(-by)), run)
+	require.NoError(t, err)
+}
+
 // A first emission starts a run: count 1, a collapsed window, an assigned id and
 // resource_version.
 func TestAddEventStartsRun(t *testing.T) {
@@ -344,11 +353,7 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	old := addEvent(t, store, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Old"})
 	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Warning", Reason: "New"}))
 
-	// Age the first run's window into the past directly — no clock injection needed.
-	s := store.(*sqliteStore)
-	_, err := s.db.ExecContext(ctx, `UPDATE events SET last_at = ? WHERE id = ?`,
-		toMillis(time.Now().UTC().Add(-2*time.Hour)), old.ID)
-	require.NoError(t, err)
+	ageRun(t, store, old.ID, 2*time.Hour)
 
 	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
 	require.NoError(t, err)
@@ -358,6 +363,84 @@ func TestSweepEventsMaxAge(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "New", got[0].Reason, "the run within maxAge is kept")
+}
+
+// The cap counts runs, not occurrences: an extend grows a run in place, so a
+// timeline repeating one (type, reason) never reaches the cap however many
+// events it records.
+func TestSweepEventsCapNCountsRuns(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	for range 5 {
+		require.NoError(t, store.EventsAdd(ctx, testGK, id,
+			storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Same"}))
+	}
+
+	deleted, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Zero(t, deleted, "one run, at the cap")
+
+	got, err := store.EventsList(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, 5, got[0].Count, "the occurrences are unbounded")
+}
+
+// maxAge is a cutoff over the whole table where the cap partitions: a quiet
+// timeline the cap would keep still loses runs that aged out.
+func TestSweepEventsMaxAgeSpansTimelines(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	quiet := addEvent(t, store, id, storeapi.EventsAddInput{Category: "quiet", Type: "Normal", Reason: "Q1"})
+	chatty := addEvent(t, store, id, storeapi.EventsAddInput{Category: "chatty", Type: "Normal", Reason: "C1"})
+	ageRun(t, store, quiet.ID, 2*time.Hour)
+	ageRun(t, store, chatty.ID, 2*time.Hour)
+
+	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted, "both timelines aged out, cap or no cap")
+}
+
+// The horizon covers every run a sweep removed: each deleted version is at or
+// below its own timeline's trimmed_through, so no trimmed run sits above the
+// mark a resume is checked against.
+func TestSweepEventsHorizonCoversEveryTrimmedRun(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	byRV := map[int64]string{} // version → category, for what the sweep removes
+	for _, cat := range []string{"a", "b"} {
+		for _, r := range []string{"R1", "R2", "R3"} {
+			e := addEvent(t, store, id, storeapi.EventsAddInput{Category: cat, Type: "Normal", Reason: r})
+			byRV[e.ResourceVersion] = cat
+		}
+	}
+	// Age one run so both bounds trim in the same sweep.
+	aged := addEvent(t, store, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Old"})
+	byRV[aged.ResourceVersion] = "c"
+	ageRun(t, store, aged.ID, 2*time.Hour)
+
+	_, err := store.EventsSweep(ctx, 1, time.Hour)
+	require.NoError(t, err)
+
+	survived := map[int64]bool{}
+	runs, err := store.EventsList(ctx, id, storeapi.EventQuery{})
+	require.NoError(t, err)
+	for _, r := range runs {
+		survived[r.ResourceVersion] = true
+	}
+	for rv, cat := range byRV {
+		if survived[rv] {
+			continue
+		}
+		assert.LessOrEqual(t, rv, eventHorizon(t, store, id, cat),
+			"trimmed run %d in %q sits above its horizon", rv, cat)
+	}
 }
 
 // EventsListSince pages the log above a cursor, oldest-first. An extend
