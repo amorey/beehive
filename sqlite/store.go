@@ -522,13 +522,20 @@ const (
 	edgeOrderByTarget   = "\n\t\tORDER BY r.to_id"   // outgoing: what this points at
 )
 
-// nextResourceVersion advances and returns the global write cursor. A standalone
-// counter, not MAX(objects.resource_version): deleting the highest-versioned row
-// must never regress the cursor and hand out a reused version.
+// nextResourceVersion advances and returns the global write cursor.
 func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
+	return advanceResourceVersion(ctx, c, 1)
+}
+
+// advanceResourceVersion advances the cursor by n and returns the highest value
+// drawn, so the range taken is [value-n+1, value]. n must be positive. A
+// standalone counter, not MAX(objects.resource_version): deleting the
+// highest-versioned row must never regress the cursor and hand out a reused
+// version.
+func advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
 	var rv int64
 	err := c.QueryRowContext(ctx,
-		`UPDATE resource_version_seq SET value = value + 1 WHERE id = 1 RETURNING value`).Scan(&rv)
+		`UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`, n).Scan(&rv)
 	return rv, err
 }
 
@@ -622,13 +629,39 @@ func (s *sqliteStore) recordObjectWrite(
 	return rv, now, nil
 }
 
+// objectWritesColumns is the log's insert column list, less the delete-only final.
+const objectWritesColumns = `resource_version, object_id, "group", kind, op, written_at`
+
 // appendWriteLog records one committed object write. Callers pass the version the
 // write took, so the entry orders against the row it describes.
 func appendWriteLog(ctx context.Context, c dbtx, id storeapi.ObjectID, gk storeapi.GroupKind, op int, rv, now int64) error {
-	_, err := c.ExecContext(ctx, `
-		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+	_, err := c.ExecContext(ctx,
+		`INSERT INTO object_writes (`+objectWritesColumns+`) VALUES (?, ?, ?, ?, ?, ?)`,
 		rv, id, gk.Group, gk.Kind, op, now)
+	return err
+}
+
+// loggedWrite is one row of a batched write log append: the identity and the
+// version a single write took.
+type loggedWrite struct {
+	id storeapi.ObjectID
+	gk storeapi.GroupKind
+	rv int64
+}
+
+// appendWriteLogUpdates records one update entry per write in a single INSERT.
+// Each carries the version its own row took: a batch shares a draw, never a value.
+func appendWriteLogUpdates(ctx context.Context, c dbtx, writes []loggedWrite, now int64) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(writes)*6)
+	for _, w := range writes {
+		// The soft delete is an update: the row is still live and readable.
+		args = append(args, w.rv, w.id, w.gk.Group, w.gk.Kind, writeOpUpdate, now)
+	}
+	_, err := c.ExecContext(ctx,
+		`INSERT INTO object_writes (`+objectWritesColumns+`) VALUES `+tupleRows(len(writes), 6), args...)
 	return err
 }
 
@@ -2107,6 +2140,78 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	return id, true, nil
 }
 
+// markChunkSize bounds the ids bound per batched deletion mark: a measured
+// optimum, not a parameter-limit ceiling like idChunkSize. A var so tests can
+// shrink it. See docs/adr/2026-07-30-store-write-shapes.md.
+var markChunkSize = 128
+
+// markManyForDeletion is markForDeletion over a set: it stamps every id whose
+// clock is still NULL, drawing one version range for the whole set rather than
+// one per row. Each row still takes its own value out of the range — the write
+// log orders on it — assigned in the order ids arrives. Reports the ids it
+// stamped, which is the write's own answer and not the caller's read. An empty
+// set draws nothing, which is what keeps a re-cascade a lone SELECT.
+// See docs/adr/2026-07-30-store-write-shapes.md.
+func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.ObjectID) (map[storeapi.ObjectID]bool, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	c := s.conn(ctx)
+	now := toMillis(time.Now().UTC())
+	end, err := advanceResourceVersion(ctx, c, len(ids))
+	if err != nil {
+		return nil, err
+	}
+	first := end - int64(len(ids)) + 1
+	marked := make(map[storeapi.ObjectID]bool, len(ids))
+	for start := 0; start < len(ids); start += markChunkSize {
+		chunk := ids[start:min(start+markChunkSize, len(ids))]
+		if err := s.markManyForDeletionChunk(ctx, c, chunk, first+int64(start), now, marked); err != nil {
+			return nil, err
+		}
+	}
+	return marked, nil
+}
+
+// markManyForDeletionChunk stamps one chunk, handing chunk[i] version first+i.
+// The assignment rides a joined VALUES list, never a CASE over the id, which is
+// quadratic in the chunk. A row the IS NULL guard skips leaves its assigned
+// version unused; the resulting gap is harmless, since consumers seek with `>`.
+// See docs/adr/2026-07-30-store-write-shapes.md.
+func (s *sqliteStore) markManyForDeletionChunk(
+	ctx context.Context,
+	c dbtx,
+	ids []storeapi.ObjectID,
+	first, now int64,
+	marked map[storeapi.ObjectID]bool,
+) error {
+	args := make([]any, 0, len(ids)*2+2)
+	for i, id := range ids {
+		args = append(args, id, first+int64(i))
+	}
+	args = append(args, now, now)
+	// RETURNING, not RowsAffected: the log entries need each row's identity and
+	// the version it actually took.
+	rows, err := c.QueryContext(ctx,
+		`WITH assigned(mark_id, mark_rv) AS (VALUES `+tupleRows(len(ids), 2)+`)
+		UPDATE objects SET deletion_requested_at = ?, updated_at = ?, resource_version = assigned.mark_rv
+		FROM assigned
+		WHERE objects.id = assigned.mark_id AND objects.deletion_requested_at IS NULL
+		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`, args...)
+	if err != nil {
+		return err
+	}
+	// Drained and closed before the insert below, which needs the single conn.
+	stamped, err := scanLoggedWrites(rows)
+	if err != nil {
+		return err
+	}
+	for _, w := range stamped {
+		marked[w.id] = true
+	}
+	return appendWriteLogUpdates(ctx, c, stamped, now)
+}
+
 // probeDeletionByName is probeObjectScoped keyed by name; a name this kind does
 // not hold is absent, not foreign. Saves the blob copies and finalizer unmarshal
 // of a full row read.
@@ -2241,6 +2346,7 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 		deleting bool
 	}
 	var children []child
+	var candidates []storeapi.ObjectID
 	for rows.Next() {
 		var ch child
 		var delAt *int64
@@ -2248,30 +2354,32 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 		_ = rows.Scan(&ch.ref.ID, &ch.ref.Group, &ch.ref.Kind, &delAt)
 		ch.deleting = delAt != nil
 		children = append(children, ch)
+		if !ch.deleting {
+			candidates = append(candidates, ch.ref.ID)
+		}
 	}
 	// modernc buffers the whole result set on the first Next; no late failure.
 	_ = rows.Err()
-	rows.Close() // free the single-conn pool before the per-child writes below
+	rows.Close() // free the single-conn pool before the writes below
+
+	// One draw and one UPDATE for the level, not one per child.
+	marked, err := s.markManyForDeletion(ctx, candidates)
+	if err != nil {
+		return storeapi.DeletionCascadeResult{}, err
+	}
 
 	res := storeapi.DeletionCascadeResult{Children: make([]storeapi.DeletionCascadeChild, 0, len(children))}
 	var markedIDs []storeapi.ObjectID
 	for _, ch := range children {
-		var marked bool
-		if !ch.deleting {
-			// Marked is the UPDATE's own answer, which here matches !ch.deleting:
-			// the SELECT above and these marks share one BEGIN IMMEDIATE
-			// transaction. Reported from the write anyway — it is the source of
-			// truth, it costs nothing, and Store admits backends that do not
-			// serialize the two.
-			var err error
-			if _, marked, err = s.markForDeletion(ctx, `id = ?`, ch.ref.ID); err != nil {
-				return storeapi.DeletionCascadeResult{}, err
-			}
-		}
-		if marked {
+		// Marked is the UPDATE's own answer, which here matches !ch.deleting: the
+		// SELECT above and the marks share one BEGIN IMMEDIATE transaction.
+		// Reported from the write anyway — it is the source of truth, it costs
+		// nothing, and Store admits backends that do not serialize the two.
+		stamped := marked[ch.ref.ID]
+		if stamped {
 			markedIDs = append(markedIDs, ch.ref.ID)
 		}
-		res.Children = append(res.Children, storeapi.DeletionCascadeChild{Marked: marked, Ref: ch.ref})
+		res.Children = append(res.Children, storeapi.DeletionCascadeChild{Marked: stamped, Ref: ch.ref})
 	}
 	// One query for the level, and only for the children this call marked: a
 	// child already deleting discounted its edges on the pass that marked it.
@@ -2576,6 +2684,21 @@ func scanObjectRefs(rows *sql.Rows) ([]storeapi.ObjectRef, error) {
 		// id (INTEGER) -> int64 and group/kind (TEXT NOT NULL) -> string never fail.
 		_ = rows.Scan(&d.ID, &d.Group, &d.Kind)
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// scanLoggedWrites scans a mutator's RETURNING rows into the shape a batched
+// write log append takes.
+func scanLoggedWrites(rows *sql.Rows) ([]loggedWrite, error) {
+	defer rows.Close()
+	var out []loggedWrite
+	for rows.Next() {
+		var w loggedWrite
+		// id (INTEGER), group/kind (TEXT NOT NULL) and resource_version (INTEGER
+		// NOT NULL) never fail.
+		_ = rows.Scan(&w.id, &w.gk.Group, &w.gk.Kind, &w.rv)
+		out = append(out, w)
 	}
 	return out, rows.Err()
 }
@@ -3000,14 +3123,17 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
 
-// kindTuples builds "(?, ?), (?, ?)" for a VALUES list of kinds, with the args
-// to fill it. Empty kinds yields an empty string, which no caller may emit.
+// tupleRows builds "(?, ?), (?, ?)" for a VALUES list of rows tuples of cols
+// each. Zero rows yields an empty string, which no caller may emit.
+func tupleRows(rows, cols int) string {
+	return strings.TrimSuffix(strings.Repeat("("+placeholders(cols)+"), ", rows), ", ")
+}
+
+// kindTuples builds a VALUES list of kinds with the args to fill it.
 func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
-	tuples := make([]string, len(kinds))
 	args := make([]any, 0, len(kinds)*2)
-	for i, gk := range kinds {
-		tuples[i] = "(?, ?)"
+	for _, gk := range kinds {
 		args = append(args, gk.Group, gk.Kind)
 	}
-	return strings.Join(tuples, ", "), args
+	return tupleRows(len(kinds), 2), args
 }

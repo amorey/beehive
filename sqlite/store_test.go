@@ -5441,6 +5441,16 @@ func blockResourceVersionDraws(t *testing.T, store *sqliteStore) {
 	require.NoError(t, err)
 }
 
+// blockWriteLogInserts makes every INSERT into object_writes abort, isolating the
+// append that follows a stamp the row already took.
+func blockWriteLogInserts(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `
+		CREATE TRIGGER block_write_log_inserts BEFORE INSERT ON object_writes
+		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	require.NoError(t, err)
+}
+
 // blockEdgeInserts makes every INSERT into edges abort while leaving the endpoint
 // read and the stamp UPDATE alone, isolating EdgesAdd's final statement.
 func blockEdgeInserts(t *testing.T, store *sqliteStore) {
@@ -5562,19 +5572,35 @@ func TestDeletionRequestsCreateFromOwnerQueryError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestDeletionRequestsCreateFromOwnerChildMarkError covers the per-child markForDeletion
-// error branch: an owned, not-yet-deleting child exists, but the version bump in
-// markForDeletion fails (sequence dropped) with a non-ErrNotFound error.
-func TestDeletionRequestsCreateFromOwnerChildMarkError(t *testing.T) {
-	store := newRawStore(t)
-	ctx := context.Background()
-	owner := newRefObject(t, store)
-	child := newRefObject(t, store)
-	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, storeapi.RelationOwnedBy))
-	dropSeq(t, store)
+// The three statements a cascade's mark rests on — the range draw, the batched
+// stamp, and the log append that must land with it. Each is reported rather than
+// swallowed, and each leaves the level unstamped: a swallowed append in
+// particular is what would make a write invisible to every watch.
+func TestDeletionRequestsCreateFromOwnerMarkErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block func(*testing.T, *sqliteStore)
+	}{
+		{"range draw", dropSeq},
+		{"batched stamp", blockObjectUpdates},
+		{"log append", blockWriteLogInserts},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRawStore(t)
+			ctx := context.Background()
+			owner := newRefObject(t, store)
+			child := newRefObject(t, store)
+			require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, storeapi.RelationOwnedBy))
+			tc.block(t, store)
 
-	_, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
-	require.Error(t, err)
+			_, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+			require.Error(t, err)
+
+			meta, err := store.ObjectsGetMeta(ctx, child.ID)
+			require.NoError(t, err)
+			assert.Nil(t, meta.DeletionRequestedAt, "a failed mark rolls its stamp back with it")
+		})
+	}
 }
 
 // A failed read leaves the mark unpushed, and every chunk after it unread.
@@ -5913,6 +5939,125 @@ func TestDeletionRequestsCreateFromOwnerWritesInVersionOrder(t *testing.T) {
 		versions = append(versions, w.ResourceVersion)
 	}
 	assert.IsIncreasing(t, versions, "the cascade's own writes must not overtake each other")
+}
+
+// The level shares one draw, so the hazard is sharing one *value*: the write log
+// orders on it, and two children at the same version are two changes a consumer
+// cannot sequence. Each child must land on its own value out of the range, and
+// the range must be exactly as wide as the level — a draw of N that stamps N rows
+// leaves no gap for the waker to warn about.
+func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	mk := func() storeapi.ObjectID { return newEventObject(t, store) }
+	owner := mk()
+	children := make([]storeapi.ObjectID, 0, 4)
+	for range 4 {
+		child := mk()
+		require.NoError(t, addEdge(ctx, store, child, owner, beehive.RelationOwnedBy))
+		children = append(children, child)
+	}
+
+	before := seqValue(t, store)
+	probe := newWriteProbe(t, store)
+	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
+	require.NoError(t, err)
+	require.Len(t, got.Children, len(children))
+
+	assert.Equal(t, before+int64(len(children)), seqValue(t, store),
+		"one draw of N, not N draws and not one value shared")
+
+	// The version on each child's row, and the version its log entry claims.
+	var rowVersions, logVersions []int64
+	for _, id := range children {
+		meta, err := store.ObjectsGetMeta(ctx, id)
+		require.NoError(t, err)
+		rowVersions = append(rowVersions, meta.ResourceVersion)
+	}
+	for _, w := range probe.expectWrites(len(children)) {
+		logVersions = append(logVersions, w.ResourceVersion)
+	}
+	assert.IsIncreasing(t, rowVersions, "every child took a distinct value, in cascade order")
+	assert.Equal(t, rowVersions, logVersions, "each entry claims the version its own row took")
+	assert.Equal(t, before+1, rowVersions[0], "the range starts where the counter stood")
+}
+
+// A level wider than one chunk still numbers straight through: the draw is for
+// the whole level, so a chunk boundary must not restart or overlap the range.
+func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
+	defer func(n int) { markChunkSize = n }(markChunkSize)
+	markChunkSize = 2 // 5 children -> 3 chunks (2, 2, 1)
+
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	mk := func() storeapi.ObjectID { return newEventObject(t, store) }
+	owner := mk()
+	for range 5 {
+		require.NoError(t, addEdge(ctx, store, mk(), owner, beehive.RelationOwnedBy))
+	}
+
+	before := seqValue(t, store)
+	probe := newWriteProbe(t, store)
+	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
+	require.NoError(t, err)
+	require.Len(t, got.Children, 5)
+	for _, ch := range got.Children {
+		assert.True(t, ch.Marked, "every child in every chunk is stamped")
+	}
+
+	var versions []int64
+	for _, w := range probe.expectWrites(5) {
+		versions = append(versions, w.ResourceVersion)
+	}
+	assert.Equal(t, []int64{before + 1, before + 2, before + 3, before + 4, before + 5}, versions,
+		"one contiguous range across the chunk boundaries")
+}
+
+// The batch assigns a version per candidate before the guard runs, so a row that
+// turns out to be pending leaves its value unused. The gap is the accepted cost —
+// consumers seek with `>` — but the row must not be reported marked and must not
+// reach the log. Driven through the unexported call because the cascade filters
+// pending children out before it, so the guard is unreachable from above.
+func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	live, pending := newEventObject(t, store), newEventObject(t, store)
+	_, err := store.DeletionRequestsCreate(ctx, testGK, pending)
+	require.NoError(t, err)
+
+	before := seqValue(t, store)
+	probe := newWriteProbe(t, store)
+
+	var marked map[storeapi.ObjectID]bool
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		marked, err = store.markManyForDeletion(ctx, []storeapi.ObjectID{pending, live})
+		return err
+	}))
+
+	assert.False(t, marked[pending], "the IS NULL guard, not the caller's read, decides")
+	assert.True(t, marked[live])
+	assert.Equal(t, before+2, seqValue(t, store), "both candidates drew; only one stamped")
+
+	w := probe.expectWrite()
+	assert.Equal(t, live, w.ID)
+	assert.Equal(t, before+2, w.ResourceVersion, "the live row kept its own assigned value")
+}
+
+// An empty candidate set must not draw: a re-cascade over an already-deleting
+// subtree is the steady state a controller re-runs every reconcile, and a draw
+// there is a counter write to stamp nothing.
+func TestMarkManyForDeletionDrawsNothingForNoCandidates(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	before := seqValue(t, store)
+
+	marked, err := store.markManyForDeletion(ctx, nil)
+	require.NoError(t, err)
+	assert.Empty(t, marked)
+	assert.Equal(t, before, seqValue(t, store))
 }
 
 // The cascade's own listing failure. Reached directly because the exported wrapper
