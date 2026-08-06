@@ -70,9 +70,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   no schedule this package promises — it is out of scope, not slow. Both wakes
   are rate-limited (`internal/rategate`), and the waker's
   cursor write keeps a floor of its own so a faster loop is not a faster write.
+  A drain that pages without a break for one stale-dependents interval **stops and
+  jumps to the write log's mark** — the backstop has already swept that range. A
+  failed mark read restarts that window rather than retrying per pass, so the bound
+  is a window per failed read, not one window.
   → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
   [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
-  [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md). Every reconcile trigger
+  [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md),
+  [ADR](docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
 - **The work queue floors how often one object is dispatched**, and a pending

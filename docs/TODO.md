@@ -124,40 +124,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   so a synchronous seed in `Start` must fall back to that path rather than returning an
   error.
 
-- **A waker resuming a very stale cursor can scan at full budget for minutes, and
-  nothing decides that draining is no longer worth it** — known, not fixed, and
-  deliberately unbounded rather than bounded by a guess. After a long enough
-  downtime, `seed` resumes a cursor far behind the write log, and each re-armed
-  pass reads its full `wakeScanPagesPerPass` budget (4 pages of `wakeScanPageCap`,
-  256 rows each) until it catches up. `scanGate` floors passes at
-  `wakeScanMinInterval` (100ms) apart, so a resume runs at up to 40 queries a
-  second on the one connection the reconcile loops share, potentially for minutes.
-  (This used to be a tick-driven budget of 32 queries a second; the wake-driven
-  refactor replaced the tick with `scanGate`'s floor, which is what actually paces
-  it today.)
-
-  **The obvious bound is the one that was removed, and it must not come back in that
-  form.** Capping `max - stored` at seed reads a `resource_version` distance, but
-  `EventsAdd` draws from that same sequence without writing anything the scan reads,
-  so the distance overstates the real backlog by an unbounded factor. A store logging
-  events at any rate would abandon cursors that were a few ticks of work. (The other
-  motivation for it — a database file swapped for a larger one — does not exist: a
-  stored cursor lives in the database it describes.)
-
-  **A measured bound would work.** Count consecutive passes that exhausted the page
-  budget, and past some number of them stop draining and jump to a fresh
-  `ObjectWritesMaxVersion`. That counts paging actually done, in the right unit and
-  immune to event traffic. The natural threshold is one `staleDependentsInterval`
-  of draining, because past that point the backstop has already swept every dependent
-  the drain is still working toward, so the remaining wakes deliver nothing.
-
-  Deferred because the cost is latency rather than divergence, the drain is doing
-  real work rather than wasting it, and no deployment has been observed where it
-  matters — the threshold above is reasoning, not measurement. Revisit if a restart
-  after a long outage is seen to starve the reconcile loops. Tripwire:
-  `TestWakerResumesAnEnormousBacklog` pins that a far-behind cursor is resumed today,
-  which is exactly what such a bound would change.
-
 - **The waker cannot tell that retention trimmed the log out from under its
   cursor** — known, not fixed, and latency rather than divergence. The per-kind
   read reports the boundary: `ObjectWritesListSince` returns `trimmedThrough`,
