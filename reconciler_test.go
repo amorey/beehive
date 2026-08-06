@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
-	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -278,9 +277,7 @@ func TestReconcilerRequeueAfter(t *testing.T) {
 // no controller-to-controller call.
 func TestDependencyRequeue(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
+	store := newStore(t)
 
 	bh := newTestBeehive(t, store, fast()...)
 
@@ -288,7 +285,7 @@ func TestDependencyRequeue(t *testing.T) {
 	reconciled := make(chan *Object[tSpec, tStatus], 16)
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// an already-settled object — no timer noise.
-	_, err = Register(bh, gk, &reconcileCapture{ch: reconciled}, WithFullPassInterval(0))
+	_, err := Register(bh, gk, &reconcileCapture{ch: reconciled}, WithFullPassInterval(0))
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -388,9 +385,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 // generation) nothing for the owed-pass backstop to notice.
 func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	ctx := context.Background()
-	db, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { db.Close() })
+	db := newStore(t)
 	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
 
 	bh := newTestBeehive(t, store, fast()...)
@@ -478,9 +473,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 // stale read forever, with no error, no condition and no log line.
 func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	ctx := context.Background()
-	db, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { db.Close() })
+	db := newStore(t)
 	store := &wakeProbeStore{Store: db, looked: make(chan struct{}, 8)}
 
 	// The stale-dependents pass cannot be disabled, and its first sweep of a fresh
@@ -578,9 +571,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// One store, two control planes: the rows outlive the process, the work queue
 	// does not. Owned by the test, since stop leaves the store open (see
 	// Beehive.stop) — which is what makes the restart possible.
-	db, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { db.Close() })
+	db := newStore(t)
 
 	gk := GroupKind{Kind: "Widget"}
 
@@ -1551,9 +1542,7 @@ func (notFoundReturningController) Reconcile(context.Context, ControllerClient[t
 func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 	ctx := context.Background()
 
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	defer s.Close()
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
@@ -1582,9 +1571,7 @@ func (requeueController) Reconcile(context.Context, ControllerClient[tStatus], *
 func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	ctx := context.Background()
 
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	defer s.Close()
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
@@ -1612,9 +1599,7 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 func TestTypedControllerReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	defer s.Close()
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
@@ -1665,9 +1650,7 @@ func (c *funcController) Reconcile(ctx context.Context, client ControllerClient[
 func TestReconcilePersistsWritesOnError(t *testing.T) {
 	ctx := context.Background()
 
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	defer s.Close()
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -1733,9 +1716,7 @@ func newSyncController(s Store) (*typedController[cSpec, cStatus], *funcControll
 func reconcileOwedHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -1863,9 +1844,7 @@ func TestReconcileReconcileOwedDecrementErrorIsNonFatal(t *testing.T) {
 func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 	ctx := context.Background()
 
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	defer s.Close()
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -2285,9 +2264,7 @@ type wakeStampingStore interface {
 // after this can only be dispatched by a tick.
 func newOwedPassHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore)) (wakeStampingStore, <-chan ObjectID) {
 	t.Helper()
-	real, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { real.Close() })
+	real := newStore(t)
 	// Seeding before Start lets a test establish a *settled* object without racing
 	// the tick, which would otherwise dispatch it for being briefly unsettled.
 	if seed != nil {
@@ -2398,9 +2375,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 	ctx := context.Background()
 	gk := GroupKind{Kind: "Widget"}
 
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
+	store := newStore(t)
 
 	// Settled before Start: observed_generation == generation, so neither is owed
 	// anything and no owed-pass listing will ever return them.
@@ -2418,7 +2393,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
 	bh := newTestBeehive(t, store, withOwedPassInterval(0), withoutGCSweeper(), WithLogger(logger))
 	opts = append(opts, WithStartupFullPass(false))
-	_, err = Register(bh, gk, &recordingController{reconciled: ch}, opts...)
+	_, err := Register(bh, gk, &recordingController{reconciled: ch}, opts...)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -2483,9 +2458,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 	ctx := context.Background()
 	gk := GroupKind{Kind: "Widget"}
 
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
+	store := newStore(t)
 	seed(store, gk)
 
 	sentinel, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
@@ -3370,9 +3343,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	// One store, two control planes: the rows outlive the process, everything
 	// in-memory does not. Owned by the test, since stop leaves the store open.
-	db, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { db.Close() })
+	db := newStore(t)
 
 	gk := GroupKind{Kind: "Widget"}
 

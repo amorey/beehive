@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
 	"slices"
 	"strings"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/amorey/beehive/sqlite"
 	"github.com/amorey/gochan/oneshot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -179,20 +181,59 @@ const testTimeout = 10 * time.Second
 // never immediately. The production defaults (seconds to tens of seconds) would
 // simply time these out.
 //
+// storeOnDisk switches the integration suite onto a file-backed store. The read
+// pool exists only on disk — in memory it aliases the write pool — so this is
+// the only configuration in which the split is exercised at all, and CI runs the
+// suite both ways. Memory stays the default so a local `go test ./...` is fast.
+var storeOnDisk = os.Getenv("BEEHIVE_TEST_STORE") == "file"
+
+// testStore is Store plus the two verbs a handful of tests reach past it for:
+// ReconcileOwedIncrement is deliberately not on Store, and DriverCursorsGet
+// lives on the optional DriverCursorer.
+type testStore interface {
+	Store
+	storeapi.DriverCursorer
+	ReconcileOwedIncrement(context.Context, ObjectID) error
+}
+
+// newStore opens the store an integration test runs against.
+func newStore(t *testing.T) testStore {
+	t.Helper()
+	var s testStore
+	var err error
+	if storeOnDisk {
+		s, err = sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	} else {
+		s, err = sqlite.OpenMemory()
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
 // Short enough that a handful of ticks fit inside testTimeout, long enough that
-// the drivers are not hammering the store's single connection while the test does
-// its own reads.
-const fastTick = 2 * time.Millisecond
+// the drivers are not hammering the store while the test does its own reads.
+//
+// The on-disk run is slower: synchronous(NORMAL) fsyncs land in the same loop,
+// so the in-memory cadence there is a flake source rather than a cadence.
+var fastTick = baseTick()
+
+func baseTick() time.Duration {
+	if storeOnDisk {
+		return 20 * time.Millisecond
+	}
+	return 2 * time.Millisecond
+}
 
 // staleDependentsTick paces the stale-dependents backstop in tests, and is
 // deliberately slower than fastTick. That pass is the one driver whose purpose is a
 // slow cadence — it re-derives what the fast paths missed — so running it at every
 // other driver's rate makes every integration test pay for its three-join query
-// hundreds of times a second, on the single connection all of them share, to
-// observe a backstop it is not testing. At ten ticks a test that does exercise it
-// still has a hundred-fold margin inside testTimeout, and production's ratio (60s
-// against the waker's 1s) is far wider than this.
-const staleDependentsTick = 10 * fastTick
+// hundreds of times a second, to observe a backstop it is not testing. At ten
+// ticks a test that does exercise it still has a hundred-fold margin inside
+// testTimeout, and production's ratio (60s against the waker's 1s) is far wider
+// than this.
+var staleDependentsTick = 10 * fastTick
 
 // fast bundles the tick intervals an integration test needs, plus whatever else
 // the caller passes. Kept as one bundle so a test reads as "run the drivers

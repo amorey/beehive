@@ -32,7 +32,6 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
-	"github.com/amorey/beehive/sqlite"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -221,9 +220,7 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 
 func newClientTestStore(t *testing.T) Store {
 	t.Helper()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newStore(t)
 	return s
 }
 

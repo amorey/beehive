@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/amorey/beehive/internal/storeapi"
-	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,8 +29,7 @@ import (
 // eventRetentionSweep trims the log to the configured bound and is a no-op until
 // WithEventRetention sets one.
 func TestSweepEventRetention(t *testing.T) {
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
+	store := newStore(t)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 	ctx := context.Background()
 

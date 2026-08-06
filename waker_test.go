@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1557,8 +1556,7 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 // guard; this pins the other half, that New actually hands the capability to the
 // waker rather than dropping it somewhere in between.
 func TestNewGivesTheWakerTheStoresCursorCapability(t *testing.T) {
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
+	store := newStore(t)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
 	bh := newTestBeehive(t, store)
