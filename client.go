@@ -218,6 +218,10 @@ type Client[Spec, Status any] interface {
 	// ownerID's children of this kind, then every change to one of them. A child
 	// created under ownerID later arrives as Added and its collection as Deleted.
 	// Same options, errors and shared tailer as WatchList.
+	//
+	// Assumes the one owner WithOwner can express, as OwnersGet and Owner() do: a
+	// child carrying several owned_by edges — reachable only through a direct
+	// Store call — streams to one of them. See docs/TODO.md.
 	OwnedObjectsListWatch(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
 	// OwnersGet returns id's owner, if it has one; ok is false with a nil error

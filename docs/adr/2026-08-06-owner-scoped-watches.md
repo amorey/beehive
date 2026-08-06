@@ -99,3 +99,11 @@ streams — a `Deleted` on the old scope and an `Added` on the new.
 - `DependentsList`/`DependenciesList` have a superficially similar hole and a
   genuinely harder one: `depends_on` edges are mutable and log nothing, so a
   scoped watch there needs the edge write to become a write to the source.
+- **One owner per child is assumed, not enforced.** `edges` permits several
+  `owned_by` rows per child, and both the resolved owner and the delete row
+  image take the first — as `fetchOwnerRef`, `LoadOwner` and `OwnersGet` already
+  do. The typed API cannot create such a child (`WithOwner` sets one field), so
+  this matches the readers around it rather than the store's raw capability.
+  Making the watch multi-owner-correct on its own would put those semantics in a
+  fourth place while `Owner()` still returns one; `docs/TODO.md` carries the
+  decision, which is to forbid the state rather than fan out to it.

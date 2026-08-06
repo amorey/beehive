@@ -361,6 +361,45 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   Worth doing when someone has a real fan-out of dependents per target. Settle
   the edge-write question before anything else: it is the whole of the work.
 
+- **Nothing stops a child having two owners, and the typed API cannot express
+  one that does** — proposed, not decided, and worth deciding pre-release
+  because only one of the two directions is reversible.
+
+  `edges` keys on `(from_id, to_id, relation)`, so a row can carry any number of
+  `owned_by` edges. Nothing in the typed API makes one: `WithOwner` sets a single
+  field, last-wins, and `insertObject` writes one edge. Only a direct
+  `Store.EdgesAdd` reaches the state, and `TestPhysicalDeletePushesEveryOwner` is
+  the one place that does.
+
+  **The read surface already chose single-owner.** `fetchOwnerRef` resolves "id's
+  single `owned_by` edge" and returns `owners[0]`; `LoadOwner` does the same;
+  `Object.Owner()` and `OwnersGet` each return one `ObjectRef`.
+  `OwnedObjectsListWatch` and the delete row image follow them
+  ([ADR](adr/2026-08-06-owner-scoped-watches.md)). The one multi-owner-correct
+  read is `OwnedObjectsList`, and only by construction — it asks who points at an
+  owner rather than collapsing a child's edges. So the state is representable,
+  half-honoured, and unreachable through the public API: the worst of the three.
+
+  **The fix is a constraint, not more fan-out.** A partial unique index —
+  `CREATE UNIQUE INDEX ... ON edges(from_id) WHERE relation = 'owned_by'` — costs
+  nothing at write time, cannot be bypassed by a raw `EdgesAdd`, and the schema is
+  [amended in place](adr/2026-07-31-amend-the-schema-in-place-until-release.md)
+  until release; `EdgesAdd` maps the violation to a sentinel as it already does
+  for `ErrNameTaken`. The alternative — making every reader multi-owner-correct —
+  means turning `Owner()`, `OwnersGet` and `LoadOwner` into slices, which widens
+  public API to support a state that public API cannot create.
+
+  **Order is the argument.** Forbidding now and allowing later is backward
+  compatible; allowing now and forbidding later is not.
+
+  What it retires: `gc.go`'s owner fan-out becomes one lookup rather than a loop
+  filtering every owner for deletion-pending, `TestPhysicalDeletePushesEveryOwner`
+  goes, and the `[0]` in three readers stops being a silent choice.
+
+  Deliberately left as is until then: the scoped watch and `objectsDelete` both
+  take the first owner. Fixing those two alone would place multi-owner semantics
+  in a fourth spot while `Owner()` still returns one.
+
 - **Event retention has never been audited end to end, and its shape is not
   derivable from the code** — the reason this entry exists rather than a fix.
   `WithEventRetention(perObject, maxAge)` is one global setting enforced by one
