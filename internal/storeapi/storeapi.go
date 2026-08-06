@@ -253,6 +253,21 @@ type DeletionCascadeChild struct {
 	Ref    ObjectRef
 }
 
+// DeletionRequestResult is what a caller needs to follow up on a deletion mark.
+type DeletionRequestResult struct {
+	// ID is the row that was marked, which the name-keyed sibling resolves.
+	// Meaningful only when Marked.
+	ID ObjectID
+	// Marked reports whether this call stamped the row; a repeat reports false.
+	Marked bool
+	// Unblocked are the deletion-pending objects this row points at through
+	// depends_on: EdgesHasIncoming discounts an edge from a deletion-pending
+	// source, so the mark lifted their RESTRICT. A probe, not a verdict — it
+	// does not check that this row was the target's last referrer. Empty
+	// unless Marked.
+	Unblocked []ObjectRef
+}
+
 // EdgesAddResult is what a caller needs to follow up on an edge it declared;
 // all of it falls out of work EdgesAdd already does.
 type EdgesAddResult struct {
@@ -367,13 +382,12 @@ type Store interface {
 	// clear (ObjectsDelete removes it). changed is true only when this call set
 	// the flag; repeats return false. Scoped to gk: wrong kind → ErrWrongKind,
 	// missing id → ErrNotFound.
-	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (changed bool, err error)
+	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (DeletionRequestResult, error)
 
 	// DeletionRequestsCreateByName is DeletionRequestsCreate keyed by name within gk, with
 	// resolve and mark in one statement. ErrNotFound if no object of gk holds
-	// the name (no ErrWrongKind: names are per-kind). id is the row the name
-	// held, and is meaningful only when changed.
-	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (id ObjectID, changed bool, err error)
+	// the name (no ErrWrongKind: names are per-kind).
+	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (DeletionRequestResult, error)
 
 	// DeletionRequestsCreateFromOwner requests deletion of every object owned by
 	// ownerID and returns them all. Writes only to children not already

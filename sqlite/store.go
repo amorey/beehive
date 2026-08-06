@@ -2004,35 +2004,58 @@ func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
 	probe func(context.Context) (pending bool, err error),
 	where string, whereArgs ...any,
-) (storeapi.ObjectID, bool, error) {
+) (storeapi.DeletionRequestResult, error) {
 	if pending, err := probe(ctx); err != nil || pending {
-		return 0, false, err
+		return storeapi.DeletionRequestResult{}, err
 	}
-	var id storeapi.ObjectID
-	var changed bool
+	var res storeapi.DeletionRequestResult
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		if id, changed, err = s.markForDeletion(ctx, where, whereArgs...); err != nil || changed {
+		if res.ID, res.Marked, err = s.markForDeletion(ctx, where, whereArgs...); err != nil {
 			return err
 		}
-		_, err = probe(ctx)
+		if !res.Marked {
+			_, err = probe(ctx)
+			return err
+		}
+		// Inside the mark's transaction: the discount that lifts the block is
+		// the mark itself, so the read cannot see a state the mark did not make.
+		res.Unblocked, err = s.unblockedTargets(ctx, res.ID)
 		return err
 	})
-	return id, changed, err
+	if err != nil {
+		return storeapi.DeletionRequestResult{}, err
+	}
+	return res, nil
+}
+
+// unblockedTargets returns the deletion-pending objects fromID points at through
+// depends_on. Sound only for a fromID this transaction just marked: that mark is
+// what makes EdgesHasIncoming discount the edge and lift the target's RESTRICT.
+func (s *sqliteStore) unblockedTargets(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT o.id, o."group", o.kind
+		FROM edges r JOIN objects o ON o.id = r.to_id
+		WHERE r.from_id = ? AND r.relation = ?
+		  AND o.deletion_requested_at IS NOT NULL`+edgeOrderByTarget,
+		fromID, string(storeapi.RelationDependsOn))
+	if err != nil {
+		return nil, err
+	}
+	return scanObjectRefs(rows)
 }
 
 // DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
 // foreign id matches no row and the probe reports ErrWrongKind.
-func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (bool, error) {
-	_, changed, err := s.requestDeletion(ctx,
+func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.DeletionRequestResult, error) {
+	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeObjectScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
-	return changed, err
 }
 
 // DeletionRequestsCreateByName marks the gk row holding name; the resolve and the mark
 // are one statement, which is where the returned id comes from.
-func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (storeapi.ObjectID, bool, error) {
+func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (storeapi.DeletionRequestResult, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeDeletionByName(ctx, gk, name) },
 		`"group" = ? AND kind = ? AND name = ?`, gk.Group, gk.Kind, name)

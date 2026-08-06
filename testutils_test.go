@@ -412,10 +412,10 @@ func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, in
 func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (bool, error) {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
-func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (bool, error) {
+func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (storeapi.DeletionRequestResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreate")
 }
-func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (ObjectID, bool, error) {
+func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
 }
 func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
