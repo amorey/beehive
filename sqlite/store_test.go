@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"sync"
@@ -3577,6 +3578,16 @@ func newRawStore(t *testing.T) *sqliteStore {
 	return store
 }
 
+// newFileRawStore is the on-disk store. The read pool only exists here: in
+// memory it aliases the write pool, so nothing about the split is observable.
+func newFileRawStore(t *testing.T) *sqliteStore {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
 // insertBadFinalizersRow inserts a row with invalid finalizers JSON directly so
 // scanObject's json.Unmarshal step fails when the row is read back.
 func insertBadFinalizersRow(t *testing.T, store *sqliteStore, gk beehive.GroupKind) beehive.ObjectID {
@@ -5922,6 +5933,42 @@ func TestDeletionRequestsCreateFromOwnerListError(t *testing.T) {
 	store.db.Close()
 	_, err := store.deletionRequestsCreateFromOwner(context.Background(), 1)
 	require.Error(t, err)
+}
+
+// read must reach the ambient transaction. Behind a read pool a read that
+// missed it would answer from the last committed snapshot — a silent stale read
+// where a single connection deadlocks.
+func TestReadJoinsTheAmbientTransaction(t *testing.T) {
+	store := newFileRawStore(t)
+
+	require.NoError(t, store.Within(context.Background(), func(ctx context.Context) error {
+		assert.Same(t, store.conn(ctx), store.read(ctx))
+
+		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: uniqueName(),
+			Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		got, err := store.ObjectsGet(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, obj.ID, got.ID, "the transaction's own uncommitted write")
+		return nil
+	}))
+}
+
+// A ctx outlives its transaction, so both selectors degrade to their pool
+// rather than failing with sql.ErrTxDone.
+func TestReadDegradesOnAClosedTransaction(t *testing.T) {
+	store := newFileRawStore(t)
+
+	var txCtx context.Context
+	require.NoError(t, store.Within(context.Background(), func(ctx context.Context) error {
+		txCtx = ctx
+		return nil
+	}))
+
+	assert.Same(t, store.readDB, store.read(txCtx))
+	assert.Same(t, store.db, store.conn(txCtx))
 }
 
 // A failed COMMIT is reported to the caller rather than swallowed. The rollback

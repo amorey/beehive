@@ -449,6 +449,16 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 	return s.db
 }
 
+// read returns the ambient transaction if ctx carries a live one, else the read
+// pool. The transaction case is not an optimisation: a read that skipped it
+// would silently miss the transaction's own uncommitted writes.
+func (s *sqliteStore) read(ctx context.Context) dbtx {
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		return fr.st.tx
+	}
+	return s.readDB
+}
+
 // Within runs fn inside a single transaction. A nested Within joins the outer
 // transaction on a SAVEPOINT — a real rollback boundary: an error fn returns
 // unwinds its own writes and queued hooks even if the outer caller swallows it.
