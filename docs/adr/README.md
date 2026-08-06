@@ -30,6 +30,7 @@ directory of archaeology.
 - [A physical delete pushes the owner it was blocking](2026-08-05-a-physical-delete-pushes-its-owner.md)
 - [A dropped dependency pushes the collect it was blocking](2026-08-05-a-dropped-dependency-pushes-its-target.md)
 - [A create under a deleting owner pushes that owner's collect](2026-08-05-a-create-pushes-a-deleting-owners-collect.md)
+- [A deletion mark pushes the target it unblocks](2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md)
 - [A commit wakes the dependency waker](2026-08-05-a-commit-wakes-the-dependency-waker.md)
 - [The dependency waker is wake-driven and has no tick](2026-08-05-the-waker-is-wake-driven.md)
 - [The dependency waker subscribes and seeds before Start returns](2026-08-06-the-waker-seeds-before-start-returns.md)

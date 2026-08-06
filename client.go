@@ -878,7 +878,8 @@ func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, 
 	// object, so it cannot ride this on a repeat.
 	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 	// A finalizing target already carries its own delete's alarm, which a
-	// throttled push would ride. See docs/adr/2026-08-06-a-deletion-mark-pushes-its-target.md.
+	// throttled push would ride. See
+	// docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md.
 	c.bh.signalRequeueManyNow(ctx, unblocked)
 }
 

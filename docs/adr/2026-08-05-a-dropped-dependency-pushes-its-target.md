@@ -104,10 +104,10 @@ every pass; it terminates when that row goes, and queue coalescing bounds it.
 A client-only target resolves to no reconciler and falls back to the sweeper, as
 every push path does.
 
-**A fourth exit from the same block is still unsignalled.** Marking the last live
-referrer deletion-pending lifts the RESTRICT block through the very discount the
-source gate above respects, and `signalDeletionRequested` enqueues only the
-object it marked. That target waits for the sweep. See `docs/TODO.md`.
+**The fourth exit from the same block is the deletion mark itself**, which lifts
+the RESTRICT through the very discount the source gate above respects. It now
+pushes too — see
+[the ADR](2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md).
 
 ### Alternatives considered
 
