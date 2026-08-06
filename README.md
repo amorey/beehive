@@ -351,6 +351,7 @@ type Client[Spec, Status any] interface {
     OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
     // The typed, kind-scoped form of OwnedList: this kind's decoded children.
     OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
+    OwnedObjectsListWatch(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
     // Event log — per-object, category-partitioned, contiguous-run aggregated.
     EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
@@ -528,7 +529,7 @@ Looking the name up is **atomic with the delete** — the name goes into the sto
 
 #### Watching
 
-`Watch` and `WatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `Watch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled.
+`Watch` and `WatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `Watch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled. `OwnedObjectsListWatch(ownerID)` is `WatchList` narrowed to one owner's children — see [secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned) below.
 
 ```go
 snap, ch, err := client.WatchList(ctx)
@@ -577,6 +578,10 @@ An object's ref edges are fetched on request, two ways:
 `OwnedList` (and the eager `LoadOwned()` / `Object.Owned()`) is the inverse of `OwnersGet` over `owned_by`: it returns the objects a given owner owns, the same way `DependentsList` inverts `DependenciesList` over `depends_on`.
 
 `OwnedObjectsList(ownerID)` is the typed version. `OwnedList` returns untyped `ObjectRef`s across every owned kind, leaving you to filter by `Kind` and `Get` each child through its own client. `OwnedObjectsList` returns decoded `*Object[Spec, Status]` children of **this client's kind** in a single query, because the kind filter and the row read fold into the edge join — no `Get` per child. Ordering (by id) and missing-owner behaviour match `OwnedList`. Deletion-pending children are included, so skip them yourself by checking `DeletionRequestedAt`. It takes the same `LoadOption`s as `List`, batched the same way; without them the children have nothing loaded and their accessors return `ErrNotLoaded`.
+
+`OwnedObjectsListWatch(ownerID)` is that read as a watch: the same snapshot, then every change to one of that owner's children — a later child as `Added`, its collection as `Deleted`. It takes the same `WatchOption`s as `WatchList` and joins the same per-kind tailer, so scoping costs a watch nothing beyond one batched edge read per drained page. Ownership is resolved from *current* state rather than from the write log, which is why a child created after the snapshot arrives correctly: the create's log entry is appended before its `owned_by` edge, in the same transaction. Like `OwnersGet` and `Object.Owner()`, it assumes the one owner `WithOwner` can express.
+
+→ [ADR: owner-scoped watches](docs/adr/2026-08-06-owner-scoped-watches.md), for the ownership invariant the resolution rests on.
 
 Eager and lazy run the same query — edges are always a separate indexed lookup, never joined into the `SELECT` that carries specs and statuses. Eager just attaches the result to the object and batches it across a `List`.
 

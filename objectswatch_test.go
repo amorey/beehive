@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -559,6 +560,276 @@ func TestWatchListReturnsASnapshot(t *testing.T) {
 	assert.Equal(t, after.ID, ev.Object.ID, "the stream carries only what the snapshot missed")
 }
 
+// An owner-scoped snapshot holds that owner's children and nothing else — not a
+// sibling owner's, and not an unowned object.
+func TestOwnedObjectsListWatchSnapshotsOnlyTheOwnersChildren(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	other := mustCreate(t, ctx, client, "other", cSpec{})
+	mine := mustCreate(t, ctx, client, "mine", cSpec{}, WithOwner(owner.ID))
+	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
+	mustCreate(t, ctx, client, "orphan", cSpec{})
+
+	snap, _, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	require.Len(t, snap.Objects, 1)
+	assert.Equal(t, mine.ID, snap.Objects[0].ID)
+	assert.GreaterOrEqual(t, snap.ResourceVersion, mine.ResourceVersion)
+}
+
+// A child created after the snapshot arrives as Added. This is the case a
+// denormalised owner column gets wrong: the create's log entry is appended
+// before its owner edge exists.
+func TestOwnedObjectsListWatchDeliversALaterChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	child := mustCreate(t, ctx, client, "child", cSpec{Val: "a"}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	assert.Equal(t, Added, ev.Type)
+	assert.Equal(t, child.ID, ev.Object.ID)
+}
+
+// Everything outside the scope is silent: another owner's child, and an object
+// with no owner at all.
+func TestOwnedObjectsListWatchIgnoresWhatItDoesNotOwn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	other := mustCreate(t, ctx, client, "other", cSpec{})
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
+	mustCreate(t, ctx, client, "orphan", cSpec{})
+	// Written last, so anything ahead of it in the stream is a leak.
+	mine := mustCreate(t, ctx, client, "mine", cSpec{}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	assert.Equal(t, mine.ID, ev.Object.ID, "only the owner's own child is delivered")
+}
+
+// A collected child is still the owner's. Its owned_by edge cascades away with
+// the row, so the scope is decided from the log entry's image — the only place
+// the owner survives.
+func TestOwnedObjectsListWatchReportsACollectedChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, bh, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	child := mustCreate(t, ctx, client, "child", cSpec{Val: "final"}, WithOwner(owner.ID))
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, client.Delete(ctx, child.ID))
+	pending := recv(t, ch)
+	require.Equal(t, Modified, pending.Type, "the deletion request is an ordinary write")
+
+	gone, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Deleted, ev.Type)
+	assert.Equal(t, child.ID, ev.Object.ID)
+	assert.Equal(t, "final", ev.Object.Spec.Val, "the row image carries the final state")
+}
+
+// A collected child whose spec cannot be decoded is still reported: the scope
+// comes off the resolved owner, not off the object that failed to decode, so
+// quarantining the body must not also drop the removal.
+func TestOwnedObjectsListWatchReportsAnUndecodableCollectedChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Name: uniqueName(),
+		Spec: []byte(`not json`),
+	})
+	require.NoError(t, err)
+	_, err = store.EdgesAdd(ctx, poison.ID, owner.ID, RelationOwnedBy)
+	require.NoError(t, err)
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
+
+	ev := recv(t, ch)
+	require.Equal(t, Deleted, ev.Type, "the removal went unreported")
+	assert.Equal(t, poison.ID, ev.ID)
+	assert.Nil(t, ev.Object, "the body is quarantined, the removal is not")
+}
+
+// A resume replays the gap scoped the same way a live stream is, collected
+// children included.
+func TestOwnedObjectsListWatchResumesFromAPosition(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, bh, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	other := mustCreate(t, ctx, client, "other", cSpec{})
+
+	snap, _, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	// All of this lands in the gap the resume below has to replay.
+	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
+	mustCreate(t, ctx, client, "orphan", cSpec{})
+	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"}, WithOwner(owner.ID))
+	doomed := mustCreate(t, ctx, client, "doomed", cSpec{Val: "b"}, WithOwner(owner.ID))
+	require.NoError(t, client.Delete(ctx, doomed.ID))
+	gone, err := bh.gcCollect(ctx, doomed.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
+	require.NoError(t, err)
+
+	first := recv(t, ch)
+	assert.Equal(t, Added, first.Type)
+	assert.Equal(t, mine.ID, first.Object.ID, "the siblings outside the scope are not replayed")
+
+	second := recv(t, ch)
+	assert.Equal(t, Deleted, second.Type)
+	assert.Equal(t, doomed.ID, second.ID)
+}
+
+// The warning is the one signal that would catch a soundness break in the owner
+// gate, so it must fire on an unresolved change and stay silent on an unowned
+// one — a kind holding both shapes would otherwise warn on every standalone
+// write and make the signal worthless.
+func TestAScopedWatchAnnouncesOnlyAnUnresolvedOwner(t *testing.T) {
+	ctx := context.Background()
+	logger, buf := captureLogger(slog.LevelWarn)
+	bh := newTestBeehive(t, newClientTestStore(t))
+	bh.logger = logger
+	client := NewClient[cSpec, cStatus](bh, clientTestGK).(*clientImpl[cSpec, cStatus])
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	spec, err := json.Marshal(cSpec{Val: "a"})
+	require.NoError(t, err)
+	row := func(id ObjectID) *RawObject {
+		return &RawObject{ID: id, Group: clientTestGK.Group, Kind: clientTestGK.Kind, Spec: spec}
+	}
+
+	// Same shape to a subscriber — a nil Owner — and only the first is a fault.
+	cfg := watchConfig{scope: watchScope{ownedBy: &owner.ID}}
+	changes, _ := client.decodeChanges([]rawChange{
+		{ID: 1, Op: WriteUpdate, ResourceVersion: 1, Object: row(1)},
+		{ID: 2, Op: WriteUpdate, ResourceVersion: 2, Object: row(2), OwnerResolved: true},
+	}, bh.migratorFor(clientTestGK), cfg, 0)
+
+	assert.Empty(t, changes, "neither belongs to the owner")
+	assert.Equal(t, 1, strings.Count(buf.String(), "unresolved owner"),
+		"the unresolved change warns, the unowned one does not")
+}
+
+// A scoped watch knows the owner, but only a caller that asked for it gets it
+// loaded: the snapshot and the stream of one call must agree on what a relation
+// accessor answers.
+func TestOwnedObjectsListWatchLeavesAnUnaskedRelationUnloaded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	first := mustCreate(t, ctx, client, "first", cSpec{}, WithOwner(owner.ID))
+
+	snap, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID, WithLoads(LoadDependencies()))
+	require.NoError(t, err)
+	require.Len(t, snap.Objects, 1)
+	require.Equal(t, first.ID, snap.Objects[0].ID)
+	_, _, err = snap.Objects[0].Owner()
+	require.ErrorIs(t, err, ErrNotLoaded, "the snapshot loaded only what was asked for")
+
+	mustCreate(t, ctx, client, "second", cSpec{}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	_, _, err = ev.Object.Owner()
+	assert.ErrorIs(t, err, ErrNotLoaded, "and so does the stream, or one call answers two ways")
+}
+
+// A scoped watch already knows every delivered object's owner — matching on it
+// is how the object got here — so LoadOwner costs it no second query.
+func TestOwnedObjectsListWatchLoadsTheOwnerItAlreadyResolved(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &countingLoadStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	snap, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID, WithLoads(LoadOwner()))
+	require.NoError(t, err)
+	require.Empty(t, snap.Objects)
+	before := store.relationReads.Load()
+
+	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	require.Equal(t, child.ID, ev.Object.ID)
+	got, ok, err := ev.Object.Owner()
+	require.NoError(t, err, "the relation the watch asked for is loaded")
+	require.True(t, ok)
+	assert.Equal(t, owner.ID, got.ID)
+	assert.Equal(t, before+1, store.relationReads.Load(), "the tailer's own read, and no second one")
+}
+
+// The owner read is part of the page, so a failed one costs a retry rather than
+// the stream — like any other poll failure. The cursor has not moved, so the
+// retry delivers exactly what the failed drain could not.
+func TestAScopedWatchSurvivesAFailedOwnerRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
+	bh := newTestBeehive(t, store, fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	store.broken.Store(true)
+	child := mustCreate(t, ctx, client, "child", cSpec{Val: "a"}, WithOwner(owner.ID))
+	waitClosed(t, chanAfter(store.failed, 1), "the drain that cannot read owners")
+
+	store.broken.Store(false)
+	ev := recv(t, ch)
+	assert.Equal(t, child.ID, ev.Object.ID)
+}
+
+// An owner with no children yet is not an error: a watch is opened before the
+// children it is waiting for exist.
+func TestOwnedObjectsListWatchOverAChildlessOwnerStaysQuiet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	snap, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, snap.Objects)
+	assert.NotZero(t, snap.ResourceVersion)
+	assert.NotNil(t, ch)
+}
+
 // The tail reads what the log says changed, not the whole kind. That is the
 // whole point of the log: a tick costs what moved, not what exists.
 func TestObjectStreamTailsTheWriteLog(t *testing.T) {
@@ -855,8 +1126,9 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	assert.Contains(t, buf.String(), "Watch")
 }
 
-// edgelessStore fails the batched relation read the eager loaders use, so a
-// watch that asked for relations cannot quietly deliver objects without them.
+// edgelessStore fails the batched relation read the eager loaders and the
+// owner-scoped tailer share, so neither can quietly deliver objects without the
+// relations it promised.
 type edgelessStore struct {
 	Store
 	broken atomic.Bool
@@ -2464,13 +2736,66 @@ func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 
 	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
-	changes, err := collectChanges(ctx, bh, clientTestGK, page)
+	changes, err := collectChanges(ctx, bh, clientTestGK, page, false)
 	require.NoError(t, err)
 
 	require.Len(t, changes, 2, "five writes to two objects collapse to two changes")
 	assert.Equal(t, second.ID, changes[0].ID, "write order, not id order")
 	assert.Equal(t, first.ID, changes[1].ID)
 	assert.Contains(t, string(changes[1].Object.Spec), "first3", "current state, not a superseded one")
+}
+
+// Ownership is resolved from current state, not from the log entry: the create
+// entry is appended before the owner edge is written, in the same transaction,
+// so an entry that carries an owner would carry none for the write that matters
+// most.
+func TestOnePageResolvesCurrentOwners(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	require.NoError(t, err)
+	changes, err := collectChanges(ctx, bh, clientTestGK, page, true)
+	require.NoError(t, err)
+
+	require.Len(t, changes, 2)
+	byID := map[ObjectID]rawChange{changes[0].ID: changes[0], changes[1].ID: changes[1]}
+	require.NotNil(t, byID[child.ID].Owner)
+	assert.Equal(t, owner.ID, byID[child.ID].Owner.ID)
+	assert.Nil(t, byID[owner.ID].Owner, "an unowned object reports no owner")
+}
+
+// The lookup is a whole extra query per page, so a kind nobody watches by owner
+// must not pay for it.
+func TestOnePageSkipsTheOwnerLookupWhenUnscoped(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	store := &countingLoadStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	require.NoError(t, err)
+	before := store.relationReads.Load()
+
+	changes, err := collectChanges(ctx, bh, clientTestGK, page, false)
+	require.NoError(t, err)
+	assert.Equal(t, before, store.relationReads.Load(), "no owner lookup without a scoped watch")
+	for _, ch := range changes {
+		assert.Nil(t, ch.Owner)
+	}
+
+	_, err = collectChanges(ctx, bh, clientTestGK, page, true)
+	require.NoError(t, err)
+	assert.Equal(t, before+1, store.relationReads.Load(), "one lookup for the whole page")
 }
 
 // Stop drains every watch: each stream closes, and no tailer goroutine outlives

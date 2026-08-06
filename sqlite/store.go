@@ -2238,6 +2238,15 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if err != nil {
 		return err
 	}
+	// The owner edge cascades with the row, so the image is the last place it can
+	// be recorded — an owner-scoped watch reads a collected child's owner here.
+	owners, err := s.EdgesListOutgoingByRelation(ctx, id, storeapi.RelationOwnedBy)
+	if err != nil {
+		return err
+	}
+	if len(owners) > 0 {
+		image.Owner = &owners[0]
+	}
 	// Conditions, events and edges cascade. No zero-row check: the read above
 	// already returned ErrNotFound for an id this transaction cannot see.
 	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
@@ -2877,6 +2886,14 @@ func (s *sqliteStore) ObjectWritesSnapshotByID(ctx context.Context, gk storeapi.
 			return nil, err
 		}
 		return []*storeapi.RawObject{obj}, nil
+	})
+}
+
+// ObjectWritesSnapshotByOwner reads one owner's children of gk. The listing is
+// already kind-scoped, so a foreign owner simply matches nothing.
+func (s *sqliteStore) ObjectWritesSnapshotByOwner(ctx context.Context, gk storeapi.GroupKind, ownerID storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
+	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
+		return s.ObjectsListByIncomingEdge(ctx, gk, ownerID, storeapi.RelationOwnedBy)
 	})
 }
 

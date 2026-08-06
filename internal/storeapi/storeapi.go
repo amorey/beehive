@@ -215,8 +215,12 @@ type RawObject struct {
 	ReconcileOwed int64       `json:"reconcileOwed"`
 	Finalizers    []string    `json:"finalizers"`
 	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
-	CreatedAt     time.Time   `json:"createdAt"`
-	UpdatedAt     time.Time   `json:"updatedAt"`
+	// Owner is set only on a delete entry's row image, where the owned_by edge
+	// has already cascaded away. Nil on a row read from objects, which resolves
+	// its owner through EdgesListOutgoingByRelation like any other relation.
+	Owner     *ObjectRef `json:"owner,omitempty"`
+	CreatedAt time.Time  `json:"createdAt"`
+	UpdatedAt time.Time  `json:"updatedAt"`
 }
 
 // ReconcileLoad is everything one reconcile pass needs from its opening read.
@@ -730,6 +734,12 @@ type Store interface {
 	// or no rows when id does not exist or belongs to another kind, and gk's log
 	// position — the kind's, because the stream that follows tails the kind.
 	ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
+
+	// ObjectWritesSnapshotByOwner is ObjectWritesSnapshot for one owner's
+	// children: the objects of kind gk with an owned_by edge to ownerID, and gk's
+	// log position. ownerID is not existence-checked and is typically another
+	// kind; no children reads empty.
+	ObjectWritesSnapshotByOwner(ctx context.Context, gk GroupKind, ownerID ObjectID) ([]*RawObject, int64, error)
 
 	// ObjectWritesSweep trims the write log to the retention bounds and returns
 	// how many entries it deleted. perKind > 0 caps each (group, kind) log to

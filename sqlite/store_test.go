@@ -7265,6 +7265,7 @@ func TestWriteLogImageCoversRawObject(t *testing.T) {
 		DeletionRequestedAt: ptr(time.UnixMilli(2).UTC()), ReconcileOwed: 1,
 		Finalizers: []string{"f"},
 		Conditions: []storeapi.Condition{{Type: "Ready", Status: "True"}},
+		Owner:      &beehive.ObjectRef{ID: 8, Group: "acme.com", Kind: "Gadget"},
 		CreatedAt:  time.UnixMilli(3).UTC(), UpdatedAt: time.UnixMilli(4).UTC(),
 	}
 	v := reflect.ValueOf(full)
@@ -7476,6 +7477,49 @@ func TestObjectWritesSnapshotByIDReadsOneRow(t *testing.T) {
 	assert.Empty(t, foreign, "another kind cannot see this row")
 }
 
+// The owner-scoped snapshot reads one owner's children and reports the KIND's
+// position, for the same reason the by-id one does: the stream that follows it
+// tails the kind's log.
+func TestObjectWritesSnapshotByOwnerReadsOneOwnersChildren(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	other := newRefObject(t, store)
+	mine := newRefObject(t, store)
+	theirs := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, mine.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, theirs.ID, other.ID, beehive.RelationOwnedBy))
+
+	rows, at, err := store.ObjectWritesSnapshotByOwner(ctx, testGK, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, mine.ID, rows[0].ID)
+	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	require.NoError(t, err)
+	assert.Equal(t, position, at, "the kind's position, not this row's version")
+
+	foreign, _, err := store.ObjectWritesSnapshotByOwner(ctx, beehive.GroupKind{Kind: "Other"}, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, foreign, "another kind cannot see this row")
+}
+
+// An owner with no children, and an id that is no owner at all, both read empty
+// rather than erroring: a watch may be opened before the children exist.
+func TestObjectWritesSnapshotByOwnerFoldsAbsence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	childless := newRefObject(t, store)
+
+	rows, at, err := store.ObjectWritesSnapshotByOwner(ctx, testGK, childless.ID)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+	assert.NotZero(t, at)
+
+	rows, _, err = store.ObjectWritesSnapshotByOwner(ctx, testGK, 404)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
 // The tail reads the objects one batch named, in one query. A short result is
 // normal: an id collected between the log read and this one is simply absent,
 // and its delete arrives as a later entry.
@@ -7625,6 +7669,53 @@ func TestObjectWritesListSinceAttachesImages(t *testing.T) {
 	require.Equal(t, storeapi.WriteDelete, last.Op)
 	require.NotNil(t, last.Final)
 	assert.Equal(t, gone.Name, last.Final.Name)
+}
+
+// The image carries the owner, which the edge cannot: it cascades away with the
+// row, so an owner-scoped watch has nowhere else to learn a collected child's
+// owner from.
+func TestObjectsDeleteImageCarriesTheOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	child := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, store.ObjectsDelete(ctx, child.ID))
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	last := page[len(page)-1]
+	require.Equal(t, storeapi.WriteDelete, last.Op)
+	require.NotNil(t, last.Final.Owner)
+	assert.Equal(t, owner.ID, last.Final.Owner.ID)
+}
+
+// The owner read is part of assembling the image, so a delete that cannot make
+// it fails rather than recording a collected child as ownerless — an absence a
+// scoped watch would believe.
+func TestObjectsDeleteFailsWhenTheOwnerReadFails(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE edges`)
+	require.NoError(t, err)
+
+	require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+}
+
+// An unowned object's image says so, rather than leaving a caller to guess
+// whether the owner was absent or unread.
+func TestObjectsDeleteImageLeavesAnUnownedObjectsOwnerNil(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+
+	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	require.NoError(t, err)
+	last := page[len(page)-1]
+	require.NotNil(t, last.Final)
+	assert.Nil(t, last.Final.Owner)
 }
 
 // A non-positive limit reads nothing rather than reaching SQLite as an unbounded

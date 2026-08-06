@@ -145,6 +145,43 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   or fold into the next break that touches these types. `EventsAddInput` (2026-08-06)
   was not that break: it added an alias rather than touching any of these four.
 
+- **`List` in a method name may be saying what the return type already says** —
+  proposed, not decided, and pre-release or never. `OwnedList` → `Owned`,
+  `OwnedObjectsList` → `OwnedObjects`, `OwnedObjectsListWatch` →
+  `OwnedObjectsWatch`, `EventsList` → `Events`, `EdgesListIncoming` →
+  `EdgesIncoming`: twenty distinct method names across `Client`,
+  `ControllerClient` and `Store`.
+
+  **The argument is already in the naming ADR, applied to a different surface.**
+  `Object`'s relation accessors dropped their verbs — `GetOwner`/`ListDependencies`
+  became `Owner()`/`Dependencies()` — because "the `Get`/`List` cardinality signal
+  moves to the return type, which already carried it"
+  ([ADR](adr/2026-07-27-noun-verb-naming.md)). A plural noun returning a slice has
+  said "many" twice before `List` says it a third time.
+
+  What has to be answered is why that reasoning stopped at `Object`. The honest
+  distinction is that those are pure accessors over already-loaded state, while
+  `Client.OwnedObjects(ctx, id)` takes a context and issues a query — and a bare
+  noun on a method that does I/O reads like a field, which hides the cost at the
+  call site. That is the case to make or reject, and it is not obviously wrong
+  either way.
+
+  **The bare family cannot follow.** `Client`'s own CRUD omits the prefix, so
+  `List` has no noun to fall back on, and `WatchList` cannot become `Watch` —
+  taken by the single-object watch. The rule would have to read "drop the verb on
+  a prefixed family, keep it where the family is the receiver", which is a second
+  exception stacked on the omit-the-prefix one. Whether that is one convention or
+  two is the thing to settle before touching a single name.
+
+  Two more loose ends. Whether `Get` goes too (`OwnersGet` → `Owner`), which reads
+  well but gives the client the same spelling as `Object.Owner()` for a different
+  operation — and if it stays, cardinality is signalled asymmetrically. And a few
+  names get worse rather than better: `ObjectsListIDs` → `ObjectsIDs` wants to be
+  `ObjectIDs`, which breaks the plural-prefix rule to fix the reading.
+
+  Worth doing before the first release or not at all: every one is public API, the
+  rename is the entire cost, and it is the kind of change that never gets cheaper.
+
 - **A cascade draws one resource version per child** — known, not fixed, and all that
   is left of the write-shapes pass's tail. Every other narrow-question write is
   settled: the ones that report no row answer from metadata (`checkObjectScoped`),
@@ -309,22 +346,59 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   work in a *different* transaction from the change that owes it — the answer is
   `synchronous=FULL`, and that is the tripwire to watch for.
 
-- **Owner-scoped watches** — wanted, deliberately out of the first write-log
-  design ([ADR](adr/2026-08-02-object-write-log.md)). `OwnedObjectsList` has a
-  typed, batched read but no watch counterpart, so a subscriber that wants one
-  owner's children watches the whole kind and filters client-side.
+- **A dependent- or dependency-scoped watch does not exist** — the half of the
+  owner-scoped work that was not taken. Owner scope shipped
+  ([ADR](adr/2026-08-06-owner-scoped-watches.md)) by resolving ownership from
+  current state, which is sound only because an `owned_by` edge is written at
+  create and removed at collect, both of them logged writes to the child.
 
-  The obvious implementation is wrong. Denormalising `owner_id` into
-  `object_writes` filters on ownership *as of the write*, and ownership can
-  change afterwards: a re-parented object keeps arriving on its old owner's
-  stream and never appears on its new one, until something writes to it again.
-  Confirming each entry against current state costs a read per entry, which is
-  most of what the index was there to buy.
+  `depends_on` has neither property: `DependenciesAdd`/`DependenciesRemove`
+  mutate edges freely, and `EdgesAdd`/`EdgesDelete` bump nothing, so an edge
+  change is invisible to the tail. A scoped watch there needs the edge write to
+  become a write to its source first — which is a change to what the write log
+  means, not a filter over it.
 
-  Worth doing when someone has a real fan-out of children per owner. The design
-  choice to settle first is whether an ownership change should itself be a write
-  to the child — which would make the logged value correct by construction, and
-  would also fix `DependentsList`/`DependenciesList`, which have the same hole.
+  Worth doing when someone has a real fan-out of dependents per target. Settle
+  the edge-write question before anything else: it is the whole of the work.
+
+- **Nothing stops a child having two owners, and the typed API cannot express
+  one that does** — proposed, not decided, and worth deciding pre-release
+  because only one of the two directions is reversible.
+
+  `edges` keys on `(from_id, to_id, relation)`, so a row can carry any number of
+  `owned_by` edges. Nothing in the typed API makes one: `WithOwner` sets a single
+  field, last-wins, and `insertObject` writes one edge. Only a direct
+  `Store.EdgesAdd` reaches the state, and `TestPhysicalDeletePushesEveryOwner` is
+  the one place that does.
+
+  **The read surface already chose single-owner.** `fetchOwnerRef` resolves "id's
+  single `owned_by` edge" and returns `owners[0]`; `LoadOwner` does the same;
+  `Object.Owner()` and `OwnersGet` each return one `ObjectRef`.
+  `OwnedObjectsListWatch` and the delete row image follow them
+  ([ADR](adr/2026-08-06-owner-scoped-watches.md)). The one multi-owner-correct
+  read is `OwnedObjectsList`, and only by construction — it asks who points at an
+  owner rather than collapsing a child's edges. So the state is representable,
+  half-honoured, and unreachable through the public API: the worst of the three.
+
+  **The fix is a constraint, not more fan-out.** A partial unique index —
+  `CREATE UNIQUE INDEX ... ON edges(from_id) WHERE relation = 'owned_by'` — costs
+  nothing at write time, cannot be bypassed by a raw `EdgesAdd`, and the schema is
+  [amended in place](adr/2026-07-31-amend-the-schema-in-place-until-release.md)
+  until release; `EdgesAdd` maps the violation to a sentinel as it already does
+  for `ErrNameTaken`. The alternative — making every reader multi-owner-correct —
+  means turning `Owner()`, `OwnersGet` and `LoadOwner` into slices, which widens
+  public API to support a state that public API cannot create.
+
+  **Order is the argument.** Forbidding now and allowing later is backward
+  compatible; allowing now and forbidding later is not.
+
+  What it retires: `gc.go`'s owner fan-out becomes one lookup rather than a loop
+  filtering every owner for deletion-pending, `TestPhysicalDeletePushesEveryOwner`
+  goes, and the `[0]` in three readers stops being a silent choice.
+
+  Deliberately left as is until then: the scoped watch and `objectsDelete` both
+  take the first owner. Fixing those two alone would place multi-owner semantics
+  in a fourth spot while `Owner()` still returns one.
 
 - **Event retention has never been audited end to end, and its shape is not
   derivable from the code** — the reason this entry exists rather than a fix.

@@ -185,6 +185,25 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
+- **`OwnedObjectsListWatch` scopes a watch to one owner's children, and reads
+  ownership from current state.** Never from the log: a create's entry is
+  appended *before* its `owned_by` edge, in the same transaction, so a
+  denormalised `owner_id` would be NULL on the write that matters most. The
+  tailer resolves a page's owners in one `EdgesGroupOutgoingByID` beside the
+  batched object read; a collected child has no edges left, so it takes its owner
+  off the delete entry's row image. **The lookup's gate (`ownerScoped`) is set
+  before a scoped subscriber registers and is never cleared** — a change
+  published without an owner while one is live is dropped silently and forever,
+  which is also why `decodeChanges` warns on a nil owner it did not expect. It is
+  sound for a snapshotting subscriber because anything above its snapshot was
+  read after the flag was set, and for a resuming one **only because `replay`
+  runs to the head**. Unlike `Watch(id)` there is no key filter: membership is
+  what the watch exists to learn. All of it rests on **ownership changing only
+  through a logged write to the child** — true by construction, pinned
+  structurally by `TestOwnedByIsWrittenInOnePlace`, and the thing a re-parent
+  verb would have to preserve. `DependentsList`/`DependenciesList` have no watch
+  counterpart for the harder reason: `depends_on` edges are mutable and log
+  nothing. → [ADR](docs/adr/2026-08-06-owner-scoped-watches.md)
 - **The event watch reads one object's log above a cursor, one reader per
   watch** (`eventswatch.go`). An extend re-samples `events.resource_version`, so
   "runs above the cursor" is exactly what changed and the old `seen`/`EventID`

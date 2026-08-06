@@ -46,6 +46,9 @@ type watchConfig struct {
 	// resumeFrom is the position to stream above, or nil to take a snapshot.
 	resumeFrom *int64
 	loads      LoadSet
+	// scope is set by the watch call, not by an option: a caller cannot ask for
+	// a scope the entry point did not choose.
+	scope watchScope
 }
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
@@ -64,6 +67,15 @@ func WithResumeFrom(rv int64) WatchOption {
 // does not become an N+1.
 func WithLoads(loads ...LoadOption) WatchOption {
 	return func(c *watchConfig) { c.loads = resolveLoads(loads) }
+}
+
+// remainingLoads is what a delivered batch still has to read. A scoped watch
+// resolves the owner in the tailer, once for every subscriber on the kind.
+func (c watchConfig) remainingLoads() LoadSet {
+	if c.scope.ownedBy != nil {
+		return c.loads &^ LoadOwnerBit
+	}
+	return c.loads
 }
 
 func resolveWatch(opts []WatchOption) watchConfig {
@@ -98,7 +110,7 @@ func (bh *Beehive) watchBackoff() driver.Backoff {
 // WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	return c.tailStream(ctx, resolveWatch(opts), nil)
+	return c.tailStream(ctx, resolveWatch(opts))
 }
 
 // Watch streams changes to the single object id: an id that does not exist yet
@@ -107,7 +119,9 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	// The tail is shared per kind — the log has no index on object_id — so a
 	// single-object watch joins the kind's reader and filters the fan-out down
 	// to its own id.
-	list, ch, err := c.tailStream(ctx, resolveWatch(opts), &id)
+	cfg := resolveWatch(opts)
+	cfg.scope.only = &id
+	list, ch, err := c.tailStream(ctx, cfg)
 	if err != nil {
 		return ObjectSnapshot[Spec, Status]{}, nil, err
 	}
@@ -118,10 +132,32 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	return snap, ch, nil
 }
 
-// snapshot reads the watch's starting state: one object, or the whole kind.
-func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, only *ObjectID) ([]*RawObject, int64, error) {
-	if only != nil {
-		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *only)
+// OwnedObjectsListWatch streams the objects of this client's kind owned by
+// ownerID. See the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) OwnedObjectsListWatch(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+	// Ownership is not in the log, so unlike Watch this cannot filter the fan-out
+	// by key: the tailer resolves each change's owner and the subscriber matches
+	// on it. See docs/adr/2026-08-06-owner-scoped-watches.md.
+	cfg := resolveWatch(opts)
+	cfg.scope.ownedBy = &ownerID
+	return c.tailStream(ctx, cfg)
+}
+
+// watchScope narrows a watch to part of its kind. At most one field is set; the
+// zero value is the whole kind.
+type watchScope struct {
+	only    *ObjectID // one object
+	ownedBy *ObjectID // one owner's children
+}
+
+// snapshot reads the watch's starting state, at the position its stream begins
+// above.
+func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, scope watchScope) ([]*RawObject, int64, error) {
+	switch {
+	case scope.only != nil:
+		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *scope.only)
+	case scope.ownedBy != nil:
+		return c.bh.store.ObjectWritesSnapshotByOwner(ctx, c.gk, *scope.ownedBy)
 	}
 	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
 }
@@ -287,6 +323,12 @@ type rawChange struct {
 	ResourceVersion int64
 	// Object is the row as read back, or the log entry's row image for a delete.
 	Object *RawObject
+	// Owner is the object's current owner, nil when it has none. Resolved only
+	// while the tailer has an owner-scoped subscriber; see objectTailer.ownerScoped.
+	Owner *ObjectRef
+	// OwnerResolved says whether Owner was looked up at all, so a nil Owner can
+	// be read as "unowned" rather than "never asked".
+	OwnerResolved bool
 }
 
 // objectTailer is one kind's shared log reader: it owns the kind's cursor,
@@ -304,6 +346,11 @@ type objectTailer struct {
 	// refs counts live subscribers. Guarded by bh.tailMu, which is also what
 	// makes "in bh.tailers" and "refs > 0" the same condition.
 	refs int
+	// ownerScoped turns on the per-page owner lookup. Set before a scoped
+	// subscriber registers, and never cleared: a change published without an
+	// owner while one is live would be dropped silently.
+	// See docs/adr/2026-08-06-owner-scoped-watches.md.
+	ownerScoped atomic.Bool
 	// cursor is only touched by run.
 	cursor int64
 	// floor, retry and scanGate are only touched by run and the pass it calls,
@@ -506,7 +553,7 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	changes, err := collectChanges(ctx, t.bh, t.gk, page)
+	changes, err := collectChanges(ctx, t.bh, t.gk, page, t.ownerScoped.Load())
 	if err != nil {
 		return 0, err
 	}
@@ -521,8 +568,9 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 
 // collectChanges coalesces a log page to the last entry per object and reads the
 // current state of everything still live, in one batch. Shared by the tailer and
-// by a resume's replay.
-func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []ObjectWrite) ([]rawChange, error) {
+// by a resume's replay. withOwners resolves each change's current owner, for an
+// owner-scoped subscriber to filter on.
+func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []ObjectWrite, withOwners bool) ([]rawChange, error) {
 	// The page arrives ascending and resource_version is the log's primary
 	// key, so keeping each id's highest-version entry preserves write order
 	// without a sort.
@@ -561,6 +609,15 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 		byID[raw.ID] = raw
 	}
 
+	// Only the live ids: a collected object's edges cascaded away, so it takes
+	// its owner off the log entry's row image instead.
+	var owners map[ObjectID][]ObjectRef
+	if withOwners {
+		if owners, err = bh.store.EdgesGroupOutgoingByID(ctx, live, RelationOwnedBy); err != nil {
+			return nil, err
+		}
+	}
+
 	changes := make([]rawChange, 0, len(order))
 	for _, w := range order {
 		raw := w.Final
@@ -579,11 +636,19 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 			continue
 		}
 		op := coalesceOp(first[w.ID], w.Op)
+		// A collected object's owner survives only in the image; a live one is
+		// read from its edges, since the image is a delete entry's alone.
+		owner := raw.Owner
+		if refs := owners[w.ID]; len(refs) > 0 {
+			owner = &refs[0]
+		}
 		changes = append(changes, rawChange{
 			ID:              w.ID,
 			Op:              op,
 			ResourceVersion: w.ResourceVersion,
 			Object:          raw,
+			Owner:           owner,
+			OwnerResolved:   withOwners,
 		})
 	}
 	return changes, nil
@@ -601,7 +666,6 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 func (c *clientImpl[Spec, Status]) tailStream(
 	ctx context.Context,
 	cfg watchConfig,
-	only *ObjectID,
 ) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
 	var empty ObjectListSnapshot[Spec, Status]
 	tailer, err := c.bh.tailerFor(ctx, c.gk)
@@ -609,10 +673,16 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		return empty, nil, fmt.Errorf("beehive: watch on %s/%s: %w", c.gk.Group, c.gk.Kind, err)
 	}
 
+	if cfg.scope.ownedBy != nil {
+		// Before the receiver and the snapshot, or a change published in between
+		// would reach this subscriber with no owner and be dropped as another's.
+		tailer.ownerScoped.Store(true)
+	}
 	var opts []conflate.ReceiverOption[ObjectID, rawChange]
-	if only != nil {
-		// Bounds this subscriber's memory to one key.
-		opts = append(opts, tailer.hub.WithKeyFilter(func(k ObjectID) bool { return k == *only }))
+	if cfg.scope.only != nil {
+		// Bounds this subscriber's memory to one key. An owner scope has no such
+		// filter: which keys belong is what the watch is there to find out.
+		opts = append(opts, tailer.hub.WithKeyFilter(func(k ObjectID) bool { return k == *cfg.scope.only }))
 	}
 	rx := tailer.hub.Receiver(opts...)
 	// Owed by every path that returns without a stream: the receiver holds a key
@@ -632,7 +702,7 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		// moment earlier, in a second place the caller has to handle.
 		snap.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
 	} else {
-		raws, at, err := c.snapshot(ctx, only)
+		raws, at, err := c.snapshot(ctx, cfg.scope)
 		if err != nil {
 			abandon()
 			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
@@ -667,7 +737,7 @@ func (c *clientImpl[Spec, Status]) tailStream(
 
 		// One place sends the terminal Failed change; see endStream.
 		if cfg.resumeFrom != nil {
-			at, fail, ok := c.replay(work, mig, cfg, only, floor, out)
+			at, fail, ok := c.replay(work, mig, cfg, floor, out)
 			if !ok {
 				c.endStream(ctx, tailer, fail, out)
 				return
@@ -789,7 +859,7 @@ func (c *clientImpl[Spec, Status]) decodeBatch(
 	changes, loaded := c.decodeChanges(batch, mig, cfg, floor)
 	retry := c.bh.watchBackoff()
 	for {
-		err := c.loadListRelated(ctx, loaded, cfg.loads)
+		err := c.loadListRelated(ctx, loaded, cfg.remainingLoads())
 		if err == nil {
 			return changes, true
 		}
@@ -817,6 +887,18 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 		if raw.ResourceVersion <= floor {
 			continue
 		}
+		if owner := cfg.scope.ownedBy; owner != nil && (raw.Owner == nil || raw.Owner.ID != *owner) {
+			// An unresolved change is dropped for good, and the gate is armed before
+			// a scoped subscriber registers precisely so it cannot happen. Gated on
+			// OwnerResolved, not on a nil Owner: an unowned object is nil too, and a
+			// kind holding both shapes would warn on every write to a standalone one.
+			if !raw.OwnerResolved {
+				c.bh.log().Warn("beehive: dropping a change with an unresolved owner",
+					"op", "Watch", "group", c.gk.Group, "kind", c.gk.Kind,
+					"id", raw.ID, "resourceVersion", raw.ResourceVersion)
+			}
+			continue
+		}
 		obj, err := rawToTyped[Spec, Status](raw.Object, mig)
 		if err != nil {
 			// Quarantine: one bad row must not kill a live watcher.
@@ -837,6 +919,11 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 			Object:          obj,
 		})
 		if raw.Op != WriteDelete && cfg.loads != 0 {
+			if cfg.scope.ownedBy != nil && cfg.loads&LoadOwnerBit != 0 {
+				// A scoped change reached here only by matching, so its owner is
+				// known and re-reading the edge would repeat the tailer's query.
+				obj.owner, obj.loaded = raw.Owner, obj.loaded|LoadOwnerBit
+			}
 			loaded = append(loaded, obj)
 		}
 	}
@@ -852,7 +939,6 @@ func (c *clientImpl[Spec, Status]) replay(
 	ctx context.Context,
 	mig Migrator,
 	cfg watchConfig,
-	only *ObjectID,
 	from int64,
 	out chan<- ObjectChange[Spec, Status],
 ) (int64, error, bool) {
@@ -893,12 +979,14 @@ func (c *clientImpl[Spec, Status]) replay(
 		}
 		next := page[len(page)-1].ResourceVersion
 		full := len(page) == tailPageCap
-		if only != nil {
+		if cfg.scope.only != nil {
 			// Filter before the read: collectChanges would otherwise read back
 			// every object in the page to deliver at most one.
-			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *only })
+			page = slices.DeleteFunc(page, func(w ObjectWrite) bool { return w.ID != *cfg.scope.only })
 		}
-		raws, err := collectChanges(ctx, c.bh, c.gk, page)
+		// An owner scope cannot narrow the page first — ownership is not in the
+		// log — so it reads the page back in full and filters after.
+		raws, err := collectChanges(ctx, c.bh, c.gk, page, cfg.scope.ownedBy != nil)
 		if err != nil {
 			if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
 				return 0, nil, false

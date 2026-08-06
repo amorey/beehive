@@ -518,6 +518,9 @@ func (s *fakeStore) ObjectWritesSnapshot(context.Context, GroupKind) ([]*RawObje
 func (s *fakeStore) ObjectWritesSnapshotByID(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesSnapshotByID")
 }
+func (s *fakeStore) ObjectWritesSnapshotByOwner(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWritesSnapshotByOwner")
+}
 func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int, error) {
 	// Zero rather than a panic: write-log retention is on by default, so every
 	// Beehive whose GC sweeper ticks reaches this.
