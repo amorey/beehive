@@ -6012,6 +6012,47 @@ func TestABareReadDoesNotWaitForAWriter(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+// Every driver reads a mark and then pages up to it, across statements and with
+// no transaction. On one connection that was monotone by construction; on a
+// pool it rests on WAL snapshots being monotone in real time whichever
+// connection serves them. Nothing else pins this, and a driver written to the
+// same shape would break silently without it.
+func TestSnapshotsAreMonotoneAcrossConnections(t *testing.T) {
+	store := newFileRawStore(t)
+	ctx := context.Background()
+
+	for range 4 {
+		newRefObject(t, store)
+	}
+	mark, err := store.ResourceVersionsMaxIssued(ctx)
+	require.NoError(t, err)
+	newRefObject(t, store) // commits above the mark, before the pages are read
+
+	// Hold every read open at once, so the pages run on connections that did not
+	// serve the mark read rather than on whichever one database/sql reuses.
+	start := make(chan struct{})
+	results := make(chan []*beehive.RawObject, readPoolConns())
+	for range cap(results) {
+		go func() {
+			<-start
+			page, err := store.ObjectsList(ctx, testGK)
+			assert.NoError(t, err)
+			results <- page
+		}()
+	}
+	close(start)
+
+	for range cap(results) {
+		page := <-results
+		var highest int64
+		for _, obj := range page {
+			highest = max(highest, obj.ResourceVersion)
+		}
+		assert.GreaterOrEqual(t, highest, mark,
+			"a read issued after the mark must see at least the mark's snapshot")
+	}
+}
+
 // The reads that wrap themselves are the page reads in the watch drains, so
 // they have to reach the read pool too — s.read alone leaves them on the write
 // connection, where they wait out every writer.
