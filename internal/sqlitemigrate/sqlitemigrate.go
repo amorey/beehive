@@ -44,7 +44,8 @@ type PoolOptions struct {
 
 // OpenPool opens a modernc-sqlite pool at path with Beehive's PRAGMAs baked
 // into the DSN — WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys on,
-// auto_vacuum=INCREMENTAL, immediate txlock. Run Apply against a writer pool.
+// auto_vacuum=INCREMENTAL, plus whatever opts selects. Run Apply against a
+// writer pool.
 // See docs/adr/2026-07-29-auto-vacuum-incremental.md.
 func OpenPool(path string, opts PoolOptions) *sql.DB {
 	// auto_vacuum MUST be set on the DSN, never in a migration: SQLite ignores

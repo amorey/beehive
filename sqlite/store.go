@@ -3027,9 +3027,9 @@ func (s *sqliteStore) snapshot(
 }
 
 // ObjectsListByIDs reads one batch of ids in one query. The tail calls it once
-// per batch rather than ObjectsGet per changed object: the pool is size 1, so
-// those would be serialized round trips and a churny kind would cost more than
-// the full listing this design replaced.
+// per batch rather than ObjectsGet per changed object: those would be a round
+// trip each, and a churny kind would cost more than the full listing this
+// design replaced.
 func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKind, ids []storeapi.ObjectID) ([]*storeapi.RawObject, error) {
 	if len(ids) == 0 {
 		return nil, nil

@@ -57,7 +57,9 @@ Three properties of `readWithin`, each deliberate:
 
 - **It joins an ambient transaction** by delegating to `Within`, so nested
   `Within`'s SAVEPOINT semantics and goroutine-ownership refusal come along for
-  free and a read inside a caller's transaction is unchanged.
+  free and a read inside a caller's transaction is unchanged. Its own commit
+  takes the same `sealForCommit` Within does — a frame another goroutine still
+  holds would otherwise have its savepoint released underneath it.
 - **Its frame is resolved by `conn` as well as `read`.** A write inside it
   therefore reaches a `query_only` connection and fails loudly. A private ctx
   key that only `read` consulted would route a stray write to the write pool,
@@ -71,8 +73,8 @@ Three properties of `readWithin`, each deliberate:
 for the first time blocks while a writer holds a transaction. Already-attached
 connections read concurrently, so an unwarmed pool pays exactly the wait it
 exists to avoid — on its first use, and again on any connection that gets
-retired. `WarmPool` opens all N up front, and the reader pool never retires an
-idle connection.
+retired. `warm` opens all N up front, from inside `open` where the pools are
+already paired, and the reader pool never retires an idle connection.
 
 **In memory the read pool is the write pool.** `file::memory:` is
 per-connection, so a second pool there would be a different, empty database.
