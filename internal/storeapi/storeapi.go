@@ -468,8 +468,11 @@ type Store interface {
 	// timeline to its newest perTimeline runs; maxAge > 0 drops runs with
 	// LastAt older than that. A zero bound is skipped. Global, not per-kind.
 	// An implementation MAY bound the work of one call, converging over
-	// sweeps, so a return does not imply every bound is met.
-	EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration) (int, error)
+	// sweeps, so a return does not imply every bound is met. capBudget > 0 asks
+	// for at most that many timelines trimmed by the perTimeline cap, so a
+	// caller sweeping rarely can ask for proportionally more; <= 0 leaves the
+	// bound to the implementation.
+	EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error)
 
 	// FinalizersDelete removes finalizer from id's list. A real removal bumps
 	// ResourceVersion; a missing one does nothing. clearedLast reports that this

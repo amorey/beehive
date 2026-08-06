@@ -296,7 +296,7 @@ func TestSweepEventsCapN(t *testing.T) {
 		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: r}))
 	}
 
-	deleted, err := store.EventsSweep(ctx, 2, 0)
+	deleted, err := store.EventsSweep(ctx, 2, 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, deleted)
 
@@ -324,7 +324,7 @@ func TestSweepEventsCapNPartitions(t *testing.T) {
 	rec(a, "sync", "S1")            // object a, sync has 1 run
 	rec(b, "connection", "OtherC1") // object b, its own timeline
 
-	_, err := store.EventsSweep(ctx, 1, 0)
+	_, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 
 	conn := "connection"
@@ -356,7 +356,7 @@ func TestSweepEventsMaxAge(t *testing.T) {
 
 	ageRun(t, store, old.ID, 2*time.Hour)
 
-	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
+	deleted, err := store.EventsSweep(ctx, 0, time.Hour, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 1, deleted)
 
@@ -379,7 +379,7 @@ func TestSweepEventsCapNCountsRuns(t *testing.T) {
 			storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "Same"}))
 	}
 
-	deleted, err := store.EventsSweep(ctx, 1, 0)
+	deleted, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	assert.Zero(t, deleted, "one run, at the cap")
 
@@ -401,7 +401,7 @@ func TestSweepEventsMaxAgeSpansTimelines(t *testing.T) {
 	ageRun(t, store, quiet.ID, 2*time.Hour)
 	ageRun(t, store, chatty.ID, 2*time.Hour)
 
-	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
+	deleted, err := store.EventsSweep(ctx, 0, time.Hour, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, deleted, "both timelines aged out, cap or no cap")
 }
@@ -423,15 +423,15 @@ func TestSweepEventsCapIsProgressive(t *testing.T) {
 		}
 	}
 
-	deleted, err := store.EventsSweep(ctx, 1, 0)
+	deleted, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, eventCapBudget, deleted, "one sweep trims up to the budget")
 
-	deleted, err = store.EventsSweep(ctx, 1, 0)
+	deleted, err = store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, deleted, "the next sweep finishes the backlog")
 
-	deleted, err = store.EventsSweep(ctx, 1, 0)
+	deleted, err = store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	assert.Zero(t, deleted, "nothing left over cap")
 }
@@ -456,7 +456,7 @@ func TestSweepEventsHorizonCoversEveryTrimmedRun(t *testing.T) {
 	byRV[aged.ResourceVersion] = "c"
 	ageRun(t, store, aged.ID, 2*time.Hour)
 
-	_, err := store.EventsSweep(ctx, 1, time.Hour)
+	_, err := store.EventsSweep(ctx, 1, time.Hour, 0)
 	require.NoError(t, err)
 
 	survived := map[int64]bool{}
@@ -555,7 +555,7 @@ func TestEventsListSinceReportsTheHorizon(t *testing.T) {
 		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "connection", Type: "Normal", Reason: r}))
 	}
 	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "sync", Type: "Normal", Reason: "S1"}))
-	_, err := store.EventsSweep(ctx, 1, 0)
+	_, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	trimmed := eventHorizon(t, store, id, "connection")
 	require.NotZero(t, trimmed)
@@ -622,7 +622,7 @@ func TestSweepEventsRecordsHorizonPerTimeline(t *testing.T) {
 	}
 	require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "sync", Type: "Normal", Reason: "S1"}))
 
-	deleted, err := store.EventsSweep(ctx, 1, 0)
+	deleted, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, deleted, "the count survives the horizon write")
 
@@ -639,7 +639,7 @@ func TestSweepEventsHorizonOnlyRises(t *testing.T) {
 	for _, r := range []string{"R1", "R2", "R3"} {
 		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: r}))
 	}
-	_, err := store.EventsSweep(ctx, 1, 0)
+	_, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	high := eventHorizon(t, store, id, "c")
 	require.NotZero(t, high)
@@ -649,7 +649,7 @@ func TestSweepEventsHorizonOnlyRises(t *testing.T) {
 	_, err = s.db.ExecContext(ctx, `UPDATE events SET resource_version = 1, last_at = ? WHERE object_id = ?`,
 		toMillis(time.Now().UTC().Add(-2*time.Hour)), id)
 	require.NoError(t, err)
-	_, err = store.EventsSweep(ctx, 0, time.Hour)
+	_, err = store.EventsSweep(ctx, 0, time.Hour, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, high, eventHorizon(t, store, id, "c"))
@@ -664,7 +664,7 @@ func TestDeleteObjectCascadesEventHorizon(t *testing.T) {
 	for _, r := range []string{"R1", "R2"} {
 		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: r}))
 	}
-	_, err := store.EventsSweep(ctx, 1, 0)
+	_, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	require.NotZero(t, eventHorizon(t, store, id, "c"))
 
@@ -816,7 +816,7 @@ func TestEventsMaxVersionFallsWhenTheNewestRunGoes(t *testing.T) {
 	before, err := store.EventsMaxVersion(ctx, id)
 	require.NoError(t, err)
 
-	deleted, err := store.EventsSweep(ctx, 1, 0)
+	deleted, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, deleted, "the older run is swept, leaving the newest")
 
@@ -828,7 +828,7 @@ func TestEventsMaxVersionFallsWhenTheNewestRunGoes(t *testing.T) {
 	// mark falls back to the empty-log zero.
 	_, err = store.db.ExecContext(ctx, `UPDATE events SET last_at = 0`)
 	require.NoError(t, err)
-	deleted, err = store.EventsSweep(ctx, 0, time.Hour)
+	deleted, err = store.EventsSweep(ctx, 0, time.Hour, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, deleted)
 	after, err = store.EventsMaxVersion(ctx, id)
@@ -1041,7 +1041,7 @@ func TestSweepEventsExecErrors(t *testing.T) {
 		store := newRawStore(t)
 		newEventObject(t, store)
 		dropEventsTable(t, store)
-		_, err := store.EventsSweep(ctx, 1, 0)
+		_, err := store.EventsSweep(ctx, 1, 0, 0)
 		require.Error(t, err)
 	})
 
@@ -1049,14 +1049,14 @@ func TestSweepEventsExecErrors(t *testing.T) {
 		store := newRawStore(t)
 		newEventObject(t, store)
 		dropEventsTable(t, store)
-		_, err := store.EventsSweep(ctx, 0, time.Hour)
+		_, err := store.EventsSweep(ctx, 0, time.Hour, 0)
 		require.Error(t, err)
 	})
 
 	t.Run("candidate row fails to scan", func(t *testing.T) {
 		store := newRawStore(t)
 		breakTimelineScan(t, store)
-		_, err := store.EventsSweep(ctx, 1, 0)
+		_, err := store.EventsSweep(ctx, 1, 0, 0)
 		require.Error(t, err)
 	})
 }
@@ -1097,7 +1097,7 @@ func TestSweepEventsDeleteFailsAfterTheHorizon(t *testing.T) {
 	}
 	blockEventDeletes(t, store)
 
-	_, err := store.EventsSweep(ctx, 1, 0)
+	_, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.Error(t, err)
 
 	// The horizon write rolls back with it: the transaction is what keeps a
@@ -1160,7 +1160,7 @@ func TestEventsListSinceAboveTheHeadIsQuiet(t *testing.T) {
 	for _, r := range []string{"R1", "R2"} {
 		require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: r}))
 	}
-	_, err := store.EventsSweep(ctx, 1, 0)
+	_, err := store.EventsSweep(ctx, 1, 0, 0)
 	require.NoError(t, err)
 
 	page, trimmed, err := store.EventsListSince(ctx, id, nil, 1<<40, 10)

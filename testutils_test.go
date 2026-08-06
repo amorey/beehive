@@ -460,7 +460,7 @@ func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
 func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	panic("not implemented: fakeStore.EventsGetLatest")
 }
-func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
+func (s *fakeStore) EventsSweep(context.Context, int, time.Duration, int) (int, error) {
 	panic("not implemented: fakeStore.EventsSweep")
 }
 func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {

@@ -2547,7 +2547,7 @@ func (eventErrStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) 
 func (eventErrStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	return nil, errBoom
 }
-func (eventErrStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
+func (eventErrStore) EventsSweep(context.Context, int, time.Duration, int) (int, error) {
 	return 0, errBoom
 }
 

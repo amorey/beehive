@@ -1902,12 +1902,15 @@ func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID,
 	return s.latestEventRun(ctx, id, category)
 }
 
-func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration) (int, error) {
+func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error) {
+	if capBudget <= 0 {
+		capBudget = eventCapBudget
+	}
 	var total int
 	// One transaction so both bounds see the same snapshot and land together.
 	err := s.Within(ctx, func(ctx context.Context) error {
 		if perTimeline > 0 {
-			n, err := s.trimEventsToCap(ctx, perTimeline)
+			n, err := s.trimEventsToCap(ctx, perTimeline, capBudget)
 			if err != nil {
 				return err
 			}
@@ -1933,9 +1936,11 @@ const eventCapCandidates = `
 	 GROUP BY object_id, category HAVING COUNT(*) > ?
 	 LIMIT ?`
 
-// eventCapBudget bounds the timelines one sweep trims: the scoped statements are
-// seeks, but a backlog of them still holds the write connection. The rest waits
-// for the next sweep. See docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md.
+// eventCapBudget bounds the timelines one sweep trims when the caller names no
+// budget of its own: the scoped statements are seeks, but a backlog of them
+// still holds the write connection. The rest waits for the next sweep. A caller
+// on a longer cadence asks for more, so the trim rate does not fall with it.
+// See docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md.
 const eventCapBudget = 256
 
 // timeline is one (object, category) partition of the event log.
@@ -1946,14 +1951,14 @@ type timeline struct {
 
 // overCapTimelines reads the candidates in full: the trims that follow run on the
 // same connection, so the cursor must be closed before they start.
-func (s *sqliteStore) overCapTimelines(ctx context.Context, perTimeline int) ([]timeline, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, eventCapCandidates, perTimeline, eventCapBudget)
+func (s *sqliteStore) overCapTimelines(ctx context.Context, perTimeline, capBudget int) ([]timeline, error) {
+	rows, err := s.conn(ctx).QueryContext(ctx, eventCapCandidates, perTimeline, capBudget)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	over := make([]timeline, 0, eventCapBudget)
+	over := make([]timeline, 0, capBudget)
 	for rows.Next() {
 		var t timeline
 		if err := rows.Scan(&t.id, &t.category); err != nil {
@@ -1966,8 +1971,8 @@ func (s *sqliteStore) overCapTimelines(ctx context.Context, perTimeline int) ([]
 
 // trimEventsToCap deletes each over-cap timeline's oldest runs, one scoped
 // statement per timeline.
-func (s *sqliteStore) trimEventsToCap(ctx context.Context, perTimeline int) (int, error) {
-	over, err := s.overCapTimelines(ctx, perTimeline)
+func (s *sqliteStore) trimEventsToCap(ctx context.Context, perTimeline, capBudget int) (int, error) {
+	over, err := s.overCapTimelines(ctx, perTimeline, capBudget)
 	if err != nil {
 		return 0, err
 	}

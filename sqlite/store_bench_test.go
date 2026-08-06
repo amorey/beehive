@@ -76,7 +76,7 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 
 	b.ResetTimer()
 	for range b.N {
-		_, err := store.EventsSweep(ctx, perTimeline, 0)
+		_, err := store.EventsSweep(ctx, perTimeline, 0, 0)
 		require.NoError(b, err)
 	}
 }
