@@ -7690,6 +7690,19 @@ func TestObjectsDeleteImageCarriesTheOwner(t *testing.T) {
 	assert.Equal(t, owner.ID, last.Final.Owner.ID)
 }
 
+// The owner read is part of assembling the image, so a delete that cannot make
+// it fails rather than recording a collected child as ownerless — an absence a
+// scoped watch would believe.
+func TestObjectsDeleteFailsWhenTheOwnerReadFails(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	_, err := store.db.ExecContext(ctx, `DROP TABLE edges`)
+	require.NoError(t, err)
+
+	require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+}
+
 // An unowned object's image says so, rather than leaving a caller to guess
 // whether the owner was absent or unread.
 func TestObjectsDeleteImageLeavesAnUnownedObjectsOwnerNil(t *testing.T) {

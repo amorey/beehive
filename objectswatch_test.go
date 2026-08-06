@@ -770,6 +770,29 @@ func TestOwnedObjectsListWatchLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 	assert.Equal(t, before+1, store.relationReads.Load(), "the tailer's own read, and no second one")
 }
 
+// The owner read is part of the page, so a failed one costs a retry rather than
+// the stream — like any other poll failure. The cursor has not moved, so the
+// retry delivers exactly what the failed drain could not.
+func TestAScopedWatchSurvivesAFailedOwnerRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
+	bh := newTestBeehive(t, store, fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
+	require.NoError(t, err)
+
+	store.broken.Store(true)
+	child := mustCreate(t, ctx, client, "child", cSpec{Val: "a"}, WithOwner(owner.ID))
+	waitClosed(t, chanAfter(store.failed, 1), "the drain that cannot read owners")
+
+	store.broken.Store(false)
+	ev := recv(t, ch)
+	assert.Equal(t, child.ID, ev.Object.ID)
+}
+
 // An owner with no children yet is not an error: a watch is opened before the
 // children it is waiting for exist.
 func TestOwnedObjectsListWatchOverAChildlessOwnerStaysQuiet(t *testing.T) {
