@@ -77,6 +77,19 @@ func TestOpenApplyError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// A read pool that cannot be warmed fails the open rather than shipping a store
+// whose first read would wait out a writer.
+func TestOpenWarmError(t *testing.T) {
+	write, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)")
+	read, _ := sql.Open("sqlite", "file::memory:")
+	read.SetMaxOpenConns(1)
+	require.NoError(t, read.Close())
+
+	_, err := open(write, read)
+	require.Error(t, err)
+	assert.Error(t, write.Ping(), "the write pool is closed too")
+}
+
 // TestOpenBuildsAReadPool: on disk the read pool is a second, query_only pool
 // that sees committed data and refuses writes.
 func TestOpenBuildsAReadPool(t *testing.T) {

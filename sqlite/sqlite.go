@@ -42,16 +42,10 @@ func readPoolConns() int {
 // Reads that are not inside a transaction run on a second, query_only pool, so
 // they do not queue behind writes. See docs/adr/2026-08-06-a-read-pool-beside-the-write-pool.md.
 func Open(path string) (*sqliteStore, error) {
-	read := sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: readPoolConns(), Reader: true})
-	s, err := open(sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}), read)
-	if err != nil {
-		return nil, err
-	}
-	if err := warm(context.Background(), read); err != nil {
-		s.Close()
-		return nil, err
-	}
-	return s, nil
+	return open(
+		sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}),
+		sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: readPoolConns(), Reader: true}),
+	)
 }
 
 // warm opens every connection in db, so none of them attaches later while a
@@ -89,20 +83,26 @@ func OpenMemory() (*sqliteStore, error) {
 	return open(db, db)
 }
 
-// Only the write pool runs Apply; read may alias write.
+// Only the write pool runs Apply; read may alias write, and is warmed once the
+// schema exists and before any writer.
 func open(write, read *sql.DB) (*sqliteStore, error) {
-	if _, err := sqlitemigrate.Apply(context.Background(), write, migrations, "migrations"); err != nil {
-		write.Close()
-		if read != write {
-			read.Close()
-		}
-		return nil, err
-	}
-	return &sqliteStore{
+	ctx := context.Background()
+	s := &sqliteStore{
 		db:     write,
 		readDB: read,
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
-	}, nil
+	}
+	if _, err := sqlitemigrate.Apply(ctx, write, migrations, "migrations"); err != nil {
+		s.Close()
+		return nil, err
+	}
+	if read != write {
+		if err := warm(ctx, read); err != nil {
+			s.Close()
+			return nil, err
+		}
+	}
+	return s, nil
 }
