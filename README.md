@@ -11,20 +11,6 @@
 
 Beehive is an embedded control plane for Go apps, backed by a durable store. With Beehive, you define desired state as objects and register controllers that reconcile actual state toward it. The system is self-healing which means it converges on restart, tolerates missed events, and handles cascading dependencies without controllers calling each other. The architecture is heavily influenced by Kubernetes and takes inspiration from the stigmergic cooperation of bees in a beehive.
 
-### Scope: one process, one `Beehive`, no out-of-band access
-
-Beehive is **embedded**, and that is a constraint as much as a description. A store is owned by **one process running one `Beehive`, which is its only writer.** Specifically, and none of these are supported:
-
-- **Two processes over one database file.** The work queue and its per-object dispatch floors, the schedule gauge, and every commit-time wake are in memory and private to one `Beehive`; the dependency waker's scan cursor is a single shared row that two wakers would consume out from under each other; `Register` is process-local, so each process knows only its own kinds.
-- **Two `Beehive` values over one store, even in the same process.** Same reason: what would have to be shared is per-`Beehive`, not per-process.
-- **Out-of-band access to the database while a `Beehive` is running.** Every write goes through that `Beehive`'s `Client`, `ControllerClient` or GC path. This rules out an external tool writing the file, and it rules out calling the `Store` directly behind the running `Beehive` — even though you opened that `Store` yourself to pass to `New`. Reading out of band is outside the contract too: invariants hold across the transactions beehive issues, so an outside reader can catch a row mid-cascade.
-
-**Restarts are supported and are not what this excludes.** Stopping a `Beehive` and starting another over the same store — a crash, a redeploy, a new binary — is the case the durable records exist for, and it converges. The constraint is on *concurrent* access, not on succession.
-
-This is documented, not enforced: beehive takes no lock and will not tell you that you have broken the rule. Behaviour under a violation is undefined — usually extra latency, since the pull passes are level-triggered and re-derive from current state, but nothing analyses the combination and nothing tests it.
-
-→ [ADR: one process, one Beehive, and it is the store's only writer](docs/adr/2026-08-05-one-process-one-beehive-sole-writer.md)
-
 ## Quickstart
 
 ```go
@@ -97,6 +83,8 @@ func main() {
 ```
 
 ## Architecture
+
+- **Embedded, single-process.** Beehive runs inside your app, not beside it: no server, no daemon, no network hop. In exchange, a store belongs to one process running one `Beehive`, which is its only writer while it runs. Restarts are supported but *concurrent* access from a separate process is not.
 
 - **Declarative core.** You write `spec`, the desired state. Controllers reconcile actual state toward it, working from current state rather than from a sequence of events. That is what makes the system self-healing: it converges on restart, and a missed event costs nothing because the next pass reads the same state anyway. A cold start is just a reconcile from stored desired state.
 
