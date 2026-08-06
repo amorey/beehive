@@ -622,6 +622,60 @@ func TestOwnedObjectsWatchListIgnoresWhatItDoesNotOwn(t *testing.T) {
 	assert.Equal(t, mine.ID, ev.Object.ID, "only the owner's own child is delivered")
 }
 
+// A collected child is still the owner's. Its owned_by edge cascades away with
+// the row, so the scope is decided from the log entry's image — the only place
+// the owner survives.
+func TestOwnedObjectsWatchListReportsACollectedChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, bh, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	child := mustCreate(t, ctx, client, "child", cSpec{Val: "final"}, WithOwner(owner.ID))
+
+	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, client.Delete(ctx, child.ID))
+	pending := recv(t, ch)
+	require.Equal(t, Modified, pending.Type, "the deletion request is an ordinary write")
+
+	gone, err := bh.gcCollect(ctx, child.ID)
+	require.NoError(t, err)
+	require.True(t, gone)
+
+	ev := recv(t, ch)
+	assert.Equal(t, Deleted, ev.Type)
+	assert.Equal(t, child.ID, ev.Object.ID)
+	assert.Equal(t, "final", ev.Object.Spec.Val, "the row image carries the final state")
+}
+
+// A collected child whose spec cannot be decoded is still reported: the scope
+// comes off the resolved owner, not off the object that failed to decode, so
+// quarantining the body must not also drop the removal.
+func TestOwnedObjectsWatchListReportsAnUndecodableCollectedChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, _, client, _ := watchFixture(t)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		Name: uniqueName(),
+		Spec: []byte(`not json`),
+	})
+	require.NoError(t, err)
+	_, err = store.EdgesAdd(ctx, poison.ID, owner.ID, RelationOwnedBy)
+	require.NoError(t, err)
+
+	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
+
+	ev := recv(t, ch)
+	require.Equal(t, Deleted, ev.Type, "the removal went unreported")
+	assert.Equal(t, poison.ID, ev.ID)
+	assert.Nil(t, ev.Object, "the body is quarantined, the removal is not")
+}
+
 // An owner with no children yet is not an error: a watch is opened before the
 // children it is waiting for exist.
 func TestOwnedObjectsWatchListOverAChildlessOwnerStaysQuiet(t *testing.T) {

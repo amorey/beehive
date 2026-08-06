@@ -626,7 +626,9 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 			continue
 		}
 		op := coalesceOp(first[w.ID], w.Op)
-		var owner *ObjectRef
+		// A collected object's owner survives only in the image; a live one is
+		// read from its edges, since the image is a delete entry's alone.
+		owner := raw.Owner
 		if refs := owners[w.ID]; len(refs) > 0 {
 			owner = &refs[0]
 		}
