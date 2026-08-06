@@ -56,26 +56,26 @@ Reading page and horizon unsynchronized loses nothing: the page bounds what was
 live at its own instant and versions only rise, so a horizon that rose in between
 means entries really were trimmed unread.
 
-### An empty page pays for the horizon once per watermark
+### An empty page reads the horizon on its own, every time
 
 An empty page carries no row to carry the horizon, and that is exactly the case a
 stalled waker hits once retention has removed *every* entry above its cursor — the
 loss it most needs to report. So `noteTrimIdle` reads `ObjectWritesMaxVersionAll`
-on its own there, gated on `horizonAt`: the watermark that read already answered
-for.
+on its own there.
 
-Gated, because on this machine the empty page costs ~29µs and the extra read
-~13µs — a 45% surcharge on the pass that runs per commit. `seed` sets `horizonAt`
-from its own mark read, and a non-empty page sets it too (its horizon was read at
-the same instant as its rows), so the steady state pays nothing and a run of quiet
-passes pays once.
+**Nothing is cached across that read.** Two drafts tried: keyed on the watermark,
+then invalidated on a failed scan as well. Both were wrong in the same way, and
+review caught each in turn. Retention runs on a clock this waker does not observe,
+so nothing it holds — a watermark that has not moved, a horizon a page reported
+one pass ago — is evidence of where the boundary is *now*. A drain that stops on
+its page budget and finds the remainder trimmed before the next pass is the case a
+watermark key misses; a failure streak is the case it misses next.
 
-**A failed scan forgets it.** The watermark standing still is *not* evidence the
-horizon did: retention runs on a clock of its own, and a failure streak is
-precisely how a live waker sits still long enough to be overtaken. Keyed on the
-watermark alone, the guard would skip the one read that could report the loss on
-the first successful pass back — so `scanFailure` resets `horizonAt`, and the
-supplementary read happens exactly where the stall was.
+The cost that motivated the caching was a mis-framing: +13µs against a ~29µs pass
+reads as +45%, but the scan floor is 100ms, so it is ~13µs ten times a second —
+0.13ms of the single connection per second, against a benchmark suite that
+measures the pass itself in tens of microseconds. Correctness by construction is
+worth more than that.
 
 ### The horizon detects a loss; it cannot move a cursor
 
@@ -111,10 +111,10 @@ exchange for a wake channel between two drivers that are otherwise independent.
   it is the common case, not the rare one.
 - **A resume is unchanged by any of this.** It still clamps to the log's mark,
   and an entry a shallower kind kept below the horizon is still scanned.
-- **The quiet pass is still one statement** in the steady state, and two on the
-  first empty page after the watermark moves or a scan fails.
-  `TestWakerSkipsTheHorizonReadAfterAPageCarriedIt` pins the gate,
-  `TestWakerRereadsTheHorizonAfterAFailedScan` pins its invalidation, and
-  `TestWakerReportsAFullyTrimmedBacklog` pins the case it exists for.
+- **A pass that reads rows is one statement; a pass that reads none is two.**
+  `TestWakerReadsNoHorizonWhenThePageCarriedIt` pins the first,
+  `TestWakerReportsAFullyTrimmedBacklog`, `TestWakerReportsABacklogTrimmedBetweenPasses`
+  and `TestWakerRereadsTheHorizonAfterAFailedScan` pin the second and the three
+  ways retention overtakes a live waker.
 - **Latency is unchanged.** This is an observability change: the wakes in the
   skipped span were, and still are, delivered by the stale-dependents pass.

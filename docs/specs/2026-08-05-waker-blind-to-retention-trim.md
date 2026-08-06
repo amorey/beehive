@@ -280,10 +280,12 @@ three during and after implementation:
 5. **An empty page reads the horizon on its own**, gated on the watermark. The
    spec's "an empty page reports 0" left the fully-trimmed backlog — case 2's
    worst form — silent, since no row survives to carry the horizon. Measured, the
-   supplementary read is ~13µs against the empty page's ~29µs, so it is paid once
-   per watermark rather than per pass — and once more after any failed scan, since
-   retention advances on its own clock while a failure streak holds the watermark
-   still. With `resumeWatermark` raising at seed and
+   supplementary read is ~13µs, and at the 100ms scan floor that is ~0.13ms of the
+   single connection per second — so it is paid on every empty page and cached
+   nowhere. Two attempts to cache it (keyed on the watermark, then invalidated on
+   failure too) were both wrong: retention advances on a clock the waker does not
+   observe, so neither a still watermark nor a page's horizon from an earlier pass
+   says where the boundary is now. With `resumeWatermark` raising at seed and
    `trimBaseline` deduping the report, jumping the watermark to the horizon on an
    idle scan changes nothing observable: the trimmed span holds no entries to skip,
    and a lagging cursor is raised at the next seed. `TestWakerResyncsPastATrimmedSpan`
