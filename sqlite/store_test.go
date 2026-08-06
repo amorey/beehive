@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -403,6 +404,36 @@ func TestSweepEventsMaxAgeSpansTimelines(t *testing.T) {
 	deleted, err := store.EventsSweep(ctx, 0, time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 2, deleted, "both timelines aged out, cap or no cap")
+}
+
+// A sweep trims at most eventCapBudget timelines, so one sweep cannot hold the
+// write connection for an unbounded backlog. What it leaves is picked up by the
+// next sweep, and the horizon only rises in between.
+func TestSweepEventsCapIsProgressive(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	id := newEventObject(t, store)
+
+	timelines := eventCapBudget + 2
+	for c := range timelines {
+		for _, r := range []string{"R1", "R2"} {
+			require.NoError(t, store.EventsAdd(ctx, testGK, id, storeapi.EventsAddInput{
+				Category: strconv.Itoa(c), Type: "Normal", Reason: r,
+			}))
+		}
+	}
+
+	deleted, err := store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, eventCapBudget, deleted, "one sweep trims up to the budget")
+
+	deleted, err = store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted, "the next sweep finishes the backlog")
+
+	deleted, err = store.EventsSweep(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Zero(t, deleted, "nothing left over cap")
 }
 
 // The horizon covers every run a sweep removed: each deleted version is at or
@@ -823,7 +854,7 @@ func TestEventsSweepSelectsCandidatesByIndex(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
 	rows, err := store.db.QueryContext(context.Background(),
-		`EXPLAIN QUERY PLAN `+eventCapCandidates, 1)
+		`EXPLAIN QUERY PLAN `+eventCapCandidates, 1, 1)
 	require.NoError(t, err)
 	defer rows.Close()
 

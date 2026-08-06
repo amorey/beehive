@@ -1930,7 +1930,14 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge t
 // index-only pass rather than a sort of the table.
 const eventCapCandidates = `
 	SELECT object_id, category FROM events
-	 GROUP BY object_id, category HAVING COUNT(*) > ?`
+	 GROUP BY object_id, category HAVING COUNT(*) > ?
+	 LIMIT ?`
+
+// eventCapBudget bounds the timelines one sweep trims: the scoped statements are
+// seeks, but an unbounded backlog of them holds the write connection. What is
+// left waits for the next sweep, which the horizon tolerates because it only
+// ever rises.
+const eventCapBudget = 256
 
 // trimEventsToCap deletes each over-cap timeline's oldest runs, one scoped
 // statement per timeline.
@@ -1941,7 +1948,7 @@ const eventCapCandidates = `
 // connection. Per timeline, both are seeks.
 func (s *sqliteStore) trimEventsToCap(ctx context.Context, cap int) (int, error) {
 	c := s.conn(ctx)
-	rows, err := c.QueryContext(ctx, eventCapCandidates, cap)
+	rows, err := c.QueryContext(ctx, eventCapCandidates, cap, eventCapBudget)
 	if err != nil {
 		return 0, err
 	}
