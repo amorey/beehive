@@ -69,8 +69,39 @@ func OpenPool(path string, opts PoolOptions) *sql.DB {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", dsn)
 	db.SetMaxOpenConns(opts.MaxConns)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	if opts.QueryOnly {
+		// Reader connections are kept, never retired: attaching to a WAL database
+		// blocks while a writer holds a transaction, so a re-attach would cost
+		// exactly the wait this pool exists to avoid. See WarmPool.
+		db.SetMaxIdleConns(opts.MaxConns)
+		db.SetConnMaxIdleTime(0)
+	} else {
+		db.SetConnMaxIdleTime(5 * time.Minute)
+	}
 	return db
+}
+
+// WarmPool opens every connection in db, so none of them attaches later while a
+// writer holds the database. Call it once the schema exists and before any
+// writer runs.
+func WarmPool(ctx context.Context, db *sql.DB, n int) error {
+	conns := make([]*sql.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for range n {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		conns = append(conns, c)
+		if err := c.PingContext(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // migration is one numbered SQL file. Version comes from the filename's

@@ -43,10 +43,17 @@ func readPoolConns() int {
 // Reads that are not inside a transaction run on a second, query_only pool, so
 // they do not queue behind writes. See docs/adr/2026-08-06-a-read-pool-beside-the-write-pool.md.
 func Open(path string) (*sqliteStore, error) {
-	return open(
-		sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}),
-		sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: readPoolConns(), QueryOnly: true}),
-	)
+	conns := readPoolConns()
+	read := sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: conns, QueryOnly: true})
+	s, err := open(sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}), read)
+	if err != nil {
+		return nil, err
+	}
+	if err := sqlitemigrate.WarmPool(context.Background(), read, conns); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
