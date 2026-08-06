@@ -80,9 +80,10 @@ type waker struct {
 	// boundary costs one log line however many pages it spans.
 	trimBaseline int64
 
-	// horizonAt is the watermark the horizon was last known for. An empty page
-	// carries no horizon, so it has to be read on its own; this keeps a run of
-	// quiet passes from paying for that read more than once.
+	// horizonAt is the watermark the horizon was last known for, or
+	// noStoredCursor once a failed scan invalidated it. An empty page carries no
+	// horizon, so it has to be read on its own; this keeps a run of quiet passes
+	// from paying for that read more than once.
 	horizonAt int64
 
 	// seeded says watermark holds a real cursor. "watermark != 0" cannot say
@@ -435,6 +436,15 @@ func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) 
 	dw.trimBaseline = trimmedThrough
 }
 
+// scanFailure ends a pass that could not read, forgetting the horizon on the way
+// out. Retention runs on a clock of its own, so a watermark held still by a
+// failure streak is no evidence the boundary stayed put — and a streak is exactly
+// how retention overtakes a live waker.
+func (dw *waker) scanFailure() scanResult {
+	dw.horizonAt = noStoredCursor
+	return scanFailed
+}
+
 // noteTrimIdle reads the horizon an empty page could not carry, once per
 // watermark: a waker stalled until retention removed every entry above its cursor
 // reads nothing but empty pages, and the loss would otherwise go unreported.
@@ -483,11 +493,11 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 		page, trimmed, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
-				return scanFailed // shutdown cancelled this read
+				return dw.scanFailure() // shutdown cancelled this read
 			}
 			dw.bh.log().WarnContext(ctx, "scanning for changed dependencies failed; the wakes are still owed and the next pass retries them",
 				"watermark", dw.watermark, "err", err)
-			return scanFailed
+			return dw.scanFailure()
 		}
 		// Before the page is consumed: a backlog drains past the boundary, so a
 		// check made after would find the watermark already above it.
@@ -497,7 +507,7 @@ func (dw *waker) scanPages(ctx context.Context) scanResult {
 			return scanIdle
 		}
 		if !dw.dependentsWake(ctx, page) {
-			return scanFailed
+			return dw.scanFailure()
 		}
 		// The page's horizon was read at the same instant as its rows, so it
 		// answers for the watermark they just moved to.

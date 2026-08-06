@@ -700,6 +700,27 @@ func TestWakerReportsAFullyTrimmedBacklog(t *testing.T) {
 	assert.Empty(t, buf.String())
 }
 
+// Retention runs on its own clock, so a watermark that has not moved is no
+// evidence the horizon has not. A failure streak is how a waker sits still long
+// enough for retention to overtake it — the very case the supplementary read
+// exists for — so a failed scan invalidates what it thinks it knows.
+func TestWakerRereadsTheHorizonAfterAFailedScan(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	// The first read fails; by the second, retention has taken the whole backlog.
+	store := &replayStore{seed: 400, trimmed: 900, err: errBoom, healFromCall: 2}
+	dw, _, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	dw.watermark, dw.horizonAt = 400, 400 // a seed already answered for this watermark
+	buf.Reset()
+
+	require.Equal(t, scanFailed, dw.scan(context.Background()))
+	buf.Reset() // the failure has its own warning
+
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Contains(t, buf.String(), "trimmedThrough=900",
+		"the stall the failure caused is exactly when retention overtakes a waker")
+}
+
 // The supplementary read is skipped when the page itself carried the horizon: it
 // was read at the same instant as the rows, so it already answers for the
 // watermark they moved it to.

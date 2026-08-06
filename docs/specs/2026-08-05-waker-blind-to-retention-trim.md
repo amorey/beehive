@@ -281,7 +281,9 @@ three during and after implementation:
    spec's "an empty page reports 0" left the fully-trimmed backlog — case 2's
    worst form — silent, since no row survives to carry the horizon. Measured, the
    supplementary read is ~13µs against the empty page's ~29µs, so it is paid once
-   per watermark rather than per pass. With `resumeWatermark` raising at seed and
+   per watermark rather than per pass — and once more after any failed scan, since
+   retention advances on its own clock while a failure streak holds the watermark
+   still. With `resumeWatermark` raising at seed and
    `trimBaseline` deduping the report, jumping the watermark to the horizon on an
    idle scan changes nothing observable: the trimmed span holds no entries to skip,
    and a lagging cursor is raised at the next seed. `TestWakerResyncsPastATrimmedSpan`

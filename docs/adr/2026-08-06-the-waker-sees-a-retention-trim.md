@@ -65,11 +65,17 @@ on its own there, gated on `horizonAt`: the watermark that read already answered
 for.
 
 Gated, because on this machine the empty page costs ~29µs and the extra read
-~13µs — a 45% surcharge on the pass that runs per commit, to re-ask a question
-whose answer cannot have changed while the watermark stands still. `seed` sets
-`horizonAt` from its own mark read, and a non-empty page sets it too (its horizon
-was read at the same instant as its rows), so the steady state pays nothing and a
-run of quiet passes pays once.
+~13µs — a 45% surcharge on the pass that runs per commit. `seed` sets `horizonAt`
+from its own mark read, and a non-empty page sets it too (its horizon was read at
+the same instant as its rows), so the steady state pays nothing and a run of quiet
+passes pays once.
+
+**A failed scan forgets it.** The watermark standing still is *not* evidence the
+horizon did: retention runs on a clock of its own, and a failure streak is
+precisely how a live waker sits still long enough to be overtaken. Keyed on the
+watermark alone, the guard would skip the one read that could report the loss on
+the first successful pass back — so `scanFailure` resets `horizonAt`, and the
+supplementary read happens exactly where the stall was.
 
 ### The horizon detects a loss; it cannot move a cursor
 
@@ -106,7 +112,9 @@ exchange for a wake channel between two drivers that are otherwise independent.
 - **A resume is unchanged by any of this.** It still clamps to the log's mark,
   and an entry a shallower kind kept below the horizon is still scanned.
 - **The quiet pass is still one statement** in the steady state, and two on the
-  first empty page after the watermark moves. `TestWakerSkipsTheHorizonReadAfterAPageCarriedIt`
-  pins the gate; `TestWakerReportsAFullyTrimmedBacklog` pins the case it exists for.
+  first empty page after the watermark moves or a scan fails.
+  `TestWakerSkipsTheHorizonReadAfterAPageCarriedIt` pins the gate,
+  `TestWakerRereadsTheHorizonAfterAFailedScan` pins its invalidation, and
+  `TestWakerReportsAFullyTrimmedBacklog` pins the case it exists for.
 - **Latency is unchanged.** This is an observability change: the wakes in the
   skipped span were, and still are, delivered by the stale-dependents pass.
