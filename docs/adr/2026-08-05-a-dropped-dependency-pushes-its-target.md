@@ -6,10 +6,11 @@
 ## Context
 
 `gcCollect` refuses to remove a deletion-pending row while `EdgesHasIncoming`
-reports a referrer under RESTRICT. Three routes lead out of that block, and two
-of them push at commit: a cleared finalizer, and the physical delete of the last
-child. The third is `ControllerClient.DependenciesDelete` dropping the last live
-`depends_on` edge.
+reports a referrer under RESTRICT. Four routes lead out of that block. Two push
+at commit: a cleared finalizer, and the physical delete of the last child. The
+third is `ControllerClient.DependenciesDelete` dropping the last live
+`depends_on` edge, which this record is about; the fourth is the deletion mark
+itself, in Consequences below.
 
 Nothing could signal it. An edge write bumps no `resource_version` and appends no
 `object_writes` entry — a ref is not a field of the object — so no cursor in the

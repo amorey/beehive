@@ -518,7 +518,7 @@ Cases 9 to 12 share one record and one driver.
 
 **Record:** `deletion_requested_at`.
 
-**Push:** six, all registered-kind only (cases 9, 10, 12, and 11's three routes). A
+**Push:** seven, all registered-kind only (cases 9, 10, 12, and 11's four routes). A
 client-only object is marked and left to the sweeper: `deletionAdvance` collects one
 directly, and running that from a commit hook would put the whole subtree below it
 on the caller's goroutine.
