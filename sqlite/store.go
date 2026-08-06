@@ -528,6 +528,11 @@ func (s *sqliteStore) readWithin(ctx context.Context, fn func(ctx context.Contex
 	if err := fn(context.WithValue(ctx, txKey{}, &txFrame{st: st})); err != nil {
 		return err
 	}
+	// Same seal Within takes: a frame still open belongs to another goroutine, and
+	// committing would release its savepoint underneath it.
+	if err := st.sealForCommit(); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

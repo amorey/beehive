@@ -6155,6 +6155,30 @@ func TestReadWithinRefusesAWrite(t *testing.T) {
 	require.Error(t, err)
 }
 
+// readWithin seals before it commits, like Within: a nested frame still open
+// belongs to another goroutine, and committing would release its savepoint
+// underneath it. Nothing in the store does this today — the guard is the reason
+// it stays that way.
+func TestReadWithinRefusesToCommitOverAnOpenFrame(t *testing.T) {
+	store := newFileRawStore(t)
+
+	entered, finish := make(chan struct{}), make(chan struct{})
+	err := store.readWithin(context.Background(), func(ctx context.Context) error {
+		go func() {
+			_ = store.Within(ctx, func(context.Context) error {
+				close(entered)
+				<-finish
+				return nil
+			})
+		}()
+		<-entered
+		return nil
+	})
+	close(finish)
+
+	require.Error(t, err, "a frame another goroutine still holds blocks the commit")
+}
+
 // A read registers no hooks and AfterCommit has no error to return, so a hook on
 // a read frame is a bug that must be loud rather than silently dropped or run.
 func TestAfterCommitPanicsOnAReadFrame(t *testing.T) {
