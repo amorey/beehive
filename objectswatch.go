@@ -289,8 +289,8 @@ var errNoRowImage = errors.New("beehive: delete log entry carries no row image")
 const tailPageCap = 512
 
 // defaultTailPagesPerDrain bounds one drain, so a resume after a long gap
-// cannot monopolise the single connection. The remainder is read by the next
-// drain, which the throttle paces.
+// cannot monopolise the read pool. The remainder is read by the next drain,
+// which the throttle paces.
 //
 // Two, not the waker's four: a tail page is 512 rows against 256, and costs a
 // batched object read and a fan-out on top of the listing.
@@ -511,8 +511,7 @@ func (t *objectTailer) pass(ctx context.Context, now time.Time, backingOff bool)
 // The position check is that read, and it runs once here rather than once per
 // page. It is the quiet-wake gate — a wake with nothing behind it costs one
 // scalar query and no listing — but a full page is already proof there is more,
-// so paying it per page would buy an answer the page length just gave, on the
-// store's single connection.
+// so paying it per page would buy an answer the page length just gave.
 // The bool reports whether the budget stopped it with work still above the
 // cursor.
 func (t *objectTailer) drain(ctx context.Context) (more bool, err error) {
@@ -592,8 +591,8 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 		}
 	}
 
-	// One batched read for everything still live. Per-object reads would run
-	// one after another on the single connection.
+	// One batched read for everything still live: N per-object reads would cost N
+	// round trips.
 	live := make([]ObjectID, 0, len(order))
 	for _, w := range order {
 		if w.Op != WriteDelete {

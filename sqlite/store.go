@@ -871,7 +871,7 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 	if err != nil {
 		return nil, err
 	}
-	// scanObjects closes rows, freeing the single connection for the conditions query.
+	// scanObjects closes rows, freeing the connection for the conditions query.
 	out, err := scanObjects(rows)
 	if err != nil {
 		return nil, err
@@ -911,7 +911,7 @@ func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.Object
 }
 
 // conditionsByIDsChunk runs one chunk, merging rows into out; it closes its
-// result set so the next chunk can run on the single connection.
+// result set so the next chunk can run on the same connection.
 func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
 	args := make([]any, len(ids))
 	placeholders := make([]string, len(ids))
@@ -1343,7 +1343,7 @@ func (s *sqliteStore) ObjectsUpdateSpecByName(ctx context.Context, gk storeapi.G
 
 // updateSpec is the read-compare-write body both spec mutators share. The read
 // is required: the no-op skip compares stored bytes, and a bare UPDATE has
-// nothing to compare against. Within (BEGIN IMMEDIATE, one connection) is what
+// nothing to compare against. Within (BEGIN IMMEDIATE, the write pool) is what
 // makes keying the UPDATE on the resolved id safe.
 func (s *sqliteStore) updateSpec(
 	ctx context.Context,
@@ -2553,7 +2553,7 @@ func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, r
 }
 
 // edgesByIDsChunk runs one chunk, merging rows into out; it closes its result
-// set so the next chunk can run on the single connection.
+// set so the next chunk can run on the same connection.
 func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
 	args := make([]any, 0, len(ids)+1)
 	placeholders := make([]string, len(ids))

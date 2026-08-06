@@ -1928,7 +1928,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 	})
 }
 
-// The throttle bounds how much of the single connection a tailer holds away
+// The throttle bounds how much of the read pool a tailer holds away
 // from the writers waking it. It is a floor on drain starts, not on delivery:
 // a refused wake is remembered by the re-arm, since the drain that runs then
 // reads its position from the store.
@@ -2015,7 +2015,7 @@ func TestTailerPassPacesTheLoop(t *testing.T) {
 }
 
 // A budget bounds one drain, so a resume after a long gap cannot hold the
-// single connection for as long as the backlog is deep. The remainder rides the
+// read pool for as long as the backlog is deep. The remainder rides the
 // cursor to the next drain, which the throttle paces.
 func TestTailerStopsAtThePageBudget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -3400,7 +3400,7 @@ func (s *blockingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk G
 }
 
 // Building a tailer must not hold tailMu, which is process-global, across the
-// cursor read, which parks on the store's single connection. Holding one across
+// cursor read, which parks on a read connection. Holding one across
 // the other lets one slow transaction stall every kind's watch setup — and every
 // release, which is what closes a cancelled watch's channel. A transaction whose
 // own goroutine waits on such a channel then deadlocks outright.

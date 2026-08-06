@@ -973,9 +973,8 @@ func TestWakerSkipsTheSelfEdge(t *testing.T) {
 }
 
 // A whole scan resolves in one edges query per page, not one per changed object.
-// The store runs on a single connection, so every lookup the waker makes
-// serializes against every writer in the process — and it sees every change in
-// the store, not just the registered kinds'.
+// A lookup per change would be a round trip per change — and the waker sees every
+// change in the store, not just the registered kinds'.
 func TestWakerResolvesAPageInOneQuery(t *testing.T) {
 	widget := GroupKind{Kind: "Widget"}
 	store := &replayStore{rows: changedAt(10, 11, 12)}
@@ -1228,7 +1227,7 @@ func TestWakerResumesFromTheStoredCursor(t *testing.T) {
 const wakeFullBudget = wakeScanPagesPerPass * wakeScanPageCap
 
 // One tick reads at most wakeScanPagesPerPass pages, so a long backlog cannot
-// monopolise the single connection the reconcile loops need too. The remainder
+// monopolise the read pool the reconcile loops need too. The remainder
 // is not lost: the cursor persists at whatever this tick reached, and the next
 // tick resumes there rather than re-reading it.
 func TestWakerStopsAtThePageBudget(t *testing.T) {

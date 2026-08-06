@@ -335,8 +335,8 @@ func withStaleDependentsInterval(d time.Duration) Option {
 
 // withWatchScanMinInterval floors the gap between two wake-driven drains of a
 // kind's write log; <= 0 turns the floor off. Global and meaningful only at New.
-// Unexported: it trades watch latency against how much of the single connection
-// a tailer holds under a sustained write stream, which is a measurement rather
+// Unexported: it trades watch latency against how much of the read pool a
+// tailer holds under a sustained write stream, which is a measurement rather
 // than a preference.
 func withWatchScanMinInterval(d time.Duration) Option {
 	return func(target any) error {

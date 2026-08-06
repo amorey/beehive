@@ -539,7 +539,7 @@ one, ch, err := client.Watch(ctx, id)
 // one.Object is current state, or nil; one.ResourceVersion is where the stream starts.
 ```
 
-**Do not open a watch inside `Within`.** The read below happens on your goroutine, and the store runs on a single connection — so it waits for the connection your transaction is holding, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
+**Do not open a watch inside `Within`.** The snapshot below is read on your goroutine, outside your transaction, so it sees the database as of before the transaction started — the writes you just made are missing from it, and the stream begins above a version that does not include them. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
 
 **Subscribe, then act.** The snapshot is read *before either returns*, so a change you make after subscribing is always in the stream — delete an object on the next line and its `Deleted` will come. If that read fails you get the error rather than a stream, since a watch with no snapshot could not report that delete. The stream carries changes strictly above `snap.ResourceVersion`: no overlap with the snapshot, no gap between them. That is also what makes "have I caught up?" a value rather than a guess — you hold the starting state before you read the first change.
 

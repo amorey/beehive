@@ -62,8 +62,8 @@ const (
 	// A watch reads on a commit wake, so this floor is not the latency of a
 	// local write — it bounds staleness for what a wake cannot cover.
 	defaultWatchFloorInterval = 30 * time.Second
-	// Floors the gap between two wake-driven drains, so a write stream cannot
-	// make its kind's tailer hold the single connection back from the writers.
+	// Floors the gap between two wake-driven drains, so a write stream cannot make
+	// its kind's tailer hold the read pool away from the other readers.
 	defaultWatchScanMinInterval = 100 * time.Millisecond
 	// The first retry after a failed tail step; it doubles up to the floor.
 	watchRetryBase = 100 * time.Millisecond

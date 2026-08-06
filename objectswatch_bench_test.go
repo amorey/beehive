@@ -36,9 +36,9 @@ import (
 // drain costs on its own but whether writers slow down when a tailer is reading
 // beside them.
 //
-// The store is on disk, not OpenMemory: the contention is over one connection
-// either way, but only a file database carries the WAL and the fsync that make
-// a writer's wait observable.
+// The store is on disk, not OpenMemory: in memory the read pool aliases the write
+// pool, so there is no split to measure, and only a file database carries the WAL
+// and the fsync that make a writer's wait observable.
 //
 // The beehive is never started, so no driver runs and the tailers are the only
 // readers competing with the writes. That isolates this PR's cost; it is not a
@@ -157,7 +157,7 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 // BenchmarkTailerDrainRateUnderSustainedWrites measures what one wake-driven
 // drain costs. That is what the throttle and the page budget are set against:
 // the throttle bounds drains per second, and a drain's cost times that rate is
-// the share of the single connection the tailer holds away from the writers
+// the share of the read pool the tailer holds away from the other readers
 // generating the wakes.
 //
 // The duty cycle a pair (budget, interval) buys is drain/(drain+interval), so

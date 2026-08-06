@@ -70,8 +70,8 @@ type ControllerClient[Status any] interface {
 	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call
-	// it makes — the store runs on one connection, so any other context
-	// deadlocks against the transaction. Watches cannot be opened inside it.
+	// it makes — any other context reads a snapshot from before the
+	// transaction and misses its writes. Watches cannot be opened inside it.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 

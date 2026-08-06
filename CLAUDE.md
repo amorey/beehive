@@ -181,7 +181,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`internal/rategate`, 100ms) — a floor tick takes the slot the same as a wake,
   so a commit landing just after one waits out the rest of the window — and one
   drain is bounded by a page budget, so a write stream cannot make a tailer hold
-  the single connection away from the writers waking it; the first drain after a
+  the read pool away from the other readers; the first drain after a
   quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
@@ -291,6 +291,25 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
   [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md),
   [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
+- **Reads outside a transaction run on a second, `query_only` pool.** One writer
+  still, queued in Go, never `SQLITE_BUSY`: the write pool keeps its single
+  connection and `_txlock=immediate`. `s.read(ctx)` is `s.conn(ctx)` with the read
+  pool as its fallback — both return the ambient transaction, which is the whole
+  defence against a read inside `Within` silently missing that transaction's
+  writes (it used to deadlock; that guarantee is genuinely weaker now).
+  **A read that spans statements uses `s.readWithin`**, a DEFERRED transaction on
+  the read pool: four read-only methods pair two reads that must agree, and
+  wrapping them in `Within` put the watch drains' page reads on the write pool.
+  Its frame is resolved by `conn` too, so a write inside one fails loudly instead
+  of landing outside the snapshot; `AfterCommit` on one panics. **`Open` warms the
+  pool** — a connection attaching to a WAL database blocks behind a live writer,
+  so a cold connection pays exactly the wait the pool exists to avoid. In memory
+  the read pool *is* the write pool (`file::memory:` is per-connection), so
+  `BEEHIVE_TEST_STORE=file` runs the suite on disk and CI runs both. Every budget
+  that used to cite "the single connection" now bounds the read pool, and
+  **read-a-mark-then-page now rests on cross-connection snapshot monotonicity**,
+  pinned by `TestSnapshotsAreMonotoneAcrossConnections`.
+  → [ADR](docs/adr/2026-08-06-a-read-pool-beside-the-write-pool.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration
   is). The sweeper drains the freelist through `FreePagesReleaser`, gated on a

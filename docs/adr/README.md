@@ -45,6 +45,7 @@ directory of archaeology.
 - [Reclaim a client-only object's reconcile_owed count](2026-08-05-reclaim-a-client-only-owed-count.md)
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)
+- [A read pool beside the write pool](2026-08-06-a-read-pool-beside-the-write-pool.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
 - [A spec write enqueues its own object](2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)

@@ -22,4 +22,5 @@ came from.
 
 ## Index
 
-- [A read pool beside the write pool](2026-08-05-sqlite-read-pool.md)
+Empty — the read-pool spec shipped as
+[an ADR](../adr/2026-08-06-a-read-pool-beside-the-write-pool.md).

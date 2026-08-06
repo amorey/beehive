@@ -1011,7 +1011,7 @@ func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
 }
 
 // ConditionsSet's kind gate and its no-op comparison key on the same object, so
-// they are one read rather than two round trips on the single connection — and the
+// they are one read rather than two round trips — and the
 // join has to ride a primary key on each side or the fold costs more than it saves.
 func TestConditionSetLoadsTheGateAndTheConditionTogether(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
@@ -5834,12 +5834,13 @@ func TestObjectWritesListSinceAllHorizonIsTheMaxAcrossKinds(t *testing.T) {
 }
 
 // resource_version is monotonic in commit order, which is what makes it usable as
-// a resume cursor at all. It holds because the store runs on a single connection:
-// the version is drawn inside the write transaction, so with a pool of two a
+// a resume cursor at all. It holds because the write pool is one connection: the
+// version is drawn inside the write transaction, so with two writers a
 // transaction could draw 5 and commit after one that drew 6, and a consumer
 // resuming from 6 would skip a real change. This test is a guard on that
-// assumption, not on new behavior — raising SetMaxOpenConns should fail here
-// rather than silently dropping wakes in production.
+// assumption, not on new behavior — widening the write pool should fail here
+// rather than silently dropping wakes in production. The read pool is not the
+// write pool and does not bear on this.
 func TestResourceVersionMonotonicInCommitOrder(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()

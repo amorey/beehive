@@ -33,7 +33,7 @@ import (
 const (
 	defaultEventPageCap = 256
 	// defaultEventPagesPerDrain bounds one drain, so a resume after a long gap
-	// cannot monopolise the single connection. The rest is read by the next drain.
+	// cannot monopolise the read pool. The rest is read by the next drain.
 	defaultEventPagesPerDrain = 2
 )
 

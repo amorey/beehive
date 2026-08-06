@@ -50,7 +50,7 @@ type waker struct {
 	retry driver.Backoff
 
 	// persistGate floors the cursor write. Without it a wake-driven pass would
-	// write the cursor at the wake rate, on the one connection every commit
+	// write the cursor at the wake rate, on the write connection every commit
 	// needs.
 	persistGate *rategate.Single
 
@@ -119,12 +119,12 @@ const wakePersistRetryMax = time.Minute
 const wakeRetryBase = 100 * time.Millisecond
 
 // wakeScanPageCap bounds one scan page. The query is cheap; the cost is round
-// trips on the store's single connection.
+// trips.
 const wakeScanPageCap = 256
 
 // wakeScanPagesPerPass bounds one pass's scan so resuming after a long gap
-// cannot monopolise the single connection. The remainder rides the in-memory
-// watermark to the next pass.
+// cannot monopolise the read pool. The remainder rides the in-memory watermark
+// to the next pass.
 //
 // Four, not sixteen, because a wake-driven pass can run ten times a second:
 // BenchmarkWakerScanRateUnderSustainedWrites measures a full-budget pass at
@@ -585,9 +585,9 @@ func (dw *waker) persist(ctx context.Context) {
 
 // dependentsWake queues every object that depends_on one of the page's targets,
 // each under its own kind, and advances the watermark past the page on success.
-// One edges query per page, not per change: every lookup queues behind every
-// writer on the single connection. Targets are deduplicated first — one pass
-// typically writes several versions of one row.
+// One edges query per page, not per change: a lookup per change is a round trip
+// per change. Targets are deduplicated first — one pass typically writes several
+// versions of one row.
 func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 	var high int64
 	ids := make([]ObjectID, 0, len(page))

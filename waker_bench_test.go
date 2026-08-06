@@ -110,7 +110,7 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 // BenchmarkWakerScanRateUnderSustainedWrites measures what one wake-driven pass
 // costs. That is what wakeScanMinInterval has to be set against: the throttle
 // bounds passes per second, and a pass's cost times that rate is the share of
-// the single connection the waker holds away from the writers generating the
+// the read pool the waker holds away from the other readers generating the
 // wakes.
 //
 // Reads and cursor writes are reported separately on purpose. Every read

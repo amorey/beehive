@@ -243,19 +243,13 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   one database file. Revisit before the first real `Migrator` consumer ships a v2, or
   the first time a rollback across a schema bump has to be supported.
 
-- **Reads and writes share one connection, so a live watch slows the write path** —
-  known, not fixed, and deferred on the safety property it trades away rather than
-  on the size of the win. Written up in
-  [`docs/specs/2026-08-05-sqlite-read-pool.md`](specs/2026-08-05-sqlite-read-pool.md),
-  which carries the design, the feasibility probe's results and the acceptance
-  criteria; the sketch below is the summary.
-  `OpenPool` sets `journal_mode(WAL)`, which lets one writer
-  and many readers run at the same time. Then `sqlite.Open` passes `maxConns = 1`, so
-  every read queues behind every write in Go's pool and that concurrency is unused.
-  The limit is `database/sql`, not SQLite.
+- **The read pool has shipped, but none of its numbers have** — the split is in
+  (`docs/adr/2026-08-06-a-read-pool-beside-the-write-pool.md`); what is missing is
+  evidence. Three measurements, each of which should get a number or an explicit
+  "accepted":
 
-  **Measured cost.** `BenchmarkWritesUnderWatch` (`objectswatch_bench_test.go`), on
-  disk, beehive not started so no driver competes:
+  `BenchmarkWritesUnderWatch` (`objectswatch_bench_test.go`) before and after, on
+  one machine. The baseline it was specced against, on disk with no driver running:
 
   | Watches | ns/op | p50 | p99 |
   | --- | --- | --- | --- |
@@ -264,73 +258,41 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   | 1 kind, 64 watches | 223,000 | 197 µs | 715 µs |
   | 16 kinds, 1 watch each | 326,000 | 271 µs | 995 µs |
 
-  One watch costs about a quarter of write throughput. Watch *count* is free, which
-  is the shared tailer working as designed. Watched *kinds* is the axis that costs:
-  the writes round-robin, so each tailer wakes with nothing to coalesce and 16 drains
-  contend for the one connection. That row is the worst case by construction — real
-  traffic bursts per kind and collapses more. Absolute numbers are machine-specific;
-  the deltas are the finding.
+  Watch *count* was already free — the shared tailer working as designed. Watched
+  *kinds* was the axis that cost, and it is where the win should be largest.
 
-  **The fix is two pools, not a larger one.** Raising `maxConns` alone breaks writes:
-  the DSN sets `_txlock=immediate`, so concurrent `Within` calls would collide at the
-  SQLite level and take `SQLITE_BUSY` with a 5s `busy_timeout` behind it, where today
-  they queue in Go. Instead keep a write pool of 1 and add a read pool of N with
-  `_pragma=query_only(true)` — `mode=ro` is worse, because a read-only connection
-  cannot recover the `-wal`/`-shm` files. `s.conn(ctx)` is already the single place
-  connection selection happens, so the change is a sibling `s.read(ctx)` returning
-  the read pool, plus moving the read-only methods onto it.
+  **Read latency and resident memory at N connections**, together rather than
+  separately: `cache_size` is per connection, so the drivers' working set is now
+  cached up to N times over, each copy colder than the single cache it replaced.
+  That is the page-cache item below arriving early, so pick the number once.
 
-  **Not all of them are bare reads.** Four read-only methods wrap themselves in
-  `Within` — `EventsSnapshot`, `EventsListSince`, `ObjectWritesListSince` and the
-  `snapshot` behind `ObjectWritesSnapshot*` — because each pairs two reads that must
-  agree. `s.read(ctx)` returns the ambient transaction, so for those it is a no-op,
-  and they are the page reads in the tailer and event-watch drains. The split needs a
-  read-side transaction (`s.readWithin`, a DEFERRED tx on the read pool) or it moves
-  only the scalar gates.
+  **Peak `-wal` size**, which is the one that can regress while the headline
+  benchmark improves. Nothing sets `wal_autocheckpoint` or `journal_size_limit`,
+  so the only checkpointing is the default PASSIVE one on the writer's `COMMIT`. A
+  PASSIVE checkpoint copies only up to the oldest active reader's mark, and
+  resetting the WAL — reusing the file from offset 0 rather than appending — needs
+  a moment with **no reader at all**. With N connections and continuously-draining
+  tailers that gap can approach zero while every individual read stays short.
+  Incremental vacuum does not help: it shrinks the main database, not the log. If
+  it does regress, the levers are a `journal_size_limit`, an explicit `TRUNCATE`
+  checkpoint on the sweeper's cadence, or a smaller N — picked against a number,
+  not in advance.
 
-  **What makes this more than a refactor.** Today a read issued outside the
-  transaction while inside one deadlocks: it waits for the connection the
-  transaction holds. That is loud and deterministic, and it is stated as a
-  caller-facing rule in `Client.Watch`'s godoc. With a read pool the same mistake
-  becomes a *silent stale read* on a second snapshot. `s.read(ctx)` must return the
-  transaction whenever one is present, and that invariant is the whole defence.
-
-  The tests would not exercise the new path. `OpenMemory` uses `file::memory:`, which
-  is per-connection, so a second pool there is a different and empty database. The
-  read pool has to fall back to the write pool in memory, which means the suite keeps
-  today's semantics and only on-disk runs cover the split. The spec's answer is a
-  file-backed constructor plus a suite-level switch, so the integration suite runs a
-  second time on disk.
-
-  **Several components budget their work against one connection**, and their
-  reasoning would have to be re-read rather than assumed: the waker's page budget
-  exists so a resume "cannot monopolise the single connection" (`waker.go:122`, `:126`,
-  `:588`), the tailer reads "one after another on the single connection"
-  (`objectswatch.go:596`), and `workqueue.go` reasons about a deadlock on it.
-  This also changes the premise of the page-cache item below, which discounts a
-  larger cache because "the store is one connection, so a larger cache is not shared
-  across concurrent readers the way the advice assumes".
-
-  Revisit when a deployment is write-bound with watches attached, or when the driver
-  count grows enough that read contention shows up without any watch at all. Tripwire:
-  `BenchmarkWritesUnderWatch` is the measurement, and its `no-watcher` row is the
-  baseline the split should move the others toward. There is no test pinning the
-  in-transaction deadlock — it would hang rather than fail — so a `s.read(ctx)` that
-  forgets the transaction case would pass the suite today.
+  Also unmeasured: **N itself**. `min(4, GOMAXPROCS)` is a guess about two
+  quantities now, because a `readWithin` frame holds its connection across a page
+  read plus a horizon read — so N bounds concurrent read *protocols*, not just
+  concurrent read statements.
 
 - **The page cache and `mmap_size` are untuned, and it is unclear whether tuning them
   buys anything here** — known, not fixed. `OpenPool` sets five pragmas and leaves
-  SQLite's stock ~2MB cache and disabled memory mapping alone. Carried as the
-  follow-on section of
-  [`docs/specs/2026-08-05-sqlite-read-pool.md`](specs/2026-08-05-sqlite-read-pool.md),
-  which changes this item's premise.
+  SQLite's stock ~2MB cache and disabled memory mapping alone.
 
   Two things make this less obviously a win than the standard advice suggests. We run
   on `modernc.org/sqlite`, a pure-Go translation rather than a cgo binding, so whether
   `mmap_size` maps anything at all there is **unverified** — that is the first thing to
-  check, and if it is a no-op the item halves. And the store is one connection, so a
-  larger cache is not shared across concurrent readers the way the advice assumes; it
-  helps only by keeping the drivers' repeated scans off the disk.
+  check, and if it is a no-op the item halves. And `cache_size` is per connection, so
+  the read pool multiplies what any number costs — which is why the item above wants
+  resident memory measured at N rather than read latency alone.
 
   Those scans are the one real argument for it. The owed pass, the stale-dependents
   pass, the waker and the watch floor all re-read the same indexes on a fixed cadence
