@@ -1088,21 +1088,27 @@ func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, int
 }
 
 // ObjectWritesListSinceAll returns the log entries above afterRV across every
-// kind, in cursor order, at most limit of them. Kind-agnostic, since a
+// kind, in cursor order, at most limit of them, with the retention horizon
+// carried as a trailing column every row repeats. Kind-agnostic, since a
 // depends_on edge may point at a kind with no controller. No row images: the
 // waker routes by id and reads current state, so decoding a collected object
 // only to discard it is pure cost.
-func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, error) {
+//
+// One statement, and deliberately no transaction — this is the waker's whole
+// quiet pass, which runs per commit.
+func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
-		return nil, nil
+		return nil, 0, nil
 	}
-	rows, err := s.conn(ctx).QueryContext(ctx,
-		`SELECT `+writeLogColumns+` FROM object_writes
+	rows, err := s.conn(ctx).QueryContext(ctx, `
+		SELECT `+writeLogColumns+`,
+		       coalesce((SELECT MAX(trimmed_through) FROM object_writes_horizon), 0)
+		  FROM object_writes
 		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
 		afterRV, limit)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	return scanWriteLog(rows, limit)
 }
@@ -1114,19 +1120,21 @@ func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int6
 // delete that has one.
 const writeLogColumns = `resource_version, object_id, "group", kind, op`
 
-// scanWriteLog collects log entries. Row images are attached separately, by the
-// one caller that reports them.
-func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, error) {
+// scanWriteLog collects log entries and the retention horizon the query carries
+// as their trailing column. Row images are attached separately, by the one
+// caller that reports them.
+func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, int64, error) {
 	defer rows.Close()
 	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
+	var trimmed int64
 	for rows.Next() {
 		var w storeapi.ObjectWrite
-		// Five declared columns into their own types; a STRICT schema cannot
+		// Six declared columns into their own types; a STRICT schema cannot
 		// surprise them.
-		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op)
+		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &trimmed)
 		writes = append(writes, w)
 	}
-	return writes, rows.Err()
+	return writes, trimmed, rows.Err()
 }
 
 // writeLogPage reads one page of gk's log with the retention horizon carried as
@@ -1144,16 +1152,7 @@ func (s *sqliteStore) writeLogPage(ctx context.Context, gk storeapi.GroupKind, a
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
-
-	writes := make([]storeapi.ObjectWrite, 0, writeLogPageCap(limit))
-	var trimmed int64
-	for rows.Next() {
-		var w storeapi.ObjectWrite
-		_ = rows.Scan(&w.ResourceVersion, &w.ID, &w.Group, &w.Kind, &w.Op, &trimmed)
-		writes = append(writes, w)
-	}
-	return writes, trimmed, rows.Err()
+	return scanWriteLog(rows, limit)
 }
 
 // writeLogPageCap caps the preallocation: a large caller limit must not

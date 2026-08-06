@@ -427,7 +427,7 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 // budget rather than the log is what stopped it.
 func (dw *waker) scanPages(ctx context.Context) scanResult {
 	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
-		page, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
+		page, _, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
 				return scanFailed // shutdown cancelled this read

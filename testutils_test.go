@@ -489,10 +489,10 @@ func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) er
 func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesListSince")
 }
-func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, error) {
+func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error) {
 	// Empty rather than a panic: Start seeds the waker, so its eager first pass
 	// scans rather than seeding, and every Beehive whose waker runs reaches this.
-	return nil, nil
+	return nil, 0, nil
 }
 func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
 	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
@@ -631,11 +631,11 @@ func (s *replayStore) failing() bool {
 	return true
 }
 
-func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, error) {
+func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
 	probeSignal(s.lists)
 	if s.failing() {
-		return nil, s.err
+		return nil, 0, s.err
 	}
 	out := make([]ObjectWrite, 0, min(limit, len(s.rows)))
 	for _, r := range s.rows {
@@ -647,7 +647,10 @@ func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64,
 		}
 	}
 	s.read += len(out)
-	return out, nil
+	if len(out) == 0 {
+		return out, 0, nil // an empty page carries no horizon, as the store's does not
+	}
+	return out, s.trimmed, nil
 }
 
 // replayRows builds count live rows at versions 1..count.

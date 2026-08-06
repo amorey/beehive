@@ -182,7 +182,7 @@ type wakeCountingStore struct {
 	cursorWrites int
 }
 
-func (s *wakeCountingStore) ObjectWritesListSinceAll(ctx context.Context, after int64, limit int) ([]ObjectWrite, error) {
+func (s *wakeCountingStore) ObjectWritesListSinceAll(ctx context.Context, after int64, limit int) ([]ObjectWrite, int64, error) {
 	s.reads++
 	return s.Store.ObjectWritesListSinceAll(ctx, after, limit)
 }

@@ -663,10 +663,17 @@ type Store interface {
 	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for
-	// the dependency waker: an edge can point at a kind with no controller. It
-	// reports no horizon, because the waker's cursor is an optimisation over the
-	// stale-dependents pass rather than a guarantee.
-	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]ObjectWrite, error)
+	// the dependency waker: an edge can point at a kind with no controller.
+	// trimmedThrough is the horizon as of the page, over every kind, so afterRV <
+	// trimmedThrough means entries were trimmed unread; equality is fine, since
+	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
+	// horizon rides the rows, and ObjectWritesMaxVersionAll answers it alone.
+	//
+	// Unlike ObjectWritesListSince this need not be atomic. It carries no row
+	// images, and a horizon that rose between two reads means entries really were
+	// trimmed unread — the page bounds what was live at its own instant, and
+	// versions only ever rise.
+	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
 	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at
 	// or below it, and ObjectWritesListSince returns nothing above it.
