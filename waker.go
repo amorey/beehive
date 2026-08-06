@@ -337,7 +337,7 @@ const (
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
 func (dw *waker) seed(ctx context.Context) scanResult {
-	mark, _, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, trimmed, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return scanFailed // shutdown, not a loss
@@ -360,7 +360,7 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 		}
 	}
 
-	watermark := resumeWatermark(stored, ok, mark)
+	watermark := resumeWatermark(stored, ok, mark, trimmed)
 
 	// persisted tracks the row, not the resume point: after a clamp the row sits
 	// above the watermark, and tracking the watermark would retry a doomed write
@@ -392,11 +392,14 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 // foreign database. Clamping replays from the mark, which is free — the wakes it
 // re-derives are idempotent, and the stale-dependents pass is the guarantee
 // either way.
-func resumeWatermark(stored int64, ok bool, mark int64) int64 {
+//
+// Never below trimmedThrough, whichever branch: entries at or under the horizon
+// are gone, so resuming there replays a range that no longer exists.
+func resumeWatermark(stored int64, ok bool, mark, trimmedThrough int64) int64 {
 	if !ok {
-		return mark
+		return max(mark, trimmedThrough)
 	}
-	return min(stored, mark)
+	return max(min(stored, mark), trimmedThrough)
 }
 
 // scan runs one pass: everything above the watermark, a page at a time. The

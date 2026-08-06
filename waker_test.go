@@ -1205,24 +1205,30 @@ func TestWakerResumesAnEnormousBacklog(t *testing.T) {
 }
 
 // resumeWatermark's cases, exercised directly rather than through seed and a
-// store double: no stored cursor, one at or past the mark, and one below it.
+// store double: no stored cursor, one at or past the mark, one below it, and a
+// horizon that raises any of them.
 func TestResumeWatermark(t *testing.T) {
 	cases := []struct {
-		name   string
-		stored int64
-		ok     bool
-		mark   int64
-		want   int64
+		name    string
+		stored  int64
+		ok      bool
+		mark    int64
+		trimmed int64
+		want    int64
 	}{
-		{"no stored cursor", 0, false, 500, 500},
-		{"stored cursor at the mark", 500, true, 500, 500},
-		{"stored cursor past the mark: clamp", 600, true, 500, 500},
-		{"stored cursor below the mark: resume", 400, true, 500, 400},
-		{"stored cursor far below the mark: still resume", 1, true, 50_000_000, 1},
+		{"no stored cursor", 0, false, 500, 0, 500},
+		{"stored cursor at the mark", 500, true, 500, 0, 500},
+		{"stored cursor past the mark: clamp", 600, true, 500, 0, 500},
+		{"stored cursor below the mark: resume", 400, true, 500, 0, 400},
+		{"stored cursor far below the mark: still resume", 1, true, 50_000_000, 0, 1},
+		{"below the horizon: resume above what was trimmed", 400, true, 500, 450, 450},
+		{"horizon below the resume point: no effect", 400, true, 500, 300, 400},
+		{"log trimmed empty: the horizon is all that is left", 400, true, 0, 900, 900},
+		{"no stored cursor, log trimmed empty", 0, false, 0, 900, 900},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.want, resumeWatermark(c.stored, c.ok, c.mark))
+			assert.Equal(t, c.want, resumeWatermark(c.stored, c.ok, c.mark, c.trimmed))
 		})
 	}
 }
