@@ -99,8 +99,8 @@ type Beehive struct {
 	concurrency             int // default worker count for all controllers; 0/1 = single-threaded
 	// Event-log retention, applied globally by the GC sweeper. Zero on both
 	// disables the sweep.
-	eventRetentionPerObject int
-	eventRetentionMaxAge    time.Duration
+	eventRetentionPerTimeline int
+	eventRetentionMaxAge      time.Duration
 	// Write-log retention, applied globally by the GC sweeper. Bounded by
 	// default, unlike the event log: an entry lands on every object write, so
 	// the log grows at reconcile rate whether or not the user opts in.
@@ -236,10 +236,10 @@ func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 // eventRetentionSweep trims the event log to the configured retention. No-op unless a
 // bound is set; a failed sweep is retried on the next tick.
 func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
-	if bh.eventRetentionPerObject <= 0 && bh.eventRetentionMaxAge <= 0 {
+	if bh.eventRetentionPerTimeline <= 0 && bh.eventRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerObject, bh.eventRetentionMaxAge); err != nil {
+	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }

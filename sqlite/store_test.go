@@ -276,7 +276,7 @@ func TestGetLatestEvent(t *testing.T) {
 	assert.Nil(t, got, "unknown category is nil")
 }
 
-// EventsSweep caps each timeline to the newest perObject runs.
+// EventsSweep caps each timeline to the newest perTimeline runs.
 func TestSweepEventsCapN(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

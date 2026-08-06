@@ -66,7 +66,7 @@ func TestResolveEvents(t *testing.T) {
 func TestWithEventRetentionDispatch(t *testing.T) {
 	bh := &Beehive{}
 	require.NoError(t, WithEventRetention(50, time.Hour)(bh))
-	assert.Equal(t, 50, bh.eventRetentionPerObject)
+	assert.Equal(t, 50, bh.eventRetentionPerTimeline)
 	assert.Equal(t, time.Hour, bh.eventRetentionMaxAge)
 
 	// Retention is global (Beehive-level); other targets ignore it.

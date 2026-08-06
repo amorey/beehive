@@ -1902,11 +1902,11 @@ func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID,
 	return s.latestEventRun(ctx, id, category)
 }
 
-func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge time.Duration) (int, error) {
+func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration) (int, error) {
 	var total int
 	// One transaction so both bounds see the same snapshot and land together.
 	err := s.Within(ctx, func(ctx context.Context) error {
-		if perObject > 0 {
+		if perTimeline > 0 {
 			// Rank runs newest-first per (object, category) and drop past the cap.
 			n, err := s.trimEvents(ctx, `id IN (
 				SELECT id FROM (
@@ -1915,7 +1915,7 @@ func (s *sqliteStore) EventsSweep(ctx context.Context, perObject int, maxAge tim
 						ORDER BY last_at DESC, id DESC) AS rn
 					FROM events
 				) WHERE rn > ?
-			)`, perObject)
+			)`, perTimeline)
 			if err != nil {
 				return err
 			}

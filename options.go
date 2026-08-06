@@ -365,16 +365,17 @@ func withWatchFloorInterval(d time.Duration) Option {
 	}
 }
 
-// WithEventRetention bounds the per-object event log, enforced globally by the
-// GC sweeper. perObject > 0 caps each (object, category) timeline to its newest
-// perObject runs — per timeline, so a flapping one can't evict a quiet one;
-// maxAge > 0 drops runs whose window ended more than maxAge ago. A zero bound
-// is skipped; both zero (the default) leaves the log unbounded. Meaningful only
-// at New.
-func WithEventRetention(perObject int, maxAge time.Duration) Option {
+// WithEventRetention bounds the event log, enforced globally by the GC sweeper.
+// perTimeline > 0 caps each (object, category) timeline to its newest
+// perTimeline runs — runs, not occurrences, since an extend grows a run in
+// place; maxAge > 0 drops runs whose window ended more than maxAge ago, across
+// every timeline. A zero bound is skipped; both zero (the default) leaves the
+// log unbounded. The sweeper enforces the cap on its own interval, so a burst
+// can sit above it until the next sweep. Meaningful only at New.
+func WithEventRetention(perTimeline int, maxAge time.Duration) Option {
 	return func(target any) error {
 		if t, ok := target.(*Beehive); ok {
-			t.eventRetentionPerObject = perObject
+			t.eventRetentionPerTimeline = perTimeline
 			t.eventRetentionMaxAge = maxAge
 		}
 		return nil
