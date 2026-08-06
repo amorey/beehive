@@ -718,7 +718,7 @@ func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	logger, buf := captureLogger(slog.LevelWarn)
-	store := &ownerlessStore{Store: newClientTestStore(t), blinded: make(chan struct{}, 256)}
+	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
 	bh := newTestBeehive(t, store, fast()...)
 	bh.logger = logger
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -731,7 +731,7 @@ func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
 	dropped := mustCreate(t, ctx, client, "dropped", cSpec{}, WithOwner(owner.ID))
 	// The blinded lookup is the drain that carried the create, so by the time it
 	// fires that change has been resolved to nothing.
-	waitClosed(t, chanAfter(store.blinded, 1), "the drain that cannot resolve an owner")
+	waitClosed(t, chanAfter(store.failed, 1), "the drain that cannot resolve an owner")
 
 	// A second child, resolvable, is the barrier: receiving it proves the batch
 	// holding the first has been through decodeChanges.
@@ -744,20 +744,30 @@ func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
 	assert.Contains(t, buf.String(), "unresolved owner")
 }
 
-// ownerlessStore resolves no owners once blinded, which is what an owner gate
-// that failed to arm would look like from a subscriber's side.
-type ownerlessStore struct {
-	Store
-	blind   atomic.Bool
-	blinded chan struct{}
-}
+// A scoped watch already knows every delivered object's owner — matching on it
+// is how the object got here — so LoadOwner costs it no second query.
+func TestOwnedObjectsWatchListLoadsTheOwnerItAlreadyResolved(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &countingLoadStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store, fast()...)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-func (s *ownerlessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
-	if s.blind.Load() && r == RelationOwnedBy {
-		probeSignal(s.blinded)
-		return nil, nil
-	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
+	snap, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID, WithLoads(LoadOwner()))
+	require.NoError(t, err)
+	require.Empty(t, snap.Objects)
+	before := store.relationReads.Load()
+
+	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	require.Equal(t, child.ID, ev.Object.ID)
+	got, ok, err := ev.Object.Owner()
+	require.NoError(t, err, "the relation the watch asked for is loaded")
+	require.True(t, ok)
+	assert.Equal(t, owner.ID, got.ID)
+	assert.Equal(t, before+1, store.relationReads.Load(), "the tailer's own read, and no second one")
 }
 
 // An owner with no children yet is not an error: a watch is opened before the
@@ -1072,20 +1082,28 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	assert.Contains(t, buf.String(), "Watch")
 }
 
-// edgelessStore fails the batched relation read the eager loaders use, so a
-// watch that asked for relations cannot quietly deliver objects without them.
+// edgelessStore refuses the batched relation read the eager loaders and the
+// owner-scoped tailer share: broken errors it, so a watch that asked for
+// relations cannot quietly deliver objects without them, and blind answers it
+// empty, which is what an owner gate that failed to arm looks like from a
+// subscriber's side.
 type edgelessStore struct {
 	Store
 	broken atomic.Bool
+	blind  atomic.Bool
 	// failed fires after a refused load, so a test can wait for the tail to have
 	// met the failure instead of watching a log buffer race.
 	failed chan struct{}
 }
 
 func (s *edgelessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
-	if s.broken.Load() {
+	switch {
+	case s.broken.Load():
 		probeSignal(s.failed)
 		return nil, errBoom
+	case s.blind.Load() && r == RelationOwnedBy:
+		probeSignal(s.failed)
+		return nil, nil
 	}
 	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
 }

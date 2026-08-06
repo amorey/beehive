@@ -111,13 +111,13 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 		ids[k] = obj.ID
 
 		for range watchersPerKind {
-			watch := clients[k].WatchList
+			var ch <-chan ObjectChange[cSpec, cStatus]
+			var err error
 			if scoped {
-				watch = func(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[cSpec, cStatus], <-chan ObjectChange[cSpec, cStatus], error) {
-					return clients[k].OwnedObjectsWatchList(ctx, ownerID, opts...)
-				}
+				_, ch, err = clients[k].OwnedObjectsWatchList(ctx, ownerID)
+			} else {
+				_, ch, err = clients[k].WatchList(ctx)
 			}
-			_, ch, err := watch(ctx)
 			require.NoError(b, err)
 			watchers.Add(1)
 			// Drain, or the fan-out coalesces into a slot nobody empties and
