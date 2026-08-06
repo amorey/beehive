@@ -390,6 +390,10 @@ This list is scoped to writes on a target that can still be depended on.
 `ObjectsDelete` also draws a version and appends a write-log entry, but a physical
 delete removes the row, and `edges.to_id` is `ON DELETE RESTRICT` — so a deleted
 target structurally cannot have a live `depends_on` edge pointing at it left to wake.
+RESTRICT only refuses the delete, though — the edges that did exist are cleared by
+`gcCollect`, which calls `EdgesDeleteFinalizingDependsOn` immediately before the
+delete. Those dependents lose their wake and need none: each is deletion-pending
+itself, so cases 9 and 11 carry it and a dependency wake would produce no reconcile.
 The write-log entry it leaves is bookkeeping, not a wake; the actual notification for
 a delete is the owner push in case 11.
 
