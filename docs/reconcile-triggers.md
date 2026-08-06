@@ -45,7 +45,7 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly seven push paths that cause a reconcile. All use
+There are exactly eight push paths that cause a reconcile. All use
 `Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
@@ -58,26 +58,28 @@ can be read.
 | A cleared finalizer enqueues its own object | `ControllerClient.FinalizersDelete` | the object whose block it lifted | the store reports `clearedLast` |
 | A physical delete enqueues the owners it unblocked | `Beehive.gcCollect` | each deletion-pending owner of the deleted row | the owner's `deletion_requested_at` |
 | A dropped dependency enqueues the target it unblocked | `ControllerClient.DependenciesDelete` | the target of the dropped `depends_on` edge | `EdgesDeleteResult.Unblocked` |
+| A create under a deleting owner enqueues that owner | `clientImpl.insertObject` | the owner named by `WithOwner` | `EdgesAddResult.ToDeleting` |
 
-Six of the seven are immediate: their gate is a store write that lands once, so
+Seven of the eight are immediate: their gate is a store write that lands once, so
 they carry new information and cancel a pending alarm rather than being absorbed by
 one. The new edge is the exception, and it is throttled because a controller can
 declare the same edge on every pass, so it goes through `work.add` and respects the
 source's backoff ladder and re-enqueue floor.
 → [the floor ADR](adr/2026-08-04-work-queue-re-enqueue-floor.md).
 
-The physical delete is the one push gated on a *different* object than the one it
-enqueues, and the one whose fan-out is N→1 — N children converging on one owner. Its
-gate reads the owner rather than the write's own result, because the delete itself
-lands once per *row* and rows are unbounded: an ungated push would let a controller
-that replaces an owned child each pass drive itself, with the floor bypassed.
-→ [its ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md).
+Two pushes — the physical delete and the create — are gated on a *different* object
+than the one they enqueue, and both fan out N→1: N children converging on one owner.
+Each gate reads the owner rather than the write's own result, because the write
+itself lands once per *row* and rows are unbounded: ungated, a controller that
+replaces an owned child each pass would drive the owner, with the floor bypassed.
+→ [the delete's ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
+[the create's](adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md).
 
 The dropped dependency is gated on *both* endpoints, which no other push is: the
 target because only a deletion-pending one was blocked, and the source because
 `EdgesHasIncoming` discounts an edge from a deletion-pending source, so dropping one
 lifts nothing. → [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
-Cases 1, 5, 9, 10 and 11 describe them in full.
+Cases 1, 5, 9, 10, 11 and 12 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
 own hook, and a client-only kind resolves to none. So a client-only object waits for
@@ -90,7 +92,7 @@ one wake with no tick behind it: the stale-dependents pass is its backstop
 instead. See case 6.
 
 Nothing else pushes a reconcile. `Client.Requeue` is an explicit call by the
-embedder, not a write, and it is case 13.
+embedder, not a write, and it is case 15.
 
 ### The pull drivers
 
@@ -495,11 +497,11 @@ on the first pass after its kind is registered. The kind filter applies to the
 
 ## C. Deletion-derived
 
-Cases 9, 10 and 11 share one record and one driver.
+Cases 9 to 12 share one record and one driver.
 
 **Record:** `deletion_requested_at`.
 
-**Push:** four, all registered-kind only (cases 9, 10, and 11's routes 1 and 2). A
+**Push:** six, all registered-kind only (cases 9, 10, 12, and 11's three routes). A
 client-only object is marked and left to the sweeper: `deletionAdvance` collects one
 directly, and running that from a commit hook would put the whole subtree below it
 on the caller's goroutine.
@@ -558,8 +560,8 @@ Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChil
 ### 11. A blocked collect retries by staying in the listing
 
 A collect is blocked when finalizers are still pending, or when `EdgesHasIncoming`
-reports a referrer under RESTRICT. Three routes lead out of one, and **the first two
-push**:
+reports a referrer under RESTRICT. Three routes lead out of one, and **each of them
+pushes**:
 
 1. **The last finalizer was cleared.** `ControllerClient.FinalizersDelete` enqueues
    the object at commit, gated on the store reporting `clearedLast`. →
@@ -617,9 +619,35 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
 `TestClientCreateRejectsFinalizersOnUnregisteredKind`.
 
+### 12. A create under a deleting owner
+
+`Create` and `GetOrCreate` write the `owned_by` edge inside the insert's
+transaction, and `EdgesAdd` reports whether the owner was deletion-pending when it
+landed. If it was, its cascade may already have run past this child — and nothing
+else would find it: an edge bumps no `resource_version`, the waker reads only
+`depends_on`, and the child's own collect returns at once because the child is not
+deleting. So `insertObject` enqueues the *owner*, whose next `gcCollect` re-runs
+`DeletionRequestsCreateFromOwner` and marks the child.
+
+The gate is the owner's `deletion_requested_at`, read by the endpoint check
+`EdgesAdd` already performs. A live owner was waiting on nothing, and pushing one
+would spin — the same reasoning as case 11's route 2, and the same reason the gate
+is not merely an optimisation.
+
+This adds no record. The record is the owner's mark, which case 9 already made, and
+the sweeper already re-cascades from it. **The push only removes a GC interval of
+latency**, which is why a lost one costs nothing but that interval, and why the
+`WithGCInterval` floor is what makes it safe.
+
+Tests: `TestCreateUnderADeletingOwnerQueuesTheOwner`,
+`TestCreateUnderALiveOwnerQueuesOnlyTheChild`,
+`TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep`,
+`TestIntegrationCreateUnderADeletingClientOnlyOwnerHealsOnTheSweep` (the pull path),
+`TestRefsAddReportsADeletingTarget`.
+
 ## D. In-memory only
 
-Cases 12, 13 and 14 leave no record. `workQueue.stop` cancels every pending timer at
+Cases 13, 14 and 15 leave no record. `workQueue.stop` cancels every pending timer at
 shutdown.
 
 **Restart: lost.** An object is recovered only if it also carries a durable record.
@@ -629,7 +657,7 @@ failed while servicing a wake keeps its `reconcile_owed` count, because
 `ReconcileOwedDecrement` runs only on success, which is case 5. A retry for a
 *settled* object with neither record has nothing to recover it.
 
-### 12. `Result.RequeueAfter`
+### 13. `Result.RequeueAfter`
 
 `runWorker` calls `workQueue.addAfter`.
 
@@ -646,7 +674,7 @@ controller should be written this way at all, or should own its own ticker and c
 Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 `TestTypedControllerReconcileDropsRequeueWhenCollected`.
 
-### 13. Failure backoff
+### 14. Failure backoff
 
 `reconciler.backoffNext` calls `addAfter`. The delay doubles up to
 `maxRetryInterval`. Only a successful reconcile clears it.
@@ -654,7 +682,7 @@ Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 Tests: `TestReconcilerRequeuesOnError`, `TestReconcilerClearsBackoffOnSuccess`,
 `TestReconcilerRequeueBackoffLadder`.
 
-### 14. `Client.Requeue`
+### 15. `Client.Requeue`
 
 `reconciler.requeue` calls `workQueue.requeueNow`, which cancels any pending alarm.
 This is the public way to beat a cadence.

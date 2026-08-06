@@ -51,15 +51,22 @@ The fan-out is N→1, unlike the cascade's N→N: N children converge on one own
 only the last can unblock it, so the other N−1 each pay a dispatch on a dying
 object. "A physical delete lands once per row" establishes termination, not a bound.
 
-**The bound is the work queue's coalescing**, which `requeueNow` reaches even though
-it bypasses the floor: `addLocked` returns early on `isQueued`, and an id already in
-flight is left dirty for `done` to re-queue. Repeat pushes at a queued or processing
-owner cost a lock and nothing else, so a wide teardown collapses to roughly one
-owner dispatch per drain. An owner with 10k children does not get 10k reconciles.
+**The bound is the work queue's coalescing, and it is partial.** `requeueNow`
+reaches it even though it bypasses the floor: `addLocked` returns early on
+`isQueued`, and an id already in flight is left dirty for `done` to re-queue. Repeat
+pushes at a queued or processing owner cost a lock and nothing else, so a wide
+teardown collapses to roughly one owner dispatch per drain — an owner with 10k
+children does not get 10k reconciles. What it does *not* bound is an owner sitting
+in backoff: `requeueNow` stops the timer and clears the alarm before `addLocked`,
+and `isQueued` is false for an id whose only state is a pending alarm, so a repeat
+push there discards the pending wait. The ladder itself survives — `requeueNow` never
+reads `backoffFor`, which only a successful reconcile clears — so the delay goes on
+doubling while nothing waits it out.
 
-This push is the only one gated on an object other than the one it enqueues, which
-costs one `ObjectsGetMeta` per owner — on the delete path only, and owners are
-normally one.
+This push is gated on an object other than the one it enqueues, which costs one
+`ObjectsGetMeta` per owner — on the delete path only, and owners are normally one.
+The create's owner push shares that shape, both bounds and both costs. See
+[its ADR](2026-08-05-a-create-pushes-a-deleting-owners-collect.md).
 
 A self `owned_by` edge is unreachable here: `owned_by` is never discounted, so a row
 owning itself is blocked forever and never reaches `ObjectsDelete`. It is also not

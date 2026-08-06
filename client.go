@@ -384,8 +384,15 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it.
 	// No wake stamp: ownership owes the child no reconcile.
 	if co.owner != nil {
-		if _, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy); err != nil {
+		res, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		if err != nil {
 			return nil, err
+		}
+		// A deleting owner's cascade may already have run past this child; a live
+		// owner was blocked by nothing, and requeueNow bypasses the floor.
+		// See docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md.
+		if res.ToDeleting {
+			c.bh.signalRequeueNow(ctx, ObjectRef{ID: *co.owner, Group: res.To.Group, Kind: res.To.Kind})
 		}
 	}
 	return raw, nil

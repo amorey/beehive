@@ -3021,6 +3021,37 @@ func TestCreateEnqueuesItsFirstReconcile(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a create queues the new object")
 }
 
+// A live owner is queued by nothing: it was never waiting on this child, and
+// requeueNow bypasses the re-enqueue floor, so waking every owner a create names
+// would let a controller that replaces a child each pass drive its owner.
+func TestCreateUnderALiveOwnerQueuesOnlyTheChild(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	settle(t, ctx, cc, r, owner)
+
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	assert.Equal(t, []ObjectID{child.ID}, queuedIDs(r.work), "the live owner owes nothing")
+}
+
+// A deletion-pending owner's cascade may already have run past this child, and
+// nothing else would find it before the sweeper: no version moves for an edge,
+// and the child's own collect returns at once because the child is not deleting.
+func TestCreateUnderADeletingOwnerQueuesTheOwner(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	settle(t, ctx, cc, r, owner)
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work) // spend the delete's own push
+
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	assert.ElementsMatch(t, []ObjectID{child.ID, owner.ID}, queuedIDs(r.work),
+		"the owner needs a re-cascade to find the new child")
+}
+
 // GetOrCreate queues only when it actually created the row: the found branch is a
 // pure read and must not nudge the reconciler.
 func TestGetOrCreateEnqueuesOnlyWhenItCreates(t *testing.T) {
