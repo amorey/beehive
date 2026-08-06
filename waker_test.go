@@ -302,7 +302,7 @@ func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
 	}
 	// The ladder is capped at the stale-dependents cadence, which is what makes
 	// the retry here fast enough to wait on.
-	bh := newTestBeehive(t, store, withStaleDependentsInterval(fastTick))
+	bh := newTestBeehive(t, store, WithStaleDependentsInterval(fastTick))
 	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 	bh.waker.prime(ctx)
@@ -1339,7 +1339,7 @@ func TestWakerRetryCapIsNotTheBackstopsCadence(t *testing.T) {
 	assert.Less(t, next, bh.staleDependentsInterval, "recovery must not lengthen with the backstop")
 }
 
-// withStaleDependentsInterval validates a positive interval, but only a Beehive
+// WithStaleDependentsInterval validates a positive interval, but only a Beehive
 // from New goes through it — a whitebox test assembles the struct. A zero threshold
 // there must mean "drain as it always did", not "shed the whole backlog on the
 // second pass".

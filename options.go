@@ -214,11 +214,34 @@ func WithOnCreate(fn func(ctx context.Context)) Option {
 	}
 }
 
-// withOwedPassInterval sets how often a controller drains work the store
-// records as owed (unconverged specs, owed dependency wakes); <= 0 disables the
-// tick. Unexported: the owed pass is what makes convergence a guarantee, and
-// its cost is bounded by what is outstanding. Only tests reach it; callers get
-// WithFullPassInterval and Client.Requeue.
+// WithOwedPassInterval sets how often a controller drains work the store
+// records as owed: unconverged specs and owed dependency wakes. Default 30s.
+// Dispatches at New and at Register, so one kind can differ from the rest.
+//
+// Every trigger for a registered kind pushes at commit, so this is not the
+// latency of a local write. What lengthening it costs is how long a *lost* push
+// waits — a crash between the commit and the dispatch, a stamp made while no
+// reconciler was registered for the source's kind — plus the first drain after
+// a restart, which runs at startup regardless. See
+// docs/adr/2026-08-06-driver-cadences-are-configurable.md.
+//
+// Cannot be disabled: d <= 0 is rejected with ErrInvalidOption. Unlike
+// WithFullPassInterval, this pass is what makes convergence a guarantee rather
+// than an optimisation, and its cost is bounded by what is outstanding rather
+// than by the object count — so "rarely" is expressible and "never" is not.
+func WithOwedPassInterval(d time.Duration) Option {
+	return func(target any) error {
+		// Checked before the target switch: the value is nonsense wherever it
+		// was aimed.
+		if d <= 0 {
+			return fmt.Errorf("%w: WithOwedPassInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		return withOwedPassInterval(d)(target)
+	}
+}
+
+// withOwedPassInterval is WithOwedPassInterval without the floor, so a test can
+// disable the tick outright and watch a push carry the work on its own.
 func withOwedPassInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {
@@ -274,6 +297,13 @@ func WithFullPassInterval(d time.Duration) Option {
 // ErrInvalidOption. Nothing on the public surface triggers collect, so a
 // sweeper-less Beehive would strand deletion-pending rows with no recourse. A
 // long interval expresses "collect rarely"; there is no "never".
+//
+// A deletion cascade over *registered* kinds advances a level per commit, so
+// this is not its latency. A client-only level has no push at all and costs one
+// interval, so a subtree of client-only kinds takes one interval per level.
+// The sweeper's per-sweep work budgets scale with d, so a longer interval trims
+// and reclaims proportionally more rather than at a lower rate. See
+// docs/adr/2026-08-06-driver-cadences-are-configurable.md.
 func WithGCInterval(d time.Duration) Option {
 	return func(target any) error {
 		// Checked before the target switch: the value is nonsense wherever it
@@ -315,16 +345,22 @@ func withWakeScanMinInterval(d time.Duration) Option {
 	}
 }
 
-// withStaleDependentsInterval sets how often the stale-dependents pass
-// re-derives which dependents a dependency has moved under. Global and
-// meaningful only at New. Unexported because it is the backstop that makes a
-// dependency wake a guarantee — tuning it would be tuning how long a lost wake
-// goes unnoticed. Like WithGCInterval it cannot be disabled: d <= 0 is rejected
-// with ErrInvalidOption, because nothing else re-derives.
-func withStaleDependentsInterval(d time.Duration) Option {
+// WithStaleDependentsInterval sets how often the stale-dependents pass
+// re-derives which dependents a dependency has moved under. Default 60s. Global
+// and meaningful only at New.
+//
+// The dependency waker propagates a target change per commit, so this is not
+// dependency latency. What lengthening it costs is how long a dependent stays
+// stale when that wake was *lost* — a crash before the scan, a failed seed, a
+// write no waker cursor covers — and it is the only thing that re-derives, so a
+// long value is a long window. It also paces the waker's abandon jump, which
+// hands a range to this pass on the argument that it has already swept it.
+//
+// Cannot be disabled: d <= 0 is rejected with ErrInvalidOption.
+func WithStaleDependentsInterval(d time.Duration) Option {
 	return func(target any) error {
 		if d <= 0 {
-			return fmt.Errorf("%w: withStaleDependentsInterval needs a positive interval, got %s", ErrInvalidOption, d)
+			return fmt.Errorf("%w: WithStaleDependentsInterval needs a positive interval, got %s", ErrInvalidOption, d)
 		}
 		if t, ok := target.(*Beehive); ok {
 			t.staleDependentsInterval = d
@@ -347,16 +383,22 @@ func withWatchScanMinInterval(d time.Duration) Option {
 	}
 }
 
-// withWatchFloorInterval sets how often a watch reads without a wake — a kind's
-// tailer, and an object's event reader. The wake covers writes made through this
-// Beehive; the floor covers what a wake cannot — a failed step, a retention
-// trim. Global and meaningful only at New, and unexported because watch latency
-// is part of the stream's contract. Cannot be disabled: d <= 0 is rejected with
-// ErrInvalidOption.
-func withWatchFloorInterval(d time.Duration) Option {
+// WithWatchFloorInterval sets how often a watch reads without a wake — a kind's
+// tailer, and an object's event reader. Default 30s. Global and meaningful only
+// at New.
+//
+// Both watch families read on a commit wake, so this is not delivery latency
+// for anything this Beehive writes. What lengthening it costs is staleness for
+// what a wake cannot cover: a retention trim, a step that failed after its
+// retry ladder gave up, and a write by a second writer over the same store —
+// which is an unsupported deployment, not a slow one. A failed read still
+// retries on its own ladder, capped in seconds, whatever this is set to.
+//
+// Cannot be disabled: d <= 0 is rejected with ErrInvalidOption.
+func WithWatchFloorInterval(d time.Duration) Option {
 	return func(target any) error {
 		if d <= 0 {
-			return fmt.Errorf("%w: withWatchFloorInterval needs a positive interval, got %s", ErrInvalidOption, d)
+			return fmt.Errorf("%w: WithWatchFloorInterval needs a positive interval, got %s", ErrInvalidOption, d)
 		}
 		if t, ok := target.(*Beehive); ok {
 			t.watchFloorInterval = d

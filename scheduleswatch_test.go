@@ -83,7 +83,7 @@ func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 // is taken out of the picture.
 func pushOnlyClient(t *testing.T) (context.Context, *Beehive, Client[cSpec, cStatus], *reconciler) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)

@@ -488,7 +488,7 @@ func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	// close the gap for a reason other than the one under test. Pushing it past the
 	// test's own timeout leaves the EdgesAdd stamp as the only thing that can
 	// requeue the dependent, which is what this is about.
-	bh := newTestBeehive(t, store, fast(withStaleDependentsInterval(time.Hour))...)
+	bh := newTestBeehive(t, store, fast(WithStaleDependentsInterval(time.Hour))...)
 
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &dependentController{observed: make(chan bool, 8)}

@@ -205,8 +205,8 @@ func fast(opts ...Option) []Option {
 		WithGCInterval(fastTick),
 		withWakeScanMinInterval(0),
 		withMinRequeueInterval(fastTick),
-		withStaleDependentsInterval(staleDependentsTick),
-		withWatchFloorInterval(fastTick),
+		WithStaleDependentsInterval(staleDependentsTick),
+		WithWatchFloorInterval(fastTick),
 	}, opts...)
 }
 
@@ -216,7 +216,7 @@ func parked(opts ...Option) []Option {
 	return fast(append([]Option{
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
-		withStaleDependentsInterval(time.Hour),
+		WithStaleDependentsInterval(time.Hour),
 		withDependencyWakerOff(),
 		withoutGCSweeper(),
 	}, opts...)...)
