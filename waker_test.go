@@ -772,6 +772,26 @@ func TestWakerReadsNoHorizonWhenThePageCarriedIt(t *testing.T) {
 	assert.Zero(t, store.marks, "a short page is not an empty one")
 }
 
+// The idle horizon read is supplementary — no wake depends on it — so a store
+// fault there is neither a report nor a failed scan, and the next pass reads the
+// boundary the failed one could not.
+func TestWakerToleratesAFailedIdleHorizonRead(t *testing.T) {
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &replayStore{seed: 400, trimmed: 900} // the backlog was trimmed away
+	dw, _, _ := seededWaker(store, GroupKind{Kind: "Widget"})
+	dw.bh.logger = logger
+	dw.watermark = 400
+
+	store.seedErr = errBoom
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	require.Equal(t, 1, store.marks, "the empty page asked for the horizon")
+	assert.Empty(t, buf.String(), "a horizon nobody could read reports nothing")
+
+	store.seedErr = nil
+	require.Equal(t, scanIdle, dw.scan(context.Background()))
+	assert.Contains(t, buf.String(), "trimmedThrough=900")
+}
+
 // A waker with no stored cursor starts at the log's head, so a trim that predates
 // its seed skipped nothing it was ever going to scan.
 func TestWakerReportsNothingWithoutAStoredCursor(t *testing.T) {

@@ -442,7 +442,7 @@ func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
-func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, RawEvent) error {
+func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, EventsAddInput) error {
 	panic("not implemented: fakeStore.EventsAdd")
 }
 func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {

@@ -57,9 +57,8 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
   **The fix is to make a failed seed hand its window to the backstop** — force one
   stale-dependents sweep once the seed lands, rather than trying to reconstruct a
-  mark nobody read. That is the same remedy the retention entry below wants, so
-  build them together. Not done because the trigger is a failed read on a cold
-  path and the backstop already covers it.
+  mark nobody read. Not done because the trigger is a failed read on a cold path
+  and the backstop already covers it.
 
   Tripwires: `TestWakerRetriesSeedOnTheNextTick` and
   `TestWakerRetriesSeedOnAFailedCursorRead` pin that a failed seed leaves the
@@ -120,48 +119,19 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   and is a much larger change to what the generation handshake means. Neither is worth
   it against saying so plainly where controllers are introduced.
 
-- **`EventsAdd` still takes the read shape, so the write-shapes rule has one
-  exception** — known, not fixed. The
-  [write-shapes ADR](docs/adr/2026-07-30-store-write-shapes.md) says a write takes
-  only what it honours, and `ObjectsCreate` was narrowed to `ObjectsCreateInput` for
-  exactly that reason. `EventsAdd(ctx, gk, id, ev Event)` still takes `Event`, the
-  read shape, and reads five of its eleven fields — `Category`, `Type`, `Reason`,
-  `Message`, `Detail`. The store assigns the rest, and its godoc says so *in prose*,
-  which is the silent-drop shape the create path was just fixed for, on the same
-  interface.
-
-  It is milder than `ObjectsCreate`'s was: the dropped fields are `ID`, `ObjectID`,
-  `Count`, `FirstAt`, `LastAt` and `ResourceVersion`, all obviously store-assigned,
-  where `Status` on a create was a plausible thing to seed. So there is no trap here
-  today, only an inconsistency.
-
-  The fix is an `EventsAddInput` beside `ObjectsCreateInput`, same shape, same reason.
-  Deferred because it is a third break of an externally implementable `Store` for a
-  case with no reachable defect, and the ADR's own argument is that the break cost is
-  paid per break rather than per method — so this wants to ride along with the next
-  one that has to happen anyway, not to be its own. Revisit then, or sooner if a
-  field is ever added to `Event` that a caller might reasonably try to set.
-
-  **It missed the `EventsMaxVersion` window** (2026-07-31), which added a `Store`
-  member and broke every external backend. That was a change to the same file and
-  the same event family, and taking this along would have cost those backends
-  nothing extra — the argument above says so in as many words. It was left out
-  because the change was scoped to the watch gate. So the next break is now the
-  *second* one an external backend pays for this, which is a point in favour of
-  taking it early rather than waiting for a third.
-
 - **Four types in `Store`'s signatures have no public alias, so the interface is not
   externally implementable today** — known, not fixed, and recorded because the rest
   of this file reasons about the cost of breaking external backends as though they
   exist.
 
   `Store` is aliased into the root package, and most of what its methods mention is
-  aliased alongside it (`RawObject`, `ObjectRef`, `ObjectsCreateInput`, `RawEvent`,
-  `DeletionCascadeChild`). Four are not: `Condition`, `EdgesAddResult`, `EventQuery`
-  and `ReconcileLoad` live only in `internal/storeapi`, which an external module
-  cannot import. A backend outside this module cannot write those signatures at all,
-  so it cannot satisfy the interface — which makes "this break costs external
-  backends" an argument about a population of zero.
+  aliased alongside it (`RawObject`, `ObjectRef`, `ObjectsCreateInput`,
+  `EventsAddInput`, `RawEvent`, `DeletionCascadeChild`). Four are not: `Condition`,
+  `EdgesAddResult`, `EventQuery` and `ReconcileLoad` live only in
+  `internal/storeapi`, which an external module cannot import. A backend outside
+  this module cannot write those signatures at all, so it cannot satisfy the
+  interface — which makes "this break costs external backends" an argument about a
+  population of zero.
 
   Three are a one-line alias each. `Condition` is not: the root package already
   exports a richer `Condition` for the typed API, so the alias needs a distinct name
@@ -172,8 +142,8 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   and because it is worth deciding deliberately: aliasing these promotes every field
   of four store-shaped structs to public API, which is a commitment the internal
   package currently avoids. Revisit when an external backend is actually attempted,
-  or fold into the next break that touches these types — the same ride-along argument
-  the `EventsAddInput` entry above makes.
+  or fold into the next break that touches these types. `EventsAddInput` (2026-08-06)
+  was not that break: it added an alias rather than touching any of these four.
 
 - **Two writes still read the whole row to answer a narrow question** — known, not
   fixed, and the tail of the write-shapes pass. Every write that reports *no* row now

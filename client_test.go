@@ -2593,7 +2593,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
-	err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	err := store.EventsAdd(ctx, clientTestGK, obj.ID, EventsAddInput{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	plain, err := client.Get(ctx, obj.ID)
@@ -2619,9 +2619,9 @@ func TestClientListLoadsEvents(t *testing.T) {
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
-	err := store.EventsAdd(ctx, clientTestGK, a.ID, RawEvent{Category: "c", Type: "Normal", Reason: "AOK"})
+	err := store.EventsAdd(ctx, clientTestGK, a.ID, EventsAddInput{Category: "c", Type: "Normal", Reason: "AOK"})
 	require.NoError(t, err)
-	err = store.EventsAdd(ctx, clientTestGK, b.ID, RawEvent{Category: "c", Type: "Warning", Reason: "BBad"})
+	err = store.EventsAdd(ctx, clientTestGK, b.ID, EventsAddInput{Category: "c", Type: "Warning", Reason: "BBad"})
 	require.NoError(t, err)
 
 	objs, err := client.List(ctx, LoadEvents())
@@ -2647,7 +2647,7 @@ func TestClientListEvents(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	rec := func(cat, typ, reason string) {
-		err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: cat, Type: typ, Reason: reason})
+		err := store.EventsAdd(ctx, clientTestGK, obj.ID, EventsAddInput{Category: cat, Type: typ, Reason: reason})
 		require.NoError(t, err)
 	}
 	rec("connection", "Warning", "ProbeFailed")
@@ -2676,7 +2676,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	err := store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "connection", Type: "Normal", Reason: "Connected"})
+	err := store.EventsAdd(ctx, clientTestGK, obj.ID, EventsAddInput{Category: "connection", Type: "Normal", Reason: "Connected"})
 	require.NoError(t, err)
 
 	got, ok, err := client.EventsGetLatest(ctx, obj.ID, "connection")
@@ -2706,7 +2706,7 @@ func TestClientWatchEvents(t *testing.T) {
 	stream, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	err = store.EventsAdd(ctx, clientTestGK, obj.ID, RawEvent{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
+	err = store.EventsAdd(ctx, clientTestGK, obj.ID, EventsAddInput{Category: "c", Type: "Warning", Reason: "ProbeFailed"})
 	require.NoError(t, err)
 
 	ev := recv(t, stream.Events)

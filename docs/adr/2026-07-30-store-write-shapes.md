@@ -126,3 +126,18 @@ conditions for it, because a condition references an object id and the id was mi
 by the `INSERT` that returned the row — so the row provably has none, and `nil` is
 what assembling would have produced. `scanWritten` is therefore reached from
 `ObjectsUpdateSpec` only.
+
+## `EventsAdd` takes an input shape too (2026-08-06)
+
+`EventsAdd` kept taking `Event`, the read shape, and read five of its eleven fields:
+`Category`, `Type`, `Reason`, `Message`, `Detail`. It now takes `EventsAddInput`
+carrying exactly those five. The dropped fields — `ID`, `ObjectID`, `Count`,
+`FirstAt`, `LastAt`, `ResourceVersion` — were all store-assigned, so nothing was
+silently discarded in practice the way seeding a `Status` on create was; what the
+exception cost was the rule's decidability, on the same interface that had just been
+narrowed for it.
+
+It was deferred once as a break to ride along with the next one, and skipped a window
+(`EventsMaxVersion`, 2026-07-31) doing so. Waiting again would have made the next
+break the third an external backend pays for the same rule, which is the argument
+against holding it any longer.
