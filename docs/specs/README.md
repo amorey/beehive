@@ -28,5 +28,4 @@ directory of live plans is worth more than a directory of finished ones.
 
 ## Index
 
-- [The event retention audit](event-retention-audit.md) — closes the
-  `docs/TODO.md` entry on event retention never having been audited.
+Empty: nothing is specified and unbuilt right now.

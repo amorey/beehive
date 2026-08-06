@@ -321,12 +321,16 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `ErrNotLoaded` for a relation nobody asked for.
   → [ADR](docs/adr/2026-07-27-secondary-lookups.md)
 - **Events are an append-only log, aggregated into runs** per (object,
-  category), extended when `(type, reason)` matches. Reads live on `Client`;
-  retention runs in the GC sweeper. "Event" means this log and nothing else.
-  `Store.EventsAdd` returns `error` alone — the watch builds its delta from a
-  cursor, not from the write's result.
+  category), extended when `(type, reason)` matches. Reads live on `Client`.
+  "Event" means this log and nothing else. `Store.EventsAdd` returns `error`
+  alone — the watch builds its delta from a cursor, not from the write's result.
+  **Retention runs in the GC sweeper and is off by default**: a cap of *runs*
+  per timeline, which trims only the timelines a candidate query finds over it
+  (bounded per sweep, so it is progressive), plus an optional flat `maxAge`
+  cutoff across every timeline.
   → [ADR](docs/adr/2026-07-27-events-api.md),
-  [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
+  [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md),
+  [ADR](docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md)
 - **The schedule watch is an in-memory gauge and the one watch with no tick at
   all**: the `workQueue` publishes each move of its `gauge` to a `gobus/watch`
   hub. Sound only because the queue is unexported and process-local and the
