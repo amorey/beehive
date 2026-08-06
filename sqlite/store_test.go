@@ -3858,6 +3858,27 @@ func TestDeletionRequestsCreateVersionDrawError(t *testing.T) {
 	assert.Nil(t, reloaded.DeletionRequestedAt, "the mark rolled back with the draw")
 }
 
+// selectScoped is the one place the kind gate lives, so its scope errors and its
+// column binding are pinned here rather than through each caller.
+func TestSelectScopedGatesAndReadsNamedColumns(t *testing.T) {
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	var gen int64
+	var deletionAt sql.NullInt64
+	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID,
+		`generation, deletion_requested_at`, &gen, &deletionAt))
+	assert.Equal(t, obj.Generation, gen)
+	assert.False(t, deletionAt.Valid)
+
+	// No columns: the gate alone, which is what checkObjectScoped wants.
+	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID, ``))
+	assert.ErrorIs(t, store.selectScoped(ctx, testGK, 999999, ``), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.selectScoped(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, ``),
+		beehive.ErrWrongKind)
+}
+
 // checkObjectScoped resolves a zero-row mark or decrement, so it only ever runs
 // after a statement that already succeeded — no fault-injection path reaches it with
 // a broken connection. Called directly, which is what whitebox tests are for.

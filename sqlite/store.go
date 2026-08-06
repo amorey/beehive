@@ -656,24 +656,44 @@ func asNameTaken(err error) error {
 	return err
 }
 
+// selectScoped reads id's row through the kind gate, binding only the columns
+// the caller names into dest, in order; empty cols is the gate alone. The one
+// place ErrNotFound and ErrWrongKind are decided for a write that needs part of
+// a row rather than all of it.
+func (s *sqliteStore) selectScoped(
+	ctx context.Context,
+	gk storeapi.GroupKind,
+	id storeapi.ObjectID,
+	cols string,
+	dest ...any,
+) error {
+	if cols != "" {
+		cols = ", " + cols
+	}
+	var group, kind string
+	err := s.conn(ctx).QueryRowContext(ctx,
+		`SELECT "group", kind`+cols+` FROM objects WHERE id = ?`, id).
+		Scan(append([]any{&group, &kind}, dest...)...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeapi.ErrNotFound // bare, like scanObject's
+	}
+	if err != nil {
+		return err
+	}
+	if group != gk.Group || kind != gk.Kind {
+		return fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
+			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
+	}
+	return nil
+}
+
 // probeObjectScoped answers "does id exist, is it gk's, and is it
 // deletion-pending?" from three columns — no blobs, no finalizer unmarshal. Same
 // errors as a scoped read: ErrNotFound, ErrWrongKind.
 func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (deletionPending bool, err error) {
-	var group, kind string
 	var deletionAt sql.NullInt64
-	err = s.conn(ctx).QueryRowContext(ctx,
-		`SELECT "group", kind, deletion_requested_at FROM objects WHERE id = ?`, id).
-		Scan(&group, &kind, &deletionAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, storeapi.ErrNotFound // bare, like scanObject's
-	}
-	if err != nil {
+	if err := s.selectScoped(ctx, gk, id, `deletion_requested_at`, &deletionAt); err != nil {
 		return false, err
-	}
-	if group != gk.Group || kind != gk.Kind {
-		return false, fmt.Errorf("%w: object %d is %s/%s, not %s/%s",
-			storeapi.ErrWrongKind, id, group, kind, gk.Group, gk.Kind)
 	}
 	return deletionAt.Valid, nil
 }
@@ -691,8 +711,7 @@ func (s *sqliteStore) checkObjectExists(ctx context.Context, id storeapi.ObjectI
 
 // checkObjectScoped is probeObjectScoped for callers that only need the gate.
 func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
-	_, err := s.probeObjectScoped(ctx, gk, id)
-	return err
+	return s.selectScoped(ctx, gk, id, ``)
 }
 
 // getObjectRow reads the objects row without assembling conditions.
