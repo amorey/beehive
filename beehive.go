@@ -65,8 +65,14 @@ const (
 	// Floors the gap between two wake-driven drains, so a write stream cannot
 	// make its kind's tailer hold the single connection back from the writers.
 	defaultWatchScanMinInterval = 100 * time.Millisecond
-	// The first retry after a failed tail step; it doubles up to the floor.
+	// The first retry after a failed tail step; it doubles up to watchRetryMax.
 	watchRetryBase = 100 * time.Millisecond
+	// watchRetryMax caps that ladder. Its own constant rather than the floor: the
+	// floor is what a healthy quiet kind costs, which is the right ceiling only
+	// while it stays seconds — an embedder that lengthens it to spare an idle
+	// laptop would otherwise be lengthening error recovery with it. See
+	// docs/adr/2026-08-06-driver-cadences-are-configurable.md.
+	watchRetryMax = 30 * time.Second
 )
 
 type beehiveState uint8

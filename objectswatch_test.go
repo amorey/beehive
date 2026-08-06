@@ -1909,6 +1909,22 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 		assert.Equal(t, 2*watchRetryBase, next, "a second failure waits longer")
 	})
 
+	// The floor is a battery knob an embedder sets in minutes; the retry cap is
+	// what a failing store should be re-read at. Capping the ladder at the floor
+	// would make the two the same number.
+	t.Run("a failing drain settles at the retry cap, not at the floor", func(t *testing.T) {
+		floor := time.Hour
+		bh := newTestBeehive(t, &failGateStore{Store: newClientTestStore(t)}, withWatchFloorInterval(floor))
+		tailer := pausedTailer(t, bh, clientTestGK)
+
+		var next time.Duration
+		for range 20 {
+			next, _, _ = tailer.pass(ctx, tailer.now(), false)
+		}
+		assert.Equal(t, watchRetryMax, next)
+		assert.Less(t, next, floor, "recovery must not lengthen with the floor")
+	})
+
 	t.Run("a trimmed cursor ends the tailer", func(t *testing.T) {
 		store := newClientTestStore(t)
 		bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
