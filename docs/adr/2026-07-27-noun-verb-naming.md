@@ -1,16 +1,16 @@
-# Methods are named NounsVerb, and every watch returns a change or a subscription
+# Methods are named NounsVerb, and every watch returns a change or a value
 
 - **Status:** Accepted — implemented across `internal/storeapi`, `client.go`, `controller.go`, `types.go`, and the internals.
 - **Date:** 2026-07-27
 
 ## Context
 
-The `Store` interface had grown to forty methods named verb-first — `CreateObject`,
-`ListIncomingRefs`, `RequestDeletion`, `DecrementPendingWake`. Godoc renders a type's
-methods alphabetically, so verb-first scatters one concern across the page: deletion
-was `RequestDeletion` under R, `MarkOwnedForDeletion` under M and
-`ListAllDeletionPending` under L, and the two halves of the `pending_wake` protocol
-sat thirty methods apart. Reading "what can I do to an edge?" meant a full scan.
+The `Store` interface had grown to forty methods named verb-first: `CreateObject`,
+`ListIncomingRefs`, `RequestDeletion`, `DecrementPendingWake`. Godoc lists a type's
+methods alphabetically, so verb-first scattered each concern across the page. Deletion
+sat under R for `RequestDeletion`, M for `MarkOwnedForDeletion` and L for
+`ListAllDeletionPending`, and the two halves of one protocol were thirty methods
+apart. Answering "what can I do to an edge?" meant reading the whole list.
 
 The stream surface had a second problem. `Watcher`, `EventWatcher` and
 `ObjectChangeWatcher` were three interfaces differing only in the name of their single
@@ -20,14 +20,16 @@ instantiation being used through only its own interface.
 
 ## Decision
 
-**1. `NounsVerbQualifier`.** The noun prefix is plural and names the family the method
-belongs to; cardinality lives in the verb (`Get`/`Watch` for one, `List`/`WatchList`
-for many). Plural rather than singular so a family has exactly one prefix —
-`EdgesAdd`/`EdgesDelete`/`EdgesListIncoming`, not `EdgeAdd` beside `EdgesListIncoming`.
+**1. `NounsVerbQualifier`.** The prefix is a plural noun naming the family the method
+belongs to, and the verb carries cardinality: `Get`/`Watch` for one, `List`/`WatchList`
+for many. Plural rather than singular so each family has exactly one prefix —
+`EdgesAdd`, `EdgesDelete`, `EdgesListIncoming`, not `EdgeAdd` beside
+`EdgesListIncoming`.
 
 **Omit the prefix when the family is already the receiver's own.** `Client` is its
-kind, so `Create`/`Get`/`Update`/`Delete`/`List` stay bare; only its secondary nouns
-(events, schedule, relations, the object watches) take one. On `ControllerClient` the
+kind, so `Create`/`Get`/`Update`/`Delete`/`List`/`Watch`/`WatchList` stay bare; only
+its secondary nouns (events, schedule, relations) take one. See the amendment below:
+the object watches were listed here as a secondary noun until 2026-08-02. On `ControllerClient` the
 line falls between a **column on the object's row** and a **table of its own**:
 `UpdateStatus` stays bare, while conditions, finalizers, events and edges — each its
 own table — are prefixed.
@@ -39,23 +41,19 @@ The `Get`/`List` cardinality signal moves to the return type, which already carr
 Exempt: `Err*` values, `With*` options, and anything satisfying an external interface.
 
 One family takes a **singular** prefix: `ReconcileOwed*`, over the
-`objects.reconcile_owed` column. The rule's purpose is one prefix per family, which a
-singular serves here as well as a plural would, and the family fronts a scalar count
-whose name it should match — `ReconcilesOwed*` buys the letter of the rule at every
-call site, and `OwedReconciles*` reads as a noun only by inverting the column name.
-Recorded rather than left to the reader, because an undocumented exception is how a
-convention erodes.
+`objects.reconcile_owed` column. The rule exists to give each family one prefix, which
+a singular does just as well here, and this family fronts a scalar count whose name it
+should match. `ReconcilesOwed*` would satisfy the letter of the rule at every call
+site, and `OwedReconciles*` only reads as a noun by inverting the column name. Recorded
+rather than left to the reader, because undocumented exceptions are how a convention
+erodes.
 
-**2. A watch over a change stream returns `<-chan NounChange` or a
-`*NounsSubscription`** — never a bare `…Watcher` interface. The change
-travels by value: `ObjectChange[Spec, Status]` is a type tag plus one pointer, so
-copying it costs nothing worth avoiding, and a pointer would add a per-change
-allocation and a `nil` case with no meaning on a delivery channel. The
-subscription is a pointer because it is a handle with identity and a `Close`. The three
-interfaces collapsed into one concrete `storeapi.Subscription[V]` with a single
-`Changes()` accessor, aliased per stream (`ObjectsSubscription`, `EventsSubscription`,
-`ObjectWritesSubscription`); a backend builds one with `NewSubscription`, and `Close`
-is idempotent through a `sync.Once`, so the test doubles no longer carry their own.
+**2. A watch over a change stream returns `<-chan NounChange`** — never a bare
+`…Watcher` interface. The change travels by value: `ObjectChange[Spec, Status]` is a
+type tag plus one pointer, so copying it costs nothing worth avoiding, and a pointer
+would add a per-change allocation and a `nil` case with no meaning on a delivery
+channel. The channel is the whole handle — `ctx` cancellation ends the stream and
+closes it — so there is no subscription object to name, hold, or `Close`.
 
 Not every watch is over changes, and the rule does not reach the ones that aren't. A
 **gauge** (`SchedulesWatch`) and a **log** (`EventsWatch`) stream the value itself:
@@ -64,10 +62,9 @@ consumer can act on — a `ScheduleChange` would carry a `Type` that never varie
 wrapper earns its place only where the consumer must tell *what happened* from *what
 it now is*, which is the test the next section applies to `Event`.
 
-`Subscribe` survives as a distinct verb for exactly one method,
-`ObjectWritesSubscribe`. It carries no row — the consumer re-reads current state — and
-that is a different contract from a watch that hands you the object, so it gets a
-different verb rather than a footnote.
+The store has no streams at all, so no method there takes a stream verb: the write
+log reads as an ordinary listing, `ObjectWritesListSince` / `ObjectWritesMaxVersion`
+— plain `List`/`Get` verbs under one noun.
 
 ## Consequences
 
@@ -78,7 +75,7 @@ The tax is a verb in the middle on qualified lists (`ObjectsListUnsettledIDs`,
 `EdgesListOutgoingByRelation`). The alternative, qualifier-before-verb, reads worse;
 it is paid on about six methods.
 
-Four judgment calls worth recording, since each has a defensible other answer:
+Five judgment calls worth recording, since each has a defensible other answer:
 
 - **`OwnersGet` for an at-most-one relation.** The prefix names the family (the store
   holds many owners), the verb carries cardinality. Folding all four relations under
@@ -96,10 +93,10 @@ Four judgment calls worth recording, since each has a defensible other answer:
   objection here; `ReconcileOwed*` (`objects.reconcile_owed`) is the same shape.
   `Pending` then drops out of the list method, since a request is only ever cleared by
   the delete itself — and out of `ReconcileOwedListIDs` for the same reason, the family
-  name already saying the row owes something. The cascade breaks the `By…` qualifier pattern (`BySlug`, `ByRelation`,
+  name already saying the row owes something. The cascade breaks the `By…` qualifier pattern (`ByName`, `ByRelation`,
   `ByIncomingEdge`, all naming the key you pass) and reads
   `DeletionRequestsCreateFromOwner`: `By` also means *agency* in English, and unlike a
-  slug an owner is animate, so `CreateByOwner` invites the wrong reading — the owner
+  name an owner is animate, so `CreateByOwner` invites the wrong reading — the owner
   is what is being deleted, not the actor. `From` keeps the sense of "derived from an
   owner id" and answers the question `CreateOwned` leaves open, whether the owner
   itself gets a request. It does not.
@@ -111,17 +108,44 @@ Four judgment calls worth recording, since each has a defensible other answer:
   `DeletionRequestsList` returns objects with no edge in the picture at all. So the
   value became `ObjectRef` — a reference to an object, the same shape Kubernetes calls
   a reference — and the family became `Edges*`, which is what it always operated on.
-  The short public alias `Ref` went with them rather than surviving as a synonym: one
-  type wants one name, and every other alias in the package (`GroupKind`, `ObjectID`,
-  `Relation`, the subscriptions) already re-exports the internal name unchanged. The
-  table itself was renamed `refs` → `edges` in `0001_init.sql` rather than migrated:
-  nothing has shipped, so there is no deployed database to carry the old name forward.
+  There is no public `Ref` alias beside it: one type wants one name, and every other
+  alias in the package (`GroupKind`, `ObjectID`, `Relation`, `ChangeType`)
+  re-exports the internal name unchanged.
+- **`EventsAdd`, not `EventsRecord`.** The rule fixes the shape but not the verb, and
+  `EventsRecord` satisfied it — `Record` also said the true thing, that a call may
+  extend the latest run instead of inserting a row. It lost on grammar. The verb slot
+  in `NounsVerb` is read as a verb only by habit: `ObjectsList` is also "a list of
+  objects" and `ConditionsSet` "a set of conditions", and what disarms those is that
+  `List` and `Set` appear dozens of times each. `Record` appeared once, so it got no
+  such help and read as a noun in the register of `EventSpec` and `ObjectRef` — a
+  method named like a type. `Add` is a verb only, and it is already this package's
+  verb for writing to a table of its own (`EdgesAdd`, `DependenciesAdd`), which is
+  the same category the prefix rule above puts events in.
 
-Left undone: `EventsSubscription` still carries a bare `Event`, so a consumer cannot
+  What `Add` gives up is that it overclaims: the common call extends a run and
+  inserts nothing. That is tolerable because the surface already reads its write
+  verbs as intent rather than as a row count — `DeletionRequestsCreate` documents
+  that "repeat calls do nothing", and `EdgesAdd` stamps only when the edge was new.
+  The aggregation moved into the doc comments on both `EventsAdd` declarations, which
+  is where a caller needs it in prose anyway. `EventsEmit` and `EventsObserve` are
+  the other verb-only candidates and both mislead: nothing is pushed here, and
+  "observe" is spoken for by the generation handshake.
+
+Left undone: `EventsWatch` still streams a bare `Event`, so a consumer cannot
 tell a new run from a count-bump on an existing one — the one place a log does face
 rule 2's test and fail it. It wants an `EventChange` there (by value, like
 `ObjectChange`) and the information would be a genuine improvement, but that is a behavioural
 change to a public surface rather than a rename, so it is not part of this work.
 
-This is a breaking change to every public surface; it ships as one release. Downstream
-consumers pinning an older tag are unaffected until they bump.
+The convention covers every public surface, so a new method has exactly one
+defensible name and reviewers argue about the noun rather than the shape.
+
+## Amendments
+
+**2026-08-02 — the object watches lost their prefix.** `ObjectsWatch` and
+`ObjectsWatchList` became `Watch` and `WatchList`. Listing them as a secondary noun
+was the error: they stream the client's own kind, so the omit-the-prefix rule reaches
+them exactly as it reaches `List`. Bare `Watch` beside `EventsWatch` reads the way
+bare `List` already reads beside `EventsList`, and the `Get`/`List` cardinality
+pairing returns. The `Object` noun stays where it carries information — the return
+types `ObjectSnapshot`, `ObjectListSnapshot` and `ObjectChange`.

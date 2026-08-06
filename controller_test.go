@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,8 +30,7 @@ import (
 func TestControllerClientDeleteFinalizer(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -39,13 +39,102 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"}, WithFinalizers("a", "b"))
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("a", "b"))
 
 	require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "a"))
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
+}
+
+// Clearing the last finalizer is the one route out of a finalizer-blocked
+// collect, so it pushes rather than waiting out a GC tick.
+func TestFinalizersDeletePushesTheCollect(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "f"))
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+}
+
+// Every neighbour of that transition owes nothing. Pushing on a live object in
+// particular would collect-probe every finalizer removal in the system.
+func TestFinalizersDeletePushesNothingOtherwise(t *testing.T) {
+	tests := []struct {
+		name       string
+		finalizers []string
+		deleting   bool
+		remove     string
+	}{
+		{"live object", []string{"f"}, false, "f"},
+		{"finalizers remain", []string{"f", "g"}, true, "f"},
+		{"absent finalizer", []string{"f"}, true, "missing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, client, cc, r := specWriteFixture(t)
+
+			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers(tt.finalizers...))
+			if tt.deleting {
+				require.NoError(t, client.Delete(ctx, obj.ID))
+			}
+			drainQueue(r.work)
+
+			require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, tt.remove))
+			assert.Empty(t, queuedIDs(r.work))
+		})
+	}
+}
+
+// The push rides AfterCommit, so an unwound frame discards it with its writes —
+// including a nested frame whose error the caller swallows, where the outer
+// transaction still commits.
+func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
+		err := cc.Within(ctx, func(ctx context.Context) error {
+			require.NoError(t, cc.FinalizersDelete(ctx, obj.ID, "f"))
+			return errBoom
+		})
+		require.ErrorIs(t, err, errBoom)
+		return nil // swallowed: the outer frame commits
+	}))
+
+	assert.Empty(t, queuedIDs(r.work))
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"f"}, got.Finalizers, "the savepoint unwound the removal too")
+}
+
+// A rejected write pushes nothing: the kind check fires before the gate is even
+// consulted.
+func TestFinalizersDeletePushesNothingOnWrongKind(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	gadgetGK := GroupKind{Kind: "Gadget"}
+	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
+	gadgetR := mustReconciler(t, bh, gadgetGK)
+
+	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
+	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
+	require.NoError(t, gadgets.Delete(ctx, gadget.ID))
+	drainQueue(gadgetR.work)
+
+	require.ErrorIs(t, cc.FinalizersDelete(ctx, gadget.ID, "f"), ErrWrongKind)
+	assert.Empty(t, queuedIDs(gadgetR.work))
 }
 
 // TestWriteStampsSchemaVersions verifies the lazy stamp-on-write half of the
@@ -66,8 +155,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		obj, err := client.Create(ctx, cSpec{Val: "hello"})
-		require.NoError(t, err)
+		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 		// Spec write (Create) stamped the spec version; status untouched (still 0).
 		raw, err := store.ObjectsGet(ctx, obj.ID)
@@ -92,8 +180,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
-		obj, err := client.Create(ctx, cSpec{Val: "hello"})
-		require.NoError(t, err)
+		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
 		raw, err := store.ObjectsGet(ctx, obj.ID)
@@ -106,8 +193,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 func TestControllerClientUpdateStatus(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -117,8 +203,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 
 	// Create an object and update its status via the ControllerClient.
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	err = cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"})
 	require.NoError(t, err)
@@ -140,33 +225,31 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	ch, err := client.ObjectsWatchList(ctx)
+	snap, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	select { // snapshot
-	case ev := <-ch:
-		require.Equal(t, Added, ev.Type)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the snapshot event")
-	}
+	require.Len(t, snap.Objects, 1)
 
-	// Same status: silent.
+	// Same status: silent. Checked at the mechanism rather than by waiting out a
+	// grace period on the channel — the watch emits off resource_version, so a
+	// no-op write that leaves it alone is one the poller cannot see, whenever it
+	// happens to look. The channel assertion below is the second half: a stray
+	// frame for this write would have to arrive before the real change's.
+	before, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
-	select {
-	case ev := <-ch:
-		t.Fatalf("unchanged status must not emit, got %v", ev.Type)
-	case <-time.After(100 * time.Millisecond):
-	}
+	after, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion,
+		"an unchanged status bumped resource_version, which is what the watch emits on")
 
 	// A real change still flows.
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "changed"}))
@@ -185,17 +268,15 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 // with the nested ControllerClient writes joining the one transaction.
 func TestControllerClientWithin(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	// Rollback: an error from fn discards every write it made.
 	sentinel := errors.New("boom")
-	err = cc.Within(ctx, func(ctx context.Context) error {
+	err := cc.Within(ctx, func(ctx context.Context) error {
 		if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "rolled-back"}); err != nil {
 			return err
 		}
@@ -220,19 +301,17 @@ func TestControllerClientWithin(t *testing.T) {
 	assert.NotNil(t, findCondition(got.Conditions, "Ready"))
 }
 
-// EventsRecord writes an aggregated run through the store, marshaling EventSpec's
+// EventsAdd writes an aggregated run through the store, marshaling EventSpec's
 // Detail; the run reads back with the mapped fields and a decodable payload.
-func TestControllerClientRecordEvent(t *testing.T) {
+func TestControllerClientAddEvent(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	require.NoError(t, cc.EventsRecord(ctx, obj.ID, EventSpec{
+	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{
 		Category: "connection", Type: EventWarning, Reason: "ProbeFailed",
 		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
 	}))
@@ -250,48 +329,43 @@ func TestControllerClientRecordEvent(t *testing.T) {
 	assert.Equal(t, probeDetail{Endpoint: "h:443", LatencyMs: 5000}, detail)
 }
 
-// EventsRecord surfaces a Detail that cannot be JSON-marshaled, before touching
+// EventsAdd surfaces a Detail that cannot be JSON-marshaled, before touching
 // the store.
-func TestControllerClientRecordEventMarshalError(t *testing.T) {
-	bh, err := New(&fakeStore{})
-	require.NoError(t, err)
+func TestControllerClientAddEventMarshalError(t *testing.T) {
+	bh := newTestBeehive(t, &fakeStore{})
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 
-	err = cc.EventsRecord(context.Background(), 1, EventSpec{Detail: make(chan int)})
+	err := cc.EventsAdd(context.Background(), 1, EventSpec{Detail: make(chan int)})
 	assert.Error(t, err, "an unmarshalable Detail fails the write")
 }
 
-// EventsRecord is kind-folded like the other writes: a controller may not record
+// EventsAdd is kind-folded like the other writes: a controller may not record
 // events on an object of another kind.
-func TestControllerClientRecordEventWrongKind(t *testing.T) {
+func TestControllerClientAddEventWrongKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	other := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Other"}}
-	err = other.EventsRecord(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
+	err := other.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
 	assert.ErrorIs(t, err, ErrWrongKind)
 }
 
-// EventsRecord composes in Within: a run recorded inside a transaction that later
+// EventsAdd composes in Within: a run recorded inside a transaction that later
 // errors is rolled back with the rest.
-func TestControllerClientRecordEventWithinRollback(t *testing.T) {
+func TestControllerClientAddEventWithinRollback(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "x"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	sentinel := errors.New("boom")
-	err = cc.Within(ctx, func(ctx context.Context) error {
-		if err := cc.EventsRecord(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
+	err := cc.Within(ctx, func(ctx context.Context) error {
+		if err := cc.EventsAdd(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
 			return err
 		}
 		return sentinel
@@ -300,14 +374,13 @@ func TestControllerClientRecordEventWithinRollback(t *testing.T) {
 
 	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "c")
 	require.NoError(t, err)
-	assert.Nil(t, run, "a EventsRecord inside a rolled-back Within must not persist")
+	assert.Nil(t, run, "an EventsAdd inside a rolled-back Within must not persist")
 }
 
 func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -316,8 +389,7 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj, err := client.Create(ctx, cSpec{Val: "hello"})
-	require.NoError(t, err)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 	require.NoError(t, cc.ConditionsSet(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue}))
 	got, err := client.Get(ctx, obj.ID)
@@ -333,8 +405,7 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -343,12 +414,10 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	from, err := client.Create(ctx, cSpec{Val: "from"})
-	require.NoError(t, err)
-	to, err := client.Create(ctx, cSpec{Val: "to"})
-	require.NoError(t, err)
+	from := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "from"})
+	to := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "to"})
 
-	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID, to.ResourceVersion))
+	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID))
 	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectRef{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
@@ -359,248 +428,219 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
 
-// edgesAddTxTrackingStore records whether the ref insert ran inside a Within call,
-// so a test can assert DependenciesAdd wraps its endpoint check + insert in one
-// transaction. Accessed only from the test goroutine, so it needs no locking.
-type edgesAddTxTrackingStore struct {
-	Store
-	depth      int
-	addRefInTx bool
-}
-
-func (s *edgesAddTxTrackingStore) Within(ctx context.Context, fn func(context.Context) error) error {
-	s.depth++
-	defer func() { s.depth-- }()
-	return s.Store.Within(ctx, fn)
-}
-
-func (s *edgesAddTxTrackingStore) EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation, targetRV int64) (storeapi.EdgesAddResult, error) {
-	s.addRefInTx = s.depth > 0
-	return s.Store.EdgesAdd(ctx, fromID, toID, relation, targetRV)
-}
-
-// TestControllerClientAddDependencyIsTransactional pins that DependenciesAdd runs its
-// endpoint existence check and the ref insert in one transaction (like
-// DependenciesDelete). EdgesAdd checks then inserts as separate statements, so without
-// the transaction a delete interleaving between them would leak a raw FK error
-// instead of the store's ErrNotFound contract.
-func TestControllerClientAddDependencyIsTransactional(t *testing.T) {
-	ctx := context.Background()
-	tracking := &edgesAddTxTrackingStore{Store: newClientTestStore(t)}
-	bh, err := New(tracking)
-	require.NoError(t, err)
-
-	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	from, err := client.Create(ctx, cSpec{Val: "from"})
-	require.NoError(t, err)
-	to, err := client.Create(ctx, cSpec{Val: "to"})
-	require.NoError(t, err)
-
-	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID, to.ResourceVersion))
-	assert.True(t, tracking.addRefInTx,
-		"DependenciesAdd must wrap its endpoint check + insert in one transaction")
-}
-
 // TestAddDependencyAcceptsCycle records that beehive lets a caller declare a
-// cycle. It is the tripwire for the deferred fix in TODO.md's cycle entry: the
+// cycle. It is the tripwire for the deferred fix in docs/TODO.md's cycle entry: the
 // candidate that rejects a cycle-closing edge at declare time would make one of
 // these calls start returning an error, so whoever builds it trips a test that
 // states today's answer rather than discovering it.
 //
 // The waker's own cycle test cannot serve here — it drives edges through a fake,
 // so a declare-time check is invisible to it.
-//
-// A zero targetResourceVersion is "no opinion", which keeps this about acceptance
-// of the edge and out of the raced-declare guard's way.
 func TestAddDependencyAcceptsCycle(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	gk := GroupKind{Kind: "Widget"}
 	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
-	a, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	b, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	a := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	b := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
-	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, b.ID, 0))
-	require.NoError(t, cc.DependenciesAdd(ctx, b.ID, a.ID, 0), "a cycle-closing edge is accepted today")
-	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, a.ID, 0), "and so is a self-edge")
+	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, b.ID))
+	require.NoError(t, cc.DependenciesAdd(ctx, b.ID, a.ID), "a cycle-closing edge is accepted today")
+	require.NoError(t, cc.DependenciesAdd(ctx, a.ID, a.ID), "and so is a self-edge")
 }
 
-// declareFixture is the shared setup for the targetResourceVersion tests: a
-// running control plane, a dependent, and a target.
+// declareFixture is the shared setup for the dependency-declare tests: a
+// dependent, a target, and a control plane that is deliberately NOT started.
 //
-// The two live in *different kinds* on purpose. The edge is deliberately
+// Not started because the thing under test is now durable rather than in-flight.
+// A declaration that decides a wake is owed records it in reconcile_owed, and a
+// running reconcile loop would drain that count out from under the assertion —
+// so the tests read the count directly, which is both the mechanism and the only
+// thing that survives a process restart. That the owed-pass tick then turns the
+// count into a reconcile is covered end to end by
+// TestDependencyRequeueRaceOnDeclare.
+//
+// The two objects live in *different kinds* on purpose. The edge is deliberately
 // cross-kind, so cc — the ControllerClient the tests declare through — belongs to
 // the target's kind, not the dependent's: every test therefore exercises the
-// routing rule (the requeue follows fromID's own GroupKind, not the caller's) by
-// construction, and a wake misrouted to the declarer's reconciler shows up as a
-// dependent that was never woken. It also keeps reconciled free of the target's
-// own passes, so the channel carries only what these tests are asserting about.
+// routing rule (the stamp follows fromID's own GroupKind, not the caller's) by
+// construction, and a stamp misrouted to the declarer's kind shows up as a
+// dependent that owes nothing.
 type declareFixture struct {
 	cc          ControllerClient[tStatus] // the target kind's client: a foreign kind to dep
+	bh          *Beehive
 	store       Store
 	targetGK    GroupKind
-	depClient   Client[tSpec, tStatus] // creates the barrier object, see requireNotRequeued
+	depGK       GroupKind
 	dep, target *Object[tSpec, tStatus]
 	// witness is a second dependent of dep's kind whose edge to the target exists
-	// from the start. It is how moveTarget knows the waker has finished with a
-	// change: the waker requeues from its own lookup's results, so the witness
-	// reconciling is an effect that cannot precede that lookup — and it proves dep
-	// was absent from it. Watching the lookup itself cannot show that; a probe on
-	// EdgesListIncoming sees a call, not which change it is for, so one already in
-	// flight is indistinguishable from the one under test.
-	witness    *Object[tSpec, tStatus]
-	reconciled chan *Object[tSpec, tStatus] // dep's kind only
+	// from the start, so an assertion that a declaration left no edge can name what
+	// the listing should still contain rather than merely expecting it empty.
+	witness *Object[tSpec, tStatus]
 }
 
 func newDeclareFixture(t *testing.T) *declareFixture {
 	t.Helper()
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
-	depGK := GroupKind{Kind: "Dependent"}
 	f := &declareFixture{
-		store:      store,
-		targetGK:   GroupKind{Kind: "Target"},
-		reconciled: make(chan *Object[tSpec, tStatus], 8),
+		bh:       bh,
+		store:    store,
+		targetGK: GroupKind{Kind: "Target"},
+		depGK:    GroupKind{Kind: "Dependent"},
 	}
-	// Resync disabled: a requeue that arrives must be the declaration's doing.
-	// Single-threaded so dispatch order is the queue's FIFO order, which is what
-	// makes requireNotRequeued's barrier exact. That is the default; pinning it
-	// here keeps the barrier's precondition visible rather than inherited.
-	_, err = Register(bh, depGK, &reconcileCapture{ch: f.reconciled},
-		WithResyncInterval(0), WithConcurrency(1))
+	_, err := Register(bh, f.depGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
-	f.cc, err = Register(bh, f.targetGK, &noopController[tSpec, tStatus]{}, WithResyncInterval(0))
+	f.cc, err = Register(bh, f.targetGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
-	f.depClient = NewClient[tSpec, tStatus](bh, depGK)
-	f.dep, err = f.depClient.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	f.witness, err = f.depClient.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	f.target, err = NewClient[tSpec, tStatus](bh, f.targetGK).Create(ctx, tSpec{})
-	require.NoError(t, err)
+	depClient := NewClient[tSpec, tStatus](bh, f.depGK)
+	f.dep = mustCreate(t, ctx, depClient, "dep", tSpec{})
+	f.witness = mustCreate(t, ctx, depClient, "witness", tSpec{})
+	f.target = mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, f.targetGK), "target", tSpec{})
 	// Declared straight through the store: the witness's edge is scaffolding, not a
-	// use of the guard under test.
+	// use of the guard under test, and going through the store leaves it unstamped.
 	require.NoError(t, addEdge(ctx, store, f.witness.ID, f.target.ID, RelationDependsOn))
 
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	t.Cleanup(func() { stop(ctx) })
-
-	// Drain both creation reconciles, so anything arriving afterwards is
-	// attributable to what the test does next.
-	seen := map[ObjectID]bool{}
-	for len(seen) < 2 {
-		seen[recv(t, f.reconciled).ID] = true
-	}
-	require.Equal(t, map[ObjectID]bool{f.dep.ID: true, f.witness.ID: true}, seen)
 	return f
 }
 
-// moveTarget changes the target and returns the version it held before, i.e. the
-// one a decision taken before the change was based on. It returns once the waker
-// has resolved this change with no edge to the dependent yet, so the change is
-// unclaimed and every later requeue of the dependent is the declaration's doing.
-func (f *declareFixture) moveTarget(t *testing.T) int64 {
+// moveTarget changes the target, so a declaration that follows is one whose read
+// of it predates the change.
+func (f *declareFixture) moveTarget(t *testing.T) {
 	t.Helper()
-	before := f.target.ResourceVersion
-	_, err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
+	err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	require.Equal(t, f.witness.ID, recv(t, f.reconciled).ID,
-		"the waker resolved this change, and reached only the witness")
-	return before
 }
 
-// requireRequeued asserts the dependent was requeued.
-func (f *declareFixture) requireRequeued(t *testing.T) {
+// owed returns the dependent kind's owed-wake listing — what the owed-pass tick
+// would drain.
+func (f *declareFixture) owed(t *testing.T) []ObjectID {
 	t.Helper()
-	assert.Equal(t, f.dep.ID, recv(t, f.reconciled).ID)
-}
-
-// requireNotRequeued asserts the dependent was not requeued — an absence, proven
-// with a barrier rather than a deadline. Creating a fresh object of the
-// dependent's kind enqueues it strictly after any wake the declaration owed:
-// DependenciesAdd's post-commit hook has already run by the time it returns, and
-// the queue is FIFO over a single worker. So the dependent, if it had been woken,
-// must be dispatched before the barrier — and seeing the barrier first proves it
-// never was, with no waiting on the clock.
-func (f *declareFixture) requireNotRequeued(t *testing.T) {
-	t.Helper()
-	barrier, err := f.depClient.Create(context.Background(), tSpec{})
+	ids, err := f.store.ReconcileOwedListIDs(context.Background(), f.depGK)
 	require.NoError(t, err)
-	assert.Equal(t, barrier.ID, recv(t, f.reconciled).ID,
-		"the dependent was requeued ahead of the barrier; no wake was owed")
+	return ids
 }
 
-// TestAddDependencyWakesWhenTargetMovedSinceRead pins the fix for the
-// read-then-declare race: a target that moved past the version the caller read
-// requeues the dependent, because the change landed while no edge existed to
-// carry it. The declaration goes through the target kind's ControllerClient (see
-// declareFixture), so this also pins that the requeue routes by fromID's own
-// kind rather than the declarer's.
-func TestAddDependencyWakesWhenTargetMovedSinceRead(t *testing.T) {
-	f := newDeclareFixture(t)
-	asRead := f.moveTarget(t)
-	require.NoError(t, f.cc.DependenciesAdd(context.Background(), f.dep.ID, f.target.ID, asRead))
-	f.requireRequeued(t)
+// requireOwed asserts the declaration recorded a wake for the dependent.
+func (f *declareFixture) requireOwed(t *testing.T) {
+	t.Helper()
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.owed(t))
 }
 
-// TestAddDependencyNoWakeWhenTargetUnmoved is the anti-spin case, and the reason
-// the check is on the target's version rather than on the edge being new: a
-// level-triggered controller re-asserts its edges every pass, and nothing
-// throttles a self-sustaining requeue. See the rejected wake-when-the-edge-is-new
-// guard in TODO.md.
-func TestAddDependencyNoWakeWhenTargetUnmoved(t *testing.T) {
-	f := newDeclareFixture(t)
+// owedCount returns how many wakes the dependent owes — the count itself, not
+// just its presence in the listing, so a test can tell "stamped once" from
+// "stamped again on every pass".
+func (f *declareFixture) owedCount(t *testing.T) int64 {
+	t.Helper()
+	meta, err := f.store.ObjectsGetMeta(context.Background(), f.dep.ID)
+	require.NoError(t, err)
+	return meta.ReconcileOwed
+}
+
+// requireNotOwed asserts the declaration recorded nothing. It is an exact
+// assertion on the whole listing, not a deadline: the count is durable, so its
+// absence needs no waiting to prove.
+func (f *declareFixture) requireNotOwed(t *testing.T) {
+	t.Helper()
+	assert.Empty(t, f.owed(t), "no wake was owed")
+}
+
+// queued returns what gk's work queue holds. Register builds the queue, so an
+// enqueue is observable with no driver running: these tests assert that the
+// declaration queued the object, not that a later pass found it.
+func (f *declareFixture) queued(t *testing.T, gk GroupKind) []ObjectID {
+	t.Helper()
+	return queuedIDs(mustReconciler(t, f.bh, gk).work)
+}
+
+func mustReconciler(t *testing.T, bh *Beehive, gk GroupKind) *reconciler {
+	t.Helper()
+	r, ok := bh.reconcilerFor(gk)
+	require.True(t, ok, "the kind must be registered to have a queue")
+	return r
+}
+
+// sameKindFixture is one registered kind holding a source and a target, which is
+// the simple shape of a declaration. newDeclareFixture is the cross-kind one.
+type sameKindFixture struct {
+	cc          ControllerClient[tStatus]
+	r           *reconciler
+	dep, target *Object[tSpec, tStatus]
+}
+
+// newSameKindFixture leaves the work queue empty. Each create enqueues its own
+// object, so draining here is what makes the queue afterwards hold the
+// declaration's work and nothing else.
+func newSameKindFixture(t *testing.T) *sameKindFixture {
+	t.Helper()
 	ctx := context.Background()
-	// Re-assert the same edge repeatedly with a current version, as a controller
-	// converging on an unchanging target does.
-	for range 3 {
-		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+	bh := newTestBeehive(t, newClientTestStore(t))
+	gk := GroupKind{Kind: "Widget"}
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	client := NewClient[tSpec, tStatus](bh, gk)
+	f := &sameKindFixture{
+		cc:     cc,
+		r:      mustReconciler(t, bh, gk),
+		dep:    mustCreate(t, ctx, client, uniqueName(), tSpec{}),
+		target: mustCreate(t, ctx, client, uniqueName(), tSpec{}),
 	}
-	f.requireNotRequeued(t)
+	drainQueue(f.r.work)
+	return f
 }
 
-// TestAddDependencyRejectsFutureResourceVersion pins the one wrong value the call
-// can actually detect. Versions come from one global cursor, so any other object's
-// is a plausible-looking int64 — but the target's own only moves forward, so a
-// version above it cannot have been read from the target. Left to stand it would
-// disable the guard silently and permanently (the comparison can never fire), so
-// it is rejected, and the edge rolls back with the transaction rather than
-// persisting with an inert guard.
-func TestAddDependencyRejectsFutureResourceVersion(t *testing.T) {
+func (f *sameKindFixture) queued() []ObjectID { return queuedIDs(f.r.work) }
+
+// TestAddDependencyWakesOncePerEdge pins the declare-time guarantee and its
+// bound together. The guarantee: the call that creates the edge records one owed
+// reconcile, durably, so a declare reaches its dependent whatever the target was
+// doing — including a change that landed between the caller's read and the
+// declare, which no scan could carry because the edge did not exist yet. The
+// declaration goes through the target kind's ControllerClient (see
+// declareFixture), so this also pins that the wake routes by fromID's own kind
+// rather than the declarer's. The bound: only the edge-creating call stamps, so a
+// level-triggered controller re-asserting its set every pass — and nothing
+// throttles a self-sustaining requeue — adds nothing after the first, even after
+// the target moves again.
+func TestAddDependencyWakesOncePerEdge(t *testing.T) {
 	f := newDeclareFixture(t)
 	ctx := context.Background()
+	// The target moved after the caller's read and before the declare: the case a
+	// write-log scan structurally cannot see.
+	f.moveTarget(t)
 
-	err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1)
-	require.ErrorIs(t, err, ErrTargetResourceVersionFuture)
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	f.requireOwed(t)
+	require.EqualValues(t, 1, f.owedCount(t))
 
-	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "a rejected declaration leaves no edge")
-	f.requireNotRequeued(t)
+	// Every later pass re-asserts the same edge, as a converging controller does.
+	// The count is what makes this exact: a re-fire would be invisible in the
+	// listing (already there from the first) but shows up here immediately.
+	for range 3 {
+		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	}
+	require.EqualValues(t, 1, f.owedCount(t), "the edge is no longer new, so no later declare stamps again")
 
-	// The target's own current version is the boundary, and is accepted.
-	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion))
+	// Nor does the target moving make a re-declare stamp: once the edge exists,
+	// delivering changes is the waker's and the stale pass's job.
+	f.moveTarget(t)
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	assert.EqualValues(t, 1, f.owedCount(t), "one wake per edge created, not per declare")
 }
 
 // TestAddDependencyStampRidesRefsAdd pins that the durable stamp is not a second
-// store call sequenced after the edge. Were it one, a caller nested in its own
-// Within could handle this method's error and commit the edge with no wake — a
-// dependent stranded on a stale read, the very race the version claim closes —
-// because a nested Within is a bare fn(ctx) that unwinds nothing.
+// store call sequenced after the edge, but a write inside EdgesAdd itself — so the
+// edge and its wake are indivisible in the store rather than by grace of the caller's
+// transaction being a real rollback boundary.
 //
 // That the stamp *cannot* be a second call is now structural: the Store interface
 // carries no standalone increment, so nothing on this path could issue one. What
@@ -610,24 +650,16 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	ctx := context.Background()
 	real := newClientTestStore(t)
 
-	bh, err := New(real)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, real)
 	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithResyncInterval(0))
+	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithFullPassInterval(0))
 	require.NoError(t, err)
 
 	client := NewClient[tSpec, tStatus](bh, gk)
-	dep, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
-	target, err := client.Create(ctx, tSpec{})
-	require.NoError(t, err)
+	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
-	stale := target.ResourceVersion
-	_, err = real.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
-	require.NoError(t, err)
-
-	// Conjunction fires: new edge, target moved past stale.
-	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID, stale))
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
 	refs, err := real.EdgesListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
@@ -638,60 +670,225 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
 }
 
-// TestAddDependencyRejectsFutureResourceVersionNested is the rejection's harder
-// case: nested in a caller's Within, whose error the caller swallows. A nested
-// Within is a bare fn(ctx) with no transaction of its own, so returning the error
-// unwinds nothing — only the caller propagating it can roll anything back. The
-// edge must therefore never be written in the first place.
-func TestAddDependencyRejectsFutureResourceVersionNested(t *testing.T) {
-	f := newDeclareFixture(t)
+// TestAddDependencyEnqueuesItsSource pins the latency this closes. The durable
+// stamp records that the source owes a reconcile, but nothing scheduled it, so the
+// first pass waited for the owed-pass tick. The declaration now enqueues the source
+// when the edge commits.
+//
+// The source and the target share a kind here, which is the simple case. The
+// cross-kind case has its own test, because it is the one that fails if the enqueue
+// routes by the caller's kind.
+func TestAddDependencyEnqueuesItsSource(t *testing.T) {
 	ctx := context.Background()
+	f := newSameKindFixture(t)
 
-	err := f.cc.Within(ctx, func(ctx context.Context) error {
-		if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, f.target.ResourceVersion+1); err != nil {
-			return nil // the caller logs and carries on; the outer tx still commits
-		}
-		return nil
-	})
-	require.NoError(t, err)
-
-	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "a rejected declaration must leave no edge, committed or not")
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(), "the new edge queues its source")
 }
 
-// TestAddDependencyStaleResourceVersionWakesAtMostOnce pins the wake's
-// once-per-edge bound against the caller who gets it wrong. A version that never
-// advances — cached across passes, or read once and reused — compares as "moved"
-// forever, so gating on that alone would re-fire every pass, and nothing throttles
-// the result. The edge-new half of the conjunction is what stops it: the second
-// declaration inserts nothing, so it wakes nothing, however stale the version.
-func TestAddDependencyStaleResourceVersionWakesAtMostOnce(t *testing.T) {
-	f := newDeclareFixture(t)
+// TestAddDependencyEnqueuesOnlyWhatItStamped pins the gate. The enqueue reads the
+// store's report of what the write did — EdgesAddResult.ReconcileOwedStamped — and
+// never the fact that the caller called DependenciesAdd.
+//
+// The gate is what bounds the enqueue. A level-triggered controller re-asserts its
+// whole dependency set on every pass, so an enqueue per call would schedule a pass
+// per pass, forever. Worse, requeueNow on an id that is in flight makes it
+// dispatchable at once, so a failing controller would retry at full speed and never
+// climb its backoff ladder. Only a genuinely new edge stamps, so only a genuinely
+// new edge queues, and the bound is one enqueue per edge ever created.
+//
+// A self-edge stamps nothing for the same reason the store excludes it: an object
+// that depends on itself owes no wake from itself.
+func TestAddDependencyEnqueuesOnlyWhatItStamped(t *testing.T) {
 	ctx := context.Background()
-	stale := f.moveTarget(t)
+	f := newSameKindFixture(t)
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+	drainQueue(f.r.work)
 
-	// First declaration: the edge is new and the target moved, so this is the
-	// requeue the guard exists for.
-	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, stale))
-	f.requireRequeued(t)
-
-	// Every later pass re-asserts the same edge with the same stale version.
+	// The edge exists now, so every later declare of it stamps nothing.
 	for range 3 {
-		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, stale))
+		require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
 	}
-	f.requireNotRequeued(t)
+	assert.Empty(t, f.queued(), "a re-asserted edge is not new, so it queues nothing")
+
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.dep.ID))
+	assert.Empty(t, f.queued(), "a self-edge stamps nothing, so it queues nothing")
 }
 
-// TestAddDependencyZeroResourceVersionSkipsCheck pins the sentinel: 0 is "no
-// opinion", the correct value when the edge is declared before the target is
-// read. It must not mean "wake unconditionally" — that would reproduce the spin
-// above in any caller that passes the zero value.
-func TestAddDependencyZeroResourceVersionSkipsCheck(t *testing.T) {
+// TestAddDependencyEnqueueRoutesByTheSourcesKind pins the routing. Edges are
+// cross-kind: a controller may declare a dependency on another kind's behalf, so
+// fromID is not necessarily the caller's kind. The enqueue must reach the
+// reconciler that owns the source.
+//
+// The fixture declares through the target kind's ControllerClient, so the source
+// belongs to a foreign kind by construction. An enqueue routed by the caller's kind
+// would reach the target kind's queue, or a kind with no reconciler at all, and the
+// source would wait for the owed pass. Nothing else in the suite catches that.
+func TestAddDependencyEnqueueRoutesByTheSourcesKind(t *testing.T) {
 	f := newDeclareFixture(t)
-	f.moveTarget(t)
-	require.NoError(t, f.cc.DependenciesAdd(context.Background(), f.dep.ID, f.target.ID, 0))
-	f.requireNotRequeued(t)
+	ctx := context.Background()
+	drainQueue(mustReconciler(t, f.bh, f.depGK).work)
+	drainQueue(mustReconciler(t, f.bh, f.targetGK).work)
+
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(t, f.depGK), "the source's own kind is queued")
+	assert.Empty(t, f.queued(t, f.targetGK), "the declarer's kind is not")
+}
+
+// TestAddDependencyEnqueuesNothingOnRollback pins that the enqueue rides
+// AfterCommit. A declaration the caller's transaction discards never happened, so
+// there is nothing to schedule.
+//
+// Neither shape here is what an ordinary reconcile produces: a reconcile opens no
+// transaction, so the hook usually runs inline and there is nothing to unwind. Both
+// shapes are opt-in, and they are the only ones that can roll back at all. The
+// nested case is the savepoint unwind, where the inner frame's hooks must go even
+// though the outer frame commits nothing.
+func TestAddDependencyEnqueuesNothingOnRollback(t *testing.T) {
+	runCommitRollback(t, func(t *testing.T, commit bool) {
+		f := newDeclareFixture(t)
+		ctx := context.Background()
+		drainQueue(mustReconciler(t, f.bh, f.depGK).work)
+
+		err := f.cc.Within(ctx, func(ctx context.Context) error {
+			return f.cc.Within(ctx, func(ctx context.Context) error {
+				if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID); err != nil {
+					return err
+				}
+				if commit {
+					return nil
+				}
+				return errBoom
+			})
+		})
+		if commit {
+			require.NoError(t, err)
+			assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(t, f.depGK), "a committed declaration queues")
+			return
+		}
+		require.ErrorIs(t, err, errBoom)
+		assert.Empty(t, f.queued(t, f.depGK), "a rolled-back declaration queues nothing")
+	})
+}
+
+// TestAddDependencyOnAClientOnlyKindEnqueuesNothing pins that a source whose kind
+// has no reconciler is not an error. The stamp still lands, and nothing in this
+// process drains it — which is unchanged by the enqueue, and is the client-only
+// kind's existing gap rather than one this path opens.
+func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	targetGK := GroupKind{Kind: "Target"}
+	cc, err := Register(bh, targetGK, &noopController[tSpec, tStatus]{})
+	require.NoError(t, err)
+
+	clientOnly := GroupKind{Kind: "NoController"}
+	dep := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnly), uniqueName(), tSpec{})
+	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, targetGK), uniqueName(), tSpec{})
+
+	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID), "an unroutable enqueue is not an error")
+
+	owed, err := store.ReconcileOwedListIDs(ctx, clientOnly)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{dep.ID}, owed, "the durable stamp still lands")
+}
+
+// redeclareController fails on every pass and re-asserts the same dependency each
+// time, which is the converging shape a level-triggered controller has. It fires
+// first on its first failing pass and hot once it has run enough times to prove
+// the backoff was bypassed.
+//
+// The target succeeds and is left alone. It shares this controller, so failing it
+// too would put a second backoff ladder under one counter, and the test could not
+// say which object's passes it had counted.
+type redeclareController struct {
+	target     ObjectID
+	calls      atomic.Int64
+	first, hot *signal
+}
+
+func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+	if obj.ID == c.target {
+		return Result{}, nil
+	}
+	if c.calls.Add(1) >= hotLoopCalls {
+		c.hot.fire()
+	}
+	c.first.fire()
+	_ = cc.DependenciesAdd(ctx, obj.ID, c.target)
+	return Result{}, errBoom
+}
+
+// TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges pins the bound the
+// gate buys. A controller that re-asserts the same dependency on every failing pass
+// creates no edge after the first, so it stamps nothing, queues nothing, and climbs
+// its backoff ladder as it would with no declaration at all.
+//
+// This is the shape almost every controller has. The shape that escapes it has its
+// own test below.
+func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), withoutGCSweeper())
+	gk := GroupKind{Kind: "Widget"}
+	ctrl := &redeclareController{first: newSignal(), hot: newSignal()}
+	_, err := Register(bh, gk, ctrl)
+	require.NoError(t, err)
+	client := NewClient[tSpec, tStatus](bh, gk)
+
+	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
+	ctrl.target = target.ID
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(context.Background())
+
+	_ = mustCreate(t, ctx, client, uniqueName(), tSpec{})
+
+	requireNoHotLoop(t, ctrl.first, ctrl.hot, &ctrl.calls,
+		"a re-asserted edge must not requeue past the backoff")
+}
+
+// TestANewEdgeOnAnInFlightSourceRespectsTheBackoff closes what the
+// stamp-every-new-edge ADR pinned as an accepted cost: a source creating a
+// genuinely new edge on every failing pass used to lose its backoff ladder,
+// because the push went through requeueNow, which marks an in-flight id dirty
+// and work.done then makes it dispatchable ahead of the alarm.
+//
+// The push now goes through work.add, so the re-enqueue floor opened by the
+// dispatch holds it, and the backoff the worker sets a line later takes the
+// floor's place. The stamp is durable either way, so nothing is lost — the owed
+// pass still carries the dependent.
+//
+// The assertion is on the mechanism and not on the clock. "Retries on the
+// ladder" is a claim about time, and this suite has no clock to assert on, so
+// the test drives the worker's own sequence — get, declare, done, addAfter —
+// and asserts the id is not dispatchable while an alarm holds it.
+func TestANewEdgeOnAnInFlightSourceRespectsTheBackoff(t *testing.T) {
+	ctx := context.Background()
+	f := newSameKindFixture(t)
+
+	// Take the id, as a worker does before it runs the controller. The dispatch
+	// opens the source's floor.
+	f.r.work.add(f.dep.ID)
+	got, ok := f.r.work.get()
+	require.True(t, ok)
+	require.Equal(t, f.dep.ID, got)
+
+	// The controller declares a new dependency and then fails.
+	require.NoError(t, f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID))
+
+	// runWorker releases the id and only then sets the backoff.
+	f.r.work.done(f.dep.ID)
+	f.r.work.addAfter(f.dep.ID, time.Hour, alarmBackoff)
+
+	assert.Empty(t, f.queued(), "the declaration must not jump the ladder")
+	at := f.r.work.scheduleAt(f.dep.ID).NextRequeueAt
+	assert.True(t, at.After(time.Now().Add(time.Minute)),
+		"the id is on the backoff ladder, got %s", at)
 }
 
 // TestAddDependencyNoWakeOnRollback pins that the wake is registered post-commit:
@@ -700,10 +897,9 @@ func TestAddDependencyZeroResourceVersionSkipsCheck(t *testing.T) {
 func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	f := newDeclareFixture(t)
 	ctx := context.Background()
-	asRead := f.moveTarget(t)
 
 	err := f.cc.Within(ctx, func(ctx context.Context) error {
-		if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID, asRead); err != nil {
+		if err := f.cc.DependenciesAdd(ctx, f.dep.ID, f.target.ID); err != nil {
 			return err
 		}
 		return errBoom
@@ -713,14 +909,13 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "the rolled-back declaration left no edge")
-	f.requireNotRequeued(t)
+	f.requireNotOwed(t)
 }
 
 func TestControllerClientHasIncomingEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -729,10 +924,8 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 	defer stop(ctx)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
 	has, err := cc.EdgesHasIncoming(ctx, owner.ID)
 	require.NoError(t, err)
@@ -750,20 +943,24 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 // rows. DependenciesAdd/EdgesHasIncoming are intentionally cross-kind and not guarded.
 func TestControllerClientWritesScopedToKind(t *testing.T) {
 	ctx := context.Background()
-	bh, err := New(newClientTestStore(t))
-	require.NoError(t, err)
+	bh := newTestBeehive(t, newClientTestStore(t))
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
 	require.NoError(t, err)
+	// "Gadget" gets a controller of its own so the finalizer below is legal to
+	// create. It is foreign to cc either way — that is the point of the test — and
+	// having its own controller is what makes ErrWrongKind the *only* thing standing
+	// between cc and the row.
+	gadgetGK := GroupKind{Kind: "Gadget"}
+	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
 
-	// A "Gadget" is a foreign kind to this controller. Give it a finalizer so the
-	// FinalizersDelete attempt has a target to (fail to) remove.
-	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
-	gadget, err := gadgets.Create(ctx, cSpec{Val: "v1"}, WithFinalizers("f"))
-	require.NoError(t, err)
+	// Give the Gadget a finalizer so the FinalizersDelete attempt has a target to
+	// (fail to) remove.
+	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
+	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
 
 	require.ErrorIs(t, cc.UpdateStatus(ctx, gadget.ID, 1, cStatus{Val: "hijacked"}), ErrWrongKind)
 	require.ErrorIs(t, cc.ConditionsSet(ctx, gadget.ID, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
@@ -788,10 +985,9 @@ func (s *failEdgesHasIncomingStore) EdgesHasIncoming(context.Context, ObjectID) 
 }
 
 func TestControllerClientHasIncomingRefsStoreError(t *testing.T) {
-	bh, err := New(&failEdgesHasIncomingStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failEdgesHasIncomingStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	_, err = cc.EdgesHasIncoming(context.Background(), 1)
+	_, err := cc.EdgesHasIncoming(context.Background(), 1)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -800,15 +996,14 @@ type failEdgesAddStore struct {
 	fakeStore
 }
 
-func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation, int64) (storeapi.EdgesAddResult, error) {
+func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	return storeapi.EdgesAddResult{}, errBoom
 }
 
 func TestControllerClientAddDependencyStoreError(t *testing.T) {
-	bh, err := New(&failEdgesAddStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failEdgesAddStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.DependenciesAdd(context.Background(), 1, 2, 0)
+	err := cc.DependenciesAdd(context.Background(), 1, 2)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -831,8 +1026,8 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) (*RawObject, error) {
-	return nil, errBoom
+func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
+	return errBoom
 }
 
 // errStatusMarshaler is a Status type whose JSON marshaling always fails.
@@ -841,18 +1036,16 @@ type errStatusMarshaler struct{}
 func (errStatusMarshaler) MarshalJSON() ([]byte, error) { return nil, errBoom }
 
 func TestControllerClientUpdateStatusMarshalError(t *testing.T) {
-	bh, err := New(&kindTStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &kindTStore{})
 	cc := &controllerClientImpl[errStatusMarshaler]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
+	err := cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
 	require.Error(t, err)
 }
 
 func TestControllerClientUpdateStatusStoreError(t *testing.T) {
-	bh, err := New(&failUpdateStatusStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failUpdateStatusStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
+	err := cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
 	require.Error(t, err)
 }
 
@@ -861,120 +1054,139 @@ type failEdgesDeleteStore struct {
 	fakeStore
 }
 
-func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
-	return errBoom
+func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+	return storeapi.EdgesDeleteResult{}, errBoom
 }
 
 // TestControllerClientDeleteDependencyDeleteRefError covers the EdgesDelete failure
 // branch: the edge removal itself fails, so the whole DependenciesDelete errors.
 func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
-	bh, err := New(&failEdgesDeleteStore{})
-	require.NoError(t, err)
+	bh := newTestBeehive(t, &failEdgesDeleteStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err = cc.DependenciesDelete(context.Background(), 1, 2)
+	err := cc.DependenciesDelete(context.Background(), 1, 2)
 	require.ErrorIs(t, err, errBoom)
 }
 
-// metaDeleteDepStore lets a DependenciesDelete test control what ObjectsGetMeta
-// returns after the edge is dropped. EdgesDelete succeeds; the rest defaults to the
-// fakeStore (Within inline, no-ops).
-type metaDeleteDepStore struct {
-	fakeStore
-	meta    *RawObject
-	metaErr error
+// Dropping the last live referrer is one of the routes out of a RESTRICT-blocked
+// collect, so it pushes rather than waiting out a GC tick.
+func TestDependenciesDeletePushesTheBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work))
 }
 
-func (s *metaDeleteDepStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
-	return nil
-}
-func (s *metaDeleteDepStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
-	return s.meta, s.metaErr
-}
+// The three gates that decline the push: a live target, an edge that was never
+// there, and a dependent already finalizing (whose edge blocks nothing).
+func TestDependenciesDeletePushesNothingOtherwise(t *testing.T) {
+	tests := []struct {
+		name            string
+		declare         bool
+		deleteTarget    bool
+		deleteDependent bool
+	}{
+		{name: "live target", declare: true},
+		{name: "missing edge", deleteTarget: true},
+		{name: "finalizing dependent", declare: true, deleteTarget: true, deleteDependent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, client, cc, r := specWriteFixture(t)
 
-// TestControllerClientDeleteDependencyTargetGone covers the post-edge re-check
-// when the target is already gone: ObjectsGetMeta reports ErrNotFound, which is
-// swallowed (nothing to wake). The wake collector must be present to reach it.
-func TestControllerClientDeleteDependencyTargetGone(t *testing.T) {
-	bh, err := New(&metaDeleteDepStore{metaErr: ErrNotFound})
-	require.NoError(t, err)
-	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+			target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+			dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+			if tt.declare {
+				require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+			}
+			if tt.deleteTarget {
+				require.NoError(t, client.Delete(ctx, target.ID))
+			}
+			if tt.deleteDependent {
+				require.NoError(t, client.Delete(ctx, dependent.ID))
+			}
+			drainQueue(r.work)
 
-	wakes := &pendingWakes{}
-	ctx := withPendingWakes(context.Background(), wakes)
-	require.NoError(t, cc.DependenciesDelete(ctx, 1, 2))
-	assert.Empty(t, wakes.targets, "a gone target schedules no wake")
-}
-
-// TestControllerClientDeleteDependencyMetaError covers ObjectsGetMeta failing with
-// a non-ErrNotFound error after the edge is dropped: it propagates out.
-func TestControllerClientDeleteDependencyMetaError(t *testing.T) {
-	bh, err := New(&metaDeleteDepStore{metaErr: errBoom})
-	require.NoError(t, err)
-	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-
-	ctx := withPendingWakes(context.Background(), &pendingWakes{})
-	err = cc.DependenciesDelete(ctx, 1, 2)
-	require.ErrorIs(t, err, errBoom)
-}
-
-// TestControllerClientDeleteDependencyWakesFinalizingTarget covers the happy wake
-// path: the freed target is itself finalizing, so it's appended to the collector
-// for a post-commit GC re-check.
-func TestControllerClientDeleteDependencyWakesFinalizingTarget(t *testing.T) {
-	now := time.Now()
-	meta := &RawObject{ID: 2, Group: "g", Kind: "K", DeletionRequestedAt: &now}
-	bh, err := New(&metaDeleteDepStore{meta: meta})
-	require.NoError(t, err)
-	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-
-	wakes := &pendingWakes{}
-	ctx := withPendingWakes(context.Background(), wakes)
-	require.NoError(t, cc.DependenciesDelete(ctx, 1, 2))
-	assert.Equal(t, []ObjectRef{{ID: 2, Group: "g", Kind: "K"}}, wakes.targets,
-		"a finalizing freed target is scheduled for a GC re-check")
+			require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+			assert.Empty(t, queuedIDs(r.work))
+		})
+	}
 }
 
-// TestControllerClientDeleteDependencyTargetAliveNotFinalizing covers the case
-// where the freed target still exists and is not finalizing: nothing is scheduled
-// to wake (it's a live object, GC has no interest in it).
-func TestControllerClientDeleteDependencyTargetAliveNotFinalizing(t *testing.T) {
-	meta := &RawObject{ID: 2, Group: "g", Kind: "K"} // DeletionRequestedAt nil
-	bh, err := New(&metaDeleteDepStore{meta: meta})
-	require.NoError(t, err)
-	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+// The edge is cross-kind, so the push routes by the target's kind rather than
+// the controller's own.
+func TestDependenciesDeletePushesAcrossKinds(t *testing.T) {
+	ctx := context.Background()
+	bh, client, cc, depR := specWriteFixture(t)
+	targetGK := GroupKind{Kind: "DropTarget"}
+	registerNoop[cSpec, cStatus](t, bh, targetGK)
+	targetR := mustReconciler(t, bh, targetGK)
+	targetClient := NewClient[cSpec, cStatus](bh, targetGK)
 
-	wakes := &pendingWakes{}
-	ctx := withPendingWakes(context.Background(), wakes)
-	require.NoError(t, cc.DependenciesDelete(ctx, 1, 2))
-	assert.Empty(t, wakes.targets, "a live, non-finalizing target schedules no wake")
+	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	drainQueue(depR.work)
+	drainQueue(targetR.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(targetR.work), "the target's own kind is queued")
+	assert.Empty(t, queuedIDs(depR.work), "the dependent's kind is not")
 }
 
-// TestControllerClientDeleteDependencyNoWakesOutsideReconcile covers the early
-// return when there's no collector on the ctx (called outside a reconcile):
-// ObjectsGetMeta is never reached, so even a panicking ObjectsGetMeta is fine.
-func TestControllerClientDeleteDependencyNoWakesOutsideReconcile(t *testing.T) {
-	bh, err := New(&metaDeleteDepStore{metaErr: errBoom})
-	require.NoError(t, err)
-	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
+// The target is finalizing, so it already carries an alarm from its own delete
+// push; an absorbed push would wait out the ladder the sweep was going to beat.
+func TestDependenciesDeletePushBeatsAPendingAlarm(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
 
-	// No withPendingWakes: pendingWakesFrom(ctx) is nil, so it returns before the
-	// ObjectsGetMeta call that would otherwise fail.
-	require.NoError(t, cc.DependenciesDelete(context.Background(), 1, 2))
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+	// Long enough that the alarm firing on its own would be the test hanging,
+	// not the assertion passing.
+	r.work.addAfter(target.ID, time.Hour, alarmBackoff)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work), "the drop beats the backoff alarm")
+}
+
+// A client-only target resolves to no reconciler; the sweeper stays its route.
+func TestDependenciesDeleteSkipsClientOnlyTarget(t *testing.T) {
+	ctx := context.Background()
+	bh, client, cc, r := specWriteFixture(t)
+	targetClient := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "UnregisteredTarget"})
+
+	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, targetClient.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.DependenciesDelete(ctx, dependent.ID, target.ID))
+	assert.Empty(t, queuedIDs(r.work))
 }
 
 func TestControllerClientReadEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh, err := New(store)
-	require.NoError(t, err)
+	bh := newTestBeehive(t, store)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	owner, err := client.Create(ctx, cSpec{Val: "owner"})
-	require.NoError(t, err)
-	child, err := client.Create(ctx, cSpec{Val: "child"}, WithOwner(owner.ID))
-	require.NoError(t, err)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, RelationDependsOn))
 
 	ref, ok, err := cc.OwnersGet(ctx, child.ID)

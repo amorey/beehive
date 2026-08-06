@@ -29,23 +29,15 @@ import (
 // targets it understands and ignores the rest.
 type Option func(target any) error
 
-// ErrConflictingOption reports an option that contradicts an argument the call
-// already carries — passing WithSlug to a method that takes the slug positionally,
-// for instance. It is distinct from an option being *inapplicable*: an option
-// aimed at a target it doesn't understand is ignored by design (see Option), while
-// a contradiction is a caller mistake whose effect would otherwise be invisible.
-var ErrConflictingOption = errors.New("beehive: option conflicts with an explicit argument")
-
-// ErrInvalidOption reports an option carrying a value that has no meaning — a
-// non-positive GC interval, for instance. Unlike ErrConflictingOption it is about
-// the argument alone, so it is returned regardless of the target the option lands
-// on: a value that means nothing at one call site means nothing at any of them.
+// ErrInvalidOption reports an option value that has no meaning (e.g. a
+// non-positive GC interval). It is about the argument alone, so it is returned
+// regardless of the target — distinct from an option being inapplicable, which
+// is ignored by design.
 var ErrInvalidOption = errors.New("beehive: option value is invalid")
 
-// LoadOption selects a secondary lookup to fetch alongside an object on a read.
-// It is distinct from Option: it applies only to read call sites (Get/GetBySlug/
-// List), composing into a LoadSet. Lazy fetching is the alternative — omit the
-// selector and call Client.OwnersGet/DependenciesList when the data is needed.
+// LoadOption selects a secondary lookup to fetch alongside an object on a read
+// (Get/GetByName/List). The lazy alternative: omit it and call
+// Client.OwnersGet/DependenciesList when the data is needed.
 type LoadOption func(*LoadSet)
 
 // LoadOwner selects the object's owner (its outgoing owned_by edge).
@@ -68,9 +60,8 @@ func LoadOwned() LoadOption {
 	return func(s *LoadSet) { *s |= LoadOwnedBit }
 }
 
-// LoadEvents selects the object's event-log runs, read via Object.Events().
-// It loads the object's current runs (bounded by retention); for filtered or
-// bounded reads use the lazy Client.EventsList with EventOptions instead.
+// LoadEvents selects the object's event-log runs, read via Object.Events(). For
+// filtered or bounded reads use the lazy Client.EventsList instead.
 func LoadEvents() LoadOption {
 	return func(s *LoadSet) { *s |= LoadEventsBit }
 }
@@ -84,19 +75,16 @@ func resolveLoads(opts []LoadOption) LoadSet {
 	return set
 }
 
-// RequeueOption configures a Client.Requeue call. Like LoadOption it is distinct
-// from Option: it applies only to Requeue.
+// RequeueOption configures a Client.Requeue call.
 type RequeueOption func(*requeueOptions)
 
 type requeueOptions struct {
 	resetBackoff bool
 }
 
-// WithResetBackoff makes a Requeue clear the object's retry backoff ladder so its
-// next failure retries from the base interval. Pass it only when the caller has
-// proof the failure condition is resolved. A plain Requeue preserves the ladder:
-// backoff is cleared by a successful reconcile or an explicit WithResetBackoff, never
-// by merely being asked to try again.
+// WithResetBackoff makes a Requeue clear the object's retry backoff ladder.
+// Pass it only when the failure condition is known to be resolved; a plain
+// Requeue preserves the ladder.
 func WithResetBackoff() RequeueOption {
 	return func(o *requeueOptions) { o.resetBackoff = true }
 }
@@ -110,61 +98,70 @@ func resolveRequeue(opts []RequeueOption) requeueOptions {
 	return o
 }
 
-// EventOption filters a Client.EventsList / EventsWatch read. Like LoadOption and
-// RequeueOption it is distinct from Option: it applies only to the event reads,
-// composing into the store's event query.
-type EventOption func(*storeapi.EventQuery)
+// EventOption configures a Client.EventsList / EventsWatch read.
+type EventOption func(*eventConfig)
 
-// WithEventCategory restricts a read to a single timeline. The category "" is the
-// default timeline (distinct from "no filter", which is the absence of this option).
+// eventConfig is what the event options fold into: the store query every read
+// takes, plus the stream position only a watch reads.
+type eventConfig struct {
+	query storeapi.EventQuery
+	// resumeFrom is the position to stream above, or nil to take a snapshot.
+	resumeFrom *int64
+}
+
+// WithEventCategory restricts a read to a single timeline. The category "" is
+// the default timeline (distinct from "no filter", the absence of this option).
 func WithEventCategory(category string) EventOption {
-	return func(q *storeapi.EventQuery) { q.Category = &category }
+	return func(c *eventConfig) { c.query.Category = &category }
 }
 
 // WithEventType restricts a read to one severity (Normal or Warning).
 func WithEventType(t EventType) EventOption {
-	return func(q *storeapi.EventQuery) { q.Type = string(t) }
+	return func(c *eventConfig) { c.query.Type = string(t) }
 }
 
 // WithEventReason restricts a read to runs with the given reason.
 func WithEventReason(reason string) EventOption {
-	return func(q *storeapi.EventQuery) { q.Reason = reason }
+	return func(c *eventConfig) { c.query.Reason = reason }
 }
 
-// WithEventLimit caps a read to the newest n runs. It bounds only the snapshot of
-// a EventsWatch subscription, not its live stream.
+// WithEventLimit caps a read to the newest n runs. On EventsWatch it bounds the
+// snapshot only: a tail has no end to count back from.
 func WithEventLimit(n int) EventOption {
-	return func(q *storeapi.EventQuery) { q.Limit = n }
+	return func(c *eventConfig) { c.query.Limit = n }
 }
 
 // WithEventsSince restricts a read to runs still active at or after t (LastAt >= t).
 func WithEventsSince(t time.Time) EventOption {
-	return func(q *storeapi.EventQuery) { q.Since = t }
+	return func(c *eventConfig) { c.query.Since = t }
 }
 
-// resolveEvents folds the per-call options into a single store event query.
-func resolveEvents(opts []EventOption) storeapi.EventQuery {
-	var q storeapi.EventQuery
+// WithEventsResumeFrom streams the runs above rv instead of taking a snapshot.
+// EventsWatch only — the other reads ignore it, the way an Option ignores a
+// target it does not recognise. A position retention has passed ends the stream
+// with ErrWatchTooOld, answered by subscribing again without this option.
+func WithEventsResumeFrom(rv int64) EventOption {
+	return func(c *eventConfig) { c.resumeFrom = &rv }
+}
+
+// resolveEvents folds the per-call options into one config.
+func resolveEvents(opts []EventOption) eventConfig {
+	var c eventConfig
 	for _, o := range opts {
-		o(&q)
+		o(&c)
 	}
-	return q
+	return c
 }
 
 // createOptions collects the per-object settings the create-time options apply.
-// Client.Create builds one, runs the options against it, and folds the result
-// into the new row (slug/finalizers) and its owner ref.
 type createOptions struct {
-	slug       *string
 	finalizers []string
 	owner      *ObjectID
 	onCreate   func(context.Context)
 }
 
-// resolveCreate folds the create-time options into one createOptions, the
-// counterpart to resolveLoads/resolveRequeue/resolveEvents for the create
-// family. It errors on the first option that does, so a bad option fails the
-// call before any store work.
+// resolveCreate folds the create-time options into one createOptions, erroring
+// on the first option that does so a bad option fails before any store work.
 func resolveCreate(opts []Option) (*createOptions, error) {
 	co := &createOptions{}
 	for _, o := range opts {
@@ -175,18 +172,15 @@ func resolveCreate(opts []Option) (*createOptions, error) {
 	return co, nil
 }
 
-// WithSlug sets the object's unique slug, looked up later via GetBySlug.
-func WithSlug(slug string) Option {
-	return func(target any) error {
-		if t, ok := target.(*createOptions); ok {
-			t.slug = &slug
-		}
-		return nil
-	}
-}
-
 // WithFinalizers attaches finalizers that must be cleared before an object is
 // physically deleted.
+//
+// It requires a controller registered for the kind in this process, and the
+// call is rejected with ErrInvalidOption otherwise: only
+// ControllerClient.FinalizersDelete can clear a finalizer, so one no controller
+// here can remove would leave the row deletion-pending forever, RESTRICT-
+// blocking its owner's delete. The check is process-local and evaluated at call
+// time — the store tracks no registrations — so register the kind first.
 func WithFinalizers(f ...string) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {
@@ -206,19 +200,11 @@ func WithOwner(id ObjectID) Option {
 	}
 }
 
-// WithOnCreate registers fn to run once, on the caller's ctx, only if this call
-// actually inserts a new row — and only after the outermost transaction it runs
-// in commits. Create always fires it; GetOrCreate fires it on the create branch
-// but not when it returns an existing row.
-//
-// It is the commit-safe channel for create-conditional side effects. The
-// GetOrCreate created bool is synchronous, so inside a caller's
-// ControllerClient.Within it reports true before the enclosing transaction
-// commits — act on it for a non-store side effect (an external call, an
-// in-memory counter) and a later rollback leaves that effect fired for a row
-// that never landed. fn is deferred through the same post-commit path as the
-// reconcile wake (Store.AfterCommit), so a rollback simply never runs it. Put
-// such side effects here rather than gating them on the returned bool.
+// WithOnCreate registers fn to run once, on the caller's ctx, only if the call
+// actually inserts a new row — and only after the outermost transaction
+// commits (Store.AfterCommit), so a rollback never runs it. Use it for
+// create-conditional side effects instead of GetOrCreate's returned bool, which
+// inside a caller's Within reports true before the transaction commits.
 func WithOnCreate(fn func(ctx context.Context)) Option {
 	return func(target any) error {
 		if t, ok := target.(*createOptions); ok {
@@ -228,85 +214,70 @@ func WithOnCreate(fn func(ctx context.Context)) Option {
 	}
 }
 
-// WithCatchupInterval sets how often a controller drains work the store has
-// recorded as owed: objects whose spec has not converged
-// (observed_generation < generation) and objects owed a durable dependency wake.
-// A value <= 0 disables the catchup tick.
-//
-// It is separate from WithResyncInterval because the two scale differently. The
-// owed set is bounded by what is actually outstanding — indexed listings that
-// return nothing in a converged system — while a full pass scales with the object
-// count. One interval governing both would mean tuning either moves the other.
-//
-// Passed to New it sets the default for all controllers; passed to Register it
-// overrides that default for one.
-func WithCatchupInterval(d time.Duration) Option {
+// withOwedPassInterval sets how often a controller drains work the store
+// records as owed (unconverged specs, owed dependency wakes); <= 0 disables the
+// tick. Unexported: the owed pass is what makes convergence a guarantee, and
+// its cost is bounded by what is outstanding. Only tests reach it; callers get
+// WithFullPassInterval and Client.Requeue.
+func withOwedPassInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.catchupInterval = d
+			t.owedPassInterval = d
 		case *reconciler:
-			t.catchupInterval = d
+			t.owedPassInterval = d
 		}
 		return nil
 	}
 }
 
-// WithResyncInterval sets how often a controller re-dispatches *every* object it
-// owns, converged or not. The default is 0, which disables it.
-//
-// This is the expensive pass, and the only one that reaches an object nothing has
-// recorded as owing work: process-scoped state a restart invalidated (liveness
-// conditions read as "verifying" until this process rewrites them), and a
-// dependency wake lost for a reason nothing observed. Both are invisible to
-// WithCatchupInterval, whose listings are driven by columns.
-//
-// It is opt-in because its cost scales with the object count rather than with what
-// is outstanding, and because the two cheaper drivers already cover convergence:
-// the catchup tick drains recorded work, and the startup pass re-confirms
-// everything once per process. Reach for this when the gap until the next restart
-// is itself too long — then set it well above WithCatchupInterval, since a full
-// pass subsumes the catchup set.
-//
-// Note for callers upgrading: this option previously paced the owed-work tick,
-// which is now WithCatchupInterval. A call left unchanged still compiles and now
-// buys a full pass at that cadence — likely more work than intended, and the
-// catchup tick keeps running at its own default regardless.
-func WithResyncInterval(d time.Duration) Option {
+// withMinRequeueInterval floors the gap between two dispatches of one object;
+// <= 0 turns the floor off. Unexported: it exists to bound a dependency cycle,
+// not to be tuned, and Client.Requeue is the supported way to beat a cadence.
+func withMinRequeueInterval(d time.Duration) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.resyncInterval = d
+			t.minRequeueInterval = d
 		case *reconciler:
-			t.resyncInterval = d
+			t.work.setFloor(d)
 		}
 		return nil
 	}
 }
 
-// WithGCInterval sets how often the global GC sweeper runs: it collects
-// deletion-pending objects (of every kind, including ones with no registered
-// controller) and applies event-log retention.
+// WithFullPassInterval sets how often a controller re-dispatches *every* object
+// it owns, converged or not. Default 0 (disabled).
 //
-// It is separate from the reconcile intervals on purpose. Removing dead rows and
-// re-dispatching live ones are different jobs with different costs, and a single
-// interval for both means tuning one moves the other. GC is also global rather
-// than per-kind — the sweeper covers kinds no controller watches — so this is
-// meaningful only at New; passed elsewhere it is ignored.
+// This is the expensive pass, and the only one that reaches an object nothing
+// has recorded as owing work — process-scoped state a restart invalidated, or a
+// wake lost for a reason nothing observed. It is opt-in because its cost scales
+// with the object count, and convergence is already covered by the owed pass
+// and the startup pass. It does not pace the owed-work tick.
+func WithFullPassInterval(d time.Duration) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.fullPassInterval = d
+		case *reconciler:
+			t.fullPassInterval = d
+		}
+		return nil
+	}
+}
+
+// WithGCInterval sets how often the global GC sweeper runs: collecting
+// deletion-pending objects of every kind, applying event-log retention, and
+// releasing freed space. Meaningful only at New.
 //
-// Unlike the reconcile intervals, it cannot be disabled: d <= 0 is rejected with
-// ErrInvalidOption. Those two knobs pace work that has another way through —
-// Client.Requeue drives a reconcile by hand — but nothing on the public surface
-// triggers collect, so a sweeper-less Beehive would let deletion-pending rows
-// accumulate with no recourse, each one's owned_by edge RESTRICT-blocking its
-// owner's own deletion. It is also the only cross-kind driver: a client-only kind
-// has no reconcile loop to fall back on. A long interval expresses "collect
-// rarely"; there is no supported way to express "never".
+// Unlike WithFullPassInterval it cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption. Nothing on the public surface triggers collect, so a
+// sweeper-less Beehive would strand deletion-pending rows with no recourse. A
+// long interval expresses "collect rarely"; there is no "never".
 func WithGCInterval(d time.Duration) Option {
 	return func(target any) error {
-		// Checked before the target switch: the value is nonsense wherever it was
-		// aimed, and reporting that only for the target that happens to consume it
-		// would let a misdirected call carry the mistake silently.
+		// Checked before the target switch: the value is nonsense wherever it
+		// was aimed.
 		if d <= 0 {
 			return fmt.Errorf("%w: WithGCInterval needs a positive interval, got %s", ErrInvalidOption, d)
 		}
@@ -317,28 +288,122 @@ func WithGCInterval(d time.Duration) Option {
 	}
 }
 
-// WithEventRetention bounds the per-object event log, enforced globally by the GC
-// sweeper on its own cadence (startup pass + WithGCInterval). perObject > 0 caps each
-// (object, category) timeline to its newest perObject runs — a ring, so a flapping
-// timeline can't evict a quiet one; maxAge > 0 drops runs whose window ended more
-// than maxAge ago. A zero bound is skipped, and both zero (the default) leaves the
-// log unbounded. Retention is global, so it is meaningful only at New; passed
-// elsewhere it is ignored.
-func WithEventRetention(perObject int, maxAge time.Duration) Option {
+// withDependencyWakerOff turns the dependency waker off. Global and meaningful
+// only at New. Unexported: it costs only latency — the reconcile_owed stamp and
+// the stale-dependents pass still cover correctness — but nothing else replaces
+// the waker's cadence.
+func withDependencyWakerOff() Option {
 	return func(target any) error {
 		if t, ok := target.(*Beehive); ok {
-			t.eventRetentionPerObject = perObject
+			t.wakerOff = true
+		}
+		return nil
+	}
+}
+
+// withWakeScanMinInterval floors the gap between two wake-driven scans of the
+// write log; <= 0 turns the floor off. Global and meaningful only at New.
+// Unexported: it trades dependency-wake latency against how much of the single
+// connection the waker holds under a sustained write stream, which is a
+// measurement rather than a preference.
+func withWakeScanMinInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.wakeScanMinInterval = d
+		}
+		return nil
+	}
+}
+
+// withStaleDependentsInterval sets how often the stale-dependents pass
+// re-derives which dependents a dependency has moved under. Global and
+// meaningful only at New. Unexported because it is the backstop that makes a
+// dependency wake a guarantee — tuning it would be tuning how long a lost wake
+// goes unnoticed. Like WithGCInterval it cannot be disabled: d <= 0 is rejected
+// with ErrInvalidOption, because nothing else re-derives.
+func withStaleDependentsInterval(d time.Duration) Option {
+	return func(target any) error {
+		if d <= 0 {
+			return fmt.Errorf("%w: withStaleDependentsInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.staleDependentsInterval = d
+		}
+		return nil
+	}
+}
+
+// withWatchScanMinInterval floors the gap between two wake-driven drains of a
+// kind's write log; <= 0 turns the floor off. Global and meaningful only at New.
+// Unexported: it trades watch latency against how much of the single connection
+// a tailer holds under a sustained write stream, which is a measurement rather
+// than a preference.
+func withWatchScanMinInterval(d time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.watchScanMinInterval = d
+		}
+		return nil
+	}
+}
+
+// withWatchFloorInterval sets how often a watch reads without a wake — a kind's
+// tailer, and an object's event reader. The wake covers writes made through this
+// Beehive; the floor covers what a wake cannot — a failed step, a retention
+// trim. Global and meaningful only at New, and unexported because watch latency
+// is part of the stream's contract. Cannot be disabled: d <= 0 is rejected with
+// ErrInvalidOption.
+func withWatchFloorInterval(d time.Duration) Option {
+	return func(target any) error {
+		if d <= 0 {
+			return fmt.Errorf("%w: withWatchFloorInterval needs a positive interval, got %s", ErrInvalidOption, d)
+		}
+		if t, ok := target.(*Beehive); ok {
+			t.watchFloorInterval = d
+		}
+		return nil
+	}
+}
+
+// WithEventRetention bounds the event log, enforced globally by the GC sweeper.
+// perTimeline > 0 caps each (object, category) timeline to its newest
+// perTimeline runs — runs, not occurrences, since an extend grows a run in
+// place; maxAge > 0 drops runs whose window ended more than maxAge ago, across
+// every timeline. A zero bound is skipped; both zero (the default) leaves the
+// log unbounded. The sweeper enforces the cap on its own interval, so a burst
+// can sit above it until the next sweep. Meaningful only at New.
+func WithEventRetention(perTimeline int, maxAge time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.eventRetentionPerTimeline = perTimeline
 			t.eventRetentionMaxAge = maxAge
 		}
 		return nil
 	}
 }
 
-// WithMigrator registers a Migrator for the controller's kind, supplying the
-// schema-version conversion applied to stored Spec/Status JSON on read (see
-// Migrator). It is meaningful only at Register — a migrator is per-kind, and
-// Register installs it into the shared registry that both the user-facing client
-// and the reconciler decode through. Passed anywhere else it is ignored.
+// WithWriteLogRetention bounds the object write log, enforced globally by the
+// GC sweeper. perKind > 0 caps each (group, kind) log to its newest perKind
+// entries — per kind, so a hot kind cannot evict a quiet one; maxAge > 0 drops
+// entries written more than maxAge ago. A zero bound is skipped.
+//
+// The default is defaultWriteLogMaxAge and no count bound; both zero leaves the
+// log unbounded, which also leaves every resume window unbounded. Retention is
+// what defines that window: a stream cannot resume below what has been trimmed.
+// Meaningful only at New.
+func WithWriteLogRetention(perKind int, maxAge time.Duration) Option {
+	return func(target any) error {
+		if t, ok := target.(*Beehive); ok {
+			t.writeLogRetentionPerKind = perKind
+			t.writeLogRetentionMaxAge = maxAge
+		}
+		return nil
+	}
+}
+
+// WithMigrator registers a Migrator for the controller's kind, applied to
+// stored Spec/Status JSON on read. Meaningful only at Register, which installs
+// it into the registry both the client and the reconciler decode through.
 func WithMigrator(m Migrator) Option {
 	return func(target any) error {
 		if t, ok := target.(*reconciler); ok {
@@ -348,49 +413,34 @@ func WithMigrator(m Migrator) Option {
 	}
 }
 
-// WithStartupResync sets whether a controller re-dispatches *every* object once
-// at startup, converged ones included. The default is true.
+// WithStartupFullPass sets whether a controller re-dispatches *every* object
+// once at startup, converged ones included. Default false.
 //
-// The pass re-confirms process-scoped state that a restart invalidated — liveness
-// conditions, for instance, read as "verifying" until a controller in this process
-// rewrites them — which no owed-work listing can see, because nothing in the store
-// records it as outstanding.
+// The pass re-confirms process-scoped state a restart invalidated — liveness
+// conditions read as "verifying" until this process rewrites them — which no
+// owed-work listing can see. Enable it for that, and that only: no reconcile
+// may depend on it, since a pass that scales with the object count cannot be
+// what guarantees convergence. Work genuinely owed is recorded and resumed at
+// startup regardless.
 //
-// It does not govern work that *is* recorded as owed. An object whose spec has not
-// converged, and one owed a durable dependency wake, are resumed at startup either
-// way: they are already owed a pass, and declining them is a correctness hole
-// rather than a saving. In-progress deletions are likewise resumed, by the GC
-// sweeper's own startup pass.
-//
-// Set it false for a large object set where the re-confirm is not worth its cost,
-// or where the embedder drives its own reconciles. Passed to New it sets the
-// default for all controllers; passed to Register it overrides that default for
-// one.
-//
-// Setting it false also opts out of crash recovery for *settled dependents*. The
-// dependency waker's resume cursor is per-process, so a crash during a waker outage
-// leaves a dependent whose target changed in that window stale: its own generation
-// never moved, so no owed-work listing can see it, and this pass is what would
-// otherwise have caught it. See the observed_cursor entry in TODO.md.
-func WithStartupResync(enabled bool) Option {
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithStartupFullPass(enabled bool) Option {
 	return func(target any) error {
 		switch t := target.(type) {
 		case *Beehive:
-			t.startupResync = enabled
+			t.startupFullPass = enabled
 		case *reconciler:
-			t.startupResync = enabled
+			t.startupFullPass = enabled
 		}
 		return nil
 	}
 }
 
-// WithLogger routes beehive's internal logging through l. Pass a logger whose
-// slog.Handler wraps your logging library — zap, zerolog, logrus, and logr all
-// ship slog bridges — to forward beehive's logs into it. A nil logger disables
-// logging entirely, which is the default.
-//
-// Passed to New it sets the logger for the control plane and the default for all
-// controllers; passed to Register it overrides that default for one controller.
+// WithLogger routes beehive's internal logging through l (zap, zerolog, logrus
+// and logr all ship slog bridges). A nil logger disables logging entirely,
+// which is the default. Passed to New it sets the control plane's logger and
+// the default for all controllers; passed to Register it overrides one.
 func WithLogger(l *slog.Logger) Option {
 	return func(target any) error {
 		switch t := target.(type) {
@@ -403,14 +453,10 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithLogLevel sets the minimum level beehive emits, layered on top of whatever
-// the logger's own handler already filters. It lets callers quiet beehive down
-// without building a leveled handler; pass a very high level to silence it while
-// keeping the logger wired up. Has no effect without WithLogger (the discard
-// logger emits nothing regardless).
-//
-// Passed to New it applies to the control plane and is the default for all
-// controllers; passed to Register it overrides that default for one controller.
+// WithLogLevel sets the minimum level beehive emits, on top of whatever the
+// logger's own handler filters. No effect without WithLogger. Passed to New it
+// applies to the control plane and is the default for all controllers; passed
+// to Register it overrides one.
 func WithLogLevel(level slog.Level) Option {
 	return func(target any) error {
 		switch t := target.(type) {
@@ -424,10 +470,11 @@ func WithLogLevel(level slog.Level) Option {
 }
 
 // WithMaxRetryInterval caps the exponential backoff between failed reconciles
-// for a controller (the default is defaultMaxRetryInterval). A value <= 0 is
-// ignored, keeping the default: a zero or negative cap would clamp every retry
-// delay to it and busy-loop the reconciler the instant it keeps returning an
-// error, which is never what a caller wants.
+// for a controller. A value <= 0 is ignored, keeping the default — a
+// non-positive cap would busy-loop the reconciler on a persistent error.
+//
+// The cap bounds the retry rate outright: a wake arriving while the object sits
+// on its backoff alarm is absorbed by that alarm rather than dispatched.
 func WithMaxRetryInterval(d time.Duration) Option {
 	return func(target any) error {
 		if t, ok := target.(*reconciler); ok && d > 0 {
@@ -438,9 +485,8 @@ func WithMaxRetryInterval(d time.Duration) Option {
 }
 
 // WithConcurrency sets the number of concurrent worker goroutines for a
-// controller. When passed to New it becomes the default for all controllers;
-// when passed to Register it overrides that default for a single controller.
-// A value <= 1 means single-threaded (the default).
+// controller; <= 1 means single-threaded (the default). Passed to New it is the
+// default for all controllers; passed to Register it overrides one.
 func WithConcurrency(n int) Option {
 	return func(target any) error {
 		switch t := target.(type) {

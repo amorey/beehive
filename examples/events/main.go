@@ -20,7 +20,7 @@
 // identical outcomes coalesce into runs, so a flapping cluster produces the
 // aggregated, newest-first timeline a panel renders:
 //
-//	Create(spec) -> prober EventsRecord×N -> Client.EventsList -> render
+//	Create(spec) -> prober EventsAdd×N -> Client.EventsWatch -> render, then resume
 //
 // Run it with `go run ./examples/events/main.go`.
 package main
@@ -90,14 +90,14 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 
-	cluster, err := client.Create(ctx, ClusterSpec{Endpoint: "10.0.0.1:443"})
+	cluster, err := client.Create(ctx, "primary", ClusterSpec{Endpoint: "10.0.0.1:443"})
 	exitOnErr(err)
 	fmt.Printf("created Cluster id=%d endpoint=%s\n\n", cluster.ID, cluster.Spec.Endpoint)
 
-	// Simulate a flapping connection: one EventsRecord per probe outcome.
+	// Simulate a flapping connection: one EventsAdd per probe outcome.
 	probe := func(typ beehive.EventType, reason, message string, detail any, n int) {
 		for range n {
-			exitOnErr(prober.EventsRecord(ctx, cluster.ID, beehive.EventSpec{
+			exitOnErr(prober.EventsAdd(ctx, cluster.ID, beehive.EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: message, Detail: detail,
 			}))
 		}
@@ -108,11 +108,22 @@ func main() {
 	probe(beehive.EventWarning, "ProbeFailed", "i/o timeout", ProbeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18)
 	probe(beehive.EventNormal, "Connected", "", nil, 4)
 
-	panel, err := client.EventsList(ctx, cluster.ID, beehive.WithEventCategory("connection"))
+	stream, err := client.EventsWatch(ctx, cluster.ID, beehive.WithEventCategory("connection"))
 	exitOnErr(err)
 
 	fmt.Println("connection-health panel (newest first):")
-	renderPanel(panel)
+	renderPanel(stream.Runs)
+
+	// A panel reconnects, and resumes from what it last rendered rather than
+	// re-reading the log. The probe below arrives on its own commit.
+	resumed, err := client.EventsWatch(ctx, cluster.ID,
+		beehive.WithEventCategory("connection"),
+		beehive.WithEventsResumeFrom(stream.ResourceVersion))
+	exitOnErr(err)
+
+	probe(beehive.EventWarning, "ProbeFailed", "i/o timeout", nil, 1)
+	fmt.Println("\nlive, resumed above the snapshot:")
+	renderPanel([]beehive.Event{<-resumed.Events})
 }
 
 // renderPanel prints each run as one line: last-seen time, ✓/✗, reason, count,

@@ -70,6 +70,10 @@ func main() {
 	exitOnErr(err)
 	defer store.Close()
 
+	// Production defaults throughout. A write schedules nothing, so the create below
+	// is found by the owed-pass tick — at 30s, which would be a 30s demo. Rather than
+	// speed the drivers up, the demo nudges the one object it made with Requeue; see
+	// the Create call.
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
@@ -83,14 +87,22 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[GreetingSpec, GreetingStatus](bh, GreetingGroupKind)
 
-	// Subscribe before creating so we don't miss the controller's UpdateStatus event.
-	watchCh, err := client.ObjectsWatchList(ctx)
+	// Watch before creating, so the create itself arrives as an Added and the
+	// controller's UpdateStatus as the Modified after it. (A watch started later
+	// would still converge — its first poll reports current state — but it could
+	// report the settled object in one event and never show the intermediate.)
+	_, watchCh, err := client.WatchList(ctx)
 	exitOnErr(err)
 
-	obj, err := client.Create(ctx, GreetingSpec{Name: "world"})
+	obj, err := client.Create(ctx, "world", GreetingSpec{Name: "world"})
 	exitOnErr(err)
 
 	fmt.Printf("created Greeting id=%d name=%v\n", obj.ID, obj.Spec.Name)
+
+	// Nothing scheduled that create, so without this the demo waits out the owed-pass
+	// tick. Requeue is a latency hint, not a correctness requirement: drop it and the
+	// same convergence happens, 30s later.
+	exitOnErr(client.Requeue(ctx, obj.ID))
 
 	waitForConvergence(obj.ID, watchCh)
 }
@@ -106,7 +118,12 @@ func stopBeehive(stop func(context.Context) error) {
 // waitForConvergence drains watchCh until it sees a status-bearing event for id.
 func waitForConvergence(id int64, watchCh <-chan beehive.ObjectChange[GreetingSpec, GreetingStatus]) {
 	for evt := range watchCh {
-		if evt.Object.ID != id || evt.Object.Status == nil {
+		// Object is nil on Failed, and on a Deleted whose row image no longer
+		// decodes; evt.ID identifies the object either way.
+		if evt.Type == beehive.Failed {
+			log.Fatalf("watch ended: %v", evt.Err)
+		}
+		if evt.ID != id || evt.Object == nil || evt.Object.Status == nil {
 			continue
 		}
 		fmt.Printf("converged: %s\n", evt.Object.Status.Message)

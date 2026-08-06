@@ -23,46 +23,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWithResyncIntervalDispatch(t *testing.T) {
+func TestWithFullPassIntervalDispatch(t *testing.T) {
 	bh := &Beehive{}
-	require.NoError(t, WithResyncInterval(5*time.Second)(bh))
-	assert.Equal(t, 5*time.Second, bh.resyncInterval)
+	require.NoError(t, WithFullPassInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.fullPassInterval)
 
 	r := &reconciler{}
-	require.NoError(t, WithResyncInterval(3*time.Second)(r))
-	assert.Equal(t, 3*time.Second, r.resyncInterval)
+	require.NoError(t, WithFullPassInterval(3*time.Second)(r))
+	assert.Equal(t, 3*time.Second, r.fullPassInterval)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithResyncInterval(time.Second)("unrelated"))
+	require.NoError(t, WithFullPassInterval(time.Second)("unrelated"))
 }
 
 // resolveEvents folds the per-call EventOptions into one EventQuery; the empty
 // set is the zero query (every run for the object).
 func TestResolveEvents(t *testing.T) {
 	since := time.Now()
-	q := resolveEvents([]EventOption{
+	cfg := resolveEvents([]EventOption{
 		WithEventCategory("connection"),
 		WithEventType(EventWarning),
 		WithEventReason("ProbeFailed"),
 		WithEventLimit(5),
 		WithEventsSince(since),
+		WithEventsResumeFrom(42),
 	})
-	require.NotNil(t, q.Category)
-	assert.Equal(t, "connection", *q.Category)
-	assert.Equal(t, "Warning", q.Type)
-	assert.Equal(t, "ProbeFailed", q.Reason)
-	assert.Equal(t, 5, q.Limit)
-	assert.Equal(t, since, q.Since)
+	require.NotNil(t, cfg.query.Category)
+	assert.Equal(t, "connection", *cfg.query.Category)
+	assert.Equal(t, "Warning", cfg.query.Type)
+	assert.Equal(t, "ProbeFailed", cfg.query.Reason)
+	assert.Equal(t, 5, cfg.query.Limit)
+	assert.Equal(t, since, cfg.query.Since)
+	require.NotNil(t, cfg.resumeFrom)
+	assert.Equal(t, int64(42), *cfg.resumeFrom)
 
 	empty := resolveEvents(nil)
-	assert.Nil(t, empty.Category, "no category filter unless requested")
-	assert.Zero(t, empty.Limit)
+	assert.Nil(t, empty.query.Category, "no category filter unless requested")
+	assert.Zero(t, empty.query.Limit)
+	assert.Nil(t, empty.resumeFrom, "a snapshot unless a resume is asked for")
 }
 
 func TestWithEventRetentionDispatch(t *testing.T) {
 	bh := &Beehive{}
 	require.NoError(t, WithEventRetention(50, time.Hour)(bh))
-	assert.Equal(t, 50, bh.eventRetentionPerObject)
+	assert.Equal(t, 50, bh.eventRetentionPerTimeline)
 	assert.Equal(t, time.Hour, bh.eventRetentionMaxAge)
 
 	// Retention is global (Beehive-level); other targets ignore it.
@@ -100,30 +104,30 @@ func TestWithConcurrencyDispatch(t *testing.T) {
 	require.NoError(t, WithConcurrency(1)("unrelated"))
 }
 
-func TestWithStartupResyncDispatch(t *testing.T) {
-	bh := &Beehive{startupResync: true}
-	require.NoError(t, WithStartupResync(false)(bh))
-	assert.False(t, bh.startupResync)
+func TestWithStartupFullPassDispatch(t *testing.T) {
+	bh := &Beehive{startupFullPass: true}
+	require.NoError(t, WithStartupFullPass(false)(bh))
+	assert.False(t, bh.startupFullPass)
 
 	r := &reconciler{}
-	require.NoError(t, WithStartupResync(true)(r))
-	assert.True(t, r.startupResync)
+	require.NoError(t, WithStartupFullPass(true)(r))
+	assert.True(t, r.startupFullPass)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithStartupResync(true)("unrelated"))
+	require.NoError(t, WithStartupFullPass(true)("unrelated"))
 }
 
-func TestWithCatchupIntervalDispatch(t *testing.T) {
+func TestOwedPassIntervalOptionDispatch(t *testing.T) {
 	bh := &Beehive{}
-	require.NoError(t, WithCatchupInterval(5*time.Second)(bh))
-	assert.Equal(t, 5*time.Second, bh.catchupInterval)
+	require.NoError(t, withOwedPassInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.owedPassInterval)
 
 	r := &reconciler{}
-	require.NoError(t, WithCatchupInterval(time.Minute)(r))
-	assert.Equal(t, time.Minute, r.catchupInterval)
+	require.NoError(t, withOwedPassInterval(time.Minute)(r))
+	assert.Equal(t, time.Minute, r.owedPassInterval)
 
 	// A target the option doesn't recognize is silently ignored.
-	require.NoError(t, WithCatchupInterval(time.Second)("unrelated"))
+	require.NoError(t, withOwedPassInterval(time.Second)("unrelated"))
 }
 
 func TestWithGCIntervalDispatch(t *testing.T) {
@@ -165,6 +169,53 @@ func TestWithGCIntervalRejectsNonPositive(t *testing.T) {
 	}
 }
 
+// TestWatchFloorIntervalRejectsNonPositive pins that the floor cannot be
+// disabled. A disabled floor would still deliver this process's own writes —
+// the wake covers those — but silently drop what only the floor covers: a
+// second writer over the store, a failed step, a retention trim.
+func TestWatchFloorIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{watchFloorInterval: time.Minute}
+			err := withWatchFloorInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "withWatchFloorInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.watchFloorInterval, "a rejected option must not have written")
+
+			// Checked before the target switch, like the two above it.
+			require.ErrorIs(t, withWatchFloorInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, withWatchFloorInterval(d)("unrelated"), ErrInvalidOption)
+
+			_, err = New(&fakeStore{}, withWatchFloorInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
+}
+
+// TestStaleDependentsIntervalRejectsNonPositive pins the third mandatory
+// interval, and the one with the strongest claim to be mandatory: the
+// stale-dependents pass is what makes a dependency wake a guarantee rather than a
+// best effort, so nothing else re-derives an owed wake if it never runs. "Rarely"
+// is expressible, "never" is not.
+func TestStaleDependentsIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{staleDependentsInterval: time.Minute}
+			err := withStaleDependentsInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "withStaleDependentsInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.staleDependentsInterval, "a rejected option must not have written")
+
+			// Checked before the target switch, like the two above it.
+			require.ErrorIs(t, withStaleDependentsInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, withStaleDependentsInterval(d)("unrelated"), ErrInvalidOption)
+
+			_, err = New(&fakeStore{}, withStaleDependentsInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		})
+	}
+}
+
 func TestWithLoggerDispatch(t *testing.T) {
 	l := slog.New(slog.DiscardHandler)
 
@@ -200,18 +251,15 @@ func TestWithLogLevelDispatch(t *testing.T) {
 // inert on anything else (so they're harmless if passed to New/Register).
 func TestCreateOptionsDispatch(t *testing.T) {
 	co := &createOptions{}
-	require.NoError(t, WithSlug("widget")(co))
 	require.NoError(t, WithFinalizers("a", "b")(co))
 	require.NoError(t, WithOwner(42)(co))
 
-	require.NotNil(t, co.slug)
-	assert.Equal(t, "widget", *co.slug)
 	assert.Equal(t, []string{"a", "b"}, co.finalizers)
 	require.NotNil(t, co.owner)
 	assert.Equal(t, ObjectID(42), *co.owner)
 
 	// A target the options don't recognize is silently ignored.
-	for _, o := range []Option{WithSlug("x"), WithFinalizers("a"), WithOwner(7)} {
+	for _, o := range []Option{WithFinalizers("a"), WithOwner(7)} {
 		require.NoError(t, o(&Beehive{}))
 	}
 }
@@ -227,4 +275,90 @@ func TestResolveLoads(t *testing.T) {
 
 	// A repeated selector is idempotent.
 	assert.Equal(t, LoadOwnerBit, resolveLoads([]LoadOption{LoadOwner(), LoadOwner()}))
+}
+
+func TestWithWriteLogRetentionDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithWriteLogRetention(50, time.Hour)(bh))
+	assert.Equal(t, 50, bh.writeLogRetentionPerKind)
+	assert.Equal(t, time.Hour, bh.writeLogRetentionMaxAge)
+
+	// Retention is global (Beehive-level); other targets ignore it.
+	require.NoError(t, WithWriteLogRetention(9, time.Minute)(&reconciler{}))
+	require.NoError(t, WithWriteLogRetention(9, time.Minute)("unrelated"))
+}
+
+func TestWithMinRequeueIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, withMinRequeueInterval(time.Minute)(bh))
+	assert.Equal(t, time.Minute, bh.minRequeueInterval)
+
+	r := &reconciler{work: newWorkQueue()}
+	require.NoError(t, withMinRequeueInterval(time.Second)(r))
+	r.work.gate.Admit(1, time.Now())
+	_, held := r.work.gate.OpensAt(1, time.Now())
+	assert.True(t, held, "the option must reach the queue's gate")
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, withMinRequeueInterval(time.Second)("unrelated"))
+}
+
+// New builds the waker's gates from the resolved intervals, which is only true
+// because it constructs the waker *after* applying the options. Built above the
+// option loop, the gate would hold the default and the option below would be
+// silently ignored.
+func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(time.Minute))
+
+	assert.Equal(t, time.Minute, bh.waker.scanGate.Interval(), "the option must reach the scan gate")
+	assert.Equal(t, defaultWakePersistInterval, bh.waker.persistGate.Interval(),
+		"and the persist floor is a cadence of its own")
+}
+
+// A non-positive interval turns the throttle off rather than holding forever,
+// which is what rategate's zero interval already means.
+func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(0))
+
+	_, held := bh.waker.scanGate.Allow(time.Now())
+	require.False(t, held)
+	_, held = bh.waker.scanGate.Allow(time.Now())
+	assert.False(t, held, "a disabled throttle holds nothing, however often it is asked")
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, withWakeScanMinInterval(time.Second)("unrelated"))
+}
+
+// The tail's throttle is a floor, not a mandatory cadence: turning it off
+// leaves the floor tick and the wake, so nothing is dropped, only unpaced.
+func TestWithWatchScanMinIntervalDisablesTheThrottle(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := newTestBeehive(t, newClientTestStore(t), withWatchScanMinInterval(d))
+			assert.Equal(t, d, bh.watchScanMinInterval)
+		})
+	}
+
+	bh := newTestBeehive(t, newClientTestStore(t), withWatchScanMinInterval(time.Minute))
+	assert.Equal(t, time.Minute, bh.watchScanMinInterval)
+
+	// Targets the option doesn't recognize are silently ignored.
+	require.NoError(t, withWatchScanMinInterval(time.Second)(&reconciler{}))
+	require.NoError(t, withWatchScanMinInterval(time.Second)("unrelated"))
+}
+
+// Register seeds the queue's floor from the New-level default, and a per-kind
+// option overrides it.
+func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {
+	bh := newTestBeehive(t, newClientTestStore(t), withMinRequeueInterval(time.Hour))
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, withMinRequeueInterval(time.Minute))
+	require.NoError(t, err)
+
+	r, ok := bh.reconcilerFor(clientTestGK)
+	require.True(t, ok)
+
+	r.work.gate.Admit(1, time.Now())
+	opensAt, held := r.work.gate.OpensAt(1, time.Now())
+	require.True(t, held, "the queue's gate must carry the resolved interval")
+	assert.True(t, opensAt.Before(time.Now().Add(2*time.Minute)), "got the New-level interval, not Register's")
 }

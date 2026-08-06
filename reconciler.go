@@ -22,7 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amorey/gobus/conflate"
+	"github.com/amorey/beehive/internal/driver"
+	"github.com/amorey/beehive/internal/logging"
 )
 
 const (
@@ -30,13 +31,14 @@ const (
 	defaultBaseRetryInterval = 1 * time.Second
 )
 
-// controllerAdapter is the non-generic view of a registered controller. The
-// generic Register wraps the user's Controller[Spec, Status] in a concrete
-// adapter that closes over Spec/Status, so everything below this line —
-// reconciler, work queue, Store — stays free of type parameters and deals in
-// raw JSON.
+// controllerAdapter is the non-generic view of a registered controller.
+// Register wraps the user's Controller[Spec, Status] in a concrete adapter, so
+// everything below — reconciler, work queue, Store — stays free of type
+// parameters.
 type controllerAdapter interface {
-	reconcile(ctx context.Context, id ObjectID) (Result, error)
+	// gone reports that id's row no longer exists, so the worker drops what is
+	// queued for it rather than dispatching an ErrNotFound.
+	reconcile(ctx context.Context, id ObjectID) (result Result, gone bool, err error)
 }
 
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
@@ -46,170 +48,129 @@ type typedController[Spec, Status any] struct {
 	bh     *Beehive
 	inner  Controller[Spec, Status]
 	client ControllerClient[Status] // built once at Register, passed into each Reconcile
-	logger *slog.Logger             // kind-tagged; set by Register (never nil after that)
+	logger *slog.Logger             // kind-tagged; set by Register
 }
 
-// log returns a non-nil logger, guarding the rare path where a typedController
-// is built outside Register (e.g. in tests) and logger was never assigned.
+// log guards the rare path where a typedController is built outside Register.
 func (t *typedController[Spec, Status]) log() *slog.Logger {
 	if t.logger == nil {
-		return discardLogger
+		return logging.Discard
 	}
 	return t.logger
 }
 
 // reconcile loads the object and runs the controller. There is no enclosing
-// transaction: each ControllerClient write commits on its own (autocommit), so a
-// write that lands before Reconcile returns an error stays committed and the level
-// loop re-derives from it on retry. A controller that needs several writes to be
-// atomic wraps them in ControllerClient.Within. GC runs in its own transaction
-// afterward (see collect).
-func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, error) {
+// transaction: each ControllerClient write commits on its own; a controller
+// that needs atomicity uses ControllerClient.Within. GC runs afterwards, in its
+// own transaction.
+func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, bool, error) {
 	log := t.log().With("id", id)
-	// Controller-client calls that free a ref target register it here; we requeue
-	// them after Reconcile returns (see DependenciesDelete).
-	wakes := &pendingWakes{}
-	ctx = withPendingWakes(ctx, wakes)
 
-	raw, err := t.bh.store.ObjectsGet(ctx, id)
+	load, err := t.bh.store.ObjectsGetForReconcile(ctx, id)
 	if errors.Is(err, ErrNotFound) {
-		// The queued object is already gone (collected by a prior pass, a cascade,
-		// or the backstop between enqueue and now). Nothing to reconcile — a no-op
-		// success, not a retryable error.
+		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
-		return Result{}, nil
+		return Result{}, true, nil
 	}
 	if err != nil {
-		return Result{}, err
+		return Result{}, false, err
 	}
-	// The already-loaded row's deletion flag is a fast path: it lets a
-	// non-finalizing reconcile (the common case) skip collect's separate
-	// transaction entirely, while still running GC on the pass where the controller
-	// clears its last finalizer.
+	raw := &load.Object
 	deleting := raw.DeletionRequestedAt != nil
 	obj, err := rawToTyped[Spec, Status](raw, t.bh.migratorFor(t.gk))
 	if err != nil {
-		// Quarantine, as List and adaptObjectStream do (see rawToTyped's callers): a row
-		// whose bytes don't decode can't be reconciled, and the bytes won't change
-		// until someone rewrites the spec — which re-enqueues it. Returning the error
-		// would instead retry the identical row forever under backoff, and resync
-		// (enqueue-by-id, no decode) re-adds it every tick regardless. Treat it as a
-		// no-op success so the worker drops it. GC still runs: collect needs only the
-		// id, so a finalizer-free deletion-pending row is still collected here; a
-		// finalizer-bearing one can't be cleared without a decode the controller can
-		// never do, so it correctly waits for a fixed build.
-		//
-		// This re-WARNs each time the catchup tick re-enqueues the unsettled poison row
-		// (it never settles, so ObjectsListUnsettledIDs keeps returning it): a bad row is an
-		// ongoing operational fault, and a recurring warning at that coarse cadence keeps
-		// it visible rather than logging once and going silent.
-		//
-		// Returning here also leaves any owed reconcile_owed count standing, which is
-		// deliberate, not an oversight of the early return: the wake is owed because a
-		// dependency moved, and this pass did not service it — the controller never
-		// saw the object. Draining it would be exactly the silent discard the
-		// quarantine is written to avoid, and would leave the dependent stale with no
-		// record that a reconcile was owed. The cost is that the reconcile-owed backstop
-		// re-enqueues this row (and re-warns) until the bytes decode again, which is
-		// the same recurring-visibility trade as above, and it self-clears the moment a
-		// fixed build lets the pass run to the decrement below.
+		// Quarantine, as List and the watch polls do: returning the error would
+		// retry the identical bytes forever under backoff. Treated as a no-op
+		// success; the owed pass re-enqueues (and re-warns) until a rewrite or a
+		// fixed build makes the row decode. Any owed reconcile_owed count is
+		// deliberately left standing — this pass never serviced the wake.
 		log.WarnContext(ctx, "skipping undecodable object; cannot reconcile", "err", err)
 		if deleting {
-			if _, gcErr := t.bh.gcCollect(ctx, id); gcErr != nil {
+			// Collect needs only the id, so a finalizer-free deletion-pending row
+			// is still collected.
+			gone, gcErr := t.bh.gcCollect(ctx, id)
+			if gcErr != nil {
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
-				return Result{}, gcErr
+				return Result{}, false, gcErr
 			}
+			return Result{}, gone, nil
 		}
-		return Result{}, nil
+		return Result{}, false, nil
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
 	result, reconcileErr := t.inner.Reconcile(ctx, t.client, obj)
 	if reconcileErr != nil {
-		// Warn, not Error: a failed reconcile is expected churn the retry loop
-		// absorbs. We don't return yet — the controller's committed writes still need
-		// their GC follow-up below (see func doc), or a freed object could strand.
+		// Warn, not Error: the retry loop absorbs failed reconciles. Don't return
+		// yet — committed writes still need their GC follow-up below.
 		log.WarnContext(ctx, "reconcile failed; will retry", "err", reconcileErr)
 	}
-	// A successful pass read the target's current state, which addresses every wake
-	// outstanding when it loaded the object — so subtract that whole count, not one.
-	// Subtracting one would leave a residual with nothing to re-enqueue it: the work
-	// queue coalesces, so the backstop's single enqueue is already spent, and with the
-	// catchup tick disabled the leftover would sit until the next process start.
-	// Increments that land *during* the pass are above the observed count, so they
-	// survive the subtraction and keep the object owed — and each brought its own
-	// in-memory requeue, so nothing has to schedule the follow-up here. Skip the
-	// write when nothing was owed. A failed subtraction is not fatal: the count
-	// stays up and the backstop retries it, whereas requeueing on the error would
-	// spin against a store that keeps failing.
+	// Subtract the whole count observed at load, not 1: this pass read current
+	// state, which answers every wake outstanding then. Increments landing during
+	// the pass sit above the observed count and survive. A failed subtraction is
+	// left to the backstop rather than retried under backoff.
 	if reconcileErr == nil && raw.ReconcileOwed != 0 {
-		if err := t.bh.store.ReconcileOwedDecrement(ctx, id, raw.ReconcileOwed); err != nil {
+		if err := t.bh.store.ReconcileOwedDecrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
 		}
 	}
-	// Advance any targets the controller freed via DependenciesDelete, so a
-	// now-unreferenced deletion-pending target is re-examined without waiting on the GC
-	// sweep. gcAdvance (not enqueueIfRegistered) rather than a plain wake because the
-	// follow-up a deletion owes is a collect, not a reconcile — it routes by the
-	// target's own kind, and a client-only target falls to the sweeper's next tick.
-	for _, tgt := range wakes.targets {
-		t.bh.gcAdvance(ctx, tgt.GroupKind(), tgt.ID)
+	// Record the dependency watermark from the cursor taken at load, never from
+	// now: every read the controller made happened after the load, so a target
+	// that moved during the pass stays counted as owed. HasDependencies only
+	// skips the call; the store's own gate keeps the write safe against a
+	// mid-pass collect.
+	//
+	// A lost write leaves the watermark low, which only over-reports staleness:
+	// any target change this pass did not observe is above the stale pass's
+	// cursor, so the next sweep finds it. Costs a redundant pass, never a strand.
+	// See docs/adr/2026-08-03-stale-dependents-cursor.md.
+	if reconcileErr == nil && load.HasDependencies {
+		// A cancelled write is shutdown, not a lost pass.
+		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
+			log.WarnContext(ctx, "failed to record the dependency watermark; the next target change re-derives it", "err", err)
+		}
 	}
-	// GC runs in its own transaction over the controller's committed writes, so a
-	// finalizer the controller just cleared is visible.
+	// GC runs in its own transaction over the controller's committed writes, so
+	// a finalizer the controller just cleared is visible.
 	if deleting {
 		gone, gcErr := t.bh.gcCollect(ctx, id)
 		if gcErr != nil {
 			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
-			// Either error makes the worker retry; prefer the reconcile error.
-			return result, cmp.Or(reconcileErr, gcErr)
+			return result, false, cmp.Or(reconcileErr, gcErr)
 		}
-		// The row is gone: like the ErrNotFound skip above, there's nothing left to
-		// reconcile, so drop any RequeueAfter and the reconcile error rather than
+		// Collected: drop any RequeueAfter and the reconcile error rather than
 		// rescheduling a dead id straight into ErrNotFound.
 		if gone {
 			log.DebugContext(ctx, "object collected")
-			return Result{}, nil
+			return Result{}, true, nil
 		}
 	}
-	return result, reconcileErr
+	return result, false, reconcileErr
 }
 
 // reconciler drives the reconcile loop for a single registered controller.
-// It owns the work queue, exponential backoff, and periodic resync timer.
+// It owns the work queue, exponential backoff, and the periodic pass timers.
 type reconciler struct {
-	gk      GroupKind
-	adapter controllerAdapter
-	store   Store
-	work    *workQueue
-	// scheduleHub fans each object's next-requeue changes out to SchedulesWatch
-	// subscribers, keyed by ObjectID with latest-value-per-id coalescing. The work
-	// queue feeds it through onSchedule; Close (on teardown) ends live streams.
-	scheduleHub       *conflate.Hub[ObjectID, Schedule]
-	catchupInterval   time.Duration
-	resyncInterval    time.Duration
+	gk                GroupKind
+	adapter           controllerAdapter
+	store             Store
+	work              *workQueue
+	owedPassInterval  time.Duration
+	fullPassInterval  time.Duration
 	maxRetryInterval  time.Duration
 	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
-	concurrency       int           // number of concurrent worker goroutines; 0/1 = single-threaded
-	// startupResync selects whether run also re-dispatches settled objects at
+	concurrency       int           // worker goroutines; 0/1 = single-threaded
+	// startupFullPass selects whether run also re-dispatches settled objects at
 	// startup; owed work is drained regardless.
-	startupResync bool
-	// migrator is the per-kind schema-version converter set by WithMigrator at
-	// Register; Register copies it into bh.migrators so the client path shares it.
-	// nil when the kind opted out.
+	startupFullPass bool
+	// migrator is set by WithMigrator at Register, which copies it into
+	// bh.migrators so the client path shares it. nil when the kind opted out.
 	migrator Migrator
-	// logger is kind-tagged and resolved (never nil) once Register runs; logLevel
-	// is the raw per-controller override consumed during that resolution.
 	logger   *slog.Logger
 	logLevel slog.Leveler
 
 	backoffMu  sync.Mutex
 	backoffFor map[ObjectID]time.Duration
-
-	// afterScheduleWatch, when set, runs after a scheduleWatch goroutine exits.
-	// Tests use it to await teardown without reading the channel — a read would
-	// let a parked send succeed and mask the ctx.Done/close arm under test.
-	afterScheduleWatch func()
 }
 
 // enqueue adds id to the work queue if one is configured.
@@ -219,9 +180,7 @@ func (r *reconciler) enqueue(id ObjectID) {
 	}
 }
 
-// enqueueUnsettled asks the store for IDs of objects that haven't converged yet
-// and enqueues them. Objects currently being reconciled are skipped to prevent
-// duplicate or concurrent reconciles for the same ID.
+// enqueueUnsettled enqueues objects whose spec hasn't converged.
 func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
@@ -229,14 +188,10 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	r.enqueueFrom(ctx, "unsettled", r.store.ObjectsListUnsettledIDs)
 }
 
-// enqueueReconcileOwed enqueues objects owed a durable dependency wake (see
-// reconcile_owed). Like a pending deletion it is recorded, known-owed work: a
-// wake bumps no generation, so the unsettled listing never sees it, and its
-// in-memory requeue does not outlive the process — a crash between the token's
-// commit and the dispatch leaves a stranded dependent nothing else re-checks.
-// Run unconditionally at startup (like deletion-pending, not gated by the spec
-// strategy): a wake owed is a specific known-owed reconcile, orthogonal to spec
-// convergence, so declining the startup resync must not suppress it.
+// enqueueReconcileOwed enqueues objects owed a durable dependency wake. Run
+// unconditionally at startup: a wake bumps no generation, so the unsettled
+// listing never sees it, and a crash between the token's commit and dispatch
+// would otherwise strand the dependent.
 func (r *reconciler) enqueueReconcileOwed(ctx context.Context) {
 	if r.store == nil {
 		return
@@ -244,24 +199,17 @@ func (r *reconciler) enqueueReconcileOwed(ctx context.Context) {
 	r.enqueueFrom(ctx, "reconcile-owed", r.store.ReconcileOwedListIDs)
 }
 
-// enqueueCatchup drains the work the store has recorded as owed: objects whose
-// spec has not converged, and objects owed a durable dependency wake. Both are
-// derived from a column, so they are cheap to ask for and return nothing in a
-// converged system — which is what lets this run on a frequent cadence where a
-// full pass could not.
-//
-// The two listings stay separate rather than being unioned in SQL so that a
-// failure in one still lets the other through, and so enqueueFrom's log names
-// which backstop lost its pass (see its doc).
-func (r *reconciler) enqueueCatchup(ctx context.Context) {
+// enqueueOwedPass drains what the store records as owed: unconverged specs and
+// owed dependency wakes. Both are column-derived and return nothing in a
+// converged system, which is what lets this run on a frequent cadence. The two
+// listings stay separate so a failure in one still lets the other through.
+func (r *reconciler) enqueueOwedPass(ctx context.Context) {
 	r.enqueueUnsettled(ctx)
 	r.enqueueReconcileOwed(ctx)
 }
 
-// enqueueAll enqueues every object of the kind, including ones whose spec is
-// already settled. Used once at startup so controllers can re-confirm
-// process-scoped state (e.g. liveness conditions, which a prior process's writes
-// leave reading as "verifying") that the unsettled-only resync would never wake.
+// enqueueAll enqueues every object of the kind, settled or not, so controllers
+// can re-confirm process-scoped state the owed pass would never wake.
 func (r *reconciler) enqueueAll(ctx context.Context) {
 	if r.store == nil {
 		return
@@ -269,28 +217,18 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
 }
 
-// log returns a non-nil logger, guarding reconcilers built outside Register (e.g.
-// the minimal ones in tests): run assigns discardLogger, but the enqueue helpers
-// are reachable without it.
+// log guards reconcilers built outside Register (e.g. minimal ones in tests).
 func (r *reconciler) log() *slog.Logger {
 	if r.logger == nil {
-		return discardLogger
+		return logging.Discard
 	}
 	return r.logger
 }
 
-// enqueueFrom enqueues the IDs returned by list. The work queue coalesces an ID
-// that is already queued and defers one that is mid-reconcile (re-queuing it via
-// done), so this never triggers a duplicate or concurrent reconcile.
-//
-// A failed list is logged, not retried: source names which backstop lost its pass,
-// because what that costs differs sharply. The two catchup listings (unsettled,
-// reconcile-owed) retry on the next catchup tick — unless catchup is off, where the
-// startup pass was the only one, and a lost reconcile-owed listing defers every
-// recorded owed wake to the next process start, the one path whose whole point is
-// not losing them. The full pass ("all") rides the resync tick, which is off by
-// default, so a failure there usually has no second chance in this process at all.
-// Silence made all of that indistinguishable from "nothing was owed".
+// enqueueFrom enqueues the IDs returned by list. The work queue coalesces
+// duplicates and defers ids mid-reconcile. A failed list is logged with its
+// source — which backstop lost its pass matters — and retried on that pass's
+// own next tick.
 func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(context.Context, GroupKind) ([]ObjectID, error)) {
 	ids, err := list(ctx, r.gk)
 	if err != nil {
@@ -331,13 +269,9 @@ func (r *reconciler) backoffClear(id ObjectID) {
 	delete(r.backoffFor, id)
 }
 
-// requeue makes id immediately dispatchable, optionally resetting its retry
-// backoff ladder first. It is the engine behind Client.Requeue — a latency hint,
-// not a synchronous run, so a worker picks the id up on its own schedule. The
-// resetBackoff intent lives here, in the layer every client surface shares, so
-// the "WithResetBackoff clears the ladder before dispatch" invariant is enforced once.
-// Backoff is otherwise cleared only by a successful reconcile, never by a plain
-// requeue.
+// requeue makes id immediately dispatchable, optionally resetting its backoff
+// ladder first. It is the engine behind Client.Requeue — a latency hint, not a
+// synchronous run. Backoff is otherwise cleared only by a successful reconcile.
 func (r *reconciler) requeue(id ObjectID, resetBackoff bool) {
 	if resetBackoff {
 		r.backoffClear(id)
@@ -346,114 +280,38 @@ func (r *reconciler) requeue(id ObjectID, resetBackoff bool) {
 }
 
 // requeueNow makes id immediately dispatchable, cancelling any pending delayed
-// requeue. It is the reconciler-layer counterpart of workQueue.requeueNow and the
-// pure immediate-dispatch step: it deliberately does not touch the backoff ladder
-// (see requeue, which layers the optional reset on top).
+// requeue. It deliberately does not touch the backoff ladder.
 func (r *reconciler) requeueNow(id ObjectID) {
 	if r.work != nil {
-		// Drop any stale backoff timer and make the id dispatchable now, atomically.
 		r.work.requeueNow(id)
 	}
 }
 
-// nextRequeueAt reports when the loop has scheduled id to be requeued (a pending
-// backoff/RequeueAfter delay, or now if already queued). ok is false when no
-// requeue is scheduled; it reports only per-id timers, so it excludes the periodic
-// resync and any event-driven wake — the actual next reconcile may be sooner.
-func (r *reconciler) nextRequeueAt(id ObjectID) (time.Time, bool) {
+// scheduleAt reports when the loop has scheduled id to be requeued. The zero
+// Schedule means nothing is scheduled; only per-id timers count, so the actual
+// next reconcile (via a periodic pass) may be sooner.
+func (r *reconciler) scheduleAt(id ObjectID) Schedule {
 	if r.work == nil {
-		return time.Time{}, false
+		return Schedule{}
 	}
-	return r.work.nextRequeueAt(id)
-}
-
-// scheduleMerge is the schedule hub's coalescing policy: latest value wins and the
-// slot is never annihilated. Unlike the object watch, "unscheduled" (the zero
-// Schedule) is a real gauge value a subscriber must observe, so it is kept, not
-// dropped — a slow reader converges to the id's current schedule.
-func scheduleMerge(_, next Schedule) (Schedule, bool) { return next, true }
-
-// schedulePublish feeds one work-queue schedule change into the hub. It is the
-// onSchedule callback, so it runs under the queue lock: it maps the queue's native
-// (time, scheduled) to the public Schedule (unscheduled folds to the zero time),
-// then Sends — which never blocks, and a closed hub drops it. The scheduled bool is
-// redundant with a zero time here, so it is ignored.
-func (r *reconciler) schedulePublish(id ObjectID, at time.Time, _ bool) {
-	_ = r.scheduleHub.Sender().Send(id, Schedule{NextRequeueAt: at})
-}
-
-// scheduleWatch returns a channel that delivers id's current schedule on subscribe
-// and every reschedule thereafter, until ctx is cancelled or the hub closes. The
-// receiver is registered atomically with the snapshot read (scheduleSubscribe), so
-// no change between the two is lost. The queue's native (time, scheduled) is mapped
-// to a Schedule here — the reconciler owns that domain type, not the queue.
-func (r *reconciler) scheduleWatch(ctx context.Context, id ObjectID) <-chan Schedule {
-	var rx *conflate.Receiver[ObjectID, Schedule]
-	at := r.work.scheduleSubscribe(id, func() {
-		rx = r.scheduleHub.Receiver(r.scheduleHub.WithKeyFilter(func(k ObjectID) bool { return k == id }))
-	})
-	snapshot := Schedule{NextRequeueAt: at}
-
-	out := make(chan Schedule)
-	go func() {
-		if r.afterScheduleWatch != nil {
-			defer r.afterScheduleWatch()
-		}
-		defer close(out)
-		defer rx.Close()
-		send := func(s Schedule) bool {
-			select {
-			case out <- s:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
-		if !send(snapshot) {
-			return
-		}
-		for {
-			sev, err := rx.RecvContext(ctx)
-			if err != nil {
-				return // ctx cancelled or hub closed
-			}
-			if !send(sev.Value) {
-				return
-			}
-		}
-	}()
-	return out
+	return r.work.scheduleAt(id)
 }
 
 // run is the per-controller reconcile loop. It exits when ctx is cancelled.
-//
-// It runs two independent tickers, and each is disabled by a non-positive interval
-// (tickerChan yields a nil channel, which never fires). resyncInterval <= 0 — the
-// default — disables the *full* pass only; the catchup tick still drives periodic
-// passes over the work the store records as owed. Only with both off does the loop
-// reconcile purely in response to events and its own startup passes, which is why
-// that combination is the one the log calls out.
+// Each ticker is disabled by a non-positive interval; fullPassInterval <= 0 —
+// the default — disables only the full pass, never the owed pass convergence
+// rests on.
 func (r *reconciler) run(ctx context.Context) {
-	// A reconciler built outside Register (e.g. in tests) may have no logger;
-	// fall back to discard so the log sites below stay nil-safe.
 	if r.logger == nil {
-		r.logger = discardLogger
+		r.logger = logging.Discard
 	}
-	// Drain the work the store records as owed, always: an object whose spec never
-	// converged (crashed mid-reconcile, or created and never settled) and one owed a
-	// durable dependency wake are both *already* owed a pass, so declining them is a
-	// correctness hole rather than a saving. In-progress deletions are the GC
-	// sweeper's, whose own unconditional startup pass routes them — a registered kind
-	// enqueued so its controller can clear finalizers, a client-only kind collected
-	// directly (see advanceDeletion). Doing that here too meant a per-kind
-	// listing that only duplicated what the sweeper had to do cross-kind.
-	r.enqueueCatchup(ctx)
-	// The startup resync is the part that is a choice: a full pass re-confirms
-	// process-scoped state a restart invalidated (liveness conditions read as
-	// "verifying" until this process rewrites them), which no owed-work listing can
-	// see. enqueueAll is a superset of the catchup set, so the overlap above is
-	// coalesced by the work queue rather than reconciled twice.
-	if r.startupResync {
+	// Always drain what the store records as owed; skipping it would be a
+	// correctness hole. Deletions in progress belong to the GC sweeper.
+	r.enqueueOwedPass(ctx)
+	// The startup full pass is a choice: it re-confirms process-scoped state a
+	// restart invalidated, which no owed-work listing can see. Nothing may
+	// depend on it. The work queue collapses the overlap with the owed pass.
+	if r.startupFullPass {
 		r.enqueueAll(ctx)
 	}
 
@@ -465,86 +323,60 @@ func (r *reconciler) run(ctx context.Context) {
 		})
 	}
 	r.logger.Info("reconciler started", "workers", n,
-		"catchupInterval", r.catchupInterval, "resyncInterval", r.resyncInterval)
-	// Say so when a periodic driver is off. Each is a supported choice, so this is
-	// not an error — but reached by accident (an unset config field, a duration that
-	// failed to parse) the failure mode is silence: work quietly stops being
-	// re-derived and nothing reports it. Info, because the caller retains recourse.
-	//
-	// Resync-off is deliberately not logged: it is the default, so narrating it
-	// would put a line in every process's startup for the ordinary case.
-	if r.catchupInterval <= 0 {
-		r.logger.InfoContext(ctx, "catchup disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ObjectsListUnsettledIDs + Client.Requeue",
+		"owedPassInterval", r.owedPassInterval, "fullPassInterval", r.fullPassInterval)
+	// An owed pass disabled by accident fails silently — work stops being
+	// re-derived — so say so. (The full passes are off by default and logged by
+	// neither their presence nor absence.)
+	if r.owedPassInterval <= 0 {
+		r.logger.InfoContext(ctx, "owed pass disabled: work the store records as owed (unconverged specs, owed dependency wakes) is drained once at startup and not re-derived after; drive it with Store.ObjectsListUnsettledIDs + Client.Requeue",
 			"group", r.gk.Group, "kind", r.gk.Kind)
 	}
-	// Drain the workers, then cancel any retry/RequeueAfter timers they left
-	// pending so a torn-down reconciler doesn't leak timers that wake a dead queue,
-	// and close the schedule hub so live SchedulesWatch streams end instead of hanging
-	// on a subscriber context that outlives the control plane.
+	// Drain the workers, then stop pending timers so a torn-down reconciler
+	// doesn't wake a dead queue. stop publishes each id's final schedule, and
+	// closing the hub's sender then ends live SchedulesWatch streams after they
+	// read it. Never Hub.Close here: that is hard tear-down with no drain, and a
+	// receiver could lose the final value on a timing race. A racing publish
+	// gets ErrClosed, which workQueue.publish expects.
 	defer func() {
 		wg.Wait()
 		if r.work != nil {
 			r.work.stop()
-		}
-		if r.scheduleHub != nil {
-			r.scheduleHub.Close()
+			r.work.closeHub()
 		}
 	}()
 
-	resync, stopResync := tickerChan(r.resyncInterval)
-	defer stopResync()
-	// The catchup tick is the cheap, frequent one: it drains only what the store
-	// records as owed, so it can run often without scaling with the object count.
-	catchup, stopCatchup := tickerChan(r.catchupInterval)
-	defer stopCatchup()
+	fullPass, stopFullPass := driver.TickerChan(r.fullPassInterval)
+	defer stopFullPass()
+	owedPass, stopOwedPass := driver.TickerChan(r.owedPassInterval)
+	defer stopOwedPass()
 
 	for {
 		select {
 		case <-ctx.Done():
 			r.logger.Info("reconciler stopped")
 			return
-		case <-catchup:
-			// Owed work only. A dropped dependency wake used to escalate this tick into
-			// a full pass, because a *settled* dependent is invisible to any owed-work
-			// listing; the waker now replays the changes it missed from its own cursor,
-			// so this tick has no repair to carry.
-			r.tick(ctx, "catchup", false)
-		case <-resync:
-			// The full pass: every object, converged or not.
-			r.tick(ctx, "resync", true)
+		case <-owedPass:
+			r.tick(ctx, "owed-pass", false)
+		case <-fullPass:
+			r.tick(ctx, "full-pass", true)
 		}
 	}
 }
 
-// tickerChan returns the tick channel for a periodic driver, plus its stop func.
-// A non-positive interval means the driver is disabled: time.NewTicker would
-// panic, and a nil channel is the right no-op — it blocks forever in a select.
-func tickerChan(d time.Duration) (<-chan time.Time, func()) {
-	if d <= 0 {
-		return nil, func() {}
-	}
-	t := time.NewTicker(d)
-	return t.C, t.Stop
-}
-
-// tick runs one periodic driver's pass. full means every object of the kind,
-// converged or not; otherwise only the work the store records as owed. A full
-// pass subsumes the catchup set, so it stands in for it rather than running both
-// — which is why both drivers share this one body.
+// tick runs one periodic pass. A full pass subsumes the owed set, so it stands
+// in for it rather than running both.
 func (r *reconciler) tick(ctx context.Context, driver string, full bool) {
 	r.logger.Debug("periodic tick", "driver", driver, "fullPass", full)
 	if full {
 		r.enqueueAll(ctx)
 		return
 	}
-	r.enqueueCatchup(ctx)
+	r.enqueueOwedPass(ctx)
 }
 
-// runWorker is the per-goroutine reconcile loop. Multiple instances may run
-// concurrently when concurrency > 1. It exits when ctx is cancelled.
+// runWorker is the per-goroutine reconcile loop; concurrency > 1 runs several.
 func (r *reconciler) runWorker(ctx context.Context) {
-	// A nil channel blocks forever in a select, which is the correct no-op
-	// when no work queue is configured.
+	// A nil channel blocks forever, the correct no-op when no queue is configured.
 	var workReady <-chan struct{}
 	if r.work != nil {
 		workReady = r.work.ready
@@ -556,22 +388,23 @@ func (r *reconciler) runWorker(ctx context.Context) {
 			return
 		case <-workReady:
 			if id, ok := r.work.get(); ok {
-				result, err := r.adapter.reconcile(ctx, id)
-				// done releases the processing hold so a re-add (live event or
-				// resync) that arrived mid-reconcile becomes dispatchable. The
-				// queue guarantees no second worker had the id in the meantime.
-				r.work.done(id)
+				result, gone, err := r.adapter.reconcile(ctx, id)
+				// done releases the processing hold so a re-add that arrived
+				// mid-reconcile becomes dispatchable; a collected row has nothing
+				// left to dispatch, so drop what is queued for it instead.
+				if gone {
+					r.work.forget(id)
+				} else {
+					r.work.done(id)
+				}
 				if err != nil {
-					// The reconcile failure itself is already logged (with the
-					// error) in typedController.reconcile; here we only add the
-					// computed backoff delay at Debug.
 					delay := r.backoffNext(id)
-					r.work.addAfter(id, delay)
+					r.work.addAfter(id, delay, alarmBackoff)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
 				} else {
 					r.backoffClear(id)
 					if result.RequeueAfter > 0 {
-						r.work.addAfter(id, result.RequeueAfter)
+						r.work.addAfter(id, result.RequeueAfter, alarmRequeueAfter)
 						r.logger.Debug("requeued", "id", id, "after", result.RequeueAfter)
 					}
 				}

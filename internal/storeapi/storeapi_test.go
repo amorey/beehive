@@ -16,6 +16,7 @@ package storeapi
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,4 +32,31 @@ func TestObjectRefGroupKind(t *testing.T) {
 	// projection rather than being normalized away.
 	core := ObjectRef{ID: 8, Kind: "Widget"}
 	assert.Equal(t, GroupKind{Kind: "Widget"}, core.GroupKind())
+}
+
+// EventQuery.Matches is the predicate the event watch applies to a page the
+// store returned unfiltered, so it has to answer exactly as EventsList's WHERE
+// clause does — including the millisecond truncation, since that is the
+// column's resolution.
+func TestEventQueryMatches(t *testing.T) {
+	at := time.UnixMilli(1_000).UTC()
+	run := Event{Category: "connection", Type: "Warning", Reason: "ProbeFailed", LastAt: at}
+	category := func(s string) *string { return &s }
+
+	assert.True(t, EventQuery{}.Matches(run), "the zero query selects every run")
+
+	assert.True(t, EventQuery{Category: category("connection")}.Matches(run))
+	assert.False(t, EventQuery{Category: category("sync")}.Matches(run))
+	assert.True(t, EventQuery{Type: "Warning"}.Matches(run))
+	assert.False(t, EventQuery{Type: "Normal"}.Matches(run))
+	assert.True(t, EventQuery{Reason: "ProbeFailed"}.Matches(run))
+	assert.False(t, EventQuery{Reason: "Synced"}.Matches(run))
+
+	assert.True(t, EventQuery{Since: at}.Matches(run), "Since is inclusive")
+	assert.False(t, EventQuery{Since: at.Add(time.Millisecond)}.Matches(run))
+	assert.True(t, EventQuery{Since: at.Add(500 * time.Microsecond)}.Matches(run),
+		"a bound inside the run's own millisecond truncates onto it, as the SQL does")
+
+	// Limit bounds a listing, not a run: it is not a predicate.
+	assert.True(t, EventQuery{Limit: 1}.Matches(run))
 }

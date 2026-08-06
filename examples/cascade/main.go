@@ -117,7 +117,16 @@ func main() {
 	exitOnErr(err)
 	defer store.Close()
 
-	bh, err := beehive.New(store)
+	// Every driver here is periodic — nothing is pushed — and a cascade advances one
+	// step per GC tick: mark the children, wait for their finalizers to clear,
+	// collect them, then collect the owner they were blocking. At the production
+	// defaults that is tens of seconds, so this demo turns the cadences down to a
+	// human timescale. The watch poll that paces the printout below is fixed at 1s,
+	// so GC is set just above it — a sweep faster than one poll would still cascade
+	// correctly, but its steps would coalesce into a single delivery.
+	// The reconciles that get each object to converged are nudged with Requeue below,
+	// so GC is the only cadence this demo has to set.
+	bh, err := beehive.New(store, beehive.WithGCInterval(1500*time.Millisecond))
 	exitOnErr(err)
 
 	_, err = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
@@ -133,24 +142,29 @@ func main() {
 	clusterClient := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 	cacheClient := beehive.NewClient[ClusterCacheSpec, ClusterCacheStatus](bh, ClusterCacheGroupKind)
 
-	// Subscribe before creating so no lifecycle event is missed.
-	clusterCh, err := clusterClient.ObjectsWatchList(ctx)
+	// Watch before creating, so each object's lifecycle reads in order from Added.
+	// A poll coalesces, so a step shorter than the interval can still be skipped.
+	_, clusterCh, err := clusterClient.WatchList(ctx)
 	exitOnErr(err)
-	cacheCh, err := cacheClient.ObjectsWatchList(ctx)
+	_, cacheCh, err := cacheClient.WatchList(ctx)
 	exitOnErr(err)
 
 	// A Cluster guarded by a connection finalizer, owning two caches that each
 	// guard a cache-flush finalizer.
-	cluster, err := clusterClient.Create(ctx, ClusterSpec{Endpoint: "db.example:5432"},
+	cluster, err := clusterClient.Create(ctx, "primary", ClusterSpec{Endpoint: "db.example:5432"},
 		beehive.WithFinalizers(connectionFinalizer))
 	exitOnErr(err)
 	fmt.Printf("created Cluster %d (endpoint=%s, finalizers=%v)\n", cluster.ID, cluster.Spec.Endpoint, cluster.Finalizers)
+	exitOnErr(clusterClient.Requeue(ctx, cluster.ID))
 
-	for range numCaches {
-		cache, err := cacheClient.Create(ctx, ClusterCacheSpec{ClusterID: cluster.ID},
+	for i := range numCaches {
+		cache, err := cacheClient.Create(ctx, fmt.Sprintf("cache-%d", i), ClusterCacheSpec{ClusterID: cluster.ID},
 			beehive.WithOwner(cluster.ID), beehive.WithFinalizers(cacheFlushFinalizer))
 		exitOnErr(err)
 		fmt.Printf("created ClusterCache %d owned by Cluster %d (finalizers=%v)\n", cache.ID, cluster.ID, cache.Finalizers)
+		// A write schedules nothing, so nudge each object rather than waiting out the
+		// owed-pass tick.
+		exitOnErr(cacheClient.Requeue(ctx, cache.ID))
 	}
 
 	watchCascade(ctx, clusterClient, clusterCh, cacheCh, cluster.ID)
@@ -189,28 +203,36 @@ func watchCascade(
 		exitOnErr(clusterClient.Delete(ctx, clusterID))
 	}
 
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(30 * time.Second)
 	for !clusterRemoved || cachesRemoved < numCaches {
 		select {
 		case ev := <-clusterCh:
-			o := ev.Object
+			// Object is nil on Failed, and on a Deleted whose row image no
+			// longer decodes; ev.ID identifies the object either way.
+			if ev.Type == beehive.Failed {
+				log.Fatalf("cluster watch ended: %v", ev.Err)
+			}
 			if ev.Type == beehive.Deleted {
-				fmt.Printf("Cluster %d: removed\n", o.ID)
+				fmt.Printf("Cluster %d: removed\n", ev.ID)
 				clusterRemoved = true
 				continue
 			}
+			o := ev.Object
 			if !deleted && o.Status != nil && o.Status.Connected && !connected {
 				connected = true
 				fmt.Printf("Cluster %d: connected to %s\n", o.ID, o.Spec.Endpoint)
 				deleteWhenReady()
 			}
 		case ev := <-cacheCh:
-			o := ev.Object
+			if ev.Type == beehive.Failed {
+				log.Fatalf("cache watch ended: %v", ev.Err)
+			}
 			if ev.Type == beehive.Deleted {
-				fmt.Printf("ClusterCache %d: removed\n", o.ID)
+				fmt.Printf("ClusterCache %d: removed\n", ev.ID)
 				cachesRemoved++
 				continue
 			}
+			o := ev.Object
 			if !deleted && o.Status != nil && o.Status.Entries > 0 && !warmed[o.ID] {
 				warmed[o.ID] = true
 				fmt.Printf("ClusterCache %d: warmed (%d entries)\n", o.ID, o.Status.Entries)

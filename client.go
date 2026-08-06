@@ -15,207 +15,280 @@
 package beehive
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/amorey/beehive/internal/storeapi"
+	"github.com/google/uuid"
 )
 
 // ErrNoController is returned by Requeue when the client's kind has no
-// registered controller: there is no reconcile loop to schedule against. A
-// client-only kind is read/write but never reconciled.
+// registered controller: there is no reconcile loop to schedule against.
 var ErrNoController = errors.New("beehive: no controller registered for kind")
 
-// ObjectChange reports a change to a watched object: what happened (Type) and
-// the object it happened to. On a Deleted change Object carries the row's final
-// state. It is delivered by value — a type tag plus one pointer — so a consumer
-// never has to reason about a nil change.
-type ObjectChange[Spec, Status any] struct {
-	Type   ChangeType
-	Object *Object[Spec, Status]
+// ErrWatchTooOld ends a watch whose unread entries retention has already
+// removed — the object write log for Watch/WatchList, the event log for
+// EventsWatch. The stream cannot continue truthfully, so it reports this and
+// closes; the caller answers by subscribing again for a fresh snapshot.
+var ErrWatchTooOld = errors.New("beehive: watch is below the log's retention horizon")
+
+// ErrWatchTooNew ends a resume whose position is above everything the log has
+// held, which means the position did not come from this store — a restored
+// backup or a swapped file restarts the sequence. Answered the same way as
+// ErrWatchTooOld: subscribe again without the resume option. Unreported, such a
+// stream says "caught up" and then drops everything until the sequence climbs
+// past the position.
+var ErrWatchTooNew = errors.New("beehive: watch resumes above the log's head")
+
+// ErrStopped ends a watch whose Beehive has stopped. It is what separates
+// shutdown from the caller cancelling: resubscribing answers ErrWatchTooOld and
+// cannot answer this one, since a stopped Beehive does not start again.
+var ErrStopped = errors.New("beehive: the beehive has stopped")
+
+// GenerateName returns prefix joined to a fresh UUIDv7, for callers whose
+// objects have no natural name:
+//
+//	obj, err := client.Create(ctx, beehive.GenerateName("cache"), spec)
+//
+// UUIDv7 leads with a millisecond timestamp, so names sharing a prefix sort by
+// creation time, and a monotonic counter makes same-process names distinct by
+// construction. Collision-resistant, not collision-proof: Create reports
+// ErrNameTaken, and a caller generating names should bound-retry on exactly
+// that sentinel:
+//
+//	for range 3 {
+//		obj, err := client.Create(ctx, beehive.GenerateName("cache"), spec)
+//		if !errors.Is(err, beehive.ErrNameTaken) {
+//			return obj, err
+//		}
+//	}
+//
+// newUUIDv7 is a seam so tests can exercise the otherwise-unreachable panic.
+var newUUIDv7 = uuid.NewV7FromReader
+
+func GenerateName(prefix string) string {
+	// crypto/rand.Read never returns an error (it crashes on an unusable OS
+	// source), so drawing the bytes here makes the whole path error-free.
+	var b [16]byte
+	rand.Read(b[:])
+
+	// Routed through uuid so the version/variant nibbles and the monotonic
+	// counter are stamped. The error is unreachable, but a dropped error would
+	// yield uuid.Nil — every name collapsing to one constant — so it panics
+	// with its cause instead.
+	id, err := newUUIDv7(bytes.NewReader(b[:]))
+	if err != nil {
+		panic("beehive: unreachable: UUIDv7 from a 16-byte reader: " + err.Error())
+	}
+	return prefix + "-" + id.String()
 }
 
-// Client is the user-facing API for a single resource kind: the surface for
-// creating, reading, updating, deleting, and watching objects.
+// checkName rejects "" before any store work, so the error does not depend on
+// whether a row happens to exist. The store refuses "" as well; this is the
+// courtesy that keeps reads from answering ErrNotFound for a bad argument.
+func checkName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: pass the name the object should be addressable by", ErrInvalidName)
+	}
+	return nil
+}
+
+// ObjectSnapshot is a single-object watch's starting state. Object is nil when
+// the id holds nothing yet; the stream that comes with it carries changes
+// strictly above ResourceVersion.
+type ObjectSnapshot[Spec, Status any] struct {
+	Object          *Object[Spec, Status]
+	ResourceVersion int64
+}
+
+// ObjectListSnapshot is a kind-wide watch's starting state: the objects as they
+// were, and the log position they are complete as of. The stream that comes
+// with it carries changes strictly above that position.
+type ObjectListSnapshot[Spec, Status any] struct {
+	Objects         []*Object[Spec, Status]
+	ResourceVersion int64
+}
+
+// ObjectChange reports a change to a watched object. On a Deleted change,
+// Object carries the row's final state, or is nil when that state could not be
+// decoded — the removal is reported either way, because nothing later in the
+// log mentions a deleted id. On a Failed change, Object is nil and Err is
+// non-nil: the stream is over, and a Failed change is always the last value
+// before the channel closes — ErrWatchTooOld for a stream that fell behind
+// retention, ErrWatchTooNew for a resume position this store never issued,
+// ErrStopped for a Beehive that stopped. A channel that closes with
+// no Failed change ended because the caller's context did, so a supervisor may
+// treat that alone as its own cancellation.
+type ObjectChange[Spec, Status any] struct {
+	Type ChangeType
+	// ID is the object this change is about, set whether or not Object is. Zero
+	// on a Failed change.
+	ID ObjectID
+	// ResourceVersion is the log position this change was reported at, and what
+	// WithResumeFrom takes to continue from here. Zero on a Failed change.
+	ResourceVersion int64
+	Object          *Object[Spec, Status]
+	Err             error
+}
+
+// Client is the user-facing API for a single resource kind: creating, reading,
+// updating, deleting, and watching objects.
 type Client[Spec, Status any] interface {
-	Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error)
-	CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error)
-	// Delete soft-deletes the object (sets DeletionRequestedAt) and advances GC so
-	// the controller runs its finalizers; physical removal follows once they clear.
-	// An id naming no object of this kind is ErrNotFound — contrast DeleteBySlug,
-	// which folds absence to nil.
+	// Create inserts a new object under name, which is required and immutable.
+	// A name already held by a live or deletion-pending row fails with
+	// ErrNameTaken — Create never writes to a row it found; use GetOrCreate
+	// when "already there" is acceptable. The new object is unsettled and owed
+	// its first reconcile.
+	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+	// Delete soft-deletes id by setting DeletionRequestedAt. A registered kind
+	// reaches its controller at commit; a client-only kind waits for the GC
+	// sweeper, which takes every deletion from there either way. Returns
+	// ErrNotFound if id holds no object — it was collected out from under the
+	// caller, which is worth hearing about. Idempotent on an already-pending
+	// row. Kind-scoped.
 	Delete(ctx context.Context, id ObjectID) error
-	// DeleteBySlug requests deletion of the object with the given slug. It is
-	// idempotent: a slug that matches no object returns nil (already gone), and a
-	// row already deletion-pending is a no-op returning nil (as Delete is on a
-	// repeated call). Kind-scoped like GetBySlug — a slug is per-kind, so this only
-	// ever targets this client's kind. Deletion itself is Delete's: a soft delete
-	// plus a GC advance.
-	//
-	// The delete-if-present partner to GetOrCreate's create-if-absent, so an
-	// ensure/remove pair is one call on each side.
-	DeleteBySlug(ctx context.Context, slug string) error
-	// DependenciesList returns the objects id depends on (its outgoing depends_on
-	// edges). The lazy counterpart to LoadDependencies().
+	// DeleteByName is Delete keyed by name: it acts on whatever holds name now.
+	// Idempotent, and absence folds to nil — a name nothing holds is the
+	// desired state — which is the one place it departs from Delete.
+	DeleteByName(ctx context.Context, name string) error
+	// DependenciesList returns the objects id depends on (outgoing depends_on).
+	// The lazy counterpart to LoadDependencies().
 	DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-	// DependentsList returns the objects that depend on id (incoming depends_on).
-	// The lazy counterpart to LoadDependents().
+	// DependentsList returns the objects that depend on id (incoming
+	// depends_on). The lazy counterpart to LoadDependents().
 	DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-	// EventsGetLatest returns the current (most-recent) run in id's category timeline.
-	// ok reports presence: false (with a nil error) when the timeline is empty.
+	// EventsGetLatest returns the current run in id's category timeline. ok is
+	// false (with a nil error) when the timeline is empty.
 	EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error)
 
-	// EventsList returns id's event-log runs, newest-first, filtered by the given
-	// options (see EventOption). Like the ref lookups it reads by id and does not
-	// kind-scope: a foreign id reads that object's log. An empty log is an empty slice.
+	// EventsList returns id's event-log runs, newest-first, filtered by opts.
+	// Reads by id, not kind-scoped. An empty log is an empty slice.
 	EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
-	// EventsWatch streams id's event log: the runs matching opts as a snapshot, then
-	// live runs, on the returned channel. The channel closes when ctx is cancelled or
-	// the stream ends. Like Watch it requires a registered controller and is scoped to
-	// this client's kind. Runs conflate per run, so a lagging reader converges to each
-	// run's latest state.
-	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error)
+	// EventsWatch streams id's event log: a snapshot of the runs matching opts,
+	// the position it was read at, and the runs the log grows by above it. An
+	// extend re-samples ResourceVersion, so a run that grew is delivered again
+	// carrying its latest state. WithEventsResumeFrom starts above a position
+	// instead of snapshotting; one retention has passed is ErrWatchTooOld and
+	// one above the log's head is ErrWatchTooNew. Requires a registered
+	// controller.
+	EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
+	// Get loads id, or returns ErrNotFound. Kind-scoped: another kind's row is
+	// not found. The read half of a read-modify-write, whose write half is
+	// Update.
 	Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error)
-	GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error)
-	// GetOrCreate returns the object with the given slug, creating it from spec if
-	// absent. Unlike CreateOrUpdate it NEVER mutates an existing row: a slug held by
-	// a live OR deletion-pending row is returned as-is with created=false, so the
-	// caller can inspect DeletionRequestedAt and decide whether to wait for GC and
-	// retry — a tombstone still holds the slug's UNIQUE constraint, so no replacement
-	// can be created until GC clears it. The read-or-create is atomic (a single
-	// store.Within transaction), so concurrent reconciles can't both create — one
-	// wins, the other observes it with created=false.
+	// GetByName is Get keyed by name: it loads whatever holds name now, or
+	// returns ErrNotFound. Kind-scoped — another kind's row holding the same
+	// name is not found.
+	GetByName(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
+	// GetOrCreate returns the object with the given name, creating it from spec
+	// if absent. It NEVER mutates an existing row: a name held by a live or
+	// deletion-pending row is returned as-is with created=false, options
+	// ignored — do not read created=false as "exists and matches opts". The
+	// read-or-create is atomic, so concurrent creates can't both win.
 	//
-	// On create the Added event is emitted and the object enqueued, as with Create;
-	// returning an existing row emits and enqueues nothing.
+	// There is no name-keyed upsert: to change an existing row, follow with
+	// Update. spec and opts are validated up front even when the row exists, so
+	// a caller bug fails regardless of store state.
 	//
-	// opts apply only on the create branch (WithOwner, WithFinalizers, WithOnCreate).
-	// WithSlug is rejected with ErrConflictingOption rather than ignored: the slug is
-	// positional here, so the option can only contradict it, and silently dropping it
-	// would surface much later as an ErrNotFound on the slug the caller meant to use.
-	//
-	// The returned created bool is synchronous, so inside a caller's
-	// ControllerClient.Within it is set before the enclosing transaction commits: a
-	// caller that fires a non-store side effect on created==true acts for a row a
-	// later rollback discards. Route create-conditional side effects through
-	// WithOnCreate, which runs only after the outermost commit; read created as a
-	// correct after-the-fact report, not a pre-commit trigger.
-	//
-	// A non-nil err means nothing was created: the new row is decoded back into
-	// Spec/Status inside the atomic Within, so a spec whose bytes don't round-trip (a
-	// marshal/type bug) rolls the insert back rather than committing a row the process
-	// can't read. Such an error therefore returns created=false, and a retry does not
-	// hit a spurious UNIQUE on a phantom row. (A decode error on the found branch — a
-	// pre-existing poison row this call did not write — likewise returns created=false,
-	// since it plainly wasn't created here.)
-	//
-	// On the found branch the options are ignored outright — an existing row that
-	// lacks the owner or finalizers you passed keeps lacking them, and created=false
-	// is the only signal you get. Do not read created=false as "exists and matches
-	// opts": a caller depending on the owner edge (for cascade collection, say) must
-	// check it with LoadOwner()/OwnersGet and reconcile the difference itself.
-	// Beehive can't adopt the row for you — owner is single, so adding the edge to a
-	// row that already has a different owner would produce a two-owner object, and
-	// picking a winner is caller policy.
-	//
-	// spec and opts are nonetheless validated up front, before the slug is read, so
-	// an unmarshalable spec or an erroring option fails the call even when the row
-	// already exists and neither would have been used. Both are caller bugs, and
-	// validating them eagerly keeps the error independent of store state: deferring
-	// would make the same call succeed or fail depending on whether the row happens
-	// to exist, hiding the bug until GC or a cold start removed it. It also keeps
-	// json.Marshal out of the transaction, which on a single-connection store would
-	// hold the write lock across arbitrary user MarshalJSON code.
-	GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
+	// The created bool is synchronous: inside a caller's Within it is set
+	// before the transaction commits, so route create-conditional side effects
+	// through WithOnCreate instead. A non-nil err means nothing was created —
+	// a new row that fails to decode rolls back rather than committing bytes
+	// the process can't read.
+	GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error)
-	ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error)
-	ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error)
 	// OwnedList returns the objects id owns (its incoming owned_by edges). The
 	// lazy counterpart to LoadOwned().
 	OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 
 	// OwnedObjectsList returns the objects owned by ownerID that belong to THIS
-	// client's kind, fully decoded — the typed, kind-scoped form of OwnedList
-	// (which returns untyped Refs across every owned kind, leaving the caller to
-	// filter by Kind and Get each child through that kind's client). Ownership is
-	// the owned_by edge (child -> owner), so these are ownerID's children of this
-	// kind, ordered by id as OwnedList is.
-	//
-	// ownerID need not be this client's kind — it is the owner, typically another
-	// kind — and like OwnedList it is not kind-scoped or existence-checked: an
-	// owner with no children of this kind, and an ownerID that doesn't exist, both
-	// read empty rather than ErrNotFound. A deletion-pending child is included;
-	// whether to skip it is the caller's call (check DeletionRequestedAt).
-	// Undecodable rows are quarantined and logged, as in List.
-	//
-	// It takes the same LoadOptions as List, batched the same way: without them the
-	// children come back with nothing loaded and their ref/event accessors return
-	// ErrNotLoaded. Pass e.g. LoadOwned() to walk a second level of the tree
-	// without a Get per child — the per-child Get this method exists to avoid.
+	// client's kind, fully decoded — the typed, kind-scoped form of OwnedList,
+	// resolved in one query instead of a Get per child. ownerID is typically
+	// another kind and is not existence-checked: no children, or no such owner,
+	// both read empty. Deletion-pending children are included; undecodable rows
+	// are quarantined and logged, as in List. Takes the same LoadOptions as
+	// List.
 	OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
 
-	// OwnersGet returns id's owner, if any. ok reports presence: false (with a nil
-	// error) when the object simply has no owner. The lazy counterpart to
-	// LoadOwner() — fetch the owner only when it is actually needed.
+	// OwnedObjectsListWatch is OwnedObjectsList as a watch: a snapshot of
+	// ownerID's children of this kind, then every change to one of them. A child
+	// created under ownerID later arrives as Added and its collection as Deleted.
+	// Same options, errors and shared tailer as WatchList.
 	//
-	// This and the three DependenciesList/DependentsList/OwnedList lookups read
-	// their edge query directly and do not kind-scope id: passing another kind's
-	// id reads that kind's edges, and a missing id reads empty — neither reports
-	// ErrNotFound. Reserve them for ids this client owns.
+	// Assumes the one owner WithOwner can express, as OwnersGet and Owner() do: a
+	// child carrying several owned_by edges — reachable only through a direct
+	// Store call — streams to one of them. See docs/TODO.md.
+	OwnedObjectsListWatch(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+
+	// OwnersGet returns id's owner, if it has one; ok is false with a nil error
+	// when it has none. The lazy counterpart to LoadOwner().
+	//
+	// This and DependenciesList/DependentsList/OwnedList run their edge query
+	// directly with no kind check: a foreign id reads that kind's edges and a
+	// missing id reads empty — neither returns ErrNotFound. Use them for ids
+	// this client owns.
 	OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
 
-	// Requeue requeues id for immediate reconcile. A latency hint, not a
-	// synchronous run: with the periodic resync enabled, correctness rests on that,
-	// not on this call.
-	//
-	// It is also the supported way to drive reconciles yourself when no ticker is
-	// configured — WithCatchupInterval(0) with WithResyncInterval(0), where startup
-	// drains owed work once and nothing re-derives it afterward.
-	// Store.ObjectsListUnsettledIDs reports what is owed.
-	//
-	// By default it preserves id's retry backoff ladder: a requeue is the common
-	// event-driven nudge (config change, dependency update, manual poke) and
-	// almost never proves the failure condition is resolved. The ladder is cleared
-	// by a successful reconcile or by passing WithResetBackoff(), never by a plain
-	// requeue. Pass WithResetBackoff() only when the caller knows the failure is
-	// resolved and the next retry should start from the base interval.
-	//
-	// Returns ErrNotFound if id does not exist and ErrNoController if the kind has
-	// no registered controller.
+	// Requeue queues id for reconcile now. A latency hint, not a synchronous
+	// run: correctness rests on the periodic drivers. By default it keeps id's
+	// retry backoff — a requeue almost never proves a failure is over — pass
+	// WithResetBackoff() when it is. Returns ErrNotFound if id does not exist,
+	// ErrNoController if the kind has no controller.
 	Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error
-	// SchedulesGet reports id's Schedule: when the reconcile loop has, in advance,
-	// scheduled id to be requeued — a pending backoff retry or RequeueAfter delay,
-	// or now if it is already queued — in Schedule.NextRequeueAt, or the zero time
-	// there when nothing is scheduled. The Schedule wrapper leaves room for future
-	// fields (e.g. a reschedule trigger) without a breaking change.
+	// SchedulesGet reports when the reconcile loop has scheduled id to be
+	// requeued (a pending backoff or RequeueAfter delay; for a queued id, the
+	// moment it became due), or the zero Schedule when nothing is scheduled. A
+	// non-blocking read of in-memory state: a missing or foreign id, and a
+	// client-only kind, all read as the zero Schedule; the error is never
+	// returned today.
 	//
-	// This is a non-blocking, best-effort read of in-memory schedule state — it
-	// touches no store, so the error is reserved for symmetry and never returned
-	// today. An id that does not exist (or belongs to another kind) is simply
-	// unscheduled, and a client-only kind has no reconcile loop at all; both read as
-	// the zero-value Schedule, indistinguishable from a real object with nothing
-	// scheduled.
-	//
-	// This is the next *scheduled* requeue, not a prediction of the next reconcile.
-	// It does not — and cannot — account for wakes that aren't a per-id timer: the
-	// periodic resync (kind-wide, conditional on being unsettled), dependency-change
-	// wakes, store-write enqueues, or Requeue. So the actual next reconcile may be
-	// earlier than reported, and a zero NextRequeueAt means "nothing scheduled", not
-	// "will not reconcile". Treat it as observability, not a guarantee. Use
-	// SchedulesWatch to observe changes live.
+	// This is the next *scheduled* requeue, not a prediction: the periodic
+	// passes and dependency wakes never appear here, so the real next reconcile
+	// may be sooner. Treat it as observability; use SchedulesWatch to follow it
+	// live.
 	SchedulesGet(ctx context.Context, id ObjectID) (Schedule, error)
-	// SchedulesWatch streams id's schedule as a gauge: the current value on subscribe,
-	// then a new Schedule on every (re)schedule — backoff step, RequeueAfter, resync
-	// or dependency wake, dispatch, or Requeue — none of which the object Watch sees.
-	// The channel closes when ctx is cancelled or the control plane stops. A lagging
-	// reader converges to the latest value (per-id coalescing), so it can miss
-	// intermediate values but never the current one. Unlike SchedulesGet, a client-only
-	// kind returns ErrNoController rather than hang on a stream that can never emit; id
-	// need not exist — an unscheduled id streams the zero Schedule until scheduled.
+	// SchedulesWatch streams id's schedule as a gauge: the current value, then
+	// a new Schedule whenever it changes. Unlike the other watches it reports
+	// in-memory state as the work queue moves it — no polling, emits only on
+	// change. The channel closes when ctx is cancelled OR when the Beehive
+	// stops (after delivering the final schedule); a reader cannot tell the two
+	// apart. A client-only kind returns ErrNoController; id need not exist.
 	SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error)
+	// Update replaces id's spec, or returns ErrNotFound (a missing row is not
+	// "already in the desired state"). A spec whose bytes match what is stored
+	// writes nothing at all, so a controller re-applying its own spec does not
+	// wake itself forever. The write half of a read-modify-write.
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
+	// UpdateByName is Update keyed by name: it writes whatever holds name now,
+	// resolving and writing in one transaction. Not for a read-modify-write —
+	// a collect-and-recreate between the read and the write would land it on a
+	// different incarnation; use Update.
+	UpdateByName(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
+	// Watch returns one object's current state, WatchList every object of this
+	// client's kind, each with a stream of the changes above it:
+	// Added/Modified/Deleted until ctx is cancelled. Both are kind-scoped and
+	// need no registered controller: the tail reads the write log, not a
+	// reconciler. Watch follows one incarnation: an id holding nothing is a nil
+	// ObjectSnapshot.Object rather than ErrNotFound, and a recreate under the
+	// same name is a different id, so the stream ends at Deleted.
+	//
+	// The snapshot is read before either returns, on the caller's goroutine, so a
+	// caller may subscribe and then act: a change it makes afterwards — including
+	// a delete — is always in the stream. The snapshot's ResourceVersion is the
+	// log position it is complete as of, and the stream carries changes strictly
+	// above it: no overlap, no gap. A failed snapshot read is returned rather
+	// than handed back as a stream whose guarantee is void.
+	//
+	// Everything after comes from the kind's shared tailer: a commit wakes it,
+	// and a floor tick covers what a wake cannot. Delivery is latest-per-object,
+	// so changes to one object collapse. A watch cannot be opened inside a
+	// transaction (the read would deadlock on the single connection).
+	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 }
 
 // NewClient returns a Client for the given resource kind. Spec and Status must
@@ -229,44 +302,42 @@ type clientImpl[Spec, Status any] struct {
 	gk GroupKind
 }
 
-// decode turns a store row into the typed object, applying this kind's migrator
-// (if any) at the decode boundary. Every read path routes through it so the
-// client and the reconciler share one migrator per kind.
+// decode turns a store row into the typed object, applying this kind's
+// migrator. Every read path routes through it.
 func (c *clientImpl[Spec, Status]) decode(raw *RawObject) (*Object[Spec, Status], error) {
 	return rawToTyped[Spec, Status](raw, c.bh.migratorFor(c.gk))
 }
 
-func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
 	}
-	co, err := resolveCreate(opts)
+	co, err := c.resolveCreate(opts)
 	if err != nil {
 		return nil, err
 	}
 
 	var obj *Object[Spec, Status]
 	// Within keeps the insert and its owner ref atomic, so a crash between them
-	// can't leave an ownerless child the GC path would never collect.
+	// can't leave an ownerless child GC would never collect.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err := c.insertObject(ctx, b, co)
+		raw, err := c.insertObject(ctx, name, b, co)
 		if err != nil {
 			return err
 		}
-		// Decode inside the transaction so a row whose bytes don't round-trip never
-		// commits: returning the error here rolls back the insert and discards the
-		// buffered wake, preserving "a Create that returns an error made no change"
-		// (no committed poison row, no phantom enqueue). decode is pure over the
-		// in-memory raw — no store read — and the migrator never runs on a create
-		// (the row is stamped at the current version, so from==current is identity),
-		// so the only failure here is an asymmetric caller codec. This is the one
-		// spot we accept user unmarshal code inside the tx; marshal stays outside it.
+		// Decode inside the transaction so a row whose bytes don't round-trip
+		// never commits: the error rolls back the insert and its buffered wake.
+		// decode is pure over the in-memory raw, and the migrator never runs on
+		// a create, so the only failure here is an asymmetric caller codec.
 		obj, err = c.decode(raw)
 		if err != nil {
 			return err
 		}
-		c.signalCreated(ctx, raw.ID, co)
+		c.signalCreated(ctx, raw, co)
 		return nil
 	})
 	if err != nil {
@@ -275,18 +346,44 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, spec Spec, opts .
 	return obj, nil
 }
 
-// insertObject inserts one new row of this client's kind and wires its owner
-// edge. Every create path shares it, so the row shape, the spec-version stamp,
-// and the owner-ref policy live in one place. Callers run it inside a Within:
-// the insert and its ref must commit together, or a crash between them leaves an
-// ownerless child the GC path would never collect. The slug rides on co, which
-// each caller has already populated from its single source (WithSlug for Create,
-// the positional argument for CreateOrUpdate/GetOrCreate).
-func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte, co *createOptions) (*RawObject, error) {
-	raw, err := c.bh.store.ObjectsCreate(ctx, &RawObject{
-		Group:       c.gk.Group,
-		Kind:        c.gk.Kind,
-		Slug:        co.slug,
+// resolveCreate folds the create-time options, then applies the one validation
+// that needs the control plane — before any store work, so a caller mistake
+// never takes the write lock.
+func (c *clientImpl[Spec, Status]) resolveCreate(opts []Option) (*createOptions, error) {
+	co, err := resolveCreate(opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.checkFinalizersClearable(co); err != nil {
+		return nil, err
+	}
+	return co, nil
+}
+
+// checkFinalizersClearable rejects WithFinalizers on a kind this process has no
+// controller for. Such a finalizer is unclearable — FinalizersDelete is
+// kind-folded, so no other controller can reach it either — and the row would
+// sit deletion-pending forever, RESTRICT-blocking its owner's delete. The check
+// is process-local and evaluated at call time (the store tracks no
+// registrations), and it fires on GetOrCreate's found branch too: deferring to
+// the insert would make the same call pass or fail depending on whether the row
+// happens to exist. Gated on the option actually being used, so an ordinary
+// create never takes bh.mu.
+func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) error {
+	if len(co.finalizers) == 0 || c.bh.isRegistered(c.gk) {
+		return nil
+	}
+	return fmt.Errorf("%w: WithFinalizers needs a controller registered for %s/%s in this process to clear them; "+
+		"a finalizer no controller here can remove would leave the row deletion-pending forever",
+		ErrInvalidOption, c.gk.Group, c.gk.Kind)
+}
+
+// insertObject inserts one new row and wires its owner edge; every create path
+// shares it. Callers run it inside a Within so the insert and its ref commit
+// together.
+func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string, spec []byte, co *createOptions) (*RawObject, error) {
+	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
+		Name:        name,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
 		Finalizers:  co.finalizers,
@@ -294,189 +391,152 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, spec []byte
 	if err != nil {
 		return nil, err
 	}
-	// The child owns the edge (child -> owner) so the owner's GC walk finds it
-	// via EdgesListIncoming(owner, RelationOwnedBy). No version claim and no wake
-	// stamp: an owner edge carries no read this call could be racing.
+	// The child owns the edge (child -> owner) so the owner's GC walk finds it.
+	// No wake stamp: ownership owes the child no reconcile.
 	if co.owner != nil {
-		if _, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy, 0); err != nil {
+		res, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		if err != nil {
 			return nil, err
+		}
+		// A deleting owner's cascade may already have run past this child; a live
+		// owner was blocked by nothing, and requeueNow bypasses the floor.
+		// See docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md.
+		if res.ToDeleting {
+			c.bh.signalRequeueNow(ctx, ObjectRef{ID: *co.owner, Group: res.To.Group, Kind: res.To.Kind})
 		}
 	}
 	return raw, nil
 }
 
-// signalCreated registers the post-commit side effects a freshly inserted row owes:
-// the reconciler wake and, if the caller passed one, the WithOnCreate hook. Both go
-// through AfterCommit, so they fire after the outermost commit and never on a
-// rollback. Create and GetOrCreate share it so the create-side-effect wiring — and
-// the wake-then-hook ordering — lives in one place, alongside insertObject.
-// CreateOrUpdate does not use it: its create branch has no onCreate, and its wake is
-// folded into the shared "if changed" path so an update and a create wake alike.
-func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, id ObjectID, co *createOptions) {
-	c.bh.wakeAfterCommit(ctx, c.gk, id)
+// signalCreated registers what a freshly inserted row owes after the commit:
+// the caller's WithOnCreate hook and the row's first reconcile. Both go through
+// AfterCommit, so neither fires on a rollback.
+func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawObject, co *createOptions) {
 	if co.onCreate != nil {
 		c.bh.store.AfterCommit(ctx, co.onCreate)
 	}
+	// A create always changes the object: there was nothing before it.
+	c.signalSpecWritten(ctx, raw.ID)
+	c.bh.signalKindWritten(ctx, c.gk)
 }
 
-// decodeAndWake is the shared tail of the slug-upsert writes (Update,
-// CreateOrUpdate): it decodes raw *inside the caller's transaction* so a spec that
-// doesn't round-trip rolls the write back rather than committing a row the process
-// can't read (see Create), and then registers the post-commit reconcile wake — but
-// only when changed is true. The wake is gated because a no-op write (an identical
-// spec, which ObjectsUpdateSpec collapses) emits nothing; waking anyway would be the lone
-// signal claiming something happened and, for a controller re-applying its own
-// kind's spec each pass, a self-sustaining reconcile loop. Keeping this contract in
-// one place is the update-path counterpart to signalCreated on the create paths.
-func (c *clientImpl[Spec, Status]) decodeAndWake(ctx context.Context, raw *RawObject, changed bool) (*Object[Spec, Status], error) {
-	obj, err := c.decode(raw)
-	if err != nil {
-		return nil, err
-	}
-	if changed {
-		c.bh.wakeAfterCommit(ctx, c.gk, raw.ID)
-	}
-	return obj, nil
-}
-
-// CreateOrUpdate idempotently reconciles the object named by slug to spec: it
-// updates the existing object carrying that slug, or creates one with that slug
-// if none exists. Wrapping the read-then-write in Within makes the upsert atomic,
-// so concurrent callers can't both insert the same slug — the second sees the
-// first's row and updates instead. Re-applying the same spec is a no-op (ObjectsUpdateSpec
-// suppresses the generation bump on equal bytes).
+// signalSpecWritten enqueues id's own reconcile once the write that changed its
+// spec commits — what makes a spec write prompt rather than a wait for the owed
+// pass.
 //
-// It drives the store mutators directly rather than composing Create/Update so
-// one row change produces exactly one wake, registered post-commit like every
-// other write path (see wakeAfterCommit) — and no wake at all when the spec was
-// already what the caller asked for.
-func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, slug string, spec Spec) (*Object[Spec, Status], error) {
-	b, err := json.Marshal(spec)
-	if err != nil {
-		return nil, err
-	}
-	var obj *Object[Spec, Status]
-	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
-		var raw *RawObject
-		changed := true // the create branch always changes something
-		switch {
-		case err == nil:
-			raw, changed, err = c.bh.store.ObjectsUpdateSpec(ctx, c.gk, existing.ID, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
-		case errors.Is(err, ErrNotFound):
-			// No opts on this surface, so the row carries no finalizers and no owner.
-			raw, err = c.insertObject(ctx, b, &createOptions{slug: &slug})
-		}
-		// A non-NotFound read error falls through both cases with raw unset; err
-		// still carries it. Both write branches reassign err.
-		if err != nil {
-			return err
-		}
-		obj, err = c.decodeAndWake(ctx, raw, changed)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return obj, nil
+// The caller passes only writes that actually CHANGED the object. Gating on
+// "the caller called Update" would enqueue byte-identical writes, rebuilding
+// the self-wake loop the store's no-op skip exists to prevent — and worse,
+// since requeueNow beats the backoff ladder. Gating on the row being unsettled
+// has the same defect: a failing reconcile leaves it unsettled forever.
+//
+// The signal is read as the write leaves it, not as the transaction commits: a
+// spec-then-UpdateStatus in one Within commits settled and still enqueues once,
+// a harmless duplicate in the direction this design errs throughout (pinned by
+// TestSpecThenStatusInOneTransactionStillEnqueues).
+func (c *clientImpl[Spec, Status]) signalSpecWritten(ctx context.Context, id ObjectID) {
+	// Not throttled: a spec write carries new information. The changed gate is
+	// what stops a controller re-applying its own spec from riding this forever.
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
 }
 
-// GetOrCreate returns the row holding slug, creating it only when absent. It is
-// the create-if-absent sibling of CreateOrUpdate: the found branch does no write
-// at all, so a deletion-pending row comes back with its tombstone intact rather
-// than being spuriously bumped back to life. See the Client interface for the
-// full contract.
-func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, slug string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+// GetOrCreate returns the row holding name, creating it only when absent. The
+// found branch does no write at all. See the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+	if err := checkName(name); err != nil {
+		return nil, false, err
+	}
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, false, err
 	}
-	co, err := resolveCreate(opts)
+	co, err := c.resolveCreate(opts)
 	if err != nil {
 		return nil, false, err
 	}
-	// The slug is positional here, so WithSlug can only contradict it. Reject rather
-	// than silently drop it: the ignored option would otherwise surface much later,
-	// as an ErrNotFound on a slug the caller believed it had asked for.
-	if co.slug != nil {
-		return nil, false, fmt.Errorf("%w: GetOrCreate takes the slug positionally; WithSlug(%q) conflicts with %q",
-			ErrConflictingOption, *co.slug, slug)
-	}
-
 	var obj *Object[Spec, Status]
 	var created bool
-	// One Within around the read and the insert is what removes the caller's
-	// TOCTOU: the loser of a concurrent create observes the winner's row instead
-	// of failing on the slug's UNIQUE constraint.
+	// One Within around the read and the insert removes the TOCTOU: the loser
+	// of a concurrent create observes the winner's row.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
+		existing, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
 		if err == nil {
-			// Found: return the existing row as-is (live or deletion-pending; never
-			// mutated). A pre-existing poison row is not ours to roll back, so its
-			// decode error surfaces with created=false — it plainly wasn't created here.
+			// Found: returned as-is, live or deletion-pending. A pre-existing
+			// poison row's decode error surfaces with created=false.
 			obj, err = c.decode(existing)
 			return err
 		}
 		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
-		// co.slug is nil here — WithSlug was rejected up front — so the positional
-		// slug is the row's only name.
-		co.slug = &slug
-		raw, err := c.insertObject(ctx, b, co)
+		raw, err := c.insertObject(ctx, name, b, co)
 		if err != nil {
 			return err
 		}
-		// Decode inside the transaction (see Create): a new row whose bytes don't
-		// round-trip must never commit, so its decode error rolls the insert back
-		// rather than leaving a committed poison row. created is set only after the
-		// decode succeeds, so a rolled-back create reports created=false — the bool
-		// tracks what actually landed, never a row the transaction discarded.
+		// Decode inside the transaction (see Create); created is set only after
+		// it succeeds, so a rolled-back create reports created=false.
 		obj, err = c.decode(raw)
 		if err != nil {
 			return err
 		}
 		created = true
-		// Wake and any WithOnCreate hook fire only for a row we just made: returning
-		// an existing object is a pure read and must not nudge the reconciler or run
-		// create-conditional side effects (which is also why they aren't gated on the
-		// returned created bool — see below).
-		c.signalCreated(ctx, raw.ID, co)
+		// Wake and WithOnCreate fire only for a row we just made; returning an
+		// existing object is a pure read.
+		c.signalCreated(ctx, raw, co)
 		return nil
 	})
 	if err != nil {
 		return nil, false, err
 	}
-	// The returned created bool is synchronous: inside a caller's Within it reports
-	// true before the enclosing transaction commits, so a caller that fires a
-	// non-store side effect on it can act for a row a later rollback discards. Route
-	// such effects through WithOnCreate, which defers to the post-commit flush and
-	// so never runs on a rollback. The bool remains a correct after-the-fact report
-	// once the outermost transaction commits.
 	return obj, created, nil
 }
 
 func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
+		// ObjectsUpdateSpec folds this client's kind into the write;
+		// hideWrongKind keeps a foreign id invisible.
+		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
+		return raw, changed, c.hideWrongKind(err)
+	})
+}
+
+func (c *clientImpl[Spec, Status]) UpdateByName(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
+	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
+		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
+	})
+}
+
+// update is the body both spec writes share. The marshal stays outside the
+// transaction — on a single-connection store it would hold the write lock
+// across arbitrary user MarshalJSON code. Wrapping the write in Within lets the
+// decode join its transaction, so a spec that doesn't round-trip rolls the
+// write back.
+func (c *clientImpl[Spec, Status]) update(
+	ctx context.Context,
+	spec Spec,
+	write func(ctx context.Context, b []byte, version int) (*RawObject, bool, error),
+) (*Object[Spec, Status], error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
 	}
-	// ObjectsUpdateSpec self-wraps in Within; wrapping it here lets the decode join that
-	// same transaction, so a spec that doesn't round-trip rolls the write back (see
-	// Create), keeping the prior good spec instead of committing a row the process
-	// can't read. Outside a caller's Within this is a standalone tx; nested in one it
-	// joins, and the wake defers to that outer commit either way.
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		// ObjectsUpdateSpec folds this client's kind into the write, so a foreign id is
-		// rejected at the store (no separate read-then-write to keep atomic);
-		// hideWrongKind keeps that foreign id invisible to this single-kind client.
-		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
-		if err = c.hideWrongKind(err); err != nil {
+		raw, changed, err := write(ctx, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		if err != nil {
 			return err
 		}
-		obj, err = c.decodeAndWake(ctx, raw, changed)
-		return err
+		if obj, err = c.decode(raw); err != nil {
+			return err
+		}
+		if changed {
+			c.signalSpecWritten(ctx, raw.ID)
+			c.bh.signalKindWritten(ctx, c.gk)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -499,11 +559,9 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads .
 	return obj, nil
 }
 
-// scopedGet loads id and confirms it belongs to this client's kind. A Client is
-// the surface for a single resource kind, so an id naming an object of another
-// kind must be invisible here — reads, updates, and deletes through this client
-// must never touch another controller's rows. On the read path ObjectsGet isn't
-// kind-scoped, so the client checks here, reporting ErrNotFound for a foreign id.
+// scopedGet loads id and confirms it belongs to this client's kind, reporting
+// ErrNotFound for a foreign id — a Client serves a single kind, so another
+// kind's rows must be invisible through it.
 func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
 	raw, err := c.bh.store.ObjectsGet(ctx, id)
 	if err != nil {
@@ -515,10 +573,8 @@ func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (
 	return raw, nil
 }
 
-// hideWrongKind keeps a foreign id invisible through this single-kind client: the
-// scoped store writes reject another kind's object with ErrWrongKind, which the
-// client reports as ErrNotFound (mirrors scopedGet on the read path). Any other
-// error passes through unchanged.
+// hideWrongKind maps the scoped store writes' ErrWrongKind to ErrNotFound,
+// mirroring scopedGet on the read path.
 func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	if errors.Is(err, ErrWrongKind) {
 		return ErrNotFound
@@ -526,8 +582,11 @@ func (c *clientImpl[Spec, Status]) hideWrongKind(err error) error {
 	return err
 }
 
-func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, loads ...LoadOption) (*Object[Spec, Status], error) {
-	raw, err := c.bh.store.ObjectsGetBySlug(ctx, c.gk, slug)
+func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
+	raw, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
 	if err != nil {
 		return nil, err
 	}
@@ -541,10 +600,9 @@ func (c *clientImpl[Spec, Status]) GetBySlug(ctx context.Context, slug string, l
 	return obj, nil
 }
 
-// loadObjectRelated populates the related-data fields named by set on one object,
-// recording each fetched lookup in obj.loaded so the accessors can tell loaded
-// from absent. Both client reads and the reconcile decode boundary call it.
-// Batched List has its own path (loadListRelated) to avoid an N+1.
+// loadObjectRelated populates the related-data fields named by set on one
+// object, recording each fetched lookup in obj.loaded. Batched List has its own
+// path (loadListRelated) to avoid an N+1.
 func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *Object[Spec, Status], set LoadSet) error {
 	if set&LoadOwnerBit != 0 {
 		owner, ok, err := fetchOwnerRef(ctx, store, obj.ID)
@@ -591,8 +649,8 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 	return nil
 }
 
-// fetchOwnerRef resolves id's single owned_by edge. Owner is single (WithOwner
-// sets one), so the first row is the owner and ok is false when there is none.
+// fetchOwnerRef resolves id's single owned_by edge; ok is false when there is
+// none.
 func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bool, error) {
 	owners, err := store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
 	if err != nil {
@@ -617,19 +675,14 @@ func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption
 }
 
 // decodeList decodes a multi-row read, quarantining rather than aborting: one
-// un-decodable row — an un-migratable shape, or a blob written by a newer build
-// (downgrade) — is skipped and logged so it can't break the whole read. The
-// calling method rides along as a field rather than in the message, so the log
-// line groups across call sites. The migrator is invariant for the kind, so it
-// is resolved once rather than re-locking the registry on every row.
+// undecodable row is skipped and logged so it can't break the whole read.
 func (c *clientImpl[Spec, Status]) decodeList(raws []*RawObject, method string) []*Object[Spec, Status] {
 	mig := c.bh.migratorFor(c.gk)
 	objs := make([]*Object[Spec, Status], 0, len(raws))
 	for _, raw := range raws {
 		obj, err := rawToTyped[Spec, Status](raw, mig)
 		if err != nil {
-			c.bh.log().Warn("beehive: skipping undecodable object",
-				"op", method, "group", c.gk.Group, "kind", c.gk.Kind, "id", raw.ID, "err", err)
+			c.warnUndecodable(method, raw.ID, err)
 			continue
 		}
 		objs = append(objs, obj)
@@ -637,9 +690,16 @@ func (c *clientImpl[Spec, Status]) decodeList(raws []*RawObject, method string) 
 	return objs
 }
 
+// warnUndecodable is the one quarantine log line, shared by every read path
+// that skips a poison row; the call site rides in "op" so the line groups.
+func (c *clientImpl[Spec, Status]) warnUndecodable(method string, id ObjectID, err error) {
+	c.bh.log().Warn("beehive: skipping undecodable object",
+		"op", method, "group", c.gk.Group, "kind", c.gk.Kind, "id", id, "err", err)
+}
+
 // loadListRelated eager-loads the requested secondary lookups for a whole list
-// in one batched store call per relation, scattering results back onto each
-// object — the N+1-free counterpart to loadObjectRelated. A nil set is a no-op.
+// in one batched store call per relation — the N+1-free counterpart to
+// loadObjectRelated.
 func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*Object[Spec, Status], set LoadSet) error {
 	if set == 0 || len(objs) == 0 {
 		return nil
@@ -692,10 +752,9 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadEventsBit != 0 {
-		// Events have no batched store primitive (unlike the ref relations), so this
-		// is one query per object — the deliberate exception to loadListRelated's
-		// batching. Each object's log is retention-bounded; for large lists or
-		// filtered reads, prefer the lazy Client.EventsList.
+		// Events have no batched store primitive, so this is one query per
+		// object — the deliberate exception. Prefer the lazy EventsList for
+		// large lists.
 		for _, o := range objs {
 			raw, err := c.bh.store.EventsList(ctx, o.ID, storeapi.EventQuery{})
 			if err != nil {
@@ -708,14 +767,39 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 	return nil
 }
 
+// sendOrDone delivers v unless ctx is cancelled first, and reports whether it
+// landed. Cancellation is checked first, on its own: once a reader parks on
+// out, both select arms are ready and Go picks at random — a subscriber that
+// gave up must not be handed one more value.
+func sendOrDone[V any](ctx context.Context, out chan<- V, v V) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	select {
+	case out <- v:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// pollFailed logs a failed poll and says whether to keep going: a transient
+// store error costs one tick, not the stream; a cancelled context is shutdown.
+func (c *clientImpl[Spec, Status]) pollFailed(ctx context.Context, what string, err error, args ...any) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	c.bh.log().WarnContext(ctx, "beehive: "+what+" poll failed; retrying on the next tick",
+		append([]any{"group", c.gk.Group, "kind", c.gk.Kind, "err", err}, args...)...)
+	return true
+}
+
 // The four lazy ref lookups read their edge query directly, with no scopedGet
-// kind guard in front: that guard was a second, blob-bearing store read (the
-// full objects row plus its conditions) issued purely to validate group/kind on
-// a hot path. We trade it for speed, mirroring the ControllerClient quartet,
-// which never checked. The cost of the trade: a foreign id reads that other
-// kind's edges and a missing id reads empty — neither surfaces as ErrNotFound —
-// so passing another kind's id through this single-kind client is silent misuse
-// rather than a clean error.
+// kind guard: that guard was a second, blob-bearing read on a hot path. The
+// trade: a foreign id reads that kind's edges and a missing id reads empty —
+// silent misuse rather than a clean error.
 func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
 	return fetchOwnerRef(ctx, c.bh.store, id)
 }
@@ -732,8 +816,8 @@ func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) (
 	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
 }
 
-// The kind filter lives in the store statement's WHERE, so foreign-kind children
-// never reach Go. See the Client interface for the contract.
+// The kind filter lives in the store statement's WHERE, so foreign-kind
+// children never reach Go.
 func (c *clientImpl[Spec, Status]) OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
 	raws, err := c.bh.store.ObjectsListByIncomingEdge(ctx, c.gk, ownerID, RelationOwnedBy)
 	if err != nil {
@@ -746,10 +830,9 @@ func (c *clientImpl[Spec, Status]) OwnedObjectsList(ctx context.Context, ownerID
 	return objs, nil
 }
 
-// reconcilerForObject validates id against this client's kind, then resolves the
-// kind's reconciler — the shared gate for the schedule-control methods. scopedGet
-// runs first so a missing or foreign id surfaces as ErrNotFound regardless of
-// registration; only then is a client-only kind reported as ErrNoController.
+// reconcilerForObject validates id against this client's kind, then resolves
+// the kind's reconciler. scopedGet runs first so a missing or foreign id
+// surfaces as ErrNotFound regardless of registration.
 func (c *clientImpl[Spec, Status]) reconcilerForObject(ctx context.Context, id ObjectID) (*reconciler, error) {
 	if _, err := c.scopedGet(ctx, id); err != nil {
 		return nil, err
@@ -762,7 +845,7 @@ func (c *clientImpl[Spec, Status]) reconcilerForObject(ctx context.Context, id O
 }
 
 // Requeue requeues id for immediate reconcile, preserving its backoff ladder
-// unless WithResetBackoff() is passed. See the Client interface for the full contract.
+// unless WithResetBackoff() is passed.
 func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error {
 	r, err := c.reconcilerForObject(ctx, id)
 	if err != nil {
@@ -772,135 +855,70 @@ func (c *clientImpl[Spec, Status]) Requeue(ctx context.Context, id ObjectID, opt
 	return nil
 }
 
-// SchedulesGet reports id's Schedule. It reads the in-memory work queue directly,
-// with no store lookup and no kind guard: a foreign or missing id just isn't in
-// this kind's schedule, and a client-only kind has no reconciler — both fold into
-// the zero-value Schedule. The error is reserved for symmetry with the rest of the
-// surface and is never returned today; ctx is unused (no I/O). See the Client
-// interface for the full contract — notably that it does not account for resync or
-// event-driven wakes.
+// SchedulesGet reads the in-memory work queue directly: no store lookup, no
+// kind guard — a foreign, missing, or client-only id all fold into the zero
+// Schedule. See the Client interface for the contract.
 func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID) (Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
 	if !ok {
 		return Schedule{}, nil // client-only kind: nothing is ever scheduled
 	}
-	at, _ := r.nextRequeueAt(id) // zero time when no requeue is scheduled
-	return Schedule{NextRequeueAt: at}, nil
-}
-
-// SchedulesWatch streams id's schedule live. It requires a registered controller
-// (the reconcile loop that owns the schedule hub); a client-only kind has none, so
-// it returns ErrNoController. See the Client interface for the full contract.
-func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
-	r, ok := c.bh.reconcilerFor(c.gk)
-	if !ok {
-		return nil, ErrNoController
-	}
-	return r.scheduleWatch(ctx, id), nil
+	return r.scheduleAt(id), nil
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	// DeletionRequestsCreate emits the Modified event itself, and only on a real state
-	// change — an idempotent retry carries the same resource_version, so emitting
-	// would show watchers a spurious diff. It folds this client's kind into the
-	// write, so a foreign id can't be deleted through this client; hideWrongKind
-	// keeps that foreign id invisible.
-	_, _, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	// DeletionRequestsCreate bumps resource_version only on a real change, so
+	// an idempotent retry triggers no spurious watch diff. Kind-folded;
+	// hideWrongKind keeps a foreign id invisible.
+	res, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
-	// Always advance GC: a retry or post-crash Delete must still hand the
-	// deletion-pending object to the controller to clear finalizers. A client-only
-	// kind has no controller to hand it to, so it falls to the global GC sweeper —
-	// whose cadence is guaranteed, since WithGCInterval refuses to be disabled.
-	c.bh.gcAdvance(ctx, c.gk, id)
+	if res.Marked {
+		c.bh.signalKindWritten(ctx, c.gk)
+		c.signalDeletionRequested(ctx, res)
+	}
 	return nil
 }
 
-// DeleteBySlug is Delete keyed by a name rather than a handle; the store resolves
-// and marks in one statement. See the Client interface for the full contract.
-func (c *clientImpl[Spec, Status]) DeleteBySlug(ctx context.Context, slug string) error {
-	// ErrNotFound is unambiguous here — nothing of this kind holds the slug, a foreign
-	// kind's included — so it is idempotent success rather than a failure to report.
-	// The one place a slug delete departs from Delete, which reports a missing id.
-	obj, _, err := c.bh.store.DeletionRequestsCreateBySlug(ctx, c.gk, slug)
+// signalDeletionRequested enqueues the marked object and the targets its mark
+// unblocked, once the mark commits. Callers pass only results that stamped a row.
+func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, res storeapi.DeletionRequestResult) {
+	// Not throttled: a delete carries new information, and the mark is once per
+	// object, so it cannot ride this on a repeat.
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: res.ID, Group: c.gk.Group, Kind: c.gk.Kind})
+	// A finalizing target already carries its own delete's alarm, which a
+	// throttled push would ride. See
+	// docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md.
+	c.bh.signalRequeueManyNow(ctx, res.Unblocked)
+}
+
+// DeleteByName is Delete keyed by name; the store resolves and marks in one
+// statement.
+func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	// ErrNotFound is idempotent success here — nothing of this kind holds the
+	// name — the one place a name delete departs from Delete.
+	res, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
 		return err
 	}
-	c.bh.gcAdvance(ctx, c.gk, obj.ID) // unconditionally, as in Delete
+	if res.Marked {
+		c.bh.signalKindWritten(ctx, c.gk)
+		c.signalDeletionRequested(ctx, res)
+	}
 	return nil
 }
 
-func (c *clientImpl[Spec, Status]) ObjectsWatchList(ctx context.Context) (<-chan ObjectChange[Spec, Status], error) {
-	if !c.bh.isRegistered(c.gk) {
-		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
-	}
-	w, err := c.bh.store.ObjectsWatchList(ctx, c.gk)
-	if err != nil {
-		return nil, err
-	}
-	return c.adaptObjectStream(ctx, w), nil
-}
-
-func (c *clientImpl[Spec, Status]) ObjectsWatch(ctx context.Context, id ObjectID) (<-chan ObjectChange[Spec, Status], error) {
-	if !c.bh.isRegistered(c.gk) {
-		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
-	}
-	w, err := c.bh.store.ObjectsWatch(ctx, c.gk, id)
-	if err != nil {
-		return nil, err
-	}
-	return c.adaptObjectStream(ctx, w), nil
-}
-
-// adaptObjectStream decodes a store Watcher's raw events (the snapshot's Added events
-// followed by live changes — the store owns snapshotting, dedup, and id
-// filtering) into typed Changes. It forwards on the returned channel until
-// ctx is cancelled, the watcher's stream ends, or an event fails to decode; the
-// channel closes and the watcher is released on exit.
-func (c *clientImpl[Spec, Status]) adaptObjectStream(ctx context.Context, w *ObjectsSubscription) <-chan ObjectChange[Spec, Status] {
-	out := make(chan ObjectChange[Spec, Status])
-	// The migrator is invariant for the watcher's lifetime; resolve it once rather
-	// than re-locking the registry on every event.
-	mig := c.bh.migratorFor(c.gk)
-	go func() {
-		defer close(out)
-		defer w.Close()
-		for {
-			select {
-			case ev, ok := <-w.Changes():
-				if !ok {
-					return
-				}
-				obj, err := rawToTyped[Spec, Status](ev.Object, mig)
-				if err != nil {
-					// Quarantine, don't tear down: skip a poison event and keep the
-					// stream alive so one un-decodable object can't silently kill a
-					// live watcher (mirrors List).
-					c.bh.log().Warn("beehive: skipping undecodable object in watch",
-						"group", c.gk.Group, "kind", c.gk.Kind, "id", ev.Object.ID, "err", err)
-					continue
-				}
-				select {
-				case out <- ObjectChange[Spec, Status]{Type: ev.Type, Object: obj}:
-				case <-ctx.Done():
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return out
-}
-
-// EventsList reads id's runs and maps them to public Events. It reads by id
-// (not kind-scoped), like the ref lookups.
+// EventsList reads id's runs and maps them to public Events. Reads by id, not
+// kind-scoped, like the ref lookups.
 func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts))
+	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts).query)
 	if err != nil {
 		return nil, err
 	}
@@ -918,49 +936,8 @@ func (c *clientImpl[Spec, Status]) EventsGetLatest(ctx context.Context, id Objec
 	return eventFromRaw(*raw), true, nil
 }
 
-func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (<-chan Event, error) {
-	if !c.bh.isRegistered(c.gk) {
-		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
-	}
-	w, err := c.bh.store.EventsWatch(ctx, c.gk, id, resolveEvents(opts))
-	if err != nil {
-		return nil, err
-	}
-	return adaptEventStream(ctx, w), nil
-}
-
-// adaptEventStream forwards a store EventsSubscription's raw runs as public Events
-// until ctx is cancelled or the stream ends, then closes the channel and releases
-// the watcher. Simpler than adaptObjectStream: event runs carry no Spec/Status to
-// decode, so there is no migrator and no per-event quarantine — it needs nothing
-// from the client, so it is a free function.
-func adaptEventStream(ctx context.Context, w *EventsSubscription) <-chan Event {
-	out := make(chan Event)
-	go func() {
-		defer close(out)
-		defer w.Close()
-		for {
-			select {
-			case ev, ok := <-w.Changes():
-				if !ok {
-					return
-				}
-				select {
-				case out <- eventFromRaw(ev):
-				case <-ctx.Done():
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return out
-}
-
 // conditionsFromRaw maps the store's raw conditions to the public Condition
-// type, dropping the storage-only bookkeeping (last-transition/updated/observed
-// generation) that the user-facing type doesn't carry. Returns nil for none.
+// type, dropping storage-only bookkeeping. Returns nil for none.
 func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	if len(raw) == 0 {
 		return nil
@@ -978,9 +955,7 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	return out
 }
 
-// eventFromRaw maps a raw event row to the public Event, translating the type
-// string and detail bytes and dropping the store-only resource_version cursor
-// (the watch layer needs it; the user-facing type doesn't).
+// eventFromRaw maps a raw event row to the public Event.
 func eventFromRaw(raw storeapi.Event) Event {
 	return Event{
 		ID:       raw.ID,
@@ -993,10 +968,12 @@ func eventFromRaw(raw storeapi.Event) Event {
 		Count:    raw.Count,
 		FirstAt:  raw.FirstAt,
 		LastAt:   raw.LastAt,
+
+		ResourceVersion: raw.ResourceVersion,
 	}
 }
 
-// eventsFromRaw maps a slice of raw event rows to public Events. Returns nil for none.
+// eventsFromRaw maps raw event rows to public Events. Returns nil for none.
 func eventsFromRaw(raw []storeapi.Event) []Event {
 	if len(raw) == 0 {
 		return nil
@@ -1008,13 +985,10 @@ func eventsFromRaw(raw []storeapi.Event) []Event {
 	return out
 }
 
-// convertBlob upgrades a stored JSON blob from its recorded schema version
-// (from) to the build's current version, returning the bytes to unmarshal. It is
-// the per-blob conversion rule shared by spec and status: a current of 0 (the
-// kind isn't versioned, or there's no migrator) or from == current is identity;
-// from < current runs convert; from > current is a downgrade — an older build
-// reading data a newer one wrote — which we refuse rather than silently truncate,
-// surfacing as a quarantine signal upstream.
+// convertBlob upgrades a stored JSON blob from its recorded schema version to
+// the build's current one. current == 0 or from == current is identity;
+// from > current is a downgrade — an older build reading newer data — refused
+// rather than silently truncated.
 func convertBlob(from, current int, raw []byte, convert func(int, json.RawMessage) (json.RawMessage, error)) ([]byte, error) {
 	switch {
 	case current == 0 || from == current:
@@ -1027,13 +1001,10 @@ func convertBlob(from, current int, raw []byte, convert func(int, json.RawMessag
 }
 
 // rawToTyped decodes a RawObject into a typed Object[Spec, Status], converting
-// each blob up from its stored schema version via m before unmarshalling (see
-// convertBlob). A nil m means the kind has no migrator: both current versions are
-// 0, so every blob is decoded as-is — byte-identical to the pre-migrator path.
+// each blob up from its stored schema version via m before unmarshalling. A nil
+// m means the kind has no migrator and every blob decodes as-is.
 func rawToTyped[Spec, Status any](raw *RawObject, m Migrator) (*Object[Spec, Status], error) {
-	// The current-version "0 if nil" rule is shared with the write paths via these
-	// helpers; the converters are only reached when from < current (never when m is
-	// nil), so guarding them once here suffices.
+	// The converters are only reached when from < current, never when m is nil.
 	var convertSpec, convertStatus func(int, json.RawMessage) (json.RawMessage, error)
 	if m != nil {
 		convertSpec = m.ConvertSpec
@@ -1052,7 +1023,7 @@ func rawToTyped[Spec, Status any](raw *RawObject, m Migrator) (*Object[Spec, Sta
 		ID:                  raw.ID,
 		Group:               raw.Group,
 		Kind:                raw.Kind,
-		Slug:                raw.Slug,
+		Name:                raw.Name,
 		Spec:                spec,
 		Generation:          raw.Generation,
 		ObservedGeneration:  raw.ObservedGeneration,

@@ -117,19 +117,20 @@ not already covering, so it gains outright.
 the index definition. Removing `WITHOUT ROWID` later would give the gain back with
 that `CREATE INDEX` line looking unchanged. Two things guard against that: the
 comment above `idx_edges_to` in `0001_init.sql` says so explicitly, and
-`TestMarkOwnedForDeletionUsesRefsIndex` (`sqlite/store_test.go`) asserts
+`TestDeletionRequestsCreateFromOwnerUsesRefsIndex` (`sqlite/store_test.go`) asserts
 `"COVERING INDEX idx_edges_to"` rather than just the index name. That assertion is
 the only place in the suite that would notice.
 
 ### Applying it to an existing database is not a one-liner
 
 SQLite cannot convert a table between rowid and `WITHOUT ROWID` in place. This
-change rode an in-place edit to `0001_init.sql`, which costs nothing:
-`sqlite/migrations/` holds exactly one file and TODO.md records that a fresh
-database is the only supported upgrade path, so editing the initial migration is
-legitimate rather than rewriting applied history.
+change rode an in-place edit to `0001_init.sql`, which costs nothing: nothing is
+deployed, so `sqlite/migrations/` holds exactly one file and a fresh database is the
+only supported upgrade path. Editing the initial migration is legitimate rather than
+rewriting applied history — the policy, and the release that expires it, are recorded
+in [the amend-in-place ADR](2026-07-31-amend-the-schema-in-place-until-release.md).
 
-Should that policy change, converting an existing store means a
+Once that expires, converting an existing store means a
 create-copy-drop-rename of the whole `edges` table — and `0001_init.sql`'s preamble
 declares `PRAGMA foreign_keys = ON` as a store contract, with `edges` sitting
 between two FK edges, so the rebuild must run under `PRAGMA foreign_keys = OFF`
@@ -141,7 +142,7 @@ worth doing early.
 
 Three commits on `refactor/refs--without-rowid`, built red/green:
 
-1. Tightened `TestMarkOwnedForDeletionUsesRefsIndex` to assert `COVERING`. Red,
+1. Tightened `TestDeletionRequestsCreateFromOwnerUsesRefsIndex` to assert `COVERING`. Red,
    failing with `SEARCH r USING INDEX idx_edges_to (to_id=? AND relation=?)`.
 2. `) STRICT, WITHOUT ROWID;` plus the migration comments. Green, full suite clean.
 3. Reworded the `EdgesAdd` wake-stamp comment in `sqlite/store.go` (and its twin in

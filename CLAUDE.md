@@ -1,52 +1,398 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
 
-`README.md` is the authoritative spec; when code and README disagree on a signature, the code is the current truth. Design rationale lives in [docs/adr](docs/adr/README.md) — keep this file to a summary plus a link, and move anything longer into a new ADR.
+`README.md` is the spec. Where the code and the README disagree about a signature,
+the code wins. Design rationale lives in [docs/adr](docs/adr/README.md); keep this
+file to a summary plus a link, and put anything longer in a new ADR.
 
 ## Status
 
-The README spec is implemented end-to-end and the suite is green. One loose end: the `fakeStore` test double in `testutils_test.go` still `panic`s on many methods — they're filled in only as a test needs them, so the real `sqlite` store backs most tests.
+The README spec is implemented end to end and the suite is green. One loose end:
+the `fakeStore` double in `testutils_test.go` still `panic`s on many methods; they
+get filled in as tests need them.
+
+Every example under `examples/` calls `Client.Requeue` after each create even
+though a spec write now enqueues its own object — `Requeue` is what the docs point
+callers at, and it covers a lost in-memory enqueue. `cascade` alone sets
+`WithGCInterval`, since collection is what it demonstrates. Leave the production
+defaults alone otherwise.
+
+Latency here is a configured interval, not a push path. If a push path is ever
+added it belongs *above* this core; the
+[drivers ADR](docs/adr/2026-07-28-periodic-scan-drivers.md) lists the constraints.
 
 ## Commands
 
 ```sh
 go build ./...
 go vet ./...
+staticcheck -checks=all ./...   # CI runs this; -checks=all flags unused unexported code
 go run ./examples/greeting/main.go   # the end-to-end smoke target
 go run ./examples/events/main.go     # Events API demo: a connection-health panel
 go test ./...
 go test -run TestName ./  # single test
+
+# Benchmarks live in *_bench_test.go and never run under `go test`; -bench opts
+# them in, and -run '^$' keeps the tests from running alongside them.
+go test -run '^$' -bench . -benchtime 2000x -count 3 ./
+go test -run '^$' -bench . -benchtime 1x ./   # smoke: compiles and runs each once
 ```
 
 ## Architecture
 
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.
 
-- **Declarative + level-triggered.** Users write `Spec` (desired state); controllers reconcile toward it from *current* state, not event sequences. Events are a latency optimization; three independent periodic drivers backstop them — `WithCatchupInterval` (owed work, per-kind), `WithResyncInterval` (full pass, per-kind, off by default), `WithGCInterval` (global, **cannot be disabled**). Startup runs catchup unconditionally plus, by default, one full pass. → [ADR](docs/adr/2026-07-27-periodic-reconcile-drivers.md)
-- **Coordination through the store, never controller-to-controller.** Controllers read/write the shared store and wake on changes.
-- **The dependency waker rides one store-wide change stream**, not one per registered kind — a `depends_on` edge may point at a client-only kind, which no per-kind subscription can name. The stream is blob-free and batch-drained. → [ADR](docs/adr/2026-07-27-store-wide-dependency-change-stream.md)
-- **Dependency-wake losses are repaired by replaying a `resource_version` watermark**, not by escalating a periodic pass. The waker holds the highest version it has processed and, on a failed lookup or a re-established subscription, replays everything above it (`ObjectWritesListSince`, paged) through the same wake path — O(changes missed). The cursor never passes the oldest write still queued: each batch carries that bound (`ObjectWriteBatch.OldestPending`, from `conflate.Receiver.Peek`), because delivery is first-touch-ordered and a batch's newest version says nothing about what is behind it. A delivered write at or below the cursor is proof of out-of-order publication and is reported at Error. The waker owns its own resubscribe loop with a backoff seam, since a cursor is not a trigger. → [ADR](docs/adr/2026-07-27-waker-watermark-replay.md), [bound ADR](docs/adr/2026-07-28-watermark-bound-from-backlog-head.md)
-- **Watch fan-out conflates per object, so it never lags-as-loss.** A per-kind conflating hub (`conflate` from `github.com/amorey/gobus`) keeps the latest event per object id; no ring, no `ErrLagged`, no relist. A store-wide `changeHub` sits beside the per-kind ones. → [ADR](docs/adr/2026-07-27-conflating-watch-fanout.md)
-- **`Spec`/`Status` separation is structural.** The user-facing `Client` has no status-write path; only the `Controller`/`ControllerClient` surface does.
-- **Reconcile is not transactional**; each `ControllerClient` write commits on its own (mutators self-wrap in `Within`, and scope id-keyed writes to the caller's `GroupKind` → `ErrWrongKind`). Use `ControllerClient.Within` when several writes must be atomic. The slug-keyed writes (`Create`/`CreateOrUpdate`/`GetOrCreate`/`DeleteBySlug`) differ only in conflict policy, and every client write registers its wake through `Store.AfterCommit`, run after the *outermost* commit. → [ADR](docs/adr/2026-07-27-writes-and-post-commit-wakes.md)
-- **Generic-to-non-generic boundary.** `Register[Spec, Status]` wraps the user's typed `Controller` in a `typedController` adapter (`reconciler.go`) satisfying the non-generic `controllerAdapter`. Everything below that line — reconciler, work queue, store — stays free of type parameters and deals in raw rows. Keep new internal machinery non-generic.
-- **Options dispatch by target type.** An `Option` type-switches on what it's applied to (`*Beehive`, `*reconciler`, …) and ignores targets it doesn't recognize — so the same option works at `New`, `Register`, or per-object call sites.
-- **GC has two backstops.** Each controller's reconcile loop runs `collect` for its own kind (routing finalizer clearing through the controller); the global GC sweeper covers **client-only kinds**, whose stranded `owned_by` edges would otherwise RESTRICT-block their owner's delete forever. `collect` is a no-op while finalizers/referrers remain and idempotent across paths, so the overlap is harmless.
-- **Generation/convergence handshake.** `Generation` increments on every spec change; `ObservedGeneration` records what the controller last settled (`nil` until the first `UpdateStatus`, which takes the generation explicitly). Mutators skip a write whose bytes match — except that `UpdateStatus` still advances `observed_generation`/`observed_at` (and does emit) when only those moved, and the no-op is gated on the schema version too. → [ADR](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md)
-- **Schema-version migration (`Migrator`, `migrator.go`).** A per-kind migrator converts spec/status blobs up *on read* at the decode boundary; writes stamp lazily and never downward. Per-column versions (`schema_version_spec`/`_status`) make that sound. Decode failures quarantine the row rather than killing a list or stream. → [ADR](docs/adr/2026-07-27-schema-version-migration.md)
-- **Declaring a dependency is caller-versioned** (`DependenciesAdd`'s `targetResourceVersion`), closing the read-then-declare window. The requeue fires only when the edge is new *and* the target has moved past the version the decision used; it has a durable twin in `objects.reconcile_owed`, stamped inside `EdgesAdd` before the insert and drained by the reconcile. → [ADR](docs/adr/2026-07-27-caller-versioned-dependencies.md)
-- **Secondary lookups (owner / dependencies / dependents / owned)** are read on request, never folded into the blob-bearing `SELECT`. Eager per-call `LoadOption`s and lazy `Client`/`ControllerClient` getters share the loaders; accessors return `ErrNotLoaded` when a relation wasn't requested. `OwnedObjectsList` is the typed counterpart of `OwnedList`. → [ADR](docs/adr/2026-07-27-secondary-lookups.md)
-- **Events API (append-only, contiguous-run aggregated).** A per-object log partitioned by `category`; `ControllerClient.EventsRecord` extends the latest run when `(type, reason)` matches and appends otherwise. `Detail` is typed-in/opaque-out and unversioned. Reads live on `Client`; retention runs in the GC sweeper. "Event(s)" is reserved for this log — the object-change streams are named apart. → [ADR](docs/adr/2026-07-27-events-api.md)
-- **Schedule watch (in-memory gauge, not the store).** `Client.SchedulesWatch`/`SchedulesGet` expose the `workQueue`'s next-requeue time, which bumps no generation or `resource_version` and so fires no object watch. It lives entirely in the beehive/reconciler layer. → [ADR](docs/adr/2026-07-27-schedule-watch.md)
+- **One process, one `Beehive`, and it is the store's only writer.** Two
+  processes over one file, two `Beehive` values over one store, and any
+  out-of-band access to the database while a `Beehive` runs — an external tool,
+  or a `Store` call behind the running `Beehive`'s back — are all **unsupported**,
+  not degraded. Restarts are supported and are not what this excludes; the
+  constraint is on *concurrent* access. Documented, not enforced. Do not justify
+  a driver, a tick or a backstop by "a second process could write the store", and
+  do not accept a bug report whose repro needs one. → [ADR](docs/adr/2026-08-05-one-process-one-beehive-sole-writer.md)
+- **Nothing store-backed is pushed, and every driver over the store is a
+  periodic scan except the waker** (`internal/driver`). Seven drivers: the owed
+  pass (unsettled specs plus `reconcile_owed`, per-kind, 30s), the full pass
+  (`WithFullPassInterval`, off by default), the GC sweeper (`WithGCInterval`,
+  **cannot be disabled**), the dependency waker (write log, **wake-driven, no
+  tick**), the stale-dependents pass (60s, **cannot be disabled**), the object
+  watch tail and the event watch (both `withWatchFloorInterval`, 30s, each with
+  a commit wake in front). Only `WithFullPassInterval` and `WithGCInterval`
+  are public; the other cadences are unexported options only tests reach, and
+  `Client.Requeue` is the public way to beat one. **No reconcile may depend on
+  either full pass** — both scale with the object count. The schedule watch is
+  the one push exception (see below); the two watch wakes are not, because their
+  floor tick stays. **The waker is the exception to the cadence, not to the
+  record**: it still reads the write log, but only a commit makes it look, and
+  what entitles it to that is the stale-dependents pass finding a superset of
+  what it finds. A write this beehive did not publish reaches its dependents on
+  no schedule this package promises — it is out of scope, not slow. Both wakes
+  are rate-limited (`internal/rategate`), and the waker's
+  cursor write keeps a floor of its own so a faster loop is not a faster write.
+  **The subscription and the watermark are both taken inside `Start`**, in that
+  order, so no write a caller can make after `Start` returns is below the
+  watermark or unheard. A failed seed does not abort startup: the loop retries it
+  on the backoff, and with no stored cursor that retry reseeds at the mark as of
+  *then* — the one seed window left, and `docs/TODO.md` carries it.
+  A drain that pages without a break for one stale-dependents interval **stops and
+  jumps to the write log's mark** — the backstop has already swept that range. A
+  failed mark read restarts that window rather than retrying per pass, so the bound
+  is a window per failed read, not one window.
+  → [ADR](docs/adr/2026-07-28-periodic-scan-drivers.md),
+  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
+  [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md),
+  [ADR](docs/adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md),
+  [ADR](docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md). Every reconcile trigger
+  is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
+  it when you add one.
+- **The work queue floors how often one object is dispatched**, and a pending
+  backoff or floor alarm absorbs an arriving wake rather than jumping it. The
+  floor is per id (`internal/rategate`), so N distinct objects cost nothing and
+  one object N times costs N intervals — which is the shape of a dependency
+  cycle. It bounds a cycle; it does not converge one. A zero interval turns off
+  the floor but **not** the absorption, which is a semantic change of its own.
+  → [ADR](docs/adr/2026-08-04-work-queue-re-enqueue-floor.md)
+- **Declarative and level-triggered.** Controllers reconcile from *current*
+  state, never from a sequence of changes; controllers coordinate through the
+  store, never with each other.
+- **Dependency staleness is derived from watermarks, and every finding is
+  durable.** A successful reconcile stamps
+  `dependency_watermarks.reconciled_against` with the write cursor as of its
+  *load*; the stale-dependents pass finds every dependent a target has moved
+  past, so any lost wake costs latency, never divergence. `EdgesAdd` *clears*
+  the watermark on a new `depends_on` edge; the `reconcile_owed` stamp on that
+  same edge is what guarantees the dependent a pass. A **failed** watermark write
+  needs no compensating record: it leaves the watermark low, and low only
+  over-reports staleness.
+  → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
+- **The stale-dependents pass scans from a cursor over target
+  `resource_version`** (`DependentsListStaleSince`), so its cost is what
+  changed, not the size of the graph. **The cursor is process-local and never
+  persisted**, so every process re-derives once and recovers a wake lost in
+  memory. **A lost watermark write is not a strand**: `reconciled_against` is
+  read in one place, where a lower value selects more, so a target change the
+  reconcile did not observe is above the sweep's cursor and the next sweep
+  lists it. What is given up is a re-report for a change already observed. This
+  pass *also* stamps `reconcile_owed` for what it finds before enqueuing, so a
+  finding outlives the queue; that stamp is what a persisted cursor would need,
+  and it is not load-bearing today. The cursor moves only when a sweep reaches
+  the end. **`reconcile_owed` has two producers** — `EdgesAdd` and this pass;
+  the owed pass is its consumer, not a third. → [ADR](docs/adr/2026-08-03-stale-dependents-cursor.md)
+- **The dependency waker scans the write log from a watermark**
+  (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
+  client-only kind). Cost is bounded by what changed. **A commit is the only
+  thing that wakes it**: an idle waker arms no timer and issues no query, so a
+  dependency chain propagates per commit. Two conditions re-arm its one timer,
+  neither periodic: a failed scan (`driver.Backoff`, 100ms up to the
+  stale-dependents cadence — without it a failed scan would wedge, since
+  `backingOff` drops arriving wakes) and a cursor row still below the watermark,
+  which would otherwise be retried only by a commit that may never come. Going
+  idle **stops** the timer, or one already ready drives a pass nobody asked for.
+  The cursor persists via the optional `DriverCursorer`; it is an optimisation
+  over the stale-dependents pass, never a guarantee. **Both store-wide reads
+  report the retention horizon** beside their value rather than folded in — the
+  abandon jump needs the bare mark — so a cursor below the boundary is warned about
+  once instead of skipping silently. The horizon **moves no cursor**: it is a max
+  over kinds, and the per-kind count bound trims a chatty kind past entries a quiet
+  one still holds, so it proves a loss without bounding an empty range.
+  → [ADR](docs/adr/2026-07-30-durable-waker-cursor.md),
+  [ADR](docs/adr/2026-08-06-the-waker-sees-a-retention-trim.md),
+  [ADR](docs/adr/2026-08-05-a-commit-wakes-the-dependency-waker.md),
+  [ADR](docs/adr/2026-08-05-the-waker-is-wake-driven.md)
+- **Object writes are recorded in an append-only log** (`object_writes`), one
+  entry per committed write, in that write's transaction. A create/update entry
+  carries no payload — consumers route by id and read current state; a physical
+  delete carries a row image, since nothing survives to be read. The soft delete
+  is an ordinary update. Retention is per kind and **bounded by default** (24h),
+  unlike the event log, because entries land at reconcile rate; what it trims is
+  recorded per kind in `object_writes_horizon`, and that horizon is the resume
+  boundary. → [ADR](docs/adr/2026-08-02-object-write-log.md)
+- **Client watches return a snapshot and subscribe to their kind's shared
+  tailer** (`objectswatch.go`). One tailer per kind owns the cursor, so reads scale
+  with watched kinds, not watch count: a quiet read costs one
+  `ObjectWritesMaxVersion` (which folds in the horizon so it only rises — gate on
+  `>`, not `!=`), a busy one reads the entries above the cursor and then one
+  batched `ObjectsListByIDs`, draining until a page comes back short. A commit
+  wakes it (`signalKindWritten`, `AfterCommit`), and the same signal wakes the
+  dependency waker, which subscribes across every kind rather than to one; the
+  emit table is derived from the store's write-log call sites, **not** from the public verbs — conditions
+  reach the log through `bumpObject`, and the owner cascade is routed by the refs
+  it returns. The fan-out is non-generic (`rawChange`) because two clients may
+  watch one kind with different type parameters; each subscriber decodes and
+  drops what its own snapshot already held. Delivery is latest-per-object, so an
+  `Added` may repeat for a snapshot object. **A batch is delivered ascending by
+  resource version** (`drainPending`), and that is load-bearing rather than
+  tidiness: a caller checkpoints a delivered change's version and resumes above
+  it, so a version delivered after a higher one would be skipped for good. The
+  merge coalesces in place, which leaves a re-written object at its original
+  queue position carrying a newer version — the one way the drain sees them out
+  of order. The batch's membership is one `TryRecvAll` cut, not a `TryRecv`
+  loop: everything pending as of one instant, so a later batch cannot carry a
+  lower version. Nothing is dropped in the merge. A cursor **below** the horizon
+  (strictly: equality has lost nothing) ends *every* subscriber with
+  `ErrWatchTooOld` and resets the tailer. **A tailer runs from its kind's first
+  watch to its last**: `tailerFor` hands back a subscriber lease and every
+  caller owes one `release`, with the count and the build both under `tailMu` —
+  the same lock the registry moves under, which is what closes the teardown
+  race. Presence in the registry is not health: a tailer that reset stays there
+  until its subscribers release, so `tailerFor` checks both or a resubscribe
+  rejoins the tailer that just failed. **Every drain start is floored**
+  (`internal/rategate`, 100ms) — a floor tick takes the slot the same as a wake,
+  so a commit landing just after one waits out the rest of the window — and one
+  drain is bounded by a page budget, so a write stream cannot make a tailer hold
+  the single connection away from the writers waking it; the first drain after a
+  quiet period is still eager.
+  → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
+  [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
+- **`OwnedObjectsListWatch` scopes a watch to one owner's children, and reads
+  ownership from current state.** Never from the log: a create's entry is
+  appended *before* its `owned_by` edge, in the same transaction, so a
+  denormalised `owner_id` would be NULL on the write that matters most. The
+  tailer resolves a page's owners in one `EdgesGroupOutgoingByID` beside the
+  batched object read; a collected child has no edges left, so it takes its owner
+  off the delete entry's row image. **The lookup's gate (`ownerScoped`) is set
+  before a scoped subscriber registers and is never cleared** — a change
+  published without an owner while one is live is dropped silently and forever,
+  which is also why `decodeChanges` warns on a nil owner it did not expect. It is
+  sound for a snapshotting subscriber because anything above its snapshot was
+  read after the flag was set, and for a resuming one **only because `replay`
+  runs to the head**. Unlike `Watch(id)` there is no key filter: membership is
+  what the watch exists to learn. All of it rests on **ownership changing only
+  through a logged write to the child** — true by construction, pinned
+  structurally by `TestOwnedByIsWrittenInOnePlace`, and the thing a re-parent
+  verb would have to preserve. `DependentsList`/`DependenciesList` have no watch
+  counterpart for the harder reason: `depends_on` edges are mutable and log
+  nothing. → [ADR](docs/adr/2026-08-06-owner-scoped-watches.md)
+- **The event watch reads one object's log above a cursor, one reader per
+  watch** (`eventswatch.go`). An extend re-samples `events.resource_version`, so
+  "runs above the cursor" is exactly what changed and the old `seen`/`EventID`
+  diff is gone. `EventsAdd`'s commit wakes it through `eventWriteHub` (keyed by
+  id, not kind); the floor tick covers a foreign writer. Nothing is shared — the
+  read is already per object and already indexed — so there is no lease
+  machinery, and no merge either: the stream is unbuffered, so a consumer that
+  stops reading pins the cursor, which is what makes `ErrWatchTooOld` reachable
+  live. `EventsSnapshot` reads runs and position in one transaction, because two
+  reads either drop a write or deliver it twice. **A read must not imply an
+  absence it cannot vouch for**: `events_horizon` records what retention trimmed,
+  per `(object, category)` to match the ring cap's partition, and a resume below
+  it is refused rather than answered; a *collected* object ends its streams with
+  `ErrNotFound`, since its log and its horizon cascade away together. The horizon
+  is only as good as the sweep's `last_at` clock, and it errs toward
+  over-reporting.
+  → [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
+- **`Spec`/`Status` separation is structural.** Only
+  `Controller`/`ControllerClient` writes status.
+- **Reconcile is not transactional.** Each `ControllerClient` write commits on
+  its own; `Within` groups writes that must land together. Id-keyed writes are
+  scoped to the caller's `GroupKind` (`ErrWrongKind`). There is no name-keyed
+  upsert — none of `Create`/`GetOrCreate`/`Delete` writes to a row it found. **A
+  write's durable record is what a driver lists**: a spec write bumps the
+  generation, a delete sets `deletion_requested_at`. A spec write also enqueues
+  its own object, gated on the store's `changed` bool — never on the row being
+  unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
+  twelve users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  delete-request enqueue, the cleared-finalizer enqueue, the dropped-dependency
+  target push, the create's push of an already-deleting owner (all shared via
+  `Beehive.signalRequeueNow` and `signalRequeueThrottled`), the GC cascade's own
+  hook, the physical delete's owner push, the delete request's push of the
+  targets its mark unblocked (all three `signalRequeueManyNow`),
+  `signalKindWritten` — which feeds the watch tailers and the dependency waker —
+  and `signalEventsWritten`, which feeds one object's event readers.
+  → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
+  [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
+  [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
+  [ADR](docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md),
+  [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
+  [ADR](docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md),
+  [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
+  [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md)
+- **The id is the key everywhere; the name is a lookup.** The bare CRUD verbs
+  take an `ObjectID` and act on one incarnation; the `…ByName` siblings act on
+  whatever holds the name *now*, resolving and writing in one transaction. The
+  name is positional on `Create`/`GetOrCreate` only, where there is no id yet.
+  Read-modify-write needs no rule: the read hands back `ID`. Names are required,
+  immutable, opaque; `""` is rejected with `ErrInvalidName` in the store itself.
+  A taken name (tombstones included) is `ErrNameTaken`; `GenerateName(prefix)`
+  builds one and callers bound-retry on the sentinel. Foreign keys stay integer
+  ids, which are never reused.
+  → [ADR](docs/adr/2026-08-02-id-primary-key-with-byname-siblings.md)
+- **A store write takes only what it honours and returns only what a caller
+  reads.** `ObjectsCreate` takes `ObjectsCreateInput`; only it and the
+  `ObjectsUpdateSpec*` mutators return a row; `EventsAdd` takes
+  `EventsAddInput`. → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
+- **A nested `Within` is a real rollback boundary** (SAVEPOINT): an error
+  unwinds that frame's writes and queued hooks even if the caller swallows it. A
+  nested `Within` from a sibling goroutine is refused with
+  `ErrConcurrentNestedTx`. → [ADR](docs/adr/2026-07-29-nested-within-savepoints.md)
+- **The generic boundary is `Register`**, which wraps the typed `Controller` in
+  the non-generic `typedController` adapter (`reconciler.go`). Keep new internal
+  machinery non-generic.
+- **Options dispatch on their target's type** and ignore targets they don't
+  recognize, so the same option works at `New`, `Register`, or per call.
+- **GC has two backstops**: each reconcile loop runs `gcCollect` for its own
+  kind (routing finalizer clearing through the controller), and the global
+  sweeper covers client-only kinds. Both are idempotent. A delete request, a
+  cascade, a physical delete and a dropped dependency each enqueue at commit for a
+  registered kind, so a cascade advances a level per commit and unwinds a level per
+  commit; a client-only level still costs a sweep. **A deletion mark also pushes
+  the deletion-pending targets it discounted**, since that mark is what lifts
+  their RESTRICT — from both the client delete and the cascade's marked children.
+  **A create under an owner that is already deleting pushes that owner**, whose
+  re-cascade is what marks the new child — gated on the owner's
+  `deletion_requested_at`, which `EdgesAdd` now reports.
+  **The sweeper also reclaims `reconcile_owed` for kinds with no reconcile loop**,
+  which nothing else drains — safe because the count is redundant with the
+  dependency watermark `EdgesAdd` clears, so a cursor-0 sweep in a later process
+  re-derives it. The clear is no-emit.
+  → [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
+  [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
+  [ADR](docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md),
+  [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
+  [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md),
+  [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
+- **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
+  pragma on a non-empty database and inside a transaction — which a migration
+  is). The sweeper drains the freelist through `FreePagesReleaser`, gated on a
+  floor and a fraction of the file. `PRAGMA incremental_vacuum` **must be
+  `Exec`'d, never `Query`'d**. → [ADR](docs/adr/2026-07-29-auto-vacuum-incremental.md)
+- **The schema is amended in place until the first release**: `sqlite/migrations/`
+  holds exactly one file, and `TestTheSchemaIsOneMigration` is the tripwire.
+  → [ADR](docs/adr/2026-07-31-amend-the-schema-in-place-until-release.md)
+- **The generation handshake.** `Generation` increments on every real spec
+  change; `ObservedGeneration` records what the controller last settled.
+  Byte-identical writes are skipped (except that `UpdateStatus` still advances
+  `observed_generation`), which is what stops a controller re-applying its own
+  spec from waking itself forever.
+  → [ADR](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md)
+- **Schema-version migration** (`Migrator`): per-kind, on read, at the decode
+  boundary; spec and status version independently; an undecodable blob
+  quarantines its row rather than killing the read.
+  → [ADR](docs/adr/2026-07-27-schema-version-migration.md)
+- **Every new `depends_on` edge stamps an owed reconcile** (`reconcile_owed`),
+  atomically with the edge inside `EdgesAdd`, drained by the owed pass. The
+  declaration also enqueues the source at commit, gated on
+  `ReconcileOwedStamped` and routed by `EdgesAddResult.From` (the edge is
+  cross-kind). The edge push is throttled; the spec write's is not.
+  → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md),
+  [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
+- **Secondary lookups are read on request**, never folded into the blob-carrying
+  `SELECT`. Eager `LoadOption`s and lazy getters share loaders; accessors return
+  `ErrNotLoaded` for a relation nobody asked for.
+  → [ADR](docs/adr/2026-07-27-secondary-lookups.md)
+- **Events are an append-only log, aggregated into runs** per (object,
+  category), extended when `(type, reason)` matches. Reads live on `Client`.
+  "Event" means this log and nothing else. `Store.EventsAdd` returns `error`
+  alone — the watch builds its delta from a cursor, not from the write's result.
+  **Retention runs in the GC sweeper and is off by default**: a cap of *runs*
+  per timeline, which trims only the timelines a candidate query finds over it
+  (bounded per sweep, so it is progressive), plus an optional flat `maxAge`
+  cutoff across every timeline.
+  → [ADR](docs/adr/2026-07-27-events-api.md),
+  [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md),
+  [ADR](docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md)
+- **The schedule watch is an in-memory gauge and the one watch with no tick at
+  all**: the `workQueue` publishes each move of its `gauge` to a `gobus/watch`
+  hub. Sound only because the queue is unexported and process-local and the
+  gauge reports every move from one type — give `workQueue` a second writer and
+  the poll has to come back. (The object tail also has a wake, but it keeps a
+  floor tick, so it is a driver rather than an exception.) Streams end when the
+  beehive stops, after the final value.
+  → [ADR](docs/adr/2026-07-27-schedule-watch.md)
 
 ## Conventions
 
-- **Methods are `NounsVerbQualifier`, with the noun plural** (`ObjectsGet`, `EdgesListIncoming`, `DeletionRequestsCreate`) — one prefix per family, cardinality in the verb (`Get`/`Watch` vs `List`/`WatchList`) — **except where the family is already the receiver's own**: `Client`'s own CRUD stays bare, and on `ControllerClient` the line falls between a column on the object's row (`UpdateStatus`, bare) and a table of its own (conditions, events, edges — prefixed). Interface members are listed alphabetically, matching godoc. `Err*`, `With*` options, and external-interface methods are exempt. **A watch over a *change* stream returns `<-chan NounChange` (by value) or a `*NounsSubscription`** — never a bare `…Watcher` interface. A watch that is a **gauge or a log** (`SchedulesWatch`, `EventsWatch`) streams the value itself; it takes a `NounChange` only when the consumer must tell *what happened* from *what it now is*. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md)
-- **Whitebox tests.** Put tests in `package beehive` (not `beehive_test`) so they can exercise unexported machinery — the reconcile loop, adapter, and options dispatch are the interesting parts and they're unexported.
-- **Tests are organized by origin file, not by topic.** A function defined in `foo.go` is tested in `foo_test.go` — mirror the source filename, regardless of feature (edges and conditions live in `sqlite/store.go`, so they're tested in `sqlite/store_test.go`). Shared helpers and fakes go in `testutils_test.go`. Not every source file needs a test file.
-- **Assertions: `stretchr/testify`** (`require` for fatal preconditions, `assert` for independent checks) — already the style in `sqlitemigrate/sqlitemigrate_test.go`.
-- **Event-driven, never sleep-paced.** Synchronize on channels (or `ctx.Done()`) that the code/fakes signal; the only use of `time` is a generous failsafe timeout in a `select` that turns a hang into a failure. No `time.Sleep` to "wait for" a goroutine and no polling loops.
-- **Comments are short, idiomatic, and human-centered.** Explain *why* and call out non-obvious invariants; don't restate what the code plainly says. Match the density already in `beehive.go`/`reconciler.go`.
-- **Stubs are explicit.** Unimplemented methods `panic("not implemented: <name>")`; unimplemented options return `nil` and are marked `(stub: not yet wired up)`.
-- **Design rationale goes in an ADR**, not here — see [docs/adr/README.md](docs/adr/README.md) for the format.
+- **Methods are `NounsVerbQualifier`, noun first and plural** (`ObjectsGet`,
+  `EdgesListIncoming`): one prefix per family, cardinality in the verb
+  (`Get`/`Watch` for one, `List`/`WatchList` for many). Drop the prefix when the
+  family is the receiver itself — `Client`'s own CRUD stays bare; on
+  `ControllerClient` a column on the object's row is bare (`UpdateStatus`), a
+  table of its own is prefixed. List interface members alphabetically. `Err*`,
+  `With*` and external-interface methods are exempt. A watch over a change
+  stream returns `<-chan NounChange`; a watch over a gauge or a log streams the
+  value itself. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md)
+- **Whitebox tests**: tests go in `package beehive`, so they reach unexported
+  machinery.
+- **Test files mirror source files, not features.** Shared helpers and fakes go
+  in `testutils_test.go`. Benchmarks mirror the same way but in
+  `<source>_bench_test.go`, so a semantics file never carries a load harness.
+  No build tag: `go test` already skips benchmarks, and a tag only hides them
+  from `go vet` until they stop compiling.
+- **Assertions use `stretchr/testify`**: `require` for preconditions, `assert`
+  for independent checks.
+- **Synchronize on signals, never on sleeps.** The only use of `time` is a
+  generous failsafe timeout in a `select`.
+- **Comments are terse; the code speaks for itself.** Concretely:
+  - Exported identifiers get godoc of 1–3 short sentences stating the contract:
+    behavior, error sentinels, scoping (e.g. "Scoped to gk: wrong kind →
+    ErrWrongKind, missing id → ErrNotFound"). Not more.
+  - Unexported identifiers get a one-line comment only when the name doesn't
+    already say it; otherwise no comment.
+  - Keep single-line invariant/trap comments the code cannot express — ordering
+    constraints, lock rules, gates ("must be Exec'd, never Query'd"; "checked
+    before the target switch"). These are the comments worth having.
+  - Never write design narration, alternatives considered, history ("this used
+    to…"), or cross-reference essays in code. If the why needs a paragraph,
+    write an ADR and leave one line: `// See docs/adr/<file>.`
+  - Don't restate what the next line does, and don't argue that the code is
+    correct — state the constraint and stop.
+- **Commits are terse conventional commits, written for a human reader.**
+  `type(scope): subject` —
+  `feat`/`fix`/`perf`/`refactor`/`test`/`docs`/`chore`, scope only when it adds
+  information (`sqlite`, `edges`, `watch`), `!` for a breaking change. Subject
+  is imperative, lower-case, no period, ≤72 chars, and says what the change
+  does, not how (`feat(edges): enqueue an edge's source when the declaration
+  commits`). No body unless the why isn't obvious from the diff — then 1–3
+  plain sentences, no bullet lists; rationale longer than that is an ADR the
+  body links. Optimise for someone reading `git log`: the subject is the whole
+  message for most commits, so spend its budget on what changed, never on
+  restating the diff or padding the format.
+- **Pull requests follow
+  [`.github/pull_request_template.md`](.github/pull_request_template.md)**: keep
+  its sections (`Summary` for the why, `Key Changes` for the what, `Checklist`),
+  and lead the title with the template's emoji for the change type — 🎣 bug fix,
+  🐋 new feature, 📜 documentation, ✨ general improvement.
+- **Stubs are explicit**: `panic("not implemented: <name>")`; stub options
+  return `nil` and are marked `(stub: not yet wired up)`.
+- **Design rationale goes in an ADR**, not here. See
+  [docs/adr/README.md](docs/adr/README.md) for the format.

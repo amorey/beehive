@@ -15,9 +15,12 @@
 package beehive
 
 import (
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/amorey/gobus"
+	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -119,7 +122,7 @@ func TestWorkQueueReadyNotRepeatedWhenQueueDrained(t *testing.T) {
 
 func TestWorkQueueAddAfter(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, 20*time.Millisecond)
+	q.addAfter(1, 20*time.Millisecond, alarmRequeueAfter)
 
 	// Not immediately available.
 	_, ok := q.get()
@@ -128,7 +131,7 @@ func TestWorkQueueAddAfter(t *testing.T) {
 	// Available after the delay fires.
 	select {
 	case <-q.ready:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testTimeout):
 		t.Fatal("item not delivered after delay")
 	}
 	id, ok := q.get()
@@ -142,7 +145,7 @@ func TestWorkQueueAddAfter(t *testing.T) {
 // keep calling add (up to a RequeueAfter that could be hours out).
 func TestWorkQueueStopCancelsPendingTimers(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, time.Hour) // would fire long after the queue is dead
+	q.addAfter(1, time.Hour, alarmRequeueAfter) // would fire long after the queue is dead
 	q.stop()
 
 	select {
@@ -155,7 +158,7 @@ func TestWorkQueueStopCancelsPendingTimers(t *testing.T) {
 
 	// Adds after stop must not enqueue.
 	q.add(2)
-	q.addAfter(3, 0)
+	q.addAfter(3, 0, alarmRequeueAfter)
 	_, ok = q.get()
 	assert.False(t, ok, "add/addAfter after stop must not enqueue")
 }
@@ -167,16 +170,16 @@ func TestWorkQueueAddAfterOnStoppedQueue(t *testing.T) {
 	q := newWorkQueue()
 	q.stop()
 
-	q.addAfter(1, time.Hour)
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
 
-	assert.Nil(t, q.alarms, "stopped queue must not track a new timer")
+	assert.Nil(t, q.gauge.alarmFor(1), "stopped queue must not track a new timer")
 	_, ok := q.get()
 	assert.False(t, ok, "addAfter on a stopped queue must not enqueue")
 }
 
 func TestWorkQueueAddAfterZeroDelay(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, 0)
+	q.addAfter(1, 0, alarmRequeueAfter)
 
 	// Zero delay must enqueue immediately (same as add).
 	select {
@@ -216,6 +219,24 @@ func TestWorkQueueNoConcurrentDispatch(t *testing.T) {
 	assert.False(t, ok, "no spurious re-dispatch after done")
 }
 
+// forget is done for an id whose row the pass deleted: a wake that arrived
+// mid-pass can only resolve to ErrNotFound, and ids are never reused.
+func TestWorkQueueForgetDropsAQueuedReAdd(t *testing.T) {
+	q := newWorkQueue()
+	q.add(7)
+	_, ok := q.get()
+	require.True(t, ok)
+
+	q.add(7)                                    // a wake arrives while the collect is committing
+	q.addAfter(7, time.Hour, alarmRequeueAfter) // and an alarm outlives the pass
+	q.forget(7)
+
+	assert.Empty(t, queuedIDs(q))
+	assert.Zero(t, q.scheduleAt(7), "nothing is left scheduled for a collected id")
+	_, ok = q.get()
+	assert.False(t, ok, "a collected id is never dispatched again")
+}
+
 // TestWorkQueueReaddAfterDone verifies an ID can be queued again once its prior
 // processing has completed via done().
 func TestWorkQueueReaddAfterDone(t *testing.T) {
@@ -231,33 +252,33 @@ func TestWorkQueueReaddAfterDone(t *testing.T) {
 	assert.Equal(t, ObjectID(7), id)
 }
 
-// TestWorkQueueNextRequeueAtEmpty verifies an unknown ID reports nothing
+// TestWorkQueueScheduleAtEmpty verifies an unknown ID reports nothing
 // scheduled.
-func TestWorkQueueNextRequeueAtEmpty(t *testing.T) {
+func TestWorkQueueScheduleAtEmpty(t *testing.T) {
 	q := newWorkQueue()
-	_, ok := q.nextRequeueAt(1)
-	assert.False(t, ok, "unknown id must report nothing scheduled")
+	assert.True(t, q.scheduleAt(1).NextRequeueAt.IsZero(),
+		"unknown id must report nothing scheduled")
 }
 
-// TestWorkQueueNextRequeueAtDispatchable verifies an ID queued for immediate
+// TestWorkQueueScheduleAtDispatchable verifies an ID queued for immediate
 // dispatch reports a due-now time (not after now).
-func TestWorkQueueNextRequeueAtDispatchable(t *testing.T) {
+func TestWorkQueueScheduleAtDispatchable(t *testing.T) {
 	q := newWorkQueue()
 	q.add(1)
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok, "queued id must report as scheduled")
+	at := q.scheduleAt(1).NextRequeueAt
+	require.False(t, at.IsZero(), "queued id must report as scheduled")
 	assert.False(t, at.After(time.Now()), "a queued-now id is due now, not in the future")
 }
 
-// TestWorkQueueNextRequeueAtAfter verifies a delayed add reports its future fire
+// TestWorkQueueScheduleAtAfter verifies a delayed add reports its future fire
 // time.
-func TestWorkQueueNextRequeueAtAfter(t *testing.T) {
+func TestWorkQueueScheduleAtAfter(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, time.Hour)
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok, "delayed id must report as scheduled")
+	at := q.scheduleAt(1).NextRequeueAt
+	require.False(t, at.IsZero(), "delayed id must report as scheduled")
 	assert.True(t, at.After(time.Now().Add(time.Minute)), "fire time must be ~1h out, got %s", at)
 }
 
@@ -266,26 +287,256 @@ func TestWorkQueueNextRequeueAtAfter(t *testing.T) {
 // timer remains.
 func TestWorkQueueAddAfterNewestWins(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, time.Hour)
-	q.addAfter(1, 3*time.Hour)
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	q.addAfter(1, 3*time.Hour, alarmRequeueAfter)
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok)
+	at := q.scheduleAt(1).NextRequeueAt
+	require.False(t, at.IsZero())
 	assert.True(t, at.After(time.Now().Add(2*time.Hour)), "newest schedule must win, got %s", at)
 }
 
-// TestWorkQueueNextRequeueAtPrefersQueued verifies that when an id has both a
-// future delayed schedule and an immediate enqueue (e.g. a pending backoff timer
-// plus a store-change add), nextRequeueAt reports it as due now — not at the
-// stale future time, which would contradict "now if already queued".
-func TestWorkQueueNextRequeueAtPrefersQueued(t *testing.T) {
+// TestWorkQueueScheduleAtPrefersQueued verifies that when an id has both a
+// future delayed schedule and an immediate enqueue, scheduleAt reports it as
+// due now — not at the stale future time, which would contradict "now if
+// already queued". The alarm must be a RequeueAfter: a backoff absorbs the add
+// instead, which TestWorkQueueAddAbsorbedByBackoffAlarm covers.
+func TestWorkQueueScheduleAtPrefersQueued(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, time.Hour) // future backoff/RequeueAfter timer
-	q.add(1)                 // ...then enqueued immediately
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	q.add(1) // ...then enqueued immediately
 
-	at, ok := q.nextRequeueAt(1)
-	require.True(t, ok)
+	at := q.scheduleAt(1).NextRequeueAt
+	require.False(t, at.IsZero())
 	assert.False(t, at.After(time.Now()), "a queued-now id is due now, not the future timer; got %s", at)
+}
+
+// throttled builds a queue whose re-enqueue floor is short enough to wait on a
+// signal rather than a clock.
+func throttled(d time.Duration) *workQueue {
+	q := newWorkQueue()
+	q.setFloor(d)
+	return q
+}
+
+// The floor is per id and starts closed, so a chain of distinct objects — and
+// the first wake to any object — pays nothing.
+func TestWorkQueueFirstAddIsNotThrottled(t *testing.T) {
+	q := throttled(time.Hour)
+
+	q.add(1)
+	q.add(2)
+
+	id, ok := q.get()
+	require.True(t, ok)
+	assert.Equal(t, ObjectID(1), id)
+	id, ok = q.get()
+	require.True(t, ok)
+	assert.Equal(t, ObjectID(2), id)
+}
+
+// A second wake inside the window is held rather than dispatched, which is what
+// bounds a dependency cycle. The window is an hour so no assertion here races
+// it; the delivery half is the test below.
+func TestWorkQueueThrottlesRepeatedAdds(t *testing.T) {
+	q := throttled(time.Hour)
+	q.add(1)
+	id, ok := q.get()
+	require.True(t, ok)
+	q.done(id)
+	<-q.ready // drain the add's pulse
+
+	q.add(1)
+	q.add(1)
+	q.add(1)
+
+	_, ok = q.get()
+	assert.False(t, ok, "a wake inside the window must not dispatch")
+	q.mu.Lock()
+	a := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	require.NotNil(t, a, "three adds in one window leave one floor alarm")
+	assert.Equal(t, alarmFloor, a.kind)
+}
+
+// The held wake is delayed, never dropped. This one waits on the queue's own
+// pulse rather than asserting anything inside a wall-clock window.
+func TestWorkQueueHeldWakeDispatchesAtTheWindowEnd(t *testing.T) {
+	q := throttled(time.Millisecond)
+	q.add(1)
+	id, ok := q.get()
+	require.True(t, ok)
+	q.done(id)
+	<-q.ready
+
+	q.add(1)
+
+	waitClosed(t, q.ready, "the held wake")
+	id, ok = q.get()
+	require.True(t, ok)
+	assert.Equal(t, ObjectID(1), id)
+}
+
+// The window must run from the dispatch, not from the enqueue: an id can sit in
+// items for an unbounded time between the two.
+func TestWorkQueueGateRecordsAtDispatchNotAtAdd(t *testing.T) {
+	q := throttled(time.Hour)
+
+	q.add(1)
+	_, held := q.gate.OpensAt(1, time.Now())
+	require.False(t, held, "an add must not open the window")
+
+	_, _ = q.get()
+	_, held = q.gate.OpensAt(1, time.Now())
+	assert.True(t, held, "the window runs from get")
+}
+
+// The disable switch turns off the floor and nothing else — a zero interval
+// holds no key, so no floor alarm is ever set.
+func TestWorkQueueZeroIntervalSetsNoFloorAlarm(t *testing.T) {
+	q := newWorkQueue() // the default gate has a zero interval
+	q.add(1)
+	id, _ := q.get()
+	q.done(id)
+	<-q.ready
+
+	q.add(1)
+
+	assert.Nil(t, q.gauge.alarmFor(1), "a zero interval must set no floor alarm")
+	_, ok := q.get()
+	assert.True(t, ok, "a re-add is immediately dispatchable")
+}
+
+// A wake arriving while the id sits on its backoff alarm is absorbed by that
+// alarm. Without this the owed pass dispatches at once and the ladder is
+// floored at owedPassInterval, which is the defect this closes.
+func TestWorkQueueAddAbsorbedByBackoffAlarm(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour, alarmBackoff)
+
+	q.add(1)
+
+	_, ok := q.get()
+	assert.False(t, ok, "the backoff alarm owns the dispatch")
+	at := q.scheduleAt(1).NextRequeueAt
+	assert.True(t, at.After(time.Now().Add(time.Minute)), "still on the ladder, got %s", at)
+}
+
+// A controller's own RequeueAfter is a schedule, not a retry, so a real wake
+// preempts it rather than waiting it out.
+func TestWorkQueueAddPreemptsRequeueAfterAlarm(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+
+	q.add(1)
+
+	id, ok := q.get()
+	require.True(t, ok, "a wake must not wait out a controller's own schedule")
+	assert.Equal(t, ObjectID(1), id)
+}
+
+// requeueNow is the engine behind Client.Requeue, the documented way to beat a
+// cadence. It clears the alarm first, so absorption never applies to it.
+func TestWorkQueueRequeueNowIgnoresABackoffAlarm(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour, alarmBackoff)
+
+	q.requeueNow(1)
+
+	id, ok := q.get()
+	require.True(t, ok, "Client.Requeue must still beat the ladder")
+	assert.Equal(t, ObjectID(1), id)
+}
+
+// A floor alarm that fires while its id is still being reconciled must not mark
+// the id dirty: done would then queue it ahead of whatever alarm the pass sets
+// a line later, and a failing pass would lose its ladder. Any pass longer than
+// the floor hits this, which is every controller doing real I/O.
+func TestWorkQueueFloorAlarmMidPassKeepsTheLadder(t *testing.T) {
+	q := throttled(time.Hour)
+	q.add(1)
+	id, ok := q.get() // the pass starts; id is in flight
+	require.True(t, ok)
+	q.add(1) // a wake mid-pass: held by a floor alarm
+
+	q.mu.Lock()
+	held := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	require.NotNil(t, held)
+	q.timerFired(1, held) // the floor opens while the pass is still running
+
+	// runWorker's tail for a failing pass.
+	q.done(id)
+	q.addAfter(id, time.Hour, alarmBackoff)
+
+	_, ok = q.get()
+	assert.False(t, ok, "the wake must not jump the backoff ladder")
+	at := q.scheduleAt(1).NextRequeueAt
+	assert.True(t, at.After(time.Now().Add(time.Minute)), "id is on the ladder, got %s", at)
+}
+
+// The floor holds a wake; it must never push work out past a sooner schedule.
+// A RequeueAfter alarm firing on its own is dispatched immediately
+// (addImmediate), so flooring one only when a wake happens to race it would
+// delay the controller's cadence for no gain.
+func TestWorkQueueFloorDoesNotDelayASoonerSchedule(t *testing.T) {
+	q := throttled(time.Hour)
+	q.add(1)
+	id, _ := q.get() // dispatch: the floor closes for an hour
+	q.done(id)
+	<-q.ready
+	q.addAfter(1, time.Minute, alarmRequeueAfter)
+
+	q.add(1) // a wake races the sooner alarm
+
+	q.mu.Lock()
+	a := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	require.NotNil(t, a)
+	assert.Equal(t, alarmRequeueAfter, a.kind, "the sooner schedule must stand")
+	assert.True(t, a.fireAt.Before(time.Now().Add(2*time.Minute)), "got %s", a.fireAt)
+}
+
+// The mirror: a schedule sooner than a pending floor takes the slot rather than
+// being dropped.
+func TestWorkQueueASoonerScheduleReplacesAFloorAlarm(t *testing.T) {
+	q := throttled(time.Hour)
+	q.add(1)
+	id, _ := q.get()
+	q.done(id)
+	<-q.ready
+	q.add(1) // floor alarm, an hour out
+
+	q.addAfter(1, time.Minute, alarmRequeueAfter)
+
+	q.mu.Lock()
+	a := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	require.NotNil(t, a)
+	assert.Equal(t, alarmRequeueAfter, a.kind)
+	assert.True(t, a.fireAt.Before(time.Now().Add(2*time.Minute)), "got %s", a.fireAt)
+}
+
+// A floor alarm is not a schedule — it is a real wake being held — so a
+// schedule the finished pass sets afterwards must not replace it. runWorker
+// calls done then addAfter, so this collides on the ordinary path.
+func TestWorkQueueAddAfterKeepsAFloorAlarm(t *testing.T) {
+	q := newWorkQueue()
+	floor := &alarm{timer: time.NewTimer(time.Hour), fireAt: time.Now().Add(time.Second), kind: alarmFloor}
+	q.mu.Lock()
+	q.gauge.setAlarm(1, floor)
+	q.mu.Unlock()
+
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	q.mu.Lock()
+	kept := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	assert.Same(t, floor, kept, "a RequeueAfter must not replace a floor alarm")
+
+	q.addAfter(1, time.Hour, alarmBackoff)
+	q.mu.Lock()
+	replaced := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	assert.NotSame(t, floor, replaced, "a backoff absorbs the held wake and replaces it")
 }
 
 // TestWorkQueueSupersededTimerDoesNotEnqueue verifies a delayed-add timer whose
@@ -294,26 +545,26 @@ func TestWorkQueueNextRequeueAtPrefersQueued(t *testing.T) {
 // that already fired but lost the race for the lock must not run the work early.
 func TestWorkQueueSupersededTimerDoesNotEnqueue(t *testing.T) {
 	q := newWorkQueue()
-	stale := &alarm{}
-	q.alarms[1] = &alarm{} // a newer schedule now occupies the slot
+	stale := &alarm{timer: time.NewTimer(time.Hour)}
+	q.gauge.setAlarm(1, &alarm{timer: time.NewTimer(time.Hour)}) // a newer schedule now occupies the slot
 
 	q.timerFired(1, stale) // the superseded timer fires late
 
 	_, ok := q.get()
 	assert.False(t, ok, "a superseded timer must not enqueue the id")
-	assert.NotNil(t, q.alarms[1], "the newer schedule must be left intact")
+	assert.NotNil(t, q.gauge.alarmFor(1), "the newer schedule must be left intact")
 }
 
 // TestWorkQueueTimerFiredEnqueues verifies a current (non-superseded) timer
 // clears its slot and enqueues the id when it fires.
 func TestWorkQueueTimerFiredEnqueues(t *testing.T) {
 	q := newWorkQueue()
-	a := &alarm{}
-	q.alarms[1] = a
+	a := &alarm{timer: time.NewTimer(time.Hour)}
+	q.gauge.setAlarm(1, a)
 
 	q.timerFired(1, a)
 
-	assert.Nil(t, q.alarms[1], "firing must clear the schedule slot")
+	assert.Nil(t, q.gauge.alarmFor(1), "firing must clear the schedule slot")
 	id, ok := q.get()
 	require.True(t, ok, "a current timer must enqueue the id")
 	assert.Equal(t, ObjectID(1), id)
@@ -323,177 +574,551 @@ func TestWorkQueueTimerFiredEnqueues(t *testing.T) {
 // stale timer never fires) and makes the id immediately dispatchable.
 func TestWorkQueueRequeueNow(t *testing.T) {
 	q := newWorkQueue()
-	q.addAfter(1, time.Hour)
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
 
 	q.requeueNow(1)
 
-	assert.Nil(t, q.alarms[1], "requeueNow must drop the pending delayed add")
+	assert.Nil(t, q.gauge.alarmFor(1), "requeueNow must drop the pending delayed add")
 	id, ok := q.get()
 	require.True(t, ok, "requeueNow must make the id dispatchable now")
 	assert.Equal(t, ObjectID(1), id)
 }
 
-// schedRecorder captures onSchedule emissions for assertions. It is unbuffered-safe:
-// the callback runs under q.mu, so record must not block on the queue; a generous
-// buffer keeps the producer non-blocking while the test drains.
-type schedRecorder struct {
-	ch chan schedEmit
+// These tests hold the publish half: which queue operations reach the sender,
+// and what they carry. They use a double rather than a hub, so a failure names
+// the queue rather than the bus.
+
+// fakeScheduleSender records what the queue published.
+type fakeScheduleSender struct {
+	mu   sync.Mutex
+	sent []keyedGaugeValue
+	err  error
 }
 
-type schedEmit struct {
-	id        ObjectID
-	at        time.Time
-	scheduled bool
+func (f *fakeScheduleSender) Send(id ObjectID, s gaugeValue) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, keyedGaugeValue{ID: id, gaugeValue: s})
+	return f.err
 }
 
-func newSchedRecorder() *schedRecorder { return &schedRecorder{ch: make(chan schedEmit, 64)} }
-
-func (r *schedRecorder) record(id ObjectID, at time.Time, scheduled bool) {
-	r.ch <- schedEmit{id, at, scheduled}
+// Watch and Close satisfy scheduleBus. These tests assert on what the queue
+// published, so neither needs to do anything.
+func (f *fakeScheduleSender) Watch(ObjectID, gaugeValue) *watch.Receiver[ObjectID, gaugeValue] {
+	panic("not implemented: fakeScheduleSender.Watch")
 }
 
-// next returns the next emission, failing the test on timeout so a missing emit is
-// a failure rather than a hang.
-func (r *schedRecorder) next(t *testing.T) schedEmit {
-	t.Helper()
-	select {
-	case e := <-r.ch:
-		return e
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected a schedule emission, got none")
-		return schedEmit{}
-	}
+func (f *fakeScheduleSender) Close() {}
+
+func (f *fakeScheduleSender) taken() []keyedGaugeValue {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]keyedGaugeValue(nil), f.sent...)
 }
 
-// expectNone asserts no emission arrives promptly — used to prove the dedup guard
-// suppressed a redundant equal value.
-func (r *schedRecorder) expectNone(t *testing.T) {
-	t.Helper()
-	select {
-	case e := <-r.ch:
-		t.Fatalf("expected no emission, got %+v", e)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
-// TestWorkQueueOnScheduleAddEmitsNow verifies an immediate add emits a due-now
-// Schedule for the id.
-func TestWorkQueueOnScheduleAddEmitsNow(t *testing.T) {
-	rec := newSchedRecorder()
+// publishingQueue is a queue wired to a recording sender.
+func publishingQueue() (*workQueue, *fakeScheduleSender) {
+	tx := &fakeScheduleSender{}
 	q := newWorkQueue()
-	q.onSchedule = rec.record
+	q.schedules = tx
+	return q, tx
+}
+
+func TestPublishAddSendsDueNow(t *testing.T) {
+	q, tx := publishingQueue()
 
 	q.add(1)
 
-	e := rec.next(t)
-	assert.Equal(t, ObjectID(1), e.id)
-	assert.True(t, e.scheduled, "a queued-now id must emit as scheduled")
-	assert.False(t, e.at.IsZero(), "a queued-now id must emit a non-zero time")
-	assert.False(t, e.at.After(time.Now()), "queued-now must be due now, not future")
+	sent := tx.taken()
+	require.Len(t, sent, 1)
+	assert.Equal(t, ObjectID(1), sent[0].ID)
+	assert.False(t, sent[0].Schedule.NextRequeueAt.IsZero())
 }
 
-// TestWorkQueueOnScheduleDedupsEqual verifies a redundant add (id already queued,
-// still due-now) does not emit a second, identical Schedule.
-func TestWorkQueueOnScheduleDedupsEqual(t *testing.T) {
-	rec := newSchedRecorder()
-	q := newWorkQueue()
-	q.onSchedule = rec.record
+// A second add for a queued id moves nothing, so it publishes nothing.
+func TestPublishRepeatedAddSendsOnce(t *testing.T) {
+	q, tx := publishingQueue()
 
 	q.add(1)
-	rec.next(t) // the first, real emission
-
-	q.add(1) // duplicate: still due-now, value unchanged
-	rec.expectNone(t)
-}
-
-// TestWorkQueueOnScheduleAddAfterEmitsFireTime verifies a delayed add emits its
-// future fire time.
-func TestWorkQueueOnScheduleAddAfterEmitsFireTime(t *testing.T) {
-	rec := newSchedRecorder()
-	q := newWorkQueue()
-	q.onSchedule = rec.record
-
-	q.addAfter(1, time.Hour)
-
-	e := rec.next(t)
-	assert.Equal(t, ObjectID(1), e.id)
-	assert.True(t, e.scheduled, "a delayed add must emit as scheduled")
-	assert.True(t, e.at.After(time.Now().Add(time.Minute)),
-		"delayed add must emit its ~1h fire time, got %s", e.at)
-}
-
-// TestWorkQueueOnScheduleGetEmitsZero verifies dispatching an id (get) with no
-// pending future alarm emits the zero/unscheduled Schedule — the transition a
-// countdown UI shows as "reconciling now, nothing scheduled".
-func TestWorkQueueOnScheduleGetEmitsZero(t *testing.T) {
-	rec := newSchedRecorder()
-	q := newWorkQueue()
-	q.onSchedule = rec.record
-
 	q.add(1)
-	rec.next(t) // due-now emit from add
+
+	assert.Len(t, tx.taken(), 1)
+}
+
+// Forgetting an id whose only schedule is a pending alarm — a RequeueAfter whose
+// row the collect removed — drops that alarm, which is a move the gauge reports.
+// With the id also dirty the dirty entry outranks the alarm and nothing moves.
+func TestPublishForgetSendsTheDroppedAlarm(t *testing.T) {
+	q, tx := publishingQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	before := len(tx.taken())
+
+	q.forget(1)
+
+	sent := tx.taken()
+	require.Len(t, sent, before+1)
+	assert.Equal(t, ObjectID(1), sent[before].ID)
+	assert.Zero(t, q.scheduleAt(1), "nothing is left scheduled for a collected id")
+}
+
+// done moves an id between processing and items, which the gauge does not read.
+func TestPublishDoneSendsNothing(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
+	id, ok := q.get()
+	require.True(t, ok)
+	before := len(tx.taken())
+
+	q.done(id)
+
+	assert.Len(t, tx.taken(), before, "done must publish nothing")
+}
+
+// Dispatch clears the dirty slot, so the id becomes unscheduled.
+func TestPublishGetSendsUnscheduled(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
 
 	_, ok := q.get()
 	require.True(t, ok)
 
-	e := rec.next(t)
-	assert.Equal(t, ObjectID(1), e.id)
-	assert.False(t, e.scheduled, "dispatch must emit as unscheduled")
-	assert.True(t, e.at.IsZero(), "dispatch must emit the unscheduled zero time")
+	sent := tx.taken()
+	require.Len(t, sent, 2, "the add and the dispatch")
+	assert.True(t, sent[1].Schedule.NextRequeueAt.IsZero(), "a dispatched id is unscheduled")
 }
 
-// TestWorkQueueOnScheduleTimerFiredEmitsNow verifies an alarm firing (its timer
-// enqueues the id) emits a due-now Schedule.
-func TestWorkQueueOnScheduleTimerFiredEmitsNow(t *testing.T) {
-	rec := newSchedRecorder()
-	q := newWorkQueue()
-	q.onSchedule = rec.record
-
-	q.addAfter(1, 20*time.Millisecond)
-	rec.next(t) // the future fire-time emit from addAfter
-
-	// When the timer fires it enqueues the id: the schedule flips to due-now.
-	e := rec.next(t)
-	assert.Equal(t, ObjectID(1), e.id)
-	assert.False(t, e.at.After(time.Now()), "a fired timer makes the id due now")
-}
-
-// TestWorkQueueOnScheduleRequeueNowEmitsNow verifies requeueNow (which drops a
-// pending future alarm and enqueues) emits a due-now Schedule.
-func TestWorkQueueOnScheduleRequeueNowEmitsNow(t *testing.T) {
-	rec := newSchedRecorder()
-	q := newWorkQueue()
-	q.onSchedule = rec.record
-
-	q.addAfter(1, time.Hour)
-	rec.next(t) // future fire-time emit
+// requeueNow clears an alarm and marks the id dirty in one critical section.
+// Reported separately that is "nothing scheduled" then "due now", and the first
+// is a state that never existed between two consistent points.
+func TestPublishRequeueNowSendsOnce(t *testing.T) {
+	q, tx := publishingQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	before := len(tx.taken())
 
 	q.requeueNow(1)
 
-	e := rec.next(t)
-	assert.Equal(t, ObjectID(1), e.id)
-	assert.False(t, e.at.After(time.Now()), "requeueNow must emit due-now")
+	sent := tx.taken()[before:]
+	require.Len(t, sent, 1, "one publish, not a deschedule followed by a schedule")
+	assert.False(t, sent[0].Schedule.NextRequeueAt.IsZero(), "due now, not nothing scheduled")
+	assert.False(t, sent[0].Schedule.NextRequeueAt.After(time.Now()))
 }
 
-// TestWorkQueueOnScheduleDoneRequeueEmitsNow verifies the schedule emits track
-// dirty transitions across a mid-processing re-add: the re-add reports due-now, and
-// done — which only shuffles processing/items, not the schedule — emits nothing.
-func TestWorkQueueOnScheduleDoneRequeueEmitsNow(t *testing.T) {
-	rec := newSchedRecorder()
-	q := newWorkQueue()
-	q.onSchedule = rec.record
+// timerFired clears the alarm and enqueues in one critical section too, so a
+// subscriber never sees the phantom deschedule between them.
+func TestPublishTimerFiredSendsOnce(t *testing.T) {
+	q, tx := publishingQueue()
+	a := &alarm{timer: time.NewTimer(time.Hour), fireAt: time.Now().Add(time.Hour)}
+	q.gauge.setAlarm(1, a)
+	before := len(tx.taken())
+
+	q.timerFired(1, a)
+
+	sent := tx.taken()[before:]
+	require.Len(t, sent, 1, "one publish, not a deschedule followed by a schedule")
+	assert.False(t, sent[0].Schedule.NextRequeueAt.After(time.Now()), "due now")
+}
+
+// A superseded timer owns no enqueue, so it moves nothing and publishes nothing.
+func TestPublishSupersededTimerSendsNothing(t *testing.T) {
+	q, tx := publishingQueue()
+	stale := &alarm{timer: time.NewTimer(time.Hour)}
+	q.gauge.setAlarm(1, &alarm{timer: time.NewTimer(time.Hour)})
+	before := len(tx.taken())
+
+	q.timerFired(1, stale)
+
+	assert.Len(t, tx.taken(), before)
+}
+
+// addAfter on an id already queued for immediate dispatch changes nothing a
+// watcher can see, because the gauge reads dirty first.
+func TestPublishAddAfterOnDirtyIDSendsNothing(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
+	before := len(tx.taken())
+
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+
+	assert.Len(t, tx.taken(), before)
+}
+
+// The stopped guard sits above the gauge call. Without it a post-stop add would
+// publish a due-now after the final values, and with no poll behind it that
+// would be the subscriber's last word.
+func TestPublishStoppedQueueSendsNothing(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(4) // still dirty after stop: finalValues clears alarms, not the dirty set
+	q.stop()
+	before := len(tx.taken())
 
 	q.add(1)
-	rec.next(t) // due-now from add
+	q.addAfter(2, time.Hour, alarmRequeueAfter)
+	q.requeueNow(3)
+	q.forget(4)
+
+	assert.Len(t, tx.taken(), before, "a stopped queue must publish nothing")
+}
+
+// stop publishes the final value of every id whose schedule moved, so a
+// subscriber's last word is accurate rather than absent.
+func TestPublishStopSendsTheFinalValues(t *testing.T) {
+	q, tx := publishingQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	before := len(tx.taken())
+
+	q.stop()
+
+	sent := tx.taken()[before:]
+	require.Len(t, sent, 1)
+	assert.Equal(t, ObjectID(1), sent[0].ID)
+	assert.True(t, sent[0].Schedule.NextRequeueAt.IsZero(), "nothing scheduled")
+}
+
+// stop clears alarms, not the dirty set, so an id queued for immediate dispatch
+// still reads as due-now afterwards. Its final value is therefore a dispatch that
+// will never happen — which is exactly what the poll reported too, because the
+// gauge genuinely still says due-now.
+//
+// Pinned so nobody "fixes" it by clearing dirty in stop, which would change what
+// the queue does rather than what it reports.
+func TestPublishStopLeavesAQueuedIDDueNow(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
+
+	q.stop()
+
+	assert.False(t, q.scheduleAt(1).NextRequeueAt.IsZero(),
+		"a queued id is not descheduled by stop")
+	last := tx.taken()
+	require.NotEmpty(t, last)
+	assert.False(t, last[len(last)-1].Schedule.NextRequeueAt.IsZero(),
+		"its final published value is that due-now, not a deschedule")
+}
+
+// stop publishes the final schedule of every id the gauge still describes, not
+// only the ids whose schedule it moved.
+//
+// That completeness is what makes a publish racing shutdown harmless. An enqueue
+// can move the gauge, release q.mu, and then lose its own publish to the closing
+// sender. Because no gauge move is possible once stopped is set, stop's snapshot
+// is the final state, so the lost publish can only ever have carried a duplicate
+// of it. Without the snapshot the subscriber would end on a value the queue had
+// already left.
+func TestPublishStopSnapshotsEveryScheduledID(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)                                    // queued now
+	q.addAfter(2, time.Hour, alarmRequeueAfter) // pending alarm
+	before := len(tx.taken())
+
+	q.stop()
+
+	final := make(map[ObjectID]Schedule)
+	for _, m := range tx.taken()[before:] {
+		final[m.ID] = m.Schedule
+	}
+	require.Len(t, final, 2, "both ids must appear in the final snapshot")
+	assert.True(t, final[2].NextRequeueAt.IsZero(), "the cleared alarm reads as unscheduled")
+	assert.False(t, final[1].NextRequeueAt.IsZero(), "the queued id keeps its due-now")
+}
+
+// Dispatch is guarded on stopped like every other mutator. That is what makes
+// stop's snapshot the gauge's final state: get is otherwise the one mutator that
+// could move the schedule afterwards, and its publish would go to a closed
+// sender and be lost.
+func TestWorkQueueStoppedQueueDispatchesNothing(t *testing.T) {
+	q, tx := publishingQueue()
+	q.add(1)
+	q.stop()
+	before := len(tx.taken())
+
 	_, ok := q.get()
+
+	assert.False(t, ok, "a stopped queue must dispatch nothing")
+	assert.Len(t, tx.taken(), before, "and must therefore publish nothing")
+	assert.False(t, q.scheduleAt(1).NextRequeueAt.IsZero(),
+		"the gauge is unchanged, so the final snapshot still describes it")
+}
+
+// BenchmarkWorkQueueHotPath measures one reconcile's worth of queue work with
+// nobody watching, which is the ordinary case for every object in the system.
+//
+// The push path publishes from inside these methods, so this is the number the
+// design has to keep honest: the capture must stay off the heap and the bus's
+// idle check must be all an unwatched publish costs.
+func BenchmarkWorkQueueHotPath(b *testing.B) {
+	q := newWorkQueue()
+	for b.Loop() {
+		q.add(1)
+		id, _ := q.get()
+		q.done(id)
+	}
+}
+
+// pendingAlarm builds an alarm as addAfter does. A real alarm always carries a
+// live timer, and finalValues stops it, so one built without a timer is not a
+// state the gauge ever holds.
+func pendingAlarm(in time.Duration) *alarm {
+	return &alarm{timer: time.NewTimer(in), fireAt: time.Now().Add(in)}
+}
+
+// The gauge is what SchedulesWatch reports, and the whole push design rests on
+// one property: a mutator that moves the observable schedule says so, and one
+// that does not stays quiet. These tests hold that line without a bus, a queue
+// or a stream in the way.
+
+func TestGaugeMarkDirtyReports(t *testing.T) {
+	g := newGauge()
+
+	got, moved := g.markDirty(7)
+	require.True(t, moved, "an id that becomes due now moves the gauge")
+	assert.False(t, got.Schedule.NextRequeueAt.IsZero(), "due-now carries the moment it became due")
+	assert.NotZero(t, got.Seq)
+
+	// Already dirty: addLocked would return early, and so does the gauge.
+	_, moved = g.markDirty(7)
+	assert.False(t, moved, "a second markDirty changes nothing observable")
+}
+
+func TestGaugeSetAlarmReports(t *testing.T) {
+	g := newGauge()
+	a := pendingAlarm(time.Hour)
+
+	got, moved := g.setAlarm(7, a)
+	require.True(t, moved)
+	assert.Equal(t, a.fireAt, got.Schedule.NextRequeueAt)
+}
+
+// at reads dirty before alarms, so an alarm on an id already queued for
+// immediate dispatch changes nothing a watcher can see.
+func TestGaugeSetAlarmOnDirtyIDReportsNothing(t *testing.T) {
+	g := newGauge()
+	_, moved := g.markDirty(7)
+	require.True(t, moved)
+
+	_, moved = g.setAlarm(7, pendingAlarm(time.Hour))
+	assert.False(t, moved, "the id already reads as due now")
+}
+
+func TestGaugeClearDirtyReports(t *testing.T) {
+	g := newGauge()
+	_, moved := g.markDirty(7)
+	require.True(t, moved)
+
+	got, moved := g.clearDirty(7)
+	require.True(t, moved, "dispatch leaves the id unscheduled")
+	assert.True(t, got.Schedule.NextRequeueAt.IsZero())
+
+	_, moved = g.clearDirty(7)
+	assert.False(t, moved, "clearing what is already clear moves nothing")
+}
+
+// Dispatching an id that also holds a future alarm reports the alarm, not the
+// zero schedule: the id is still scheduled, just not now.
+func TestGaugeClearDirtyFallsBackToTheAlarm(t *testing.T) {
+	g := newGauge()
+	a := pendingAlarm(time.Hour)
+	g.setAlarm(7, a)
+	g.markDirty(7)
+
+	got, moved := g.clearDirty(7)
+	require.True(t, moved)
+	assert.Equal(t, a.fireAt, got.Schedule.NextRequeueAt)
+}
+
+func TestGaugeClearAlarmReports(t *testing.T) {
+	g := newGauge()
+	g.setAlarm(7, pendingAlarm(time.Hour))
+
+	got, moved := g.clearAlarm(7)
+	require.True(t, moved)
+	assert.True(t, got.Schedule.NextRequeueAt.IsZero())
+
+	_, moved = g.clearAlarm(7)
+	assert.False(t, moved, "clearing an absent alarm moves nothing")
+}
+
+// Shutdown clears every alarm, but an id that is also dirty reads as due-now
+// before and after, so it must not be reported. Reporting it would publish a
+// Seq bump for a schedule nobody can see change.
+// finalValues answers for every id the gauge described, whether or not dropping
+// the alarms changed that id. An alarmed id becomes unscheduled and must be told
+// so; a queued id keeps its due-now, because dropping alarms dequeues nothing.
+func TestGaugeFinalValuesCoverEveryDescribedID(t *testing.T) {
+	g := newGauge()
+	g.setAlarm(1, pendingAlarm(time.Hour)) // alarmed only
+	g.setAlarm(2, pendingAlarm(time.Hour))
+	g.markDirty(2) // alarmed and queued: reads as due now
+
+	got := g.finalValues()
+
+	final := make(map[ObjectID]Schedule, len(got))
+	for _, k := range got {
+		final[k.ID] = k.Schedule
+	}
+	require.Len(t, final, 2)
+	assert.True(t, final[1].NextRequeueAt.IsZero(), "the alarm is gone, so id 1 is unscheduled")
+	assert.False(t, final[2].NextRequeueAt.IsZero(), "id 2 is queued, so it is still due now")
+}
+
+// Each final value must supersede whatever a subscriber already holds, or the
+// bus rejects it and the last word is lost.
+func TestGaugeFinalValuesAdvanceTheSeq(t *testing.T) {
+	g := newGauge()
+	last, ok := g.setAlarm(1, pendingAlarm(time.Hour))
 	require.True(t, ok)
-	rec.next(t) // zero from dispatch
 
-	q.add(1) // re-added while processing: marked dirty, still emits due-now
-	e := rec.next(t)
-	assert.Equal(t, ObjectID(1), e.id)
-	assert.False(t, e.at.After(time.Now()))
+	got := g.finalValues()
 
-	q.done(1) // shuffles processing/items only; schedule unchanged, so no emit
-	rec.expectNone(t)
+	require.Len(t, got, 1)
+	assert.Greater(t, got[0].Seq, last.Seq, "a final value must outrank the one it replaces")
+}
+
+// Seq is the queue's order, so it advances on every reported move and never
+// on a quiet one. Accept compares it, so a stalled Seq would let a stale
+// publish win.
+func TestGaugeSeqAdvancesOnlyOnAReportedMove(t *testing.T) {
+	g := newGauge()
+
+	first, moved := g.markDirty(1)
+	require.True(t, moved)
+	second, moved := g.markDirty(2)
+	require.True(t, moved)
+	assert.Greater(t, second.Seq, first.Seq)
+
+	_, moved = g.markDirty(1) // already dirty
+	require.False(t, moved)
+	third, moved := g.markDirty(3)
+	require.True(t, moved)
+	assert.Equal(t, second.Seq+1, third.Seq, "a quiet call consumed no Seq")
+}
+
+func TestGaugeAtReportsTheCurrentSchedule(t *testing.T) {
+	g := newGauge()
+	assert.True(t, g.at(7).Schedule.NextRequeueAt.IsZero(), "an unknown id is unscheduled")
+
+	a := pendingAlarm(time.Hour)
+	g.setAlarm(7, a)
+	assert.Equal(t, a.fireAt, g.at(7).Schedule.NextRequeueAt)
+
+	// at does not move the gauge, so it does not consume a Seq.
+	before := g.at(7).Seq
+	assert.Equal(t, before, g.at(7).Seq)
+}
+
+// Bus-boundary tests. Each holds a receiver from the hub and starts no stream on
+// it, because Peek is a single-consumer read: a live SchedulesWatch takes a
+// value the instant it lands, so a Peek racing it reports ErrEmpty on a
+// coin-flip and proves nothing.
+//
+// Peek is what makes these tests mean what they say. Reading alone cannot
+// distinguish "Accept rejected the value" from "the value arrived and the
+// stream's equality check swallowed it", and the second passes with the hub
+// wired without Accept at all.
+
+func TestHubStaleSendNeverReachesTheSlot(t *testing.T) {
+	q := newWorkQueue()
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	// Two moves for one id, published in the reverse of the order they became
+	// true — the shape two racing publishes produce.
+	newer := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 9}
+	older := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Minute)}, Seq: 8}
+	require.NoError(t, q.schedules.Send(1, newer))
+	require.NoError(t, q.schedules.Send(1, older))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, newer.Schedule, ev.Value.Schedule, "Accept must reject the older Seq")
+
+	ev, err = rx.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, newer.Schedule, ev.Value.Schedule)
+}
+
+// The same shape with the newer value still unread. An earlier draft of the
+// upstream package replaced a waiting value on arrival order alone, which would
+// have let the stale send evict it.
+func TestHubStaleSendDoesNotDisplaceAnUnreadValue(t *testing.T) {
+	q := newWorkQueue()
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	newer := gaugeValue{Schedule: Schedule{NextRequeueAt: time.Now().Add(time.Hour)}, Seq: 5}
+	require.NoError(t, q.schedules.Send(1, newer))
+	// newer is now unread in the slot.
+	require.NoError(t, q.schedules.Send(1, gaugeValue{Seq: 4}))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, newer.Schedule, ev.Value.Schedule)
+}
+
+// The value read at subscribe is the prev of the first Accept call, so a publish
+// that predates it is rejected by the same rule that rejects a reordered one.
+// This is what closes the subscribe seam.
+func TestHubSubscribeBaselineRejectsADuplicate(t *testing.T) {
+	q := newWorkQueue()
+	q.add(1) // the move completes...
+
+	rx, seed := q.watchSchedule(1) // ...and the subscriber reads it as its baseline
+	defer rx.Close()
+
+	// A publish carrying that same move now lands late.
+	require.NoError(t, q.schedules.Send(1, seed))
+
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "the duplicate must never enter the slot")
+}
+
+// A receiver watching one id holds nothing for another. The second half is what
+// makes the first mean "B did not reach A" rather than "this receiver never
+// receives anything", and both fit on one receiver because Peek takes nothing.
+func TestHubKeyScope(t *testing.T) {
+	q := newWorkQueue()
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	q.add(2)
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "another id's move must not reach this receiver")
+
+	q.add(1)
+	ev, err := rx.Peek()
+	require.NoError(t, err, "this id's move must reach it")
+	assert.False(t, ev.Value.Schedule.NextRequeueAt.IsZero())
+}
+
+// stop publishes the final values before the sender closes, and a receiver
+// holding an unread value is not yet terminal — so the last word is readable.
+func TestHubFinalValueIsQueuedBeforeTheSenderCloses(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+
+	q.stop()
+	q.schedules.Close()
+
+	ev, err := rx.Peek()
+	require.NoError(t, err, "the final value is unread, so the receiver is not terminal")
+	assert.True(t, ev.Value.Schedule.NextRequeueAt.IsZero(), "nothing scheduled")
+}
+
+// watchSchedule reads the gauge and registers the watch in one critical section,
+// so the baseline is the value current at registration.
+func TestHubWatchScheduleSeedsFromTheGauge(t *testing.T) {
+	q := newWorkQueue()
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+	rx, want := q.watchSchedule(1)
+	defer rx.Close()
+
+	// Nothing has superseded the baseline, so there is nothing to read...
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+
+	// ...but the baseline is the prev, so an older publish is still rejected.
+	require.NoError(t, q.schedules.Send(1, gaugeValue{Seq: want.Seq - 1}))
+	_, err = rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }

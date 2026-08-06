@@ -9,45 +9,38 @@
 -- ============================================================
 
 CREATE TABLE objects (
-    -- Incarnation identity. AUTOINCREMENT (not plain rowid) is required:
-    -- a recycled id would break ABA safety on delete/recreate. int64 in Go;
-    -- 0 is the "not yet persisted" sentinel.
+    -- Incarnation identity. AUTOINCREMENT required: a recycled id would break
+    -- ABA safety on delete/recreate. int64 in Go; 0 = not yet persisted.
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     -- "" = core group, "acme.com" = plugin.
     "group" TEXT NOT NULL,
     kind    TEXT NOT NULL,
 
-    -- NULL for internally-generated objects; set for user-named objects (e.g. kubeconfig entries).
-    -- Immutable — a rename is delete+recreate.
-    -- Unique within (group, kind); SQLite NULL != NULL so multiple NULL slugs are allowed.
-    slug TEXT,
+    -- The Client API's key. Immutable (a rename is delete+recreate, which is why
+    -- edges key on id), unique within (group, kind). NOT NULL and the CHECK make
+    -- that total at the column: SQLite NULL != NULL, '' is what unset
+    -- configuration reads as, and Store is a public extension point.
+    name TEXT NOT NULL CHECK (name <> ''),
 
     spec   TEXT NOT NULL, -- JSON, user-owned,        HARD / desired state
     status TEXT,          -- JSON, controller-owned,  SOFT / observed state (nullable)
 
-    -- Per-column migrator schema versions: the schema version each blob was last
-    -- written at. Opaque to the store (like resource_version) — the generic layer's
-    -- Migrator converts a blob from its stored version on read. 0 = not versioned
-    -- (the kind hasn't opted in), which is why both default to 0.
+    -- Schema version each blob was last written at; 0 = not versioned. Opaque to
+    -- the store; the Migrator converts on read.
     schema_version_spec   INTEGER NOT NULL DEFAULT 0,
     schema_version_status INTEGER NOT NULL DEFAULT 0,
 
-    -- Convergence handshake. generation bumps only on a spec change.
-    -- observed_generation is the last generation a reconciler finished;
-    -- observed_generation == generation means "applied" (spec progress, not liveness).
-    -- observed_at records *when* the object settled at observed_generation — a
-    -- handshake timestamp, not a reconcile heartbeat. It stops ticking once a
-    -- generation is recorded (an UpdateStatus that changes neither the bytes nor
-    -- the generation writes nothing at all), so it can't be read as "last ran".
-    -- Controller liveness belongs in the events log.
+    -- Convergence handshake: generation bumps only on a spec change;
+    -- observed_generation == generation means "applied". observed_at is a
+    -- handshake timestamp, NOT a reconcile heartbeat — it stops ticking once a
+    -- generation is recorded. Controller liveness belongs in the events log.
     generation          INTEGER NOT NULL DEFAULT 1,
     observed_generation INTEGER,
     observed_at         INTEGER,
 
-    -- Global monotonic write cursor. Used as a watch cursor, CAS token, and no-op
-    -- suppression guard (bumped only on a real change).
-    -- Distinct from id: id = incarnation identity; resource_version = mutation cursor.
+    -- Global monotonic write cursor: watch cursor, CAS token, no-op suppression
+    -- guard (bumped only on a real change).
     resource_version INTEGER NOT NULL,
 
     -- Async delete: deletion_requested_at set ⇒ finalizing;
@@ -55,42 +48,25 @@ CREATE TABLE objects (
     deletion_requested_at INTEGER,
     finalizers            TEXT NOT NULL DEFAULT '[]', -- JSON array of finalizer names
 
-    -- How many passes beehive owes this object. DependenciesAdd adds one when it
-    -- detects its target moved between the caller's read and the declare (the
-    -- read-then-declare race), so the wake survives a crash that loses the in-memory
-    -- requeue; a successful reconcile subtracts the count it observed. 0 = nothing
-    -- owed. A count (not a flag) so a wake owed while an earlier one is being
-    -- reconciled is not lost: it lands above the observed count and survives the
-    -- subtraction. Subtracting the whole observed count (not 1) is what drains a
-    -- multi-wake row in the single pass the backstop schedules for it.
-    --
-    -- This is durable, owed *work*; the in-memory dependency waker is a separate
-    -- mechanism and leaves nothing here. A second durable marker (undecodable rows,
-    -- say) gets its own column and its own cadence — it does not join this count.
+    -- Durable owed passes; 0 = nothing owed. A count, not a flag: a wake landing
+    -- mid-pass sits above the observed count and survives the subtraction, and a
+    -- successful reconcile subtracts the whole count it observed. The in-memory
+    -- waker is separate and leaves nothing here.
     reconcile_owed INTEGER NOT NULL DEFAULT 0,
 
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
 
-    UNIQUE ("group", kind, slug)
+    UNIQUE ("group", kind, name)
 ) STRICT;
 
 CREATE INDEX idx_objects_kind ON objects("group", kind);    -- list / resync a kind
 CREATE INDEX idx_objects_rv   ON objects(resource_version); -- watch ordering
 
--- Finalizing objects, for the global GC sweeper. Keyed on (id, "group", kind)
--- rather than on deletion_requested_at because the sweeper's only query is
---
---   SELECT id, "group", kind FROM objects
---    WHERE deletion_requested_at IS NOT NULL ORDER BY id
---
--- (it needs the kind to route: registered kind -> enqueue for its controller,
--- client-only -> collect directly). This key covers that read and is already in
--- id order, so it plans as a plain `SCAN ... USING INDEX` with no row fetch and
--- no sort; keying on deletion_requested_at instead costs both. The partial WHERE
--- is what keeps the wider key cheap — only finalizing rows are indexed, and
--- id/group/kind are write-once, so entries appear when a delete is requested and
--- vanish when the row is collected, never updated in between.
+-- Finalizing objects, for the global GC sweeper. The key covers the sweeper's
+-- exact read (SELECT id, "group", kind ... WHERE deletion_requested_at IS NOT
+-- NULL ORDER BY id) — no row fetch, no sort; keep them aligned. The partial
+-- WHERE keeps the wider key cheap.
 CREATE INDEX idx_objects_deleting
     ON objects(id, "group", kind)
     WHERE deletion_requested_at IS NOT NULL;
@@ -100,9 +76,8 @@ CREATE INDEX idx_objects_unsettled
     ON objects("group", kind)
     WHERE observed_generation IS NULL OR observed_generation < generation;
 
--- Objects owed a durable dependency wake (see reconcile_owed). Separate from the
--- unsettled index because the two are orthogonal: an object can be spec-converged
--- yet still owe a wake. The backstop query (ReconcileOwedListIDs) rides this.
+-- Objects owed a durable wake (ReconcileOwedListIDs). Separate from unsettled:
+-- an object can be spec-converged yet still owe a wake.
 CREATE INDEX idx_objects_reconcile_owed
     ON objects("group", kind)
     WHERE reconcile_owed != 0;
@@ -121,13 +96,8 @@ CREATE TABLE conditions (
     reason  TEXT,          -- machine-readable token, e.g. "DialTimeout"
     message TEXT,          -- human-readable detail for the troubleshooting UI
 
-    -- Writer-declared classification:
-    --   0 = store-truth  derived from persisted state; valid as-is across restart
-    --   1 = liveness     derived from a live resource; valid only in the writing process
-    -- Liveness rows: the read path compares updated_at against process start; a
-    -- prior-process write surfaces as Unknown / "verifying" until a controller
-    -- re-confirms it (which bumps updated_at). Default is store-truth; liveness is
-    -- opt-in by the writer.
+    -- 0 = store-truth (valid across restart); 1 = liveness (valid only in the
+    -- writing process — a prior-process write reads as Unknown until re-confirmed).
     liveness INTEGER NOT NULL DEFAULT 0 CHECK (liveness IN (0, 1)),
 
     transitioned_at INTEGER NOT NULL, -- epoch ms when status last CHANGED
@@ -136,8 +106,9 @@ CREATE TABLE conditions (
     PRIMARY KEY (object_id, type)
 ) STRICT;
 
--- Fetch all conditions for an object (status assembly, cascade delete).
-CREATE INDEX idx_conditions_object ON conditions(object_id);
+-- No index beyond the primary key: every read is keyed on object_id, and the PK
+-- autoindex already covers that prefix. A separate (object_id) index served
+-- nothing and cost a b-tree write per upsert.
 
 -- ============================================================
 -- edges
@@ -159,19 +130,67 @@ CREATE TABLE edges (
     -- depends_on `to` going NotReady ⇒ `from` requeued automatically by Beehive
     relation TEXT NOT NULL CHECK (relation IN ('owned_by', 'depends_on')),
 
-    -- WITHOUT ROWID: every column is in the key, so a rowid table would store each
-    -- edge twice — once in the table, once in the automatic index enforcing this
-    -- key. Here the key *is* the table. It also makes idx_edges_to below covering.
+    -- WITHOUT ROWID: every column is in the key, so a rowid table would store
+    -- each edge twice. Also what makes idx_edges_to covering.
     PRIMARY KEY (from_id, to_id, relation)
 ) STRICT, WITHOUT ROWID;
 
--- Answers "who points at X?" for cascade-GC and wake-dependents. Reads from_id,
--- which the index appears not to hold — but a secondary index on a WITHOUT ROWID
--- table identifies rows by primary key, so this is really (to_id, relation,
--- from_id) and the probe never touches the table. The covering property lives in
--- the table's storage class, not here: dropping WITHOUT ROWID silently reinstates
--- a row fetch per edge with this line looking unchanged.
+-- "Who points at X?". A secondary index on a WITHOUT ROWID table carries the
+-- primary key, so this is really (to_id, relation, from_id) and covering —
+-- dropping WITHOUT ROWID silently reinstates a row fetch per edge.
 CREATE INDEX idx_edges_to ON edges(to_id, relation);
+
+-- ============================================================
+-- dependency_watermarks
+-- Per-dependent staleness watermark: the store-wide write cursor
+-- (resource_version_seq) as of the moment this object's last
+-- successful reconcile loaded its state. A dependent is stale
+-- when a target it depends_on has a resource_version above it.
+-- ============================================================
+
+-- A side table, not a column on objects: SQLite rewrites the whole record on
+-- UPDATE, and objects rows carry the blobs inline.
+--
+-- Sparse by construction: a row exists only once a dependent has reconciled, and
+-- an absent row means "never reconciled against a known point, therefore stale"
+-- — which is why the scan LEFT JOINs. That absence is load-bearing on the write
+-- side too: a new depends_on edge deletes the row (see EdgesAdd).
+--
+-- A rowid table (unlike edges): object_id aliases the rowid, so the per-edge
+-- probe is a direct rowid seek.
+--
+-- ON DELETE CASCADE: derived state with no claim on the object's lifetime.
+--
+-- reconciled_at is observability only, and NOT a reconcile heartbeat: it moves
+-- only when reconciled_against does (one WHERE guards both), and only
+-- successful passes of dependents write it at all.
+CREATE TABLE dependency_watermarks (
+    object_id          INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
+    reconciled_against INTEGER NOT NULL, -- resource_version_seq value observed at load
+    reconciled_at      INTEGER NOT NULL  -- millis; moves only with reconciled_against
+) STRICT;
+
+-- ============================================================
+-- driver_cursors
+-- Durable scan position for a periodic driver, keyed by driver
+-- name. One row today: the dependency waker's write-log
+-- watermark (see waker.go). Lets a driver resume where it
+-- stopped across a restart instead of reseeding from "now".
+-- ============================================================
+
+-- WITHOUT ROWID: the key is TEXT, so a rowid table would store every name twice.
+-- name identifies the driver — nothing for a foreign key to reference.
+--
+-- Single-writer: a second process sharing this database would steal pages from
+-- the first's scan. A constraint to keep true, not a gap to close.
+--
+-- updated_at is guarded by the same WHERE as cursor, so a no-progress tick
+-- dirties no page — load-bearing at the waker's cadence.
+CREATE TABLE driver_cursors (
+    name       TEXT PRIMARY KEY,
+    cursor     INTEGER NOT NULL, -- resource_version scanned through, inclusive
+    updated_at INTEGER NOT NULL  -- millis; moves only with cursor
+) STRICT, WITHOUT ROWID;
 
 -- ============================================================
 -- events
@@ -185,8 +204,7 @@ CREATE INDEX idx_edges_to ON edges(to_id, relation);
 -- ============================================================
 
 CREATE TABLE events (
-    -- Run identity. AUTOINCREMENT so a physically-deleted (retention-swept) run's
-    -- id is never reused as a UI row key. int64 in Go.
+    -- Run identity. AUTOINCREMENT so a retention-swept run's id is never reused.
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
@@ -205,22 +223,126 @@ CREATE TABLE events (
     resource_version INTEGER NOT NULL
 ) STRICT;
 
--- Serves both the append-time "latest run for (object, category)" probe and the
--- newest-first panel query (ORDER BY last_at DESC).
-CREATE INDEX idx_events_object_cat ON events(object_id, category, last_at DESC);
+-- Newest-first read order for EventsList and EventsSweep's ring window. id
+-- closes the tiebreak, making the order total — without it a limited EventsList
+-- sorts the whole timeline. Does NOT serve the append-time probe (see
+-- idx_events_latest).
+CREATE INDEX idx_events_object_cat
+    ON events(object_id, category, last_at DESC, id DESC);
 
--- Watch ordering (mirrors idx_objects_rv).
-CREATE INDEX idx_events_rv ON events(resource_version);
+-- The append-time probe: EventsAdd's "newest run" means greatest id (append
+-- order, not clock order) — a different sort from the index above, not a prefix,
+-- so one key cannot answer both. Without it the probe sorts and table-fetches
+-- the whole timeline per event, unbounded with retention off. Extend writes
+-- touch none of these columns, so only a new run inserts an entry.
+CREATE INDEX idx_events_latest ON events(object_id, category, id DESC);
+
+-- Covers EventsMaxVersion and the watch tail's range seek above a cursor.
+-- Without it: one table fetch per run, past overflow chains.
+CREATE INDEX idx_events_object_rv ON events(object_id, resource_version);
+
+-- ============================================================
+-- events_horizon
+-- What event retention has removed, per timeline. A read must
+-- not imply an absence it cannot vouch for: a trimmed run and a
+-- run never written are the same empty result, so a resume BELOW
+-- trimmed_through is refused rather than answered. A cursor
+-- sitting exactly on it has lost nothing.
+-- EventsSweep is the only writer.
+-- ============================================================
+
+-- Keyed by (object_id, category) to match the ring cap's own partition, which
+-- trims each timeline independently: an object-wide horizon would let a chatty
+-- category refuse every resume on a quiet one. WITHOUT ROWID for the
+-- object_writes_horizon reasons: a composite key a rowid table would store
+-- twice, tiny rows, and reads by the full key or its object_id prefix.
+CREATE TABLE events_horizon (
+    object_id       INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+    category        TEXT    NOT NULL,
+    trimmed_through INTEGER NOT NULL, -- highest resource_version trimmed here
+    PRIMARY KEY (object_id, category)
+) STRICT, WITHOUT ROWID;
+
+-- ============================================================
+-- object_writes
+-- Append-only change log. One entry per committed object write,
+-- inserted in that write's transaction and carrying the
+-- resource_version it was assigned.
+-- ============================================================
+
+-- A rowid table, unlike edges. INTEGER PRIMARY KEY makes resource_version the
+-- rowid itself, so the table is already clustered in cursor order with no
+-- separate key index — WITHOUT ROWID would add nothing here.
+CREATE TABLE object_writes (
+    -- From resource_version_seq, so it orders against objects.resource_version
+    -- and events.resource_version. Never reused. The rowid alias: an append is
+    -- an in-order insert at the end of the B-tree.
+    resource_version INTEGER PRIMARY KEY,
+
+    -- NO FOREIGN KEY, deliberately. ON DELETE CASCADE would erase exactly the
+    -- delete entries this log exists to record; ON DELETE RESTRICT would make
+    -- the log block collection. The id is a routing key, not a reference, and
+    -- ids are never reused (objects.id is AUTOINCREMENT).
+    object_id INTEGER NOT NULL,
+
+    "group" TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+
+    -- 1 create, 2 update, 3 physical delete. The soft delete is an UPDATE: the
+    -- object is still live and readable, so it appends 2.
+    op INTEGER NOT NULL CHECK (op IN (1, 2, 3)),
+
+    written_at INTEGER NOT NULL, -- epoch ms
+
+    -- Delete entries only, NULL otherwise: a JSON row image of the object as it
+    -- was when collected. NOT just its blobs — a Deleted change reports a whole
+    -- object, so the image carries name, generation, the handshake fields,
+    -- finalizers and timestamps too. Conditions live in their own ON DELETE
+    -- CASCADE table and are gone by collection, so they are captured here or
+    -- they are lost.
+    final TEXT
+) STRICT;
+
+-- The watch tail: seek by kind, scan in cursor order. object_id and op are in
+-- the key to make it covering — without them every entry costs a row fetch.
+--
+-- resource_version is spelled out even though it is the rowid and every index
+-- entry carries the rowid anyway: the implicit copy sorts LAST, so relying on it
+-- would order by ("group", kind, object_id, op, resource_version) and lose the
+-- range seek the tail is built on.
+CREATE INDEX idx_object_writes_kind
+    ON object_writes("group", kind, resource_version, object_id, op);
+
+-- ObjectWritesSweep's maxAge bound. Without it the age sweep is a full scan of
+-- what will be the largest table in the database, on every GC tick.
+CREATE INDEX idx_object_writes_age ON object_writes(written_at);
+
+-- ============================================================
+-- object_writes_horizon
+-- What retention has removed from object_writes, per kind. A
+-- resume BELOW trimmed_through is refused: the log has a hole
+-- under it. A cursor sitting exactly on it has lost nothing —
+-- the next unread entry is trimmed_through + 1.
+-- ObjectWritesSweep is the only writer.
+-- ============================================================
+
+-- WITHOUT ROWID, for the edges reasons: a composite text key a rowid table would
+-- store twice, tiny rows, one row per kind rather than per write, and reads
+-- always by full primary key.
+CREATE TABLE object_writes_horizon (
+    "group"         TEXT    NOT NULL,
+    kind            TEXT    NOT NULL,
+    trimmed_through INTEGER NOT NULL, -- highest resource_version trimmed for this kind
+    PRIMARY KEY ("group", kind)
+) STRICT, WITHOUT ROWID;
 
 -- ============================================================
 -- resource_version_seq
 -- Monotonic global write cursor, decoupled from the objects table.
 -- ============================================================
 
--- Deriving the next resource_version from MAX(objects.resource_version) lets a
--- version be reused once the highest-versioned row is physically deleted, which
--- breaks its use as a watch cursor / CAS token. A standalone single-row counter
--- only ever increments, regardless of row deletions, so versions are never reused.
+-- MAX(objects.resource_version) would reuse a version once the highest row is
+-- deleted; a standalone counter only ever increments.
 CREATE TABLE resource_version_seq (
     id    INTEGER PRIMARY KEY CHECK (id = 1), -- single row, always id = 1
     value INTEGER NOT NULL                    -- last resource_version handed out
