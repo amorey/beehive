@@ -29,7 +29,7 @@ import (
 
 func TestControllerClientDeleteFinalizer(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -121,7 +121,7 @@ func TestFinalizersDeletePushesNothingWhenRolledBack(t *testing.T) {
 // consulted.
 func TestFinalizersDeletePushesNothingOnWrongKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	gadgetGK := GroupKind{Kind: "Gadget"}
@@ -146,7 +146,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("registered migrator stamps current versions", func(t *testing.T) {
-		store := newClientTestStore(t)
+		store := newStore(t)
 		bh, err := New(store)
 		require.NoError(t, err)
 
@@ -172,7 +172,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 	})
 
 	t.Run("no migrator stamps 0 (backward compatible)", func(t *testing.T) {
-		store := newClientTestStore(t)
+		store := newStore(t)
 		bh, err := New(store)
 		require.NoError(t, err)
 
@@ -192,7 +192,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 
 func TestControllerClientUpdateStatus(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -225,7 +225,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -268,7 +268,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 // with the nested ControllerClient writes joining the one transaction.
 func TestControllerClientWithin(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -305,7 +305,7 @@ func TestControllerClientWithin(t *testing.T) {
 // Detail; the run reads back with the mapped fields and a decodable payload.
 func TestControllerClientAddEvent(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -343,7 +343,7 @@ func TestControllerClientAddEventMarshalError(t *testing.T) {
 // events on an object of another kind.
 func TestControllerClientAddEventWrongKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -357,7 +357,7 @@ func TestControllerClientAddEventWrongKind(t *testing.T) {
 // errors is rolled back with the rest.
 func TestControllerClientAddEventWithinRollback(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -379,7 +379,7 @@ func TestControllerClientAddEventWithinRollback(t *testing.T) {
 
 func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -404,7 +404,7 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -438,7 +438,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 // so a declare-time check is invisible to it.
 func TestAddDependencyAcceptsCycle(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	gk := GroupKind{Kind: "Widget"}
@@ -486,7 +486,7 @@ type declareFixture struct {
 func newDeclareFixture(t *testing.T) *declareFixture {
 	t.Helper()
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	f := &declareFixture{
@@ -582,7 +582,7 @@ type sameKindFixture struct {
 func newSameKindFixture(t *testing.T) *sameKindFixture {
 	t.Helper()
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	gk := GroupKind{Kind: "Widget"}
 	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
@@ -648,7 +648,7 @@ func TestAddDependencyWakesOncePerEdge(t *testing.T) {
 // which is what the two assertions below do: edge and wake land together.
 func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	ctx := context.Background()
-	real := newClientTestStore(t)
+	real := newStore(t)
 
 	bh := newTestBeehive(t, real)
 	gk := GroupKind{Kind: "Widget"}
@@ -778,7 +778,7 @@ func TestAddDependencyEnqueuesNothingOnRollback(t *testing.T) {
 // kind's existing gap rather than one this path opens.
 func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	targetGK := GroupKind{Kind: "Target"}
 	cc, err := Register(bh, targetGK, &noopController[tSpec, tStatus]{})
@@ -832,7 +832,7 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withoutGCSweeper())
+	bh := newTestBeehive(t, newStore(t), withoutGCSweeper())
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &redeclareController{first: newSignal(), hot: newSignal()}
 	_, err := Register(bh, gk, ctrl)
@@ -914,7 +914,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 
 func TestControllerClientHasIncomingEdges(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -943,7 +943,7 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 // rows. DependenciesAdd/EdgesHasIncoming are intentionally cross-kind and not guarded.
 func TestControllerClientWritesScopedToKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
 	require.NoError(t, err)
@@ -1179,7 +1179,7 @@ func TestDependenciesDeleteSkipsClientOnlyTarget(t *testing.T) {
 
 func TestControllerClientReadEdges(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)

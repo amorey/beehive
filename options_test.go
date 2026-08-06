@@ -308,7 +308,7 @@ func TestWithMinRequeueIntervalDispatch(t *testing.T) {
 // option loop, the gate would hold the default and the option below would be
 // silently ignored.
 func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(time.Minute))
+	bh := newTestBeehive(t, newStore(t), withWakeScanMinInterval(time.Minute))
 
 	assert.Equal(t, time.Minute, bh.waker.scanGate.Interval(), "the option must reach the scan gate")
 	assert.Equal(t, defaultWakePersistInterval, bh.waker.persistGate.Interval(),
@@ -318,7 +318,7 @@ func TestNewBuildsTheWakersGatesFromTheResolvedIntervals(t *testing.T) {
 // A non-positive interval turns the throttle off rather than holding forever,
 // which is what rategate's zero interval already means.
 func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t), withWakeScanMinInterval(0))
+	bh := newTestBeehive(t, newStore(t), withWakeScanMinInterval(0))
 
 	_, held := bh.waker.scanGate.Allow(time.Now())
 	require.False(t, held)
@@ -334,12 +334,12 @@ func TestWithWakeScanMinIntervalDisablesTheThrottle(t *testing.T) {
 func TestWithWatchScanMinIntervalDisablesTheThrottle(t *testing.T) {
 	for _, d := range []time.Duration{0, -time.Second} {
 		t.Run(d.String(), func(t *testing.T) {
-			bh := newTestBeehive(t, newClientTestStore(t), withWatchScanMinInterval(d))
+			bh := newTestBeehive(t, newStore(t), withWatchScanMinInterval(d))
 			assert.Equal(t, d, bh.watchScanMinInterval)
 		})
 	}
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchScanMinInterval(time.Minute))
+	bh := newTestBeehive(t, newStore(t), withWatchScanMinInterval(time.Minute))
 	assert.Equal(t, time.Minute, bh.watchScanMinInterval)
 
 	// Targets the option doesn't recognize are silently ignored.
@@ -350,7 +350,7 @@ func TestWithWatchScanMinIntervalDisablesTheThrottle(t *testing.T) {
 // Register seeds the queue's floor from the New-level default, and a per-kind
 // option overrides it.
 func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t), withMinRequeueInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withMinRequeueInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, withMinRequeueInterval(time.Minute))
 	require.NoError(t, err)
 

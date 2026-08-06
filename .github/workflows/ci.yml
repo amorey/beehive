@@ -63,12 +63,12 @@ jobs:
 
       # The read pool exists only on disk — in memory it aliases the write pool,
       # so nothing about the split, including its refusal of a write, is
-      # exercised by the run above.
+      # exercised by the run above. Only the root package reads the switch.
       - name: Run tests on a file-backed store
         env:
           GOMAXPROCS: ${{ matrix.gomaxprocs }}
           BEEHIVE_TEST_STORE: file
-        run: go test -race ./...
+        run: go test -race ./
 
   coverage:
     name: Coverage (100%)

@@ -179,17 +179,17 @@ func TestOpenPool(t *testing.T) {
 	require.NoError(t, db.Ping())
 }
 
-// TestOpenPoolQueryOnly pins both halves of the reader pool's DSN. query_only
+// TestOpenPoolReader pins both halves of the reader pool's DSN. query_only
 // refuses the write; the absent _txlock is what lets BeginTx open a DEFERRED
 // read transaction instead of grabbing a write lock it cannot have.
-func TestOpenPoolQueryOnly(t *testing.T) {
+func TestOpenPoolReader(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	w := OpenPool(path, PoolOptions{MaxConns: 1})
 	t.Cleanup(func() { w.Close() })
 	_, err := w.Exec(`CREATE TABLE a(id INTEGER PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	r := OpenPool(path, PoolOptions{MaxConns: 2, QueryOnly: true})
+	r := OpenPool(path, PoolOptions{MaxConns: 2, Reader: true})
 	t.Cleanup(func() { r.Close() })
 
 	_, err = r.Exec(`INSERT INTO a (id) VALUES (1)`)
@@ -203,10 +203,10 @@ func TestOpenPoolQueryOnly(t *testing.T) {
 	assert.Equal(t, 0, n)
 }
 
-// TestOpenPoolQueryOnlyRecoversWAL is why the reader pool is query_only rather
+// TestOpenPoolReaderRecoversWAL is why the reader pool is query_only rather
 // than mode=ro: it must open a database no writer of its own has touched, and
 // read through a -wal left hot by an unclean close.
-func TestOpenPoolQueryOnlyRecoversWAL(t *testing.T) {
+func TestOpenPoolReaderRecoversWAL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	w := OpenPool(path, PoolOptions{MaxConns: 1})
 	_, err := w.Exec(`CREATE TABLE a(id INTEGER PRIMARY KEY)`)
@@ -217,7 +217,7 @@ func TestOpenPoolQueryOnlyRecoversWAL(t *testing.T) {
 	t.Cleanup(func() { w.Close() })
 	require.FileExists(t, path+"-wal")
 
-	r := OpenPool(path, PoolOptions{MaxConns: 2, QueryOnly: true})
+	r := OpenPool(path, PoolOptions{MaxConns: 2, Reader: true})
 	t.Cleanup(func() { r.Close() })
 	var n int
 	require.NoError(t, r.QueryRow(`SELECT count(*) FROM a`).Scan(&n))

@@ -162,7 +162,7 @@ func TestRawToTypedConversion(t *testing.T) {
 // must skip it before reaching the good one.
 func TestListSkipsUndecodableRows(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
@@ -193,7 +193,7 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -218,12 +218,6 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	assert.Equal(t, "good", snap.Objects[0].Spec.Val)
 }
 
-func newClientTestStore(t *testing.T) Store {
-	t.Helper()
-	s := newStore(t)
-	return s
-}
-
 // errMarshaler is a type whose JSON marshaling always fails, used to exercise
 // the json.Marshal error paths in Create and Update.
 type errMarshaler struct{}
@@ -232,7 +226,7 @@ func (errMarshaler) MarshalJSON() ([]byte, error) { return nil, errors.New("cann
 
 func TestClientCreateMarshalError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, err := client.Create(ctx, "bad-marshal", errMarshaler{})
@@ -241,7 +235,7 @@ func TestClientCreateMarshalError(t *testing.T) {
 
 func TestClientUpdateMarshalError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, err := client.Update(ctx, 1, errMarshaler{})
@@ -252,7 +246,7 @@ func TestClientUpdateMarshalError(t *testing.T) {
 // per-call Option (before any store write), so a bad option fails fast.
 func TestClientCreateOptionError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	// An option that fails when applied to the create-options target.
 	badOpt := func(target any) error {
@@ -269,7 +263,7 @@ func TestClientCreateOptionError(t *testing.T) {
 
 func TestClientCreate(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, "hello-1", cSpec{Val: "hello"})
@@ -287,7 +281,7 @@ func TestClientCreate(t *testing.T) {
 // at the new signature.
 func TestClientCreateRejectsTakenName(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "taken", cSpec{Val: "first"})
 
@@ -302,7 +296,7 @@ func TestClientCreateRejectsTakenName(t *testing.T) {
 // the same error, or a delete-then-recreate looks like a different failure.
 func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -324,7 +318,7 @@ func TestClientCreateReportsNameTakenByATombstone(t *testing.T) {
 // validate names".
 func TestClientRejectsEmptyName(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	t.Run("Create", func(t *testing.T) {
@@ -358,7 +352,7 @@ func TestClientRejectsEmptyName(t *testing.T) {
 // stays hidden until a cold start or a GC sweep removes the row.
 func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// An unmarshalable spec would also fail this call — assert the name is checked
@@ -377,7 +371,7 @@ func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 // interesting property is that they address different things.
 func TestClientCRUDIsIDKeyedWithByNameSiblings(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "a"})
@@ -409,7 +403,7 @@ func TestClientCRUDIsIDKeyedWithByNameSiblings(t *testing.T) {
 // *owner*.
 func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, err := client.Create(ctx, "unclearable", cSpec{Val: "a"}, WithFinalizers("cleanup"))
@@ -427,7 +421,7 @@ func TestClientCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 // happens before the name lookup.
 func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"}, WithFinalizers("cleanup"))
@@ -442,7 +436,7 @@ func TestClientGetOrCreateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
 // exists and strand the first time it does not.
 func TestClientGetOrCreateRejectsFinalizersOnTheFoundBranch(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, err := client.Create(ctx, "w1", cSpec{Val: "a"})
 	require.NoError(t, err, "the row exists, so the create branch is not reached")
@@ -458,7 +452,7 @@ func TestClientGetOrCreateRejectsFinalizersOnTheFoundBranch(t *testing.T) {
 // the finalizer makes one uncollectable.
 func TestClientCreateWithoutFinalizersAllowsUnregisteredKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj, err := client.Create(ctx, "owned", cSpec{Val: "a"})
@@ -469,7 +463,7 @@ func TestClientCreateWithoutFinalizersAllowsUnregisteredKind(t *testing.T) {
 
 func TestClientCreateWithOptions(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
@@ -501,7 +495,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 
 func TestClientCreateOwnerRefError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	// The owner must exist: the ref's foreign key rejects a dangling owner, and
 	// Within rolls the half-made child back with it.
@@ -516,7 +510,7 @@ func TestClientCreateOwnerRefError(t *testing.T) {
 
 func TestClientGet(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -530,7 +524,7 @@ func TestClientGet(t *testing.T) {
 
 func TestClientGetAbsentName(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, err := client.GetByName(ctx, "nonexistent")
@@ -539,7 +533,7 @@ func TestClientGetAbsentName(t *testing.T) {
 
 func TestClientList(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -554,7 +548,7 @@ func TestClientList(t *testing.T) {
 
 func TestClientUpdate(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
@@ -568,7 +562,7 @@ func TestClientUpdate(t *testing.T) {
 
 func TestClientGetOrCreateCreates(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj, created, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -586,7 +580,7 @@ func TestClientGetOrCreateCreates(t *testing.T) {
 
 func TestClientGetOrCreateReturnsExisting(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	first, _, err := client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
@@ -603,7 +597,7 @@ func TestClientGetOrCreateReturnsExisting(t *testing.T) {
 
 func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -625,7 +619,7 @@ func TestClientGetOrCreateReturnsDeletionPending(t *testing.T) {
 // contract: GetOrCreate never mutates a row it did not create.
 func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -661,7 +655,7 @@ func (badDecodeSpec) MarshalJSON() ([]byte, error) { return []byte(`"not-an-obje
 // not hit a spurious UNIQUE on a phantom row.
 func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "BadDecode"}
 	client := NewClient[badDecodeSpec, cStatus](bh, gk)
@@ -686,7 +680,7 @@ func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 // without Start leaves a queue nothing drains, so a stray enqueue would be visible.
 func TestClientCreateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "BadDecode"}
 	_, err := Register(bh, gk, &noopController[badDecodeSpec, cStatus]{})
@@ -725,7 +719,7 @@ func (s conditionalBadSpec) MarshalJSON() ([]byte, error) {
 // so it rolls back — the prior good spec (and generation) survive, and no wake fires.
 func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "CondBad"}
 	_, err := Register(bh, gk, &noopController[conditionalBadSpec, cStatus]{})
@@ -753,7 +747,7 @@ func TestClientUpdateRollsBackOnDecodeError(t *testing.T) {
 // returns an existing row.
 func TestClientWithOnCreateFiresOnlyOnCreate(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	var calls int
@@ -797,7 +791,7 @@ func TestClientWithOnCreateFiresOnlyAfterOuterCommit(t *testing.T) {
 		t.Run(w.name, func(t *testing.T) {
 			runCommitRollback(t, func(t *testing.T, commit bool) {
 				ctx := context.Background()
-				bh, err := New(newClientTestStore(t))
+				bh, err := New(newStore(t))
 				require.NoError(t, err)
 				client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -858,7 +852,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 		t.Run(w.name, func(t *testing.T) {
 			runCommitRollback(t, func(t *testing.T, commit bool) {
 				ctx := context.Background()
-				store := newClientTestStore(t)
+				store := newStore(t)
 				bh, err := New(store)
 				require.NoError(t, err)
 				// Registered but never started, so nothing drains what the writes owe.
@@ -900,7 +894,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 // re-applies its own kind's spec each pass would otherwise re-owe itself forever.
 func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -930,7 +924,7 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 	runCommitRollback(t, func(t *testing.T, commit bool) {
 		ctx := context.Background()
-		store := newClientTestStore(t)
+		store := newStore(t)
 		bh, err := New(store)
 		require.NoError(t, err)
 		_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -963,7 +957,7 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 
 func TestClientGetOrCreateWithOwner(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -981,7 +975,7 @@ func TestClientGetOrCreateWithOwner(t *testing.T) {
 
 func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -998,7 +992,7 @@ func TestClientGetOrCreateWithFinalizers(t *testing.T) {
 
 func TestClientGetOrCreateMarshalError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, created, err := client.GetOrCreate(ctx, "w1", errMarshaler{})
@@ -1018,7 +1012,7 @@ func TestClientGetOrCreateStoreError(t *testing.T) {
 
 func TestClientGetOrCreateOptionError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	badOpt := func(any) error { return errBoom }
 
@@ -1053,7 +1047,7 @@ func TestClientGetOrCreateRawToTypedError(t *testing.T) {
 
 func TestClientGetNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, err := client.Get(ctx, 999)
@@ -1077,7 +1071,7 @@ func TestClientWatchNonExistentID(t *testing.T) {
 
 func TestClientDeleteNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	err := client.Delete(ctx, 999)
@@ -1086,7 +1080,7 @@ func TestClientDeleteNotFound(t *testing.T) {
 
 func TestClientDelete(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, uniqueName(), cSpec{})
@@ -1104,7 +1098,7 @@ func TestClientDelete(t *testing.T) {
 
 func TestClientDeleteByName(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
@@ -1120,7 +1114,7 @@ func TestClientDeleteByName(t *testing.T) {
 
 func TestClientDeleteByNameNotFoundIsNil(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	assert.NoError(t, client.DeleteByName(ctx, "never-created"))
@@ -1128,7 +1122,7 @@ func TestClientDeleteByNameNotFoundIsNil(t *testing.T) {
 
 func TestClientDeleteByNameIdempotent(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
@@ -1141,7 +1135,7 @@ func TestClientDeleteByNameIdempotent(t *testing.T) {
 // as a pure no-op: no error, and no second state change for watchers to see.
 func TestClientDeleteAlreadyDeleting(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1169,7 +1163,7 @@ func TestClientDeleteAlreadyDeleting(t *testing.T) {
 // row must wake nobody.
 func TestClientDeleteMarksForCollection(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -1193,7 +1187,7 @@ func TestClientDeleteMarksForCollection(t *testing.T) {
 // Delete reports success (nothing of this kind to delete) and leaves it be.
 func TestClientDeleteKindScoped(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	widgets := NewClient[cSpec, cStatus](bh, clientTestGK)
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
@@ -1221,7 +1215,7 @@ func TestClientDeleteStoreError(t *testing.T) {
 // left untouched, never updated or marked for deletion through the wrong client.
 func TestClientIDOpsScopedToKind(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
@@ -1438,7 +1432,7 @@ func assertChanClosed[T any](t *testing.T, ch <-chan T) {
 // single-proc race build.
 func watchTestClient(t *testing.T) (context.Context, Client[cSpec, cStatus]) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	// Registered after the store's own close, so it runs before it: the streams
@@ -1608,7 +1602,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 
 	// A fresh beehive rather than watchTestClient's, since this test needs the
 	// ControllerClient that registration returns.
-	bh2, err := New(newClientTestStore(t), fast()...)
+	bh2, err := New(newStore(t), fast()...)
 	require.NoError(t, err)
 	cc, err := Register(bh2, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -1680,7 +1674,7 @@ func TestWatchInitialSnapshot(t *testing.T) {
 // control plane.
 func TestStartAfterStopErrors(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
@@ -1701,7 +1695,7 @@ func TestStartAfterStopErrors(t *testing.T) {
 func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
@@ -1717,7 +1711,7 @@ func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 
 func TestClientGetOwner(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1751,7 +1745,7 @@ func TestClientGetOwner(t *testing.T) {
 // what makes the mis-implementation quiet: only the read surface changes.
 func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1771,7 +1765,7 @@ func TestClientListDependentsIncludesSelfEdge(t *testing.T) {
 
 func TestClientListDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1800,7 +1794,7 @@ func TestClientListDependenciesAndDependents(t *testing.T) {
 
 func TestClientListOwned(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1825,7 +1819,7 @@ func TestClientListOwned(t *testing.T) {
 func ownedObjectsFixture(t *testing.T) (context.Context, Client[cSpec, cStatus], Client[cSpec, cStatus], ObjectID, []*Object[cSpec, cStatus]) {
 	t.Helper()
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	// One consumer of this fixture creates a child WithFinalizers, which is legal
 	// only on a registered kind.
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -2043,7 +2037,7 @@ func TestClientListOwnedObjectsLoadError(t *testing.T) {
 
 func TestClientGetWithLoadOwner(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2094,7 +2088,7 @@ func (s *countingStore) EdgesGroupIncomingByID(ctx context.Context, ids []Object
 
 func TestClientListWithLoadOwnerBatches(t *testing.T) {
 	ctx := context.Background()
-	store := &countingStore{Store: newClientTestStore(t)}
+	store := &countingStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2122,7 +2116,7 @@ func TestClientListWithLoadOwnerBatches(t *testing.T) {
 
 func TestClientLoadsOwned(t *testing.T) {
 	ctx := context.Background()
-	store := &countingStore{Store: newClientTestStore(t)}
+	store := &countingStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2170,7 +2164,7 @@ func TestClientLoadsOwned(t *testing.T) {
 
 func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2196,7 +2190,7 @@ func TestClientGetLoadsDependenciesAndDependents(t *testing.T) {
 
 func TestClientListBatchesDependenciesAndDependents(t *testing.T) {
 	ctx := context.Background()
-	store := &countingStore{Store: newClientTestStore(t)}
+	store := &countingStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2243,7 +2237,7 @@ func (edgeErrorStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relati
 
 func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 	ctx := context.Background()
-	store := &edgeErrorStore{Store: newClientTestStore(t)}
+	store := &edgeErrorStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2267,7 +2261,7 @@ func TestEagerLoadStoreErrorsPropagate(t *testing.T) {
 
 func TestClientLazyRefsMissingIDReadsEmpty(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// The lazy lookups drop the scopedGet kind guard for speed, so a missing id
@@ -2312,7 +2306,7 @@ func TestGetDecodeError(t *testing.T) {
 // for an id that does not exist, before reaching any reconciler.
 func TestClientRequeueNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	err := client.Requeue(ctx, 999)
@@ -2324,7 +2318,7 @@ func TestClientRequeueNotFound(t *testing.T) {
 // registered to enqueue it on.
 func TestClientRequeueNoController(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2348,7 +2342,7 @@ func TestClientRequeue(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			bh, err := New(newClientTestStore(t))
+			bh, err := New(newStore(t))
 			require.NoError(t, err)
 			_, err = Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 			require.NoError(t, err)
@@ -2383,7 +2377,7 @@ func TestClientRequeue(t *testing.T) {
 // rather than ErrNotFound.
 func TestClientGetScheduleUnknownID(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
@@ -2397,7 +2391,7 @@ func TestClientGetScheduleUnknownID(t *testing.T) {
 // the pending delayed reconcile's fire time in NextRequeueAt.
 func TestClientGetScheduleScheduled(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
@@ -2419,7 +2413,7 @@ func TestClientGetScheduleScheduled(t *testing.T) {
 // Schedule (and no error) when nothing is scheduled for the id.
 func TestClientGetScheduleUnscheduled(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
@@ -2439,7 +2433,7 @@ func TestClientGetScheduleUnscheduled(t *testing.T) {
 // degrading gracefully rather than erroring like the SchedulesWatch live stream.
 func TestClientGetScheduleNoController(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2455,7 +2449,7 @@ func TestClientGetScheduleNoController(t *testing.T) {
 func TestClientWatchScheduleSnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
@@ -2481,7 +2475,7 @@ func TestClientWatchScheduleSnapshot(t *testing.T) {
 func TestClientWatchScheduleLive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
@@ -2523,7 +2517,7 @@ func TestClientWatchScheduleLive(t *testing.T) {
 func TestClientWatchScheduleNoController(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2552,7 +2546,7 @@ func (eventErrStore) EventsSweep(context.Context, int, time.Duration) (int, erro
 // propagates to the caller.
 func TestClientEventReadsPropagateStoreError(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, eventErrStore{newClientTestStore(t)})
+	bh := newTestBeehive(t, eventErrStore{newStore(t)})
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -2572,7 +2566,7 @@ func TestClientEventReadsPropagateStoreError(t *testing.T) {
 // eventsFromRaw nil branch).
 func TestClientListEventsEmpty(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2587,7 +2581,7 @@ func TestClientListEventsEmpty(t *testing.T) {
 // aggregated, newest-first timeline the health panel shows.
 func TestEventsConnectionPanelTimeline(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -2652,7 +2646,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 // it the accessor reports ErrNotLoaded.
 func TestClientGetLoadsEvents(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2676,7 +2670,7 @@ func TestClientGetLoadsEvents(t *testing.T) {
 // List(LoadEvents()) attaches each object's own runs.
 func TestClientListLoadsEvents(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2704,7 +2698,7 @@ func TestClientListLoadsEvents(t *testing.T) {
 // query options resolved into the store filter.
 func TestClientListEvents(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2734,7 +2728,7 @@ func TestClientListEvents(t *testing.T) {
 // Event with ok=false when the timeline is empty.
 func TestClientGetLatestEvent(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
@@ -2759,7 +2753,7 @@ func TestClientGetLatestEvent(t *testing.T) {
 func TestClientWatchEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -2817,7 +2811,7 @@ func TestEventFromRaw(t *testing.T) {
 // set, letting a caller read and delete by name but forcing an id to write.
 func TestClientUpdateIsIDKeyedWithByNameSibling(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
 
@@ -2836,7 +2830,7 @@ func TestClientUpdateIsIDKeyedWithByNameSibling(t *testing.T) {
 // nothing to write the spec onto — so Update reports absence both ways.
 func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, err := client.UpdateByName(ctx, "no-such-name", cSpec{Val: "v1"})
@@ -2847,7 +2841,7 @@ func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {
 // the kind into its own lookup rather than trusting the caller's.
 func TestClientUpdateIsKindScoped(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	widgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Widget"})
 	gadgets := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Gadget"})
@@ -2873,7 +2867,7 @@ func TestClientUpdateIsKindScoped(t *testing.T) {
 // either mutator would pass everything else in the suite.
 func TestClientNameKeyedWritesFollowTheNameAcrossARecreate(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	first := mustCreate(t, ctx, client, "prod", cSpec{Val: "first"})
@@ -2932,7 +2926,7 @@ func (s *resolveProbeStore) ObjectsGetByName(ctx context.Context, gk GroupKind, 
 // transaction.
 func TestClientUpdateDoesNotResolveTheNameSeparately(t *testing.T) {
 	ctx := context.Background()
-	probe := &resolveProbeStore{Store: newClientTestStore(t)}
+	probe := &resolveProbeStore{Store: newStore(t)}
 	bh := newTestBeehive(t, probe)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
@@ -2952,7 +2946,7 @@ func TestClientUpdateDoesNotResolveTheNameSeparately(t *testing.T) {
 // far likelier than luck running out.
 func TestGenerateNameRetryLoopSurvivesACollision(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// Something already holds the name the generator is about to produce.
@@ -2989,7 +2983,7 @@ func TestGenerateNameRetryLoopSurvivesACollision(t *testing.T) {
 // The README/godoc example, compiled so it cannot drift into not building.
 func TestGenerateNameDocExampleCompiles(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	obj, err := client.Create(ctx, GenerateName("cache"), cSpec{Val: "v"})
@@ -3059,7 +3053,7 @@ func TestGenerateNamePanicsRatherThanReturningTheNilUUID(t *testing.T) {
 // the object, not that some pass later found it.
 func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc, mustReconciler(t, bh, clientTestGK)
@@ -3313,7 +3307,7 @@ func TestSpecWriteEnqueuesNothingOnRollback(t *testing.T) {
 // nothing and the write succeeds, rather than erroring or panicking.
 func TestSpecWriteOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	clientOnly := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "NoController"})
 
 	obj, err := clientOnly.Create(ctx, uniqueName(), cSpec{Val: "a"})
@@ -3389,7 +3383,7 @@ func TestFailingRespecControllerKeepsItsBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withoutGCSweeper())
+	bh := newTestBeehive(t, newStore(t), withoutGCSweeper())
 	ctrl := &respecController{first: newSignal(), hot: newSignal()}
 	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)

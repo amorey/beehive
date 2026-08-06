@@ -51,7 +51,7 @@ func TestSweepEventRetention(t *testing.T) {
 	})
 
 	t.Run("store error is logged, not fatal", func(t *testing.T) {
-		bad, err := New(eventErrStore{newClientTestStore(t)}, WithEventRetention(2, time.Hour))
+		bad, err := New(eventErrStore{newStore(t)}, WithEventRetention(2, time.Hour))
 		require.NoError(t, err)
 		bad.eventRetentionSweep(ctx) // EventsSweep errors → warn branch, must not panic
 	})
@@ -166,7 +166,7 @@ func TestSweepReconcileOwedFailureIsNotFatal(t *testing.T) {
 func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
 	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
 	swept := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "swept"})
@@ -190,7 +190,7 @@ func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
 // left by a prior process, and nothing in this one consumes them.
 func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
 	from := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "from"})
@@ -522,14 +522,14 @@ func TestSweepWriteLogRetention(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("bounded by default", func(t *testing.T) {
-		bh, err := New(newClientTestStore(t))
+		bh, err := New(newStore(t))
 		require.NoError(t, err)
 		assert.Equal(t, defaultWriteLogMaxAge, bh.writeLogRetentionMaxAge)
 		assert.Zero(t, bh.writeLogRetentionPerKind, "no count bound by default")
 	})
 
 	t.Run("both zero disables the sweep", func(t *testing.T) {
-		store := newClientTestStore(t)
+		store := newStore(t)
 		bh, err := New(store, WithWriteLogRetention(0, 0))
 		require.NoError(t, err)
 		gk := GroupKind{Kind: "Widget"}
@@ -546,7 +546,7 @@ func TestSweepWriteLogRetention(t *testing.T) {
 	})
 
 	t.Run("caps per kind", func(t *testing.T) {
-		store := newClientTestStore(t)
+		store := newStore(t)
 		bh, err := New(store, WithWriteLogRetention(2, 0))
 		require.NoError(t, err)
 		gk := GroupKind{Kind: "Widget"}
@@ -576,7 +576,7 @@ func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	_, err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 

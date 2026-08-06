@@ -83,7 +83,7 @@ func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 // is taken out of the picture.
 func pushOnlyClient(t *testing.T) (context.Context, *Beehive, Client[cSpec, cStatus], *reconciler) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)
@@ -231,7 +231,7 @@ func assertQuiet(t *testing.T, ch <-chan Schedule, msg string) {
 // poll interval is short enough that a retained poll would have ticked many
 // times.
 func TestScheduleStreamMakesNoPeriodicRead(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())

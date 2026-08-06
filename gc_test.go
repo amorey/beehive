@@ -224,7 +224,7 @@ func TestCollectDeleteObjectError(t *testing.T) {
 // running here.
 func gcFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus]) {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	return bh, NewClient[cSpec, cStatus](bh, clientTestGK)
 }
 
@@ -707,7 +707,7 @@ func TestCollectBreaksSelfDependency(t *testing.T) {
 
 func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 
 	// Full pass disabled: the cycle must break purely event-driven.
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
@@ -737,7 +737,7 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 
 func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 
 	// Full pass disabled: the finalizer gate must clear purely event-driven.
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
@@ -766,7 +766,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 
 func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 
 	// Simulate a crash mid-delete: a deletion-pending row is already in the durable
 	// store before any control plane runs. (Written through the store directly, so
@@ -820,7 +820,7 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 
 	// Full pass disabled: the post-reconcile GC hook alone must remove the row once
 	// the controller clears the finalizer in the same pass.
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	_, err := Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"})
 	require.NoError(t, err)
@@ -851,7 +851,7 @@ func TestIntegrationGCCascadeWithFullPassDisabled(t *testing.T) {
 	// Full pass disabled: the cascade must complete purely event-driven. Deleting the
 	// child frees the owner's RESTRICT, and removing the child must wake the owner
 	// directly — there is no backstop tick to re-check it.
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
@@ -877,7 +877,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 
 	// A short full-pass interval drives the deletion-pending backstop, which re-checks the
 	// owner once its child (and the owned_by edge) is gone.
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithGCInterval(5*time.Millisecond))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithGCInterval(5*time.Millisecond))...)
 
 	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
@@ -913,7 +913,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithGCInterval(5*time.Millisecond))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithGCInterval(5*time.Millisecond))...)
 
 	// Only the owner kind has a controller; the child kind is client-only.
 	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
@@ -960,7 +960,7 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 func TestIntegrationGCSweepCollectsStandaloneClientOnlyDelete(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 
 	// No controller registered for this kind: it is entirely client-only.
 	client := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "ClientOnly"})
@@ -1059,7 +1059,7 @@ func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClien
 // drop's own push is the only thing left that can collect the target.
 func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, parked()...)
 
 	ctrl := &depReleaseController{}
@@ -1107,7 +1107,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 // push, leaving the sweeper's tick as the only collector.
 func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1135,7 +1135,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 // parked the mark's own push is the only thing that can collect it.
 func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, parked()...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1167,7 +1167,7 @@ func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
 // push, leaving the sweeper's tick as the only collector.
 func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1194,7 +1194,7 @@ func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
 // The cascade marks referrers too, so the same push has to come from there.
 func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, parked()...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1257,7 +1257,7 @@ func (c *siblingFinalizerClearingController) Reconcile(ctx context.Context, cc C
 // the pass the finalizer blocked.
 func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
@@ -1297,7 +1297,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
 // the store issues none, leaving the sweeper's tick as the only collector.
 func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1324,7 +1324,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 // child, and the child's removal is what dispatches the owner again.
 func TestIntegrationLastChildCollectsItsOwnerWithoutASweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
@@ -1355,7 +1355,7 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutASweep(t *testing.T) {
 // and the periodic passes off, the create's push is the only route left.
 func TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
@@ -1391,7 +1391,7 @@ func TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep(t *testing.
 // holds for an owner whose kind is registered in another process.
 func TestIntegrationCreateUnderADeletingClientOnlyOwnerHealsOnTheSweep(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
 
 	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
@@ -1427,7 +1427,7 @@ func TestIntegrationCreateUnderADeletingClientOnlyOwnerHealsOnTheSweep(t *testin
 // too, or it would dispatch the still-unsettled owner and stand in for the sweep.
 func TestIntegrationLastChildCollectsItsOwnerWithoutThePush(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
@@ -1470,7 +1470,7 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutThePush(t *testing.T) {
 // dispatches a reconcile either.
 func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	ctx := context.Background()
-	real := newClientTestStore(t)
+	real := newStore(t)
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
 	raw, err := real.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
@@ -1515,7 +1515,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 // pass can be what dispatches it. A periodic GC sweep is the only path left.
 func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	ctx := context.Background()
-	real := newClientTestStore(t)
+	real := newStore(t)
 	store := &listProbeStore{
 		Store:      real,
 		owedListed: make(chan struct{}, 8),

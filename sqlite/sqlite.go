@@ -31,8 +31,7 @@ import (
 //go:embed migrations
 var migrations embed.FS
 
-// readPoolConns caps the read pool. A constant, not an option: there is no
-// measurement behind a knob yet.
+// readPoolConns caps the read pool.
 func readPoolConns() int {
 	return min(4, runtime.GOMAXPROCS(0))
 }
@@ -43,17 +42,36 @@ func readPoolConns() int {
 // Reads that are not inside a transaction run on a second, query_only pool, so
 // they do not queue behind writes. See docs/adr/2026-08-06-a-read-pool-beside-the-write-pool.md.
 func Open(path string) (*sqliteStore, error) {
-	conns := readPoolConns()
-	read := sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: conns, QueryOnly: true})
+	read := sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: readPoolConns(), Reader: true})
 	s, err := open(sqlitemigrate.OpenPool(path, sqlitemigrate.PoolOptions{MaxConns: 1}), read)
 	if err != nil {
 		return nil, err
 	}
-	if err := sqlitemigrate.WarmPool(context.Background(), read, conns); err != nil {
+	if err := warm(context.Background(), read); err != nil {
 		s.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// warm opens every connection in db, so none of them attaches later while a
+// writer holds the database — which blocks until that write commits. Runs once
+// the schema exists and before any writer.
+func warm(ctx context.Context, db *sql.DB) error {
+	conns := make([]*sql.Conn, 0, db.Stats().MaxOpenConnections)
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for range cap(conns) {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		conns = append(conns, c)
+	}
+	return nil
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
@@ -71,8 +89,7 @@ func OpenMemory() (*sqliteStore, error) {
 	return open(db, db)
 }
 
-// open takes both pools already built — DSN knowledge belongs to sqlitemigrate.
-// Only the write pool runs Apply. read may alias write.
+// Only the write pool runs Apply; read may alias write.
 func open(write, read *sql.DB) (*sqliteStore, error) {
 	if _, err := sqlitemigrate.Apply(context.Background(), write, migrations, "migrations"); err != nil {
 		write.Close()

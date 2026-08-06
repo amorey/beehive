@@ -5972,6 +5972,28 @@ func TestReadDegradesOnAClosedTransaction(t *testing.T) {
 	assert.Same(t, store.db, store.conn(txCtx))
 }
 
+// holdWriter parks a write transaction on the write pool and returns a release.
+// Signal-synchronised: a read that returns before release cannot have been
+// waiting on the writer.
+func holdWriter(t *testing.T, store *sqliteStore, id storeapi.ObjectID) (release func()) {
+	t.Helper()
+	writing, released := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- store.Within(context.Background(), func(ctx context.Context) error {
+			_, _, err := store.ObjectsUpdateSpec(ctx, testGK, id, []byte(`{"a":1}`), 0)
+			close(writing)
+			<-released
+			return err
+		})
+	}()
+	<-writing
+	return func() {
+		close(released)
+		require.NoError(t, <-done)
+	}
+}
+
 // The point of the split: a bare read runs while a writer holds the write
 // connection. Signal-synchronised — the read must return before the writer is
 // released, so a pass cannot come from the writer finishing first.
@@ -5980,20 +6002,10 @@ func TestABareReadDoesNotWaitForAWriter(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	writing, release := make(chan struct{}), make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		done <- store.Within(ctx, func(ctx context.Context) error {
-			_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
-			close(writing)
-			<-release
-			return err
-		})
-	}()
+	release := holdWriter(t, store, obj.ID)
 
 	// Every connection, not just the first: one attaching to the WAL database now
 	// would block on the writer, which is why Open warms the pool.
-	<-writing
 	read := make(chan error, readPoolConns())
 	for range cap(read) {
 		go func() {
@@ -6009,15 +6021,11 @@ func TestABareReadDoesNotWaitForAWriter(t *testing.T) {
 			t.Fatal("a bare read queued behind the writer")
 		}
 	}
-	close(release)
-	require.NoError(t, <-done)
+	release()
 }
 
-// Every driver reads a mark and then pages up to it, across statements and with
-// no transaction. On one connection that was monotone by construction; on a
-// pool it rests on WAL snapshots being monotone in real time whichever
-// connection serves them. Nothing else pins this, and a driver written to the
-// same shape would break silently without it.
+// Read-a-mark-then-page is every driver's shape, and on one connection it was
+// monotone by construction. On a pool it rests on WAL, and nothing else pins it.
 func TestSnapshotsAreMonotoneAcrossConnections(t *testing.T) {
 	store := newFileRawStore(t)
 	ctx := context.Background()
@@ -6065,17 +6073,7 @@ func TestTheSelfWrappingReadsDoNotWaitForAWriter(t *testing.T) {
 		Category: "Health", Type: "Normal", Reason: "Ready",
 	}))
 
-	writing, release := make(chan struct{}), make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		done <- store.Within(ctx, func(ctx context.Context) error {
-			_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
-			close(writing)
-			<-release
-			return err
-		})
-	}()
-	<-writing
+	release := holdWriter(t, store, obj.ID)
 
 	reads := map[string]func() error{
 		"ObjectWritesListSince": func() error { _, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 8); return err },
@@ -6093,9 +6091,7 @@ func TestTheSelfWrappingReadsDoNotWaitForAWriter(t *testing.T) {
 			t.Fatalf("%s queued behind the writer", name)
 		}
 	}
-
-	close(release)
-	require.NoError(t, <-done)
+	release()
 }
 
 // readWithin is what gives a multi-statement read one snapshot without taking

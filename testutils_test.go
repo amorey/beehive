@@ -175,12 +175,6 @@ func (m *fakeMigrator) ConvertStatus(from int, raw json.RawMessage) (json.RawMes
 // one thing it must not do.
 const testTimeout = 10 * time.Second
 
-// fastTick is the cadence every integration test runs its drivers at. Nothing is
-// pushed — a reconcile after a write, a collect after a delete and a dependency wake
-// all arrive on a tick — so a test observes a write propagate within a tick or two,
-// never immediately. The production defaults (seconds to tens of seconds) would
-// simply time these out.
-//
 // storeOnDisk switches the integration suite onto a file-backed store. The read
 // pool exists only on disk — in memory it aliases the write pool — so this is
 // the only configuration in which the split is exercised at all, and CI runs the
@@ -211,19 +205,17 @@ func newStore(t *testing.T) testStore {
 	return s
 }
 
-// Short enough that a handful of ticks fit inside testTimeout, long enough that
-// the drivers are not hammering the store while the test does its own reads.
+// fastTick is the cadence every integration test runs its drivers at. Nothing is
+// pushed — a reconcile after a write, a collect after a delete and a dependency
+// wake all arrive on a tick — so a test observes a write propagate within a tick
+// or two, never immediately. The production defaults (seconds to tens of
+// seconds) would simply time these out.
 //
-// The on-disk run is slower: synchronous(NORMAL) fsyncs land in the same loop,
-// so the in-memory cadence there is a flake source rather than a cadence.
-var fastTick = baseTick()
-
-func baseTick() time.Duration {
-	if storeOnDisk {
-		return 20 * time.Millisecond
-	}
-	return 2 * time.Millisecond
-}
+// Short enough that a handful of ticks fit inside testTimeout, long enough that
+// the drivers are not hammering the store while the test does its own reads. The
+// on-disk run is slower: synchronous(NORMAL) fsyncs land in the same loop, so
+// the in-memory cadence there is a flake source rather than a cadence.
+var fastTick = 2 * time.Millisecond
 
 // staleDependentsTick paces the stale-dependents backstop in tests, and is
 // deliberately slower than fastTick. That pass is the one driver whose purpose is a
@@ -234,6 +226,14 @@ func baseTick() time.Duration {
 // testTimeout, and production's ratio (60s against the waker's 1s) is far wider
 // than this.
 var staleDependentsTick = 10 * fastTick
+
+// The on-disk run is slower across the board, keeping the ratio above.
+func init() {
+	if storeOnDisk {
+		fastTick *= 10
+		staleDependentsTick *= 10
+	}
+}
 
 // fast bundles the tick intervals an integration test needs, plus whatever else
 // the caller passes. Kept as one bundle so a test reads as "run the drivers
@@ -1416,7 +1416,7 @@ func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int
 func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
 	t.Helper()
 	store := &pollProbeStore{
-		Store:        newClientTestStore(t),
+		Store:        newStore(t),
 		polled:       make(chan struct{}, 256),
 		listed:       make(chan struct{}, 256),
 		eventsListed: make(chan struct{}, 256),

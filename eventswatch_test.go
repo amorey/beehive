@@ -387,7 +387,7 @@ func TestEventsWatchDeliversWithoutTicking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -572,7 +572,7 @@ func TestEventsWatchOnABeehiveNotBuiltByNewFails(t *testing.T) {
 	// Registered by hand: Register itself needs the maps New builds, and what is
 	// under test is the hub, not the registry.
 	bh := &Beehive{
-		store:       newClientTestStore(t),
+		store:       newStore(t),
 		reconcilers: map[GroupKind]*reconciler{clientTestGK: {}},
 	}
 	// The siblings still tolerate the zero hub, which is what makes Watch the

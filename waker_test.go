@@ -216,7 +216,7 @@ func TestAClientWriteWakesTheWakersSubscription(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	rx, ok := bh.kindWriteHub.WatchAcross() // as waker.run subscribes
 	require.True(t, ok)
 	defer rx.Close()
@@ -1589,7 +1589,7 @@ func (c *settlingCapture) Reconcile(ctx context.Context, cc ControllerClient[cSt
 func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 	ctx := context.Background()
 	probe := &listProbeStore{
-		Store:        newClientTestStore(t),
+		Store:        newStore(t),
 		watermarkSet: make(chan struct{}, 1),
 	}
 	// The waker off, so only re-derivation can reach the dependent.
@@ -1629,7 +1629,7 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 	ctx := context.Background()
 	probe := &listProbeStore{
-		Store:       newClientTestStore(t),
+		Store:       newStore(t),
 		staleListed: make(chan struct{}, 1),
 	}
 	bh := newTestBeehive(t, probe, fast()...)
@@ -1785,7 +1785,7 @@ func TestStaleDependentsSweepStartsEveryProcessAtTheBeginning(t *testing.T) {
 // not reconciled yet, would have its whole fan-out stamped again on every sweep.
 func TestStaleDependentsSweepDoesNotRestampAConsumedVersion(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	sd := sweeperOver(store)
 	spec := []byte(`{}`)
 
@@ -1820,7 +1820,7 @@ func TestStaleDependentsSweepDoesNotRestampAConsumedVersion(t *testing.T) {
 // guarantee off the queue's drop policy.
 func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	sd := sweeperOver(store)
 
 	spec := []byte(`{}`)
@@ -1878,7 +1878,7 @@ func TestStaleDependentsSweepHoldsTheCursorOnStampFailure(t *testing.T) {
 // docs/adr/2026-08-03-stale-dependents-cursor.md.
 func TestStaleDependentsSweepRepairsALostFindingAfterRestart(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	spec := []byte(`{}`)
 	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)

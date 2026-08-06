@@ -169,8 +169,9 @@ type txFrame struct {
 type txState struct {
 	tx *sql.Tx
 
-	// readOnly marks a readWithin frame: its tx is on the query_only pool, so a
-	// write reaching it fails rather than landing, and it owes no hooks.
+	// readOnly marks a readWithin frame. conn resolves it too, so a write inside
+	// one fails on the query_only pool instead of landing outside the snapshot;
+	// it owes no hooks, and AfterCommit panics on it.
 	readOnly bool
 
 	// mu guards against a Within fn fanning calls across goroutines; AfterCommit
@@ -442,26 +443,23 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// conn returns the ambient transaction if ctx carries a live one, else the pool.
-// A closed txState degrades to the pool — the ctx outlives its transaction, so a
-// write issued on it commits standalone rather than failing with sql.ErrTxDone.
-// Hooks should use the detached ctx AfterCommit hands them.
-func (s *sqliteStore) conn(ctx context.Context) dbtx {
+// pick returns the ambient transaction if ctx carries a live one, else pool. A
+// closed txState degrades to pool — the ctx outlives its transaction, so a call
+// issued on it runs standalone rather than failing with sql.ErrTxDone. Hooks
+// should use the detached ctx AfterCommit hands them.
+func pick(ctx context.Context, pool dbtx) dbtx {
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
 		return fr.st.tx
 	}
-	return s.db
+	return pool
 }
 
-// read returns the ambient transaction if ctx carries a live one, else the read
-// pool. The transaction case is not an optimisation: a read that skipped it
-// would silently miss the transaction's own uncommitted writes.
-func (s *sqliteStore) read(ctx context.Context) dbtx {
-	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
-		return fr.st.tx
-	}
-	return s.readDB
-}
+func (s *sqliteStore) conn(ctx context.Context) dbtx { return pick(ctx, s.db) }
+
+// read is conn for a read issued outside a transaction. Reaching the ambient
+// transaction is not an optimisation: a read that skipped it would silently miss
+// that transaction's own uncommitted writes.
+func (s *sqliteStore) read(ctx context.Context) dbtx { return pick(ctx, s.readDB) }
 
 // Within runs fn inside a single transaction. A nested Within joins the outer
 // transaction on a SAVEPOINT — a real rollback boundary: an error fn returns
@@ -514,11 +512,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 // readWithin runs fn inside one read snapshot on the read pool, for a read that
 // spans several statements and needs them to agree. It joins the ambient
 // transaction instead if ctx carries a live one, so a read nested in a caller's
-// Within still sees that transaction's uncommitted writes.
-//
-// fn must not write: the frame it installs is resolved by conn as well as read,
-// so a write inside fn fails on the query_only pool rather than landing on the
-// write pool outside the snapshot.
+// Within still sees that transaction's uncommitted writes. fn must not write.
 func (s *sqliteStore) readWithin(ctx context.Context, fn func(ctx context.Context) error) error {
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
 		return s.Within(ctx, fn)

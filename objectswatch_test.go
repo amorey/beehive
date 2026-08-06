@@ -56,7 +56,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := &flakyListStore{Store: newClientTestStore(t)}
+	store := &flakyListStore{Store: newStore(t)}
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := newTestBeehive(t, store, fast(WithLogger(logger))...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -90,7 +90,7 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -149,7 +149,7 @@ func TestWatchSingleObjectIsKindScoped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -453,7 +453,7 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -538,7 +538,7 @@ func TestWatchFloorFallsBackToTheDefault(t *testing.T) {
 func TestWatchListReturnsASnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Millisecond))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Millisecond))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
@@ -565,7 +565,7 @@ func TestWatchListReturnsASnapshot(t *testing.T) {
 func TestOwnedObjectsListWatchSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
@@ -587,7 +587,7 @@ func TestOwnedObjectsListWatchSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 func TestOwnedObjectsListWatchDeliversALaterChild(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
@@ -606,7 +606,7 @@ func TestOwnedObjectsListWatchDeliversALaterChild(t *testing.T) {
 func TestOwnedObjectsListWatchIgnoresWhatItDoesNotOwn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
@@ -718,7 +718,7 @@ func TestOwnedObjectsListWatchResumesFromAPosition(t *testing.T) {
 func TestAScopedWatchAnnouncesOnlyAnUnresolvedOwner(t *testing.T) {
 	ctx := context.Background()
 	logger, buf := captureLogger(slog.LevelWarn)
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	bh.logger = logger
 	client := NewClient[cSpec, cStatus](bh, clientTestGK).(*clientImpl[cSpec, cStatus])
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
@@ -746,7 +746,7 @@ func TestAScopedWatchAnnouncesOnlyAnUnresolvedOwner(t *testing.T) {
 func TestOwnedObjectsListWatchLeavesAnUnaskedRelationUnloaded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	first := mustCreate(t, ctx, client, "first", cSpec{}, WithOwner(owner.ID))
@@ -770,7 +770,7 @@ func TestOwnedObjectsListWatchLeavesAnUnaskedRelationUnloaded(t *testing.T) {
 func TestOwnedObjectsListWatchLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &countingLoadStore{Store: newClientTestStore(t)}
+	store := &countingLoadStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
@@ -797,7 +797,7 @@ func TestOwnedObjectsListWatchLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 func TestAScopedWatchSurvivesAFailedOwnerRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
+	store := &edgelessStore{Store: newStore(t), failed: make(chan struct{}, 256)}
 	bh := newTestBeehive(t, store, fast()...)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
@@ -819,7 +819,7 @@ func TestAScopedWatchSurvivesAFailedOwnerRead(t *testing.T) {
 func TestOwnedObjectsListWatchOverAChildlessOwnerStaysQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
@@ -1027,7 +1027,7 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 func TestWatchNeedsNoController(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
+	bh := newTestBeehive(t, newStore(t), fast()...)
 	clientOnly := GroupKind{Group: "acme.com", Kind: "Unregistered"}
 	client := NewClient[cSpec, cStatus](bh, clientOnly)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -1104,7 +1104,7 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, &imagelessStore{newClientTestStore(t)}, fast()...)
+	bh := newTestBeehive(t, &imagelessStore{newStore(t)}, fast()...)
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -1151,7 +1151,7 @@ func (s *edgelessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []Object
 func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
+	store := &edgelessStore{Store: newStore(t), failed: make(chan struct{}, 256)}
 	store.broken.Store(true)
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -1211,7 +1211,7 @@ func (s *emptyPageStore) ObjectWritesListSince(context.Context, GroupKind, int64
 func TestAnEmptyPageAboveTheCursorIsQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &emptyPageStore{Store: newClientTestStore(t), listed: make(chan struct{}, 8)}
+	store := &emptyPageStore{Store: newStore(t), listed: make(chan struct{}, 8)}
 
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -1255,7 +1255,7 @@ func (s *vanishingStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID
 func TestAVanishedObjectIsSkipped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := &vanishingStore{Store: newClientTestStore(t), read: make(chan struct{}, 256)}
+	store := &vanishingStore{Store: newStore(t), read: make(chan struct{}, 256)}
 	bh := newTestBeehive(t, store, fast()...)
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
@@ -1279,7 +1279,7 @@ func TestKindWriteHubPublishesOnCreate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	rx, _ := bh.kindWriteHub.Watch(clientTestGK)
 	defer rx.Close()
 
@@ -1297,7 +1297,7 @@ func TestKindWriteHubWatchAcrossTakesAnyKind(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	rx, ok := bh.kindWriteHub.WatchAcross()
 	require.True(t, ok)
 	defer rx.Close()
@@ -1314,7 +1314,7 @@ func TestKindWriteHubWatchAcrossTakesAnyKind(t *testing.T) {
 // position from the store, so N wakes for N kinds would be N passes finding
 // what one pass already found.
 func TestKindWriteHubWatchAcrossCollapsesABurst(t *testing.T) {
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	rx, ok := bh.kindWriteHub.WatchAcross()
 	require.True(t, ok)
 	defer rx.Close()
@@ -1533,7 +1533,7 @@ func TestKindWriteHubClosesOnStop(t *testing.T) {
 	defer cancel()
 
 	t.Run("after start", func(t *testing.T) {
-		bh, err := New(newClientTestStore(t), fast()...)
+		bh, err := New(newStore(t), fast()...)
 		require.NoError(t, err)
 		stop, err := bh.Start(ctx)
 		require.NoError(t, err)
@@ -1546,7 +1546,7 @@ func TestKindWriteHubClosesOnStop(t *testing.T) {
 	})
 
 	t.Run("never started", func(t *testing.T) {
-		bh, err := New(newClientTestStore(t))
+		bh, err := New(newStore(t))
 		require.NoError(t, err)
 		rx, _ := bh.kindWriteHub.Watch(clientTestGK)
 		defer rx.Close()
@@ -1602,7 +1602,7 @@ func TestTailerLosesNoWriteAtStartup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &writeDuringMaxVersionStore{Store: newClientTestStore(t)}
+	store := &writeDuringMaxVersionStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1638,7 +1638,7 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 
 	const burst = tailPageCap + 88
 
-	store := &countingTailStore{Store: newClientTestStore(t)}
+	store := &countingTailStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store)
 
 	_, rx := startTailer(t, bh, clientTestGK)
@@ -1794,7 +1794,7 @@ func TestTailerRetriesAfterAFailedStep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &flakyListStore{Store: newClientTestStore(t)}
+	store := &flakyListStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 	_, rx := startTailer(t, bh, clientTestGK)
 
@@ -1814,7 +1814,7 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &flakyListStore{Store: newClientTestStore(t)}
+	store := &flakyListStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1887,7 +1887,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 	defer cancel()
 
 	t.Run("a drained log re-arms at the floor", func(t *testing.T) {
-		bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+		bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 		tailer := pausedTailer(t, bh, clientTestGK)
 
 		next, backingOff, done := tailer.pass(ctx, tailer.now(), false)
@@ -1897,7 +1897,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 	})
 
 	t.Run("a failed drain climbs the retry ladder and drops wakes", func(t *testing.T) {
-		bh := newTestBeehive(t, &failGateStore{Store: newClientTestStore(t)}, withWatchFloorInterval(time.Hour))
+		bh := newTestBeehive(t, &failGateStore{Store: newStore(t)}, withWatchFloorInterval(time.Hour))
 		tailer := pausedTailer(t, bh, clientTestGK)
 
 		next, backingOff, done := tailer.pass(ctx, tailer.now(), false)
@@ -1910,7 +1910,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 	})
 
 	t.Run("a trimmed cursor ends the tailer", func(t *testing.T) {
-		store := newClientTestStore(t)
+		store := newStore(t)
 		bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 		tailer := pausedTailer(t, bh, clientTestGK)
@@ -1939,7 +1939,7 @@ func TestTailerPassPacesTheLoop(t *testing.T) {
 	const throttle = 100 * time.Millisecond
 	paced := func(t *testing.T) (*objectTailer, *countingTailStore, *fakeClock) {
 		t.Helper()
-		store := &countingTailStore{Store: newClientTestStore(t)}
+		store := &countingTailStore{Store: newStore(t)}
 		tailer, clk := pacedTailer(t, store, throttle)
 		return tailer, store, clk
 	}
@@ -2000,7 +2000,7 @@ func TestTailerPassPacesTheLoop(t *testing.T) {
 	t.Run("a non-positive interval disables the throttle", func(t *testing.T) {
 		for _, d := range []time.Duration{0, -time.Second} {
 			t.Run(d.String(), func(t *testing.T) {
-				store := &countingTailStore{Store: newClientTestStore(t)}
+				store := &countingTailStore{Store: newStore(t)}
 				tailer, clk := pacedTailer(t, store, d)
 				reads := store.positionReads.Load()
 
@@ -2024,7 +2024,7 @@ func TestTailerStopsAtThePageBudget(t *testing.T) {
 	const throttle = 100 * time.Millisecond
 	const backlog = tailPageCap + 88
 
-	store := newClientTestStore(t)
+	store := newStore(t)
 	tailer, clk := pacedTailer(t, store, throttle)
 	tailer.pagesPerDrain = 1
 	rx := tailer.hub.Receiver()
@@ -2058,7 +2058,7 @@ func TestTailerDeliversAWriteThatLandsInsideTheThrottle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t),
+	bh := newTestBeehive(t, newStore(t),
 		withWatchFloorInterval(time.Hour), withWatchScanMinInterval(50*time.Millisecond))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	_, rx := startTailer(t, bh, clientTestGK)
@@ -2107,7 +2107,7 @@ func TestTailerResumeWaitsOutOnlyTheRestOfTheThrottle(t *testing.T) {
 		{"a drain past the window waits not at all", 2 * throttle, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := &slowListStore{Store: newClientTestStore(t), perPage: tc.perPage}
+			store := &slowListStore{Store: newStore(t), perPage: tc.perPage}
 			tailer, clk := pacedTailer(t, store, throttle)
 			tailer.pagesPerDrain = 1
 			store.clk = clk
@@ -2153,7 +2153,7 @@ func TestTailerStepToleratesAGateAheadOfTheLog(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, &gateAheadStore{Store: newClientTestStore(t), ahead: 1000})
+	bh := newTestBeehive(t, &gateAheadStore{Store: newStore(t), ahead: 1000})
 	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
 	require.NoError(t, err)
 	defer tailer.close()
@@ -2188,7 +2188,7 @@ func TestTailerStepReportsAFailedGateRead(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, &failGateStore{Store: newClientTestStore(t)}, withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, &failGateStore{Store: newStore(t)}, withWatchFloorInterval(time.Hour))
 	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
 	require.NoError(t, err)
 	defer tailer.close()
@@ -2206,7 +2206,7 @@ func TestTailerStepStopsWhenTheFanOutIsClosed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
 	require.NoError(t, err)
 	defer tailer.close()
@@ -2229,7 +2229,7 @@ func TestTailerEndsWithItsLastSubscriber(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	firstCtx, endFirst := context.WithCancel(ctx)
@@ -2268,7 +2268,7 @@ func TestWatchOnAnUnstartedBeehiveEndsWithItsCaller(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	watchCtx, endWatch := context.WithCancel(ctx)
@@ -2291,7 +2291,7 @@ func TestWatchAfterAResetJoinsAFreshTailer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &flakyListStore{Store: newClientTestStore(t)}
+	store := &flakyListStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2333,7 +2333,7 @@ func TestTailerStartsLazilyAndStopsWithBeehive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	assert.Zero(t, tailerCount(bh), "a tailer started before anything watched")
 
@@ -2390,7 +2390,7 @@ func TestTailerEndsWhenTheKindWriteHubCloses(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	tailer, err := newObjectTailer(ctx, bh, clientTestGK)
 	require.NoError(t, err)
 
@@ -2438,7 +2438,7 @@ type writeWorld struct {
 
 func newWriteWorld(t *testing.T) *writeWorld {
 	t.Helper()
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	// Registered but never started: WithFinalizers refuses a kind no controller
 	// in this process can clear, and nothing here needs a reconcile loop.
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -2456,7 +2456,7 @@ func TestWatchListDeliversWithoutPolling(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t),
+	bh := newTestBeehive(t, newStore(t),
 		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2479,7 +2479,7 @@ func TestWatchSeesDeleteOfSnapshotObject(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	// A first watch starts the kind's tailer, so the create below is published
@@ -2513,7 +2513,7 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &countingTailStore{Store: newClientTestStore(t)}
+	store := &countingTailStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	typed := NewClient[cSpec, cStatus](bh, clientTestGK)
 	raw := NewClient[json.RawMessage, json.RawMessage](bh, clientTestGK)
@@ -2543,7 +2543,7 @@ func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t),
+	bh := newTestBeehive(t, newStore(t),
 		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
@@ -2575,7 +2575,7 @@ func TestWatchLoadsAreBatchedPerDrain(t *testing.T) {
 
 	const burst = 64
 
-	store := &countingLoadStore{Store: newClientTestStore(t)}
+	store := &countingLoadStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2619,7 +2619,7 @@ func TestWatchResumeReplaysGapThenGoesLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t),
+	bh := newTestBeehive(t, newStore(t),
 		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2647,7 +2647,7 @@ func TestWatchResumeReplaysBeyondOnePage(t *testing.T) {
 
 	const gap = tailPageCap + 40
 
-	bh := newTestBeehive(t, newClientTestStore(t),
+	bh := newTestBeehive(t, newStore(t),
 		withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2679,7 +2679,7 @@ func TestTailerQueryCountConstantInSubscribers(t *testing.T) {
 
 	reads := func(t *testing.T, subscribers int) int64 {
 		t.Helper()
-		store := &countingTailStore{Store: newClientTestStore(t)}
+		store := &countingTailStore{Store: newStore(t)}
 		bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2703,7 +2703,7 @@ func TestTailerQueryCountConstantInSubscribers(t *testing.T) {
 
 	// And a kind nobody writes to costs nothing: the floor is an hour away and
 	// no wake fires.
-	store := &countingTailStore{Store: newClientTestStore(t)}
+	store := &countingTailStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	for range 3 {
@@ -2721,7 +2721,7 @@ func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	first := mustCreate(t, ctx, client, "first", cSpec{Val: "first"})
 	second := mustCreate(t, ctx, client, "second", cSpec{Val: "second"})
@@ -2753,7 +2753,7 @@ func TestOnePageResolvesCurrentOwners(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
@@ -2776,7 +2776,7 @@ func TestOnePageSkipsTheOwnerLookupWhenUnscoped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &countingLoadStore{Store: newClientTestStore(t)}
+	store := &countingLoadStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
@@ -2804,7 +2804,7 @@ func TestWatchGoroutinesDrainOnStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 
 	var streams []<-chan ObjectChange[cSpec, cStatus]
 	for _, kind := range []string{"A", "B", "C"} {
@@ -2856,7 +2856,7 @@ func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			store := &failingLoadStore{Store: newClientTestStore(t), tried: make(chan struct{})}
+			store := &failingLoadStore{Store: newStore(t), tried: make(chan struct{})}
 			bh := newTestBeehive(t, store, withWatchFloorInterval(fastTick))
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -2900,7 +2900,7 @@ type resumeListStore struct {
 func newResumeListStore(t *testing.T) *resumeListStore {
 	t.Helper()
 	return &resumeListStore{
-		Store:  newClientTestStore(t),
+		Store:  newStore(t),
 		tried:  make(chan struct{}),
 		served: make(chan struct{}),
 	}
@@ -2985,7 +2985,7 @@ type failListByIDsStore struct {
 
 func newFailListByIDsStore(t *testing.T) *failListByIDsStore {
 	t.Helper()
-	return &failListByIDsStore{Store: newClientTestStore(t), tried: make(chan struct{})}
+	return &failListByIDsStore{Store: newStore(t), tried: make(chan struct{})}
 }
 
 func (s *failListByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
@@ -3051,7 +3051,7 @@ func TestWatchSingleObjectResumeReplaysOnlyItsID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &countingLoadByIDsStore{Store: newClientTestStore(t)}
+	store := &countingLoadByIDsStore{Store: newStore(t)}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -3107,7 +3107,7 @@ func TestWatchResumeStopsDeliveringWhenTheCallerGivesUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
@@ -3223,7 +3223,7 @@ func TestWatchDeliversUnderSustainedWrites(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t))
+	bh := newTestBeehive(t, newStore(t))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	const objects = 8
@@ -3296,7 +3296,7 @@ func TestTailBackoffSurvivesCommitWakes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := &failingPositionStore{Store: newClientTestStore(t), tried: make(chan struct{}, 1)}
+	store := &failingPositionStore{Store: newStore(t), tried: make(chan struct{}, 1)}
 	bh := newTestBeehive(t, store)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
@@ -3337,7 +3337,7 @@ func TestWatchOnABeehiveNotBuiltByNewFails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := &Beehive{store: newClientTestStore(t)}
+	bh := &Beehive{store: newStore(t)}
 	// The siblings still tolerate it, which is what makes Watch the odd one.
 	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
 	require.NotPanics(t, bh.kindWriteHub.Close)
@@ -3355,7 +3355,7 @@ func TestWatchEndsWithErrStoppedOnStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	_, live, err := client.WatchList(ctx)
@@ -3410,7 +3410,7 @@ func TestTailerBuildDoesNotStallOtherKinds(t *testing.T) {
 
 	slowKind := GroupKind{Kind: "Slow"}
 	store := &blockingPositionStore{
-		Store:   newClientTestStore(t),
+		Store:   newStore(t),
 		gk:      slowKind,
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
@@ -3462,7 +3462,7 @@ func TestStopToleratesConcurrentCommitWakes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 
 	var senders sync.WaitGroup
 	bad := make(chan error, 16)
@@ -3580,7 +3580,7 @@ func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 			defer cancel()
 
-			store := tc.store(newClientTestStore(t))
+			store := tc.store(newStore(t))
 			bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 			mustCreate(t, ctx, client, "w1", cSpec{})
@@ -3671,7 +3671,7 @@ func TestConcurrentTailerBuildsSettleOnOne(t *testing.T) {
 	defer cancel()
 
 	store := &blockFirstPositionStore{
-		Store:   newClientTestStore(t),
+		Store:   newStore(t),
 		gk:      clientTestGK,
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
@@ -3711,7 +3711,7 @@ func TestResumeAboveTheLogHeadFails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newStore(t), withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
@@ -3774,7 +3774,7 @@ func TestResumeRetriesAFailedHeadCheck(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	store := &failHeadCheckStore{Store: newClientTestStore(t), failed: make(chan struct{})}
+	store := &failHeadCheckStore{Store: newStore(t), failed: make(chan struct{})}
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
@@ -3808,7 +3808,7 @@ func TestResumeHeadCheckRetryEndsWithTheCaller(t *testing.T) {
 	defer cancel()
 
 	store := &failHeadCheckStore{
-		Store:  newClientTestStore(t),
+		Store:  newStore(t),
 		always: true,
 		failed: make(chan struct{}),
 	}
@@ -3867,7 +3867,7 @@ func TestWatchLoadRetryDecodesOnce(t *testing.T) {
 	}
 
 	const failures = 2
-	store := &countingLoadFailStore{Store: newClientTestStore(t)}
+	store := &countingLoadFailStore{Store: newStore(t)}
 	store.failuresLeft.Store(failures)
 	bh := newTestBeehive(t, store, withWatchFloorInterval(time.Hour))
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, WithMigrator(mig))

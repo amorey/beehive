@@ -652,7 +652,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 // is what catches that; this one only pins the wake.
 func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast()...)
 
 	gk := GroupKind{Kind: "Widget"}
@@ -754,7 +754,7 @@ func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tS
 // that falls behind after startup.
 func TestSelfDrivenRecovery(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	gk := GroupKind{Kind: "Widget"}
 
 	raw, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{
@@ -1369,7 +1369,7 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 // its name and owned_by edge waiting for a controller that can never decode it.
 func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store)
 	gk := GroupKind{Kind: "Widget"}
 
@@ -1950,7 +1950,7 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &statusSettingController{reconciled: newSignal()}
 	_, err := Register(bh, clientTestGK, ctrl)
@@ -1975,7 +1975,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &specEchoController{
 		firstDone:  newSignal(),
@@ -2009,7 +2009,7 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &deletionTrackingController{
 		reconciled: newSignal(),
@@ -2038,7 +2038,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 func TestIntegrationDeleteCollectsWithoutThePush(t *testing.T) {
 	ctx := context.Background()
 
-	store := newClientTestStore(t)
+	store := newStore(t)
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
 
 	ctrl := &deletionTrackingController{
@@ -2069,7 +2069,7 @@ func TestIntegrationDeleteCollectsWithoutThePush(t *testing.T) {
 func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &funcController{
 		signal: newSignal(),
@@ -2114,7 +2114,7 @@ func (c *conditionSettingController) Reconcile(ctx context.Context, client Contr
 func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &conditionSettingController{reconciled: newSignal()}
 	_, err := Register(bh, clientTestGK, ctrl)
@@ -2149,7 +2149,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	ctx := context.Background()
 
-	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
+	bh := newTestBeehive(t, newStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &funcController{
 		signal: newSignal(),
@@ -2178,7 +2178,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 
 func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 
 	// Insert an object before beehive starts (simulating a previous process run).
 	specJSON, err := json.Marshal(cSpec{Val: "pre-existing"})
@@ -2248,21 +2248,12 @@ func TestReconcilerScheduleAtNilWork(t *testing.T) {
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
 }
 
-// wakeStampingStore is the store surface an owed-pass test needs: the Store contract
-// plus ReconcileOwedIncrement, which is deliberately not on Store (see the comment
-// on reconcileOwedHarness) but exists on the concrete sqlite store so a
-// test can seed an owed wake without staging the whole declare race.
-type wakeStampingStore interface {
-	Store
-	ReconcileOwedIncrement(context.Context, ObjectID) error
-}
-
 // newOwedPassHarness starts a control plane whose only periodic driver is the
 // owed-pass tick — the full pass and GC off, no startup spec pass — and returns
 // once the
 // startup pass has provably drained both owed sets. Whatever the caller seeds
 // after this can only be dispatched by a tick.
-func newOwedPassHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore)) (wakeStampingStore, <-chan ObjectID) {
+func newOwedPassHarness(t *testing.T, gk GroupKind, seed func(testStore)) (testStore, <-chan ObjectID) {
 	t.Helper()
 	real := newStore(t)
 	// Seeding before Start lets a test establish a *settled* object without racing
@@ -2339,7 +2330,7 @@ func TestOwedPassTickDispatchesOwedWake(t *testing.T) {
 	// Seeded before Start and left *settled*, so the unsettled listing can never
 	// be what dispatches it.
 	var id ObjectID
-	real, reconciled := newOwedPassHarness(t, gk, func(s wakeStampingStore) {
+	real, reconciled := newOwedPassHarness(t, gk, func(s testStore) {
 		raw, err := s.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
 		err = s.ObjectsUpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
@@ -2603,7 +2594,7 @@ var clientOnlyGK = GroupKind{Kind: "Config"}
 func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, func()) {
 	t.Helper()
 	ctx := context.Background()
-	store := newClientTestStore(t)
+	store := newStore(t)
 
 	// The dependency waker is the only driver under test here, so its scans run
 	// unthrottled while everything else is pushed out of the way. The re-enqueue
@@ -2932,7 +2923,7 @@ type watermarkHarness struct {
 func newWatermarkHarness(t *testing.T, wrap func(Store) Store) *watermarkHarness {
 	t.Helper()
 	ctx := context.Background()
-	s := newClientTestStore(t)
+	s := newStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -3067,7 +3058,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 // HasDependencies exists to avoid.
 func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *testing.T) {
 	ctx := context.Background()
-	s := newClientTestStore(t)
+	s := newStore(t)
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	dep, err := s.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
@@ -3431,7 +3422,7 @@ func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 	defer cancel()
 
 	ctrl := &cycleController{first: newSignal(), hot: newSignal()}
-	bh := newTestBeehive(t, newClientTestStore(t),
+	bh := newTestBeehive(t, newStore(t),
 		withWakeScanMinInterval(0),
 		withMinRequeueInterval(hotLoopWindow))
 	cc, err := Register(bh, clientTestGK, ctrl)
