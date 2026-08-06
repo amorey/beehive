@@ -210,6 +210,18 @@ func fast(opts ...Option) []Option {
 	}, opts...)
 }
 
+// parked is fast with every periodic pass stopped, so a push is the only thing
+// left that can dispatch — which is what a "…WithoutASweep" test asserts.
+func parked(opts ...Option) []Option {
+	return fast(append([]Option{
+		WithFullPassInterval(0),
+		withOwedPassInterval(time.Hour),
+		withStaleDependentsInterval(time.Hour),
+		withDependencyWakerOff(),
+		withoutGCSweeper(),
+	}, opts...)...)
+}
+
 // drainRecv discards whatever a bus receiver is holding, so the next Recv proves
 // something published after the drain.
 func drainRecv[E any, R interface{ TryRecv() (E, error) }](rx R) {
@@ -412,10 +424,10 @@ func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, in
 func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (bool, error) {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
-func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (bool, error) {
+func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (storeapi.DeletionRequestResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreate")
 }
-func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (ObjectID, bool, error) {
+func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
 }
 func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
@@ -427,7 +439,7 @@ func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, strin
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")
 }
-func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
+func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
 func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, RawEvent) error {

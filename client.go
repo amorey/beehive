@@ -860,23 +860,27 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// DeletionRequestsCreate bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
-	marked, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	res, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
-	if marked {
+	if res.Marked {
 		c.bh.signalKindWritten(ctx, c.gk)
-		c.signalDeletionRequested(ctx, id)
+		c.signalDeletionRequested(ctx, res)
 	}
 	return nil
 }
 
-// signalDeletionRequested enqueues id once its deletion mark commits. Callers
-// pass only writes that actually stamped the row.
-func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, id ObjectID) {
+// signalDeletionRequested enqueues the marked object and the targets its mark
+// unblocked, once the mark commits. Callers pass only results that stamped a row.
+func (c *clientImpl[Spec, Status]) signalDeletionRequested(ctx context.Context, res storeapi.DeletionRequestResult) {
 	// Not throttled: a delete carries new information, and the mark is once per
 	// object, so it cannot ride this on a repeat.
-	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
+	c.bh.signalRequeueNow(ctx, ObjectRef{ID: res.ID, Group: c.gk.Group, Kind: c.gk.Kind})
+	// A finalizing target already carries its own delete's alarm, which a
+	// throttled push would ride. See
+	// docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md.
+	c.bh.signalRequeueManyNow(ctx, res.Unblocked)
 }
 
 // DeleteByName is Delete keyed by name; the store resolves and marks in one
@@ -887,16 +891,16 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	id, marked, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	res, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
 		}
 		return err
 	}
-	if marked {
+	if res.Marked {
 		c.bh.signalKindWritten(ctx, c.gk)
-		c.signalDeletionRequested(ctx, id)
+		c.signalDeletionRequested(ctx, res)
 	}
 	return nil
 }

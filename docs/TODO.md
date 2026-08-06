@@ -7,25 +7,6 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 Once we decide to build one, the entry here shrinks to a pointer at the work, and
 moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
-- **Marking a referrer deletion-pending unblocks its target, and nothing signals
-  it** — a real gap, one GC interval of latency, no divergence.
-
-  `EdgesHasIncoming` discounts a `depends_on` edge from a deletion-pending source,
-  so marking the last live referrer lifts the target's RESTRICT block on the spot.
-  `signalDeletionRequested` enqueues only the object it marked, so the target
-  waits for the next sweep. It is the fourth exit from case 11's block and the
-  only one left that does not push; the other three all do.
-
-  The fix is route 2's shape at the delete-request site:
-  `EdgesListOutgoingByRelation(id, RelationDependsOn)` before the mark commits,
-  filtered to deletion-pending targets, pushed with `signalRequeueManyNow`. The
-  mark's own `marked` bool already bounds it to once per object. It needs its own
-  gate analysis and its own ADR, which is why it is not folded into the dropped
-  dependency's push.
-
-  Build it when the latency is measured to matter, or when a second consumer of
-  the same read appears.
-
 - **A dependency cycle of length ≥ 2 never converges** — rate-limited, not fixed.
   The self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`. Two
   objects that depend on each other still wake each other forever. A's write wakes

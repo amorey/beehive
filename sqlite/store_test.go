@@ -1889,9 +1889,9 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	changed, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	res, err := store.DeletionRequestsCreate(ctx, testGK, created.ID)
 	require.NoError(t, err)
-	assert.True(t, changed, "first call is a real change")
+	assert.True(t, res.Marked, "first call is a real change")
 	first, err := store.ObjectsGet(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Greater(t, first.ResourceVersion, created.ResourceVersion,
@@ -1899,9 +1899,9 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 
 	// A repeat request changes no deletion state, so it must be a no-op: same
 	// resource_version, same updated_at, no spurious watch/CAS churn.
-	changed, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+	res, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
 	require.NoError(t, err)
-	assert.False(t, changed, "repeat call is an idempotent no-op")
+	assert.False(t, res.Marked, "repeat call is an idempotent no-op")
 	second, err := store.ObjectsGet(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
@@ -1931,9 +1931,9 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	obj := newRefObject(t, store)
 
 	before := seqValue(t, store)
-	changed, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	res, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err)
-	require.True(t, changed)
+	require.True(t, res.Marked)
 
 	marked, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
@@ -1943,13 +1943,13 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 		"the row carries the value the counter committed, not one beside it")
 
 	// The repeat is blocked by the guard, so nothing is drawn and no gap appears.
-	changed, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	res, err = store.DeletionRequestsCreate(ctx, testGK, obj.ID)
 	require.NoError(t, err)
-	require.False(t, changed)
+	require.False(t, res.Marked)
 	assert.Equal(t, after, seqValue(t, store), "a guard-blocked mark draws no version")
 
 	// Same for a mark that matches no row at all, via the other keying.
-	_, _, err = store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
+	_, err = store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
 	require.ErrorIs(t, err, beehive.ErrNotFound)
 	assert.Equal(t, after, seqValue(t, store), "a mark that matches nothing draws none either")
 }
@@ -1995,8 +1995,8 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	// First cascade marks both children (one write each) and returns both.
 	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
-	require.Len(t, got, 2)
-	assert.True(t, got[0].Marked && got[1].Marked, "this call stamped both")
+	require.Len(t, got.Children, 2)
+	assert.True(t, got.Children[0].Marked && got.Children[1].Marked, "this call stamped both")
 	probe.expectWrites(2)
 	a1, err := store.ObjectsGetMeta(ctx, childA)
 	require.NoError(t, err)
@@ -2009,8 +2009,8 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	// nothing — no resource_version churn, and nothing new in the write log.
 	got2, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
-	require.Len(t, got2, 2)
-	assert.False(t, got2[0].Marked || got2[1].Marked, "the repeat stamped neither")
+	require.Len(t, got2.Children, 2)
+	assert.False(t, got2.Children[0].Marked || got2.Children[1].Marked, "the repeat stamped neither")
 	probe.expectNone()
 	a2, err := store.ObjectsGetMeta(ctx, childA)
 	require.NoError(t, err)
@@ -2040,9 +2040,9 @@ func TestDeletionRequestsCreateStampsOnceUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			changed, err := store.DeletionRequestsCreate(ctx, testGK, id)
+			res, err := store.DeletionRequestsCreate(ctx, testGK, id)
 			assert.NoError(t, err)
-			if changed {
+			if res.Marked {
 				stamped.Add(1)
 			}
 		}()
@@ -2367,6 +2367,85 @@ func TestHasIncomingRefsIgnoresFinalizingDependent(t *testing.T) {
 	assert.True(t, has, "a finalizing owned child still blocks deletion")
 }
 
+// Marking a dependent lifts the RESTRICT its depends_on edge held, through the
+// discount above, so the mark reports the target it unblocked.
+func TestDeletionRequestReportsTheTargetItUnblocks(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	target := newRefObject(t, store)
+	dep := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
+	_, err := store.DeletionRequestsCreate(ctx, testGK, target.ID)
+	require.NoError(t, err)
+
+	res, err := store.DeletionRequestsCreate(ctx, testGK, dep.ID)
+	require.NoError(t, err)
+	require.True(t, res.Marked)
+	assert.Equal(t, []beehive.ObjectID{target.ID}, refIDs(res.Unblocked))
+}
+
+// A cascade marks children the same way a delete marks one object, so it lifts
+// the same RESTRICTs and owes the same report — one query for the whole level.
+func TestCascadeReportsTheTargetsItsChildrenUnblock(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	child := newRefObject(t, store)
+	target := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	require.NoError(t, addEdge(ctx, store, child.ID, target.ID, beehive.RelationDependsOn))
+	_, err := store.DeletionRequestsCreate(ctx, testGK, target.ID)
+	require.NoError(t, err)
+
+	res, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, res.Children, 1)
+	assert.Equal(t, []beehive.ObjectID{target.ID}, refIDs(res.Unblocked))
+
+	// The re-cascade marks nothing, so it lifted nothing.
+	res, err = store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, res.Unblocked, "a child already deleting discounted its edge long ago")
+}
+
+// A cascade level is unbounded, so the read chunks; every chunk's targets have to
+// survive into the one result.
+func TestCascadeReportsUnblockedTargetsAcrossChunks(t *testing.T) {
+	defer func(n int) { idChunkSize = n }(idChunkSize)
+	idChunkSize = 2 // 5 children -> 3 chunks (2, 2, 1)
+
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	var targets []beehive.ObjectID
+	for range 5 {
+		child, target := newRefObject(t, store), newRefObject(t, store)
+		require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+		require.NoError(t, addEdge(ctx, store, child.ID, target.ID, beehive.RelationDependsOn))
+		_, err := store.DeletionRequestsCreate(ctx, testGK, target.ID)
+		require.NoError(t, err)
+		targets = append(targets, target.ID)
+	}
+
+	res, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, targets, refIDs(res.Unblocked))
+}
+
+// A self-edge blocks nothing — the object's own mark already queues it — so
+// reporting it would push the same object twice, as the waker's skip avoids.
+func TestDeletionRequestReportsNoSelfEdge(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, addEdge(ctx, store, obj.ID, obj.ID, beehive.RelationDependsOn))
+
+	res, err := store.DeletionRequestsCreate(ctx, testGK, obj.ID)
+	require.NoError(t, err)
+	require.True(t, res.Marked)
+	assert.Empty(t, res.Unblocked)
+}
+
 func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2388,7 +2467,7 @@ func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 		// Keyed by a name no row holds, so here ErrNotFound carries its full meaning:
 		// nothing of this kind is named that.
 		"DeletionRequestsCreateByName": func() error {
-			_, _, err := store.DeletionRequestsCreateByName(ctx, testGK, "never-created")
+			_, err := store.DeletionRequestsCreateByName(ctx, testGK, "never-created")
 			return err
 		},
 	}
@@ -2433,16 +2512,16 @@ func TestDeletionRequestsCreateByNameIsIdempotent(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	res, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
-	require.True(t, changed, "this call set the flag")
+	require.True(t, res.Marked, "this call set the flag")
 	first, err := store.ObjectsGetByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.NotNil(t, first.DeletionRequestedAt, "the name's own row is the one marked")
 
-	_, changed, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	res, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
-	assert.False(t, changed, "the repeat changed nothing")
+	assert.False(t, res.Marked, "the repeat changed nothing")
 	second, err := store.ObjectsGetByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.NotNil(t, second.DeletionRequestedAt)
@@ -2465,14 +2544,14 @@ func TestDeletionRequestsCreateByNameReturnsTheMarkedID(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	id, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	res, err := store.DeletionRequestsCreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
-	require.True(t, changed)
-	assert.Equal(t, created.ID, id, "the id of the row the name held")
+	require.True(t, res.Marked)
+	assert.Equal(t, created.ID, res.ID, "the id of the row the name held")
 
-	_, changed, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
+	res, err = store.DeletionRequestsCreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
-	assert.False(t, changed)
+	assert.False(t, res.Marked)
 }
 
 // Names are unique per kind, not globally, so another kind's row holding the same
@@ -2488,7 +2567,7 @@ func TestDeletionRequestsCreateByNameIsKindScoped(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, _, err = store.DeletionRequestsCreateByName(ctx, testGK, "shared")
+	_, err = store.DeletionRequestsCreateByName(ctx, testGK, "shared")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 	assert.NotErrorIs(t, err, beehive.ErrWrongKind)
 
@@ -3802,14 +3881,14 @@ func TestDeletionRequestsCreateReadsNoBlobOnEitherBranch(t *testing.T) {
 	// matches and the UPDATE stamps it.
 	id := insertBadFinalizersRow(t, store, testGK)
 
-	changed, err := store.DeletionRequestsCreate(ctx, testGK, id)
+	res, err := store.DeletionRequestsCreate(ctx, testGK, id)
 	require.NoError(t, err, "the mark binds no blob column and reads none back")
-	assert.True(t, changed)
+	assert.True(t, res.Marked)
 
 	// The repeat takes the probe, which answers already-pending from metadata alone.
-	changed, err = store.DeletionRequestsCreate(ctx, testGK, id)
+	res, err = store.DeletionRequestsCreate(ctx, testGK, id)
 	require.NoError(t, err, "the probe resolves the no-op without decoding the row")
-	assert.False(t, changed, "the repeat stamps nothing")
+	assert.False(t, res.Marked, "the repeat stamps nothing")
 
 	// The probe still reports scope, which is the one thing it must read to answer.
 	_, err = store.DeletionRequestsCreate(ctx, beehive.GroupKind{Kind: "Other"}, id)
@@ -3968,9 +4047,9 @@ func TestRefsAddReportsADeletingTarget(t *testing.T) {
 	child := newRefObject(t, store)
 	owner := newRefObject(t, store)
 
-	marked, err := store.DeletionRequestsCreate(ctx, testGK, owner.ID)
+	mark, err := store.DeletionRequestsCreate(ctx, testGK, owner.ID)
 	require.NoError(t, err)
-	require.True(t, marked)
+	require.True(t, mark.Marked)
 
 	res, err := store.EdgesAdd(ctx, child.ID, owner.ID, "owned_by")
 	require.NoError(t, err)
@@ -4244,9 +4323,9 @@ func TestDeleteRefAbsentNoop(t *testing.T) {
 // collectable and what the EdgesDelete gates read on both endpoints.
 func markDeleting(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
 	t.Helper()
-	changed, err := store.DeletionRequestsCreate(context.Background(), testGK, id)
+	res, err := store.DeletionRequestsCreate(context.Background(), testGK, id)
 	require.NoError(t, err)
-	require.True(t, changed)
+	require.True(t, res.Marked)
 }
 
 func TestDeleteRefReportsTheUnblockedTarget(t *testing.T) {
@@ -5218,6 +5297,14 @@ func TestDeletionRequestsCreateFromOwnerChildMarkError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// A failed read leaves the mark unpushed, and every chunk after it unread.
+func TestUnblockedTargetsDBError(t *testing.T) {
+	store := newRawStore(t)
+	store.db.Close()
+	_, err := store.unblockedTargets(context.Background(), []storeapi.ObjectID{1})
+	require.Error(t, err)
+}
+
 func TestListOutgoingRefsDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
@@ -5538,7 +5625,7 @@ func TestDeletionRequestsCreateFromOwnerWritesInVersionOrder(t *testing.T) {
 
 	got, err := store.DeletionRequestsCreateFromOwner(ctx, owner)
 	require.NoError(t, err)
-	require.Len(t, got, 3)
+	require.Len(t, got.Children, 3)
 
 	// Every version the cascade wrote, as a scan returns them.
 	var versions []int64
@@ -6720,9 +6807,9 @@ func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
 
 	t.Run("absent name", func(t *testing.T) {
 		before := raw.txCount.Load()
-		_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
+		res, err := store.DeletionRequestsCreateByName(ctx, testGK, "no-such-name")
 		require.ErrorIs(t, err, storeapi.ErrNotFound)
-		assert.False(t, changed)
+		assert.False(t, res.Marked)
 		assert.Equal(t, before, raw.txCount.Load(), "an absent name answered from a lock-free read")
 	})
 
@@ -6735,22 +6822,22 @@ func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
 
 	t.Run("the delete that lands does take one", func(t *testing.T) {
 		before := raw.txCount.Load()
-		_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
+		res, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
 		require.NoError(t, err)
-		assert.True(t, changed)
+		assert.True(t, res.Marked)
 		assert.Equal(t, before+1, raw.txCount.Load())
 	})
 
 	t.Run("already pending", func(t *testing.T) {
 		before := raw.txCount.Load()
-		_, changed, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
+		res, err := store.DeletionRequestsCreateByName(ctx, testGK, "prod")
 		require.NoError(t, err)
-		assert.False(t, changed, "already deletion-pending is an idempotent no-op")
+		assert.False(t, res.Marked, "already deletion-pending is an idempotent no-op")
 		assert.Equal(t, before, raw.txCount.Load())
 
-		changed, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
+		res, err = store.DeletionRequestsCreate(ctx, testGK, created.ID)
 		require.NoError(t, err)
-		assert.False(t, changed)
+		assert.False(t, res.Marked)
 		assert.Equal(t, before, raw.txCount.Load())
 	})
 }
@@ -6774,10 +6861,10 @@ func TestRequestDeletionResolvesARowThatMovedAfterTheProbe(t *testing.T) {
 		return calls > 1, nil
 	}
 
-	_, changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	res, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
 
 	require.NoError(t, err, "the row was collected or marked by someone else; that is success")
-	assert.False(t, changed, "this call stamped nothing")
+	assert.False(t, res.Marked, "this call stamped nothing")
 	assert.Equal(t, 2, calls, "the probe ran again inside the transaction to resolve the zero-row mark")
 }
 
@@ -6796,10 +6883,10 @@ func TestRequestDeletionReportsARowCollectedAfterTheProbe(t *testing.T) {
 		return false, storeapi.ErrNotFound // gone
 	}
 
-	_, changed, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	res, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
 
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
-	assert.False(t, changed)
+	assert.False(t, res.Marked)
 }
 
 // asNameTaken translates only the UNIQUE violation; every other failure has to pass
@@ -6826,11 +6913,11 @@ func TestDeletionRequestsCreateByNameSurfacesAProbeReadError(t *testing.T) {
 	store := newRawStore(t)
 	dropObjects(t, store)
 
-	_, changed, err := store.DeletionRequestsCreateByName(context.Background(), testGK, "whatever")
+	res, err := store.DeletionRequestsCreateByName(context.Background(), testGK, "whatever")
 
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "a broken read is not an absent row")
-	assert.False(t, changed)
+	assert.False(t, res.Marked)
 }
 
 // writeLogEntry is one object_writes row, read straight from the table so the

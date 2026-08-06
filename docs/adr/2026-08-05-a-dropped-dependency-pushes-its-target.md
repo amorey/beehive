@@ -6,10 +6,11 @@
 ## Context
 
 `gcCollect` refuses to remove a deletion-pending row while `EdgesHasIncoming`
-reports a referrer under RESTRICT. Three routes lead out of that block, and two
-of them push at commit: a cleared finalizer, and the physical delete of the last
-child. The third is `ControllerClient.DependenciesDelete` dropping the last live
-`depends_on` edge.
+reports a referrer under RESTRICT. Four routes lead out of that block. Two push
+at commit: a cleared finalizer, and the physical delete of the last child. The
+third is `ControllerClient.DependenciesDelete` dropping the last live
+`depends_on` edge, which this record is about; the fourth is the deletion mark
+itself, in Consequences below.
 
 Nothing could signal it. An edge write bumps no `resource_version` and appends no
 `object_writes` entry — a ref is not a field of the object — so no cursor in the
@@ -104,10 +105,10 @@ every pass; it terminates when that row goes, and queue coalescing bounds it.
 A client-only target resolves to no reconciler and falls back to the sweeper, as
 every push path does.
 
-**A fourth exit from the same block is still unsignalled.** Marking the last live
-referrer deletion-pending lifts the RESTRICT block through the very discount the
-source gate above respects, and `signalDeletionRequested` enqueues only the
-object it marked. That target waits for the sweep. See `docs/TODO.md`.
+**The fourth exit from the same block is the deletion mark itself**, which lifts
+the RESTRICT through the very discount the source gate above respects. It now
+pushes too — see
+[the ADR](2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md).
 
 ### Alternatives considered
 

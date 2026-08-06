@@ -47,13 +47,13 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// kind: a wide cascade would otherwise queue one commit hook per row
 		// for wakes that coalesce anyway. Ungated on Marked, unlike the push: a
 		// re-cascade's wake reads one position and finds nothing.
-		children, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
+		cascade, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
 		if err != nil {
 			return err
 		}
-		woken := make(map[GroupKind]bool, len(children))
+		woken := make(map[GroupKind]bool, len(cascade.Children))
 		var pushed []ObjectRef
-		for _, ch := range children {
+		for _, ch := range cascade.Children {
 			if gk := ch.Ref.GroupKind(); !woken[gk] {
 				woken[gk] = true
 				bh.signalKindWritten(ctx, gk)
@@ -65,6 +65,9 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 				pushed = append(pushed, ch.Ref)
 			}
 		}
+		// Marking a child discounts its depends_on edges, which lifts the
+		// RESTRICT on any deletion-pending target. One hook for both.
+		pushed = append(pushed, cascade.Unblocked...)
 		bh.signalRequeueManyNow(ctx, pushed)
 
 		// The controller hasn't finished cleanup.

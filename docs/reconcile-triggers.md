@@ -45,7 +45,7 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly eight push paths that cause a reconcile. All use
+There are exactly nine push paths that cause a reconcile. All use
 `Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
@@ -59,8 +59,9 @@ can be read.
 | A physical delete enqueues the owners it unblocked | `Beehive.gcCollect` | each deletion-pending owner of the deleted row | the owner's `deletion_requested_at` |
 | A dropped dependency enqueues the target it unblocked | `ControllerClient.DependenciesDelete` | the target of the dropped `depends_on` edge | `EdgesDeleteResult.Unblocked` |
 | A create under a deleting owner enqueues that owner | `clientImpl.insertObject` | the owner named by `WithOwner` | `EdgesAddResult.ToDeleting` |
+| A deletion mark enqueues the targets it unblocked | `clientImpl.signalDeletionRequested`, `Beehive.gcCollect` | each deletion-pending `depends_on` target of a row this call marked | `DeletionRequestResult.Unblocked`, `DeletionCascadeResult.Unblocked` |
 
-Seven of the eight are immediate: their gate is a store write that lands once, so
+Eight of the nine are immediate: their gate is a store write that lands once, so
 they carry new information and cancel a pending alarm rather than being absorbed by
 one. The new edge is the exception, and it is throttled because a controller can
 declare the same edge on every pass, so it goes through `work.add` and respects the
@@ -75,10 +76,13 @@ replaces an owned child each pass would drive the owner, with the floor bypassed
 → [the delete's ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
 [the create's](adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md).
 
-The dropped dependency is gated on *both* endpoints, which no other push is: the
-target because only a deletion-pending one was blocked, and the source because
-`EdgesHasIncoming` discounts an edge from a deletion-pending source, so dropping one
-lifts nothing. → [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
+The dropped dependency is gated on *both* endpoints: the target because only a
+deletion-pending one was blocked, and the source because `EdgesHasIncoming`
+discounts an edge from a deletion-pending source, so dropping one lifts nothing.
+→ [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md). The deletion
+mark reads the same pair from the other side — it *is* the source's mark, so only
+the target is left to filter, and the row it marked is what the mark itself
+enqueues. → [its ADR](adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md).
 Cases 1, 5, 9, 10, 11 and 12 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
@@ -514,7 +518,7 @@ Cases 9 to 12 share one record and one driver.
 
 **Record:** `deletion_requested_at`.
 
-**Push:** six, all registered-kind only (cases 9, 10, 12, and 11's three routes). A
+**Push:** seven, all registered-kind only (cases 9, 10, 12, and 11's four routes). A
 client-only object is marked and left to the sweeper: `deletionAdvance` collects one
 directly, and running that from a commit hook would put the whole subtree below it
 on the caller's goroutine.
@@ -573,7 +577,7 @@ Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChil
 ### 11. A blocked collect retries by staying in the listing
 
 A collect is blocked when finalizers are still pending, or when `EdgesHasIncoming`
-reports a referrer under RESTRICT. Three routes lead out of one, and **each of them
+reports a referrer under RESTRICT. Four routes lead out of one, and **each of them
 pushes**:
 
 1. **The last finalizer was cleared.** `ControllerClient.FinalizersDelete` enqueues
@@ -597,15 +601,20 @@ pushes**:
    source, so a finalizing dependent releasing its refs lifts nothing. →
    [the ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
 
-A fourth exit is unsignalled: **marking the last live referrer deletion-pending**
-lifts the block too, through that same discount, and the mark enqueues only the
-object it marked. That target waits for the next sweep; see its entry in
-[`TODO.md`](TODO.md).
+4. **The last live referrer was marked deletion-pending.** That mark is what makes
+   `EdgesHasIncoming` discount the edge, so it lifts the block itself and reports
+   what it lifted: `DeletionRequestResult.Unblocked` for a client delete,
+   `DeletionCascadeResult.Unblocked` for the children a cascade marks. Read inside
+   the mark's own transaction, so the state it reports is the state it made. Same
+   two filters as route 3, plus the self-edge, which the object's own mark already
+   queues. →
+   [the ADR](adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md).
 
 Every push here is a probe about *which* referrer went, not a verdict: route 2
 pushes every deletion-pending owner without checking that this child was the last
-one, route 3 does not check that the edge was the last either, and `gcCollect`
-re-checks the block itself. The sweep remains the route after a crash.
+one, routes 3 and 4 do not check that the edge or the referrer was the last
+either, and `gcCollect` re-checks the block itself. The sweep remains the route
+after a crash.
 
 Every block is temporary by construction. The one block that was not is a finalizer
 on a client-only kind, which no `FinalizersDelete` can reach. That is now rejected at
@@ -630,7 +639,19 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestIntegrationLastChildCollectsItsOwnerWithoutASweep`,
 `TestIntegrationLastChildCollectsItsOwnerWithoutThePush`,
 `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
-`TestClientCreateRejectsFinalizersOnUnregisteredKind`.
+`TestClientCreateRejectsFinalizersOnUnregisteredKind`,
+`TestDeleteRequestPushesTheBlockedTarget`,
+`TestDeleteByNamePushesTheBlockedTarget`,
+`TestDeleteRequestPushesNoLiveTarget`, `TestDeleteRequestPushesNoOwnedByTarget`,
+`TestRepeatedDeleteRequestPushesOnce`,
+`TestDeletionRequestReportsTheTargetItUnblocks`,
+`TestDeletionRequestReportsNoSelfEdge`,
+`TestCascadeMarkPushesAChildsBlockedTarget`,
+`TestCascadeMarkPushesNoTargetOfAnUnmarkedChild`,
+`TestCascadeReportsTheTargetsItsChildrenUnblock`,
+`TestIntegrationDeleteRequestCollectsWithoutASweep`,
+`TestIntegrationDeleteRequestCollectsWithoutThePush`,
+`TestIntegrationCascadeMarkCollectsWithoutASweep`.
 
 ### 12. A create under a deleting owner
 

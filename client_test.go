@@ -1293,8 +1293,8 @@ type requestDeletionByNameErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (ObjectID, bool, error) {
-	return 0, false, errBoom
+func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (storeapi.DeletionRequestResult, error) {
+	return storeapi.DeletionRequestResult{}, errBoom
 }
 
 // getOrCreateBadJSONStore drives GetOrCreate's rawToTyped error path: the
@@ -3124,6 +3124,81 @@ func TestDeleteByNameEnqueuesItsOwnObject(t *testing.T) {
 
 	require.NoError(t, client.DeleteByName(ctx, name))
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "the delete queues the row the name held")
+}
+
+// EdgesHasIncoming discounts a depends_on edge from a deletion-pending source, so
+// marking the referrer lifts the target's RESTRICT then and there. Without this
+// push the target waits out a GC interval.
+func TestDeleteRequestPushesTheBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, client.Delete(ctx, dependent.ID))
+	assert.ElementsMatch(t, []ObjectID{dependent.ID, target.ID}, queuedIDs(r.work),
+		"the mark queues itself and the target it unblocked")
+}
+
+// The name sibling resolves to the same row, so it pushes the same target.
+func TestDeleteByNamePushesTheBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	name := uniqueName()
+	dependent := mustCreate(t, ctx, client, name, cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, client.DeleteByName(ctx, name))
+	assert.ElementsMatch(t, []ObjectID{dependent.ID, target.ID}, queuedIDs(r.work))
+}
+
+// A live target was never blocked, and requeueNow bypasses the floor: pushing one
+// would let a controller deleting a dependent each pass spin.
+func TestDeleteRequestPushesNoLiveTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, client.Delete(ctx, dependent.ID))
+	assert.Equal(t, []ObjectID{dependent.ID}, queuedIDs(r.work), "only the object it marked")
+}
+
+// owned_by always counts until physical removal, so marking a child lifts nothing
+// on its owner — that is route 2's push, not this one.
+func TestDeleteRequestPushesNoOwnedByTarget(t *testing.T) {
+	ctx := context.Background()
+	_, client, _, r := specWriteFixture(t)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, client.Delete(ctx, child.ID))
+	assert.Equal(t, []ObjectID{child.ID}, queuedIDs(r.work), "an owned_by target is not unblocked")
+}
+
+// The repeat stamps nothing, so it has nothing to report: the push rides the mark.
+func TestRepeatedDeleteRequestPushesOnce(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, cc.DependenciesAdd(ctx, dependent.ID, target.ID))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.Delete(ctx, dependent.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, client.Delete(ctx, dependent.ID))
+	assert.Empty(t, queuedIDs(r.work), "the repeat marked nothing, so it queues nothing")
 }
 
 // The gate is the store's report that this call stamped the row. Without it a

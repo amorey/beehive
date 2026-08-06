@@ -155,8 +155,8 @@ func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawO
 	}
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) ([]storeapi.DeletionCascadeChild, error) {
-	return nil, s.markErr
+func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
+	return storeapi.DeletionCascadeResult{}, s.markErr
 }
 func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
 	return s.dropDependsErr
@@ -353,6 +353,47 @@ func TestCascadePushesEachMarkedChild(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []ObjectID{childA.ID, childB.ID}, queuedIDs(r.work),
 		"both marked children are queued")
+}
+
+// A cascade marks referrers, so it lifts the same RESTRICTs a delete request
+// does — and the targets ride the push the children already take.
+func TestCascadeMarkPushesAChildsBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	require.NoError(t, addEdge(ctx, bh.store, child.ID, target.ID, RelationDependsOn))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []ObjectID{child.ID, target.ID}, queuedIDs(r.work),
+		"the marked child and the target its mark unblocked")
+}
+
+// The re-cascade marks nothing, so it lifts nothing: an ungated push would re-arm
+// the targets on every reconcile of the deleting owner.
+func TestCascadeMarkPushesNoTargetOfAnUnmarkedChild(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	require.NoError(t, addEdge(ctx, bh.store, child.ID, target.ID, RelationDependsOn))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	drainQueue(r.work)
+
+	_, err = bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, queuedIDs(r.work), "the re-cascade stamped nothing, so it lifted nothing")
 }
 
 // owned_by is cross-kind, so each child's push routes by its own GroupKind, never
@@ -1019,13 +1060,7 @@ func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClien
 func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store, fast(
-		WithFullPassInterval(0),
-		withOwedPassInterval(time.Hour),
-		withStaleDependentsInterval(time.Hour),
-		withDependencyWakerOff(),
-		withoutGCSweeper(),
-	)...)
+	bh := newTestBeehive(t, store, parked()...)
 
 	ctrl := &depReleaseController{}
 	_, err := Register(bh, clientTestGK, ctrl)
@@ -1093,6 +1128,96 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, target.ID))
 	_, err = store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
+	waitForDeletions(t, w, target.ID)
+}
+
+// Marking the last live referrer lifts the target's RESTRICT, and with every pass
+// parked the mark's own push is the only thing that can collect it.
+func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, parked()...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	// The target's own delete push finds the live edge and leaves it blocked.
+	// Waiting for that pass to go idle leaves the dependent's mark as the only
+	// thing that can collect it.
+	require.NoError(t, client.Delete(ctx, target.ID))
+	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
+
+	require.NoError(t, client.Delete(ctx, dep.ID))
+	waitForDeletions(t, w, target.ID)
+}
+
+// The pull path under that push: marking the referrer through the store issues no
+// push, leaving the sweeper's tick as the only collector.
+func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
+	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, target.ID))
+	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, dep.ID)
+	require.NoError(t, err)
+	waitForDeletions(t, w, target.ID)
+}
+
+// The cascade marks referrers too, so the same push has to come from there.
+func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, parked()...)
+
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	require.NoError(t, addEdge(ctx, store, child.ID, target.ID, RelationDependsOn))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, w, err := client.WatchList(wctx)
+	require.NoError(t, err)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	require.NoError(t, client.Delete(ctx, target.ID))
+	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
+
+	// The owner's collect cascades to the child, whose mark lifts the block.
+	require.NoError(t, client.Delete(ctx, owner.ID))
 	waitForDeletions(t, w, target.ID)
 }
 

@@ -212,11 +212,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
-  eleven users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  twelve users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
   delete-request enqueue, the cleared-finalizer enqueue, the dropped-dependency
   target push, the create's push of an already-deleting owner (all shared via
   `Beehive.signalRequeueNow` and `signalRequeueThrottled`), the GC cascade's own
-  hook, the physical delete's owner push (both `signalRequeueManyNow`),
+  hook, the physical delete's owner push, the delete request's push of the
+  targets its mark unblocked (all three `signalRequeueManyNow`),
   `signalKindWritten` — which feeds the watch tailers and the dependency waker —
   and `signalEventsWritten`, which feeds one object's event readers.
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
@@ -225,7 +226,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md),
   [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
   [ADR](docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md),
-  [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md)
+  [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
+  [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md)
 - **The id is the key everywhere; the name is a lookup.** The bare CRUD verbs
   take an `ObjectID` and act on one incarnation; the `…ByName` siblings act on
   whatever holds the name *now*, resolving and writing in one transaction. The
@@ -254,9 +256,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   sweeper covers client-only kinds. Both are idempotent. A delete request, a
   cascade, a physical delete and a dropped dependency each enqueue at commit for a
   registered kind, so a cascade advances a level per commit and unwinds a level per
-  commit; a client-only level still costs a sweep. **A create under an owner that is
-  already deleting pushes that owner**, whose re-cascade is what marks the new child
-  — gated on the owner's `deletion_requested_at`, which `EdgesAdd` now reports.
+  commit; a client-only level still costs a sweep. **A deletion mark also pushes
+  the deletion-pending targets it discounted**, since that mark is what lifts
+  their RESTRICT — from both the client delete and the cascade's marked children.
+  **A create under an owner that is already deleting pushes that owner**, whose
+  re-cascade is what marks the new child — gated on the owner's
+  `deletion_requested_at`, which `EdgesAdd` now reports.
   **The sweeper also reclaims `reconcile_owed` for kinds with no reconcile loop**,
   which nothing else drains — safe because the count is redundant with the
   dependency watermark `EdgesAdd` clears, so a cursor-0 sweep in a later process
@@ -265,6 +270,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
   [ADR](docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md),
   [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
+  [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md),
   [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration
