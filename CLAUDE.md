@@ -240,8 +240,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   → [ADR](docs/adr/2026-08-02-id-primary-key-with-byname-siblings.md)
 - **A store write takes only what it honours and returns only what a caller
   reads.** `ObjectsCreate` takes `ObjectsCreateInput`; only it and the
-  `ObjectsUpdateSpec*` mutators return a row. `EventsAdd` is a kept exception
-  (see `docs/TODO.md`). → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
+  `ObjectsUpdateSpec*` mutators return a row; `EventsAdd` takes
+  `EventsAddInput`. → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
 - **A nested `Within` is a real rollback boundary** (SAVEPOINT): an error
   unwinds that frame's writes and queued hooks even if the caller swallows it. A
   nested `Within` from a sibling goroutine is refused with

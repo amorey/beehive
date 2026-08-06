@@ -141,6 +141,17 @@ type Event struct {
 	ResourceVersion int64
 }
 
+// EventsAddInput is everything EventsAdd accepts. Deliberately not Event: the
+// rest of a run is store-assigned (identity, Count, window, ResourceVersion).
+// See docs/adr/2026-07-30-store-write-shapes.md.
+type EventsAddInput struct {
+	Category string
+	Detail   []byte // opaque JSON payload; nil when none
+	Message  string
+	Reason   string
+	Type     string
+}
+
 // EventQuery filters and bounds a EventsList read. The zero value selects every
 // run for the object, newest first (by LastAt, then id).
 type EventQuery struct {
@@ -410,13 +421,12 @@ type Store interface {
 	// directly.
 	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
 
-	// EventsAdd records an observation in the (id, ev.Category) timeline. If
+	// EventsAdd records an observation in the (id, in.Category) timeline. If
 	// the latest run there has the same (Type, Reason) it is extended (Count
 	// up, LastAt moved, Message/Detail re-sampled); otherwise a new run is
-	// appended with Count 1. Only ev's Category, Type, Reason, Message and
-	// Detail are read. Scoped to gk: wrong kind → ErrWrongKind, missing id →
-	// ErrNotFound.
-	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, ev Event) error
+	// appended with Count 1. Scoped to gk: wrong kind → ErrWrongKind, missing
+	// id → ErrNotFound.
+	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, in EventsAddInput) error
 
 	// EventsGetLatest returns the most recent run in id's category timeline, or
 	// nil if none. Reads by id only (not kind-scoped).

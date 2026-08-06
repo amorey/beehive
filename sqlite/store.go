@@ -1643,7 +1643,7 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 	return evID, typ, reason, true, nil
 }
 
-func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, ev storeapi.Event) error {
+func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, in storeapi.EventsAddInput) error {
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
@@ -1657,16 +1657,16 @@ func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id s
 		}
 		now := toMillis(time.Now().UTC())
 
-		latestID, latestType, latestReason, hasLatest, err := s.latestEventKey(ctx, id, ev.Category)
+		latestID, latestType, latestReason, hasLatest, err := s.latestEventKey(ctx, id, in.Category)
 		if err != nil {
 			return err
 		}
-		if hasLatest && latestType == ev.Type && latestReason == ev.Reason {
+		if hasLatest && latestType == in.Type && latestReason == in.Reason {
 			// Extend: bump count and window end, re-sample message/detail, advance rv.
 			_, err = c.ExecContext(ctx, `
 				UPDATE events SET count = count + 1, last_at = ?, message = ?,
 					detail = ?, resource_version = ?
-				WHERE id = ?`, now, ev.Message, jsonText(ev.Detail), rv, latestID)
+				WHERE id = ?`, now, in.Message, jsonText(in.Detail), rv, latestID)
 			return err
 		}
 		// New run (empty timeline or key changed): count 1, point window.
@@ -1675,7 +1675,7 @@ func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id s
 				(object_id, category, type, reason, message, detail,
 				 count, first_at, last_at, resource_version)
 			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
-			id, ev.Category, ev.Type, ev.Reason, ev.Message, jsonText(ev.Detail), now, now, rv)
+			id, in.Category, in.Type, in.Reason, in.Message, jsonText(in.Detail), now, now, rv)
 		return err
 	})
 }

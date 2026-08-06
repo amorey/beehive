@@ -60,6 +60,10 @@ type ObjectsCreateInput = storeapi.ObjectsCreateInput
 // RawEvent is the untyped event-log row below the generic boundary.
 type RawEvent = storeapi.Event
 
+// EventsAddInput is the write shape EventsAdd accepts — only the fields a
+// recorded observation carries.
+type EventsAddInput = storeapi.EventsAddInput
+
 // DeletionCascadeChild is one owned child of a deletion cascade, as
 // DeletionRequestsCreateFromOwner reports it.
 type DeletionCascadeChild = storeapi.DeletionCascadeChild
