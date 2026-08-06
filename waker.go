@@ -78,6 +78,10 @@ type waker struct {
 	// that, because an empty store's cursor really is zero.
 	seeded bool
 
+	// primed is what the seed in prime found, and what run's first turn starts
+	// from.
+	primed scanResult
+
 	// drainSince is when the current run of budget-exhausting passes began; zero
 	// when no drain is running. Only paging counts, so a gate refusal is not a
 	// drain.
@@ -250,6 +254,21 @@ func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
 		wait = max(wait, opensAt.Sub(now))
 	}
 	return max(wait, wakeRetryBase), true
+}
+
+// primedWait is how long run waits before its first pass, from what the seed in
+// prime found. Gated on seeded, not on primed: scanIdle is scanResult's zero
+// value, so a waker nobody primed would otherwise read as caught up and idle
+// forever.
+func (dw *waker) primedWait() time.Duration {
+	switch {
+	case !dw.seeded:
+		return dw.retry.Next()
+	case dw.primed == scanMore:
+		return 0
+	default:
+		return wakeIdle
+	}
 }
 
 // wakeIdle is pass's "no reason to look again": the loop arms nothing.

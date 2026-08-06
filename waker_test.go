@@ -154,6 +154,33 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 	})
 }
 
+// What the seed in Start left behind decides the loop's opening move. The gate
+// is seeded rather than the primed value, so a waker nobody primed retries
+// instead of reading scanResult's zero value as "caught up" and idling forever.
+func TestWakerPrimedWait(t *testing.T) {
+	widget := GroupKind{Kind: "Widget"}
+
+	t.Run("seeded and caught up arms nothing", func(t *testing.T) {
+		dw, _, _ := seededWaker(&replayStore{}, widget)
+
+		assert.Equal(t, wakeIdle, dw.primedWait(), "the wake is the only reason left to look")
+	})
+
+	t.Run("a backlog is drained at once", func(t *testing.T) {
+		dw, _, _ := seededWaker(&replayStore{}, widget)
+		dw.primed = scanMore
+
+		assert.Zero(t, dw.primedWait(), "a resume must not wait for a commit that may never come")
+	})
+
+	t.Run("unseeded climbs the retry ladder", func(t *testing.T) {
+		dw, _ := wakerOver(&replayStore{}, widget)
+
+		assert.Equal(t, wakeRetryBase, dw.primedWait(), "a failed seed is retried, not waited on")
+		assert.Equal(t, 2*wakeRetryBase, dw.primedWait(), "and the ladder is the loop's own")
+	})
+}
+
 // The commit wake is the whole point: a dependent must not wait out a tick to
 // learn its target moved. The floor here is an hour, so a scan can only be the
 // wake's doing.
