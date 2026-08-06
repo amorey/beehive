@@ -65,6 +65,9 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 				pushed = append(pushed, ch.Ref)
 			}
 		}
+		// Marking a child discounts its depends_on edges, which lifts the
+		// RESTRICT on any deletion-pending target. One hook for both.
+		pushed = append(pushed, cascade.Unblocked...)
 		bh.signalRequeueManyNow(ctx, pushed)
 
 		// The controller hasn't finished cleanup.

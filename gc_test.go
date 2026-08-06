@@ -355,6 +355,47 @@ func TestCascadePushesEachMarkedChild(t *testing.T) {
 		"both marked children are queued")
 }
 
+// A cascade marks referrers, so it lifts the same RESTRICTs a delete request
+// does — and the targets ride the push the children already take.
+func TestCascadeMarkPushesAChildsBlockedTarget(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	require.NoError(t, addEdge(ctx, bh.store, child.ID, target.ID, RelationDependsOn))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	drainQueue(r.work)
+
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []ObjectID{child.ID, target.ID}, queuedIDs(r.work),
+		"the marked child and the target its mark unblocked")
+}
+
+// The re-cascade marks nothing, so it lifts nothing: an ungated push would re-arm
+// the targets on every reconcile of the deleting owner.
+func TestCascadeMarkPushesNoTargetOfAnUnmarkedChild(t *testing.T) {
+	ctx := context.Background()
+	bh, client, r := cascadeFixture(t)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
+	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
+	require.NoError(t, addEdge(ctx, bh.store, child.ID, target.ID, RelationDependsOn))
+	require.NoError(t, client.Delete(ctx, target.ID))
+	require.NoError(t, client.Delete(ctx, owner.ID))
+	_, err := bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	drainQueue(r.work)
+
+	_, err = bh.gcCollect(ctx, owner.ID)
+	require.NoError(t, err)
+	assert.Empty(t, queuedIDs(r.work), "the re-cascade stamped nothing, so it lifted nothing")
+}
+
 // owned_by is cross-kind, so each child's push routes by its own GroupKind, never
 // the owner's. The wake beside it is deduped per kind for the same reason.
 func TestCascadePushesAcrossKinds(t *testing.T) {
