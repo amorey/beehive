@@ -710,6 +710,56 @@ func TestOwnedObjectsWatchListResumesFromAPosition(t *testing.T) {
 	assert.Equal(t, doomed.ID, second.ID)
 }
 
+// A nil owner means "unowned" and "not resolved" alike, and only the first is
+// legitimate. The second silently drops the change forever, so it announces
+// itself: this is the sticky owner gate's continuous assertion, in place of one
+// test of one interleaving.
+func TestAScopedWatchAnnouncesAnUnresolvedOwner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger, buf := captureLogger(slog.LevelWarn)
+	store := &ownerlessStore{Store: newClientTestStore(t), blinded: make(chan struct{}, 256)}
+	bh := newTestBeehive(t, store, fast()...)
+	bh.logger = logger
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+
+	_, ch, err := client.OwnedObjectsWatchList(ctx, owner.ID)
+	require.NoError(t, err)
+
+	store.blind.Store(true)
+	dropped := mustCreate(t, ctx, client, "dropped", cSpec{}, WithOwner(owner.ID))
+	// The blinded lookup is the drain that carried the create, so by the time it
+	// fires that change has been resolved to nothing.
+	waitClosed(t, chanAfter(store.blinded, 1), "the drain that cannot resolve an owner")
+
+	// A second child, resolvable, is the barrier: receiving it proves the batch
+	// holding the first has been through decodeChanges.
+	store.blind.Store(false)
+	delivered := mustCreate(t, ctx, client, "delivered", cSpec{}, WithOwner(owner.ID))
+
+	ev := recv(t, ch)
+	assert.Equal(t, delivered.ID, ev.Object.ID)
+	assert.NotEqual(t, dropped.ID, ev.Object.ID, "an unresolved change is not delivered")
+	assert.Contains(t, buf.String(), "unresolved owner")
+}
+
+// ownerlessStore resolves no owners once blinded, which is what an owner gate
+// that failed to arm would look like from a subscriber's side.
+type ownerlessStore struct {
+	Store
+	blind   atomic.Bool
+	blinded chan struct{}
+}
+
+func (s *ownerlessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
+	if s.blind.Load() && r == RelationOwnedBy {
+		probeSignal(s.blinded)
+		return nil, nil
+	}
+	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
+}
+
 // An owner with no children yet is not an error: a watch is opened before the
 // children it is waiting for exist.
 func TestOwnedObjectsWatchListOverAChildlessOwnerStaysQuiet(t *testing.T) {

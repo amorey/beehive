@@ -19,8 +19,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1909,6 +1913,46 @@ func TestClientListOwnedObjectsUnknownOwner(t *testing.T) {
 	got, err := widgets.OwnedObjectsList(ctx, 99999)
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+// An owner-scoped watch resolves ownership from current state, which is sound
+// only because ownership never changes under it: an owned_by edge is written at
+// create and removed only when the child is collected. "No verb moves one" is a
+// claim over an open set and cannot be asserted behaviourally, so this asserts
+// the structure that makes it true. A second call site is where a re-parent verb
+// would appear; see docs/adr/2026-08-06-owner-scoped-watches.md before adding
+// one.
+func TestOwnedByIsWrittenInOnePlace(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+
+	var sites []string
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), e.Name(), nil, 0)
+		require.NoError(t, err)
+
+		var fn string
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				fn = node.Name.Name
+			case *ast.CallExpr:
+				sel, ok := node.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "EdgesAdd" || len(node.Args) == 0 {
+					return true
+				}
+				if last, ok := node.Args[len(node.Args)-1].(*ast.Ident); ok && last.Name == "RelationOwnedBy" {
+					sites = append(sites, e.Name()+":"+fn)
+				}
+			}
+			return true
+		})
+	}
+
+	assert.Equal(t, []string{"client.go:insertObject"}, sites)
 }
 
 // ownedObjectsErrorStore errors on the batched owned-children read.

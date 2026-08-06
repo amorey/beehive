@@ -877,7 +877,18 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 	// Deleted objects have no relations to load: the edges went with the row.
 	var loaded []*Object[Spec, Status]
 	for _, raw := range batch {
-		if raw.ResourceVersion <= floor || !scope.holds(raw) {
+		if raw.ResourceVersion <= floor {
+			continue
+		}
+		if !scope.holds(raw) {
+			// nil means "unowned" and "not resolved" alike, and the second would
+			// drop this change for good. The gate is armed before a scoped
+			// subscriber registers precisely so it cannot happen.
+			if scope.ownedBy != nil && raw.Owner == nil {
+				c.bh.log().Warn("beehive: dropping a change with an unresolved owner",
+					"op", "Watch", "group", c.gk.Group, "kind", c.gk.Kind,
+					"id", raw.ID, "resourceVersion", raw.ResourceVersion)
+			}
 			continue
 		}
 		obj, err := rawToTyped[Spec, Status](raw.Object, mig)
