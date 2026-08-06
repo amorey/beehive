@@ -131,7 +131,7 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 	}{
 		{"quiet", 0},
 		{"one-page", wakeScanPageCap},
-		{"full-budget", wakeScanPagesPerPass * wakeScanPageCap},
+		{"full-budget", wakeFullBudget},
 	} {
 		b.Run(backlog.name, func(b *testing.B) {
 			store := benchWakeLog(b, backlog.rows)
