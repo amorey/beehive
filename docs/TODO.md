@@ -7,30 +7,16 @@ so the next reader can tell "we decided against this" from "nobody thought of it
 Once we decide to build one, the entry here shrinks to a pointer at the work, and
 moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
-- **An edge write is invisible to every cursor in the system, and the fix is one
-  counter rather than a log** — known, not fixed, and recorded here mostly to
-  settle the question it keeps raising: whether `edges` writes belong in
-  `object_writes`. They do not.
+- **`edges` writes do not belong in `object_writes`** — not a defect; recorded to
+  settle a question that keeps coming back. `EdgesAdd` and `EdgesDelete` bump no
+  `resource_version` and append no write-log entry, because a ref is not a field of
+  the object. Both cover themselves instead: a new edge stamps `reconcile_owed`
+  inside `EdgesAdd`, and a dropped one reports the RESTRICT block it lifted as
+  `EdgesDeleteResult.Unblocked`
+  ([ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md)). No cursor is
+  asked to see either.
 
-  `EdgesAdd` and `EdgesDelete` bump no `resource_version` and append no write-log
-  entry, because a ref is not a field of the object. So no log cursor can see a
-  new edge, a dropped one, or the `dependency_watermarks` clear that rides a new
-  one. One place pays for it: a collect unblocked by `DependenciesDelete` dropping
-  the last referrer, which waits for the next GC tick with nothing able to signal it
-  (route 3 of case 11 in [`reconcile-triggers.md`](reconcile-triggers.md)). It is the
-  only route of that case left: routes 1 and 2, the cleared finalizer and the last
-  child's removal, both push now, which removes the common reasons anyone would
-  notice this one.
-
-  **The stale-dependents pass no longer pays.** Its scan is bounded by a cursor
-  over target `resource_version`, which an edge write also cannot move — but a
-  new edge stamps `reconcile_owed` inside `EdgesAdd`, so the owed pass carries
-  that dependent and the scan is not asked to see it. An idle tick of the pass is
-  now one `ResourceVersionsMaxIssued` read, so there is no full scan left for a
-  gate to skip. See
-  [the ADR](adr/2026-08-03-stale-dependents-cursor.md).
-
-  **Recording edges in `object_writes` is the wrong fix, on four counts.**
+  **Recording them in `object_writes` would be wrong on four counts.**
   `edges.from_id` is `ON DELETE CASCADE`, so collecting an object removes its
   outgoing edges inside SQLite with no Go code on the path — a faithful log would
   need a trigger, or would under-record exactly the case a log exists to make
@@ -43,15 +29,24 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   a `resource_version` and an append for each edge write, on a path that is free
   today, which a controller re-declaring its edge set every pass pays per pass.
 
-  **One monotonic counter covers what actually needs covering.** A consumer that
-  needs "did the edge set move" needs one bit, not a stream: an epoch bumped by
-  `EdgesAdd` and `EdgesDelete`, shaped like `driver_cursors`. No retention, no
-  watch noise, and the cascade needs no trigger, because a cascade that removes
-  edges also collects an object and that already appends.
+- **Marking a referrer deletion-pending unblocks its target, and nothing signals
+  it** — a real gap, one GC interval of latency, no divergence.
 
-  Deferred because the one consumer left is route 3 of case 11, where the cost is a
-  single GC tick of latency on a deletion. Build the counter only when a second
-  consumer appears, or when that latency is measured to matter.
+  `EdgesHasIncoming` discounts a `depends_on` edge from a deletion-pending source,
+  so marking the last live referrer lifts the target's RESTRICT block on the spot.
+  `signalDeletionRequested` enqueues only the object it marked, so the target
+  waits for the next sweep. It is the fourth exit from case 11's block and the
+  only one left that does not push; the other three all do.
+
+  The fix is route 2's shape at the delete-request site:
+  `EdgesListOutgoingByRelation(id, RelationDependsOn)` before the mark commits,
+  filtered to deletion-pending targets, pushed with `signalRequeueManyNow`. The
+  mark's own `marked` bool already bounds it to once per object. It needs its own
+  gate analysis and its own ADR, which is why it is not folded into the dropped
+  dependency's push.
+
+  Build it when the latency is measured to matter, or when a second consumer of
+  the same read appears.
 
 - **A dependency cycle of length ≥ 2 never converges** — rate-limited, not fixed.
   The self-edge case *is* fixed: `dependentsWake` skips `from_id == to_id`. Two

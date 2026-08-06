@@ -45,7 +45,7 @@ never cost correctness. The durable record and its driver are what make that tru
 
 ### The push paths
 
-There are exactly six push paths that cause a reconcile. All use
+There are exactly seven push paths that cause a reconcile. All use
 `Store.AfterCommit`, so a rollback discards them, and none can run before the row
 can be read.
 
@@ -57,8 +57,9 @@ can be read.
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 | A cleared finalizer enqueues its own object | `ControllerClient.FinalizersDelete` | the object whose block it lifted | the store reports `clearedLast` |
 | A physical delete enqueues the owners it unblocked | `Beehive.gcCollect` | each deletion-pending owner of the deleted row | the owner's `deletion_requested_at` |
+| A dropped dependency enqueues the target it unblocked | `ControllerClient.DependenciesDelete` | the target of the dropped `depends_on` edge | `EdgesDeleteResult.Unblocked` |
 
-Five of the six are immediate: their gate is a store write that lands once, so
+Six of the seven are immediate: their gate is a store write that lands once, so
 they carry new information and cancel a pending alarm rather than being absorbed by
 one. The new edge is the exception, and it is throttled because a controller can
 declare the same edge on every pass, so it goes through `work.add` and respects the
@@ -71,6 +72,11 @@ gate reads the owner rather than the write's own result, because the delete itse
 lands once per *row* and rows are unbounded: an ungated push would let a controller
 that replaces an owned child each pass drive itself, with the floor bypassed.
 → [its ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md).
+
+The dropped dependency is gated on *both* endpoints, which no other push is: the
+target because only a deletion-pending one was blocked, and the source because
+`EdgesHasIncoming` discounts an edge from a deletion-pending source, so dropping one
+lifts nothing. → [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
 Cases 1, 5, 9, 10 and 11 describe them in full.
 
 Every push is confined to a registered kind: each resolves a reconciler inside its
@@ -556,23 +562,36 @@ push**:
    would spin. →
    [the ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md).
 3. **`DependenciesDelete` dropped the last referrer.** An edge write bumps no
-   `resource_version` and appends no write-log entry, so no cursor in the system can
-   see it at all.
+   `resource_version` and appends no write-log entry, so no cursor can see it —
+   which is why the write reports the lifted block itself, as
+   `EdgesDeleteResult.Unblocked`. Two filters, both load-bearing: the target's
+   `deletion_requested_at`, because a live target was never blocked; and the
+   *source's*, because `EdgesHasIncoming` discounts an edge from a deletion-pending
+   source, so a finalizing dependent releasing its refs lifts nothing. →
+   [the ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
 
-Route 3 waits for the next sweep; its entry in [`TODO.md`](TODO.md) has the fix.
+A fourth exit is unsignalled: **marking the last live referrer deletion-pending**
+lifts the block too, through that same discount, and the mark enqueues only the
+object it marked. That target waits for the next sweep; see its entry in
+[`TODO.md`](TODO.md).
 
-The push is a probe about *which* referrer went, not a verdict: route 2 pushes every
-deletion-pending owner without checking that this child was the last one, and
-`gcCollect` re-checks the block itself.
-
-The push is a probe, not a verdict: `gcCollect` re-checks the RESTRICT block, and the
-sweep remains the route after a crash.
+Every push here is a probe about *which* referrer went, not a verdict: route 2
+pushes every deletion-pending owner without checking that this child was the last
+one, route 3 does not check that the edge was the last either, and `gcCollect`
+re-checks the block itself. The sweep remains the route after a crash.
 
 Every block is temporary by construction. The one block that was not is a finalizer
 on a client-only kind, which no `FinalizersDelete` can reach. That is now rejected at
 create time. Thus a sweep always has a route to progress.
 
-Tests: `TestFinalizersDeletePushesTheCollect`,
+Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
+`TestDependenciesDeletePushesNothingOtherwise`,
+`TestDependenciesDeletePushesAcrossKinds`,
+`TestDependenciesDeletePushBeatsAPendingAlarm`,
+`TestDependenciesDeleteSkipsClientOnlyTarget`,
+`TestIntegrationDroppedDependencyCollectsWithoutASweep`,
+`TestIntegrationDroppedDependencyCollectsWithoutThePush`,
+`TestFinalizersDeletePushesTheCollect`,
 `TestFinalizersDeletePushesNothingOtherwise`,
 `TestIntegrationClearedFinalizerCollectsWithoutASweep`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
@@ -584,7 +603,6 @@ Tests: `TestFinalizersDeletePushesTheCollect`,
 `TestIntegrationLastChildCollectsItsOwnerWithoutASweep`,
 `TestIntegrationLastChildCollectsItsOwnerWithoutThePush`,
 `TestCollectKeepsFinalizedObject`, `TestCollectDeletesOwnerAfterChildGone`,
-`TestIntegrationGCDeleteDependencyUnblocksTarget`,
 `TestClientCreateRejectsFinalizersOnUnregisteredKind`.
 
 ## D. In-memory only

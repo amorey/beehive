@@ -2799,6 +2799,12 @@ func (c *depObserver) settle(t *testing.T, ctx context.Context, bh *Beehive, cli
 func queuedFor(q *workQueue, id ObjectID) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	return queuedForLocked(q, id)
+}
+
+// queuedForLocked is queuedFor with q.mu already held, for a caller reading it
+// alongside another field of the queue in one observation.
+func queuedForLocked(q *workQueue, id ObjectID) bool {
 	if _, dirty := q.gauge.dirty[id]; dirty {
 		return true
 	}
@@ -2944,8 +2950,9 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
-	require.NoError(t, store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn))
-	_, err := bh.gcCollect(ctx, target.ID)
+	_, err := store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	_, err = bh.gcCollect(ctx, target.ID)
 	require.NoError(t, err)
 	_, err = store.ObjectsGet(ctx, target.ID)
 	assert.ErrorIs(t, err, ErrNotFound, "the target collects once its last dependent edge is gone")

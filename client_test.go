@@ -2994,14 +2994,12 @@ func TestGenerateNamePanicsRatherThanReturningTheNilUUID(t *testing.T) {
 // Register builds the work queue, so an enqueue is observable with no driver
 // running at all — which is the point: these tests assert that the *write* queued
 // the object, not that some pass later found it.
-func specWriteFixture(t *testing.T) (Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
+func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], ControllerClient[cStatus], *reconciler) {
 	t.Helper()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
-	r, ok := bh.reconcilerFor(clientTestGK)
-	require.True(t, ok)
-	return NewClient[cSpec, cStatus](bh, clientTestGK), cc, r
+	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc, mustReconciler(t, bh, clientTestGK)
 }
 
 // settle drives the generation handshake to "converged" and empties the queue, so
@@ -3017,7 +3015,7 @@ func settle(t *testing.T, ctx context.Context, cc ControllerClient[cStatus], r *
 // object without waiting for the owed pass.
 func TestCreateEnqueuesItsFirstReconcile(t *testing.T) {
 	ctx := context.Background()
-	client, _, r := specWriteFixture(t)
+	_, client, _, r := specWriteFixture(t)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "a create queues the new object")
@@ -3027,7 +3025,7 @@ func TestCreateEnqueuesItsFirstReconcile(t *testing.T) {
 // pure read and must not nudge the reconciler.
 func TestGetOrCreateEnqueuesOnlyWhenItCreates(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	name := uniqueName()
 
 	obj, created, err := client.GetOrCreate(ctx, name, cSpec{Val: "a"})
@@ -3046,7 +3044,7 @@ func TestGetOrCreateEnqueuesOnlyWhenItCreates(t *testing.T) {
 // owed pass would otherwise be the first thing to list it.
 func TestUpdateEnqueuesTheObject(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
@@ -3062,7 +3060,7 @@ func TestUpdateEnqueuesTheObject(t *testing.T) {
 // re-applies its own spec would wake itself forever.
 func TestNoOpUpdateOnASettledObjectEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
@@ -3076,7 +3074,7 @@ func TestNoOpUpdateOnASettledObjectEnqueuesNothing(t *testing.T) {
 // without waiting out a GC tick — the asymmetry with Create that this closes.
 func TestDeleteEnqueuesItsOwnObject(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
@@ -3088,7 +3086,7 @@ func TestDeleteEnqueuesItsOwnObject(t *testing.T) {
 // already did.
 func TestDeleteByNameEnqueuesItsOwnObject(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	name := uniqueName()
 	obj := mustCreate(t, ctx, client, name, cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
@@ -3101,7 +3099,7 @@ func TestDeleteByNameEnqueuesItsOwnObject(t *testing.T) {
 // caller retrying Delete would re-arm the object on every attempt.
 func TestRepeatedDeleteEnqueuesOnce(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
@@ -3118,7 +3116,7 @@ func TestRepeatedDeleteEnqueuesOnce(t *testing.T) {
 func TestSpecWriteEnqueuesNothingOnRollback(t *testing.T) {
 	runCommitRollback(t, func(t *testing.T, commit bool) {
 		ctx := context.Background()
-		client, cc, r := specWriteFixture(t)
+		_, client, cc, r := specWriteFixture(t)
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 		settle(t, ctx, cc, r, obj)
 
@@ -3168,7 +3166,7 @@ func TestSpecWriteOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 // skips an enqueue for work another transaction had just made owed.
 func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 	ctx := context.Background()
-	client, cc, r := specWriteFixture(t)
+	_, client, cc, r := specWriteFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
@@ -3243,7 +3241,7 @@ func TestFailingRespecControllerKeepsItsBackoff(t *testing.T) {
 // write on a row that is unsettled for some other reason enqueues nothing.
 func TestNoOpUpdateOnAnUnsettledObjectEnqueuesNothing(t *testing.T) {
 	ctx := context.Background()
-	client, _, r := specWriteFixture(t)
+	_, client, _, r := specWriteFixture(t)
 
 	// Never settled: observed_generation is NULL, so ObjectsListUnsettledIDs lists it.
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})

@@ -735,6 +735,8 @@ The check is **process-local and evaluated at call time**, since the store recor
 
 The target can be **any** kind, including one you only ever use through `Client` and never register — configuration, secrets, any reference data your app writes and your controllers read. The waker scans the whole store's write log rather than only the kinds with controllers, so such a target wakes its dependents like any other.
 
+**Dropping** an edge is what releases a target you were holding open: a deletion-pending object cannot be collected while a live dependent points at it, and `DependenciesDelete` collects it as soon as the edge goes, rather than at the next sweep.
+
 Every call that **creates** the edge records, durably and atomically with the edge itself, that the dependent owes a reconcile (a count on the row, `reconcile_owed`, drained by the owed pass). That one rule covers every way a declare could otherwise miss: a change to the target landing between your read and the edge's commit, a declare made on another object's behalf while that object's own reconcile is mid-flight, and a crash before the wake is serviced. Re-asserting your edges on every pass costs nothing after the first, because only the call that created the edge records anything — the cost is one reconcile per edge ever created.
 
 There is nothing else to pass: the call takes no version claim, because nothing conditions on one. An earlier design stamped the wake only when the target had moved past the version the caller read, which made the claim load-bearing and left one interleaving stranded; with the stamp unconditional, a claim would be dead weight in every caller's hands, so it was removed rather than kept as decoration.

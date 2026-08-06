@@ -454,7 +454,7 @@ func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error
 func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	panic("not implemented: fakeStore.EdgesAdd")
 }
-func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) error {
+func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
 	panic("not implemented: fakeStore.EdgesDelete")
 }
 func (s *fakeStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
@@ -909,6 +909,20 @@ func queuedIDs(q *workQueue) []ObjectID {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return append([]ObjectID(nil), q.items...)
+}
+
+// awaitQueueIdle blocks until id is neither queued nor in flight, so a following
+// step cannot be served by a pass that was already running. Both halves are read
+// in one lock hold: released between them, the worker moving id from items to
+// processing would read as idle.
+func awaitQueueIdle(t *testing.T, q *workQueue, id ObjectID) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		_, busy := q.processing[id]
+		return !busy && !queuedForLocked(q, id)
+	}, testTimeout, time.Millisecond, "object %d never went idle", id)
 }
 
 // reconcileCapture is a Controller that reports every object it reconciles on a
