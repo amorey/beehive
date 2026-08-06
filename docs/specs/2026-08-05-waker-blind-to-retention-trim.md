@@ -1,10 +1,10 @@
 # The dependency waker detects a log retention trimmed under its cursor
 
-- **Status:** Ready to implement — supersedes the deferred entry "the waker cannot
-  tell that retention trimmed the log out from under its cursor" in
-  [`../TODO.md`](../TODO.md), which this change deletes.
-- **Date:** 2026-08-05, rewritten 2026-08-06 (review pass: the report gate and the
-  read shape both changed; see "Revision notes")
+- **Status:** Implemented 2026-08-06 — rationale now lives in
+  [the ADR](../adr/2026-08-06-the-waker-sees-a-retention-trim.md), and the deferred
+  `../TODO.md` entry it supersedes is deleted. One planned piece was dropped
+  during implementation; see "Revision notes".
+- **Date:** 2026-08-05, rewritten 2026-08-06
 
 ## Problem
 
@@ -255,7 +255,8 @@ Existing tripwires that must keep passing unchanged:
 
 ## Revision notes
 
-Two things changed after the first draft was checked against the code:
+Three things changed after the first draft was checked against the code, the
+third during implementation:
 
 1. **The report gate.** Comparing the horizon against `dw.watermark` alone is a
    false positive on every restart of a store whose log was trimmed empty, because
@@ -266,3 +267,8 @@ Two things changed after the first draft was checked against the code:
    exists for row images the store-wide read does not carry, and the fallback would
    add a second statement to the quiet pass that runs per commit. The authoritative
    horizon read moved to `ObjectWritesMaxVersionAll`, which `seed` already calls.
+3. **The mid-scan jump was dropped.** With `resumeWatermark` raising at seed and
+   `trimBaseline` deduping the report, jumping the watermark to the horizon on an
+   idle scan changes nothing observable: the trimmed span holds no entries to skip,
+   and a lagging cursor is raised at the next seed. `TestWakerResyncsPastATrimmedSpan`
+   and `TestWakerHoldsTheWatermarkWhileDraining` were dropped with it.
