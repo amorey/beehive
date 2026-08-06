@@ -1070,16 +1070,21 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 }
 
 // ObjectWritesMaxVersionAll reads the write log's high-water mark across every
-// kind, covered by the log's primary key. An empty log reads 0.
+// kind, covered by the log's primary key, plus the retention horizon beside it.
+// An empty log reads 0.
 //
-// It reads object_writes, not resource_version_seq: the event log draws from
-// that sequence too, and a consumer of this pair must not see the cursor move
-// for a write it can never be shown. Retention is the only thing that lowers it.
-func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, error) {
-	var rv sql.NullInt64
-	err := s.conn(ctx).QueryRowContext(ctx,
-		`SELECT MAX(resource_version) FROM object_writes`).Scan(&rv)
-	return rv.Int64, err
+// The mark reads object_writes, not resource_version_seq: the event log draws
+// from that sequence too, and a consumer of this pair must not see the cursor
+// move for a write it can never be shown. Retention is the only thing that
+// lowers it, and the horizon is what says so — one statement, since the caller
+// that compares them needs both at one instant.
+func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, int64, error) {
+	var at, trimmed int64
+	err := s.conn(ctx).QueryRowContext(ctx, `
+		SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0),
+		       coalesce((SELECT MAX(trimmed_through) FROM object_writes_horizon), 0)`).
+		Scan(&at, &trimmed)
+	return at, trimmed, err
 }
 
 // ObjectWritesListSinceAll returns the log entries above afterRV across every

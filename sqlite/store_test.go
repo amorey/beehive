@@ -3288,7 +3288,7 @@ type writeProbe struct {
 // what lands after this call.
 func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
+	rv, _, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return &writeProbe{t: t, store: store, rv: rv}
 }
@@ -3689,7 +3689,7 @@ func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
 	_, err = store.ObjectWritesSweep(ctx, 0, time.Hour)
 	require.NoError(t, err)
 
-	logged, err := store.ObjectWritesMaxVersionAll(ctx)
+	logged, _, err := store.ObjectWritesMaxVersionAll(ctx)
 	require.NoError(t, err)
 	require.Zero(t, logged, "the log is empty, so its max is back to 0")
 
@@ -5872,7 +5872,7 @@ func TestDriverCursorsSetKeysByName(t *testing.T) {
 // it — what a dependent records as its watermark.
 func cursorNow(t *testing.T, store beehive.Store) int64 {
 	t.Helper()
-	rv, err := store.ObjectWritesMaxVersionAll(context.Background())
+	rv, _, err := store.ObjectWritesMaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return rv
 }
@@ -6346,6 +6346,37 @@ func TestObjectWritesMaxVersionAllRisesOnCollection(t *testing.T) {
 	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
 
 	assert.Greater(t, cursorNow(t, store), second.ResourceVersion)
+}
+
+// ageOutWriteLog backdates every log entry and sweeps it, which is what an idle
+// store past its retention window reaches on its own.
+func ageOutWriteLog(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `UPDATE object_writes SET written_at = 0`)
+	require.NoError(t, err)
+	_, err = store.ObjectWritesSweep(context.Background(), 0, time.Hour)
+	require.NoError(t, err)
+}
+
+// The mark falls when retention trims, so on its own it cannot tell a caught-up
+// consumer from one whose history was deleted. The horizon beside it can: a
+// resume below it lost entries.
+func TestObjectWritesMaxVersionAllReportsTheHorizon(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	at, trimmed, err := store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	require.Equal(t, obj.ResourceVersion, at)
+	assert.Zero(t, trimmed, "nothing has been trimmed")
+
+	ageOutWriteLog(t, store)
+
+	at, trimmed, err = store.ObjectWritesMaxVersionAll(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, at, "the log is empty, so its bare max is back to 0")
+	assert.Equal(t, obj.ResourceVersion, trimmed, "the horizon is the only record of what it held")
 }
 
 // ---------------------------------------------------------------------------

@@ -511,10 +511,10 @@ func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int,
 	// Beehive whose GC sweeper ticks reaches this.
 	return 0, nil
 }
-func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.
-	return 0, nil
+	return 0, 0, nil
 }
 
 // depsStore serves a per-target dependent set from the waker's batched lookup
@@ -559,18 +559,19 @@ func changedAt(versions ...int64) []ObjectWrite {
 // for a test that needs to act at that instant.
 type seedProbe struct {
 	Store
-	mark   int64
-	err    error
-	onRead func()
-	reads  int
+	mark    int64
+	trimmed int64
+	err     error
+	onRead  func()
+	reads   int
 }
 
-func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	s.reads++
 	if s.onRead != nil {
 		s.onRead()
 	}
-	return s.mark, s.err
+	return s.mark, s.trimmed, s.err
 }
 
 // replayStore serves ObjectWritesListSinceAll from a fixed set of rows, recording the
@@ -580,7 +581,8 @@ func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
 type replayStore struct {
 	depsStore
 	rows    []ObjectWrite // every live row, in version order
-	seed    int64         // what ObjectWritesMaxVersionAll reports
+	seed    int64         // the mark ObjectWritesMaxVersionAll reports
+	trimmed int64         // the retention horizon both reads report
 	pages   [][2]int64    // (afterRV, limit) per call
 	read    int           // rows actually served, across every page
 	lists   chan struct{} // one token per page request, when set
@@ -598,11 +600,11 @@ type replayStore struct {
 	healFromCall int
 }
 
-func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	if s.seedErr != nil {
-		return 0, s.seedErr
+		return 0, 0, s.seedErr
 	}
-	return s.seed, nil
+	return s.seed, s.trimmed, nil
 }
 
 // cursors returns the afterRV of every scan so far, which is how a test sees

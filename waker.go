@@ -337,7 +337,7 @@ const (
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
 func (dw *waker) seed(ctx context.Context) scanResult {
-	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, _, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return scanFailed // shutdown, not a loss
@@ -466,7 +466,7 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	if drained < dw.abandonAfter {
 		return scanMore
 	}
-	mark, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, _, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
 	if err != nil {
 		// Not scanFailed: no wake depends on this read, and backing off would drop
 		// the wakes arriving meanwhile. Restarting the window is what paces the

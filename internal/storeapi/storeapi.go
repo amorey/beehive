@@ -672,9 +672,14 @@ type Store interface {
 	// or below it, and ObjectWritesListSince returns nothing above it.
 	ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error)
 
-	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind. Not
-	// monotonic — a delete lowers it — so consumers compare for inequality.
-	ObjectWritesMaxVersionAll(ctx context.Context) (int64, error)
+	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind, with
+	// the horizon reported beside it rather than folded in. at is the log's bare
+	// maximum, so it is not monotonic — a delete or a retention sweep lowers it —
+	// and consumers compare for inequality. trimmedThrough is the highest version
+	// retention has removed from any kind, 0 when nothing has been: at ==
+	// trimmedThrough == 0 is an empty log, and a cursor below trimmedThrough lost
+	// entries it never read.
+	ObjectWritesMaxVersionAll(ctx context.Context) (at int64, trimmedThrough int64, err error)
 
 	// ObjectWritesSnapshot returns every object of kind gk and the log position
 	// the listing is complete as of, read in one transaction so no write falls

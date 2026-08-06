@@ -1132,10 +1132,10 @@ type slowMarkStore struct {
 	markReads int
 }
 
-func (s *slowMarkStore) ObjectWritesMaxVersionAll(context.Context) (int64, error) {
+func (s *slowMarkStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	s.markReads++
 	s.clk.advance(s.hold)
-	return 0, errBoom
+	return 0, 0, errBoom
 }
 
 // The restarted window runs from after the failed read, not from before it: a read
