@@ -39,7 +39,7 @@ func TestSweepEventRetention(t *testing.T) {
 	obj, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	for _, r := range []string{"R1", "R2", "R3", "R4"} {
-		err := store.EventsAdd(ctx, gk, obj.ID, EventsAddInput{Category: "c", Type: "Normal", Reason: r})
+		err := store.Events().Add(ctx, gk, obj.ID, EventsAddInput{Category: "c", Type: "Normal", Reason: r})
 		require.NoError(t, err)
 	}
 
@@ -47,7 +47,7 @@ func TestSweepEventRetention(t *testing.T) {
 		bh, err := New(store)
 		require.NoError(t, err)
 		bh.eventRetentionSweep(ctx)
-		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
+		got, err := store.Events().List(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 4)
 	})
@@ -62,7 +62,7 @@ func TestSweepEventRetention(t *testing.T) {
 		bh, err := New(store, WithEventRetention(2, 0))
 		require.NoError(t, err)
 		bh.eventRetentionSweep(ctx)
-		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
+		got, err := store.Events().List(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
 	})
@@ -124,7 +124,11 @@ type eventSweepStore struct {
 	budget chan int
 }
 
-func (s *eventSweepStore) EventsSweep(_ context.Context, _ int, _ time.Duration, capBudget int) (int, error) {
+func (s *eventSweepStore) Events() storeapi.Events {
+	return eventsOverride{Events: s.Store.Events(), sweep: s.sweep}
+}
+
+func (s *eventSweepStore) sweep(_ context.Context, _ int, _ time.Duration, capBudget int) (int, error) {
 	select {
 	case s.budget <- capBudget:
 	default:

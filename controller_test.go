@@ -316,7 +316,7 @@ func TestControllerClientAddEvent(t *testing.T) {
 		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
 	}))
 
-	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "connection")
+	run, err := bh.store.Events().GetLatest(ctx, obj.ID, "connection")
 	require.NoError(t, err)
 	require.NotNil(t, run)
 	assert.Equal(t, "Warning", run.Type)
@@ -372,7 +372,7 @@ func TestControllerClientAddEventWithinRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, sentinel)
 
-	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "c")
+	run, err := bh.store.Events().GetLatest(ctx, obj.ID, "c")
 	require.NoError(t, err)
 	assert.Nil(t, run, "an EventsAdd inside a rolled-back Within must not persist")
 }

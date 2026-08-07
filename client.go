@@ -639,7 +639,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnedBit
 	}
 	if set&LoadEventsBit != 0 {
-		raw, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
+		raw, err := store.Events().List(ctx, obj.ID, storeapi.EventQuery{})
 		if err != nil {
 			return err
 		}
@@ -756,7 +756,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		// object — the deliberate exception. Prefer the lazy EventsList for
 		// large lists.
 		for _, o := range objs {
-			raw, err := c.bh.store.EventsList(ctx, o.ID, storeapi.EventQuery{})
+			raw, err := c.bh.store.Events().List(ctx, o.ID, storeapi.EventQuery{})
 			if err != nil {
 				return err
 			}
@@ -918,7 +918,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 // EventsList reads id's runs and maps them to public Events. Reads by id, not
 // kind-scoped, like the ref lookups.
 func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts).query)
+	raw, err := c.bh.store.Events().List(ctx, id, resolveEvents(opts).query)
 	if err != nil {
 		return nil, err
 	}
@@ -926,7 +926,7 @@ func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, 
 }
 
 func (c *clientImpl[Spec, Status]) EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error) {
-	raw, err := c.bh.store.EventsGetLatest(ctx, id, category)
+	raw, err := c.bh.store.Events().GetLatest(ctx, id, category)
 	if err != nil {
 		return Event{}, false, err
 	}

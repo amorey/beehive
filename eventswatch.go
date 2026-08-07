@@ -142,7 +142,7 @@ func (r *eventReader) start(ctx context.Context) error {
 		return err
 	}
 	if r.cfg.resumeFrom == nil {
-		runs, at, err := r.bh.store.EventsSnapshot(ctx, r.id, r.cfg.query)
+		runs, at, err := r.bh.store.Events().Snapshot(ctx, r.id, r.cfg.query)
 		if err != nil {
 			return err
 		}
@@ -186,7 +186,7 @@ func (r *eventReader) checkKind(ctx context.Context) error {
 func (r *eventReader) checkResume(ctx context.Context, at int64) error {
 	// One row: this asks whether anything is above the position, and run reads
 	// the page itself.
-	runs, trimmed, err := r.bh.store.EventsListSince(ctx, r.id, r.cfg.query.Category, at, 1)
+	runs, trimmed, err := r.bh.store.Events().ListSince(ctx, r.id, r.cfg.query.Category, at, 1)
 	if err != nil {
 		return err
 	}
@@ -199,7 +199,7 @@ func (r *eventReader) checkResume(ctx context.Context, at int64) error {
 	// Only a resume at or beyond the head gets this far, so no resume with real
 	// work to do pays for this read. The horizon is folded in because retention
 	// on the newest run lowers the mark.
-	head, err := r.bh.store.EventsMaxVersion(ctx, r.id)
+	head, err := r.bh.store.Events().MaxVersion(ctx, r.id)
 	if err != nil {
 		return err
 	}
@@ -281,7 +281,7 @@ func (r *eventReader) drain(ctx context.Context) (more bool, err error) {
 // step reads one page of the log above the cursor, delivers what the caller
 // asked for, and returns the page length.
 func (r *eventReader) step(ctx context.Context) (int, error) {
-	page, trimmed, err := r.bh.store.EventsListSince(ctx, r.id, r.cfg.query.Category, r.cursor, r.pageCap)
+	page, trimmed, err := r.bh.store.Events().ListSince(ctx, r.id, r.cfg.query.Category, r.cursor, r.pageCap)
 	if err != nil {
 		return 0, err
 	}

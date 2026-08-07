@@ -370,6 +370,9 @@ type Store interface {
 	// DeletionRequests is the deletion-request lifecycle over objects.deletion_requested_at.
 	DeletionRequests() DeletionRequests
 
+	// Events is the per-object event log, aggregated into runs.
+	Events() Events
+
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
@@ -444,6 +447,58 @@ type DeletionRequests interface {
 	// registered kinds to their controller and collect client-only kinds
 	// directly.
 	List(ctx context.Context) ([]ObjectRef, error)
+}
+
+// Events is the per-object event log, aggregated into runs.
+type Events interface {
+	// Add records an observation in the (id, in.Category) timeline. If
+	// the latest run there has the same (Type, Reason) it is extended (Count
+	// up, LastAt moved, Message/Detail re-sampled); otherwise a new run is
+	// appended with Count 1. Scoped to gk: wrong kind → ErrWrongKind, missing
+	// id → ErrNotFound.
+	Add(ctx context.Context, gk GroupKind, id ObjectID, in EventsAddInput) error
+
+	// GetLatest returns the most recent run in id's category timeline, or
+	// nil if none. Reads by id only (not kind-scoped).
+	GetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
+
+	// List returns id's event runs matching q, newest first (by LastAt,
+	// then id). The zero EventQuery returns every run. Not kind-scoped.
+	List(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
+
+	// ListSince returns id's runs above afterRV, oldest first, at most
+	// limit of them, with the retention horizon (0 when nothing was trimmed). An
+	// extend re-samples ResourceVersion, so the page is exactly what changed. The
+	// page is unfiltered and spans every category; category selects only which
+	// horizon is reported, nil meaning the max across the object's timelines.
+	// ErrNotFound when id holds no object: its log cascaded away with it, so an
+	// empty page there is not "no events".
+	ListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
+		[]Event, int64, error)
+
+	// MaxVersion returns the highest ResourceVersion over id's event
+	// runs, 0 when there are none (unknown id included). Spans every category
+	// and ignores filters. Not monotonic — retention can lower it — so
+	// consumers compare for inequality, not greater-than.
+	MaxVersion(ctx context.Context, id ObjectID) (int64, error)
+
+	// Snapshot returns id's runs matching q and the log position the
+	// listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what EventsMaxVersion reports — the object's
+	// whole log, not the query's — so a filtered watch resumes above what it
+	// could not see. Not kind-scoped; an unknown id reads as no runs at 0.
+	Snapshot(ctx context.Context, id ObjectID, q EventQuery) ([]Event, int64, error)
+
+	// Sweep trims the event log to the retention bounds and returns how
+	// many runs it deleted. perTimeline > 0 caps each (object, category)
+	// timeline to its newest perTimeline runs; maxAge > 0 drops runs with
+	// LastAt older than that. A zero bound is skipped. Global, not per-kind.
+	// An implementation MAY bound the work of one call, converging over
+	// sweeps, so a return does not imply every bound is met. capBudget > 0 asks
+	// for at most that many timelines trimmed by the perTimeline cap, so a
+	// caller sweeping rarely can ask for proportionally more; <= 0 leaves the
+	// bound to the implementation.
+	Sweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error)
 }
 
 type Dependencies interface {
@@ -546,55 +601,6 @@ type unmigrated interface {
 	// cancellation and values are inherited). fn must not panic: hooks run in
 	// sequence and nothing recovers.
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
-
-	// EventsAdd records an observation in the (id, in.Category) timeline. If
-	// the latest run there has the same (Type, Reason) it is extended (Count
-	// up, LastAt moved, Message/Detail re-sampled); otherwise a new run is
-	// appended with Count 1. Scoped to gk: wrong kind → ErrWrongKind, missing
-	// id → ErrNotFound.
-	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, in EventsAddInput) error
-
-	// EventsGetLatest returns the most recent run in id's category timeline, or
-	// nil if none. Reads by id only (not kind-scoped).
-	EventsGetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
-
-	// EventsList returns id's event runs matching q, newest first (by LastAt,
-	// then id). The zero EventQuery returns every run. Not kind-scoped.
-	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
-
-	// EventsListSince returns id's runs above afterRV, oldest first, at most
-	// limit of them, with the retention horizon (0 when nothing was trimmed). An
-	// extend re-samples ResourceVersion, so the page is exactly what changed. The
-	// page is unfiltered and spans every category; category selects only which
-	// horizon is reported, nil meaning the max across the object's timelines.
-	// ErrNotFound when id holds no object: its log cascaded away with it, so an
-	// empty page there is not "no events".
-	EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
-		[]Event, int64, error)
-
-	// EventsSnapshot returns id's runs matching q and the log position the
-	// listing is complete as of, read in one transaction so no write falls
-	// between them. The position is what EventsMaxVersion reports — the object's
-	// whole log, not the query's — so a filtered watch resumes above what it
-	// could not see. Not kind-scoped; an unknown id reads as no runs at 0.
-	EventsSnapshot(ctx context.Context, id ObjectID, q EventQuery) ([]Event, int64, error)
-
-	// EventsMaxVersion returns the highest ResourceVersion over id's event
-	// runs, 0 when there are none (unknown id included). Spans every category
-	// and ignores filters. Not monotonic — retention can lower it — so
-	// consumers compare for inequality, not greater-than.
-	EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error)
-
-	// EventsSweep trims the event log to the retention bounds and returns how
-	// many runs it deleted. perTimeline > 0 caps each (object, category)
-	// timeline to its newest perTimeline runs; maxAge > 0 drops runs with
-	// LastAt older than that. A zero bound is skipped. Global, not per-kind.
-	// An implementation MAY bound the work of one call, converging over
-	// sweeps, so a return does not imply every bound is met. capBudget > 0 asks
-	// for at most that many timelines trimmed by the perTimeline cap, so a
-	// caller sweeping rarely can ask for proportionally more; <= 0 leaves the
-	// bound to the implementation.
-	EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error)
 
 	// FinalizersDelete removes finalizer from id's list. A real removal bumps
 	// ResourceVersion; a missing one does nothing. clearedLast reports that this

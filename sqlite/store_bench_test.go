@@ -63,20 +63,20 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 
 		// A distinct reason per event, or the run extends instead of appending.
 		for r := range perTimeline {
-			require.NoError(b, store.EventsAdd(ctx, testGK, obj.ID, storeapi.EventsAddInput{
+			require.NoError(b, store.Events().Add(ctx, testGK, obj.ID, storeapi.EventsAddInput{
 				Category: "c", Type: "Normal", Reason: fmt.Sprintf("R%d", r),
 			}))
 		}
 	}
 	for i := range overCap {
-		require.NoError(b, store.EventsAdd(ctx, testGK, ids[i], storeapi.EventsAddInput{
+		require.NoError(b, store.Events().Add(ctx, testGK, ids[i], storeapi.EventsAddInput{
 			Category: "c", Type: "Normal", Reason: "Extra",
 		}))
 	}
 
 	b.ResetTimer()
 	for range b.N {
-		_, err := store.EventsSweep(ctx, perTimeline, 0, 0)
+		_, err := store.Events().Sweep(ctx, perTimeline, 0, 0)
 		require.NoError(b, err)
 	}
 }

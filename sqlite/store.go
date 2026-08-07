@@ -48,6 +48,10 @@ type sqliteDeletionRequests struct{ *sqliteStore }
 
 func (s *sqliteStore) DeletionRequests() storeapi.DeletionRequests { return sqliteDeletionRequests{s} }
 
+type sqliteEvents struct{ *sqliteStore }
+
+func (s *sqliteStore) Events() storeapi.Events { return sqliteEvents{s} }
+
 type sqliteDependencies struct{ *sqliteStore }
 
 func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
@@ -1749,7 +1753,7 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 	return evID, typ, reason, true, nil
 }
 
-func (s *sqliteStore) EventsAdd(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, in storeapi.EventsAddInput) error {
+func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, in storeapi.EventsAddInput) error {
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
@@ -1801,7 +1805,7 @@ func scanEvents(rows *sql.Rows) ([]storeapi.Event, error) {
 	return out, rows.Err()
 }
 
-func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery) ([]storeapi.Event, error) {
+func (s sqliteEvents) List(ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery) ([]storeapi.Event, error) {
 	where := []string{"object_id = ?"}
 	args := []any{id}
 	if q.Category != nil {
@@ -1837,17 +1841,17 @@ func (s *sqliteStore) EventsList(ctx context.Context, id storeapi.ObjectID, q st
 // EventsSnapshot lists id's runs and reads its log position in one transaction:
 // two reads cannot answer "these runs, as of this position" — whichever order
 // they run in, a write between them is either delivered twice or dropped.
-func (s *sqliteStore) EventsSnapshot(
+func (s sqliteEvents) Snapshot(
 	ctx context.Context, id storeapi.ObjectID, q storeapi.EventQuery,
 ) ([]storeapi.Event, int64, error) {
 	var runs []storeapi.Event
 	var at int64
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		if runs, err = s.EventsList(ctx, id, q); err != nil {
+		if runs, err = s.Events().List(ctx, id, q); err != nil {
 			return err
 		}
-		at, err = s.EventsMaxVersion(ctx, id)
+		at, err = s.Events().MaxVersion(ctx, id)
 		return err
 	})
 	if err != nil {
@@ -1861,7 +1865,7 @@ func (s *sqliteStore) EventsSnapshot(
 // Self-wrapped for ObjectWritesListSince's reason: the page, the horizon and the
 // existence probe must describe one instant, or a sweep landing between them
 // reports a horizon above rows the page already carried.
-func (s *sqliteStore) EventsListSince(
+func (s sqliteEvents) ListSince(
 	ctx context.Context, id storeapi.ObjectID, category *string, afterRV int64, limit int,
 ) ([]storeapi.Event, int64, error) {
 	if limit <= 0 {
@@ -1939,18 +1943,18 @@ func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, ca
 // on idx_events_object_rv, NULL reading as 0. That index exists for this read
 // alone; without it the plan fetches one table row per run, past overflow chains
 // (TestEventsMaxVersionUsesCoveringIndex pins the plan).
-func (s *sqliteStore) EventsMaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
+func (s sqliteEvents) MaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
 	var rv sql.NullInt64
 	err := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT MAX(resource_version) FROM events WHERE object_id = ?`, id).Scan(&rv)
 	return rv.Int64, err
 }
 
-func (s *sqliteStore) EventsGetLatest(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
+func (s sqliteEvents) GetLatest(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
 	return s.latestEventRun(ctx, id, category)
 }
 
-func (s *sqliteStore) EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error) {
+func (s sqliteEvents) Sweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error) {
 	if capBudget <= 0 {
 		capBudget = eventCapBudget
 	}

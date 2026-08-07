@@ -134,7 +134,7 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 			return err
 		}
 	}
-	if err := c.bh.store.EventsAdd(ctx, c.gk, id, storeapi.EventsAddInput{
+	if err := c.bh.store.Events().Add(ctx, c.gk, id, storeapi.EventsAddInput{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,

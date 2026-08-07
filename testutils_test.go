@@ -574,26 +574,91 @@ func (f fakeConditions) Delete(ctx context.Context, gk GroupKind, id ObjectID, c
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")
 }
-func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, EventsAddInput) error {
-	panic("not implemented: fakeStore.EventsAdd")
+func (s *fakeStore) Events() storeapi.Events { return fakeEvents{} }
+
+// fakeEvents is fakeStore's event-log family. Sweep answers zero rather than
+// panicking: the GC sweeper runs in every Beehive.
+type fakeEvents struct{}
+
+func (fakeEvents) Add(context.Context, GroupKind, ObjectID, EventsAddInput) error {
+	panic("not implemented: fakeStore.Events().Add")
 }
-func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
-	panic("not implemented: fakeStore.EventsList")
+
+func (fakeEvents) GetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
+	panic("not implemented: fakeStore.Events().GetLatest")
 }
-func (s *fakeStore) EventsListSince(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error) {
-	panic("not implemented: fakeStore.EventsListSince")
+
+func (fakeEvents) List(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
+	panic("not implemented: fakeStore.Events().List")
 }
-func (s *fakeStore) EventsSnapshot(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error) {
-	panic("not implemented: fakeStore.EventsSnapshot")
+
+func (fakeEvents) ListSince(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.Events().ListSince")
 }
-func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
-	panic("not implemented: fakeStore.EventsMaxVersion")
+
+func (fakeEvents) MaxVersion(context.Context, ObjectID) (int64, error) {
+	panic("not implemented: fakeStore.Events().MaxVersion")
 }
-func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
-	panic("not implemented: fakeStore.EventsGetLatest")
+
+func (fakeEvents) Snapshot(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.Events().Snapshot")
 }
-func (s *fakeStore) EventsSweep(context.Context, int, time.Duration, int) (int, error) {
-	panic("not implemented: fakeStore.EventsSweep")
+
+func (fakeEvents) Sweep(context.Context, int, time.Duration, int) (int, error) {
+	panic("not implemented: fakeStore.Events().Sweep")
+}
+
+// eventsOverride replaces the hooks that are set and delegates the rest.
+type eventsOverride struct {
+	storeapi.Events
+	getLatest  func(context.Context, ObjectID, string) (*RawEvent, error)
+	list       func(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error)
+	listSince  func(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error)
+	maxVersion func(context.Context, ObjectID) (int64, error)
+	snapshot   func(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error)
+	sweep      func(context.Context, int, time.Duration, int) (int, error)
+}
+
+func (o eventsOverride) GetLatest(ctx context.Context, id ObjectID, category string) (*RawEvent, error) {
+	if o.getLatest != nil {
+		return o.getLatest(ctx, id, category)
+	}
+	return o.Events.GetLatest(ctx, id, category)
+}
+
+func (o eventsOverride) List(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, error) {
+	if o.list != nil {
+		return o.list(ctx, id, q)
+	}
+	return o.Events.List(ctx, id, q)
+}
+
+func (o eventsOverride) ListSince(ctx context.Context, id ObjectID, cat *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
+	if o.listSince != nil {
+		return o.listSince(ctx, id, cat, afterRV, limit)
+	}
+	return o.Events.ListSince(ctx, id, cat, afterRV, limit)
+}
+
+func (o eventsOverride) MaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+	if o.maxVersion != nil {
+		return o.maxVersion(ctx, id)
+	}
+	return o.Events.MaxVersion(ctx, id)
+}
+
+func (o eventsOverride) Snapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
+	if o.snapshot != nil {
+		return o.snapshot(ctx, id, q)
+	}
+	return o.Events.Snapshot(ctx, id, q)
+}
+
+func (o eventsOverride) Sweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error) {
+	if o.sweep != nil {
+		return o.sweep(ctx, perTimeline, maxAge, capBudget)
+	}
+	return o.Events.Sweep(ctx, perTimeline, maxAge, capBudget)
 }
 func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	panic("not implemented: fakeStore.EdgesAdd")
@@ -1505,12 +1570,21 @@ func (s *pollProbeStore) ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawO
 // EventsListSince is the event reader's own page read: it carries eventsErr and
 // signals after the read, which is the seam the cancellation test needs — past
 // it the only thing left that can observe a cancelled context is the send.
-func (s *pollProbeStore) EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
+func (s *pollProbeStore) Events() storeapi.Events {
+	return eventsOverride{
+		Events:     s.Store.Events(),
+		listSince:  s.eventsListSince,
+		maxVersion: s.eventsMaxVersion,
+		snapshot:   s.eventsSnapshot,
+	}
+}
+
+func (s *pollProbeStore) eventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
 	if s.eventsErr.Load() {
 		probeSignal(s.eventsFailed)
 		return nil, 0, errBoom
 	}
-	page, trimmed, err := s.Store.EventsListSince(ctx, id, category, afterRV, limit)
+	page, trimmed, err := s.Store.Events().ListSince(ctx, id, category, afterRV, limit)
 	if forced := s.forceEventTrimmed.Load(); forced > 0 {
 		trimmed = forced
 	}
@@ -1520,18 +1594,18 @@ func (s *pollProbeStore) EventsListSince(ctx context.Context, id ObjectID, categ
 
 // EventsSnapshot and EventsMaxVersion are the reads only the subscribe path
 // makes, each with its own fault so a test can drive one at a time.
-func (s *pollProbeStore) EventsSnapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
+func (s *pollProbeStore) eventsSnapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
 	if s.eventsSnapErr.Load() {
 		return nil, 0, errBoom
 	}
-	return s.Store.EventsSnapshot(ctx, id, q)
+	return s.Store.Events().Snapshot(ctx, id, q)
 }
 
-func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+func (s *pollProbeStore) eventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
 	if s.markErr.Load() {
 		return 0, errBoom
 	}
-	return s.Store.EventsMaxVersion(ctx, id)
+	return s.Store.Events().MaxVersion(ctx, id)
 }
 
 // watchFixture wires a Beehive with one registered kind over a probe store — the

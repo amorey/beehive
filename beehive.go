@@ -266,7 +266,7 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 	if bh.eventRetentionPerTimeline <= 0 && bh.eventRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge, bh.gcBudget(eventCapPerSweep)); err != nil {
+	if _, err := bh.store.Events().Sweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge, bh.gcBudget(eventCapPerSweep)); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }
