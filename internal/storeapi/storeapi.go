@@ -351,7 +351,8 @@ func (r ObjectRef) GroupKind() GroupKind {
 }
 
 // Store is the durable-store contract beehive depends on internally. Non-
-// generic; it deals only in raw rows.
+// generic; it deals only in raw rows. Each family is reached through an
+// accessor: store.Edges().Add.
 //
 // A mutator returns a row exactly where a public Client write returns that
 // object to the user — today ObjectsCreate and ObjectsUpdateSpec only. Where a row is
@@ -362,6 +363,14 @@ func (r ObjectRef) GroupKind() GroupKind {
 // See docs/adr/2026-07-30-store-write-shapes.md.
 type Store interface {
 	io.Closer
+
+	unmigrated
+}
+
+// unmigrated holds the families not yet reached through an accessor. It shrinks
+// as each one moves and is deleted once empty — nothing should be added to it.
+// See docs/specs/2026-08-07-grouped-store-api.md.
+type unmigrated interface {
 
 	// Within runs fn inside a single transaction, committing on nil error and
 	// rolling back otherwise. Store calls made with the ctx passed to fn join

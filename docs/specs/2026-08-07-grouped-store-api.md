@@ -269,16 +269,21 @@ Each step compiles and passes.
    panic without the capability) all exercise it. Each retargets to a store whose
    `DriverCursors().Get` returns `ok=false` — same semantics, reached through a value
    instead of a nil check. `sqlite` already implements all three methods.
-1. **Give the test doubles a per-family seam** (see Testing), while every name is still
-   flat. Both idioms are converted here: `fakeStore` and the 36 decorators.
-2. **Introduce the staging shape.** Rename today's interface `unmigrated`, and declare
+1. **Introduce the staging shape.** Rename today's interface `unmigrated`, and declare
    `Store` as `io.Closer` + `unmigrated`. Pure rename; nothing else moves.
-3. **One family per commit.** *Move* that family's declarations out of `unmigrated` into
+
+   The test-double seam does **not** come first, though an earlier draft put it there:
+   its override fields are typed on the sub-interfaces (`func(storeapi.Edges) …`), which
+   do not exist until a family migrates. Written first it would have to be written flat
+   and regrouped later — the churn it exists to avoid. Each family's doubles convert
+   inside that family's commit instead.
+2. **One family per commit.** *Move* that family's declarations out of `unmigrated` into
    a new sub-interface, shortening each name; add the accessor and the one-line receiver
-   struct in `sqlite`; rewrite the call sites — ~74 in the root package, ~1068 in tests,
-   plus the 8 cross-family bodies in `sqlite/store.go`, which move with the *callee's*
-   family. All compiler-enumerated. Nine commits.
-4. **Delete `unmigrated`.** Empty by now; its deletion is the migration's end state. Note
+   struct in `sqlite`; add the family's override struct to the test seam and convert the
+   doubles that shadow it; rewrite the call sites — ~74 in the root package, ~1068 in
+   tests, plus the 8 cross-family bodies in `sqlite/store.go`, which move with the
+   *callee's* family. All compiler-enumerated. Nine commits.
+3. **Delete `unmigrated`.** Empty by now; its deletion is the migration's end state. Note
    this step is **manual**: `unmigrated` stays embedded in `Store`, so it is still "used"
    and no linter will flag it. Emptiness is the signal to look, not a tripwire that fires.
 
@@ -303,7 +308,7 @@ sub-interface wrapper — two types where there was one, and `listProbeStore`
 That is issue #93's Q1 cost resurfacing on the test side, which D2 removed the seam that
 paid for.
 
-**So step 1 builds one per-family seam that serves both idioms.** A single decorator type
+**So each family commit extends one shared seam that serves both idioms.** A single decorator type
 in `testutils_test.go` wraps a `Store` and holds per-family override structs of func
 fields; each family's wrapper delegates to the wrapped store when its field is nil. Both
 idioms then read as closures over a base:
@@ -319,9 +324,9 @@ d.edges.listIncoming = func(next storeapi.Edges) … { n++; return next.ListInco
 ```
 
 `fakeStore` gets the same treatment with panic-stubs as the defaults instead of
-delegation, so the 33 collapse the same way. Doing this **before** the renames is what
-keeps the nine family commits mechanical — otherwise each one hand-writes wrappers for
-every probe touching its family.
+delegation, so the 33 collapse the same way. Measured: **35 decorator types, 61 overrides,
+34 distinct methods**, and the worst case is `pollProbeStore` at 12 methods across four
+families — four hand-written wrappers, without the seam.
 
 The ~1068 direct `store.ObjectsCreate(…)` calls in tests (355 root, 713 under `sqlite/`)
 change one family at a time inside that family's commit. An earlier draft claimed these
