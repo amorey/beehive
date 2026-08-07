@@ -265,6 +265,12 @@ type Condition struct {
 	// store downgrades a liveness condition written by a prior process to
 	// Unknown until a controller re-confirms it.
 	Liveness bool
+	// Unconfirmed reports that Status is a downgrade this process derived, not a
+	// status anyone wrote: a liveness condition an earlier process left behind,
+	// read as Unknown until a controller re-confirms it. Reason, Message and the
+	// stamps below are the pre-downgrade write's, so they describe the last known
+	// status rather than this Unknown.
+	Unconfirmed bool
 	// Set by the store on read, ignored on write. A downgraded liveness
 	// condition keeps the stored write's stamps.
 	TransitionedAt time.Time // when Status last changed

@@ -64,6 +64,7 @@ for the mapping.
 - [The id is the Client API's key; the name resolves through ByName siblings](2026-08-02-id-primary-key-with-byname-siblings.md)
 - [Name-keyed writes](2026-07-27-name-keyed-writes.md)
 - [The generation handshake and content no-ops](2026-07-27-generation-handshake-and-noop-writes.md)
+- [A downgraded liveness condition says so](2026-08-07-a-downgraded-liveness-condition-says-so.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
 - [The schema is amended in place until release](2026-07-31-amend-the-schema-in-place-until-release.md)
 - [Every new depends_on edge stamps a durable owed reconcile](2026-07-29-stamp-every-new-dependency-edge.md)

@@ -946,6 +946,7 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 			Reason:         c.Reason,
 			Message:        c.Message,
 			Liveness:       c.Liveness,
+			Unconfirmed:    c.Unconfirmed,
 			TransitionedAt: c.TransitionedAt,
 			UpdatedAt:      c.UpdatedAt,
 		}

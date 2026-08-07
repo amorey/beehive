@@ -1609,9 +1609,12 @@ func (s *sqliteStore) livenessStale(cond *storeapi.Condition) bool {
 
 // downgradeLiveness surfaces a stale liveness condition as Unknown on the read
 // path — never on the write path, whose no-op comparison must see stored truth.
+// Unconfirmed is what tells the two Unknowns apart; nothing else on the wire does.
+// See docs/adr/2026-08-07-a-downgraded-liveness-condition-says-so.md.
 func (s *sqliteStore) downgradeLiveness(cond *storeapi.Condition) {
 	if s.livenessStale(cond) {
 		cond.Status = "Unknown"
+		cond.Unconfirmed = true
 	}
 }
 

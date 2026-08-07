@@ -5629,7 +5629,75 @@ func TestLivenessDowngradedToUnknownBeforeProcessStart(t *testing.T) {
 	require.NotNil(t, live)
 	require.NotNil(t, truth)
 	assert.Equal(t, "Unknown", live.Status, "stale liveness condition downgrades to Unknown")
+	assert.True(t, live.Unconfirmed, "the downgrade says so, rather than leaving it to be inferred")
 	assert.Equal(t, "True", truth.Status, "store-truth condition is unaffected")
+	assert.False(t, truth.Unconfirmed)
+}
+
+func TestGenuineUnknownIsNotUnconfirmed(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "genuine-unknown")
+
+	// This process assessed the resource and genuinely cannot tell. Same wire
+	// shape as a downgrade — {Unknown, Liveness} — and Reason is no help, since a
+	// downgraded Connected would carry this one too.
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Connected", Status: "Unknown", Reason: "Dialed", Liveness: true})
+	require.NoError(t, err)
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	cond := findCondition(got.Conditions, "Connected")
+	require.NotNil(t, cond)
+	assert.Equal(t, "Unknown", cond.Status)
+	assert.False(t, cond.Unconfirmed, "an Unknown this process wrote is not a downgrade")
+}
+
+func TestUnconfirmedIsSetOnTheListPath(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "list-path")
+
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Connected", Status: "True", Liveness: true})
+	require.NoError(t, err)
+	store.processStart = time.Now().Add(time.Hour)
+
+	// conditionsByIDs is a second read path with its own downgrade call.
+	got, err := store.Objects().List(ctx, testGK)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	cond := findCondition(got[0].Conditions, "Connected")
+	require.NotNil(t, cond)
+	assert.Equal(t, "Unknown", cond.Status)
+	assert.True(t, cond.Unconfirmed, "the batched read downgrades and flags the same as the single read")
+}
+
+func TestUnconfirmedIsIgnoredOnWrite(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "unconfirmed-write")
+
+	// A caller round-tripping a read condition back into Set carries Unconfirmed
+	// with it. It must reach neither storage nor the no-op comparison, or the
+	// round trip would look like a change and rewrite the stamps forever.
+	set := storeapi.Condition{Type: "Connected", Status: "True", Liveness: true}
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, set))
+	first, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	before := findCondition(first.Conditions, "Connected").UpdatedAt
+
+	echo := set
+	echo.Unconfirmed = true
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, echo))
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	cond := findCondition(got.Conditions, "Connected")
+	require.NotNil(t, cond)
+	assert.False(t, cond.Unconfirmed, "Unconfirmed is derived on read, never stored")
+	assert.Equal(t, before, cond.UpdatedAt, "the echo is still a no-op")
 }
 
 func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
@@ -5660,6 +5728,7 @@ func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "True", findCondition(got.Conditions, "Connected").Status,
 		"re-confirmed liveness condition is no longer downgraded")
+	assert.False(t, findCondition(got.Conditions, "Connected").Unconfirmed)
 }
 
 func TestSetConditionObjectNotFound(t *testing.T) {

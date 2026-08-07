@@ -323,6 +323,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   writing status**, for a controller whose whole report is conditions, and
   clamps unconditionally — which also bounds it to one write per generation.
   → [ADR](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md)
+- **A downgraded liveness condition says so.** `downgradeLiveness` sets
+  `Condition.Unconfirmed` beside the `Unknown` rewrite, because the predicate
+  (`UpdatedAt` before `processStart`) is store-internal and a remote consumer
+  cannot evaluate it even in principle — so `{Unknown, Liveness}` alone cannot
+  distinguish a prior process's unrefreshed report from an assessment that ran and
+  came back inconclusive. Read-only: `SetConditions` doesn't copy it and
+  `conditionUnchanged` doesn't compare it, so echoing a read condition back stays a
+  no-op. Both read paths already funnel through `downgradeLiveness`, so there is no
+  third site. `Reason`/`Message`/both stamps stay the pre-downgrade write's — last
+  known values, not facts about the `Unknown`.
+  → [ADR](docs/adr/2026-08-07-a-downgraded-liveness-condition-says-so.md)
 - **Schema-version migration** (`Migrator`): per-kind, on read, at the decode
   boundary; spec and status version independently; an undecodable blob
   quarantines its row rather than killing the read.
