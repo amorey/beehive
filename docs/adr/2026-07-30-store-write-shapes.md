@@ -157,3 +157,51 @@ It was deferred once as a break to ride along with the next one, and skipped a w
 (`EventsMaxVersion`, 2026-07-31) doing so. Waiting again would have made the next
 break the third an external backend pays for the same rule, which is the argument
 against holding it any longer.
+
+## A cascade draws one version range, not one per child (2026-08-06)
+
+The lazy draw above is per call, and `deletionRequestsCreateFromOwner` called
+`markForDeletion` per child. An N-child cascade therefore drew N versions, committed
+N counter writes and appended N log entries one statement at a time — the tail this
+ADR's sweep left open, and the last one.
+
+`markManyForDeletion` takes the level at once: one `advanceResourceVersion(n)` for the
+range, one `UPDATE` per chunk, one `INSERT` per chunk. Each child still takes its own
+value out of the range — the write log orders on it, so a shared value would be two
+changes a consumer cannot sequence — assigned in the order the child lookup returned.
+The `IS NULL` guard stays per row, so `Marked` remains the write's answer rather than
+the caller's read, and a row the guard skips leaves its assigned value unused. That
+gap is accepted: consumers seek with `>`, and a rolled-back draw already produces one.
+
+**The assignment rides a joined `VALUES` list, not a `CASE` over the id.** A `CASE` is
+re-evaluated per row, so its cost is quadratic in the chunk — at a 2000-wide chunk it
+was *slower per child* than the per-child marks it replaced. The join materializes the
+list and seeks `objects` by primary key.
+
+**`markChunkSize` is a measured optimum, not a parameter-limit ceiling** the way
+`idChunkSize` is. The assignment list is materialized per statement, so cost per child
+is flat up to about 128 and climbs above it: a 4096-child cascade cost 83 ms at a chunk
+of 64, 85 ms at 128, 95 ms at 256 and 114 ms at 512. It is 128 — far below the variable
+limit, and there for the measurement rather than the limit. That is why the two chunk
+knobs stay separate: one answers a correctness ceiling, the other a cost curve.
+
+`BenchmarkDeletionCascade`, on disk, first cascade over a level of N:
+
+| children | before | after |
+| --- | --- | --- |
+| 1 | 170 µs | 190 µs |
+| 16 | 1.24 ms | 0.42 ms |
+| 256 | 18.2 ms | 4.50 ms |
+
+Marginal cost per child goes from ~71 µs to ~19 µs. The re-cascade rows are unchanged
+by construction — an already-deleting level is a lone `SELECT` and never reaches the
+mark, which is also why the batch draws nothing on an empty candidate set.
+
+**The one-child row gets ~10% worse**, and is left that way. Delegating a lone
+candidate back to `markForDeletion` recovers it, and was tried: it buys 17 µs by making
+the draw lazy at N=1 and eager above it, so the helper acquires a second semantics —
+a guarded no-op draws nothing on one path and leaves a gap on the other. The fork is
+unreachable through the cascade, which filters pending children before it, so what it
+actually costs is a caveat in the doc comment and a test to pin a distinction nothing
+observes. One helper with one behaviour is worth more than 17 µs on the narrowest
+cascade there is.

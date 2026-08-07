@@ -182,22 +182,6 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   Worth doing before the first release or not at all: every one is public API, the
   rename is the entire cost, and it is the kind of change that never gets cheaper.
 
-- **A cascade draws one resource version per child** — known, not fixed, and all that
-  is left of the write-shapes pass's tail. Every other narrow-question write is
-  settled: the ones that report no row answer from metadata (`checkObjectScoped`),
-  the three that need row content read only the columns they use (`selectScoped`),
-  `ConditionsSet`'s gate and its no-op read are one `LEFT JOIN`, and a deletion mark
-  draws its version only once it knows it will stamp one — see
-  [the ADR](adr/2026-07-30-store-write-shapes.md).
-
-  `deletionRequestsCreateFromOwner` calls `markForDeletion` per child, so an N-child
-  cascade draws N versions where one `value + N` draw would do. It only pays on
-  children not already deleting — the cascade skips the rest before calling — so the
-  steady-state re-cascade is unaffected and this is the first-pass cost of a large
-  subtree only. Worth doing when a cascade over a wide subtree shows up as write
-  cost; the per-child version is what the write log orders on, so a batched draw has
-  to hand each child its own value out of the range, not share one.
-
 - **`incoming == 0` conflates "no migrator" with "unversioned", so an old build can
   launder reshaped bytes under the stored schema version** — known, not fixed.
   Explore a `WithSchemaVersion(n)` option that lets a kind declare its schema
