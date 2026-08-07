@@ -1590,26 +1590,45 @@ func conditionSetLoad(types int) string {
 	 WHERE o.id = ?`
 }
 
-// loadForConditionSet runs conditionSetLoad over the types being written: the
-// scope error, then whichever of them are stored, keyed by type. Stored truth,
-// undowngraded — see downgradeLiveness.
+// loadForConditionSet runs conditionSetLoad over the conditions being written:
+// the scope error, then whichever of their types are stored, keyed by type.
+// Stored truth, undowngraded — see downgradeLiveness. Chunked under
+// conditionChunkSize, like the upsert it feeds.
 func (s *sqliteStore) loadForConditionSet(
 	ctx context.Context,
 	gk storeapi.GroupKind,
 	id storeapi.ObjectID,
-	types []string,
+	conds []storeapi.Condition,
 ) (map[string]storeapi.Condition, error) {
-	args := make([]any, 0, len(types)+1)
-	for _, t := range types {
-		args = append(args, t)
+	existing := make(map[string]storeapi.Condition, len(conds))
+	for start := 0; start < len(conds); start += conditionChunkSize {
+		chunk := conds[start:min(start+conditionChunkSize, len(conds))]
+		if err := s.loadForConditionSetChunk(ctx, gk, id, chunk, existing); err != nil {
+			return nil, err
+		}
+	}
+	return existing, nil
+}
+
+// loadForConditionSetChunk runs one chunk, merging rows into out; it closes its
+// result set so the next chunk can run on the single connection.
+func (s *sqliteStore) loadForConditionSetChunk(
+	ctx context.Context,
+	gk storeapi.GroupKind,
+	id storeapi.ObjectID,
+	conds []storeapi.Condition,
+	out map[string]storeapi.Condition,
+) error {
+	args := make([]any, 0, len(conds)+1)
+	for _, cond := range conds {
+		args = append(args, cond.Type)
 	}
 	args = append(args, id)
-	rows, err := s.conn(ctx).QueryContext(ctx, conditionSetLoad(len(types)), args...)
+	rows, err := s.conn(ctx).QueryContext(ctx, conditionSetLoad(len(conds)), args...)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
-	existing := make(map[string]storeapi.Condition, len(types))
 	var gated bool
 	for rows.Next() {
 		var (
@@ -1620,18 +1639,18 @@ func (s *sqliteStore) loadForConditionSet(
 		)
 		if err := rows.Scan(&group, &kind, &condType, &status, &reason, &message,
 			&liveness, &updatedAt); err != nil {
-			return nil, err
+			return err
 		}
 		if !gated {
 			if err := gateKind(gk, id, group, kind); err != nil {
-				return nil, err
+				return err
 			}
 			gated = true
 		}
 		if !status.Valid { // LEFT JOIN miss: the object holds none of these types
 			continue
 		}
-		existing[condType.String] = storeapi.Condition{
+		out[condType.String] = storeapi.Condition{
 			Type:      condType.String,
 			Status:    status.String,
 			Reason:    reason.String,
@@ -1641,12 +1660,12 @@ func (s *sqliteStore) loadForConditionSet(
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return err
 	}
 	if !gated {
-		return nil, storeapi.ErrNotFound // bare, like scanObject's
+		return storeapi.ErrNotFound // bare, like scanObject's
 	}
-	return existing, nil
+	return nil
 }
 
 // bumpObject advances id's resource_version — the visibility half of the
@@ -1680,22 +1699,21 @@ func (s *sqliteStore) conditionUnchanged(existing map[string]storeapi.Condition,
 		stored.Liveness == want.Liveness
 }
 
-// conditionChunkSize bounds the conditions bound per upsert, under SQLite's
-// parameter limit at eight parameters a row. A var so tests can shrink it.
+// conditionChunkSize bounds the conditions bound per statement — the gate read
+// and the upsert both — under SQLite's parameter limit at eight parameters a
+// row. A var so tests can shrink it.
 var conditionChunkSize = 512
 
 func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, conds ...storeapi.Condition) error {
 	if len(conds) == 0 {
 		return nil
 	}
-	types := make([]string, 0, len(conds))
 	seen := make(map[string]bool, len(conds))
 	for _, cond := range conds {
 		if seen[cond.Type] {
 			return fmt.Errorf("%w: %q", storeapi.ErrDuplicateConditionType, cond.Type)
 		}
 		seen[cond.Type] = true
-		types = append(types, cond.Type)
 	}
 	// Within keeps the condition writes and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
@@ -1704,7 +1722,7 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 		// an FK violation, no blob decoded — joined to the stored conditions of the
 		// types being written, since no-op suppression needs them and all key on the
 		// same object.
-		existing, err := s.loadForConditionSet(ctx, gk, id, types)
+		existing, err := s.loadForConditionSet(ctx, gk, id, conds)
 		if err != nil {
 			return err
 		}

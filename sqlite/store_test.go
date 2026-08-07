@@ -5099,6 +5099,19 @@ func TestSetConditionsSpanningChunksTakesOneVersion(t *testing.T) {
 	assert.Len(t, got.Conditions, len(conds), "every chunk lands")
 	assert.Equal(t, got.ResourceVersion, probe.expectWrite().ResourceVersion,
 		"chunking is a statement split, not a write split")
+
+	// Rewrite: now the gate read spans chunks over stored rows, so a chunk it
+	// failed to merge would read as unchanged and be dropped from the write.
+	for i := range conds {
+		conds[i].Status = "False"
+	}
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, conds...))
+	got, err = store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	for _, cond := range got.Conditions {
+		assert.Equal(t, "False", cond.Status, "%s must be rewritten", cond.Type)
+	}
+	probe.expectWrite()
 }
 
 func TestSetConditionsSuppressesPerCondition(t *testing.T) {

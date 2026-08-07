@@ -239,7 +239,10 @@ the transaction opens, so a refused batch writes none of its conditions.
 
 `conditionChunkSize` is a parameter-limit ceiling like `idChunkSize`, not a measured
 optimum like `markChunkSize`: conditions per object are a handful, so the chunk loop
-exists to keep a pathological batch correct rather than to shape a cost curve.
+exists to keep a pathological batch correct rather than to shape a cost curve. It
+bounds **both** statements the call makes — the gate read's `IN` list and the upsert —
+since a ceiling applied to one of the two is not a ceiling; the read chunks and merges
+the same way `conditionsByIDs` already does.
 
 **Rejected: a verb that carries conditions alongside `UpdateStatus`**, which is the
 other half of what prompted this. `Within` already lands both in one transaction, so
