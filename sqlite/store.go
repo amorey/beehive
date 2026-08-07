@@ -60,6 +60,10 @@ type sqliteObjectWrites struct{ *sqliteStore }
 
 func (s *sqliteStore) ObjectWrites() storeapi.ObjectWrites { return sqliteObjectWrites{s} }
 
+type sqliteObjects struct{ *sqliteStore }
+
+func (s *sqliteStore) Objects() storeapi.Objects { return sqliteObjects{s} }
+
 type sqliteDependencies struct{ *sqliteStore }
 
 func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
@@ -579,7 +583,7 @@ func (s *sqliteStore) scanWritten(ctx context.Context, sc scanner) (*storeapi.Ra
 	return obj, nil
 }
 
-func (s *sqliteStore) ObjectsCreate(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
+func (s sqliteObjects) Create(ctx context.Context, gk storeapi.GroupKind, in storeapi.ObjectsCreateInput) (*storeapi.RawObject, error) {
 	// Self-wrapped: the version draw and the insert must be atomic, and Store is
 	// public, so this cannot rest on the caller already being in a transaction.
 	var created *storeapi.RawObject
@@ -799,7 +803,7 @@ func (s *sqliteStore) getObjectRowScoped(ctx context.Context, gk storeapi.GroupK
 	return obj, nil
 }
 
-func (s *sqliteStore) ObjectsGet(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+func (s sqliteObjects) Get(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	obj, err := s.getObjectRow(ctx, id)
 	if err != nil {
 		return nil, err
@@ -810,7 +814,7 @@ func (s *sqliteStore) ObjectsGet(ctx context.Context, id storeapi.ObjectID) (*st
 // ObjectsGetForReconcile is the reconcile loop's opening read (see the contract
 // on storeapi.Store). The cursor and the dependency flag are correlated
 // subqueries, riding the row read rather than adding round trips.
-func (s *sqliteStore) ObjectsGetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
+func (s sqliteObjects) GetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
 	var load storeapi.ReconcileLoad
 	row := s.conn(ctx).QueryRowContext(ctx, `
 		SELECT `+objectColumns+`,
@@ -831,7 +835,7 @@ func (s *sqliteStore) ObjectsGetForReconcile(ctx context.Context, id storeapi.Ob
 
 // ObjectsGetMeta is getObjectRow across the store boundary: no conditions
 // assembled, for metadata-only callers.
-func (s *sqliteStore) ObjectsGetMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
+func (s sqliteObjects) GetMeta(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
 	return s.getObjectRow(ctx, id)
 }
 
@@ -844,7 +848,7 @@ func (s *sqliteStore) getObjectRowByName(ctx context.Context, gk storeapi.GroupK
 	return scanObject(row)
 }
 
-func (s *sqliteStore) ObjectsGetByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
+func (s sqliteObjects) GetByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
 	obj, err := s.getObjectRowByName(ctx, gk, name)
 	if err != nil {
 		return nil, err
@@ -852,7 +856,7 @@ func (s *sqliteStore) ObjectsGetByName(ctx context.Context, gk storeapi.GroupKin
 	return s.attachConditions(ctx, obj)
 }
 
-func (s *sqliteStore) ObjectsList(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
+func (s sqliteObjects) List(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
 	return s.listObjectsWhere(ctx, `WHERE o."group" = ? AND o.kind = ?`, gk.Group, gk.Kind)
 }
 
@@ -861,7 +865,7 @@ func (s *sqliteStore) ObjectsList(ctx context.Context, gk storeapi.GroupKind) ([
 //
 // The edge is a semi-join, not a join: IN (SELECT …) lets idx_edges_to drive, so
 // the work scales with the referrers rather than every object of the kind.
-func (s *sqliteStore) ObjectsListByIncomingEdge(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
+func (s sqliteObjects) ListByIncomingEdge(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
 	return s.listObjectsWhere(ctx, `
 		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
 		  AND o."group" = ? AND o.kind = ?`,
@@ -945,7 +949,7 @@ func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.O
 	return rows.Err()
 }
 
-func (s *sqliteStore) ObjectsListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s sqliteObjects) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
 		 WHERE "group" = ? AND kind = ?
@@ -1142,7 +1146,7 @@ func (s sqliteDependencies) WatermarkSet(ctx context.Context, id storeapi.Object
 	return err
 }
 
-func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s sqliteObjects) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
 		gk.Group, gk.Kind)
@@ -1332,7 +1336,7 @@ func stampVersion(stored, incoming int) (int, error) {
 }
 
 // ObjectsUpdateSpec replaces id's spec within gk. See updateSpec for the shape.
-func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
+func (s sqliteObjects) UpdateSpec(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	// The scoped read enforces the kind boundary while doubling as the compare's load.
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
 		return s.getObjectRowScoped(ctx, gk, id)
@@ -1341,7 +1345,7 @@ func (s *sqliteStore) ObjectsUpdateSpec(ctx context.Context, gk storeapi.GroupKi
 
 // ObjectsUpdateSpecByName replaces the spec of whatever holds name within gk. No
 // ErrWrongKind: the kind is in the WHERE, so a foreign name is simply absent.
-func (s *sqliteStore) ObjectsUpdateSpecByName(ctx context.Context, gk storeapi.GroupKind, name string, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
+func (s sqliteObjects) UpdateSpecByName(ctx context.Context, gk storeapi.GroupKind, name string, spec []byte, specVersion int) (*storeapi.RawObject, bool, error) {
 	return s.updateSpec(ctx, spec, specVersion, func(ctx context.Context) (*storeapi.RawObject, error) {
 		return s.getObjectRowByName(ctx, gk, name)
 	})
@@ -1409,7 +1413,7 @@ func (s *sqliteStore) updateSpec(
 // resource_version — settling at a new generation is a real transition, and it
 // fires at most once per generation. Identical status with the generation
 // already recorded writes nothing at all.
-func (s *sqliteStore) ObjectsUpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
+func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
@@ -2079,7 +2083,7 @@ func (s *sqliteStore) trimEvents(ctx context.Context, where string, args ...any)
 	return int(n), nil
 }
 
-func (s *sqliteStore) FinalizersDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (bool, error) {
+func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, finalizer string) (bool, error) {
 	var clearedLast bool
 	// Within keeps the read-modify-write of the finalizer list atomic.
 	err := s.Within(ctx, func(ctx context.Context) error {
@@ -2411,7 +2415,7 @@ func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, owner
 	return res, err
 }
 
-func (s *sqliteStore) ObjectsDelete(ctx context.Context, id storeapi.ObjectID) error {
+func (s sqliteObjects) Delete(ctx context.Context, id storeapi.ObjectID) error {
 	// Self-wrapped: the cascade to conditions, events and edges goes together or
 	// not at all.
 	return s.Within(ctx, func(ctx context.Context) error { return s.objectsDelete(ctx, id) })
@@ -2425,7 +2429,7 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	c := s.conn(ctx)
 	// Read before the DELETE: the conditions cascade with the row, so this is the
 	// last moment the image can be assembled.
-	image, err := s.ObjectsGet(ctx, id)
+	image, err := s.Objects().Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -3081,7 +3085,7 @@ func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...an
 // read would never reach the stream, since the stream starts above it.
 func (s sqliteObjectWrites) Snapshot(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, int64, error) {
 	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-		return s.ObjectsList(ctx, gk)
+		return s.Objects().List(ctx, gk)
 	})
 }
 
@@ -3089,7 +3093,7 @@ func (s sqliteObjectWrites) Snapshot(ctx context.Context, gk storeapi.GroupKind)
 // "not there" cases — missing and foreign — into an empty result.
 func (s sqliteObjectWrites) SnapshotByID(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
 	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-		obj, err := s.ObjectsGet(ctx, id)
+		obj, err := s.Objects().Get(ctx, id)
 		if errors.Is(err, storeapi.ErrNotFound) {
 			return nil, nil
 		}
@@ -3104,7 +3108,7 @@ func (s sqliteObjectWrites) SnapshotByID(ctx context.Context, gk storeapi.GroupK
 // already kind-scoped, so a foreign owner simply matches nothing.
 func (s sqliteObjectWrites) SnapshotByOwner(ctx context.Context, gk storeapi.GroupKind, ownerID storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
 	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
-		return s.ObjectsListByIncomingEdge(ctx, gk, ownerID, storeapi.RelationOwnedBy)
+		return s.Objects().ListByIncomingEdge(ctx, gk, ownerID, storeapi.RelationOwnedBy)
 	})
 }
 
@@ -3133,7 +3137,7 @@ func (s *sqliteStore) snapshot(
 // per batch rather than ObjectsGet per changed object: the pool is size 1, so
 // those would be serialized round trips and a churny kind would cost more than
 // the full listing this design replaced.
-func (s *sqliteStore) ObjectsListByIDs(ctx context.Context, gk storeapi.GroupKind, ids []storeapi.ObjectID) ([]*storeapi.RawObject, error) {
+func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids []storeapi.ObjectID) ([]*storeapi.RawObject, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}

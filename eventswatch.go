@@ -165,7 +165,7 @@ func (r *eventReader) start(ctx context.Context) error {
 // about — where another kind's id is ErrNotFound for good, an id belonging to
 // one kind for life.
 func (r *eventReader) checkKind(ctx context.Context) error {
-	raw, err := r.bh.store.ObjectsGetMeta(ctx, r.id)
+	raw, err := r.bh.store.Objects().GetMeta(ctx, r.id)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}

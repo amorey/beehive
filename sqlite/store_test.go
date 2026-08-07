@@ -587,7 +587,7 @@ func TestEventsListSinceReportsACollectedObject(t *testing.T) {
 	assert.Empty(t, page)
 	assert.Zero(t, at)
 
-	require.NoError(t, store.ObjectsDelete(ctx, id))
+	require.NoError(t, store.Objects().Delete(ctx, id))
 	_, _, err = store.Events().ListSince(ctx, id, nil, 0, 10)
 	assert.ErrorIs(t, err, storeapi.ErrNotFound)
 }
@@ -668,7 +668,7 @@ func TestDeleteObjectCascadesEventHorizon(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, eventHorizon(t, store, id, "c"))
 
-	require.NoError(t, store.ObjectsDelete(ctx, id))
+	require.NoError(t, store.Objects().Delete(ctx, id))
 	assert.Zero(t, eventHorizon(t, store, id, "c"))
 }
 
@@ -679,7 +679,7 @@ func TestDeleteObjectCascadesEvents(t *testing.T) {
 	id := newEventObject(t, store)
 
 	require.NoError(t, store.Events().Add(ctx, testGK, id, storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "X"}))
-	require.NoError(t, store.ObjectsDelete(ctx, id))
+	require.NoError(t, store.Objects().Delete(ctx, id))
 
 	got, err := store.Events().List(ctx, id, storeapi.EventQuery{})
 	require.NoError(t, err)
@@ -1226,7 +1226,7 @@ func TestObjectsCreateRejectsTheEmptyName(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "",
 		Spec: []byte(`{}`),
 	})
@@ -1254,7 +1254,7 @@ func TestObjectsNameColumnRejectsTheEmptyStringInSQL(t *testing.T) {
 // half of a constraint assertion, where the error text is the driver's to change.
 func assertNoObjectRows(t *testing.T, store beehive.Store) {
 	t.Helper()
-	ids, err := store.ObjectsListIDs(context.Background(), testGK)
+	ids, err := store.Objects().ListIDs(context.Background(), testGK)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "the refused row must not have landed")
 }
@@ -1263,7 +1263,7 @@ func TestObjectsCreateAssignsIdentity(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "world",
 		Spec: []byte(`{"name":"world"}`),
 	})
@@ -1288,7 +1288,7 @@ func TestObjectsCreatePersistsFinalizers(t *testing.T) {
 	ctx := context.Background()
 
 	want := []string{"kstack.sh/cluster", "kstack.sh/dns"}
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:       "guarded",
 		Spec:       []byte(`{}`),
 		Finalizers: want,
@@ -1297,7 +1297,7 @@ func TestObjectsCreatePersistsFinalizers(t *testing.T) {
 	assert.Equal(t, want, created.Finalizers)
 
 	// Round-trips through the JSON column, not just the returned struct.
-	reloaded, err := store.ObjectsGet(ctx, created.ID)
+	reloaded, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, want, reloaded.Finalizers)
 }
@@ -1306,17 +1306,17 @@ func TestGetByIdAndName(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "world",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 
-	byID, err := store.ObjectsGet(ctx, created.ID)
+	byID, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, byID.ID)
 
-	byName, err := store.ObjectsGetByName(ctx, testGK, "world")
+	byName, err := store.Objects().GetByName(ctx, testGK, "world")
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, byName.ID)
 }
@@ -1325,10 +1325,10 @@ func TestGetNotFound(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	_, err := store.ObjectsGet(ctx, 999)
+	_, err := store.Objects().Get(ctx, 999)
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 
-	_, err = store.ObjectsGetByName(ctx, testGK, "nope")
+	_, err = store.Objects().GetByName(ctx, testGK, "nope")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
@@ -1337,7 +1337,7 @@ func TestDuplicateNameRejected(t *testing.T) {
 	ctx := context.Background()
 
 	mk := func() error {
-		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: "dup",
 			Spec: []byte(`{}`),
 		})
@@ -1358,19 +1358,19 @@ func TestDuplicateNameRejected(t *testing.T) {
 func TestDuplicateNameCreateLandsNothing(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	first, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	first, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "dup",
 		Spec: []byte(`{"v":1}`),
 	})
 	require.NoError(t, err)
 
-	_, err = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "dup",
 		Spec: []byte(`{"v":2}`),
 	})
 	require.ErrorIs(t, err, storeapi.ErrNameTaken)
 
-	ids, err := store.ObjectsListIDs(ctx, testGK)
+	ids, err := store.Objects().ListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectID{first.ID}, ids, "the losing create left no row")
 }
@@ -1379,13 +1379,13 @@ func TestObjectsUpdateSpecBumpsGeneration(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{"v":1}`),
 	})
 	require.NoError(t, err)
 
-	updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":2}`), 0)
+	updated, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 
 	assert.EqualValues(t, 2, updated.Generation, "spec change bumps generation")
@@ -1400,7 +1400,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{"v":1}`),
 	})
@@ -1408,13 +1408,13 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 
 	// Settle the object so observed_generation == generation; an idempotent
 	// update must leave it settled.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	again, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
+	again, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
 	require.NoError(t, err)
 
 	assert.EqualValues(t, created.Generation, again.Generation, "identical spec must not bump generation")
@@ -1431,8 +1431,8 @@ func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	updated, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	updated, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	require.NotNil(t, updated.ObservedGeneration)
@@ -1457,7 +1457,7 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 	assert.Zero(t, plain.StatusVersion, "status version defaults to 0")
 
 	// ObjectsCreate persists the caller-set spec version; status stays 0 (nil at create).
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        "v",
 		Spec:        []byte(`{}`),
 		SpecVersion: 3,
@@ -1466,20 +1466,20 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 	assert.EqualValues(t, 3, created.SpecVersion)
 	assert.Zero(t, created.StatusVersion)
 
-	reread, err := store.ObjectsGet(ctx, created.ID)
+	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, reread.SpecVersion, "spec version survives a re-read")
 	assert.Zero(t, reread.StatusVersion)
 
 	// UpdateStatus stamps only the status version, leaving spec untouched.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 7))
-	withStatus, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 7))
+	withStatus, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, withStatus.SpecVersion, "status write must not touch spec version")
 	assert.EqualValues(t, 7, withStatus.StatusVersion)
 
 	// ObjectsUpdateSpec stamps only the spec version, leaving status untouched.
-	withSpec, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 5)
+	withSpec, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 5)
 	require.NoError(t, err)
 	assert.EqualValues(t, 5, withSpec.SpecVersion)
 	assert.EqualValues(t, 7, withSpec.StatusVersion, "spec write must not touch status version")
@@ -1492,11 +1492,11 @@ func TestUpdateStatusRejectsFutureGeneration(t *testing.T) {
 	created := newRefObject(t, store)
 
 	// created.Generation is 1; reporting generation 5 is impossible to have seen.
-	err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`), 0)
 	require.ErrorIs(t, err, beehive.ErrObservedGenerationFuture)
 
 	// The rejected write must not have landed.
-	reread, err := store.ObjectsGet(ctx, created.ID)
+	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Nil(t, reread.ObservedGeneration, "rejected status write must not record observed generation")
 	assert.Empty(t, reread.Status, "rejected status write must not store status")
@@ -1508,13 +1508,13 @@ func TestUpdateStatusAcceptsStaleGeneration(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	bumped, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
 	// Controller reports it reconciled the now-stale generation 1.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0))
-	updated, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0))
+	updated, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated.ObservedGeneration)
 	assert.EqualValues(t, created.Generation, *updated.ObservedGeneration)
@@ -1532,14 +1532,14 @@ func TestUpdateStatusIdenticalStatusIsNoOp(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	first, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	again, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	assert.Equal(t, first.ResourceVersion, again.ResourceVersion, "identical status must not bump resource_version")
@@ -1554,14 +1554,14 @@ func TestUpdateStatusChangedStatusWrites(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	first, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 0))
-	again, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 0))
+	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	assert.Greater(t, again.ResourceVersion, first.ResourceVersion, "a real status change bumps resource_version")
@@ -1577,10 +1577,10 @@ func TestUpdateStatusNoOpStillRejectsFutureGeneration(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
-	err = store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`), 0)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`), 0)
 	require.ErrorIs(t, err, beehive.ErrObservedGenerationFuture)
 }
 
@@ -1591,14 +1591,14 @@ func TestUpdateStatusScopedOnBothBranches(t *testing.T) {
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
-	err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
 	for _, status := range [][]byte{[]byte(`{"msg":"hi"}`), []byte(`{"msg":"bye"}`)} {
-		err = store.ObjectsUpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, created.Generation, status, 0)
+		err = store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, created.Generation, status, 0)
 		assert.ErrorIs(t, err, beehive.ErrWrongKind)
 
-		err = store.ObjectsUpdateStatus(ctx, testGK, 999999, 1, status, 0)
+		err = store.Objects().UpdateStatus(ctx, testGK, 999999, 1, status, 0)
 		assert.ErrorIs(t, err, beehive.ErrNotFound)
 	}
 }
@@ -1616,19 +1616,19 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	err := store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
 	// New spec, same status: the reconcile observed generation 2 but wrote no
 	// new content.
-	bumped, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	again, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
+	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	require.NotNil(t, again.ObservedGeneration)
@@ -1640,20 +1640,20 @@ func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
 	// The convergence is observable: a consumer scanning the write log finds the
 	// row and re-reads it at the generation the controller settled.
 	assert.Equal(t, again.ResourceVersion, probe.expectWrite().ResourceVersion)
-	reread, err := store.ObjectsGet(ctx, created.ID)
+	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reread.ObservedGeneration)
 	assert.EqualValues(t, bumped.Generation, *reread.ObservedGeneration)
 
 	// It really settled: the owed-pass backstop no longer sees it.
-	unsettled, err := store.ObjectsListUnsettledIDs(ctx, testGK)
+	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.NotContains(t, unsettled, created.ID)
 
 	// And a second identical call, now with the generation already recorded,
 	// writes nothing at all.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	third, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
+	third, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, again.ObservedAt, third.ObservedAt, "no observed_at churn once the generation is recorded")
 	assert.Equal(t, again.ResourceVersion, third.ResourceVersion)
@@ -1672,13 +1672,13 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	bumped, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
 	// The newer reconcile lands first and settles the object at generation 2.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, settled.ObservedGeneration)
 	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
@@ -1686,8 +1686,8 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 	probe := newWriteProbe(t, store)
 
 	// The straggler, still holding generation 1, reports identical status.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	late, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	late, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	require.NotNil(t, late.ObservedGeneration)
@@ -1698,7 +1698,7 @@ func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
 	probe.expectNone()
 
 	// The object is still converged as far as the owed-pass backstop is concerned.
-	unsettled, err := store.ObjectsListUnsettledIDs(ctx, testGK)
+	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.NotContains(t, unsettled, created.ID)
 }
@@ -1716,19 +1716,19 @@ func TestUpdateStatusChangedStaleGenerationUnsettles(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	bumped, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, bumped.Generation)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, settled.ObservedGeneration)
 	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
 
 	// The straggler, still holding generation 1, writes different status.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"stale"}`), 0))
-	late, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"stale"}`), 0))
+	late, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	assert.JSONEq(t, `{"msg":"stale"}`, string(late.Status), "the status content lands")
@@ -1739,7 +1739,7 @@ func TestUpdateStatusChangedStaleGenerationUnsettles(t *testing.T) {
 
 	// The point of not clamping: the object is unsettled again, so the full pass
 	// backstop re-reconciles it and the stale content gets re-derived.
-	unsettled, err := store.ObjectsListUnsettledIDs(ctx, testGK)
+	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Contains(t, unsettled, created.ID)
 }
@@ -1757,21 +1757,21 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        uniqueName(),
 		Spec:        []byte(`{"v":1}`),
 		SpecVersion: 1,
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
 	// Same status bytes, newer status schema version: a real write, announced.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 2))
-	statusStamped, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 2))
+	statusStamped, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, statusStamped.StatusVersion, "the newer status version lands")
 	assert.Equal(t, 1, statusStamped.SpecVersion, "and leaves the spec version alone")
@@ -1781,7 +1781,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 
 	// Same spec bytes, newer spec schema version: likewise a real write, so the
 	// generation bump wakes the controller to re-derive from the reinterpreted spec.
-	specStamped, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 3)
+	specStamped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 3)
 	require.NoError(t, err)
 	assert.Equal(t, 3, specStamped.SpecVersion, "the newer spec version lands")
 	assert.Equal(t, 2, specStamped.StatusVersion, "and leaves the status version alone")
@@ -1790,7 +1790,7 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	probe.expectWrite()
 
 	// Both stamps survive a re-read.
-	reread, err := store.ObjectsGet(ctx, created.ID)
+	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, reread.SpecVersion)
 	assert.Equal(t, 2, reread.StatusVersion)
@@ -1803,24 +1803,24 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        uniqueName(),
 		Spec:        []byte(`{"v":1}`),
 		SpecVersion: 1,
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
-	again, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
+	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "no resource_version bump")
 
-	sameSpec, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 1)
+	sameSpec, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 1)
 	require.NoError(t, err)
 	assert.EqualValues(t, created.Generation, sameSpec.Generation, "no generation bump")
 	assert.Equal(t, settled.ResourceVersion, sameSpec.ResourceVersion, "no resource_version bump")
@@ -1839,14 +1839,14 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        uniqueName(),
 		Spec:        []byte(`{"v":3}`),
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, 3, settled.StatusVersion)
 
@@ -1854,17 +1854,17 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 
 	// A build that lost the kind's migrator (reporting 0) has no version opinion:
 	// the write goes through and leaves the tag alone.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	stale, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	stale, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, stale.StatusVersion, "a no-op status write never stamps backwards")
 
-	staleSpec, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":3}`), 0)
+	staleSpec, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":3}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, 3, staleSpec.SpecVersion, "a no-op spec write never stamps backwards (0 = no migrator)")
 
 	// The row is untouched: same versions on re-read, nothing announced.
-	reread, err := store.ObjectsGet(ctx, created.ID)
+	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, reread.SpecVersion)
 	assert.Equal(t, 3, reread.StatusVersion)
@@ -1879,21 +1879,21 @@ func TestNoOpWriteStampsUpwardWhileConverging(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        uniqueName(),
 		Spec:        []byte(`{}`),
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	err = store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
 	require.NoError(t, err)
 
-	bumped, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 3)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 3)
 	require.NoError(t, err)
 
 	// Converging at the new generation with identical status and no version opinion.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	got, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
+	got, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, got.StatusVersion, "the convergence write doesn't stamp backwards either")
 	require.NotNil(t, got.ObservedGeneration)
@@ -1911,27 +1911,27 @@ func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        uniqueName(),
 		Spec:        []byte(`{"v":3}`),
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	err = store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
 	require.NoError(t, err)
 
 	// Content no-op and real content change, spec and status alike.
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":3}`), 1)
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":3}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":9}`), 1)
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":9}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
-	err = store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
-	err = store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 1)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
 
 	// Nothing landed: the row still holds its v3 bytes at v3.
-	reread, err := store.ObjectsGet(ctx, created.ID)
+	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, reread.SpecVersion)
 	assert.Equal(t, 3, reread.StatusVersion)
@@ -1948,22 +1948,22 @@ func TestContentWriteWithNoMigratorKeepsSchemaVersion(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:        uniqueName(),
 		Spec:        []byte(`{"v":3}`),
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	err = store.ObjectsUpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
 	require.NoError(t, err)
 
-	updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, created.ID, []byte(`{"v":4}`), 0)
+	updated, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":4}`), 0)
 	require.NoError(t, err)
 	require.Greater(t, updated.Generation, created.Generation, "precondition: a real content write")
 	assert.Equal(t, 3, updated.SpecVersion, "a content write with no migrator keeps the stored version")
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, created.ID, updated.Generation, []byte(`{"msg":"bye"}`), 0))
-	settled, err := store.ObjectsGet(ctx, created.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, updated.Generation, []byte(`{"msg":"bye"}`), 0))
+	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, settled.StatusVersion, "same on the status half")
 }
@@ -1973,20 +1973,20 @@ func TestListObjects(t *testing.T) {
 	ctx := context.Background()
 
 	for _, n := range []string{"a", "b", "c"} {
-		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: n,
 			Spec: []byte(`{}`),
 		})
 		require.NoError(t, err)
 	}
 	// A different kind must not leak into the list.
-	_, err := store.ObjectsCreate(ctx, beehive.GroupKind{Group: "", Kind: "Other"}, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, beehive.GroupKind{Group: "", Kind: "Other"}, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 
-	list, err := store.ObjectsList(ctx, testGK)
+	list, err := store.Objects().List(ctx, testGK)
 	require.NoError(t, err)
 	require.Len(t, list, 3)
 
@@ -2001,12 +2001,12 @@ func TestResourceVersionIsMonotonic(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	a, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	a, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "a",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
-	b, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	b, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "b",
 		Spec: []byte(`{}`),
 	})
@@ -2014,7 +2014,7 @@ func TestResourceVersionIsMonotonic(t *testing.T) {
 	assert.Greater(t, b.ResourceVersion, a.ResourceVersion, "each create takes the next cursor value")
 
 	// A later mutation advances the global cursor past every prior write.
-	updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
+	updated, _, err := store.Objects().UpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 	assert.Greater(t, updated.ResourceVersion, b.ResourceVersion)
 }
@@ -2023,12 +2023,12 @@ func TestResourceVersionNotReusedAfterDelete(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	a, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	a, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "a",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
-	b, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	b, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "b",
 		Spec: []byte(`{}`),
 	})
@@ -2036,9 +2036,9 @@ func TestResourceVersionNotReusedAfterDelete(t *testing.T) {
 
 	// Delete the highest-versioned row, then write again. The cursor must not
 	// fall back to b's version — it only ever moves forward.
-	require.NoError(t, store.ObjectsDelete(ctx, b.ID))
+	require.NoError(t, store.Objects().Delete(ctx, b.ID))
 
-	updated, _, err := store.ObjectsUpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
+	updated, _, err := store.Objects().UpdateSpec(ctx, testGK, a.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 	assert.Greater(t, updated.ResourceVersion, b.ResourceVersion,
 		"a deleted row's resource_version must never be reused")
@@ -2053,7 +2053,7 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	res, err := store.DeletionRequests().Create(ctx, testGK, created.ID)
 	require.NoError(t, err)
 	assert.True(t, res.Marked, "first call is a real change")
-	first, err := store.ObjectsGet(ctx, created.ID)
+	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Greater(t, first.ResourceVersion, created.ResourceVersion,
 		"the first request is a real change and bumps the cursor")
@@ -2063,7 +2063,7 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	res, err = store.DeletionRequests().Create(ctx, testGK, created.ID)
 	require.NoError(t, err)
 	assert.False(t, res.Marked, "repeat call is an idempotent no-op")
-	second, err := store.ObjectsGet(ctx, created.ID)
+	second, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
 		"an idempotent repeat must not bump resource_version")
@@ -2096,7 +2096,7 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Marked)
 
-	marked, err := store.ObjectsGet(ctx, obj.ID)
+	marked, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	after := seqValue(t, store)
 	assert.Equal(t, before+1, after, "a stamped mark consumes exactly one version")
@@ -2126,11 +2126,11 @@ func TestGetObjectMetaSkipsConditions(t *testing.T) {
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	full, err := store.ObjectsGet(ctx, created.ID)
+	full, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.Len(t, full.Conditions, 1, "ObjectsGet assembles conditions")
 
-	meta, err := store.ObjectsGetMeta(ctx, created.ID)
+	meta, err := store.Objects().GetMeta(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Nil(t, meta.Conditions, "ObjectsGetMeta must not assemble conditions")
 	// Otherwise the same row: id and version match the conditions-laden read.
@@ -2159,10 +2159,10 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	require.Len(t, got.Children, 2)
 	assert.True(t, got.Children[0].Marked && got.Children[1].Marked, "this call stamped both")
 	probe.expectWrites(2)
-	a1, err := store.ObjectsGetMeta(ctx, childA)
+	a1, err := store.Objects().GetMeta(ctx, childA)
 	require.NoError(t, err)
 	require.NotNil(t, a1.DeletionRequestedAt, "child A marked for deletion")
-	b1, err := store.ObjectsGetMeta(ctx, childB)
+	b1, err := store.Objects().GetMeta(ctx, childB)
 	require.NoError(t, err)
 	require.NotNil(t, b1.DeletionRequestedAt, "child B marked for deletion")
 
@@ -2173,10 +2173,10 @@ func TestDeletionRequestsCreateFromOwnerCascadesThenIsNoOp(t *testing.T) {
 	require.Len(t, got2.Children, 2)
 	assert.False(t, got2.Children[0].Marked || got2.Children[1].Marked, "the repeat stamped neither")
 	probe.expectNone()
-	a2, err := store.ObjectsGetMeta(ctx, childA)
+	a2, err := store.Objects().GetMeta(ctx, childA)
 	require.NoError(t, err)
 	assert.Equal(t, a1.ResourceVersion, a2.ResourceVersion, "no re-mark, no rv churn")
-	b2, err := store.ObjectsGetMeta(ctx, childB)
+	b2, err := store.Objects().GetMeta(ctx, childB)
 	require.NoError(t, err)
 	assert.Equal(t, b1.ResourceVersion, b2.ResourceVersion)
 }
@@ -2249,7 +2249,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:       uniqueName(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"a", "b"},
@@ -2260,9 +2260,9 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 
 	// Removing a present finalizer is a real change: only that finalizer drops,
 	// resource_version bumps, and watchers see a Modified event.
-	_, err = store.FinalizersDelete(ctx, testGK, created.ID, "a")
+	_, err = store.Objects().DeleteFinalizer(ctx, testGK, created.ID, "a")
 	require.NoError(t, err)
-	got, err := store.ObjectsGet(ctx, created.ID)
+	got, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, got.Finalizers)
 	assert.Greater(t, got.ResourceVersion, created.ResourceVersion)
@@ -2271,7 +2271,7 @@ func TestDeleteFinalizerRemovesOneAndEmits(t *testing.T) {
 		"the finalizer removal is observable in the write log")
 
 	// Persisted, not just reflected in the returned struct.
-	reloaded, err := store.ObjectsGet(ctx, created.ID)
+	reloaded, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, reloaded.Finalizers)
 }
@@ -2280,7 +2280,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:       uniqueName(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"a"},
@@ -2292,9 +2292,9 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 	// Removing a finalizer that isn't present changes nothing: the list is intact,
 	// resource_version is unbumped, and no event fires (a watcher would otherwise
 	// see a spurious diff).
-	_, err = store.FinalizersDelete(ctx, testGK, created.ID, "missing")
+	_, err = store.Objects().DeleteFinalizer(ctx, testGK, created.ID, "missing")
 	require.NoError(t, err)
-	got, err := store.ObjectsGet(ctx, created.ID)
+	got, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a"}, got.Finalizers)
 	assert.Equal(t, created.ResourceVersion, got.ResourceVersion)
@@ -2303,7 +2303,7 @@ func TestDeleteFinalizerAbsentIsNoOp(t *testing.T) {
 
 func TestDeleteFinalizerMissingObject(t *testing.T) {
 	store := newTestStore(t)
-	_, err := store.FinalizersDelete(context.Background(), testGK, 999, "a")
+	_, err := store.Objects().DeleteFinalizer(context.Background(), testGK, 999, "a")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
@@ -2327,7 +2327,7 @@ func TestDeleteFinalizerReportsClearedLast(t *testing.T) {
 			store := newTestStore(t)
 			ctx := context.Background()
 
-			created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 				Name:       uniqueName(),
 				Spec:       []byte(`{}`),
 				Finalizers: tt.finalizers,
@@ -2338,7 +2338,7 @@ func TestDeleteFinalizerReportsClearedLast(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			clearedLast, err := store.FinalizersDelete(ctx, testGK, created.ID, tt.remove)
+			clearedLast, err := store.Objects().DeleteFinalizer(ctx, testGK, created.ID, tt.remove)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, clearedLast)
 		})
@@ -2614,11 +2614,11 @@ func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 
 	ops := map[string]func() error{
 		"ObjectsUpdateSpec": func() error {
-			_, _, err := store.ObjectsUpdateSpec(ctx, testGK, missing, []byte(`{}`), 0)
+			_, _, err := store.Objects().UpdateSpec(ctx, testGK, missing, []byte(`{}`), 0)
 			return err
 		},
 		"UpdateStatus": func() error {
-			err := store.ObjectsUpdateStatus(ctx, testGK, missing, 1, []byte(`{}`), 0)
+			err := store.Objects().UpdateStatus(ctx, testGK, missing, 1, []byte(`{}`), 0)
 			return err
 		},
 		"DeletionRequestsCreate": func() error {
@@ -2647,13 +2647,13 @@ func TestDeletionRequestsCreateIsIdempotent(t *testing.T) {
 
 	_, err := store.DeletionRequests().Create(ctx, testGK, created.ID)
 	require.NoError(t, err)
-	first, err := store.ObjectsGet(ctx, created.ID)
+	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, first.DeletionRequestedAt)
 
 	_, err = store.DeletionRequests().Create(ctx, testGK, created.ID)
 	require.NoError(t, err)
-	second, err := store.ObjectsGet(ctx, created.ID)
+	second, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, second.DeletionRequestedAt)
 	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,
@@ -2667,7 +2667,7 @@ func TestDeletionRequestsCreateByNameIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "w1",
 		Spec: []byte(`{}`),
 	})
@@ -2676,14 +2676,14 @@ func TestDeletionRequestsCreateByNameIsIdempotent(t *testing.T) {
 	res, err := store.DeletionRequests().CreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.True(t, res.Marked, "this call set the flag")
-	first, err := store.ObjectsGetByName(ctx, testGK, "w1")
+	first, err := store.Objects().GetByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.NotNil(t, first.DeletionRequestedAt, "the name's own row is the one marked")
 
 	res, err = store.DeletionRequests().CreateByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	assert.False(t, res.Marked, "the repeat changed nothing")
-	second, err := store.ObjectsGetByName(ctx, testGK, "w1")
+	second, err := store.Objects().GetByName(ctx, testGK, "w1")
 	require.NoError(t, err)
 	require.NotNil(t, second.DeletionRequestedAt)
 	assert.Equal(t, *first.DeletionRequestedAt, *second.DeletionRequestedAt,
@@ -2699,7 +2699,7 @@ func TestDeletionRequestsCreateByNameReturnsTheMarkedID(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "w1",
 		Spec: []byte(`{}`),
 	})
@@ -2722,7 +2722,7 @@ func TestDeletionRequestsCreateByNameIsKindScoped(t *testing.T) {
 	ctx := context.Background()
 	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
 
-	other, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	other, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: "shared",
 		Spec: []byte(`{}`),
 	})
@@ -2732,7 +2732,7 @@ func TestDeletionRequestsCreateByNameIsKindScoped(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 	assert.NotErrorIs(t, err, beehive.ErrWrongKind)
 
-	got, err := store.ObjectsGet(ctx, other.ID)
+	got, err := store.Objects().Get(ctx, other.ID)
 	require.NoError(t, err)
 	assert.Nil(t, got.DeletionRequestedAt, "the other kind's row is untouched")
 }
@@ -2743,12 +2743,12 @@ func TestDeleteObject(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.ObjectsDelete(ctx, created.ID))
+	require.NoError(t, store.Objects().Delete(ctx, created.ID))
 
-	_, err := store.ObjectsGet(ctx, created.ID)
+	_, err := store.Objects().Get(ctx, created.ID)
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 
-	assert.ErrorIs(t, store.ObjectsDelete(ctx, created.ID), beehive.ErrNotFound,
+	assert.ErrorIs(t, store.Objects().Delete(ctx, created.ID), beehive.ErrNotFound,
 		"deleting a missing row reports not found")
 }
 
@@ -2759,7 +2759,7 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 	// Commit: writes inside a successful Within are visible afterward.
 	var committedID beehive.ObjectID
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
-		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: "committed",
 			Spec: []byte(`{}`),
 		})
@@ -2769,13 +2769,13 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 		committedID = obj.ID
 		return nil
 	}))
-	_, err := store.ObjectsGet(ctx, committedID)
+	_, err := store.Objects().Get(ctx, committedID)
 	assert.NoError(t, err)
 
 	// Rollback: a non-nil error discards every write in the transaction.
 	sentinel := errors.New("boom")
 	err = store.Within(ctx, func(ctx context.Context) error {
-		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: "rolledback",
 			Spec: []byte(`{}`),
 		})
@@ -2783,7 +2783,7 @@ func TestWithinCommitsAndRollsBack(t *testing.T) {
 		return sentinel
 	})
 	assert.ErrorIs(t, err, sentinel)
-	_, err = store.ObjectsGetByName(ctx, testGK, "rolledback")
+	_, err = store.Objects().GetByName(ctx, testGK, "rolledback")
 	assert.ErrorIs(t, err, beehive.ErrNotFound, "rolled-back write must not persist")
 }
 
@@ -2801,7 +2801,7 @@ func TestAfterCommit(t *testing.T) {
 	var order []string
 	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
 		return store.Within(ctx, func(ctx context.Context) error {
-			obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 				Name: "hooked",
 				Spec: []byte(`{}`),
 			})
@@ -2811,10 +2811,10 @@ func TestAfterCommit(t *testing.T) {
 				// The hook's ctx is detached from the (now committed) transaction, so
 				// this read runs on the pool and the write below opens a fresh
 				// transaction instead of joining a dead *sql.Tx.
-				_, err := store.ObjectsGet(hookCtx, obj.ID)
+				_, err := store.Objects().Get(hookCtx, obj.ID)
 				assert.NoError(t, err, "hook must see the committed row")
 				assert.NoError(t, store.Within(hookCtx, func(hookCtx context.Context) error {
-					_, _, err := store.ObjectsUpdateSpec(hookCtx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+					_, _, err := store.Objects().UpdateSpec(hookCtx, testGK, obj.ID, []byte(`{"a":1}`), 0)
 					return err
 				}), "a hook must be able to open its own transaction")
 			})
@@ -2862,7 +2862,7 @@ func TestAfterCommit(t *testing.T) {
 // ctx carries. The savepoint tests use names to tell writes apart after the fact.
 func createIn(t *testing.T, store beehive.Store, ctx context.Context, name string) {
 	t.Helper()
-	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: name,
 		Spec: []byte(`{}`),
 	})
@@ -2873,7 +2873,7 @@ func createIn(t *testing.T, store beehive.Store, ctx context.Context, name strin
 // transaction.
 func committed(t *testing.T, store beehive.Store, name string) bool {
 	t.Helper()
-	_, err := store.ObjectsGetByName(context.Background(), testGK, name)
+	_, err := store.Objects().GetByName(context.Background(), testGK, name)
 	if errors.Is(err, beehive.ErrNotFound) {
 		return false
 	}
@@ -3004,7 +3004,7 @@ func TestWithinFailedUnwindPoisonsTheTransaction(t *testing.T) {
 
 		// Swallowed, as a careless caller would. Further nested work must be refused
 		// rather than accumulate on a transaction in unknown state.
-		_, refused = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		_, refused = store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: "after",
 			Spec: []byte(`{}`),
 		})
@@ -3039,7 +3039,7 @@ func TestWithinOnAClosedTransactionOpensAFreshOne(t *testing.T) {
 			})
 			// conn has to agree with Within, or the same ctx takes a fresh
 			// transaction one way and a dead one the other.
-			_, readErr = store.ObjectsGetByName(txCtx, testGK, "seed")
+			_, readErr = store.Objects().GetByName(txCtx, testGK, "seed")
 		})
 		return nil
 	}))
@@ -3308,7 +3308,7 @@ func TestWithinRefusesToCommitWhileANestedFrameIsOpen(t *testing.T) {
 			// outlives its transaction. require would also be illegal off the test
 			// goroutine.
 			_ = store.Within(txCtx, func(nested context.Context) error {
-				_, _ = store.ObjectsCreate(nested, testGK, beehive.ObjectsCreateInput{
+				_, _ = store.Objects().Create(nested, testGK, beehive.ObjectsCreateInput{
 					Name: "orphan",
 					Spec: []byte(`{}`),
 				})
@@ -3386,7 +3386,7 @@ func TestWithinRefusesAContextFromAnUnwoundFrame(t *testing.T) {
 		// A live sibling at the same depth: the dead ctx's depth now matches the
 		// height again, which is all admission used to look at.
 		return store.Within(txCtx, func(context.Context) error {
-			_, createErr := store.ObjectsCreate(captured, testGK, beehive.ObjectsCreateInput{
+			_, createErr := store.Objects().Create(captured, testGK, beehive.ObjectsCreateInput{
 				Name: "revived",
 				Spec: []byte(`{}`),
 			})
@@ -3444,7 +3444,7 @@ func TestObjectsListUnsettledIDs(t *testing.T) {
 
 	// settled: ObservedGeneration == Generation — must NOT appear
 	settled := newRefObject(t, store)
-	err := store.ObjectsUpdateStatus(ctx, testGK, settled.ID, settled.Generation, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, settled.ID, settled.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 
 	// unsettled: ObservedGeneration is nil — must appear
@@ -3452,24 +3452,24 @@ func TestObjectsListUnsettledIDs(t *testing.T) {
 
 	// unsettled: ObservedGeneration < Generation (spec changed after reconcile) — must appear
 	stale := newRefObject(t, store)
-	err = store.ObjectsUpdateStatus(ctx, testGK, stale.ID, stale.Generation, []byte(`{}`), 0)
+	err = store.Objects().UpdateStatus(ctx, testGK, stale.ID, stale.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, stale.ID, []byte(`{"updated":true}`), 0)
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, stale.ID, []byte(`{"updated":true}`), 0)
 	require.NoError(t, err)
 
 	// different kind — must NOT appear
-	_, err = store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 
-	ids, err := store.ObjectsListUnsettledIDs(ctx, testGK)
+	ids, err := store.Objects().ListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{nilObs.ID, stale.ID}, ids)
 
 	// ObjectsListIDs returns every object of the kind, settled or not, ordered by id.
-	all, err := store.ObjectsListIDs(ctx, testGK)
+	all, err := store.Objects().ListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{settled.ID, nilObs.ID, stale.ID}, all)
 }
@@ -3478,7 +3478,7 @@ func TestListIDsQueryError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.ObjectsListIDs(context.Background(), testGK)
+	_, err := store.Objects().ListIDs(context.Background(), testGK)
 	require.Error(t, err)
 }
 
@@ -3491,7 +3491,7 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	sentinel := errors.New("outer boom")
 	err := store.Within(ctx, func(ctx context.Context) error {
 		if err := store.Within(ctx, func(ctx context.Context) error {
-			_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+			_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 				Name: "nested",
 				Spec: []byte(`{}`),
 			})
@@ -3503,7 +3503,7 @@ func TestNestedWithinJoinsOuterTransaction(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, sentinel)
 
-	_, err = store.ObjectsGetByName(ctx, testGK, "nested")
+	_, err = store.Objects().GetByName(ctx, testGK, "nested")
 	assert.ErrorIs(t, err, beehive.ErrNotFound,
 		"nested Within joins the outer tx, so the outer rollback discards its write")
 }
@@ -3614,7 +3614,7 @@ func TestObjectsCreateDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(context.Background(), testGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -3625,7 +3625,7 @@ func TestListObjectsQueryError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.ObjectsList(context.Background(), testGK)
+	_, err := store.Objects().List(context.Background(), testGK)
 	require.Error(t, err)
 }
 
@@ -3640,7 +3640,7 @@ func TestListObjectsScanError(t *testing.T) {
 		`UPDATE objects SET finalizers = 'not-valid-json' WHERE id = ?`, created.ID)
 	require.NoError(t, err)
 
-	_, err = store.ObjectsList(ctx, testGK)
+	_, err = store.Objects().List(ctx, testGK)
 	require.Error(t, err)
 }
 
@@ -3648,14 +3648,14 @@ func TestObjectsListUnsettledIDsQueryError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.ObjectsListUnsettledIDs(context.Background(), testGK)
+	_, err := store.Objects().ListUnsettledIDs(context.Background(), testGK)
 	require.Error(t, err)
 }
 
 // reconcileOwed reads an object's owed-wake count off the row.
 func reconcileOwed(t *testing.T, store *sqliteStore, id beehive.ObjectID) int64 {
 	t.Helper()
-	obj, err := store.ObjectsGet(context.Background(), id)
+	obj, err := store.Objects().Get(context.Background(), id)
 	require.NoError(t, err)
 	return obj.ReconcileOwed
 }
@@ -3731,7 +3731,7 @@ func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
-	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
+	require.NoError(t, store.Objects().Delete(ctx, a.ID))
 
 	assert.NoError(t, store.ReconcileOwed().Decrement(ctx, testGK, a.ID, 1))
 }
@@ -3742,7 +3742,7 @@ var clientOnlyGK = beehive.GroupKind{Kind: "ClientOnly"}
 
 func newKindObject(t *testing.T, store beehive.Store, gk beehive.GroupKind) *beehive.RawObject {
 	t.Helper()
-	obj, err := store.ObjectsCreate(context.Background(), gk, beehive.ObjectsCreateInput{
+	obj, err := store.Objects().Create(context.Background(), gk, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -3908,7 +3908,7 @@ func TestReconcileOwedStampSkipsVanishedRows(t *testing.T) {
 	ctx := context.Background()
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
+	require.NoError(t, store.Objects().Delete(ctx, a.ID))
 
 	err := store.ReconcileOwed().Stamp(ctx, []beehive.ObjectRef{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
@@ -3958,7 +3958,7 @@ func TestObjectsUpdateSpecDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, _, err := store.ObjectsUpdateSpec(context.Background(), testGK, 1, []byte(`{}`), 0)
+	_, _, err := store.Objects().UpdateSpec(context.Background(), testGK, 1, []byte(`{}`), 0)
 	require.Error(t, err)
 }
 
@@ -3966,7 +3966,7 @@ func TestUpdateStatusDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	err := store.ObjectsUpdateStatus(context.Background(), testGK, 1, 1, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(context.Background(), testGK, 1, 1, []byte(`{}`), 0)
 	require.Error(t, err)
 }
 
@@ -4026,11 +4026,11 @@ func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	hideObjectColumn(t, store, "spec")
 
 	status := []byte(`{"msg":"hi"}`)
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 0, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 0, status, 0),
 		"the content branch")
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 1, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 1, status, 0),
 		"identical bytes, handshake advancing")
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, id, 1, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 1, status, 0),
 		"identical bytes at a recorded generation: nothing written")
 
 	var obs int64
@@ -4041,9 +4041,9 @@ func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	assert.JSONEq(t, `{"msg":"hi"}`, stored)
 
 	// The gates still answer from the columns it does read.
-	assert.ErrorIs(t, store.ObjectsUpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, 1, status, 0),
+	assert.ErrorIs(t, store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, 1, status, 0),
 		beehive.ErrWrongKind)
-	assert.ErrorIs(t, store.ObjectsUpdateStatus(ctx, testGK, id, 99, status, 0),
+	assert.ErrorIs(t, store.Objects().UpdateStatus(ctx, testGK, id, 99, status, 0),
 		beehive.ErrObservedGenerationFuture)
 }
 
@@ -4054,7 +4054,7 @@ func TestDeleteFinalizerReadsNoBlobBesidesTheList(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)
 
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:       uniqueName(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"a", "b"},
@@ -4065,11 +4065,11 @@ func TestDeleteFinalizerReadsNoBlobBesidesTheList(t *testing.T) {
 	hideObjectColumn(t, store, "spec")
 	hideObjectColumn(t, store, "status")
 
-	clearedLast, err := store.FinalizersDelete(ctx, testGK, created.ID, "a")
+	clearedLast, err := store.Objects().DeleteFinalizer(ctx, testGK, created.ID, "a")
 	require.NoError(t, err)
 	assert.False(t, clearedLast, "b is still held")
 
-	clearedLast, err = store.FinalizersDelete(ctx, testGK, created.ID, "b")
+	clearedLast, err = store.Objects().DeleteFinalizer(ctx, testGK, created.ID, "b")
 	require.NoError(t, err)
 	assert.True(t, clearedLast, "the last finalizer off a deleting object")
 
@@ -4079,9 +4079,9 @@ func TestDeleteFinalizerReadsNoBlobBesidesTheList(t *testing.T) {
 	assert.JSONEq(t, `[]`, finalizers)
 
 	// The gates still answer from the columns it does read.
-	_, err = store.FinalizersDelete(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, "a")
+	_, err = store.Objects().DeleteFinalizer(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, "a")
 	assert.ErrorIs(t, err, beehive.ErrWrongKind)
-	_, err = store.FinalizersDelete(ctx, testGK, 999999, "a")
+	_, err = store.Objects().DeleteFinalizer(ctx, testGK, 999999, "a")
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
 }
 
@@ -4092,7 +4092,7 @@ func TestDeleteFinalizerRefusesAnUndecodableList(t *testing.T) {
 	store := newRawStore(t)
 	id := insertBadFinalizersRow(t, store, testGK)
 
-	_, err := store.FinalizersDelete(context.Background(), testGK, id, "a")
+	_, err := store.Objects().DeleteFinalizer(context.Background(), testGK, id, "a")
 	require.Error(t, err)
 }
 
@@ -4109,7 +4109,7 @@ func TestDeletionRequestsCreateVersionDrawError(t *testing.T) {
 	_, err := store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.Error(t, err)
 
-	reloaded, err := store.ObjectsGet(ctx, obj.ID)
+	reloaded, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, reloaded.DeletionRequestedAt, "the mark rolled back with the draw")
 }
@@ -4176,7 +4176,7 @@ func TestDeleteObjectDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	err := store.ObjectsDelete(context.Background(), 1)
+	err := store.Objects().Delete(context.Background(), 1)
 	require.Error(t, err)
 }
 
@@ -4184,7 +4184,7 @@ func TestScanObjectBadFinalizersJSON(t *testing.T) {
 	store := newRawStore(t)
 	id := insertBadFinalizersRow(t, store, testGK)
 
-	_, err := store.ObjectsGet(context.Background(), id)
+	_, err := store.Objects().Get(context.Background(), id)
 	require.Error(t, err)
 }
 
@@ -4561,10 +4561,10 @@ func TestRefsAddNoVersionBumpNoEvent(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, a.ID, b.ID, "depends_on"))
 	probe.expectNone()
 
-	gotA, err := store.ObjectsGet(ctx, a.ID)
+	gotA, err := store.Objects().Get(ctx, a.ID)
 	require.NoError(t, err)
 	assert.Equal(t, a.ResourceVersion, gotA.ResourceVersion, "a ref edge does not bump the from object")
-	gotB, err := store.ObjectsGet(ctx, b.ID)
+	gotB, err := store.Objects().Get(ctx, b.ID)
 	require.NoError(t, err)
 	assert.Equal(t, b.ResourceVersion, gotB.ResourceVersion, "a ref edge does not bump the to object")
 }
@@ -4798,7 +4798,7 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 	// Two children of testGK plus one of another kind, all owned by owner.
 	c2 := newRefObject(t, store)
 	c1 := newRefObject(t, store)
-	foreign, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	foreign, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -4814,7 +4814,7 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	got, err := store.ObjectsListByIncomingEdge(ctx, testGK, owner.ID, "owned_by")
+	got, err := store.Objects().ListByIncomingEdge(ctx, testGK, owner.ID, "owned_by")
 	require.NoError(t, err)
 	require.Len(t, got, 2, "the foreign-kind child and the depends_on referrer are excluded")
 	// Ordered by id (c2 was created first), with full rows and conditions attached.
@@ -4824,11 +4824,11 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 	require.Len(t, got[1].Conditions, 1)
 	assert.Equal(t, "Ready", got[1].Conditions[0].Type)
 
-	none, err := store.ObjectsListByIncomingEdge(ctx, testGK, c1.ID, "owned_by")
+	none, err := store.Objects().ListByIncomingEdge(ctx, testGK, c1.ID, "owned_by")
 	require.NoError(t, err)
 	assert.Empty(t, none, "an owner with no children of this kind reads empty")
 
-	missing, err := store.ObjectsListByIncomingEdge(ctx, testGK, 99999, "owned_by")
+	missing, err := store.Objects().ListByIncomingEdge(ctx, testGK, 99999, "owned_by")
 	require.NoError(t, err)
 	assert.Empty(t, missing, "a nonexistent owner reads empty, not ErrNotFound")
 }
@@ -4836,7 +4836,7 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 func TestObjectsListByIncomingRefDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, err := store.ObjectsListByIncomingEdge(context.Background(), testGK, 1, "owned_by")
+	_, err := store.Objects().ListByIncomingEdge(context.Background(), testGK, 1, "owned_by")
 	require.Error(t, err)
 }
 
@@ -4893,7 +4893,7 @@ func TestRefsListIncomingDBError(t *testing.T) {
 // newConditionObject creates a bare object to hang conditions on.
 func newConditionObject(t *testing.T, store beehive.Store, name string) *beehive.RawObject {
 	t.Helper()
-	obj, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
+	obj, err := store.Objects().Create(context.Background(), testGK, beehive.ObjectsCreateInput{
 		Name: name,
 		Spec: []byte(`{}`),
 	})
@@ -4919,7 +4919,7 @@ func TestSetConditionReadBack(t *testing.T) {
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{
 		Type: "Ready", Status: "True", Reason: "Provisioned", Message: "all good",
 	}))
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 
 	cond := findCondition(got.Conditions, "Ready")
@@ -4951,15 +4951,15 @@ func TestConditionsSurfaceOnReads(t *testing.T) {
 		assert.Equal(t, "Degraded", healthy.Reason)
 	}
 
-	byID, err := store.ObjectsGet(ctx, obj.ID)
+	byID, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assertBoth(t, byID.Conditions)
 
-	byName, err := store.ObjectsGetByName(ctx, testGK, "multi-read")
+	byName, err := store.Objects().GetByName(ctx, testGK, "multi-read")
 	require.NoError(t, err)
 	assertBoth(t, byName.Conditions)
 
-	list, err := store.ObjectsList(ctx, testGK)
+	list, err := store.Objects().List(ctx, testGK)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assertBoth(t, list[0].Conditions)
@@ -4985,7 +4985,7 @@ func TestSetConditionTransitionedAt(t *testing.T) {
 	// Same status, different reason: transitioned_at is preserved at the sentinel.
 	backdate()
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "B"}))
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, time.UnixMilli(sentinel).UTC(), findCondition(got.Conditions, "Ready").TransitionedAt,
 		"same status keeps transitioned_at")
@@ -4993,7 +4993,7 @@ func TestSetConditionTransitionedAt(t *testing.T) {
 	// Status change: transitioned_at advances to the write's fresh stamp.
 	backdate()
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False", Reason: "C"}))
-	got, err = store.ObjectsGet(ctx, obj.ID)
+	got, err = store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	changed := findCondition(got.Conditions, "Ready")
 	assert.True(t, changed.TransitionedAt.After(time.UnixMilli(sentinel).UTC()),
@@ -5010,7 +5010,7 @@ func TestSetConditionEmitsAndBumpsResourceVersion(t *testing.T) {
 	probe := newWriteProbe(t, store)
 
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"}))
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Greater(t, got.ResourceVersion, obj.ResourceVersion, "a condition change bumps resource_version")
 
@@ -5024,14 +5024,14 @@ func TestSetConditionNoOpSuppressed(t *testing.T) {
 	obj := newConditionObject(t, store, "noop")
 
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"}))
-	first, err := store.ObjectsGet(ctx, obj.ID)
+	first, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
 	// An identical write changes nothing: no resource_version bump, no event.
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"}))
-	again, err := store.ObjectsGet(ctx, obj.ID)
+	again, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, again.ResourceVersion, "identical condition write is a no-op")
 	probe.expectNone()
@@ -5050,7 +5050,7 @@ func TestDeleteCondition(t *testing.T) {
 	probe := newWriteProbe(t, store)
 
 	require.NoError(t, store.Conditions().Delete(ctx, testGK, obj.ID, "Ready"))
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "Ready removed")
 	require.NotNil(t, findCondition(got.Conditions, "Healthy"), "Healthy untouched")
@@ -5067,7 +5067,7 @@ func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
 	probe := newWriteProbe(t, store)
 
 	require.NoError(t, store.Conditions().Delete(ctx, testGK, obj.ID, "Ready"))
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, obj.ResourceVersion, got.ResourceVersion, "deleting an absent condition is a no-op")
 	probe.expectNone()
@@ -5088,14 +5088,14 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 
 	// UpdateStatus returns no row, so there is nothing here to assemble; it must
 	// still leave the condition alone, and still emit.
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"v":1}`), 0))
-	updated, err := store.ObjectsGet(ctx, obj.ID)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"v":1}`), 0))
+	updated, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(updated.Conditions, "Ready"), "a status write must not disturb conditions")
 	probe.expectWrite()
 
 	// ObjectsUpdateSpec too.
-	spec, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"s":1}`), 0)
+	spec, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"s":1}`), 0)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(spec.Conditions, "Ready"), "ObjectsUpdateSpec result carries conditions")
 	probe.expectWrite()
@@ -5103,7 +5103,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	// DeletionRequestsCreate (the row persists; conditions still exist).
 	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err)
-	del, err := store.ObjectsGet(ctx, obj.ID)
+	del, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(del.Conditions, "Ready"), "a deletion mark must not disturb conditions")
 	probe.expectWrite()
@@ -5122,7 +5122,7 @@ func TestOnlyUpdateSpecCanFailAssemblingConditions(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE conditions`)
 	require.NoError(t, err)
 
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0),
 		"a status write does not read conditions, so a missing table cannot fail it")
 	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err, "nor does a deletion mark")
@@ -5132,10 +5132,10 @@ func TestOnlyUpdateSpecCanFailAssemblingConditions(t *testing.T) {
 	// (scanWritten); an identical one returns the row it read (attachConditions
 	// directly). newConditionObject's spec is `{}`, so the order matters: the
 	// changed write has to come first for the second call to be the no-op.
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.Error(t, err, "the write path assembles through scanWritten")
 
-	_, _, err = store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.Error(t, err, "the content no-op assembles onto the row it read")
 }
 
@@ -5147,7 +5147,7 @@ func TestDeleteObjectCascadesConditions(t *testing.T) {
 	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	var count int
 	require.NoError(t, store.db.QueryRowContext(ctx,
@@ -5172,7 +5172,7 @@ func TestLivenessDowngradedToUnknownBeforeProcessStart(t *testing.T) {
 	// is no longer re-confirmed by this process, so it reads as "verifying".
 	store.processStart = time.Now().Add(time.Hour)
 
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	live := findCondition(got.Conditions, "Connected")
 	truth := findCondition(got.Conditions, "Provisioned")
@@ -5195,7 +5195,7 @@ func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
 	_, err = store.db.ExecContext(ctx,
 		`UPDATE conditions SET updated_at = 0 WHERE object_id = ? AND type = 'Connected'`, obj.ID)
 	require.NoError(t, err)
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.Equal(t, "Unknown", findCondition(got.Conditions, "Connected").Status, "precondition: reads as verifying")
 
@@ -5206,7 +5206,7 @@ func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
 		storeapi.Condition{Type: "Connected", Status: "True", Reason: "Dialed", Liveness: true})
 	require.NoError(t, err)
 
-	got, err = store.ObjectsGet(ctx, obj.ID)
+	got, err = store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "True", findCondition(got.Conditions, "Connected").Status,
 		"re-confirmed liveness condition is no longer downgraded")
@@ -5277,13 +5277,13 @@ func TestConditionAssemblyError(t *testing.T) {
 
 	breakConditionRowRead(t, store, obj.ID)
 
-	_, err := store.ObjectsGet(ctx, obj.ID)
+	_, err := store.Objects().Get(ctx, obj.ID)
 	require.Error(t, err, "ObjectsGet surfaces a conditions scan error")
 
-	_, err = store.ObjectsList(ctx, testGK)
+	_, err = store.Objects().List(ctx, testGK)
 	require.Error(t, err, "ObjectsList surfaces a conditions scan error")
 
-	_, err = store.ObjectsGetForReconcile(ctx, obj.ID)
+	_, err = store.Objects().GetForReconcile(ctx, obj.ID)
 	require.Error(t, err, "ObjectsGetForReconcile surfaces a conditions scan error")
 }
 
@@ -5306,7 +5306,7 @@ func TestConditionResourceVersionError(t *testing.T) {
 	// A real change whose version bump fails: the whole call rolls back.
 	err = store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
-	got, err := store.ObjectsGet(ctx, obj.ID)
+	got, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	ready := findCondition(got.Conditions, "Ready")
 	require.NotNil(t, ready, "rolled-back ConditionsSet must not delete the prior condition")
@@ -5315,7 +5315,7 @@ func TestConditionResourceVersionError(t *testing.T) {
 	// A delete whose version bump fails likewise rolls back, leaving the row.
 	err = store.Conditions().Delete(ctx, testGK, obj.ID, "Ready")
 	require.Error(t, err)
-	got, err = store.ObjectsGet(ctx, obj.ID)
+	got, err = store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, findCondition(got.Conditions, "Ready"), "rolled-back ConditionsDelete must leave the condition in place")
 }
@@ -5377,7 +5377,7 @@ func TestListObjectsConditionsChunks(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	got, err := store.ObjectsList(ctx, testGK)
+	got, err := store.Objects().List(ctx, testGK)
 	require.NoError(t, err)
 	require.Len(t, got, 5)
 	for _, obj := range got {
@@ -5402,7 +5402,7 @@ func TestObjectsUpdateSpecResourceVersionError(t *testing.T) {
 	obj := newRefObject(t, store)
 	dropSeq(t, store)
 
-	_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"changed":true}`), 0)
+	_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"changed":true}`), 0)
 	require.Error(t, err)
 }
 
@@ -5414,7 +5414,7 @@ func TestUpdateStatusResourceVersionError(t *testing.T) {
 	obj := newRefObject(t, store)
 	dropSeq(t, store)
 
-	err := store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0)
 	require.Error(t, err)
 }
 
@@ -5470,7 +5470,7 @@ func TestObjectsUpdateSpecCrossVersionUpdateError(t *testing.T) {
 	obj := newRefObject(t, store)
 	blockObjectUpdates(t, store)
 
-	_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, obj.Spec, 1)
+	_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, obj.Spec, 1)
 	require.Error(t, err)
 }
 
@@ -5482,12 +5482,12 @@ func TestUpdateStatusCrossVersionUpdateError(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 	status := []byte(`{"ok":true}`)
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 1))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 1))
 	blockObjectUpdates(t, store)
 
 	// obj.Generation is the generation the call above settled at, so re-reading the
 	// row to recover it would only echo the argument.
-	err := store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 2)
+	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 2)
 	require.Error(t, err)
 }
 
@@ -5501,11 +5501,11 @@ func TestUpdateStatusHandshakeResourceVersionError(t *testing.T) {
 	status := []byte(`{"ok":true}`)
 	// Settle at generation 0 first, so the repeat call at the object's real
 	// generation is an unsettled no-op rather than the already-settled path.
-	err := store.ObjectsUpdateStatus(ctx, testGK, obj.ID, 0, status, 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, 0, status, 0)
 	require.NoError(t, err)
 	dropSeq(t, store)
 
-	err = store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 0)
+	err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 0)
 	require.Error(t, err)
 }
 
@@ -5539,7 +5539,7 @@ func TestDeleteConditionDeleteExecError(t *testing.T) {
 func TestDeleteFinalizerResourceVersionError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name:       uniqueName(),
 		Spec:       []byte(`{}`),
 		Finalizers: []string{"f"},
@@ -5547,7 +5547,7 @@ func TestDeleteFinalizerResourceVersionError(t *testing.T) {
 	require.NoError(t, err)
 	dropSeq(t, store)
 
-	_, err = store.FinalizersDelete(ctx, testGK, obj.ID, "f")
+	_, err = store.Objects().DeleteFinalizer(ctx, testGK, obj.ID, "f")
 	require.Error(t, err)
 }
 
@@ -5596,7 +5596,7 @@ func TestDeletionRequestsCreateFromOwnerMarkErrors(t *testing.T) {
 			_, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID)
 			require.Error(t, err)
 
-			meta, err := store.ObjectsGetMeta(ctx, child.ID)
+			meta, err := store.Objects().GetMeta(ctx, child.ID)
 			require.NoError(t, err)
 			assert.Nil(t, meta.DeletionRequestedAt, "a failed mark rolls its stamp back with it")
 		})
@@ -5682,7 +5682,7 @@ func TestDeletionRequestsList(t *testing.T) {
 	// kind. This listing is deliberately cross-kind — it is the GC sweeper's, and
 	// the sweeper's whole reason to exist is the kinds no controller watches.
 	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
-	other, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	other, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -5714,7 +5714,7 @@ func TestScopedMutatorWrongKind(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store) // kind = testGK
 	other := beehive.GroupKind{Kind: "Other"}
-	err := store.ObjectsUpdateStatus(ctx, other, obj.ID, 0, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(ctx, other, obj.ID, 0, []byte(`{}`), 0)
 	require.ErrorIs(t, err, beehive.ErrWrongKind)
 }
 
@@ -5728,7 +5728,7 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 	otherGK := beehive.GroupKind{Kind: "Other"}
 
 	mk := func(gk beehive.GroupKind) *beehive.RawObject {
-		o, err := store.ObjectsCreate(ctx, gk, beehive.ObjectsCreateInput{
+		o, err := store.Objects().Create(ctx, gk, beehive.ObjectsCreateInput{
 			Name: uniqueName(),
 			Spec: []byte(`{}`),
 		})
@@ -5782,7 +5782,7 @@ func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 
 	base := newRefObject(t, store)
 	gone := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
+	require.NoError(t, store.Objects().Delete(ctx, gone.ID))
 
 	got, _, err := store.ObjectWrites().ListSinceAll(ctx, base.ResourceVersion, 10)
 	require.NoError(t, err)
@@ -5832,7 +5832,7 @@ func TestObjectWritesListSinceAllHorizonIsTheMaxAcrossKinds(t *testing.T) {
 
 	newRefObject(t, store) // testGK, trimmed first and so the shallower horizon
 	ageOutWriteLog(t, store)
-	deeper, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	deeper, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -5861,7 +5861,7 @@ func TestResourceVersionMonotonicInCommitOrder(t *testing.T) {
 
 	var prev int64
 	for range 20 {
-		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: uniqueName(),
 			Spec: []byte(`{}`),
 		})
@@ -5874,7 +5874,7 @@ func TestResourceVersionMonotonicInCommitOrder(t *testing.T) {
 	// And the sequence never hands back a version already used, even after the
 	// highest-versioned row is physically deleted — the counter is standalone, not
 	// MAX(objects.resource_version).
-	require.NoError(t, store.ObjectsDelete(ctx, 20))
+	require.NoError(t, store.Objects().Delete(ctx, 20))
 	after := newRefObject(t, store)
 	assert.Greater(t, after.ResourceVersion, prev, "a delete cannot make the cursor regress")
 }
@@ -5907,7 +5907,7 @@ func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
 	store := newRawStore(t)
 	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
 	require.NoError(t, err)
-	_, err = store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`)})
 	require.Error(t, err)
 }
@@ -5971,7 +5971,7 @@ func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
 	// The version on each child's row, and the version its log entry claims.
 	var rowVersions, logVersions []int64
 	for _, id := range children {
-		meta, err := store.ObjectsGetMeta(ctx, id)
+		meta, err := store.Objects().GetMeta(ctx, id)
 		require.NoError(t, err)
 		rowVersions = append(rowVersions, meta.ResourceVersion)
 	}
@@ -6126,11 +6126,11 @@ func TestObjectsDeleteMissingRowIsNotFound(t *testing.T) {
 	ctx := context.Background()
 
 	obj := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
-	assert.ErrorIs(t, store.ObjectsDelete(ctx, obj.ID), storeapi.ErrNotFound,
+	assert.ErrorIs(t, store.Objects().Delete(ctx, obj.ID), storeapi.ErrNotFound,
 		"the second delete finds no row")
-	assert.ErrorIs(t, store.ObjectsDelete(ctx, obj.ID+404), storeapi.ErrNotFound,
+	assert.ErrorIs(t, store.Objects().Delete(ctx, obj.ID+404), storeapi.ErrNotFound,
 		"an id that never existed reads the same way")
 }
 
@@ -6146,14 +6146,14 @@ func TestObjectsDeleteRefusesAReferencedRow(t *testing.T) {
 	_, err := store.Edges().Add(ctx, dependent.ID, target.ID, beehive.RelationDependsOn)
 	require.NoError(t, err)
 
-	err = store.ObjectsDelete(ctx, target.ID)
+	err = store.Objects().Delete(ctx, target.ID)
 	require.Error(t, err, "the edge's RESTRICT must block the delete")
 	assert.NotErrorIs(t, err, storeapi.ErrNotFound, "the row is there; the constraint is what failed")
 
 	// Dropping the edge releases it, which is the order GC drives: the referrer goes
 	// first, and the row it was holding open becomes collectable.
 	require.NoError(t, dropEdge(ctx, store, dependent.ID, target.ID, beehive.RelationDependsOn))
-	assert.NoError(t, store.ObjectsDelete(ctx, target.ID))
+	assert.NoError(t, store.Objects().Delete(ctx, target.ID))
 }
 
 // newDependentObject creates an object of testGK with an outgoing depends_on
@@ -6238,7 +6238,7 @@ func TestDependencyWatermarksSetSkipsCollectedObject(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
+	require.NoError(t, store.Objects().Delete(ctx, dep.ID))
 
 	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 5))
 
@@ -6266,7 +6266,7 @@ func TestDependencyWatermarksCascadeOnObjectDelete(t *testing.T) {
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 3))
 
-	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
+	require.NoError(t, store.Objects().Delete(ctx, dep.ID))
 
 	_, _, ok := readWatermark(t, store, dep.ID)
 	assert.False(t, ok)
@@ -6763,7 +6763,7 @@ func TestDependentsListStaleSinceFiltersByKind(t *testing.T) {
 	ctx := context.Background()
 	other := beehive.GroupKind{Kind: "Gadget"}
 	target := newRefObject(t, store)
-	dep, err := store.ObjectsCreate(ctx, other, beehive.ObjectsCreateInput{
+	dep, err := store.Objects().Create(ctx, other, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -6784,7 +6784,7 @@ func TestDependentsListStaleSinceFiltersByKind(t *testing.T) {
 func TestDependentsListStaleSinceFindsDependentsOfUnregisteredTargets(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	target, err := store.ObjectsCreate(ctx, beehive.GroupKind{Group: "", Kind: "Gadget"}, beehive.ObjectsCreateInput{
+	target, err := store.Objects().Create(ctx, beehive.GroupKind{Group: "", Kind: "Gadget"}, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -6793,7 +6793,7 @@ func TestDependentsListStaleSinceFindsDependentsOfUnregisteredTargets(t *testing
 	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store))
 
-	_, _, err = store.ObjectsUpdateSpec(ctx, beehive.GroupKind{Kind: "Gadget"}, target.ID, []byte(`{"v":2}`), 0)
+	_, _, err = store.Objects().UpdateSpec(ctx, beehive.GroupKind{Kind: "Gadget"}, target.ID, []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store),
@@ -6826,13 +6826,13 @@ func TestObjectsGetForReconcileReturnsTheWriteCursor(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	load, err := store.ObjectsGetForReconcile(ctx, obj.ID)
+	load, err := store.Objects().GetForReconcile(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, obj.ID, load.Object.ID)
 	assert.Equal(t, cursorNow(t, store), load.Cursor)
 
 	moveTarget(t, store, obj.ID)
-	load, err = store.ObjectsGetForReconcile(ctx, obj.ID)
+	load, err = store.Objects().GetForReconcile(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, cursorNow(t, store), load.Cursor, "the cursor tracks the store, not the object")
 }
@@ -6846,17 +6846,17 @@ func TestObjectsGetForReconcileReportsHasDependencies(t *testing.T) {
 	target := newRefObject(t, store)
 
 	dep := newDependentObject(t, store, target.ID)
-	load, err := store.ObjectsGetForReconcile(ctx, dep.ID)
+	load, err := store.Objects().GetForReconcile(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.True(t, load.HasDependencies)
 
 	owned := newRefObject(t, store)
 	require.NoError(t, addEdge(ctx, store, owned.ID, target.ID, beehive.RelationOwnedBy))
-	load, err = store.ObjectsGetForReconcile(ctx, owned.ID)
+	load, err = store.Objects().GetForReconcile(ctx, owned.ID)
 	require.NoError(t, err)
 	assert.False(t, load.HasDependencies, "owned_by is not a dependency")
 
-	load, err = store.ObjectsGetForReconcile(ctx, target.ID)
+	load, err = store.Objects().GetForReconcile(ctx, target.ID)
 	require.NoError(t, err)
 	assert.False(t, load.HasDependencies)
 }
@@ -6866,7 +6866,7 @@ func TestObjectsGetForReconcileReportsHasDependencies(t *testing.T) {
 func TestObjectsGetForReconcileReportsMissingObject(t *testing.T) {
 	store := newRawStore(t)
 
-	_, err := store.ObjectsGetForReconcile(context.Background(), 404)
+	_, err := store.Objects().GetForReconcile(context.Background(), 404)
 	assert.ErrorIs(t, err, storeapi.ErrNotFound)
 }
 
@@ -6879,7 +6879,7 @@ func TestObjectsGetForReconcileAttachesConditions(t *testing.T) {
 	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
-	load, err := store.ObjectsGetForReconcile(ctx, obj.ID)
+	load, err := store.Objects().GetForReconcile(ctx, obj.ID)
 	require.NoError(t, err)
 	require.Len(t, load.Object.Conditions, 1)
 	assert.Equal(t, "Ready", load.Object.Conditions[0].Type)
@@ -6928,7 +6928,7 @@ func TestObjectWritesMaxVersionAllRisesOnCollection(t *testing.T) {
 	second := newRefObject(t, store)
 	require.Equal(t, second.ResourceVersion, cursorNow(t, store))
 
-	require.NoError(t, store.ObjectsDelete(ctx, second.ID))
+	require.NoError(t, store.Objects().Delete(ctx, second.ID))
 
 	assert.Greater(t, cursorNow(t, store), second.ResourceVersion)
 }
@@ -6988,7 +6988,7 @@ func churnStore(t *testing.T, store *sqliteStore) {
 	}
 	blob := append(append([]byte(`{"v":"`), spec...), []byte(`"}`)...)
 	for i := 0; i < 600; i++ {
-		_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: uniqueName(),
 			Spec: blob,
 		})
@@ -7203,18 +7203,18 @@ var nameSeq atomic.Int64
 func TestObjectsUpdateSpecByNameSkipsANoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "prod",
 		Spec: []byte(`{"v":1}`),
 	})
 	require.NoError(t, err)
 
-	same, _, err := store.ObjectsUpdateSpecByName(ctx, testGK, "prod", []byte(`{"v":1}`), 0)
+	same, _, err := store.Objects().UpdateSpecByName(ctx, testGK, "prod", []byte(`{"v":1}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, created.Generation, same.Generation, "identical bytes bump no generation")
 	assert.Equal(t, created.ResourceVersion, same.ResourceVersion, "and draw no resource_version")
 
-	changed, _, err := store.ObjectsUpdateSpecByName(ctx, testGK, "prod", []byte(`{"v":2}`), 0)
+	changed, _, err := store.Objects().UpdateSpecByName(ctx, testGK, "prod", []byte(`{"v":2}`), 0)
 	require.NoError(t, err)
 	assert.Equal(t, created.Generation+1, changed.Generation)
 	assert.Greater(t, changed.ResourceVersion, created.ResourceVersion)
@@ -7227,16 +7227,16 @@ func TestObjectsUpdateSpecByNameIsKindScoped(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	other := beehive.GroupKind{Kind: "Other"}
-	_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "shared",
 		Spec: []byte(`{"v":1}`),
 	})
 	require.NoError(t, err)
 
-	_, _, err = store.ObjectsUpdateSpecByName(ctx, other, "shared", []byte(`{"v":2}`), 0)
+	_, _, err = store.Objects().UpdateSpecByName(ctx, other, "shared", []byte(`{"v":2}`), 0)
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 
-	_, _, err = store.ObjectsUpdateSpecByName(ctx, testGK, "absent", []byte(`{"v":2}`), 0)
+	_, _, err = store.Objects().UpdateSpecByName(ctx, testGK, "absent", []byte(`{"v":2}`), 0)
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 }
 
@@ -7255,7 +7255,7 @@ func TestDeletionRequestsNoOpPathsTakeNoWriteTransaction(t *testing.T) {
 	store := newTestStore(t)
 	raw := store.(*sqliteStore)
 	ctx := context.Background()
-	created, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "prod",
 		Spec: []byte(`{}`),
 	})
@@ -7353,7 +7353,7 @@ func TestObjectsCreateLeavesANonUniqueErrorAlone(t *testing.T) {
 	store := newRawStore(t)
 	dropObjects(t, store)
 
-	_, err := store.ObjectsCreate(context.Background(), testGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(context.Background(), testGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -7441,7 +7441,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "spec update",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+				_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
 				require.NoError(t, err)
 			},
 			logs: true,
@@ -7449,7 +7449,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "status update",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+				require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
 			},
 			logs: true,
 		},
@@ -7465,14 +7465,14 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "finalizer cleared",
 			setup: func(t *testing.T, store beehive.Store) *beehive.RawObject {
-				obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+				obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 					Name: uniqueName(), Spec: []byte(`{}`), Finalizers: []string{"f"},
 				})
 				require.NoError(t, err)
 				return obj
 			},
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				_, err := store.FinalizersDelete(ctx, testGK, obj.ID, "f")
+				_, err := store.Objects().DeleteFinalizer(ctx, testGK, obj.ID, "f")
 				require.NoError(t, err)
 			},
 			logs: true,
@@ -7488,7 +7488,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "byte-identical spec write",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				_, changed, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, obj.Spec, obj.SpecVersion)
+				_, changed, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, obj.Spec, obj.SpecVersion)
 				require.NoError(t, err)
 				require.False(t, changed, "precondition: the store must skip this write")
 			},
@@ -7522,7 +7522,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 				return
 			}
 			require.Len(t, entries, 2)
-			after, err := store.ObjectsGetMeta(ctx, obj.ID)
+			after, err := store.Objects().GetMeta(ctx, obj.ID)
 			require.NoError(t, err)
 			assert.Equal(t, writeOpUpdate, entries[1].Op)
 			assert.Equal(t, obj.ID, entries[1].ObjectID)
@@ -7541,7 +7541,7 @@ func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
 	obj := newRefObject(t, store)
 	before := seqValue(t, store.(*sqliteStore))
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	assert.Greater(t, seqValue(t, store.(*sqliteStore)), before)
 }
@@ -7553,13 +7553,13 @@ func TestObjectsDeleteAppendsARowImage(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
-	before, err := store.ObjectsGet(ctx, obj.ID)
+	before, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	entries := writeLogEntries(t, store)
 	last := entries[len(entries)-1]
@@ -7617,7 +7617,7 @@ func TestObjectWritesListSinceScopesToKind(t *testing.T) {
 	ctx := context.Background()
 	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
 	mine := newRefObject(t, store)
-	_, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -7646,7 +7646,7 @@ func TestObjectWritesMaxVersionScopesToKind(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, mine.ResourceVersion, at)
 
-	_, err = store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -7681,12 +7681,12 @@ func TestObjectWritesSweepRecordsThePerKindHorizon(t *testing.T) {
 
 	staleA := newRefObject(t, store)
 	oldA := newRefObject(t, store)
-	oldB, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	oldB, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	keptA := newRefObject(t, store)
-	keptB, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	keptB, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -7719,7 +7719,7 @@ func TestObjectWritesSweepCapsEachKind(t *testing.T) {
 	for range 3 {
 		newRefObject(t, store)
 	}
-	quiet, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	quiet, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -7853,12 +7853,12 @@ func TestObjectsListByIDsIsKindScoped(t *testing.T) {
 	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
 	mine := newRefObject(t, store)
 	alsoMine := newRefObject(t, store)
-	foreign, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	foreign, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)
 
-	got, err := store.ObjectsListByIDs(ctx, testGK, []beehive.ObjectID{
+	got, err := store.Objects().ListByIDs(ctx, testGK, []beehive.ObjectID{
 		alsoMine.ID, mine.ID, foreign.ID, 9999,
 	})
 	require.NoError(t, err)
@@ -7866,7 +7866,7 @@ func TestObjectsListByIDsIsKindScoped(t *testing.T) {
 	assert.Equal(t, mine.ID, got[0].ID)
 	assert.Equal(t, alsoMine.ID, got[1].ID)
 
-	empty, err := store.ObjectsListByIDs(ctx, testGK, nil)
+	empty, err := store.Objects().ListByIDs(ctx, testGK, nil)
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 }
@@ -7905,7 +7905,7 @@ func TestObjectWritesListSinceRefusesAnImagelessDelete(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 	_, err := store.(*sqliteStore).db.ExecContext(ctx,
 		`UPDATE object_writes SET final = NULL WHERE op = ?`, writeOpDelete)
 	require.NoError(t, err)
@@ -7936,7 +7936,7 @@ func TestWritesFailWhenTheWriteLogIsGone(t *testing.T) {
 		{
 			name: "create",
 			write: func(t *testing.T, store *sqliteStore, _ *beehive.RawObject) error {
-				_, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+				_, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 					Name: uniqueName(), Spec: []byte(`{}`),
 				})
 				return err
@@ -7945,7 +7945,7 @@ func TestWritesFailWhenTheWriteLogIsGone(t *testing.T) {
 		{
 			name: "spec update",
 			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
-				_, _, err := store.ObjectsUpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+				_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"a":1}`), 0)
 				return err
 			},
 		},
@@ -7959,7 +7959,7 @@ func TestWritesFailWhenTheWriteLogIsGone(t *testing.T) {
 		{
 			name: "collection",
 			write: func(t *testing.T, store *sqliteStore, obj *beehive.RawObject) error {
-				return store.ObjectsDelete(ctx, obj.ID)
+				return store.Objects().Delete(ctx, obj.ID)
 			},
 		},
 	}
@@ -7982,7 +7982,7 @@ func TestObjectWritesListSinceAttachesImages(t *testing.T) {
 	ctx := context.Background()
 	kept := newRefObject(t, store)
 	gone := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
+	require.NoError(t, store.Objects().Delete(ctx, gone.ID))
 
 	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
@@ -8004,7 +8004,7 @@ func TestObjectsDeleteImageCarriesTheOwner(t *testing.T) {
 	owner := newRefObject(t, store)
 	child := newRefObject(t, store)
 	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
-	require.NoError(t, store.ObjectsDelete(ctx, child.ID))
+	require.NoError(t, store.Objects().Delete(ctx, child.ID))
 
 	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
@@ -8024,7 +8024,7 @@ func TestObjectsDeleteFailsWhenTheOwnerReadFails(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE edges`)
 	require.NoError(t, err)
 
-	require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+	require.Error(t, store.Objects().Delete(ctx, obj.ID))
 }
 
 // An unowned object's image says so, rather than leaving a caller to guess
@@ -8033,7 +8033,7 @@ func TestObjectsDeleteImageLeavesAnUnownedObjectsOwnerNil(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
@@ -8128,7 +8128,7 @@ func TestObjectWritesListSinceRefusesAnUndecodableImage(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 	_, err := store.(*sqliteStore).db.ExecContext(ctx,
 		`UPDATE object_writes SET final = 'not json' WHERE op = ?`, writeOpDelete)
 	require.NoError(t, err)
@@ -8159,7 +8159,7 @@ func TestObjectsDeleteFailsWithoutAVersionToDraw(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
 	require.NoError(t, err)
 
-	require.Error(t, store.ObjectsDelete(ctx, obj.ID))
+	require.Error(t, store.Objects().Delete(ctx, obj.ID))
 }
 
 // The sweep surfaces a broken log and a broken horizon table separately: the
@@ -8225,7 +8225,7 @@ func TestObjectWritesSweepCapsEachKindWithItsOwnHorizon(t *testing.T) {
 	for range 3 {
 		busy = append(busy, newRefObject(t, store))
 	}
-	quiet, err := store.ObjectsCreate(ctx, otherGK, beehive.ObjectsCreateInput{
+	quiet, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{
 		Name: uniqueName(), Spec: []byte(`{}`),
 	})
 	require.NoError(t, err)

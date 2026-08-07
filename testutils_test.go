@@ -355,30 +355,6 @@ func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) 
 // AfterCommit runs inline: the fake never opens a transaction, so there is no
 // commit to wait for.
 func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
-func (s *fakeStore) ObjectsCreate(context.Context, GroupKind, ObjectsCreateInput) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsCreate")
-}
-func (s *fakeStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGet")
-}
-func (s *fakeStore) ObjectsGetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
-	panic("not implemented: fakeStore.ObjectsGetForReconcile")
-}
-func (s *fakeStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGetMeta")
-}
-func (s *fakeStore) ObjectsGetByName(context.Context, GroupKind, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGetByName")
-}
-func (s *fakeStore) ObjectsList(context.Context, GroupKind) ([]*RawObject, error) {
-	return nil, nil
-}
-func (s *fakeStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
-func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
 
 // answers 0: the GC sweeper calls it on every tick
 
@@ -428,19 +404,7 @@ func (d depsOverride) WatermarkSet(ctx context.Context, id ObjectID, cursor int6
 	}
 	return d.Dependencies.WatermarkSet(ctx, id, cursor)
 }
-func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.ObjectsUpdateSpec")
-}
 
-func (s *fakeStore) ObjectsUpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error) {
-	panic("not implemented: ObjectsUpdateSpecByName")
-}
-func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
-	panic("not implemented: fakeStore.UpdateStatus")
-}
-func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (bool, error) {
-	panic("not implemented: fakeStore.FinalizersDelete")
-}
 func (s *fakeStore) DeletionRequests() storeapi.DeletionRequests { return fakeDeletionRequests{} }
 
 // fakeDeletionRequests is fakeStore's deletion-request family. List answers
@@ -771,6 +735,197 @@ func (o writesOverride) Sweep(ctx context.Context, perKind int, maxAge time.Dura
 	return o.ObjectWrites.Sweep(ctx, perKind, maxAge)
 }
 
+func (s *fakeStore) Objects() storeapi.Objects { return fakeObjects{} }
+
+// fakeObjects is fakeStore's objects family. The listings answer empty rather
+// than panicking: the drivers list objects in every Beehive.
+type fakeObjects struct{}
+
+func (fakeObjects) Create(context.Context, GroupKind, ObjectsCreateInput) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().Create")
+}
+
+func (fakeObjects) Delete(context.Context, ObjectID) error {
+	panic("not implemented: fakeStore.Objects().Delete")
+}
+
+func (fakeObjects) Get(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().Get")
+}
+
+func (fakeObjects) GetByName(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().GetByName")
+}
+
+func (fakeObjects) GetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
+	panic("not implemented: fakeStore.Objects().GetForReconcile")
+}
+
+func (fakeObjects) GetMeta(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().GetMeta")
+}
+
+func (fakeObjects) ListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().ListByIDs")
+}
+
+func (fakeObjects) ListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return nil, nil
+}
+
+func (fakeObjects) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+
+func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+
+func (fakeObjects) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.Objects().UpdateSpec")
+}
+
+func (fakeObjects) UpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error) {
+	panic("not implemented: ObjectsUpdateSpecByName")
+}
+
+func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
+	panic("not implemented: fakeStore.UpdateStatus")
+}
+
+func (fakeObjects) List(context.Context, GroupKind) ([]*RawObject, error) {
+	return nil, nil
+}
+
+func (fakeObjects) DeleteFinalizer(context.Context, GroupKind, ObjectID, string) (bool, error) {
+	panic("not implemented: fakeStore.Objects().DeleteFinalizer")
+}
+
+// objectsOverride replaces the hooks that are set and delegates the rest.
+type objectsOverride struct {
+	storeapi.Objects
+	create             func(context.Context, GroupKind, storeapi.ObjectsCreateInput) (*RawObject, error)
+	deleteFinalizer    func(context.Context, GroupKind, ObjectID, string) (bool, error)
+	get                func(context.Context, ObjectID) (*RawObject, error)
+	getForReconcile    func(context.Context, ObjectID) (storeapi.ReconcileLoad, error)
+	getMeta            func(context.Context, ObjectID) (*RawObject, error)
+	list               func(context.Context, GroupKind) ([]*RawObject, error)
+	listByIDs          func(context.Context, GroupKind, []ObjectID) ([]*RawObject, error)
+	listByIncomingEdge func(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error)
+	listIDs            func(context.Context, GroupKind) ([]ObjectID, error)
+	listUnsettledIDs   func(context.Context, GroupKind) ([]ObjectID, error)
+	objectsDelete      func(context.Context, ObjectID) error
+	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
+	updateSpecByName   func(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error)
+	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
+	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
+}
+
+func (o objectsOverride) Create(ctx context.Context, gk GroupKind, in storeapi.ObjectsCreateInput) (*RawObject, error) {
+	if o.create != nil {
+		return o.create(ctx, gk, in)
+	}
+	return o.Objects.Create(ctx, gk, in)
+}
+
+func (o objectsOverride) DeleteFinalizer(ctx context.Context, gk GroupKind, id ObjectID, f string) (bool, error) {
+	if o.deleteFinalizer != nil {
+		return o.deleteFinalizer(ctx, gk, id, f)
+	}
+	return o.Objects.DeleteFinalizer(ctx, gk, id, f)
+}
+
+func (o objectsOverride) Delete(ctx context.Context, id ObjectID) error {
+	if o.objectsDelete != nil {
+		return o.objectsDelete(ctx, id)
+	}
+	return o.Objects.Delete(ctx, id)
+}
+
+func (o objectsOverride) Get(ctx context.Context, id ObjectID) (*RawObject, error) {
+	if o.get != nil {
+		return o.get(ctx, id)
+	}
+	return o.Objects.Get(ctx, id)
+}
+
+func (o objectsOverride) GetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	if o.getForReconcile != nil {
+		return o.getForReconcile(ctx, id)
+	}
+	return o.Objects.GetForReconcile(ctx, id)
+}
+
+func (o objectsOverride) GetMeta(ctx context.Context, id ObjectID) (*RawObject, error) {
+	if o.getMeta != nil {
+		return o.getMeta(ctx, id)
+	}
+	return o.Objects.GetMeta(ctx, id)
+}
+
+func (o objectsOverride) List(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+	if o.list != nil {
+		return o.list(ctx, gk)
+	}
+	return o.Objects.List(ctx, gk)
+}
+
+func (o objectsOverride) ListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+	if o.listByIDs != nil {
+		return o.listByIDs(ctx, gk, ids)
+	}
+	return o.Objects.ListByIDs(ctx, gk, ids)
+}
+
+func (o objectsOverride) ListByIncomingEdge(ctx context.Context, gk GroupKind, to ObjectID, rel Relation) ([]*RawObject, error) {
+	if o.listByIncomingEdge != nil {
+		return o.listByIncomingEdge(ctx, gk, to, rel)
+	}
+	return o.Objects.ListByIncomingEdge(ctx, gk, to, rel)
+}
+
+func (o objectsOverride) ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if o.listIDs != nil {
+		return o.listIDs(ctx, gk)
+	}
+	return o.Objects.ListIDs(ctx, gk)
+}
+
+func (o objectsOverride) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if o.listUnsettledIDs != nil {
+		return o.listUnsettledIDs(ctx, gk)
+	}
+	return o.Objects.ListUnsettledIDs(ctx, gk)
+}
+
+func (o objectsOverride) UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, v int) (*RawObject, bool, error) {
+	if o.updateSpec != nil {
+		return o.updateSpec(ctx, gk, id, spec, v)
+	}
+	return o.Objects.UpdateSpec(ctx, gk, id, spec, v)
+}
+
+func (o objectsOverride) UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, v int) (*RawObject, bool, error) {
+	if o.updateSpecByName != nil {
+		return o.updateSpecByName(ctx, gk, name, spec, v)
+	}
+	return o.Objects.UpdateSpecByName(ctx, gk, name, spec, v)
+}
+
+func (o objectsOverride) GetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
+	if o.getByName != nil {
+		return o.getByName(ctx, gk, name)
+	}
+	return o.Objects.GetByName(ctx, gk, name)
+}
+
+func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observed int64, status []byte, version int) error {
+	if o.updateStatus != nil {
+		return o.updateStatus(ctx, gk, id, observed, status, version)
+	}
+	return o.Objects.UpdateStatus(ctx, gk, id, observed, status, version)
+}
+
 func (s *fakeStore) Conditions() storeapi.Conditions { return s.conditions }
 
 // fakeConditions is fakeStore's conditions family. A nil hook panics, which is
@@ -793,9 +948,6 @@ func (f fakeConditions) Delete(ctx context.Context, gk GroupKind, id ObjectID, c
 		panic("not implemented: fakeStore.Conditions().Delete")
 	}
 	return f.delete(ctx, gk, id, condType)
-}
-func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
-	panic("not implemented: fakeStore.ObjectsDelete")
 }
 func (s *fakeStore) Events() storeapi.Events { return fakeEvents{} }
 
@@ -882,13 +1034,6 @@ func (o eventsOverride) Sweep(ctx context.Context, perTimeline int, maxAge time.
 		return o.sweep(ctx, perTimeline, maxAge, capBudget)
 	}
 	return o.Events.Sweep(ctx, perTimeline, maxAge, capBudget)
-}
-func (s *fakeStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
-	return nil, nil
-}
-
-func (s *fakeStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsListByIDs")
 }
 
 // ReclaimSpace reclaims nothing, which the contract permits. The GC sweeper
@@ -1287,7 +1432,7 @@ func findCondition(conds []Condition, condType string) *Condition {
 // itself: a spec change bumps the generation, and this listing is what notices.
 func unsettledIDs(t *testing.T, store Store) []ObjectID {
 	t.Helper()
-	ids, err := store.ObjectsListUnsettledIDs(context.Background(), clientTestGK)
+	ids, err := store.Objects().ListUnsettledIDs(context.Background(), clientTestGK)
 	require.NoError(t, err)
 	return ids
 }
@@ -1546,8 +1691,12 @@ func probeSignal(ch chan struct{}) {
 	}
 }
 
-func (s *listProbeStore) ObjectsListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ObjectsListUnsettledIDs(ctx, gk)
+func (s *listProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listUnsettledIDs: s.listUnsettledIDsObjects}
+}
+
+func (s *listProbeStore) listUnsettledIDsObjects(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.Objects().ListUnsettledIDs(ctx, gk)
 	probeSignal(s.unsettledListed)
 	return ids, err
 }
@@ -1708,20 +1857,24 @@ func (s *pollProbeStore) listSinceObjectWrites(ctx context.Context, gk GroupKind
 }
 
 // ObjectsList signals *after* the read returns.
-func (s *pollProbeStore) ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+func (s *pollProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), list: s.listObjects, listByIDs: s.listByIDsObjects, listIDs: s.listIDsObjects, get: s.getObjects, getMeta: s.getMetaObjects}
+}
+
+func (s *pollProbeStore) listObjects(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
 	if s.listErr.Load() {
 		return nil, errBoom
 	}
-	out, err := s.Store.ObjectsList(ctx, gk)
+	out, err := s.Store.Objects().List(ctx, gk)
 	probeSignal(s.listed)
 	return out, err
 }
 
-func (s *pollProbeStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+func (s *pollProbeStore) listByIDsObjects(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
 	if s.getErr.Load() {
 		return nil, errBoom
 	}
-	out, err := s.Store.ObjectsListByIDs(ctx, gk, ids)
+	out, err := s.Store.Objects().ListByIDs(ctx, gk, ids)
 	select {
 	case s.byIDs <- ids:
 	default:
@@ -1729,28 +1882,28 @@ func (s *pollProbeStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids
 	return out, err
 }
 
-func (s *pollProbeStore) ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+func (s *pollProbeStore) listIDsObjects(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
 	if s.listIDsErr.Load() {
 		return nil, errBoom
 	}
-	return s.Store.ObjectsListIDs(ctx, gk)
+	return s.Store.Objects().ListIDs(ctx, gk)
 }
 
-func (s *pollProbeStore) ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error) {
+func (s *pollProbeStore) getObjects(ctx context.Context, id ObjectID) (*RawObject, error) {
 	if s.getErr.Load() {
 		return nil, errBoom
 	}
-	return s.Store.ObjectsGet(ctx, id)
+	return s.Store.Objects().Get(ctx, id)
 }
 
 // ObjectsGetMeta is the event watch's per-tick read, so it signals on every call —
 // error or not — which is what a test waiting out a failing phase needs.
-func (s *pollProbeStore) ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawObject, error) {
+func (s *pollProbeStore) getMetaObjects(ctx context.Context, id ObjectID) (*RawObject, error) {
 	defer probeSignal(s.metaRead)
 	if s.metaErr.Load() {
 		return nil, errBoom
 	}
-	return s.Store.ObjectsGetMeta(ctx, id)
+	return s.Store.Objects().GetMeta(ctx, id)
 }
 
 // EventsListSince is the event reader's own page read: it carries eventsErr and

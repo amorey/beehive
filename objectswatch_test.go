@@ -138,7 +138,7 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	ev := recv(t, ch)
 	assert.Equal(t, Deleted, ev.Type)
@@ -307,7 +307,7 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 	// Remove the row outright and stop reading: the next poll tails the delete
 	// entry, builds the tombstone from its row image, and parks in the send.
 	drainProbe(store.tailed)
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 	waitClosed(t, chanAfter(store.tailed, 1), "the tail that observes the removal")
 	cancel()
 
@@ -330,7 +330,7 @@ func TestWatchReportsRemovalOfARowItCouldNeverDecode(t *testing.T) {
 	defer cancel()
 
 	store, _, client, _ := watchFixture(t)
-	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	poison, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
@@ -340,7 +340,7 @@ func TestWatchReportsRemovalOfARowItCouldNeverDecode(t *testing.T) {
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.polled, 2), "the poll that quarantines the poison row")
 
-	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
+	require.NoError(t, store.Objects().Delete(ctx, poison.ID))
 
 	// A good object created after the removal is the barrier: it can only arrive
 	// after the poll that dropped the poison row from the stream's own bookkeeping.
@@ -663,7 +663,7 @@ func TestOwnedObjectsListWatchReportsAnUndecodableCollectedChild(t *testing.T) {
 	defer cancel()
 	store, _, client, _ := watchFixture(t)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
-	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	poison, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
@@ -674,7 +674,7 @@ func TestOwnedObjectsListWatchReportsAnUndecodableCollectedChild(t *testing.T) {
 	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
+	require.NoError(t, store.Objects().Delete(ctx, poison.ID))
 
 	ev := recv(t, ch)
 	require.Equal(t, Deleted, ev.Type, "the removal went unreported")
@@ -886,7 +886,7 @@ func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
 	require.NoError(t, err)
 	store.listIDsErr.Store(true) // the liveness probe is gone; using it would fail here
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	ev := recv(t, ch)
 	require.Equal(t, Deleted, ev.Type)
@@ -1078,7 +1078,7 @@ func TestCoalescedCreateThenDeleteReportsDeleted(t *testing.T) {
 	defer cancel()
 	store, _, client, _ := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	_, ch, err := client.WatchList(ctx, WithResumeFrom(0))
 	require.NoError(t, err)
@@ -1125,7 +1125,7 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	require.NoError(t, bh.store.ObjectsDelete(ctx, doomed.ID))
+	require.NoError(t, bh.store.Objects().Delete(ctx, doomed.ID))
 	_, err = client.Update(ctx, survivor.ID, cSpec{Val: "still here"})
 	require.NoError(t, err)
 
@@ -1261,7 +1261,11 @@ type vanishingStore struct {
 	read chan struct{}
 }
 
-func (s *vanishingStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
+func (s *vanishingStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listByIDs: s.listByIDsObjects}
+}
+
+func (s *vanishingStore) listByIDsObjects(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
 	probeSignal(s.read)
 	return nil, nil
 }
@@ -1675,7 +1679,7 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	spec, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	for i := range burst {
-		_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 			Name: fmt.Sprintf("burst-%d", i),
 			Spec: spec,
 		})
@@ -1897,7 +1901,7 @@ func seedWriteLog(t *testing.T, ctx context.Context, store Store, n int) {
 	spec, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	for i := range n {
-		_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 			Name: fmt.Sprintf("seed-%d", i),
 			Spec: spec,
 		})
@@ -3053,12 +3057,16 @@ func newFailListByIDsStore(t *testing.T) *failListByIDsStore {
 	return &failListByIDsStore{Store: newClientTestStore(t), tried: make(chan struct{})}
 }
 
-func (s *failListByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+func (s *failListByIDsStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listByIDs: s.listByIDsObjects}
+}
+
+func (s *failListByIDsStore) listByIDsObjects(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
 	if s.failAll.Load() || s.fail.CompareAndSwap(true, false) {
 		s.triedOnce.Do(func() { close(s.tried) })
 		return nil, errBoom
 	}
-	return s.Store.ObjectsListByIDs(ctx, gk, ids)
+	return s.Store.Objects().ListByIDs(ctx, gk, ids)
 }
 
 // The state read behind a replayed page is retried with the same backoff as
@@ -3152,11 +3160,15 @@ type countingLoadByIDsStore struct {
 	sizes []int
 }
 
-func (s *countingLoadByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+func (s *countingLoadByIDsStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listByIDs: s.listByIDsObjects}
+}
+
+func (s *countingLoadByIDsStore) listByIDsObjects(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
 	s.mu.Lock()
 	s.sizes = append(s.sizes, len(ids))
 	s.mu.Unlock()
-	return s.Store.ObjectsListByIDs(ctx, gk, ids)
+	return s.Store.Objects().ListByIDs(ctx, gk, ids)
 }
 
 func (s *countingLoadByIDsStore) batchSizes() []int {
@@ -3707,7 +3719,7 @@ func TestWatchQuarantinesAnUndecodableWriteOnTheTail(t *testing.T) {
 	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
@@ -3977,7 +3989,7 @@ func TestWatchLoadRetryDecodesOnce(t *testing.T) {
 	// migrator has something to convert. A Create would stamp the current one.
 	spec, err := json.Marshal(cSpec{Val: "a"})
 	require.NoError(t, err)
-	obj, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: "w1", Spec: spec})
+	obj, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: "w1", Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
 

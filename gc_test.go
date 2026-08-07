@@ -142,7 +142,11 @@ type collectFakeStore struct {
 // reaching the fake is one of its owners.
 const collectedID ObjectID = 1
 
-func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *collectFakeStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), getMeta: s.getMetaObjects, objectsDelete: s.deleteObjects}
+}
+
+func (s *collectFakeStore) getMetaObjects(_ context.Context, id ObjectID) (*RawObject, error) {
 	now := time.Now()
 	if id != collectedID {
 		if s.ownerMetaErr != nil {
@@ -175,7 +179,7 @@ func (s *collectFakeStore) hasIncomingEdges(context.Context, ObjectID) (bool, er
 func (s *collectFakeStore) listOutgoingByRelationEdges(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return s.owners, s.listOwnersErr
 }
-func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
+func (s *collectFakeStore) deleteObjects(context.Context, ObjectID) error {
 	return s.deleteObjectErr
 }
 
@@ -779,7 +783,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// Simulate a crash mid-delete: a deletion-pending row is already in the durable
 	// store before any control plane runs. (Written through the store directly, so
 	// no reconcile has touched it.)
-	raw, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	raw, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -789,7 +793,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// which the startup resumption of owed work would pick up as unsettled — the row
 	// would then be removed for two reasons and this test would stop pinning either
 	// one. Deletion does not bump generation, so the row stays settled below.
-	err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
+	err = store.Objects().UpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
 	_, err = store.DeletionRequests().Create(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
@@ -1326,7 +1330,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	_, err = store.FinalizersDelete(ctx, clientTestGK, obj.ID, "f")
+	_, err = store.Objects().DeleteFinalizer(ctx, clientTestGK, obj.ID, "f")
 	require.NoError(t, err)
 	waitForDeletions(t, w, obj.ID)
 }
@@ -1464,7 +1468,7 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutThePush(t *testing.T) {
 	// first collect and leave the owner's own delete push as the collector.
 	require.NoError(t, client.Delete(ctx, owner.ID))
 	waitForDeletionRequest(t, w, child.ID)
-	require.NoError(t, store.ObjectsDelete(ctx, child.ID))
+	require.NoError(t, store.Objects().Delete(ctx, child.ID))
 	waitForDeletions(t, w, owner.ID)
 }
 
@@ -1485,7 +1489,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	real := newClientTestStore(t)
 	store := &listProbeStore{Store: real, gcSwept: make(chan struct{}, 8)}
 
-	raw, err := real.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	raw, err := real.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{}`),
 	})
@@ -1508,7 +1512,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		_, err := real.ObjectsGetMeta(ctx, raw.ID)
+		_, err := real.Objects().GetMeta(ctx, raw.ID)
 		return errors.Is(err, ErrNotFound)
 	}, testTimeout, 5*time.Millisecond, "deletion-pending row was never collected: GC is still riding the reconcile interval")
 }

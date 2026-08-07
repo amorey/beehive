@@ -36,7 +36,7 @@ func TestSweepEventRetention(t *testing.T) {
 	ctx := context.Background()
 
 	gk := GroupKind{Kind: "Widget"}
-	obj, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	obj, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	for _, r := range []string{"R1", "R2", "R3", "R4"} {
 		err := store.Events().Add(ctx, gk, obj.ID, EventsAddInput{Category: "c", Type: "Normal", Reason: r})
@@ -260,7 +260,7 @@ func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
 
 	bh.reconcileOwedSweep(ctx)
 
-	raw, err := store.ObjectsGet(ctx, from.ID)
+	raw, err := store.Objects().Get(ctx, from.ID)
 	require.NoError(t, err)
 	assert.Zero(t, raw.ReconcileOwed, "no reconcile loop can drain it, so the sweep does")
 }
@@ -593,7 +593,7 @@ func TestSweepWriteLogRetention(t *testing.T) {
 		require.NoError(t, err)
 		gk := GroupKind{Kind: "Widget"}
 		for range 3 {
-			_, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+			_, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 			require.NoError(t, err)
 		}
 
@@ -610,7 +610,7 @@ func TestSweepWriteLogRetention(t *testing.T) {
 		require.NoError(t, err)
 		gk := GroupKind{Kind: "Widget"}
 		for range 3 {
-			_, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+			_, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 			require.NoError(t, err)
 		}
 

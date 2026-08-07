@@ -202,7 +202,7 @@ func BenchmarkTailerDrainRateUnderSustainedWrites(b *testing.B) {
 					spec, err := json.Marshal(cSpec{})
 					require.NoError(b, err)
 					for i := range backlog.rows {
-						_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+						_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 							Name: "backlog-" + strconv.Itoa(i),
 							Spec: spec,
 						})

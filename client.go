@@ -382,7 +382,7 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // shares it. Callers run it inside a Within so the insert and its ref commit
 // together.
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string, spec []byte, co *createOptions) (*RawObject, error) {
-	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
+	raw, err := c.bh.store.Objects().Create(ctx, c.gk, ObjectsCreateInput{
 		Name:        name,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
@@ -459,7 +459,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 	// One Within around the read and the insert removes the TOCTOU: the loser
 	// of a concurrent create observes the winner's row.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
+		existing, err := c.bh.store.Objects().GetByName(ctx, c.gk, name)
 		if err == nil {
 			// Found: returned as-is, live or deletion-pending. A pre-existing
 			// poison row's decode error surfaces with created=false.
@@ -495,7 +495,7 @@ func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
 		// ObjectsUpdateSpec folds this client's kind into the write;
 		// hideWrongKind keeps a foreign id invisible.
-		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
+		raw, changed, err := c.bh.store.Objects().UpdateSpec(ctx, c.gk, id, b, version)
 		return raw, changed, c.hideWrongKind(err)
 	})
 }
@@ -505,7 +505,7 @@ func (c *clientImpl[Spec, Status]) UpdateByName(ctx context.Context, name string
 		return nil, err
 	}
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
-		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
+		return c.bh.store.Objects().UpdateSpecByName(ctx, c.gk, name, b, version)
 	})
 }
 
@@ -563,7 +563,7 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads .
 // ErrNotFound for a foreign id — a Client serves a single kind, so another
 // kind's rows must be invisible through it.
 func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
-	raw, err := c.bh.store.ObjectsGet(ctx, id)
+	raw, err := c.bh.store.Objects().Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +586,7 @@ func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string, l
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
-	raw, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
+	raw, err := c.bh.store.Objects().GetByName(ctx, c.gk, name)
 	if err != nil {
 		return nil, err
 	}
@@ -663,7 +663,7 @@ func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bo
 }
 
 func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ObjectsList(ctx, c.gk)
+	raws, err := c.bh.store.Objects().List(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}
@@ -819,7 +819,7 @@ func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) (
 // The kind filter lives in the store statement's WHERE, so foreign-kind
 // children never reach Go.
 func (c *clientImpl[Spec, Status]) OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ObjectsListByIncomingEdge(ctx, c.gk, ownerID, RelationOwnedBy)
+	raws, err := c.bh.store.Objects().ListByIncomingEdge(ctx, c.gk, ownerID, RelationOwnedBy)
 	if err != nil {
 		return nil, err
 	}

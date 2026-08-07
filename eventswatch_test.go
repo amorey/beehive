@@ -312,7 +312,7 @@ func TestEventsWatchEndsWhenTheObjectIsCollected(t *testing.T) {
 	stream, err := client.EventsWatch(ctx, obj.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 	waitClosed(t, closedWhenDrained(stream.Events), "the stream to end with its object")
 	assert.ErrorIs(t, stream.Err(), ErrNotFound)
 }

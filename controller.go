@@ -108,7 +108,7 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err != nil {
 		return err
 	}
-	return c.wakeAfter(ctx, c.bh.store.ObjectsUpdateStatus(
+	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
 		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
@@ -151,7 +151,7 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 // gcCollect still re-checks the RESTRICT block. See
 // docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md.
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
-	clearedLast, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
+	clearedLast, err := c.bh.store.Objects().DeleteFinalizer(ctx, c.gk, id, finalizer)
 	if err := c.wakeAfter(ctx, err); err != nil {
 		return err
 	}

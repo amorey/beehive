@@ -66,7 +66,7 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, bool, error) {
 	log := t.log().With("id", id)
 
-	load, err := t.bh.store.ObjectsGetForReconcile(ctx, id)
+	load, err := t.bh.store.Objects().GetForReconcile(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
@@ -185,7 +185,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "unsettled", r.store.ObjectsListUnsettledIDs)
+	r.enqueueFrom(ctx, "unsettled", r.store.Objects().ListUnsettledIDs)
 }
 
 // enqueueReconcileOwed enqueues objects owed a durable dependency wake. Run
@@ -214,7 +214,7 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
+	r.enqueueFrom(ctx, "all", r.store.Objects().ListIDs)
 }
 
 // log guards reconcilers built outside Register (e.g. minimal ones in tests).

@@ -158,14 +158,14 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 		// Spec write (Create) stamped the spec version; status untouched (still 0).
-		raw, err := store.ObjectsGet(ctx, obj.ID)
+		raw, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "Create stamps the migrator's spec version")
 		assert.Equal(t, 0, raw.StatusVersion, "no status written yet")
 
 		// Controller status write stamps the status version, spec unchanged.
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
-		raw, err = store.ObjectsGet(ctx, obj.ID)
+		raw, err = store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "status write must not touch spec version")
 		assert.Equal(t, 9, raw.StatusVersion, "UpdateStatus stamps the migrator's status version")
@@ -183,7 +183,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-		raw, err := store.ObjectsGet(ctx, obj.ID)
+		raw, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Zero(t, raw.SpecVersion, "no migrator => spec version stays 0")
 		assert.Zero(t, raw.StatusVersion, "no migrator => status version stays 0")
@@ -540,7 +540,7 @@ func (f *declareFixture) requireOwed(t *testing.T) {
 // "stamped again on every pass".
 func (f *declareFixture) owedCount(t *testing.T) int64 {
 	t.Helper()
-	meta, err := f.store.ObjectsGetMeta(context.Background(), f.dep.ID)
+	meta, err := f.store.Objects().GetMeta(context.Background(), f.dep.ID)
 	require.NoError(t, err)
 	return meta.ReconcileOwed
 }
@@ -1025,7 +1025,11 @@ type kindTStore struct {
 func (s *kindTStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }
-func (s *kindTStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *kindTStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), get: s.getObjects}
+}
+
+func (s *kindTStore) getObjects(_ context.Context, id ObjectID) (*RawObject, error) {
 	return &RawObject{ID: id, Kind: "T"}, nil
 }
 
@@ -1034,7 +1038,11 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
+func (s *failUpdateStatusStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.kindTStore.Objects(), updateStatus: s.updateStatus}
+}
+
+func (s *failUpdateStatusStore) updateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
 	return errBoom
 }
 

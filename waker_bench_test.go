@@ -84,7 +84,7 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 					from, err := store.ResourceVersionsMaxIssued(ctx)
 					require.NoError(b, err)
 					target := ids[i%len(ids)]
-					_, _, err = store.ObjectsUpdateSpec(ctx, clientTestGK, target, benchSpec(), 0)
+					_, _, err = store.Objects().UpdateSpec(ctx, clientTestGK, target, benchSpec(), 0)
 					require.NoError(b, err)
 					sd.cursor = from
 					b.StartTimer()
@@ -226,7 +226,7 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 	ids := make([]ObjectID, objects)
 	err = store.Within(ctx, func(ctx context.Context) error {
 		for i := range objects {
-			obj, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+			obj, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 				Name: uniqueName(),
 				Spec: []byte(`{"Val":"0"}`),
 			})

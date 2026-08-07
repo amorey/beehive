@@ -601,7 +601,7 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 			live = append(live, w.ID)
 		}
 	}
-	rows, err := bh.store.ObjectsListByIDs(ctx, gk, live)
+	rows, err := bh.store.Objects().ListByIDs(ctx, gk, live)
 	if err != nil {
 		return nil, err
 	}

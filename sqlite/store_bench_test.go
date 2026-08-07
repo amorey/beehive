@@ -54,7 +54,7 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 	const perTimeline = 4
 	ids := make([]storeapi.ObjectID, timelines)
 	for i := range ids {
-		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: fmt.Sprintf("bench-%d", i),
 			Spec: []byte(`{}`),
 		})
@@ -115,13 +115,13 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	owner, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	owner, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "owner",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(b, err)
 	for i := range children {
-		child, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		child, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: fmt.Sprintf("child-%d", i),
 			Spec: []byte(`{}`),
 		})

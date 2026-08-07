@@ -1667,7 +1667,7 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 
 	// One object, so a version has been issued: the sweep skips a store where
 	// nothing has ever been written, and would never reach the listing.
-	_, err = probe.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	_, err = probe.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1831,25 +1831,25 @@ func TestStaleDependentsSweepDoesNotRestampAConsumedVersion(t *testing.T) {
 	spec := []byte(`{}`)
 
 	// The target is written last, so it sits at exactly the mark sweep one ends on.
-	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	dep, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
-	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	target, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	sd.sweep(ctx)
-	raw, err := store.ObjectsGet(ctx, dep.ID)
+	raw, err := store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, raw.ReconcileOwed, "the dependent has no watermark, so one pass is owed")
 
 	// An unrelated write moves the mark, so the next tick sweeps. The target
 	// itself has not moved, and the dependent is still stale.
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	_, err = store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 
 	sd.sweep(ctx)
 
-	raw, err = store.ObjectsGet(ctx, dep.ID)
+	raw, err = store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, raw.ReconcileOwed, "the target did not move, so nothing more is owed")
 }
@@ -1865,9 +1865,9 @@ func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
 	sd := sweeperOver(store)
 
 	spec := []byte(`{}`)
-	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	target, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
-	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	dep, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
@@ -1921,26 +1921,26 @@ func TestStaleDependentsSweepRepairsALostFindingAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	spec := []byte(`{}`)
-	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	dep, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
-	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	target, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	sweeperOver(store).sweep(ctx)
-	owed, err := store.ObjectsGet(ctx, dep.ID)
+	owed, err := store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, owed.ReconcileOwed, "the sweep recorded the finding")
 
 	// Drained, then lost: the reconcile it dispatched never ran.
 	require.NoError(t, store.ReconcileOwed().Decrement(ctx, clientTestGK, dep.ID, 1))
-	owed, err = store.ObjectsGet(ctx, dep.ID)
+	owed, err = store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	require.Zero(t, owed.ReconcileOwed, "nothing durable names the dependent now")
 
 	sweeperOver(store).sweep(ctx)
 
-	owed, err = store.ObjectsGet(ctx, dep.ID)
+	owed, err = store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, owed.ReconcileOwed, "the new process re-derives and finds it again")
 }

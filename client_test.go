@@ -168,12 +168,12 @@ func TestListSkipsUndecodableRows(t *testing.T) {
 
 	// No migrator: convertBlob is identity, so the bad bytes reach json.Unmarshal,
 	// which fails — exactly the shape-mismatch case the migrator seam guards.
-	_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	good, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{"Val":"good"}`),
 	})
@@ -199,12 +199,12 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	good, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	good, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`{"Val":"good"}`),
 	})
@@ -640,7 +640,7 @@ func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a new object is owed its first pass")
 
 	// Settle it, so the found branch below starts from "nothing owed".
-	err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+	err = store.Objects().UpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
 	require.NoError(t, err)
 	require.Empty(t, unsettledIDs(t, store), "precondition: settled")
 
@@ -676,7 +676,7 @@ func TestClientGetOrCreateRollsBackOnDecodeError(t *testing.T) {
 
 	// Nothing committed: the name is still absent, so a second attempt takes the
 	// create branch again (not the found branch) and likewise rolls back.
-	_, err = store.ObjectsGetByName(ctx, gk, "w1")
+	_, err = store.Objects().GetByName(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 	_, created, err = client.GetOrCreate(ctx, "w1", badDecodeSpec{Val: "b"})
 	require.Error(t, err)
@@ -703,7 +703,7 @@ func TestClientCreateRollsBackOnDecodeError(t *testing.T) {
 	assert.Nil(t, obj)
 	assert.Empty(t, queuedIDs(r.work), "a rolled-back create must not wake the reconciler")
 
-	_, err = store.ObjectsGetByName(ctx, gk, "w1")
+	_, err = store.Objects().GetByName(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the poison row must not have committed")
 }
 
@@ -871,7 +871,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 				client := NewClient[cSpec, cStatus](bh, clientTestGK)
 				seeded := mustCreate(t, ctx, client, "seed", cSpec{Val: "a"})
 				// Settle the seed so its own unconverged spec doesn't mask the write's.
-				err = store.ObjectsUpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
+				err = store.Objects().UpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
 				require.NoError(t, err)
 				require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
@@ -911,7 +911,7 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, "w1", cSpec{Val: "a"})
 	// Settle it, so anything the write below owes is its own.
-	err = store.ObjectsUpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
+	err = store.Objects().UpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
 	require.NoError(t, err)
 	require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
@@ -1252,7 +1252,11 @@ type createBadJSONStore struct {
 	fakeStore
 }
 
-func (s *createBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
+func (s *createBadJSONStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), create: s.createObjects}
+}
+
+func (s *createBadJSONStore) createObjects(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -1261,7 +1265,11 @@ type errorObjectsCreateStore struct {
 	fakeStore
 }
 
-func (s *errorObjectsCreateStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
+func (s *errorObjectsCreateStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), create: s.createObjects}
+}
+
+func (s *errorObjectsCreateStore) createObjects(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1270,7 +1278,11 @@ type updateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *updateBadJSONStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+func (s *updateBadJSONStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), updateSpec: s.updateSpecObjects}
+}
+
+func (s *updateBadJSONStore) updateSpecObjects(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, true, nil
 }
 
@@ -1279,7 +1291,11 @@ type errorUpdateSpecStore struct {
 	fakeStore
 }
 
-func (s *errorUpdateSpecStore) ObjectsUpdateSpec(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
+func (s *errorUpdateSpecStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), updateSpec: s.updateSpecObjects}
+}
+
+func (s *errorUpdateSpecStore) updateSpecObjects(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (*RawObject, bool, error) {
 	return nil, false, errBoom
 }
 
@@ -1289,7 +1305,11 @@ type nameErrorStore struct {
 	fakeStore
 }
 
-func (s *nameErrorStore) ObjectsGetByName(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *nameErrorStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), getByName: s.getByNameObjects}
+}
+
+func (s *nameErrorStore) getByNameObjects(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1313,11 +1333,15 @@ type getOrCreateBadJSONStore struct {
 	fakeStore
 }
 
-func (s *getOrCreateBadJSONStore) ObjectsGetByName(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
+func (s *getOrCreateBadJSONStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), getByName: s.getByNameObjects, create: s.createObjects}
+}
+
+func (s *getOrCreateBadJSONStore) getByNameObjects(_ context.Context, _ GroupKind, _ string) (*RawObject, error) {
 	return nil, ErrNotFound
 }
 
-func (s *getOrCreateBadJSONStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
+func (s *getOrCreateBadJSONStore) createObjects(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return &RawObject{ID: 1, Spec: []byte("not-json")}, nil
 }
 
@@ -1328,7 +1352,11 @@ type createErrorStore struct {
 	getOrCreateBadJSONStore
 }
 
-func (s *createErrorStore) ObjectsCreate(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
+func (s *createErrorStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.getOrCreateBadJSONStore.Objects(), create: s.create}
+}
+
+func (s *createErrorStore) create(_ context.Context, _ GroupKind, _ ObjectsCreateInput) (*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1337,7 +1365,11 @@ type errorListObjectsStore struct {
 	fakeStore
 }
 
-func (s *errorListObjectsStore) ObjectsList(_ context.Context, _ GroupKind) ([]*RawObject, error) {
+func (s *errorListObjectsStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), list: s.listObjects}
+}
+
+func (s *errorListObjectsStore) listObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -1348,7 +1380,11 @@ type badJSONStore struct {
 	gk GroupKind
 }
 
-func (s *badJSONStore) ObjectsList(_ context.Context, _ GroupKind) ([]*RawObject, error) {
+func (s *badJSONStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), list: s.listObjects}
+}
+
+func (s *badJSONStore) listObjects(_ context.Context, _ GroupKind) ([]*RawObject, error) {
 	return []*RawObject{{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}}, nil
 }
 
@@ -1995,7 +2031,11 @@ type ownedObjectsErrorStore struct {
 	fakeStore
 }
 
-func (*ownedObjectsErrorStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsErrorStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), listByIncomingEdge: s.listByIncomingEdge}
+}
+
+func (*ownedObjectsErrorStore) listByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return nil, errBoom
 }
 
@@ -2015,7 +2055,11 @@ type ownedObjectsBadJSONStore struct {
 	gk GroupKind
 }
 
-func (s *ownedObjectsBadJSONStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsBadJSONStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), listByIncomingEdge: s.listByIncomingEdgeObjects}
+}
+
+func (s *ownedObjectsBadJSONStore) listByIncomingEdgeObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return []*RawObject{
 		{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")},
 		{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)},
@@ -2040,7 +2084,11 @@ type ownedObjectsLoadErrorStore struct {
 	gk GroupKind
 }
 
-func (s *ownedObjectsLoadErrorStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+func (s *ownedObjectsLoadErrorStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), listByIncomingEdge: s.listByIncomingEdgeObjects}
+}
+
+func (s *ownedObjectsLoadErrorStore) listByIncomingEdgeObjects(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
 }
 
@@ -2324,10 +2372,14 @@ type getBadJSONStore struct {
 	gk GroupKind
 }
 
-func (s *getBadJSONStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
+func (s *getBadJSONStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), get: s.getObjects, getByName: s.getByNameObjects}
+}
+
+func (s *getBadJSONStore) getObjects(context.Context, ObjectID) (*RawObject, error) {
 	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
 }
-func (s *getBadJSONStore) ObjectsGetByName(context.Context, GroupKind, string) (*RawObject, error) {
+func (s *getBadJSONStore) getByNameObjects(context.Context, GroupKind, string) (*RawObject, error) {
 	return &RawObject{ID: 1, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte("not-json")}, nil
 }
 
@@ -2965,9 +3017,13 @@ type resolveProbeStore struct {
 	resolved atomic.Bool
 }
 
-func (s *resolveProbeStore) ObjectsGetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
+func (s *resolveProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), getByName: s.getByNameObjects}
+}
+
+func (s *resolveProbeStore) getByNameObjects(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
 	s.resolved.Store(true)
-	return s.Store.ObjectsGetByName(ctx, gk, name)
+	return s.Store.Objects().GetByName(ctx, gk, name)
 }
 
 // The single-threaded ABA test above cannot catch a resolve-then-write Update:
@@ -3394,7 +3450,7 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 
 	// The committed row is settled, so the owed pass would not list it...
 	bh := client.(*clientImpl[cSpec, cStatus]).bh
-	unsettled, err := bh.store.ObjectsListUnsettledIDs(ctx, clientTestGK)
+	unsettled, err := bh.store.Objects().ListUnsettledIDs(ctx, clientTestGK)
 	require.NoError(t, err)
 	assert.Empty(t, unsettled, "the committed row is settled")
 
@@ -3466,7 +3522,7 @@ func TestNoOpUpdateOnAnUnsettledObjectEnqueuesNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, obj.Generation, same.Generation, "identical bytes must not bump the generation")
 
-	unsettled, err := client.(*clientImpl[cSpec, cStatus]).bh.store.ObjectsListUnsettledIDs(ctx, clientTestGK)
+	unsettled, err := client.(*clientImpl[cSpec, cStatus]).bh.store.Objects().ListUnsettledIDs(ctx, clientTestGK)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectID{obj.ID}, unsettled, "the row is still unsettled")
 	assert.Empty(t, queuedIDs(r.work), "an unsettled row is not a reason to enqueue a write that changed nothing")

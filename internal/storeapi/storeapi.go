@@ -379,6 +379,9 @@ type Store interface {
 	// ObjectWrites is the append-only object write log.
 	ObjectWrites() ObjectWrites
 
+	// Objects is the objects table.
+	Objects() Objects
+
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
@@ -635,6 +638,94 @@ type ObjectWrites interface {
 	Sweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
 }
 
+// Objects is the objects table.
+type Objects interface {
+	// DeleteFinalizer removes finalizer from id's list. A real removal bumps
+	// ResourceVersion; a missing one does nothing. clearedLast reports that this
+	// call removed the last finalizer from a deletion-pending row. Scoped to gk:
+	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
+	DeleteFinalizer(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (clearedLast bool, err error)
+
+	// Create inserts a new object of kind gk. The store assigns ID and
+	// ResourceVersion and sets Generation to 1.
+	Create(ctx context.Context, gk GroupKind, in ObjectsCreateInput) (*RawObject, error)
+
+	// Delete removes the row outright — the physical delete the GC path
+	// performs. Callers must ensure finalizers are empty first.
+	Delete(ctx context.Context, id ObjectID) error
+
+	// Get loads an object by id, or returns ErrNotFound.
+	Get(ctx context.Context, id ObjectID) (*RawObject, error)
+
+	// GetByName loads the object with the given name within gk, or
+	// returns ErrNotFound.
+	GetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
+
+	// GetForReconcile is the reconcile loop's opening read: the object
+	// with conditions, the store-wide write cursor as of the same statement,
+	// and whether it has dependencies. ErrNotFound if the row is gone.
+	GetForReconcile(ctx context.Context, id ObjectID) (ReconcileLoad, error)
+
+	// GetMeta is ObjectsGet without the conditions query (Conditions is
+	// always nil). ErrNotFound if no object matches.
+	GetMeta(ctx context.Context, id ObjectID) (*RawObject, error)
+
+	// ListByIDs returns the objects of kind gk whose ids are in ids,
+	// ordered by id — creation order, not the caller's order and not
+	// resource_version order. An id naming no object, or one of another kind, is
+	// absent: a short result is normal, not an error. Callers keep ids to a
+	// batch a backend can bind in one statement; the watch tail bounds it by its
+	// page cap.
+	ListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
+
+	// ListByIncomingEdge returns the full objects of kind gk that point
+	// at toID through relation, ordered by id, with conditions — edges and
+	// rows in one query. Other kinds are filtered out; no matching edge reads
+	// empty, not ErrNotFound.
+	ListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
+
+	// ListIDs returns the ids of every object of kind gk, ordered by id.
+	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// ListUnsettledIDs returns the IDs of objects of kind gk whose
+	// observed_generation doesn't match generation (not yet converged).
+	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// UpdateSpec replaces an object's spec, bumping Generation and
+	// ResourceVersion, and stamps specVersion. Spec bytes identical to the
+	// stored ones at the row's own schema version are a no-op: no bump, and
+	// changed reports false (bytes at a different schema version always take
+	// the write path). changed=true is what callers enqueue a reconcile on.
+	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
+	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+
+	// UpdateSpecByName is ObjectsUpdateSpec keyed by name within gk, ErrNotFound if
+	// the name is not held (no ErrWrongKind). Same no-op and changed
+	// semantics. An implementation MUST resolve and write in one transaction:
+	// the no-op comparison needs the stored bytes, and a split would let a
+	// concurrent collect hand the name to a replacement in between.
+	UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+
+	// UpdateStatus replaces an object's status, records observedGeneration and
+	// stamps statusVersion. Changed bytes bump ObservedAt, ResourceVersion and
+	// UpdatedAt. Bytes identical at the row's own schema version write no
+	// status — but ObservedGeneration/ObservedAt (and ResourceVersion) still
+	// advance if this reconcile settled a new generation, at most once per
+	// generation; a call identical in both respects writes nothing at all.
+	//
+	// A stale observedGeneration (at or below the recorded value) is ignored
+	// on the no-op path but written as given on the content-changed path,
+	// rolling the object back to unsettled so a later pass re-derives it.
+	//
+	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
+	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
+	// Returns no row.
+	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
+
+	// List returns every object of kind gk, ordered by id.
+	List(ctx context.Context, gk GroupKind) ([]*RawObject, error)
+}
+
 type Dependencies interface {
 	// ListStaleSince returns objects of the given kinds with a
 	// depends_on edge to a target whose resource_version is above their
@@ -735,91 +826,6 @@ type unmigrated interface {
 	// cancellation and values are inherited). fn must not panic: hooks run in
 	// sequence and nothing recovers.
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
-
-	// FinalizersDelete removes finalizer from id's list. A real removal bumps
-	// ResourceVersion; a missing one does nothing. clearedLast reports that this
-	// call removed the last finalizer from a deletion-pending row. Scoped to gk:
-	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
-	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (clearedLast bool, err error)
-
-	// ObjectsCreate inserts a new object of kind gk. The store assigns ID and
-	// ResourceVersion and sets Generation to 1.
-	ObjectsCreate(ctx context.Context, gk GroupKind, in ObjectsCreateInput) (*RawObject, error)
-
-	// ObjectsDelete removes the row outright — the physical delete the GC path
-	// performs. Callers must ensure finalizers are empty first.
-	ObjectsDelete(ctx context.Context, id ObjectID) error
-
-	// ObjectsGet loads an object by id, or returns ErrNotFound.
-	ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error)
-
-	// ObjectsGetByName loads the object with the given name within gk, or
-	// returns ErrNotFound.
-	ObjectsGetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
-
-	// ObjectsGetForReconcile is the reconcile loop's opening read: the object
-	// with conditions, the store-wide write cursor as of the same statement,
-	// and whether it has dependencies. ErrNotFound if the row is gone.
-	ObjectsGetForReconcile(ctx context.Context, id ObjectID) (ReconcileLoad, error)
-
-	// ObjectsGetMeta is ObjectsGet without the conditions query (Conditions is
-	// always nil). ErrNotFound if no object matches.
-	ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawObject, error)
-
-	// ObjectsList returns every object of kind gk, ordered by id.
-	ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error)
-
-	// ObjectsListByIncomingEdge returns the full objects of kind gk that point
-	// at toID through relation, ordered by id, with conditions — edges and
-	// rows in one query. Other kinds are filtered out; no matching edge reads
-	// empty, not ErrNotFound.
-	ObjectsListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
-
-	// ObjectsListByIDs returns the objects of kind gk whose ids are in ids,
-	// ordered by id — creation order, not the caller's order and not
-	// resource_version order. An id naming no object, or one of another kind, is
-	// absent: a short result is normal, not an error. Callers keep ids to a
-	// batch a backend can bind in one statement; the watch tail bounds it by its
-	// page cap.
-	ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
-
-	// ObjectsListIDs returns the ids of every object of kind gk, ordered by id.
-	ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ObjectsListUnsettledIDs returns the IDs of objects of kind gk whose
-	// observed_generation doesn't match generation (not yet converged).
-	ObjectsListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ObjectsUpdateSpec replaces an object's spec, bumping Generation and
-	// ResourceVersion, and stamps specVersion. Spec bytes identical to the
-	// stored ones at the row's own schema version are a no-op: no bump, and
-	// changed reports false (bytes at a different schema version always take
-	// the write path). changed=true is what callers enqueue a reconcile on.
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
-
-	// ObjectsUpdateSpecByName is ObjectsUpdateSpec keyed by name within gk, ErrNotFound if
-	// the name is not held (no ErrWrongKind). Same no-op and changed
-	// semantics. An implementation MUST resolve and write in one transaction:
-	// the no-op comparison needs the stored bytes, and a split would let a
-	// concurrent collect hand the name to a replacement in between.
-	ObjectsUpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
-
-	// ObjectsUpdateStatus replaces an object's status, records observedGeneration and
-	// stamps statusVersion. Changed bytes bump ObservedAt, ResourceVersion and
-	// UpdatedAt. Bytes identical at the row's own schema version write no
-	// status — but ObservedGeneration/ObservedAt (and ResourceVersion) still
-	// advance if this reconcile settled a new generation, at most once per
-	// generation; a call identical in both respects writes nothing at all.
-	//
-	// A stale observedGeneration (at or below the recorded value) is ignored
-	// on the no-op path but written as given on the content-changed path,
-	// rolling the object back to unsettled so a later pass re-derives it.
-	//
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
-	// Returns no row.
-	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
 
 	// ResourceVersionsMaxIssued returns the highest resource version issued. It
 	// reads the sequence, not a table, so retention cannot lower it. It moves

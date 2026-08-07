@@ -34,7 +34,7 @@ import "context"
 // per kind rather than per child because it is cross-kind and coalesces anyway.
 func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
-		obj, err := bh.store.ObjectsGetMeta(ctx, id)
+		obj, err := bh.store.Objects().GetMeta(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -100,7 +100,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// would spin, since requeueNow bypasses the re-enqueue floor.
 		var blocked []ObjectRef
 		for _, owner := range owners {
-			meta, err := bh.store.ObjectsGetMeta(ctx, owner.ID)
+			meta, err := bh.store.Objects().GetMeta(ctx, owner.ID)
 			if err != nil {
 				return err
 			}
@@ -108,7 +108,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 				blocked = append(blocked, owner)
 			}
 		}
-		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
+		if err := bh.store.Objects().Delete(ctx, id); err != nil {
 			return err
 		}
 		bh.signalKindWritten(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind})
