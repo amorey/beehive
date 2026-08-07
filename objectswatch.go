@@ -614,7 +614,7 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 	// its owner off the log entry's row image instead.
 	var owners map[ObjectID][]ObjectRef
 	if withOwners {
-		if owners, err = bh.store.EdgesGroupOutgoingByID(ctx, live, RelationOwnedBy); err != nil {
+		if owners, err = bh.store.Edges().GroupOutgoingByID(ctx, live, RelationOwnedBy); err != nil {
 			return nil, err
 		}
 	}

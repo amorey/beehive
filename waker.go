@@ -599,7 +599,7 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 		seen[ref.ID] = struct{}{}
 		ids = append(ids, ref.ID)
 	}
-	byTarget, err := dw.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
+	byTarget, err := dw.bh.store.Edges().GroupIncomingByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false

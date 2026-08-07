@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/amorey/beehive/internal/storeapi"
 	"log/slog"
 	"math"
 	"slices"
@@ -663,7 +664,7 @@ func TestOwnedObjectsListWatchReportsAnUndecodableCollectedChild(t *testing.T) {
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	_, err = store.EdgesAdd(ctx, poison.ID, owner.ID, RelationOwnedBy)
+	_, err = store.Edges().Add(ctx, poison.ID, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 
 	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
@@ -1137,12 +1138,16 @@ type edgelessStore struct {
 	failed chan struct{}
 }
 
-func (s *edgelessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *edgelessStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *edgelessStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
 	if s.broken.Load() {
 		probeSignal(s.failed)
 		return nil, errBoom
 	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, r)
 }
 
 // A watch that asked for relations fails rather than delivering objects whose
@@ -2624,9 +2629,13 @@ type countingLoadStore struct {
 	relationReads atomic.Int64
 }
 
-func (s *countingLoadStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *countingLoadStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *countingLoadStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	s.relationReads.Add(1)
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
 // A resume replays the log gap before going live, and pages it: with a day of
@@ -2850,7 +2859,11 @@ type failingLoadStore struct {
 	tried chan struct{}
 }
 
-func (s *failingLoadStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *failingLoadStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *failingLoadStore) groupOutgoingByIDEdges(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	s.once.Do(func() { close(s.tried) })
 	return nil, errBoom
 }
@@ -3544,11 +3557,15 @@ func (s *failAfterArmStore) hit() bool {
 	return true
 }
 
-func (s *failAfterArmStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *failAfterArmStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *failAfterArmStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	if s.failEdges && s.hit() {
 		return nil, errBoom
 	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
 func (s *failAfterArmStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
@@ -3858,11 +3875,15 @@ type countingLoadFailStore struct {
 	failuresLeft atomic.Int64
 }
 
-func (s *countingLoadFailStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *countingLoadFailStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *countingLoadFailStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	if s.failuresLeft.Add(-1) >= 0 {
 		return nil, errBoom
 	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
 // Only the relation load is retried. Decoding is pure and cannot fail the call,

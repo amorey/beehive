@@ -126,7 +126,7 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 			Spec: []byte(`{}`),
 		})
 		require.NoError(b, err)
-		_, err = store.EdgesAdd(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy)
+		_, err = store.Edges().Add(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy)
 		require.NoError(b, err)
 	}
 

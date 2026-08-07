@@ -2953,7 +2953,7 @@ func TestClientOnlyTargetDeletionUnwedges(t *testing.T) {
 
 	// The wake is only half the story: with the edge dropped, the target must
 	// actually collect rather than stay deletion-pending forever.
-	_, err := store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn)
+	_, err := store.Edges().Delete(ctx, dep.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	_, err = bh.gcCollect(ctx, target.ID)
 	require.NoError(t, err)
@@ -3086,7 +3086,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 	// The third party declares from outside the pass's client, mid-flight. The
 	// target never moves, so only the edge-new stamp can carry this wake.
 	h.inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], _ *Object[cSpec, cStatus]) (Result, error) {
-		_, err := h.store.EdgesAdd(ctx, h.dep, quiet.ID, RelationDependsOn)
+		_, err := h.store.Edges().Add(ctx, h.dep, quiet.ID, RelationDependsOn)
 		return Result{}, err
 	}
 	_, _, err = h.tc.reconcile(ctx, h.dep)

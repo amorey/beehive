@@ -52,6 +52,10 @@ type sqliteEvents struct{ *sqliteStore }
 
 func (s *sqliteStore) Events() storeapi.Events { return sqliteEvents{s} }
 
+type sqliteEdges struct{ *sqliteStore }
+
+func (s *sqliteStore) Edges() storeapi.Edges { return sqliteEdges{s} }
+
 type sqliteDependencies struct{ *sqliteStore }
 
 func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
@@ -2423,7 +2427,7 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	}
 	// The owner edge cascades with the row, so the image is the last place it can
 	// be recorded — an owner-scoped watch reads a collected child's owner here.
-	owners, err := s.EdgesListOutgoingByRelation(ctx, id, storeapi.RelationOwnedBy)
+	owners, err := s.Edges().ListOutgoingByRelation(ctx, id, storeapi.RelationOwnedBy)
 	if err != nil {
 		return err
 	}
@@ -2461,7 +2465,7 @@ const edgeIsNew = `NOT EXISTS (
 // harmless way: a stamp with no edge is one spurious wake that drains; an edge
 // with no stamp is a dependent stranded on a stale read that ObjectsListUnsettledIDs
 // structurally cannot see.
-func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesAddResult, error) {
+func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesAddResult, error) {
 	var out storeapi.EdgesAddResult
 	err := s.Within(ctx, func(ctx context.Context) error {
 		// One round-trip, no blobs. A join, not scalar subqueries: SQLite does no
@@ -2541,7 +2545,7 @@ func (s *sqliteStore) EdgesAdd(ctx context.Context, fromID, toID storeapi.Object
 // edge was there, the target is deletion-pending and the source is not — the
 // last condition because EdgesHasIncoming already discounts an edge from a
 // deletion-pending source.
-func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesDeleteResult, error) {
+func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesDeleteResult, error) {
 	res, err := s.conn(ctx).ExecContext(ctx,
 		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
 		fromID, toID, string(relation))
@@ -2589,7 +2593,7 @@ func (s *sqliteStore) EdgesDelete(ctx context.Context, fromID, toID storeapi.Obj
 
 // EdgesListIncoming returns the objects pointing at toID through relation, joining edges
 // to objects so each carries the GroupKind needed to route a requeue.
-func (s *sqliteStore) EdgesListIncoming(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
+func (s sqliteEdges) ListIncoming(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.from_id
@@ -2603,7 +2607,7 @@ func (s *sqliteStore) EdgesListIncoming(ctx context.Context, toID storeapi.Objec
 // EdgesGroupIncomingByID resolves EdgesListIncoming for many targets at once,
 // bucketed by target id — the incoming twin of EdgesGroupOutgoingByID. It routes
 // by r.to_id and joins the source side (r.from_id).
-func (s *sqliteStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+func (s sqliteEdges) GroupIncomingByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
 	return s.edgesByIDs(ctx, toIDs, relation, "to_id", "from_id")
 }
 
@@ -2670,7 +2674,7 @@ func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.Obj
 
 // EdgesListOutgoingByRelation returns the objects fromID points at through relation. No
 // DISTINCT needed: (from_id, to_id, relation) is unique.
-func (s *sqliteStore) EdgesListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
+func (s sqliteEdges) ListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
@@ -2684,7 +2688,7 @@ func (s *sqliteStore) EdgesListOutgoingByRelation(ctx context.Context, fromID st
 // EdgesGroupOutgoingByID resolves EdgesListOutgoingByRelation for many sources at
 // once, bucketed by source id. It routes by r.from_id and joins the target side
 // (r.to_id).
-func (s *sqliteStore) EdgesGroupOutgoingByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+func (s sqliteEdges) GroupOutgoingByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
 	return s.edgesByIDs(ctx, fromIDs, relation, "from_id", "to_id")
 }
 
@@ -2726,7 +2730,7 @@ func scanLoggedWrites(rows *sql.Rows, err error) ([]loggedWrite, error) {
 // EdgesDeleteFinalizingDependsOn removes depends_on edges into toID whose source is
 // itself deletion-pending, breaking the mutual-RESTRICT deadlock between
 // finalizing objects. Bumps no version.
-func (s *sqliteStore) EdgesDeleteFinalizingDependsOn(ctx context.Context, toID storeapi.ObjectID) error {
+func (s sqliteEdges) DeleteFinalizingDependsOn(ctx context.Context, toID storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		DELETE FROM edges
 		WHERE to_id = ? AND relation = ?
@@ -2739,7 +2743,7 @@ func (s *sqliteStore) EdgesDeleteFinalizingDependsOn(ctx context.Context, toID s
 // depends_on edge from a deletion-pending source is ignored — otherwise two
 // finalizing objects depending on each other would never clear. owned_by always
 // counts: the foreground cascade waits for physical removal.
-func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID) (bool, error) {
+func (s sqliteEdges) HasIncoming(ctx context.Context, id storeapi.ObjectID) (bool, error) {
 	var exists int
 	err := s.conn(ctx).QueryRowContext(ctx, `
 		SELECT EXISTS(

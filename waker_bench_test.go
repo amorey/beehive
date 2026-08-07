@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"github.com/amorey/beehive/internal/storeapi"
 	"strconv"
 	"testing"
 
@@ -184,9 +185,13 @@ func (s *wakeCountingStore) ObjectWritesListSinceAll(ctx context.Context, after 
 	return s.Store.ObjectWritesListSinceAll(ctx, after, limit)
 }
 
-func (s *wakeCountingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *wakeCountingStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupIncomingByID: s.groupIncomingByIDEdges}
+}
+
+func (s *wakeCountingStore) groupIncomingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	s.reads++
-	return s.Store.EdgesGroupIncomingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupIncomingByID(ctx, ids, rel)
 }
 
 func (s *wakeCountingStore) DriverCursorsSet(ctx context.Context, name string, at int64) error {
@@ -229,7 +234,7 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 		for i, from := range ids {
 			for n := 1; n <= benchStaleEdgesPerObject; n++ {
 				to := ids[(i+n)%objects]
-				if _, err := store.EdgesAdd(ctx, from, to, RelationDependsOn); err != nil {
+				if _, err := store.Edges().Add(ctx, from, to, RelationDependsOn); err != nil {
 					return err
 				}
 			}

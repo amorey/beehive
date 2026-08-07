@@ -373,6 +373,9 @@ type Store interface {
 	// Events is the per-object event log, aggregated into runs.
 	Events() Events
 
+	// Edges is the owned_by and depends_on edge table.
+	Edges() Edges
+
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
@@ -499,6 +502,67 @@ type Events interface {
 	// caller sweeping rarely can ask for proportionally more; <= 0 leaves the
 	// bound to the implementation.
 	Sweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error)
+}
+
+// Edges is the owned_by and depends_on edge table.
+type Edges interface {
+	// Add inserts a directed (fromID -> toID) edge with the given
+	// relation. Idempotent; both endpoints must exist or ErrNotFound. Bumps no
+	// version.
+	//
+	// Every new depends_on edge it creates (self-edges excluded) increments
+	// fromID's reconcile_owed and reports it as ReconcileOwedStamped. The
+	// endpoint check, the stamp and the insert MUST be one atomic unit — a
+	// stamp issued separately could be dropped while the edge commits,
+	// stranding the dependent. The same edge-new gate also clears fromID's
+	// dependency_watermarks row (a watermark recorded over a smaller
+	// dependency set cannot speak for a new target). The stamp is
+	// unconditional on the caller and independent of whether fromID's kind has
+	// a controller. See docs/adr/2026-07-29-stamp-every-new-dependency-edge.md.
+	//
+	// The result also reports both endpoints' GroupKinds and whether toID was
+	// deletion-pending, all read by the endpoint check inside that same unit.
+	Add(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
+
+	// Delete removes the (fromID, toID, relation) edge; removing a missing
+	// one does nothing. Bumps no version. For a depends_on edge it reports
+	// whether the removal lifted a RESTRICT block, so a caller can push the
+	// target's collect; Unblocked is never set for any other relation, because
+	// the source-side condition behind it is the discount EdgesHasIncoming
+	// gives depends_on alone.
+	Delete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
+
+	// DeleteFinalizingDependsOn removes the depends_on edges pointing at toID
+	// whose source is itself marked for deletion, so mutually dependent
+	// finalizing objects don't RESTRICT-block each other forever. owned_by
+	// edges are left alone.
+	DeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
+
+	// GroupIncomingByID is the batched form of EdgesListIncoming: sources
+	// pointing at many targets through relation, grouped by target id. A
+	// target with no sources is absent from the map.
+	GroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
+
+	// GroupOutgoingByID is the batched form of EdgesListOutgoingByRelation: the
+	// relation's targets for many sources, grouped by source id. A source with
+	// no matching edge is absent from the map. An implementation may split a
+	// large id list across queries.
+	GroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
+
+	// HasIncoming reports whether anything with a live claim points at
+	// id: an owned_by edge, or a depends_on edge from a source that is not
+	// itself finalizing (a deletion-pending dependent no longer counts, or
+	// mutually dependent finalizing objects would deadlock). GC pairs this
+	// with EdgesDeleteFinalizingDependsOn before ObjectsDelete.
+	HasIncoming(ctx context.Context, id ObjectID) (bool, error)
+
+	// ListIncoming returns every object pointing at toID through
+	// relation, ordered by id.
+	ListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error)
+
+	// ListOutgoingByRelation returns the objects fromID points at through relation,
+	// ordered by id — the inverse of EdgesListIncoming.
+	ListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 }
 
 type Dependencies interface {
@@ -686,64 +750,6 @@ type unmigrated interface {
 	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
 	// Returns no row.
 	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
-
-	// EdgesAdd inserts a directed (fromID -> toID) edge with the given
-	// relation. Idempotent; both endpoints must exist or ErrNotFound. Bumps no
-	// version.
-	//
-	// Every new depends_on edge it creates (self-edges excluded) increments
-	// fromID's reconcile_owed and reports it as ReconcileOwedStamped. The
-	// endpoint check, the stamp and the insert MUST be one atomic unit — a
-	// stamp issued separately could be dropped while the edge commits,
-	// stranding the dependent. The same edge-new gate also clears fromID's
-	// dependency_watermarks row (a watermark recorded over a smaller
-	// dependency set cannot speak for a new target). The stamp is
-	// unconditional on the caller and independent of whether fromID's kind has
-	// a controller. See docs/adr/2026-07-29-stamp-every-new-dependency-edge.md.
-	//
-	// The result also reports both endpoints' GroupKinds and whether toID was
-	// deletion-pending, all read by the endpoint check inside that same unit.
-	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
-
-	// EdgesDelete removes the (fromID, toID, relation) edge; removing a missing
-	// one does nothing. Bumps no version. For a depends_on edge it reports
-	// whether the removal lifted a RESTRICT block, so a caller can push the
-	// target's collect; Unblocked is never set for any other relation, because
-	// the source-side condition behind it is the discount EdgesHasIncoming
-	// gives depends_on alone.
-	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
-
-	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
-	// whose source is itself marked for deletion, so mutually dependent
-	// finalizing objects don't RESTRICT-block each other forever. owned_by
-	// edges are left alone.
-	EdgesDeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
-
-	// EdgesGroupIncomingByID is the batched form of EdgesListIncoming: sources
-	// pointing at many targets through relation, grouped by target id. A
-	// target with no sources is absent from the map.
-	EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
-
-	// EdgesGroupOutgoingByID is the batched form of EdgesListOutgoingByRelation: the
-	// relation's targets for many sources, grouped by source id. A source with
-	// no matching edge is absent from the map. An implementation may split a
-	// large id list across queries.
-	EdgesGroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
-
-	// EdgesHasIncoming reports whether anything with a live claim points at
-	// id: an owned_by edge, or a depends_on edge from a source that is not
-	// itself finalizing (a deletion-pending dependent no longer counts, or
-	// mutually dependent finalizing objects would deadlock). GC pairs this
-	// with EdgesDeleteFinalizingDependsOn before ObjectsDelete.
-	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
-
-	// EdgesListIncoming returns every object pointing at toID through
-	// relation, ordered by id.
-	EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error)
-
-	// EdgesListOutgoingByRelation returns the objects fromID points at through relation,
-	// ordered by id — the inverse of EdgesListIncoming.
-	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
 
 	// ResourceVersionsMaxIssued returns the highest resource version issued. It
 	// reads the sequence, not a table, so retention cannot lower it. It moves

@@ -394,7 +394,7 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it.
 	// No wake stamp: ownership owes the child no reconcile.
 	if co.owner != nil {
-		res, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		res, err := c.bh.store.Edges().Add(ctx, raw.ID, *co.owner, RelationOwnedBy)
 		if err != nil {
 			return nil, err
 		}
@@ -615,7 +615,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnerBit
 	}
 	if set&LoadDependenciesBit != 0 {
-		deps, err := store.EdgesListOutgoingByRelation(ctx, obj.ID, RelationDependsOn)
+		deps, err := store.Edges().ListOutgoingByRelation(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -623,7 +623,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependenciesBit
 	}
 	if set&LoadDependentsBit != 0 {
-		dependents, err := store.EdgesListIncoming(ctx, obj.ID, RelationDependsOn)
+		dependents, err := store.Edges().ListIncoming(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -631,7 +631,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependentsBit
 	}
 	if set&LoadOwnedBit != 0 {
-		owned, err := store.EdgesListIncoming(ctx, obj.ID, RelationOwnedBy)
+		owned, err := store.Edges().ListIncoming(ctx, obj.ID, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -652,7 +652,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 // fetchOwnerRef resolves id's single owned_by edge; ok is false when there is
 // none.
 func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bool, error) {
-	owners, err := store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
+	owners, err := store.Edges().ListOutgoingByRelation(ctx, id, RelationOwnedBy)
 	if err != nil {
 		return ObjectRef{}, false, err
 	}
@@ -709,7 +709,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		ids[i] = o.ID
 	}
 	if set&LoadOwnerBit != 0 {
-		byID, err := c.bh.store.EdgesGroupOutgoingByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.Edges().GroupOutgoingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -722,7 +722,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependenciesBit != 0 {
-		byID, err := c.bh.store.EdgesGroupOutgoingByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.Edges().GroupOutgoingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -732,7 +732,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependentsBit != 0 {
-		byID, err := c.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.Edges().GroupIncomingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -742,7 +742,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadOwnedBit != 0 {
-		byID, err := c.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.Edges().GroupIncomingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -805,15 +805,15 @@ func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (
 }
 
 func (c *clientImpl[Spec, Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationOwnedBy)
 }
 
 // The kind filter lives in the store statement's WHERE, so foreign-kind

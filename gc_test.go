@@ -162,13 +162,17 @@ func (s *collectFakeStore) DeletionRequests() storeapi.DeletionRequests {
 func (s *collectFakeStore) createFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
 	return storeapi.DeletionCascadeResult{}, s.markErr
 }
-func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
+func (s *collectFakeStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), deleteFinalizingDependsOn: s.deleteFinalizingDependsOnEdges, hasIncoming: s.hasIncomingEdges, listOutgoingByRelation: s.listOutgoingByRelationEdges}
+}
+
+func (s *collectFakeStore) deleteFinalizingDependsOnEdges(context.Context, ObjectID) error {
 	return s.dropDependsErr
 }
-func (s *collectFakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
+func (s *collectFakeStore) hasIncomingEdges(context.Context, ObjectID) (bool, error) {
 	return s.hasEdges, s.hasEdgesErr
 }
-func (s *collectFakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+func (s *collectFakeStore) listOutgoingByRelationEdges(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return s.owners, s.listOwnersErr
 }
 func (s *collectFakeStore) ObjectsDelete(context.Context, ObjectID) error {
@@ -1134,7 +1138,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, target.ID))
-	_, err = store.EdgesDelete(ctx, dep.ID, target.ID, RelationDependsOn)
+	_, err = store.Edges().Delete(ctx, dep.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	waitForDeletions(t, w, target.ID)
 }

@@ -168,7 +168,7 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 // bounds it to one enqueue per edge ever created — and routed by res.From
 // because the edge is cross-kind.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
-	res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.Edges().Add(ctx, fromID, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 // because the edge is cross-kind. See
 // docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
 func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
-	res, err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.Edges().Delete(ctx, fromID, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
@@ -204,19 +204,19 @@ func (c *controllerClientImpl[Status]) OwnersGet(ctx context.Context, id ObjectI
 }
 
 func (c *controllerClientImpl[Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationOwnedBy)
 }
 
 func (c *controllerClientImpl[Status]) EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error) {
-	return c.bh.store.EdgesHasIncoming(ctx, id)
+	return c.bh.store.Edges().HasIncoming(ctx, id)
 }
 
 // Within groups writes into one transaction. It adds no kind scoping of its

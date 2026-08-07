@@ -418,12 +418,12 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	to := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "to"})
 
 	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID))
-	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
+	deps, err := bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectRef{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
 	require.NoError(t, cc.DependenciesDelete(ctx, from.ID, to.ID))
-	deps, err = bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
+	deps, err = bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
@@ -661,7 +661,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
-	refs, err := real.EdgesListIncoming(ctx, target.ID, RelationDependsOn)
+	refs, err := real.Edges().ListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, objectRefIDs(refs), "the edge landed")
 
@@ -906,7 +906,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errBoom)
 
-	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.Edges().ListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "the rolled-back declaration left no edge")
 	f.requireNotOwed(t)
@@ -980,7 +980,11 @@ type failEdgesHasIncomingStore struct {
 	fakeStore
 }
 
-func (s *failEdgesHasIncomingStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
+func (s *failEdgesHasIncomingStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), hasIncoming: s.hasIncomingEdges}
+}
+
+func (s *failEdgesHasIncomingStore) hasIncomingEdges(context.Context, ObjectID) (bool, error) {
 	return false, errBoom
 }
 
@@ -996,7 +1000,11 @@ type failEdgesAddStore struct {
 	fakeStore
 }
 
-func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
+func (s *failEdgesAddStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), add: s.addEdges}
+}
+
+func (s *failEdgesAddStore) addEdges(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	return storeapi.EdgesAddResult{}, errBoom
 }
 
@@ -1054,7 +1062,11 @@ type failEdgesDeleteStore struct {
 	fakeStore
 }
 
-func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+func (s *failEdgesDeleteStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), delete: s.deleteEdges}
+}
+
+func (s *failEdgesDeleteStore) deleteEdges(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
 	return storeapi.EdgesDeleteResult{}, errBoom
 }
 

@@ -496,7 +496,7 @@ func TestClientCreateWithOptions(t *testing.T) {
 	assert.Equal(t, []string{"cleanup-a", "cleanup-b"}, got.Finalizers)
 
 	// The owner ref is recorded child -> owner, so the owner sees the child.
-	refs, err := store.EdgesListIncoming(ctx, owner.ID, RelationOwnedBy)
+	refs, err := store.Edges().ListIncoming(ctx, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	assert.Equal(t, child.ID, refs[0].ID)
@@ -1954,7 +1954,16 @@ func TestOwnedByIsWrittenInOnePlace(t *testing.T) {
 				if !ok || len(node.Args) == 0 {
 					return true
 				}
-				if sel.Sel.Name != "EdgesAdd" && sel.Sel.Name != "EdgesDelete" {
+				if sel.Sel.Name != "Add" && sel.Sel.Name != "Delete" {
+					return true
+				}
+				// ...reached through the Edges() accessor, so an unrelated Add
+				// elsewhere is not mistaken for an edge write.
+				recv, ok := sel.X.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if fam, ok := recv.Fun.(*ast.SelectorExpr); !ok || fam.Sel.Name != "Edges" {
 					return true
 				}
 				if relationName(node.Args[len(node.Args)-1]) == "RelationOwnedBy" {
@@ -2035,7 +2044,11 @@ func (s *ownedObjectsLoadErrorStore) ObjectsListByIncomingEdge(context.Context, 
 	return []*RawObject{{ID: 2, Group: s.gk.Group, Kind: s.gk.Kind, Spec: []byte(`{"Val":"ok"}`)}}, nil
 }
 
-func (*ownedObjectsLoadErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *ownedObjectsLoadErrorStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), groupOutgoingByID: s.groupOutgoingByID}
+}
+
+func (*ownedObjectsLoadErrorStore) groupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
 
@@ -2089,14 +2102,18 @@ type countingStore struct {
 	incomingByIDs int
 }
 
-func (s *countingStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
-	s.outgoingByIDs++
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+func (s *countingStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges, groupIncomingByID: s.groupIncomingByIDEdges}
 }
 
-func (s *countingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *countingStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+	s.outgoingByIDs++
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
+}
+
+func (s *countingStore) groupIncomingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	s.incomingByIDs++
-	return s.Store.EdgesGroupIncomingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupIncomingByID(ctx, ids, rel)
 }
 
 func TestClientListWithLoadOwnerBatches(t *testing.T) {
@@ -2235,16 +2252,26 @@ type edgeErrorStore struct {
 	Store
 }
 
-func (edgeErrorStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]ObjectRef, error) {
+func (s edgeErrorStore) Edges() storeapi.Edges {
+	return edgesOverride{
+		Edges:                  s.Store.Edges(),
+		groupIncomingByID:      s.groupIncomingByID,
+		groupOutgoingByID:      s.groupOutgoingByID,
+		listIncoming:           s.listIncoming,
+		listOutgoingByRelation: s.listOutgoingByRelation,
+	}
+}
+
+func (edgeErrorStore) listOutgoingByRelation(context.Context, ObjectID, Relation) ([]ObjectRef, error) {
 	return nil, errBoom
 }
-func (edgeErrorStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]ObjectRef, error) {
+func (edgeErrorStore) listIncoming(context.Context, ObjectID, Relation) ([]ObjectRef, error) {
 	return nil, errBoom
 }
-func (edgeErrorStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
+func (edgeErrorStore) groupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
-func (edgeErrorStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
+func (edgeErrorStore) groupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	return nil, errBoom
 }
 

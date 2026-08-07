@@ -77,12 +77,12 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// Drop depends_on edges from finalizing dependents first, or two
 		// deletion-pending objects that depend on each other would hold each
 		// other's RESTRICT forever. owned_by edges are left for the cascade.
-		if err := bh.store.EdgesDeleteFinalizingDependsOn(ctx, id); err != nil {
+		if err := bh.store.Edges().DeleteFinalizingDependsOn(ctx, id); err != nil {
 			return err
 		}
 		// Still referenced: RESTRICT forbids the delete. A later sweep retries
 		// once the referrer is gone.
-		referenced, err := bh.store.EdgesHasIncoming(ctx, id)
+		referenced, err := bh.store.Edges().HasIncoming(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -92,7 +92,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 
 		// Read before the delete: edges.from_id is ON DELETE CASCADE. owned_by
 		// only: EdgesHasIncoming discounts depends_on from a deleting source.
-		owners, err := bh.store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
+		owners, err := bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationOwnedBy)
 		if err != nil {
 			return err
 		}

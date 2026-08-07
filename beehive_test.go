@@ -232,7 +232,7 @@ func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
 	target := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "target"})
 	// The production stamp: a new depends_on edge owes swept a reconcile no loop
 	// will ever run.
-	_, err := bh.store.EdgesAdd(ctx, swept.ID, target.ID, RelationDependsOn)
+	_, err := bh.store.Edges().Add(ctx, swept.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 
 	_, ch, err := loose.WatchList(ctx)
@@ -254,7 +254,7 @@ func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
 	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
 	from := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "from"})
 	to := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "to"})
-	res, err := bh.store.EdgesAdd(ctx, from.ID, to.ID, RelationDependsOn)
+	res, err := bh.store.Edges().Add(ctx, from.ID, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.True(t, res.ReconcileOwedStamped, "the edge must owe a reconcile to begin with")
 

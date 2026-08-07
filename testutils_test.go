@@ -548,6 +548,117 @@ func (o owedOverride) Sweep(ctx context.Context, keep []GroupKind) (int, error) 
 	return o.ReconcileOwed.Sweep(ctx, keep)
 }
 
+func (s *fakeStore) Edges() storeapi.Edges { return fakeEdges{} }
+
+// fakeEdges is fakeStore's edge family. The listings answer empty rather than
+// panicking: the drivers walk edges in every Beehive.
+type fakeEdges struct{}
+
+func (fakeEdges) Add(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
+	panic("not implemented: fakeStore.Edges().Add")
+}
+
+func (fakeEdges) Delete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+	panic("not implemented: fakeStore.Edges().Delete")
+}
+
+func (fakeEdges) ListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) GroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) ListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) ListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) GroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) DeleteFinalizingDependsOn(context.Context, ObjectID) error {
+	return nil
+}
+
+func (fakeEdges) HasIncoming(context.Context, ObjectID) (bool, error) {
+	return false, nil
+}
+
+// edgesOverride replaces the hooks that are set and delegates the rest.
+type edgesOverride struct {
+	storeapi.Edges
+	add                       func(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error)
+	delete                    func(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error)
+	deleteFinalizingDependsOn func(context.Context, ObjectID) error
+	groupIncomingByID         func(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error)
+	groupOutgoingByID         func(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error)
+	hasIncoming               func(context.Context, ObjectID) (bool, error)
+	listIncoming              func(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error)
+	listOutgoingByRelation    func(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error)
+}
+
+func (o edgesOverride) Add(ctx context.Context, from, to ObjectID, rel Relation) (storeapi.EdgesAddResult, error) {
+	if o.add != nil {
+		return o.add(ctx, from, to, rel)
+	}
+	return o.Edges.Add(ctx, from, to, rel)
+}
+
+func (o edgesOverride) Delete(ctx context.Context, from, to ObjectID, rel Relation) (storeapi.EdgesDeleteResult, error) {
+	if o.delete != nil {
+		return o.delete(ctx, from, to, rel)
+	}
+	return o.Edges.Delete(ctx, from, to, rel)
+}
+
+func (o edgesOverride) DeleteFinalizingDependsOn(ctx context.Context, to ObjectID) error {
+	if o.deleteFinalizingDependsOn != nil {
+		return o.deleteFinalizingDependsOn(ctx, to)
+	}
+	return o.Edges.DeleteFinalizingDependsOn(ctx, to)
+}
+
+func (o edgesOverride) GroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	if o.groupIncomingByID != nil {
+		return o.groupIncomingByID(ctx, ids, rel)
+	}
+	return o.Edges.GroupIncomingByID(ctx, ids, rel)
+}
+
+func (o edgesOverride) GroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	if o.groupOutgoingByID != nil {
+		return o.groupOutgoingByID(ctx, ids, rel)
+	}
+	return o.Edges.GroupOutgoingByID(ctx, ids, rel)
+}
+
+func (o edgesOverride) HasIncoming(ctx context.Context, id ObjectID) (bool, error) {
+	if o.hasIncoming != nil {
+		return o.hasIncoming(ctx, id)
+	}
+	return o.Edges.HasIncoming(ctx, id)
+}
+
+func (o edgesOverride) ListIncoming(ctx context.Context, to ObjectID, rel Relation) ([]storeapi.ObjectRef, error) {
+	if o.listIncoming != nil {
+		return o.listIncoming(ctx, to, rel)
+	}
+	return o.Edges.ListIncoming(ctx, to, rel)
+}
+
+func (o edgesOverride) ListOutgoingByRelation(ctx context.Context, from ObjectID, rel Relation) ([]storeapi.ObjectRef, error) {
+	if o.listOutgoingByRelation != nil {
+		return o.listOutgoingByRelation(ctx, from, rel)
+	}
+	return o.Edges.ListOutgoingByRelation(ctx, from, rel)
+}
+
 func (s *fakeStore) Conditions() storeapi.Conditions { return s.conditions }
 
 // fakeConditions is fakeStore's conditions family. A nil hook panics, which is
@@ -660,35 +771,8 @@ func (o eventsOverride) Sweep(ctx context.Context, perTimeline int, maxAge time.
 	}
 	return o.Events.Sweep(ctx, perTimeline, maxAge, capBudget)
 }
-func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
-	panic("not implemented: fakeStore.EdgesAdd")
-}
-func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
-	panic("not implemented: fakeStore.EdgesDelete")
-}
-func (s *fakeStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
 func (s *fakeStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
 	return nil, nil
-}
-func (s *fakeStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
-	return nil
-}
-func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
-	return false, nil
 }
 
 func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
@@ -753,7 +837,11 @@ type depsStore struct {
 	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *depsStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), groupIncomingByID: s.groupIncomingByIDEdges}
+}
+
+func (s *depsStore) groupIncomingByIDEdges(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
 	s.calls.Add(1)
 	if s.err != nil {
 		return nil, s.err
@@ -1204,7 +1292,7 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 // stays a one-liner with no side effects on the owed listings. Tests that assert
 // on the EdgesAddResult or the stamp call the method directly.
 func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
-	res, err := store.EdgesAdd(ctx, from, to, relation)
+	res, err := store.Edges().Add(ctx, from, to, relation)
 	if err != nil {
 		return err
 	}
@@ -1270,8 +1358,12 @@ type wakeProbeStore struct {
 	looked   chan struct{} // one send per targetID depends_on lookup
 }
 
-func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error) {
-	refs, err := s.Store.EdgesListIncoming(ctx, toID, relation)
+func (s *wakeProbeStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), listIncoming: s.listIncomingEdges, groupIncomingByID: s.groupIncomingByIDEdges}
+}
+
+func (s *wakeProbeStore) listIncomingEdges(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error) {
+	refs, err := s.Store.Edges().ListIncoming(ctx, toID, relation)
 	if toID == s.targetID {
 		s.note(relation)
 	}
@@ -1281,8 +1373,8 @@ func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, r
 // EdgesGroupIncomingByID is the waker's own lookup (it resolves a whole batch of
 // changed targets in one query), so the probe has to cover it too — otherwise a
 // test waiting on "the waker looked" would wait forever.
-func (s *wakeProbeStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error) {
-	refs, err := s.Store.EdgesGroupIncomingByID(ctx, toIDs, relation)
+func (s *wakeProbeStore) groupIncomingByIDEdges(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error) {
+	refs, err := s.Store.Edges().GroupIncomingByID(ctx, toIDs, relation)
 	if slices.Contains(toIDs, s.targetID) {
 		s.note(relation)
 	}
