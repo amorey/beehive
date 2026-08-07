@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// SchedulesWatch is a gauge, so it repeats nothing: the same state on two
+// WatchSchedule is a gauge, so it repeats nothing: the same state on two
 // consecutive polls is one delivery. A subscriber reads it to learn when the next
 // requeue is, and a stream that re-sent an unchanged schedule every tick would be a
 // heartbeat rather than a schedule.
@@ -32,7 +32,7 @@ import (
 // and signals the store on every tick, so a token proves another poll came round —
 // which is what lets this assert on deliveries that must *not* happen without
 // timing anything itself.
-func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
+func TestWatchScheduleEmitsOnlyOnChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -42,7 +42,7 @@ func TestSchedulesWatchEmitsOnlyOnChange(t *testing.T) {
 	_, _, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 
 	// The zero Schedule is a real gauge value, not an absence, so it is delivered.
@@ -99,7 +99,7 @@ func TestScheduleStreamDeliversTheSnapshotFirst(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
 	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 
 	got := recv(t, ch)
@@ -110,7 +110,7 @@ func TestScheduleStreamDeliversTheSnapshotFirst(t *testing.T) {
 func TestScheduleStreamDeliversTheZeroSnapshot(t *testing.T) {
 	ctx, _, client, _ := pushOnlyClient(t)
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 
 	assert.True(t, recv(t, ch).NextRequeueAt.IsZero(), "an unscheduled id reads as the zero Schedule")
@@ -120,7 +120,7 @@ func TestScheduleStreamDeliversTheZeroSnapshot(t *testing.T) {
 // tick, and here with no poll in the process at all.
 func TestScheduleStreamDeliversWithoutATick(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero())
 
@@ -135,7 +135,7 @@ func TestScheduleStreamDeliversWithoutATick(t *testing.T) {
 // shows the two halves are wired together.
 func TestScheduleStreamNeverShowsAStaleValue(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero())
 
@@ -152,7 +152,7 @@ func TestScheduleStreamNeverShowsAStaleValue(t *testing.T) {
 // and the stream would otherwise report the same value twice.
 func TestScheduleStreamRepeatsNothing(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero())
 
@@ -169,7 +169,7 @@ func TestScheduleStreamRepeatsNothing(t *testing.T) {
 func TestScheduleStreamHidesTheRequeueNowIntermediate(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
 	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.False(t, recv(t, ch).NextRequeueAt.IsZero(), "snapshot: the pending alarm")
 
@@ -184,9 +184,9 @@ func TestScheduleStreamHidesTheRequeueNowIntermediate(t *testing.T) {
 // delay the other.
 func TestScheduleStreamFansOut(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	first, err := client.SchedulesWatch(ctx, 1)
+	first, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
-	second, err := client.SchedulesWatch(ctx, 1)
+	second, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, first).NextRequeueAt.IsZero())
 	require.True(t, recv(t, second).NextRequeueAt.IsZero())
@@ -200,7 +200,7 @@ func TestScheduleStreamFansOut(t *testing.T) {
 // A stream watching one id is untouched by another id's moves.
 func TestScheduleStreamIgnoresAnotherID(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero())
 
@@ -238,7 +238,7 @@ func TestScheduleStreamMakesNoPeriodicRead(t *testing.T) {
 	t.Cleanup(cancel)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the snapshot")
 
@@ -257,7 +257,7 @@ func TestScheduleStreamShutdownDeliversThenEnds(t *testing.T) {
 	require.NoError(t, err)
 	r.work.addAfter(1, time.Hour, alarmRequeueAfter)
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.False(t, recv(t, ch).NextRequeueAt.IsZero(), "the pending alarm")
 
@@ -300,7 +300,7 @@ func TestSchedulePublishAfterCloseIsNotFatal(t *testing.T) {
 func TestScheduleStreamDropsACoalescedRepeat(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 
 	// Published before the snapshot is read, so it lands in the receiver's slot
@@ -327,7 +327,7 @@ func TestScheduleStreamCancelBeforeTheSnapshotIsRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already given up before the stream produces anything
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 
 	// The stream ends without delivering the snapshot. sendOrDone checks the
@@ -342,7 +342,7 @@ func TestScheduleStreamCancelWhileDeliveringAMove(t *testing.T) {
 	_, _, client, r := pushOnlyClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ch, err := client.SchedulesWatch(ctx, 1)
+	ch, err := client.WatchSchedule(ctx, 1)
 	require.NoError(t, err)
 	require.True(t, recv(t, ch).NextRequeueAt.IsZero(), "the snapshot")
 
@@ -354,14 +354,14 @@ func TestScheduleStreamCancelWhileDeliveringAMove(t *testing.T) {
 
 // A registered reconciler always has a work queue, because Register builds the
 // queue and its hub together. The guard exists so that this path agrees with
-// reconciler.scheduleAt behind SchedulesGet, which has kept a nil-queue branch
+// reconciler.scheduleAt behind GetSchedule, which has kept a nil-queue branch
 // for reconcilers built directly in tests: both report having no scheduling
 // machinery rather than one answering and its sibling panicking.
 func TestScheduleStreamNilQueueReportsNoController(t *testing.T) {
 	ctx, _, client, r := pushOnlyClient(t)
 	r.work = nil
 
-	_, err := client.SchedulesWatch(ctx, 1)
+	_, err := client.WatchSchedule(ctx, 1)
 
 	assert.ErrorIs(t, err, ErrNoController)
 }

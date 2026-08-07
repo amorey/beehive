@@ -31,7 +31,7 @@ import (
 // The queue also reports a schedule; see "The schedule" below.
 type workQueue struct {
 	mu sync.Mutex
-	// gauge holds the state SchedulesWatch reports: which ids are queued now and
+	// gauge holds the state WatchSchedule reports: which ids are queued now and
 	// which hold a pending alarm.
 	gauge      *gauge
 	processing map[ObjectID]struct{} // handed out via get, not yet done
@@ -384,7 +384,7 @@ type keyedGaugeValue struct {
 	gaugeValue
 }
 
-// gauge owns the two maps SchedulesWatch reports on. Nothing outside this type
+// gauge owns the two maps WatchSchedule reports on. Nothing outside this type
 // touches them, and every changing method returns a result its caller must
 // read — that discipline is what stands in for the backstop this stream does
 // not have. If workQueue ever gains a second writer, the poll has to come back

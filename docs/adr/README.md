@@ -21,6 +21,11 @@ whatever still governs live code into the new record and delete the old file —
 holds the previous text, and a directory of live records is worth more than a
 directory of archaeology.
 
+Records dated before 2026-08-07 spell the pre-rename `Client`/`ControllerClient`
+method names (`EventsAdd`, `OwnersGet`, `EventsWatch`, …). That prose is left as
+written; see [the VerbNoun record](2026-08-07-verb-noun-on-the-client-surfaces.md)
+for the mapping.
+
 ## Index
 
 - [One process, one Beehive, and it is the store's only writer](2026-08-05-one-process-one-beehive-sole-writer.md)
@@ -63,4 +68,5 @@ directory of archaeology.
 - [Events API](2026-07-27-events-api.md)
 - [Event retention is a ring per timeline, and it is off by default](2026-08-06-event-retention-is-a-ring-per-timeline.md)
 - [Schedule watch](2026-07-27-schedule-watch.md)
-- [NounsVerb method naming and the watch return shape](2026-07-27-noun-verb-naming.md)
+- [The client surfaces are named VerbNoun](2026-08-07-verb-noun-on-the-client-surfaces.md)
+- [NounsVerb method naming and the watch return shape](2026-07-27-noun-verb-naming.md) (superseded)

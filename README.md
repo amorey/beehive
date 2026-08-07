@@ -45,7 +45,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
   // Remove any external resources, then clear the finalizer to allow the row to be deleted.
   if obj.DeletionRequestedAt != nil {
     // TODO: clean up external resources for obj.Spec
-    // TODO: remove finalizer: return beehive.Result{}, client.FinalizersDelete(ctx, obj.ID, "kstack.sh/cluster")
+    // TODO: remove finalizer: return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
     return beehive.Result{}, nil
   }
 
@@ -123,7 +123,7 @@ Every driver is one of these. They run on separate intervals because they are se
 | dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | none: a commit wakes it |
 | stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | `WithStaleDependentsInterval`, default 60s |
 | watch tail | the write log of each watched kind, once per kind however many watches it has | one cheap read per watched kind per tick, and a commit wakes it before the tick | `WithWatchFloorInterval`, default 30s |
-| event watch | one object's event log above a cursor, for each live `EventsWatch` | what the log has grown by, and a commit wakes it before the tick | `WithWatchFloorInterval`, default 30s |
+| event watch | one object's event log above a cursor, for each live `WatchEvents` | what the log has grown by, and a commit wakes it before the tick | `WithWatchFloorInterval`, default 30s |
 
 **Every cadence here is configurable, and only the full pass can be switched off.** That is deliberate on both counts. A tick is no longer how work is found — every trigger for a registered kind pushes at commit, and both watch families read on a commit wake — so lengthening one buys a mostly-idle process a much quieter store while costing recovery time on a *lost* push, which is a trade an embedder is entitled to make. Turning one off is not, because each is the only thing that re-derives its own class of work. → [ADR: the driver cadences are configurable](docs/adr/2026-08-06-driver-cadences-are-configurable.md)
 
@@ -226,13 +226,13 @@ func EventDetail[T any](e Event) (T, error)
 
 `Message` is *sampled*, not part of the run key. Recording the same `(Category, Type, Reason)` with a new message extends the current run and updates the message shown, rather than starting a new run.
 
-`Detail` is the machine-readable companion to `Message`: an optional structured payload, so `ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`. Like `Spec` and `Status` it goes in **typed and comes out opaque**. On write it is any JSON-marshalable value, which `EventsAdd` marshals. On read it is a `json.RawMessage` you decode when you need it, with `EventDetail[T](e)`. Decoding per event, with the type that event's `Reason` implies, is what lets one timeline mix reasons carrying different payload shapes without making the API generic.
+`Detail` is the machine-readable companion to `Message`: an optional structured payload, so `ProbeFailed` might carry `{"endpoint":"10.0.0.1:443","latencyMs":5000}`. Like `Spec` and `Status` it goes in **typed and comes out opaque**. On write it is any JSON-marshalable value, which `AddEvent` marshals. On read it is a `json.RawMessage` you decode when you need it, with `EventDetail[T](e)`. Decoding per event, with the type that event's `Reason` implies, is what lets one timeline mix reasons carrying different payload shapes without making the API generic.
 
 `Detail` is sampled like `Message` — latest occurrence wins, and it is not part of the run key — so a payload that varies never splits a run. If you need every occurrence's payload, that event shouldn't aggregate: give it a unique `Reason`. Unlike `Spec` and `Status`, `Detail` is **not** schema-versioned, so reshaping it breaks decoding of older rows. That is tolerable only because retention ages events out; put a version inside the payload if you need more.
 
-Only controllers write events. `ControllerClient.EventsAdd` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`EventsList`, `EventsWatch`, `EventsGetLatest`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
+Only controllers write events. `ControllerClient.AddEvent` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`ListEvents`, `WatchEvents`, `GetLatestEvent`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
 
-A connection-health panel renders one category's timeline directly — `client.EventsList(ctx, id, WithEventCategory("connection"))` yields, newest first:
+A connection-health panel renders one category's timeline directly — `client.ListEvents(ctx, id, WithEventCategory("connection"))` yields, newest first:
 
 ```
 10:08:30  ✓ Connected      ×4    10:08:00–10:08:30
@@ -354,25 +354,25 @@ type Client[Spec, Status any] interface {
     WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
-    OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
-    DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    // The typed, kind-scoped form of OwnedList: this kind's decoded children.
-    OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
-    OwnedObjectsListWatch(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
+    ListDependencies(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    // The typed, kind-scoped form of ListOwned: this kind's decoded children.
+    ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
+    WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
 
     // Event log — per-object, category-partitioned, contiguous-run aggregated.
-    EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
-    EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error)
-    EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
+    ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
+    GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
+    WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 
     // Reconcile control.
     Requeue(ctx context.Context, id ObjectID, opts ...RequeueOption) error // requeue now; preserves backoff unless WithResetBackoff()
 
     // Scheduling — observe the next-requeue time.
-    SchedulesGet(ctx context.Context, id ObjectID) (Schedule, error)          // current schedule (zero if nothing scheduled)
-    SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) // stream the schedule live as a gauge
+    GetSchedule(ctx context.Context, id ObjectID) (Schedule, error)          // current schedule (zero if nothing scheduled)
+    WatchSchedule(ctx context.Context, id ObjectID) (<-chan Schedule, error) // stream the schedule live as a gauge
 }
 
 func NewClient[Spec, Status any](bh *Beehive, gk GroupKind) Client[Spec, Status]
@@ -474,8 +474,8 @@ Use `GetOrCreate` when a controller has to make sure a child exists **without ev
 
 The example uses two surfaces, and they are not interchangeable. `GetOrCreate` is on
 `Client` — here the child kind's client, built with `NewClient` and held by the
-controller. `EventsAdd` is on the `ControllerClient` that `Reconcile` receives,
-for writes about the object being reconciled. `Client` has no `EventsAdd` and
+controller. `AddEvent` is on the `ControllerClient` that `Reconcile` receives,
+for writes about the object being reconciled. `Client` has no `AddEvent` and
 `ControllerClient` has no `GetOrCreate`: a controller creates children through a
 `Client` for their kind.
 
@@ -501,8 +501,8 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
         return beehive.Result{RequeueAfter: 5 * time.Second}, nil
     }
     if created {
-        // EventsAdd is about obj (this controller's object), not the child.
-        if err := cc.EventsAdd(ctx, obj.ID, beehive.EventSpec{
+        // AddEvent is about obj (this controller's object), not the child.
+        if err := cc.AddEvent(ctx, obj.ID, beehive.EventSpec{
             Category: "lifecycle", Reason: "ClusterCreated",
         }); err != nil {
             return beehive.Result{}, err
@@ -518,7 +518,7 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
 
 The options apply **only when the call creates the row** (`WithOwner`, `WithFinalizers`, `WithOnCreate`). Options that don't apply are ignored, as everywhere else.
 
-That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `OwnersGet`, or `GetByName(ctx, name, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
+That has a sharp edge worth stating plainly: since the found branch ignores the options, **`created=false` does not mean "exists and matches your options."** A row created earlier without `WithOwner` comes back with no owner edge, and a caller that assumes otherwise ends up with a child the GC cascade will never collect when the parent goes. If you depend on the owner edge, check it — `GetOrCreate` then `GetOwner`, or `GetByName(ctx, name, LoadOwner())` — and fix the difference yourself. Beehive will not adopt the row for you: an object has at most one owner, so adding the edge to a row that already has a different one would give it two, and deciding which owner wins is your policy, not the library's.
 
 `DeleteByName` is the other half of the pair: `GetOrCreate` creates if absent, `DeleteByName` deletes if present. Both are idempotent and both understand tombstones, so a controller that ensures a name-keyed child on one branch and removes it on another writes one call for each. It replaces the usual open-coding of `GetByName`, treating `ErrNotFound` as success, treating `DeletionRequestedAt` as a no-op, then deleting:
 
@@ -538,7 +538,7 @@ Looking the name up is **atomic with the delete** — the name goes into the sto
 
 #### Watching
 
-`Watch` and `WatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `Watch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled. `OwnedObjectsListWatch(ownerID)` is `WatchList` narrowed to one owner's children — see [secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned) below.
+`Watch` and `WatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `Watch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled. `WatchOwnedObjects(ownerID)` is `WatchList` narrowed to one owner's children — see [secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned) below.
 
 ```go
 snap, ch, err := client.WatchList(ctx)
@@ -573,7 +573,7 @@ A slow subscriber stalls its own stream and nothing else: no change is dropped, 
 
 Neither watch needs a registered controller — the tail reads the write log, not a reconciler — and both are kind-scoped: `Watch` on another kind's id streams nothing. The id need not exist yet; an absent object is a `nil` `Object`, and its creation arrives as `Added`.
 
-(The event *log* below, `EventsList`/`EventsWatch`, is a different thing: an `ObjectChange` says an object changed, an `Event` is a log entry.)
+(The event *log* below, `ListEvents`/`WatchEvents`, is a different thing: an `ObjectChange` says an object changed, an `Event` is a log entry.)
 
 → [ADR: every driver is a periodic scan of the store](docs/adr/2026-07-28-periodic-scan-drivers.md), for what a poll costs and the constraints any push path above it would have to satisfy.
 
@@ -582,13 +582,13 @@ Neither watch needs a registered controller — the tail reads the write log, no
 An object's ref edges are fetched on request, two ways:
 
 - **Eager** — pass `LoadOption`s to a read: `Get(ctx, id, LoadOwner())`, `List(ctx, LoadDependencies(), LoadDependents())`. The returned objects carry the data (read via the accessors). On `List` each relation is one batched query, not one per object.
-- **Lazy** — call `OwnersGet` / `DependenciesList` / `DependentsList` / `OwnedList` when you actually need the data. These run the edge query directly, with no validating read in front, so they do **not** check the kind: another kind's id returns that kind's edges, and a missing id returns nothing, neither as `ErrNotFound`. Use them for ids the client owns.
+- **Lazy** — call `GetOwner` / `ListDependencies` / `ListDependents` / `ListOwned` when you actually need the data. These run the edge query directly, with no validating read in front, so they do **not** check the kind: another kind's id returns that kind's edges, and a missing id returns nothing, neither as `ErrNotFound`. Use them for ids the client owns.
 
-`OwnedList` (and the eager `LoadOwned()` / `Object.Owned()`) is the inverse of `OwnersGet` over `owned_by`: it returns the objects a given owner owns, the same way `DependentsList` inverts `DependenciesList` over `depends_on`.
+`ListOwned` (and the eager `LoadOwned()` / `Object.Owned()`) is the inverse of `GetOwner` over `owned_by`: it returns the objects a given owner owns, the same way `ListDependents` inverts `ListDependencies` over `depends_on`.
 
-`OwnedObjectsList(ownerID)` is the typed version. `OwnedList` returns untyped `ObjectRef`s across every owned kind, leaving you to filter by `Kind` and `Get` each child through its own client. `OwnedObjectsList` returns decoded `*Object[Spec, Status]` children of **this client's kind** in a single query, because the kind filter and the row read fold into the edge join — no `Get` per child. Ordering (by id) and missing-owner behaviour match `OwnedList`. Deletion-pending children are included, so skip them yourself by checking `DeletionRequestedAt`. It takes the same `LoadOption`s as `List`, batched the same way; without them the children have nothing loaded and their accessors return `ErrNotLoaded`.
+`ListOwnedObjects(ownerID)` is the typed version. `ListOwned` returns untyped `ObjectRef`s across every owned kind, leaving you to filter by `Kind` and `Get` each child through its own client. `ListOwnedObjects` returns decoded `*Object[Spec, Status]` children of **this client's kind** in a single query, because the kind filter and the row read fold into the edge join — no `Get` per child. Ordering (by id) and missing-owner behaviour match `ListOwned`. Deletion-pending children are included, so skip them yourself by checking `DeletionRequestedAt`. It takes the same `LoadOption`s as `List`, batched the same way; without them the children have nothing loaded and their accessors return `ErrNotLoaded`.
 
-`OwnedObjectsListWatch(ownerID)` is that read as a watch: the same snapshot, then every change to one of that owner's children — a later child as `Added`, its collection as `Deleted`. It takes the same `WatchOption`s as `WatchList` and joins the same per-kind tailer, so scoping costs a watch nothing beyond one batched edge read per drained page. Ownership is resolved from *current* state rather than from the write log, which is why a child created after the snapshot arrives correctly: the create's log entry is appended before its `owned_by` edge, in the same transaction. Like `OwnersGet` and `Object.Owner()`, it assumes the one owner `WithOwner` can express.
+`WatchOwnedObjects(ownerID)` is that read as a watch: the same snapshot, then every change to one of that owner's children — a later child as `Added`, its collection as `Deleted`. It takes the same `WatchOption`s as `WatchList` and joins the same per-kind tailer, so scoping costs a watch nothing beyond one batched edge read per drained page. Ownership is resolved from *current* state rather than from the write log, which is why a child created after the snapshot arrives correctly: the create's log entry is appended before its `owned_by` edge, in the same transaction. Like `GetOwner` and `Object.Owner()`, it assumes the one owner `WithOwner` can express.
 
 → [ADR: owner-scoped watches](docs/adr/2026-08-06-owner-scoped-watches.md), for the ownership invariant the resolution rests on.
 
@@ -608,9 +608,9 @@ By default `Requeue` **keeps the object's retry backoff**. A requeue is an ordin
 
 The scheduling API reports when an object is **next due to reconcile**, as a [`Schedule`](#schedule) whose `NextRequeueAt` is a pending backoff retry, a `RequeueAfter` delay, or a re-enqueue floor holding a wake — or now, if the object is already queued, or the zero time if nothing is scheduled.
 
-`SchedulesGet` is the point read: a non-blocking read of in-memory state, with no store lookup and no kind check, so it returns no error today (the error is reserved for symmetry with the rest of the surface). A missing id, another kind's id and a client-only kind all read as the zero `Schedule`, which looks the same as a real object with nothing scheduled.
+`GetSchedule` is the point read: a non-blocking read of in-memory state, with no store lookup and no kind check, so it returns no error today (the error is reserved for symmetry with the rest of the surface). A missing id, another kind's id and a client-only kind all read as the zero `Schedule`, which looks the same as a real object with nothing scheduled.
 
-`SchedulesWatch` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a wake held by the re-enqueue floor, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It is pushed rather than polled, and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `SchedulesGet` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
+`WatchSchedule` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a wake held by the re-enqueue floor, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It is pushed rather than polled, and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `GetSchedule` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
 
 Both are on `Client` only, and both read **per-id timers only**. Neither predicts the next reconcile: the real one can come **earlier**, because the owed pass, the full pass and the dependency wake are not per-id timers, and **a zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee.
 
@@ -618,9 +618,9 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 
 #### Events
 
-`EventsList` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `EventsGetLatest` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `OwnersGet` does.
+`ListEvents` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `GetLatestEvent` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `GetOwner` does.
 
-`EventsWatch` hands back an `EventStream`: `Runs` is the snapshot as of `ResourceVersion`, `Events` streams what the log grows by above it — oldest-first — and `Err()` says why the stream ended once `Events` is closed. It reads the log above a cursor, and an `EventsAdd` commit wakes it, so a local write arrives at commit rather than on a tick; the floor (`WithWatchFloorInterval`) is what covers a write another process made. An **extend is not a new run**: the row comes back with a higher `ResourceVersion` and a bumped `Count`, which is what lets you update it in place. There are no tombstones, since a run can only appear or grow.
+`WatchEvents` hands back an `EventStream`: `Runs` is the snapshot as of `ResourceVersion`, `Events` streams what the log grows by above it — oldest-first — and `Err()` says why the stream ended once `Events` is closed. It reads the log above a cursor, and an `AddEvent` commit wakes it, so a local write arrives at commit rather than on a tick; the floor (`WithWatchFloorInterval`) is what covers a write another process made. An **extend is not a new run**: the row comes back with a higher `ResourceVersion` and a bumped `Count`, which is what lets you update it in place. There are no tombstones, since a run can only appear or grow.
 
 `WithEventsResumeFrom(rv)` starts above a position instead of snapshotting, so a reconnecting reader pays for the gap rather than the whole log — checkpoint the `ResourceVersion` of what you were delivered. Two answers end a resume instead of serving it: `ErrWatchTooOld` when retention has taken runs below your position, and `ErrWatchTooNew` when the position is above everything that object's log has held. Both mean "subscribe again without the option". A stream also ends with `ErrNotFound` if the object is collected, because its log cascades away with it — an empty stream would otherwise read as "no events" about an object that no longer exists.
 
@@ -639,18 +639,18 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 ```go
 type ControllerClient[Status any] interface {
     UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
-    ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error
-    ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error
-    EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error
-    FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error
-    DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error
-    DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error
-    EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
+    SetCondition(ctx context.Context, id ObjectID, condition Condition) error
+    DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
+    AddEvent(ctx context.Context, id ObjectID, event EventSpec) error
+    DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
+    AddDependency(ctx context.Context, fromID, toID ObjectID) error
+    DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
+    HasIncomingEdges(ctx context.Context, id ObjectID) (bool, error)
     // Lazy secondary lookups, for reading an object's edges during reconcile.
-    OwnersGet(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
-    DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
+    ListDependencies(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
@@ -659,15 +659,15 @@ type ControllerClient[Status any] interface {
 
 The generation handshake is the exception. `observedGeneration` and `ObservedAt` are recorded even when the content is unchanged, so a reconcile that legitimately changed no status still settles the object instead of being re-queued by every owed-pass tick. That write does bump `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees the object converge. It happens at most once per generation: the next unchanged pass finds the generation already recorded and writes nothing.
 
-`ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `EventsAdd` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
+`ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `AddEvent` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
 
 → [ADR: the generation handshake and content no-ops](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md), for how the no-op splits the two halves of the write and why it is gated on the schema version.
 
-`OwnersGet`, `DependenciesList`, `DependentsList` and `OwnedList` are the same lazy lookups the `Client` has. `Reconcile` is handed its object directly, with no read call of its own, so these are how it reads related edges. `OwnersGet` returns the owner over `owned_by` and `OwnedList` the reverse, the owner's children; `DependentsList` is the reverse of `DependenciesList` over `depends_on`.
+`GetOwner`, `ListDependencies`, `ListDependents` and `ListOwned` are the same lazy lookups the `Client` has. `Reconcile` is handed its object directly, with no read call of its own, so these are how it reads related edges. `GetOwner` returns the owner over `owned_by` and `ListOwned` the reverse, the owner's children; `ListDependents` is the reverse of `ListDependencies` over `depends_on`.
 
-`EdgesHasIncoming` is a different question, used by GC: does anything with a live claim still point at `id`? That means an owned child, or a dependent that is not itself being deleted — one that is going away has no claim. You cannot rebuild it from `DependentsList`, because it folds in owned children as well. A finalizer can wait on it: a controller holding a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
+`HasIncomingEdges` is a different question, used by GC: does anything with a live claim still point at `id`? That means an owned child, or a dependent that is not itself being deleted — one that is going away has no claim. You cannot rebuild it from `ListDependents`, because it folds in owned children as well. A finalizer can wait on it: a controller holding a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
-`EventsAdd` adds an observation to the object's event log — see [Event](#event). Adding is not always an insert: repeating the latest run's `(Category, Type, Reason)` extends that run instead of appending a second one, which is what lets a controller report every poll without growing the log per poll. Like `ConditionsSet` it is scoped to the controller's kind (`ErrWrongKind` for another kind's id) and composes inside `Within`, so a controller can record an event and flip a condition together.
+`AddEvent` adds an observation to the object's event log — see [Event](#event). Adding is not always an insert: repeating the latest run's `(Category, Type, Reason)` extends that run instead of appending a second one, which is what lets a controller report every poll without growing the log per poll. Like `SetCondition` it is scoped to the controller's kind (`ErrWrongKind` for another kind's id) and composes inside `Within`, so a controller can record an event and flip a condition together.
 
 ### Controller
 
@@ -732,17 +732,17 @@ func WithWriteLogRetention(perKind int, maxAge time.Duration) Option // write-lo
 
 `WithOwner` writes an `owned_by` edge in the same transaction as the `Create`. Deleting the owner then cascades to the child through GC.
 
-`WithFinalizers` is the one create option that needs a kind **this process has registered a controller for**; otherwise the call fails with `ErrInvalidOption`. Only `ControllerClient.FinalizersDelete` can clear a finalizer, and it folds the calling controller's own kind into the write — so a client-only kind's finalizer is removable by nothing, and the row would stay deletion-pending forever while its `owned_by` edge blocks its owner's delete.
+`WithFinalizers` is the one create option that needs a kind **this process has registered a controller for**; otherwise the call fails with `ErrInvalidOption`. Only `ControllerClient.DeleteFinalizer` can clear a finalizer, and it folds the calling controller's own kind into the write — so a client-only kind's finalizer is removable by nothing, and the row would stay deletion-pending forever while its `owned_by` edge blocks its owner's delete.
 
 The check is **process-local and evaluated at call time**, since the store records no registrations: it refuses a create issued before this process's own `Register`. Register the kind first. It runs before any store work and only when the option is used, so an ordinary create on a client-only kind is unaffected — and like every other create-option check it is eager, so `GetOrCreate` rejects it on the found branch too rather than only when a row is really inserted.
 
 `WithOnCreate` is the safe way to run a side effect only if the row is really created — an external call, an in-memory counter. It waits for the *outermost* commit, so it runs once and never after a rollback; it is the only thing in beehive deferred that way. `Create` always fires it, `GetOrCreate` only when it inserts. Prefer it to branching on `GetOrCreate`'s `created` bool, which is returned synchronously: inside an enclosing `ControllerClient.Within` that bool is set before the transaction commits, so acting on it fires your side effect for a row a rollback may still discard.
 
-`DependenciesAdd` and `DependenciesDelete` manage `depends_on` edges during reconcile. When a target changes, the next dependency-wake scan queues the dependent. Each commits on its own, or joins a `Within` the controller opened.
+`AddDependency` and `DeleteDependency` manage `depends_on` edges during reconcile. When a target changes, the next dependency-wake scan queues the dependent. Each commits on its own, or joins a `Within` the controller opened.
 
 The target can be **any** kind, including one you only ever use through `Client` and never register — configuration, secrets, any reference data your app writes and your controllers read. The waker scans the whole store's write log rather than only the kinds with controllers, so such a target wakes its dependents like any other.
 
-**Dropping** an edge is what releases a target you were holding open: a deletion-pending object cannot be collected while a live dependent points at it, and `DependenciesDelete` collects it as soon as the edge goes, rather than at the next sweep.
+**Dropping** an edge is what releases a target you were holding open: a deletion-pending object cannot be collected while a live dependent points at it, and `DeleteDependency` collects it as soon as the edge goes, rather than at the next sweep.
 
 Every call that **creates** the edge records, durably and atomically with the edge itself, that the dependent owes a reconcile (a count on the row, `reconcile_owed`, drained by the owed pass). That one rule covers every way a declare could otherwise miss: a change to the target landing between your read and the edge's commit, a declare made on another object's behalf while that object's own reconcile is mid-flight, and a crash before the wake is serviced. Re-asserting your edges on every pass costs nothing after the first, because only the call that created the edge records anything — the cost is one reconcile per edge ever created.
 
@@ -768,7 +768,7 @@ func LoadEvents() LoadOption        // fetch the most-recent events (default N p
 func WithResetBackoff() RequeueOption   // clear the retry backoff ladder before requeuing (default: preserve it)
 ```
 
-The event read methods take `EventOption`s (also a separate type from `Option`, applying only to `EventsList`/`EventsWatch`) — see [Events](#events). `WithEventsResumeFrom` is the one that means nothing outside `EventsWatch`, and the other reads ignore it:
+The event read methods take `EventOption`s (also a separate type from `Option`, applying only to `ListEvents`/`WatchEvents`) — see [Events](#events). `WithEventsResumeFrom` is the one that means nothing outside `WatchEvents`, and the other reads ignore it:
 
 ```go
 func WithEventCategory(cat string) EventOption  // restrict to a single timeline
@@ -776,5 +776,5 @@ func WithEventType(t EventType) EventOption      // only Normal or only Warning
 func WithEventReason(reason string) EventOption  // only runs with this reason
 func WithEventLimit(n int) EventOption           // cap the number of runs returned / snapshotted
 func WithEventsSince(t time.Time) EventOption    // only runs active at or after t
-func WithEventsResumeFrom(rv int64) EventOption  // EventsWatch: stream above rv instead of snapshotting
+func WithEventsResumeFrom(rv int64) EventOption  // WatchEvents: stream above rv instead of snapshotting
 ```

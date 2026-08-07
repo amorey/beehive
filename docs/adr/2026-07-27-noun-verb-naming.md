@@ -1,15 +1,18 @@
 # Methods are named NounsVerb, and every watch returns a change or a value
 
-- **Status:** Accepted — implemented across `internal/storeapi`, `client.go`, `controller.go`, `types.go`, and the internals.
+- **Status:** Its `NounsVerb` rule is dead — `Store` moved to accessors, then
+  `Client`/`ControllerClient` to
+  [`VerbNoun`](2026-08-07-verb-noun-on-the-client-surfaces.md), which restates
+  rule 2 unchanged. Kept, not deleted, because several judgment calls below are
+  still the only argument for names in live code: `ObjectRef` over
+  `Ref`/`Referrer`, `Add` over `Record` as the write verb, the singular
+  `ReconcileOwed` family, and `DeletionRequests…From`.
 - **Date:** 2026-07-27
 
-> **Amended 2026-08-07.** This record still governs `Client` and
-> `ControllerClient`, and its names below are left as they were written — several
-> of its arguments are *about* those names. It no longer governs `Store`, where
-> the noun moved from the method name onto a type and each family is reached
-> through an accessor (`store.Edges().Add`). That drops the two costs recorded in
-> *Consequences* — the verb in the middle, and the verb slot reading as a verb
-> only by habit — and lets `Edges().HasIncoming` read as the predicate it is.
+> **Amended 2026-08-07.** Names below are left as written — several arguments
+> are *about* those names, and the `Store` half's two recorded costs (the verb in
+> the middle, and the verb slot reading as a verb only by habit) are what the two
+> moves were for.
 
 ## Context
 

@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// OwnersGet errors with ErrNotLoaded when unloaded; once loaded, ok reports
+// GetOwner errors with ErrNotLoaded when unloaded; once loaded, ok reports
 // presence and folds away the loaded-but-ownerless case.
 func TestObjectGetOwner(t *testing.T) {
 	owner := ObjectRef{ID: 7, Kind: "Cluster"}
@@ -50,7 +50,7 @@ func TestObjectGetOwner(t *testing.T) {
 	})
 }
 
-// DependenciesList errors with ErrNotLoaded when unloaded; a loaded-but-empty
+// ListDependencies errors with ErrNotLoaded when unloaded; a loaded-but-empty
 // result is an empty slice with a nil error.
 func TestObjectListDependencies(t *testing.T) {
 	deps := []ObjectRef{{ID: 1}, {ID: 2}}
@@ -107,7 +107,7 @@ func TestObjectListOwned(t *testing.T) {
 	assert.Equal(t, owned, got)
 }
 
-// Object.EventsList is gated by LoadEventsBit like the ref accessors: ErrNotLoaded
+// Object.ListEvents is gated by LoadEventsBit like the ref accessors: ErrNotLoaded
 // until LoadEvents() was passed, then the loaded runs (empty slice when none).
 func TestObjectListEvents(t *testing.T) {
 	events := []Event{{ID: 1, Reason: "Connected"}}

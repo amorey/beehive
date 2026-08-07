@@ -14,7 +14,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
   Almost any write sustains it: changed status bytes, a byte-identical
   `UpdateStatus` at a generation the object has not settled at, any real condition
-  write, or `FinalizersDelete`. Only `EventsAdd` is safe, because it bumps no
+  write, or `DeleteFinalizer`. Only `AddEvent` is safe, because it bumps no
   object `resource_version`.
 
   **The contention is gone.** The work queue's re-enqueue floor bounds the loop to
@@ -29,7 +29,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   and every generation matches.
 
   **The remaining fix is to reject cycles when the edge is declared**, which needs
-  a recursive CTE on the single connection in `DependenciesAdd` — strictly more
+  a recursive CTE on the single connection in `AddDependency` — strictly more
   expensive than the pre-read that already sank an earlier declare-time guard. It
   is also still open whether beehive should support cycles at all, which is a
   reason not to guard hastily. Deferred on that question rather than on cost now
@@ -146,16 +146,17 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   was not that break: it added an alias rather than touching any of these four.
 
 - **`List` in a method name may be saying what the return type already says** —
-  proposed, not decided, and pre-release or never. `OwnedList` → `Owned`,
-  `OwnedObjectsList` → `OwnedObjects`, `OwnedObjectsListWatch` →
-  `OwnedObjectsWatch`, `EventsList` → `Events`, `EdgesListIncoming` →
-  `EdgesIncoming`: twenty distinct method names across `Client`,
-  `ControllerClient` and `Store`. The `Store` half is reshaped since the families
-  moved onto types — there the question is now `Edges().ListIncoming` →
-  `Edges().Incoming`.
+  proposed, not decided, and pre-release or never. `ListOwned` → `Owned`,
+  `ListOwnedObjects` → `OwnedObjects`, `ListEvents` → `Events`, and on the store
+  `Edges().ListIncoming` → `Edges().Incoming`: twenty distinct method names
+  across `Client`, `ControllerClient` and `Store`.
+
+  Only the cardinality verbs are in question. `WatchOwnedObjects` and the other
+  watches keep theirs — `Watch` says what the method *does*, not how many it
+  returns, and a bare `OwnedObjects` could not say it streams.
 
   **The argument is already in the naming ADR, applied to a different surface.**
-  `Object`'s relation accessors dropped their verbs — `GetOwner`/`ListDependencies`
+  `Object`'s relation accessors dropped their verbs — `OwnersGet`/`DependenciesList`
   became `Owner()`/`Dependencies()` — because "the `Get`/`List` cardinality signal
   moves to the return type, which already carried it"
   ([ADR](adr/2026-07-27-noun-verb-naming.md)). A plural noun returning a slice has
@@ -168,14 +169,14 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   call site. That is the case to make or reject, and it is not obviously wrong
   either way.
 
-  **The bare family cannot follow.** `Client`'s own CRUD omits the prefix, so
-  `List` has no noun to fall back on, and `WatchList` cannot become `Watch` —
-  taken by the single-object watch. The rule would have to read "drop the verb on
-  a prefixed family, keep it where the family is the receiver", which is a second
-  exception stacked on the omit-the-prefix one. Whether that is one convention or
-  two is the thing to settle before touching a single name.
+  **The bare `List` cannot follow.** `Client`'s own CRUD omits the noun, so
+  `List` has none to fall back on, and `WatchList` cannot become `Watch` —
+  taken by the single-object watch. The rule would have to read "drop the verb
+  where a noun is spoken, keep it where the noun is the receiver's own kind",
+  which is a second exception stacked on the omit-the-noun one. Whether that is
+  one convention or two is the thing to settle before touching a single name.
 
-  Two more loose ends. Whether `Get` goes too (`OwnersGet` → `Owner`), which reads
+  Two more loose ends. Whether `Get` goes too (`GetOwner` → `Owner`), which reads
   well but gives the client the same spelling as `Object.Owner()` for a different
   operation — and if it stays, cardinality is signalled asymmetrically. And a few
   names get worse rather than better: `ObjectsListIDs` → `ObjectsIDs` wants to be
@@ -338,7 +339,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   current state, which is sound only because an `owned_by` edge is written at
   create and removed at collect, both of them logged writes to the child.
 
-  `depends_on` has neither property: `DependenciesAdd`/`DependenciesRemove`
+  `depends_on` has neither property: `AddDependency`/`DeleteDependency`
   mutate edges freely, and `EdgesAdd`/`EdgesDelete` bump nothing, so an edge
   change is invisible to the tail. A scoped watch there needs the edge write to
   become a write to its source first — which is a change to what the write log
@@ -359,10 +360,10 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
   **The read surface already chose single-owner.** `fetchOwnerRef` resolves "id's
   single `owned_by` edge" and returns `owners[0]`; `LoadOwner` does the same;
-  `Object.Owner()` and `OwnersGet` each return one `ObjectRef`.
-  `OwnedObjectsListWatch` and the delete row image follow them
+  `Object.Owner()` and `GetOwner` each return one `ObjectRef`.
+  `WatchOwnedObjects` and the delete row image follow them
   ([ADR](adr/2026-08-06-owner-scoped-watches.md)). The one multi-owner-correct
-  read is `OwnedObjectsList`, and only by construction — it asks who points at an
+  read is `ListOwnedObjects`, and only by construction — it asks who points at an
   owner rather than collapsing a child's edges. So the state is representable,
   half-honoured, and unreachable through the public API: the worst of the three.
 
@@ -372,7 +373,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   [amended in place](adr/2026-07-31-amend-the-schema-in-place-until-release.md)
   until release; `EdgesAdd` maps the violation to a sentinel as it already does
   for `ErrNameTaken`. The alternative — making every reader multi-owner-correct —
-  means turning `Owner()`, `OwnersGet` and `LoadOwner` into slices, which widens
+  means turning `Owner()`, `GetOwner` and `LoadOwner` into slices, which widens
   public API to support a state that public API cannot create.
 
   **Order is the argument.** Forbidding now and allowing later is backward
@@ -387,7 +388,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   in a fourth spot while `Owner()` still returns one.
 
 - **A kind-wide event watch does not exist, so a panel over N objects runs N
-  readers** — known, not fixed. `EventsWatch` is per object, and each stream is
+  readers** — known, not fixed. `WatchEvents` is per object, and each stream is
   its own receiver, goroutine, timer and gate over its own cursor (see
   [the ADR](adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)). That is
   cheaper than the poll it replaced at any fan-out, and still linear in streams.
@@ -397,3 +398,11 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   by kind, so a kind-wide tail has no seek to ride. Revisit when a consumer holds
   enough streams for the goroutine count to matter, and expect it to need an index
   before it needs an API.
+
+- **The store-side tests still spell pre-accessor method names in prose and test
+  names** — `sqlite/store_test.go` and `internal/storeapi/storeapi_test.go` carry
+  `EventsAdd`, `EventsList`, `ConditionsSet`, `EdgesHasIncoming` in comments, and
+  test names like `TestEventsListSince*`, `TestConditionsSetLoadError` and
+  `TestDependentsListStaleSince*`. Drift from the accessor refactor, left out of
+  the verb-first rename so that diff stayed one mechanical change. Nothing reads
+  wrong, but the names now point at methods that exist on neither surface.

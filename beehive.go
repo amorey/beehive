@@ -398,7 +398,7 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	bh.eventWriteHub.Close()
 
 	// The watch tailers are not counted in wg: each ends with its own last
-	// subscriber, or with the hub close above. SchedulesWatch streams
+	// subscriber, or with the hub close above. WatchSchedule streams
 	// report the work queue instead and end here, after their final value.
 	bh.log().Info("control plane stopped")
 	return drainErr
@@ -529,7 +529,7 @@ func (bh *Beehive) reconcilerFor(gk GroupKind) (*reconciler, bool) {
 // backoff or a re-enqueue floor. AfterCommit means a rollback (or savepoint
 // unwind) discards the enqueue, and outside a transaction it runs inline.
 // Callers gate on what the write actually changed (see signalSpecWritten and
-// DependenciesAdd).
+// AddDependency).
 func (bh *Beehive) signalRequeueNow(ctx context.Context, ref ObjectRef) {
 	bh.store.AfterCommit(ctx, func(context.Context) {
 		if r, ok := bh.reconcilerFor(ref.GroupKind()); ok {

@@ -37,7 +37,7 @@ var ErrInvalidOption = errors.New("beehive: option value is invalid")
 
 // LoadOption selects a secondary lookup to fetch alongside an object on a read
 // (Get/GetByName/List). The lazy alternative: omit it and call
-// Client.OwnersGet/DependenciesList when the data is needed.
+// Client.GetOwner/ListDependencies when the data is needed.
 type LoadOption func(*LoadSet)
 
 // LoadOwner selects the object's owner (its outgoing owned_by edge).
@@ -61,7 +61,7 @@ func LoadOwned() LoadOption {
 }
 
 // LoadEvents selects the object's event-log runs, read via Object.Events(). For
-// filtered or bounded reads use the lazy Client.EventsList instead.
+// filtered or bounded reads use the lazy Client.ListEvents instead.
 func LoadEvents() LoadOption {
 	return func(s *LoadSet) { *s |= LoadEventsBit }
 }
@@ -98,7 +98,7 @@ func resolveRequeue(opts []RequeueOption) requeueOptions {
 	return o
 }
 
-// EventOption configures a Client.EventsList / EventsWatch read.
+// EventOption configures a Client.ListEvents / WatchEvents read.
 type EventOption func(*eventConfig)
 
 // eventConfig is what the event options fold into: the store query every read
@@ -125,7 +125,7 @@ func WithEventReason(reason string) EventOption {
 	return func(c *eventConfig) { c.query.Reason = reason }
 }
 
-// WithEventLimit caps a read to the newest n runs. On EventsWatch it bounds the
+// WithEventLimit caps a read to the newest n runs. On WatchEvents it bounds the
 // snapshot only: a tail has no end to count back from.
 func WithEventLimit(n int) EventOption {
 	return func(c *eventConfig) { c.query.Limit = n }
@@ -137,7 +137,7 @@ func WithEventsSince(t time.Time) EventOption {
 }
 
 // WithEventsResumeFrom streams the runs above rv instead of taking a snapshot.
-// EventsWatch only — the other reads ignore it, the way an Option ignores a
+// WatchEvents only — the other reads ignore it, the way an Option ignores a
 // target it does not recognise. A position retention has passed ends the stream
 // with ErrWatchTooOld, answered by subscribing again without this option.
 func WithEventsResumeFrom(rv int64) EventOption {
@@ -177,7 +177,7 @@ func resolveCreate(opts []Option) (*createOptions, error) {
 //
 // It requires a controller registered for the kind in this process, and the
 // call is rejected with ErrInvalidOption otherwise: only
-// ControllerClient.FinalizersDelete can clear a finalizer, so one no controller
+// ControllerClient.DeleteFinalizer can clear a finalizer, so one no controller
 // here can remove would leave the row deletion-pending forever, RESTRICT-
 // blocking its owner's delete. The check is process-local and evaluated at call
 // time — the store tracks no registrations — so register the kind first.

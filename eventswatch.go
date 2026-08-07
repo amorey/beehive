@@ -74,8 +74,8 @@ type eventWriteHub struct {
 
 func newEventWriteHub() eventWriteHub { return eventWriteHub{newSignalHub[ObjectID]()} }
 
-// EventsWatch streams id's event log. See the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) EventsWatch(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error) {
+// WatchEvents streams id's event log. See the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error) {
 	if !c.bh.isRegistered(c.gk) {
 		return nil, fmt.Errorf("beehive: no controller registered for %s/%s", c.gk.Group, c.gk.Kind)
 	}

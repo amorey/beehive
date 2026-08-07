@@ -40,14 +40,14 @@ func (c *finalizerClearingController) Reconcile(ctx context.Context, client Cont
 	}
 	for _, f := range obj.Finalizers {
 		if f == c.finalizer {
-			return Result{}, client.FinalizersDelete(ctx, obj.ID, c.finalizer)
+			return Result{}, client.DeleteFinalizer(ctx, obj.ID, c.finalizer)
 		}
 	}
 	return Result{}, nil
 }
 
 // hasIncomingEdgesGatingController models the documented finalizer workflow: an
-// object holding `finalizer` clears it only once EdgesHasIncoming reports no live
+// object holding `finalizer` clears it only once HasIncomingEdges reports no live
 // claim, so a shared resource outlives its last real user. Objects that don't
 // hold the finalizer are left for GC directly.
 type hasIncomingEdgesGatingController struct {
@@ -67,11 +67,11 @@ func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc Con
 	if !held {
 		return Result{}, nil
 	}
-	referenced, err := cc.EdgesHasIncoming(ctx, obj.ID)
+	referenced, err := cc.HasIncomingEdges(ctx, obj.ID)
 	if err != nil || referenced {
 		return Result{}, err // a live user remains; keep the finalizer
 	}
-	return Result{}, cc.FinalizersDelete(ctx, obj.ID, c.finalizer)
+	return Result{}, cc.DeleteFinalizer(ctx, obj.ID, c.finalizer)
 }
 
 // waitForDeletions consumes w until it has seen a Deleted event for every id in
@@ -130,8 +130,8 @@ type collectFakeStore struct {
 	getMetaErr      error                // ObjectsGetMeta, for the collected object
 	markErr         error                // DeletionRequestsCreateFromOwner
 	dropDependsErr  error                // EdgesDeleteFinalizingDependsOn
-	hasEdges        bool                 // EdgesHasIncoming result
-	hasEdgesErr     error                // EdgesHasIncoming error
+	hasEdges        bool                 // HasIncomingEdges result
+	hasEdgesErr     error                // HasIncomingEdges error
 	owners          []storeapi.ObjectRef // EdgesListOutgoingByRelation result
 	listOwnersErr   error                // EdgesListOutgoingByRelation error
 	ownerMetaErr    error                // ObjectsGetMeta, for an owner row
@@ -276,7 +276,7 @@ func TestCollectDeletesUnfinalizedObject(t *testing.T) {
 // object undeletable.
 //
 // It is deliberately *not* the twin of TestClientListDependentsIncludesSelfEdge:
-// collect reads edges through EdgesHasIncoming and EdgesDeleteFinalizingDependsOn,
+// collect reads edges through HasIncomingEdges and EdgesDeleteFinalizingDependsOn,
 // never EdgesListIncoming, so a self-edge filtered out of that call would leave
 // this path untouched. The two tests cover different consumers, not two halves of
 // one mistake.
@@ -655,7 +655,7 @@ func TestPhysicalDeletePushesEveryOwner(t *testing.T) {
 	assert.ElementsMatch(t, []ObjectID{ownerA.ID, ownerB.ID}, queuedIDs(r.work))
 }
 
-// EdgesHasIncoming already discounts a depends_on edge from a deletion-pending
+// HasIncomingEdges already discounts a depends_on edge from a deletion-pending
 // source, so dropping one unblocks nothing and its target must not be pushed.
 func TestPhysicalDeleteQueuesNoDependsOnTarget(t *testing.T) {
 	ctx := context.Background()
@@ -1068,7 +1068,7 @@ func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClien
 	if target.DeletionRequestedAt == nil {
 		return Result{}, nil
 	}
-	return Result{}, cc.DependenciesDelete(ctx, depID, targetID)
+	return Result{}, cc.DeleteDependency(ctx, depID, targetID)
 }
 
 // With the sweeper stopped, the waker off and every periodic pass parked, the
@@ -1265,7 +1265,7 @@ func (c *siblingFinalizerClearingController) Reconcile(ctx context.Context, cc C
 	if target.DeletionRequestedAt == nil || len(target.Finalizers) == 0 {
 		return Result{}, nil
 	}
-	return Result{}, cc.FinalizersDelete(ctx, targetID, finalizer)
+	return Result{}, cc.DeleteFinalizer(ctx, targetID, finalizer)
 }
 
 // With the sweeper stopped and the periodic passes off, the push is the only

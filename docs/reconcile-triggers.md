@@ -52,12 +52,12 @@ can be read.
 | Push path | Made by | Starts | Gate |
 |---|---|---|---|
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
-| A new edge enqueues the edge's source | `ControllerClient.DependenciesAdd` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
+| A new edge enqueues the edge's source | `ControllerClient.AddDependency` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
-| A cleared finalizer enqueues its own object | `ControllerClient.FinalizersDelete` | the object whose block it lifted | the store reports `clearedLast` |
+| A cleared finalizer enqueues its own object | `ControllerClient.DeleteFinalizer` | the object whose block it lifted | the store reports `clearedLast` |
 | A physical delete enqueues the owners it unblocked | `Beehive.gcCollect` | each deletion-pending owner of the deleted row | the owner's `deletion_requested_at` |
-| A dropped dependency enqueues the target it unblocked | `ControllerClient.DependenciesDelete` | the target of the dropped `depends_on` edge | `EdgesDeleteResult.Unblocked` |
+| A dropped dependency enqueues the target it unblocked | `ControllerClient.DeleteDependency` | the target of the dropped `depends_on` edge | `EdgesDeleteResult.Unblocked` |
 | A create under a deleting owner enqueues that owner | `clientImpl.insertObject` | the owner named by `WithOwner` | `EdgesAddResult.ToDeleting` |
 | A deletion mark enqueues the targets it unblocked | `clientImpl.signalDeletionRequested`, `Beehive.gcCollect` | each deletion-pending `depends_on` target of a row this call marked | `DeletionRequestResult.Unblocked`, `DeletionCascadeResult.Unblocked` |
 
@@ -595,7 +595,7 @@ A collect is blocked when finalizers are still pending, or when `Edges().HasInco
 reports a referrer under RESTRICT. Four routes lead out of one, and **each of them
 pushes**:
 
-1. **The last finalizer was cleared.** `ControllerClient.FinalizersDelete` enqueues
+1. **The last finalizer was cleared.** `ControllerClient.DeleteFinalizer` enqueues
    the object at commit, gated on the store reporting `clearedLast`. →
    [the ADR](adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md).
 2. **The last child was removed.** `gcCollect` reads the dying row's `owned_by`
@@ -607,7 +607,7 @@ pushes**:
    `deletion_requested_at`, because a live owner was never blocked and pushing one
    would spin. →
    [the ADR](adr/2026-08-05-a-physical-delete-pushes-its-owner.md).
-3. **`DependenciesDelete` dropped the last referrer.** An edge write bumps no
+3. **`DeleteDependency` dropped the last referrer.** An edge write bumps no
    `resource_version` and appends no write-log entry, so no cursor can see it —
    which is why the write reports the lifted block itself, as
    `EdgesDeleteResult.Unblocked`. Two filters, both load-bearing: the target's
@@ -764,7 +764,7 @@ Each item below looks like a trigger. None of them is one.
   appends no write-log entry, which is what makes it the one write that is safe
   inside a dependency cycle. It does wake the object's own event readers, through
   a hub of its own — that is a watch delivery, not a trigger.
-- **A schedule change wakes nothing.** `SchedulesWatch` reports an in-memory gauge.
+- **A schedule change wakes nothing.** `WatchSchedule` reports an in-memory gauge.
   It bumps no generation and no `resource_version`. It is delivered by a push hub
   rather than by a poll. That changes how a subscriber learns of it. It changes
   nothing about what it triggers.
@@ -772,7 +772,7 @@ Each item below looks like a trigger. None of them is one.
   tailers and the dependency waker. The tailer half never enqueues a reconcile; the
   waker half does, and it is case 6. Do not confuse the tailer with the push paths in
   section 1.
-- **`EventsWatch` wakes nothing.** It reads one object's event log above a cursor
+- **`WatchEvents` wakes nothing.** It reads one object's event log above a cursor
   for its subscriber. It enqueues no reconcile.
 - **An object of a client-only kind is never reconciled.** It has no reconcile loop.
   An unsettled spec on one is inert. Only its deletion is acted on, by the sweeper.

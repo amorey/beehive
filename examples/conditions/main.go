@@ -87,10 +87,10 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 
 	if ready {
 		// Pool is full: clear the transient progress condition and mark Ready.
-		if err := client.ConditionsDelete(ctx, obj.ID, condProgressing); err != nil {
+		if err := client.DeleteCondition(ctx, obj.ID, condProgressing); err != nil {
 			return beehive.Result{}, err
 		}
-		if err := client.ConditionsSet(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:     condReady,
 			Status:   beehive.ConditionTrue,
 			Reason:   "AllReplicasOnline",
@@ -100,7 +100,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 			return beehive.Result{}, err
 		}
 	} else {
-		if err := client.ConditionsSet(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:    condProgressing,
 			Status:  beehive.ConditionTrue,
 			Reason:  "ScalingUp",
@@ -108,7 +108,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 		}); err != nil {
 			return beehive.Result{}, err
 		}
-		if err := client.ConditionsSet(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:     condReady,
 			Status:   beehive.ConditionFalse,
 			Reason:   "ScalingUp",

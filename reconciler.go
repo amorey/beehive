@@ -335,7 +335,7 @@ func (r *reconciler) run(ctx context.Context) {
 	}
 	// Drain the workers, then stop pending timers so a torn-down reconciler
 	// doesn't wake a dead queue. stop publishes each id's final schedule, and
-	// closing the hub's sender then ends live SchedulesWatch streams after they
+	// closing the hub's sender then ends live WatchSchedule streams after they
 	// read it. Never Hub.Close here: that is hard tear-down with no drain, and a
 	// receiver could lose the final value on a timing race. A racing publish
 	// gets ErrClosed, which workQueue.publish expects.
