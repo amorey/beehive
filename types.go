@@ -41,10 +41,6 @@ type ObjectRef = storeapi.ObjectRef
 // adapter. See storeapi.Store for the full contract.
 type Store = storeapi.Store
 
-// DriverCursorer is an optional Store capability for persisting a driver's scan
-// position across restarts. The dependency waker uses it when present.
-type DriverCursorer = storeapi.DriverCursorer
-
 // RawObject is the untyped row below the generic boundary: opaque Spec/Status
 // JSON plus Beehive-owned metadata.
 type RawObject = storeapi.RawObject

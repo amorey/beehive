@@ -82,7 +82,7 @@ re-drain exactly the range that was just abandoned.
 The abandoned range costs at most two sweep intervals of latency, one in the
 common case: reaching the threshold proves a sweep *started*, and a sweep that
 fails a page holds its cursor for the next one. Never divergence — this is the
-same trade three documented gaps already accept (a store with no `DriverCursorer`,
+same trade three documented gaps already accept (a store that persists no cursor,
 a wake queued but never delivered, a log trimmed under the cursor).
 
 It leans on the backstop finding a superset of what the waker finds.

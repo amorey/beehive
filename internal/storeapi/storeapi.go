@@ -759,20 +759,17 @@ type Store interface {
 	// backend may release fewer, including none, and one that reclaims nothing
 	// returns 0. Non-positive maxPages releases nothing.
 	ReclaimSpace(ctx context.Context, maxPages int) (int, error)
-}
 
-// DriverCursorer is an optional Store capability: persistence for a periodic
-// driver's scan position, so a restart resumes rather than reseeding from
-// "now". Deliberately not a member of Store — it is a latency optimisation
-// over the stale-dependents pass, which already guarantees the wake.
-type DriverCursorer interface {
 	// DriverCursorsGet returns the cursor last persisted for name, or ok=false
 	// if none has been yet. Absence is normal, not an error; zero is a
-	// legitimate cursor value, so it cannot double as "no cursor".
+	// legitimate cursor value, so it cannot double as "no cursor". A backend
+	// that persists nothing always reports ok=false, which costs latency after a
+	// restart and nothing else — the stale-dependents pass guarantees the wake.
 	DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
 
 	// DriverCursorsSet persists cursor for name if it is greater than what is
 	// stored, and otherwise writes nothing — a non-advancing call must cost no
-	// write, since a driver may call this every tick.
+	// write, since a driver may call this every tick. A backend that persists
+	// nothing discards it.
 	DriverCursorsSet(ctx context.Context, name string, cursor int64) error
 }

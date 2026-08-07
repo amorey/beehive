@@ -49,9 +49,9 @@ func TestStartWithNoControllersSkipsWaker(t *testing.T) {
 // wakerOver builds a waker over a scripted write log, plus reconcilers for the
 // given kinds so a wake has somewhere to land. The Beehive is assembled by hand
 // rather than through New: these tests drive seed and scan directly, so nothing
-// should be running concurrently with the assertions. It mirrors New's own
-// type-assertion, so a store double opts into the durable-cursor path exactly by
-// implementing DriverCursorer — nothing here has to say which.
+// should be running concurrently with the assertions. Every store persists a
+// cursor now, so a double opts out by reporting ok=false rather than by omitting
+// the methods.
 func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	order := make([]*reconciler, 0, len(kinds))
@@ -87,8 +87,8 @@ func seededWaker(store Store, kinds ...GroupKind) (*waker, *fakeClock, map[Group
 // avoid — to wake dependents for changes that happened before the process began,
 // which the startup pass already covers.
 //
-// *replayStore alone implements no DriverCursorer, so this is also the
-// no-capability fallback: it pins that a store which cannot persist a cursor
+// *replayStore persists nothing — its DriverCursorsGet always reports ok=false —
+// so this is also the no-persistence fallback: a store that cannot keep a cursor
 // seeds exactly as it always did.
 func TestWakerSeedsFromTheWriteLogMax(t *testing.T) {
 	store := &replayStore{seed: 500, rows: replayRows(3)}
@@ -507,9 +507,9 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	})
 }
 
-// A store that implements DriverCursorer but has never persisted a cursor for
-// this waker seeds the same way a store with no capability at all does: there is
-// nothing stored to prefer over the write log's max.
+// A store that persists cursors but has never stored one for this waker seeds
+// the same way a store that persists nothing does: there is nothing stored to
+// prefer over the write log's max.
 func TestWakerSeedsFromMaxWithoutAStoredCursor(t *testing.T) {
 	store := &cursorStore{replayStore: replayStore{seed: 500, rows: replayRows(3)}}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
@@ -1578,20 +1578,14 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 }
 
 // Every waker test above drives a double, so all of them would stay green if the
-// real store stopped satisfying DriverCursorer — New's type assertion discards
-// its failure, leaving cursors nil and the waker silently back on
-// reseed-from-max. The static assertions in sqlite/store.go are the primary
-// guard; this pins the other half, that New actually hands the capability to the
-// waker rather than dropping it somewhere in between.
-func TestNewGivesTheWakerTheStoresCursorCapability(t *testing.T) {
+// waker stopped writing through to a real database at all. This pins the wiring
+// end to end: a seed over the sqlite store lands in driver_cursors.
+func TestTheWakerSeedReachesTheDatabase(t *testing.T) {
 	store, err := sqlite.OpenMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
 	bh := newTestBeehive(t, store)
-	require.NotNil(t, bh.waker.cursors, "the sqlite store persists cursors, so the waker must have them")
-
-	// And the wiring carries all the way through a real seed and back.
 	require.NotEqual(t, scanFailed, bh.waker.seed(context.Background()))
 	cursor, ok, err := store.DriverCursorsGet(context.Background(), cursorNameWaker)
 	require.NoError(t, err)
@@ -1683,7 +1677,7 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 }
 
 // staleListErrorStore fails the staleness listing, for the sweep's failure arm.
-// It is a DriverCursorer so a test can watch the cursor it must not move.
+// It persists a cursor so a test can watch the one it must not move.
 type staleListErrorStore struct {
 	fakeStore
 	calls  atomic.Int64

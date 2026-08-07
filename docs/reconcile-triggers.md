@@ -396,7 +396,7 @@ See [the ADR](adr/2026-08-06-the-waker-seeds-before-start-returns.md) and
 
 Case 8 is still the guarantee. Three things bypass the cursor:
 
-- A store that does not implement `DriverCursorer`.
+- A store that persists no driver cursor.
 - The first start of a fresh store.
 - A wake that was queued but never delivered. The cursor records what was
   *scanned*, never what was woken.

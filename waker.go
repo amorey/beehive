@@ -39,10 +39,6 @@ import (
 type waker struct {
 	bh *Beehive
 
-	// cursors persists the watermark across restarts when the store supports it;
-	// nil means every restart reseeds from ObjectWritesMaxVersionAll.
-	cursors DriverCursorer
-
 	// now is the waker's only clock, so the rate tests drive it by hand.
 	now func() time.Time
 
@@ -238,12 +234,10 @@ func (dw *waker) teardown() {
 // applied: the gates take their intervals here, so one built earlier would hold
 // the defaults whatever the caller asked for.
 func newWaker(bh *Beehive) *waker {
-	cursors, _ := bh.store.(DriverCursorer)
 	return &waker{
-		bh:      bh,
-		cursors: cursors,
-		now:     time.Now,
-		retry:   driver.Backoff{Base: wakeRetryBase, Max: wakeRetryMax},
+		bh:    bh,
+		now:   time.Now,
+		retry: driver.Backoff{Base: wakeRetryBase, Max: wakeRetryMax},
 		persistRetry: driver.Backoff{
 			Base: max(bh.wakePersistInterval, wakeRetryBase),
 			Max:  wakePersistRetryMax,
@@ -295,7 +289,7 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 // carries the attempt costs a scan: the gate floors every attempt, the retry
 // ladder paces a failing one.
 func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
-	if dw.cursors == nil || dw.watermark <= dw.persisted {
+	if dw.watermark <= dw.persisted {
 		return 0, false
 	}
 	wait := dw.persistOpensAt.Sub(now)
@@ -359,17 +353,14 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 		return scanFailed
 	}
 
-	var stored int64
-	var ok bool
-	if dw.cursors != nil {
-		if stored, ok, err = dw.cursors.DriverCursorsGet(ctx, cursorNameWaker); err != nil {
-			if ctx.Err() != nil {
-				return scanFailed
-			}
-			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next pass",
-				"err", err)
+	stored, ok, err := dw.bh.store.DriverCursorsGet(ctx, cursorNameWaker)
+	if err != nil {
+		if ctx.Err() != nil {
 			return scanFailed
 		}
+		dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next pass",
+			"err", err)
+		return scanFailed
 	}
 
 	watermark := resumeWatermark(stored, ok, mark)
@@ -560,7 +551,7 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 // never rolled back — the wakes are already queued.
 func (dw *waker) persist(ctx context.Context) {
 	// ctx.Err() checked here so a shutdown mid-scan isn't logged as a failure.
-	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
+	if dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return
 	}
 	now := dw.now()
@@ -570,7 +561,7 @@ func (dw *waker) persist(ctx context.Context) {
 	if now.Before(dw.persistOpensAt) {
 		return
 	}
-	if err := dw.cursors.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
+	if err := dw.bh.store.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
 		dw.persistFailures++
 		dw.persistOpensAt = now.Add(dw.persistRetry.Next())
 		if dw.persistFailures > 1 {

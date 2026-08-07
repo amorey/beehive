@@ -532,6 +532,17 @@ func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int,
 func (s *fakeStore) ReclaimSpace(context.Context, int) (int, error) {
 	return 0, nil
 }
+
+// DriverCursorsGet and DriverCursorsSet persist nothing, which the contract
+// permits: ok=false is "none stored yet", so a waker over this store reseeds
+// from the write log's max every time. cursorStore is the persisting double.
+func (s *fakeStore) DriverCursorsGet(context.Context, string) (int64, bool, error) {
+	return 0, false, nil
+}
+
+func (s *fakeStore) DriverCursorsSet(context.Context, string, int64) error {
+	return nil
+}
 func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.
@@ -685,11 +696,11 @@ func replayRows(count int) []ObjectWrite {
 	return rows
 }
 
-// cursorStore layers storeapi.DriverCursorer on top of replayStore, so a waker
-// test can script what a durable store already has stored for the waker's
-// cursor name and observe what it writes. A plain *replayStore does not
-// implement DriverCursorer at all — that is what exercises the no-capability
-// fallback — so this is a distinct type rather than a field toggle.
+// cursorStore gives replayStore a real cursor table, so a waker test can script
+// what a durable store already holds for the waker's cursor name and observe what
+// it writes. A plain *replayStore persists nothing and always reports ok=false —
+// that is what exercises the no-persistence fallback — so this is a distinct type
+// rather than a field toggle.
 type cursorStore struct {
 	replayStore
 	stored map[string]int64 // what DriverCursorsGet reports; nil means nothing stored

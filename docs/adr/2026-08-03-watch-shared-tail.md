@@ -74,7 +74,7 @@ table derived from the verbs would miss two rows:
   than per row.
 
 A deeper alternative exists: an optional `ObjectWritesNotifier` on `Store`,
-probed the way `DriverCursorer` and `FreePagesReleaser` are, called from the
+probed the way the optional capabilities once were, called from the
 three helpers themselves. The bundled store could then never forget to publish,
 and the floor tick already degrades correctly for a store that does not
 implement it. It is not taken here for two reasons: it puts a watch concern

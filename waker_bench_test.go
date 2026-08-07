@@ -168,16 +168,13 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 func benchWakeLog(b *testing.B, rows int) *wakeCountingStore {
 	b.Helper()
 	store, _ := benchStaleGraph(b, max(rows, 1))
-	cursors, ok := store.(DriverCursorer)
-	require.True(b, ok, "the waker's cursor path needs a store that can persist one")
-	return &wakeCountingStore{Store: store, DriverCursorer: cursors}
+	return &wakeCountingStore{Store: store}
 }
 
 // wakeCountingStore counts what one pass costs the store, split the way the
 // waker's two kinds of query are paid for.
 type wakeCountingStore struct {
 	Store
-	DriverCursorer
 	reads        int
 	cursorWrites int
 }
@@ -194,7 +191,7 @@ func (s *wakeCountingStore) EdgesGroupIncomingByID(ctx context.Context, ids []Ob
 
 func (s *wakeCountingStore) DriverCursorsSet(ctx context.Context, name string, at int64) error {
 	s.cursorWrites++
-	return s.DriverCursorer.DriverCursorsSet(ctx, name, at)
+	return s.Store.DriverCursorsSet(ctx, name, at)
 }
 
 // benchSpec returns a spec no row has held. A byte-identical write is a no-op

@@ -32,13 +32,7 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Compile-time interface checks. The optional capabilities are acquired by type
-// assertion with the failure discarded, so a drifted signature would silently
-// turn the feature off rather than fail to build.
-var (
-	_ storeapi.Store          = (*sqliteStore)(nil)
-	_ storeapi.DriverCursorer = (*sqliteStore)(nil)
-)
+var _ storeapi.Store = (*sqliteStore)(nil)
 
 // object_writes.op. The soft delete is an ordinary update: the row is still
 // live and readable, so only the GC's physical removal is writeOpDelete.
@@ -2734,7 +2728,7 @@ func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID
 	return exists == 1, nil
 }
 
-// DriverCursorsGet reads name's persisted cursor (see storeapi.DriverCursorer). A
+// DriverCursorsGet reads name's persisted cursor (see storeapi.Store). A
 // missing row is ok=false: absence is the ordinary first-run state, not a fault.
 func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64, bool, error) {
 	var cursor int64
@@ -2749,7 +2743,7 @@ func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64,
 	return cursor, true, nil
 }
 
-// DriverCursorsSet upserts name's persisted cursor (see storeapi.DriverCursorer).
+// DriverCursorsSet upserts name's persisted cursor (see storeapi.Store).
 // The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
 // write outright — no page dirtied on a quiet tick.
 func (s *sqliteStore) DriverCursorsSet(ctx context.Context, name string, cursor int64) error {

@@ -1,7 +1,7 @@
 # The dependency waker persists its scan cursor, as an optimisation over the stale-dependents pass
 
 - **Status:** Accepted — implemented in `sqlite/migrations/0001_init.sql`
-  (`driver_cursors`), `internal/storeapi/storeapi.go` (`DriverCursorer`),
+  (`driver_cursors`), `internal/storeapi/storeapi.go` (`Store.DriverCursors*`),
   `store.go`, `sqlite/store.go`, `waker.go`, `beehive.go`.
 - **Date:** 2026-07-30
 
@@ -36,19 +36,21 @@ This is that version, built on top of the ground truth rather than replacing it.
 **Persist the watermark; keep everything downstream of it exactly as
 approximate as it already was.**
 
-### `DriverCursorer`, an optional capability
+### Cursor persistence, a required `Store` member
 
 ```go
-type DriverCursorer interface {
-    DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
-    DriverCursorsSet(ctx context.Context, name string, cursor int64) error
-}
+DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
+DriverCursorsSet(ctx context.Context, name string, cursor int64) error
 ```
 
-Not a `Store` member, for the same reason `FreePagesReleaser` is not: a `Store`
-that doesn't implement it is simply not resumed across restarts — the waker's
-original, tested behaviour — rather than every implementation and test double
-having to answer a question only some of them need to. `ok bool` rather than
+This began as an optional `DriverCursorer` the waker type-asserted, so a `Store`
+that didn't implement it was simply not resumed across restarts — the waker's
+original, tested behaviour. It is now required, because `ok=false` already says
+exactly that: a backend that persists nothing reports absence forever, reseeds
+from the write log's max every restart, and the stale-dependents pass covers the
+gap as it always did. The optionality bought a nil check rather than any
+semantics. See [the grouped-Store spec](../specs/2026-08-07-grouped-store-api.md),
+D3. `ok bool` rather than
 `ErrNotFound` marks absence as the normal first-run state rather than a fault;
 `ErrNotFound`'s own contract scopes it to "no object matches", and zero is a
 legitimate cursor value on an empty store, so it cannot double as "no cursor"

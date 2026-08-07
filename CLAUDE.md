@@ -145,7 +145,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   below the watermark, which would otherwise be retried only by a commit that may
   never come. Going
   idle **stops** the timer, or one already ready drives a pass nobody asked for.
-  The cursor persists via the optional `DriverCursorer`; it is an optimisation
+  The cursor persists via `Store.DriverCursorsSet`; it is an optimisation
   over the stale-dependents pass, never a guarantee. **Both store-wide reads
   report the retention horizon** beside their value rather than folded in — the
   abandon jump needs the bare mark — so a cursor below the boundary is warned about
