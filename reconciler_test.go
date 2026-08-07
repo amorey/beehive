@@ -313,7 +313,7 @@ func TestDependencyRequeue(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, "depends_on"))
 
 	// An observable change to the target must wake the dependent.
-	err = store.ConditionsSet(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = store.Conditions().Set(ctx, GroupKind{Group: target.Group, Kind: target.Kind}, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	// Wait for the dependent specifically rather than for "the next reconcile":
@@ -616,7 +616,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// already unclaimed when the edge appears — the outside-a-reconcile race. The
 	// ControllerClient outlives the control plane (it holds the store, not the
 	// loops), so the declaration commits normally with no running queue to reach.
-	err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = db.Conditions().Set(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
@@ -2863,7 +2863,7 @@ func TestClientOnlyTargetWakesDependent(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 	at := observer.settle(t, ctx, bh, depClient, dep.ID, target.ID)
 
-	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	// Client has no conditions write, so this one goes straight to the store —
 	// which announces nothing. Publish what an in-band write would have.
@@ -2893,7 +2893,7 @@ func TestClientOnlyTargetCreatedAfterStart(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 	at := observer.settle(t, ctx, bh, depClient, dep.ID, target.ID)
 
-	err := store.ConditionsSet(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, clientOnlyGK, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	// Client has no conditions write, so this one goes straight to the store —
 	// which announces nothing. Publish what an in-band write would have.
@@ -3406,7 +3406,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	require.NoError(t, stop1(ctx))
 
 	// --- the crash window: the target changes with nobody running ---
-	err = db.ConditionsSet(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err = db.Conditions().Set(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	// --- the restart: a second process, the first already stopped ---

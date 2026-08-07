@@ -34,6 +34,12 @@ import (
 
 var _ storeapi.Store = (*sqliteStore)(nil)
 
+// sqliteConditions is the conditions family. Embedding the store keeps every
+// method body unchanged: s.db still resolves.
+type sqliteConditions struct{ *sqliteStore }
+
+func (s *sqliteStore) Conditions() storeapi.Conditions { return sqliteConditions{s} }
+
 // object_writes.op. The soft delete is an ordinary update: the row is still
 // live and readable, so only the GC's physical removal is writeOpDelete.
 const (
@@ -1599,7 +1605,7 @@ func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want stor
 		existing.Liveness == want.Liveness
 }
 
-func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) error {
+func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) error {
 	// Within keeps the condition write and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
@@ -1637,7 +1643,7 @@ func (s *sqliteStore) ConditionsSet(ctx context.Context, gk storeapi.GroupKind, 
 	})
 }
 
-func (s *sqliteStore) ConditionsDelete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {
+func (s sqliteConditions) Delete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {
 	// Within keeps the delete and the version bump atomic (see ConditionsSet).
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)

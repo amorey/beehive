@@ -515,7 +515,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 // of it predates the change.
 func (f *declareFixture) moveTarget(t *testing.T) {
 	t.Helper()
-	err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
+	err := f.store.Conditions().Set(context.Background(), f.targetGK, f.target.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 }

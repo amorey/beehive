@@ -325,6 +325,8 @@ type (
 type fakeStore struct {
 	mu     sync.Mutex
 	closed bool
+
+	conditions fakeConditions
 }
 
 func (s *fakeStore) Close() error {
@@ -430,11 +432,28 @@ func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID)
 func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
 }
-func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
-	panic("not implemented: fakeStore.ConditionsSet")
+func (s *fakeStore) Conditions() storeapi.Conditions { return s.conditions }
+
+// fakeConditions is fakeStore's conditions family. A nil hook panics, which is
+// what an unimplemented fakeStore method has always done; a test that needs one
+// sets it rather than declaring a type.
+type fakeConditions struct {
+	set    func(context.Context, GroupKind, ObjectID, storeapi.Condition) error
+	delete func(context.Context, GroupKind, ObjectID, string) error
 }
-func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) error {
-	panic("not implemented: fakeStore.ConditionsDelete")
+
+func (f fakeConditions) Set(ctx context.Context, gk GroupKind, id ObjectID, cond storeapi.Condition) error {
+	if f.set == nil {
+		panic("not implemented: fakeStore.Conditions().Set")
+	}
+	return f.set(ctx, gk, id, cond)
+}
+
+func (f fakeConditions) Delete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error {
+	if f.delete == nil {
+		panic("not implemented: fakeStore.Conditions().Delete")
+	}
+	return f.delete(ctx, gk, id, condType)
 }
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")

@@ -2122,7 +2122,7 @@ func TestGetObjectMetaSkipsConditions(t *testing.T) {
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
-	err := store.ConditionsSet(ctx, testGK, created.ID,
+	err := store.Conditions().Set(ctx, testGK, created.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
@@ -4002,16 +4002,16 @@ func TestGatedWritesReadNoBlobToGateOnKind(t *testing.T) {
 	ctx := context.Background()
 	id := insertBadFinalizersRow(t, store, testGK)
 
-	require.NoError(t, store.ConditionsSet(ctx, testGK, id,
+	require.NoError(t, store.Conditions().Set(ctx, testGK, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
-	require.NoError(t, store.ConditionsDelete(ctx, testGK, id, "Ready"))
+	require.NoError(t, store.Conditions().Delete(ctx, testGK, id, "Ready"))
 	require.NoError(t, store.EventsAdd(ctx, testGK, id,
 		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}))
 
 	// The gate still reports scope and existence, which is all it reads for.
-	assert.ErrorIs(t, store.ConditionsSet(ctx, beehive.GroupKind{Kind: "Other"}, id,
+	assert.ErrorIs(t, store.Conditions().Set(ctx, beehive.GroupKind{Kind: "Other"}, id,
 		storeapi.Condition{Type: "Ready", Status: "True"}), beehive.ErrWrongKind)
-	assert.ErrorIs(t, store.ConditionsDelete(ctx, testGK, 999999, "Ready"), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.Conditions().Delete(ctx, testGK, 999999, "Ready"), beehive.ErrNotFound)
 	assert.ErrorIs(t, store.EventsAdd(ctx, beehive.GroupKind{Kind: "Other"}, id,
 		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}), beehive.ErrWrongKind)
 }
@@ -4338,7 +4338,7 @@ func TestRefsAddReportsADeletingTarget(t *testing.T) {
 // that need a target to have changed since an earlier read.
 func moveTarget(t *testing.T, store *sqliteStore, id beehive.ObjectID) {
 	t.Helper()
-	err := store.ConditionsSet(context.Background(), testGK,
+	err := store.Conditions().Set(context.Background(), testGK,
 		id, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 }
@@ -4810,7 +4810,7 @@ func TestObjectsListByIncomingRef(t *testing.T) {
 	dep := newRefObject(t, store)
 	require.NoError(t, addEdge(ctx, store, dep.ID, owner.ID, "depends_on"))
 
-	err = store.ConditionsSet(ctx, testGK, c1.ID,
+	err = store.Conditions().Set(ctx, testGK, c1.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
@@ -4916,7 +4916,7 @@ func TestSetConditionReadBack(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "ready-obj")
 
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{
 		Type: "Ready", Status: "True", Reason: "Provisioned", Message: "all good",
 	}))
 	got, err := store.ObjectsGet(ctx, obj.ID)
@@ -4934,10 +4934,10 @@ func TestConditionsSurfaceOnReads(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "multi-read")
 
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 	// A second, independent type must coexist without clobbering the first.
-	err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Healthy", Status: "False", Reason: "Degraded"})
+	err = store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Healthy", Status: "False", Reason: "Degraded"})
 	require.NoError(t, err)
 
 	assertBoth := func(t *testing.T, conds []storeapi.Condition) {
@@ -4970,7 +4970,7 @@ func TestSetConditionTransitionedAt(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "transition")
 
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "A"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "A"})
 	require.NoError(t, err)
 
 	// Backdate transitioned_at to a known sentinel so we can prove preservation
@@ -4984,7 +4984,7 @@ func TestSetConditionTransitionedAt(t *testing.T) {
 
 	// Same status, different reason: transitioned_at is preserved at the sentinel.
 	backdate()
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "B"}))
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "B"}))
 	got, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, time.UnixMilli(sentinel).UTC(), findCondition(got.Conditions, "Ready").TransitionedAt,
@@ -4992,7 +4992,7 @@ func TestSetConditionTransitionedAt(t *testing.T) {
 
 	// Status change: transitioned_at advances to the write's fresh stamp.
 	backdate()
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False", Reason: "C"}))
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False", Reason: "C"}))
 	got, err = store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	changed := findCondition(got.Conditions, "Ready")
@@ -5009,7 +5009,7 @@ func TestSetConditionEmitsAndBumpsResourceVersion(t *testing.T) {
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"}))
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"}))
 	got, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Greater(t, got.ResourceVersion, obj.ResourceVersion, "a condition change bumps resource_version")
@@ -5023,14 +5023,14 @@ func TestSetConditionNoOpSuppressed(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "noop")
 
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"}))
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"}))
 	first, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
 	// An identical write changes nothing: no resource_version bump, no event.
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"}))
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True", Reason: "Up"}))
 	again, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, again.ResourceVersion, "identical condition write is a no-op")
@@ -5042,14 +5042,14 @@ func TestDeleteCondition(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "deletable")
 
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Healthy", Status: "True"})
+	err = store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Healthy", Status: "True"})
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ConditionsDelete(ctx, testGK, obj.ID, "Ready"))
+	require.NoError(t, store.Conditions().Delete(ctx, testGK, obj.ID, "Ready"))
 	got, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "Ready removed")
@@ -5066,7 +5066,7 @@ func TestDeleteConditionAbsentIsNoOp(t *testing.T) {
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.ConditionsDelete(ctx, testGK, obj.ID, "Ready"))
+	require.NoError(t, store.Conditions().Delete(ctx, testGK, obj.ID, "Ready"))
 	got, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, obj.ResourceVersion, got.ResourceVersion, "deleting an absent condition is a no-op")
@@ -5081,7 +5081,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "preserve")
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
@@ -5144,7 +5144,7 @@ func TestDeleteObjectCascadesConditions(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "cascade")
 
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
@@ -5161,10 +5161,10 @@ func TestLivenessDowngradedToUnknownBeforeProcessStart(t *testing.T) {
 	obj := newConditionObject(t, store, "liveness")
 
 	// A liveness condition and a store-truth condition, both written "now".
-	err := store.ConditionsSet(ctx, testGK, obj.ID,
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Connected", Status: "True", Liveness: true})
 	require.NoError(t, err)
-	err = store.ConditionsSet(ctx, testGK, obj.ID,
+	err = store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Provisioned", Status: "True"})
 	require.NoError(t, err)
 
@@ -5187,7 +5187,7 @@ func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "reconfirm")
 
-	err := store.ConditionsSet(ctx, testGK, obj.ID,
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Connected", Status: "True", Reason: "Dialed", Liveness: true})
 	require.NoError(t, err)
 
@@ -5202,7 +5202,7 @@ func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
 	// Re-confirming the identical condition must NOT be suppressed as a no-op: the
 	// write has to refresh updated_at so the condition is valid in this process
 	// again, otherwise it stays downgraded to Unknown forever.
-	err = store.ConditionsSet(ctx, testGK, obj.ID,
+	err = store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Connected", Status: "True", Reason: "Dialed", Liveness: true})
 	require.NoError(t, err)
 
@@ -5214,7 +5214,7 @@ func TestStaleLivenessReConfirmRefreshes(t *testing.T) {
 
 func TestSetConditionObjectNotFound(t *testing.T) {
 	store := newTestStore(t)
-	err := store.ConditionsSet(context.Background(), testGK, 999999, storeapi.Condition{
+	err := store.Conditions().Set(context.Background(), testGK, 999999, storeapi.Condition{
 		Type: "Ready", Status: "True",
 	})
 	assert.ErrorIs(t, err, beehive.ErrNotFound)
@@ -5223,7 +5223,7 @@ func TestSetConditionObjectNotFound(t *testing.T) {
 func TestSetConditionDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	err := store.ConditionsSet(context.Background(), testGK, 1, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(context.Background(), testGK, 1, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.Error(t, err)
 }
 
@@ -5234,14 +5234,14 @@ func TestSetConditionInvalidStatusRejected(t *testing.T) {
 
 	// The conditions.status CHECK constraint rejects anything outside the enum,
 	// surfacing as an error from the upsert.
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "Bogus"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "Bogus"})
 	require.Error(t, err)
 }
 
 func TestDeleteConditionDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	err := store.ConditionsDelete(context.Background(), testGK, 1, "Ready")
+	err := store.Conditions().Delete(context.Background(), testGK, 1, "Ready")
 	require.Error(t, err)
 }
 
@@ -5297,14 +5297,14 @@ func TestConditionResourceVersionError(t *testing.T) {
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "rv-error")
 
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	_, err = store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
 	require.NoError(t, err)
 
 	// A real change whose version bump fails: the whole call rolls back.
-	err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
+	err = store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
 	got, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
@@ -5313,7 +5313,7 @@ func TestConditionResourceVersionError(t *testing.T) {
 	assert.Equal(t, "True", ready.Status, "rolled-back ConditionsSet must not apply the changed status")
 
 	// A delete whose version bump fails likewise rolls back, leaving the row.
-	err = store.ConditionsDelete(ctx, testGK, obj.ID, "Ready")
+	err = store.Conditions().Delete(ctx, testGK, obj.ID, "Ready")
 	require.Error(t, err)
 	got, err = store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)
@@ -5332,7 +5332,7 @@ func TestConditionsSetLoadError(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE conditions`)
 	require.NoError(t, err)
 
-	err = store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
+	err = store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "False"})
 	require.Error(t, err)
 }
 
@@ -5372,7 +5372,7 @@ func TestListObjectsConditionsChunks(t *testing.T) {
 	ctx := context.Background()
 	for _, name := range []string{"a", "b", "c", "d", "e"} {
 		obj := newConditionObject(t, store, "chunked-"+name)
-		err := store.ConditionsSet(ctx, testGK, obj.ID,
+		err := store.Conditions().Set(ctx, testGK, obj.ID,
 			storeapi.Condition{Type: "Ready", Status: "True"})
 		require.NoError(t, err)
 	}
@@ -5517,7 +5517,7 @@ func TestDeleteConditionScopedReadError(t *testing.T) {
 	obj := newConditionObject(t, store, "del-cond-read")
 	dropObjects(t, store)
 
-	err := store.ConditionsDelete(ctx, testGK, obj.ID, "Ready")
+	err := store.Conditions().Delete(ctx, testGK, obj.ID, "Ready")
 	require.Error(t, err)
 }
 
@@ -5529,7 +5529,7 @@ func TestDeleteConditionDeleteExecError(t *testing.T) {
 	obj := newConditionObject(t, store, "del-cond-exec")
 	dropConditions(t, store)
 
-	err := store.ConditionsDelete(ctx, testGK, obj.ID, "Ready")
+	err := store.Conditions().Delete(ctx, testGK, obj.ID, "Ready")
 	require.Error(t, err)
 }
 
@@ -6876,7 +6876,7 @@ func TestObjectsGetForReconcileAttachesConditions(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	err := store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
+	err := store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 
 	load, err := store.ObjectsGetForReconcile(ctx, obj.ID)
@@ -7456,7 +7456,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "condition set",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID, storeapi.Condition{
+				require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{
 					Type: "Ready", Status: "True", Reason: "Settled",
 				}))
 			},
@@ -7554,7 +7554,7 @@ func TestObjectsDeleteAppendsARowImage(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 	require.NoError(t, store.ObjectsUpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
-	require.NoError(t, store.ConditionsSet(ctx, testGK, obj.ID,
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
 	before, err := store.ObjectsGet(ctx, obj.ID)
 	require.NoError(t, err)

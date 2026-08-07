@@ -364,7 +364,24 @@ func (r ObjectRef) GroupKind() GroupKind {
 type Store interface {
 	io.Closer
 
+	// Conditions is the conditions table.
+	Conditions() Conditions
+
 	unmigrated
+}
+
+// Conditions is the per-object condition table.
+type Conditions interface {
+	// Delete removes the condition of type condType from id. A real removal
+	// bumps ResourceVersion; a missing condition does nothing. Scoped to gk:
+	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
+	Delete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
+
+	// Set inserts or updates the condition keyed by (id, cond.Type). A real
+	// change bumps ResourceVersion; an identical write does nothing. Scoped to
+	// gk: wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row;
+	// read conditions back with Objects().Get.
+	Set(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
 }
 
 // unmigrated holds the families not yet reached through an accessor. It shrinks
@@ -400,17 +417,6 @@ type unmigrated interface {
 	// cancellation and values are inherited). fn must not panic: hooks run in
 	// sequence and nothing recovers.
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
-
-	// ConditionsDelete removes the condition of type condType from id. A real
-	// removal bumps ResourceVersion; a missing condition does nothing. Scoped
-	// to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
-	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
-
-	// ConditionsSet inserts or updates the condition keyed by (id, cond.Type).
-	// A real change bumps ResourceVersion; an identical write does nothing.
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// Returns no row; read conditions back with ObjectsGet.
-	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
 
 	// DeletionRequestsCreate sets DeletionRequestedAt; the row stays until finalizers
 	// clear (ObjectsDelete removes it). changed is true only when this call set

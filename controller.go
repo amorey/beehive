@@ -113,7 +113,7 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 }
 
 func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error {
-	return c.wakeAfter(ctx, c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
 		Reason:   condition.Reason,
@@ -123,7 +123,7 @@ func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id Obj
 }
 
 func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error {
-	return c.wakeAfter(ctx, c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType))
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Delete(ctx, c.gk, id, conditionType))
 }
 
 func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error {
