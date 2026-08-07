@@ -32,6 +32,13 @@ jobs:
       - name: Run vetter
         run: go vet ./...
 
+      # Every example carries //go:build ignore, so ./... never reaches them and
+      # an API change can break one without failing anything.
+      - name: Vet the examples
+        run: |
+          set -euo pipefail
+          for f in examples/*/main.go; do go vet "$f"; done
+
   staticcheck:
     name: Staticcheck
     runs-on: ubuntu-24.04

@@ -198,7 +198,11 @@ func (s *wakeCountingStore) groupIncomingByIDEdges(ctx context.Context, ids []Ob
 	return s.Store.Edges().GroupIncomingByID(ctx, ids, rel)
 }
 
-func (s *wakeCountingStore) DriverCursorsSet(ctx context.Context, name string, at int64) error {
+func (s *wakeCountingStore) DriverCursors() storeapi.DriverCursors {
+	return cursorsOverride{DriverCursors: s.Store.DriverCursors(), set: s.setDriverCursor}
+}
+
+func (s *wakeCountingStore) setDriverCursor(ctx context.Context, name string, at int64) error {
 	s.cursorWrites++
 	return s.Store.DriverCursors().Set(ctx, name, at)
 }

@@ -325,8 +325,6 @@ type (
 type fakeStore struct {
 	mu     sync.Mutex
 	closed bool
-
-	conditions fakeConditions
 }
 
 func (s *fakeStore) Close() error {
@@ -356,12 +354,7 @@ func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) 
 // commit to wait for.
 func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
 
-// answers 0: the GC sweeper calls it on every tick
-
-// ReconcileOwedStamp answers nil like the listings above it: the stale-dependents
-// driver stamps what it finds, so a panic would break every Start.
-
-// ResourceVersionsMaxIssued answers 0: the stale-dependents driver reads it every
+// GetLatestResourceVersion answers 0: the stale-dependents driver reads it every
 // tick, so a panic would break every Start.
 func (s *fakeStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return 0, nil
@@ -381,6 +374,19 @@ func (fakeDependencies) ListStaleSince(_ context.Context, _ []GroupKind, after S
 
 func (fakeDependencies) WatermarkSet(context.Context, ObjectID, int64) error {
 	panic("not implemented: fakeStore.Dependencies().WatermarkSet")
+}
+
+// cursorsOverride replaces the hooks that are set and delegates the rest.
+type cursorsOverride struct {
+	storeapi.DriverCursors
+	set func(context.Context, string, int64) error
+}
+
+func (o cursorsOverride) Set(ctx context.Context, name string, cursor int64) error {
+	if o.set != nil {
+		return o.set(ctx, name, cursor)
+	}
+	return o.DriverCursors.Set(ctx, name, cursor)
 }
 
 // depsOverride replaces the hooks that are set on a real Dependencies and
@@ -534,10 +540,6 @@ func (fakeEdges) GroupIncomingByID(context.Context, []ObjectID, Relation) (map[O
 	return nil, nil
 }
 
-func (fakeEdges) ListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-
 func (fakeEdges) ListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
 	return nil, nil
 }
@@ -669,14 +671,12 @@ func (fakeObjectWrites) Sweep(context.Context, int, time.Duration) (int, error) 
 // writesOverride replaces the hooks that are set and delegates the rest.
 type writesOverride struct {
 	storeapi.ObjectWrites
-	listSince       func(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error)
-	listSinceAll    func(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error)
-	maxVersion      func(context.Context, GroupKind) (int64, error)
-	maxVersionAll   func(context.Context) (int64, int64, error)
-	snapshot        func(context.Context, GroupKind) ([]*RawObject, int64, error)
-	snapshotByID    func(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error)
-	snapshotByOwner func(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error)
-	sweep           func(context.Context, int, time.Duration) (int, error)
+	listSince     func(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error)
+	listSinceAll  func(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error)
+	maxVersion    func(context.Context, GroupKind) (int64, error)
+	maxVersionAll func(context.Context) (int64, int64, error)
+	snapshot      func(context.Context, GroupKind) ([]*RawObject, int64, error)
+	snapshotByID  func(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error)
 }
 
 func (o writesOverride) ListSince(ctx context.Context, gk GroupKind, after int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
@@ -719,20 +719,6 @@ func (o writesOverride) SnapshotByID(ctx context.Context, gk GroupKind, id Objec
 		return o.snapshotByID(ctx, gk, id)
 	}
 	return o.ObjectWrites.SnapshotByID(ctx, gk, id)
-}
-
-func (o writesOverride) SnapshotByOwner(ctx context.Context, gk GroupKind, owner ObjectID) ([]*RawObject, int64, error) {
-	if o.snapshotByOwner != nil {
-		return o.snapshotByOwner(ctx, gk, owner)
-	}
-	return o.ObjectWrites.SnapshotByOwner(ctx, gk, owner)
-}
-
-func (o writesOverride) Sweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error) {
-	if o.sweep != nil {
-		return o.sweep(ctx, perKind, maxAge)
-	}
-	return o.ObjectWrites.Sweep(ctx, perKind, maxAge)
 }
 
 func (s *fakeStore) Objects() storeapi.Objects { return fakeObjects{} }
@@ -805,7 +791,6 @@ func (fakeObjects) DeleteFinalizer(context.Context, GroupKind, ObjectID, string)
 type objectsOverride struct {
 	storeapi.Objects
 	create             func(context.Context, GroupKind, storeapi.ObjectsCreateInput) (*RawObject, error)
-	deleteFinalizer    func(context.Context, GroupKind, ObjectID, string) (bool, error)
 	get                func(context.Context, ObjectID) (*RawObject, error)
 	getForReconcile    func(context.Context, ObjectID) (storeapi.ReconcileLoad, error)
 	getMeta            func(context.Context, ObjectID) (*RawObject, error)
@@ -816,7 +801,6 @@ type objectsOverride struct {
 	listUnsettledIDs   func(context.Context, GroupKind) ([]ObjectID, error)
 	objectsDelete      func(context.Context, ObjectID) error
 	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
-	updateSpecByName   func(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error)
 	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
 	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
 }
@@ -826,13 +810,6 @@ func (o objectsOverride) Create(ctx context.Context, gk GroupKind, in storeapi.O
 		return o.create(ctx, gk, in)
 	}
 	return o.Objects.Create(ctx, gk, in)
-}
-
-func (o objectsOverride) DeleteFinalizer(ctx context.Context, gk GroupKind, id ObjectID, f string) (bool, error) {
-	if o.deleteFinalizer != nil {
-		return o.deleteFinalizer(ctx, gk, id, f)
-	}
-	return o.Objects.DeleteFinalizer(ctx, gk, id, f)
 }
 
 func (o objectsOverride) Delete(ctx context.Context, id ObjectID) error {
@@ -905,13 +882,6 @@ func (o objectsOverride) UpdateSpec(ctx context.Context, gk GroupKind, id Object
 	return o.Objects.UpdateSpec(ctx, gk, id, spec, v)
 }
 
-func (o objectsOverride) UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, v int) (*RawObject, bool, error) {
-	if o.updateSpecByName != nil {
-		return o.updateSpecByName(ctx, gk, name, spec, v)
-	}
-	return o.Objects.UpdateSpecByName(ctx, gk, name, spec, v)
-}
-
 func (o objectsOverride) GetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
 	if o.getByName != nil {
 		return o.getByName(ctx, gk, name)
@@ -926,29 +896,19 @@ func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id Obje
 	return o.Objects.UpdateStatus(ctx, gk, id, observed, status, version)
 }
 
-func (s *fakeStore) Conditions() storeapi.Conditions { return s.conditions }
+func (s *fakeStore) Conditions() storeapi.Conditions { return fakeConditions{} }
 
-// fakeConditions is fakeStore's conditions family. A nil hook panics, which is
-// what an unimplemented fakeStore method has always done; a test that needs one
-// sets it rather than declaring a type.
-type fakeConditions struct {
-	set    func(context.Context, GroupKind, ObjectID, storeapi.Condition) error
-	delete func(context.Context, GroupKind, ObjectID, string) error
+// fakeConditions is fakeStore's conditions family.
+type fakeConditions struct{}
+
+func (fakeConditions) Set(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
+	panic("not implemented: fakeStore.Conditions().Set")
 }
 
-func (f fakeConditions) Set(ctx context.Context, gk GroupKind, id ObjectID, cond storeapi.Condition) error {
-	if f.set == nil {
-		panic("not implemented: fakeStore.Conditions().Set")
-	}
-	return f.set(ctx, gk, id, cond)
+func (fakeConditions) Delete(context.Context, GroupKind, ObjectID, string) error {
+	panic("not implemented: fakeStore.Conditions().Delete")
 }
 
-func (f fakeConditions) Delete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error {
-	if f.delete == nil {
-		panic("not implemented: fakeStore.Conditions().Delete")
-	}
-	return f.delete(ctx, gk, id, condType)
-}
 func (s *fakeStore) Events() storeapi.Events { return fakeEvents{} }
 
 // fakeEvents is fakeStore's event-log family. Sweep answers zero rather than
@@ -1233,10 +1193,9 @@ type cursorStore struct {
 func (s *cursorStore) DriverCursors() storeapi.DriverCursors { return cursorStoreCursors{s} }
 
 // cursorStoreCursors is cursorStore's scripted cursor table.
-type cursorStoreCursors struct{ s *cursorStore }
+type cursorStoreCursors struct{ *cursorStore }
 
-func (c cursorStoreCursors) Get(_ context.Context, name string) (int64, bool, error) {
-	s := c.s
+func (s cursorStoreCursors) Get(_ context.Context, name string) (int64, bool, error) {
 	if s.getErr != nil {
 		return 0, false, s.getErr
 	}
@@ -1244,8 +1203,7 @@ func (c cursorStoreCursors) Get(_ context.Context, name string) (int64, bool, er
 	return v, ok, nil
 }
 
-func (c cursorStoreCursors) Set(_ context.Context, name string, cursor int64) error {
-	s := c.s
+func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) error {
 	s.setAttempts++
 	if s.setErr != nil {
 		return s.setErr

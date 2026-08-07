@@ -1040,19 +1040,19 @@ func (s sqliteReconcileOwed) Sweep(ctx context.Context, keep []storeapi.GroupKin
 	return int(n), nil
 }
 
-// ReconcileOwedIncrement and ReconcileOwedDecrement are single no-emit UPDATEs
+// Increment and Decrement are single no-emit UPDATEs
 // on the owed-wake count; the decrement floors at 0 (contract on storeapi.Store).
 //
 // The increment is deliberately not on that interface: production wakes come
 // from EdgesAdd, whose stamp must be indivisible from the edge insert, and from
 // ReconcileOwedStamp. It stays here so tests can seed a count.
-func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.ObjectID) error {
+func (s sqliteReconcileOwed) Increment(ctx context.Context, id storeapi.ObjectID) error {
 	_, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)
 	return err
 }
 
-// ReconcileOwedDecrement folds the kind into the UPDATE, so a foreign id matches
+// Decrement folds the kind into the UPDATE, so a foreign id matches
 // no row; the disambiguating read is paid only when nothing was written.
 func (s sqliteReconcileOwed) Decrement(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observed int64) error {
 	res, err := s.conn(ctx).ExecContext(ctx,
@@ -2667,9 +2667,9 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 	return rows.Err()
 }
 
-// EdgesListOutgoing returns the distinct objects fromID points at (any
+// ListOutgoing returns the distinct objects fromID points at (any
 // relation); DISTINCT collapses an object reached through several relations.
-func (s *sqliteStore) EdgesListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
+func (s sqliteEdges) ListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
 	rows, err := s.conn(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id

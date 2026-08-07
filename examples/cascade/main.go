@@ -72,7 +72,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 		// Hold the connection open while any cache still has a live claim on us.
 		// EdgesHasIncoming ignores caches that are themselves finalizing, so this clears
 		// once the owned caches are gone — not merely marked for deletion.
-		referenced, err := client.Edges().HasIncoming(ctx, obj.ID)
+		referenced, err := client.EdgesHasIncoming(ctx, obj.ID)
 		if err != nil {
 			return beehive.Result{}, err
 		}

@@ -1801,7 +1801,7 @@ func reconcileOwedHarness(t *testing.T, wrap func(Store) Store) (*typedControlle
 		require.NoError(t, err)
 		return got.ReconcileOwed
 	}
-	owe := func() error { return s.ReconcileOwedIncrement(ctx, raw.ID) }
+	owe := func() error { return incrementOwed(t, s, raw.ID) }
 	return tc, inner, raw.ID, count, owe
 }
 
@@ -2325,13 +2325,26 @@ func TestReconcilerScheduleAtNilWork(t *testing.T) {
 	assert.NotPanics(t, func() { r.requeueNow(1) }, "requeueNow must be nil-work safe")
 }
 
-// wakeStampingStore is the store surface an owed-pass test needs: the Store contract
-// plus ReconcileOwedIncrement, which is deliberately not on Store (see the comment
-// on reconcileOwedHarness) but exists on the concrete sqlite store so a
-// test can seed an owed wake without staging the whole declare race.
+// wakeStampingStore is the store surface an owed-pass test needs: the Store
+// contract, whose ReconcileOwed() family carries an Increment that is
+// deliberately absent from storeapi.ReconcileOwed (see the comment on
+// reconcileOwedHarness) but exists on the concrete sqlite family, so a test can
+// seed an owed wake without staging the whole declare race.
 type wakeStampingStore interface {
 	Store
-	ReconcileOwedIncrement(context.Context, ObjectID) error
+}
+
+// owedIncrementer is the concrete sqlite family's seed-only Increment.
+type owedIncrementer interface {
+	Increment(context.Context, ObjectID) error
+}
+
+// incrementOwed seeds an owed wake through the concrete family.
+func incrementOwed(t *testing.T, s Store, id ObjectID) error {
+	t.Helper()
+	inc, ok := s.ReconcileOwed().(owedIncrementer)
+	require.True(t, ok, "the sqlite ReconcileOwed family seeds an owed wake")
+	return inc.Increment(context.Background(), id)
 }
 
 // newOwedPassHarness starts a control plane whose only periodic driver is the
@@ -2428,7 +2441,7 @@ func TestOwedPassTickDispatchesOwedWake(t *testing.T) {
 
 	// Now owed a wake, the way a crash between a target's commit and the
 	// dependent's dispatch leaves it.
-	require.NoError(t, real.ReconcileOwedIncrement(ctx, id))
+	require.NoError(t, incrementOwed(t, real, id))
 
 	select {
 	case got := <-reconciled:

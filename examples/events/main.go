@@ -97,7 +97,7 @@ func main() {
 	// Simulate a flapping connection: one EventsAdd per probe outcome.
 	probe := func(typ beehive.EventType, reason, message string, detail any, n int) {
 		for range n {
-			exitOnErr(prober.Events().Add(ctx, cluster.ID, beehive.EventSpec{
+			exitOnErr(prober.EventsAdd(ctx, cluster.ID, beehive.EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: message, Detail: detail,
 			}))
 		}
