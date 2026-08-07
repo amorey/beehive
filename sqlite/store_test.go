@@ -1598,6 +1598,38 @@ func TestSetObservedGenerationWakesDependentsOncePerGeneration(t *testing.T) {
 	assert.Empty(t, probe.writes(), "a repeat settle wakes nobody")
 }
 
+// Re-passing the status you were handed looks like a way to settle without
+// SetObservedGeneration, and it is unsound: the no-op gate is the schema version
+// too, so on a build where the status version rose the same call takes the
+// content path — rewriting status, moving updated_at, and landing a stale
+// generation unclamped. Asserts the cliff exists, not that it is good.
+func TestUpdateStatusReUseIsUnsoundAcrossAStatusVersionBump(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	status := []byte(`{"msg":"hi"}`)
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, status, 1))
+
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	require.NoError(t, err)
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, bumped.Generation))
+	settled, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+
+	// The same bytes, re-passed at a stale generation under a raised status
+	// version. SetObservedGeneration would drop this; UpdateStatus does not.
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, status, 2))
+
+	reread, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reread.ObservedGeneration)
+	assert.EqualValues(t, created.Generation, *reread.ObservedGeneration,
+		"the content path unsettles a converged object")
+	assert.Greater(t, reread.ResourceVersion, settled.ResourceVersion, "and rewrites the row")
+	assert.EqualValues(t, 2, reread.StatusVersion)
+}
+
 // TestSchemaVersionColumnsRoundTrip verifies the opaque per-column schema
 // versions: they default to 0, ObjectsCreate persists the caller-set spec version
 // (status is nil at create, so its version stays 0), and the version args to
