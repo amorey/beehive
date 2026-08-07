@@ -257,6 +257,10 @@ type Condition struct {
 	// store downgrades a liveness condition written by a prior process to
 	// Unknown until a controller re-confirms it.
 	Liveness bool
+	// Set by the store on read, ignored on write. A downgraded liveness
+	// condition keeps the stored write's stamps.
+	TransitionedAt time.Time // when Status last changed
+	UpdatedAt      time.Time // when the condition was last written
 }
 
 // EventID is the store-assigned unique identifier for an event run.

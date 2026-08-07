@@ -531,6 +531,41 @@ func TestClientGet(t *testing.T) {
 	assert.Nil(t, got.Status)
 }
 
+// UpdatedAt tracks every write, TransitionedAt only a status flip.
+func TestClientReadsConditionStamps(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	created := mustCreate(t, ctx, client, uniqueName(), cSpec{})
+
+	set := func(status ConditionStatus, reason string) Condition {
+		t.Helper()
+		require.NoError(t, store.Conditions().Set(ctx, clientTestGK, created.ID,
+			storeapi.Condition{Type: "Ready", Status: string(status), Reason: reason}))
+		got, err := client.Get(ctx, created.ID)
+		require.NoError(t, err)
+		cond := findCondition(got.Conditions, "Ready")
+		require.NotNil(t, cond)
+		return *cond
+	}
+
+	first := set(ConditionFalse, "Dialing")
+	assert.False(t, first.TransitionedAt.IsZero(), "first write stamps TransitionedAt")
+	assert.Equal(t, first.UpdatedAt, first.TransitionedAt, "first write stamps both alike")
+
+	sameStatus := set(ConditionFalse, "DialTimeout")
+	assert.Equal(t, first.TransitionedAt, sameStatus.TransitionedAt,
+		"same status keeps TransitionedAt")
+	assert.False(t, sameStatus.UpdatedAt.Before(first.UpdatedAt), "a write moves UpdatedAt")
+
+	flipped := set(ConditionTrue, "Connected")
+	assert.Equal(t, flipped.UpdatedAt, flipped.TransitionedAt, "a flip restamps both alike")
+	assert.False(t, flipped.TransitionedAt.Before(first.TransitionedAt),
+		"a flip advances TransitionedAt")
+}
+
 func TestClientGetAbsentName(t *testing.T) {
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))

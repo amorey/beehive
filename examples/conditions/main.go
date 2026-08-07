@@ -226,6 +226,8 @@ func printConditions(obj *beehive.Object[ServerSpec, ServerStatus]) {
 	}
 	fmt.Printf("rv=%d conditions:\n", obj.ResourceVersion)
 	for _, c := range obj.Conditions {
-		fmt.Printf("  %-12s %-7s reason=%s msg=%q\n", c.Type, c.Status, c.Reason, c.Message)
+		// TransitionedAt moves only on a status flip: how long the status has held.
+		fmt.Printf("  %-12s %-7s for=%-6s reason=%s msg=%q\n", c.Type, c.Status,
+			time.Since(c.TransitionedAt).Round(10*time.Millisecond), c.Reason, c.Message)
 	}
 }
