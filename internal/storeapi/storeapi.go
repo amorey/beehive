@@ -436,9 +436,8 @@ type Store interface {
 	ReclaimSpace(ctx context.Context, maxPages int) (int, error)
 }
 
-// Dependencies is the dependency-watermark table: what each dependent was last
-// reconciled against, and the scan that finds the ones a target has moved past.
-// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an object is owed a pass.
+// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an
+// object is owed a pass.
 type ReconcileOwed interface {
 	// Decrement subtracts observed from id's reconcile_owed,
 	// floored at 0. Callers pass the count they loaded, not 1: one pass
@@ -474,7 +473,8 @@ type ReconcileOwed interface {
 	Sweep(ctx context.Context, keep []GroupKind) (int, error)
 }
 
-// DeletionRequests is the deletion-request lifecycle over objects.deletion_requested_at.
+// DeletionRequests is the deletion-request lifecycle over
+// objects.deletion_requested_at.
 type DeletionRequests interface {
 	// Create sets DeletionRequestedAt; the row stays until finalizers
 	// clear (ObjectsDelete removes it). changed is true only when this call set
@@ -767,6 +767,8 @@ type Objects interface {
 	List(ctx context.Context, gk GroupKind) ([]*RawObject, error)
 }
 
+// Dependencies is the dependency-watermark table: what each dependent was last
+// reconciled against, and the scan that finds the ones a target has moved past.
 type Dependencies interface {
 	// ListStaleSince returns objects of the given kinds with a
 	// depends_on edge to a target whose resource_version is above their
