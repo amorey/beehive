@@ -111,8 +111,6 @@ returned. A backend that never reclaims returns 0 and is within contract, so the
 optionality bought a nil check rather than any semantics. The name drops the freelist,
 which is SQLite's vocabulary and not every backend's.
 
-See [the grouped-Store spec](../specs/2026-08-07-grouped-store-api.md), D3.
-
 ## Consequences
 
 - **`PRAGMA incremental_vacuum` frees one page per step, so the transport is

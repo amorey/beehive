@@ -50,8 +50,7 @@ original, tested behaviour. It is now required, because `ok=false` already says
 exactly that: a backend that persists nothing reports absence forever, reseeds
 from the write log's max every restart, and the stale-dependents pass covers the
 gap as it always did. The optionality bought a nil check rather than any
-semantics. See [the grouped-Store spec](../specs/2026-08-07-grouped-store-api.md),
-D3. `ok bool` rather than
+semantics. `ok bool` rather than
 `ErrNotFound` marks absence as the normal first-run state rather than a fault;
 `ErrNotFound`'s own contract scopes it to "no object matches", and zero is a
 legitimate cursor value on an empty store, so it cannot double as "no cursor"

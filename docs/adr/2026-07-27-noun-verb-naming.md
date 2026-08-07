@@ -9,8 +9,7 @@
 > the noun moved from the method name onto a type and each family is reached
 > through an accessor (`store.Edges().Add`). That drops the two costs recorded in
 > *Consequences* — the verb in the middle, and the verb slot reading as a verb
-> only by habit — and lets `Edges().HasIncoming` read as the predicate it is. See
-> [the grouped-Store spec](../specs/2026-08-07-grouped-store-api.md).
+> only by habit — and lets `Edges().HasIncoming` read as the predicate it is.
 
 ## Context
 

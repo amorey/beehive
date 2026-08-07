@@ -374,8 +374,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`ConditionsSet`, `EventsAdd`). List interface members alphabetically. `Err*`,
   `With*` and external-interface methods are exempt. A watch over a change
   stream returns `<-chan NounChange`; a watch over a gauge or a log streams the
-  value itself. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md),
-  [spec](docs/specs/2026-08-07-grouped-store-api.md)
+  value itself. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md)
 - **Whitebox tests**: tests go in `package beehive`, so they reach unexported
   machinery.
 - **Test files mirror source files, not features.** Shared helpers and fakes go
