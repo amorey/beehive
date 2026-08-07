@@ -376,6 +376,9 @@ type Store interface {
 	// Edges is the owned_by and depends_on edge table.
 	Edges() Edges
 
+	// ObjectWrites is the append-only object write log.
+	ObjectWrites() ObjectWrites
+
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
@@ -563,6 +566,73 @@ type Edges interface {
 	// ListOutgoingByRelation returns the objects fromID points at through relation,
 	// ordered by id — the inverse of EdgesListIncoming.
 	ListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
+}
+
+// ObjectWrites is the append-only object write log.
+type ObjectWrites interface {
+	// ListSince returns gk's log entries above afterRV in cursor
+	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
+	// unread and the caller must resync; equality is fine, since the next unread
+	// entry is trimmedThrough + 1.
+	//
+	// An implementation MUST read the page, the horizon and the delete entries'
+	// row images atomically — they describe one instant or they are wrong. Read
+	// apart, a retention sweep landing between them can report a horizon above
+	// entries the page already captured, which reads as unrecoverable loss for a
+	// stream that lost nothing, or delete a captured entry's image, leaving a
+	// WriteDelete with a nil Final that has no state to report.
+	//
+	// Every WriteDelete entry returned MUST carry a non-nil Final.
+	ListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
+
+	// ListSinceAll is ObjectWritesListSince across every kind, for
+	// the dependency waker: an edge can point at a kind with no controller.
+	// trimmedThrough is the horizon as of the page, over every kind, so afterRV <
+	// trimmedThrough means entries were trimmed unread; equality is fine, since
+	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
+	// horizon rides the rows, and ObjectWritesMaxVersionAll answers it alone.
+	//
+	// Unlike ObjectWritesListSince the page and the horizon need not be read
+	// atomically: a horizon that rose in between means entries really were trimmed
+	// unread.
+	ListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
+
+	// MaxVersion returns gk's log position: every entry for gk is at
+	// or below it, and ObjectWritesListSince returns nothing above it.
+	MaxVersion(ctx context.Context, gk GroupKind) (int64, error)
+
+	// MaxVersionAll is ObjectWritesMaxVersion across every kind, with
+	// the horizon reported beside it rather than folded in. at is the log's bare
+	// maximum, so it is not monotonic — a delete or a retention sweep lowers it —
+	// and consumers compare for inequality. trimmedThrough is the highest version
+	// retention has removed from any kind, 0 when nothing has been: at ==
+	// trimmedThrough == 0 is an empty log, and a cursor below trimmedThrough lost
+	// entries it never read.
+	MaxVersionAll(ctx context.Context) (at int64, trimmedThrough int64, err error)
+
+	// Snapshot returns every object of kind gk and the log position
+	// the listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what ObjectWritesMaxVersion reports.
+	Snapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error)
+
+	// SnapshotByID is ObjectWritesSnapshot for one object: the row,
+	// or no rows when id does not exist or belongs to another kind, and gk's log
+	// position — the kind's, because the stream that follows tails the kind.
+	SnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
+
+	// SnapshotByOwner is ObjectWritesSnapshot for one owner's
+	// children: the objects of kind gk with an owned_by edge to ownerID, and gk's
+	// log position. ownerID is not existence-checked and is typically another
+	// kind; no children reads empty.
+	SnapshotByOwner(ctx context.Context, gk GroupKind, ownerID ObjectID) ([]*RawObject, int64, error)
+
+	// Sweep trims the write log to the retention bounds and returns
+	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
+	// its newest perKind entries; maxAge > 0 drops entries written more than
+	// maxAge ago. A zero bound is skipped. It raises each affected kind's
+	// horizon in the same transaction that deletes that kind's entries, so a
+	// resume is never accepted against a log with a hole in it.
+	Sweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
 }
 
 type Dependencies interface {
@@ -756,70 +826,6 @@ type unmigrated interface {
 	// for an event write too, so it is a "did anything change" answer, not a
 	// log position to scan from.
 	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
-
-	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
-	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
-	// unread and the caller must resync; equality is fine, since the next unread
-	// entry is trimmedThrough + 1.
-	//
-	// An implementation MUST read the page, the horizon and the delete entries'
-	// row images atomically — they describe one instant or they are wrong. Read
-	// apart, a retention sweep landing between them can report a horizon above
-	// entries the page already captured, which reads as unrecoverable loss for a
-	// stream that lost nothing, or delete a captured entry's image, leaving a
-	// WriteDelete with a nil Final that has no state to report.
-	//
-	// Every WriteDelete entry returned MUST carry a non-nil Final.
-	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
-
-	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for
-	// the dependency waker: an edge can point at a kind with no controller.
-	// trimmedThrough is the horizon as of the page, over every kind, so afterRV <
-	// trimmedThrough means entries were trimmed unread; equality is fine, since
-	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
-	// horizon rides the rows, and ObjectWritesMaxVersionAll answers it alone.
-	//
-	// Unlike ObjectWritesListSince the page and the horizon need not be read
-	// atomically: a horizon that rose in between means entries really were trimmed
-	// unread.
-	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
-
-	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at
-	// or below it, and ObjectWritesListSince returns nothing above it.
-	ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error)
-
-	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind, with
-	// the horizon reported beside it rather than folded in. at is the log's bare
-	// maximum, so it is not monotonic — a delete or a retention sweep lowers it —
-	// and consumers compare for inequality. trimmedThrough is the highest version
-	// retention has removed from any kind, 0 when nothing has been: at ==
-	// trimmedThrough == 0 is an empty log, and a cursor below trimmedThrough lost
-	// entries it never read.
-	ObjectWritesMaxVersionAll(ctx context.Context) (at int64, trimmedThrough int64, err error)
-
-	// ObjectWritesSnapshot returns every object of kind gk and the log position
-	// the listing is complete as of, read in one transaction so no write falls
-	// between them. The position is what ObjectWritesMaxVersion reports.
-	ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error)
-
-	// ObjectWritesSnapshotByID is ObjectWritesSnapshot for one object: the row,
-	// or no rows when id does not exist or belongs to another kind, and gk's log
-	// position — the kind's, because the stream that follows tails the kind.
-	ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
-
-	// ObjectWritesSnapshotByOwner is ObjectWritesSnapshot for one owner's
-	// children: the objects of kind gk with an owned_by edge to ownerID, and gk's
-	// log position. ownerID is not existence-checked and is typically another
-	// kind; no children reads empty.
-	ObjectWritesSnapshotByOwner(ctx context.Context, gk GroupKind, ownerID ObjectID) ([]*RawObject, int64, error)
-
-	// ObjectWritesSweep trims the write log to the retention bounds and returns
-	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
-	// its newest perKind entries; maxAge > 0 drops entries written more than
-	// maxAge ago. A zero bound is skipped. It raises each affected kind's
-	// horizon in the same transaction that deletes that kind's entries, so a
-	// resume is never accepted against a log with a hole in it.
-	ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
 
 	// ReclaimSpace returns up to maxPages of space freed by deleted rows to the
 	// OS and reports how many it released — a report, not a guarantee; a

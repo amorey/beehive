@@ -599,7 +599,7 @@ func TestSweepWriteLogRetention(t *testing.T) {
 
 		bh.writeLogRetentionSweep(ctx)
 
-		page, _, err := store.ObjectWritesListSince(ctx, gk, 0, 10)
+		page, _, err := store.ObjectWrites().ListSince(ctx, gk, 0, 10)
 		require.NoError(t, err)
 		assert.Len(t, page, 3)
 	})
@@ -616,7 +616,7 @@ func TestSweepWriteLogRetention(t *testing.T) {
 
 		bh.writeLogRetentionSweep(ctx)
 
-		page, _, err := store.ObjectWritesListSince(ctx, gk, 0, 10)
+		page, _, err := store.ObjectWrites().ListSince(ctx, gk, 0, 10)
 		require.NoError(t, err)
 		assert.Len(t, page, 2)
 	})

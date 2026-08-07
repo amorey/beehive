@@ -343,7 +343,7 @@ const (
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
 func (dw *waker) seed(ctx context.Context) scanResult {
-	mark, trimmed, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, trimmed, err := dw.bh.store.ObjectWrites().MaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return scanFailed // shutdown, not a loss
@@ -444,7 +444,7 @@ func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) 
 //
 // Supplementary — a failure is not a failed scan, since no wake depends on it.
 func (dw *waker) noteTrimIdle(ctx context.Context) {
-	_, trimmed, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	_, trimmed, err := dw.bh.store.ObjectWrites().MaxVersionAll(ctx)
 	if err != nil {
 		return
 	}
@@ -479,7 +479,7 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 // budget rather than the log is what stopped it.
 func (dw *waker) scanPages(ctx context.Context) scanResult {
 	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
-		page, trimmed, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
+		page, trimmed, err := dw.bh.store.ObjectWrites().ListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
 				return scanFailed // shutdown cancelled this read
@@ -522,7 +522,7 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	if drained < dw.abandonAfter {
 		return scanMore
 	}
-	mark, _, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, _, err := dw.bh.store.ObjectWrites().MaxVersionAll(ctx)
 	if err != nil {
 		// Not scanFailed: no wake depends on this read, and backing off would drop
 		// the wakes arriving meanwhile. Restarting the window is what paces the

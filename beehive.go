@@ -277,7 +277,7 @@ func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
 	if bh.writeLogRetentionPerKind <= 0 && bh.writeLogRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.ObjectWritesSweep(ctx, bh.writeLogRetentionPerKind, bh.writeLogRetentionMaxAge); err != nil {
+	if _, err := bh.store.ObjectWrites().Sweep(ctx, bh.writeLogRetentionPerKind, bh.writeLogRetentionMaxAge); err != nil {
 		bh.log().Warn("write log retention sweep failed; retry next sweep", "err", err)
 	}
 }

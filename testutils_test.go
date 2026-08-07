@@ -659,6 +659,118 @@ func (o edgesOverride) ListOutgoingByRelation(ctx context.Context, from ObjectID
 	return o.Edges.ListOutgoingByRelation(ctx, from, rel)
 }
 
+func (s *fakeStore) ObjectWrites() storeapi.ObjectWrites { return fakeObjectWrites{} }
+
+// fakeObjectWrites is fakeStore's write-log family.
+type fakeObjectWrites struct{}
+
+func (fakeObjectWrites) ListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().ListSince")
+}
+
+func (fakeObjectWrites) ListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error) {
+	// Empty rather than a panic: Start seeds the waker, so its eager first pass
+	// scans rather than seeding, and every Beehive whose waker runs reaches this.
+	return nil, 0, nil
+}
+
+func (fakeObjectWrites) MaxVersion(context.Context, GroupKind) (int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().MaxVersion")
+}
+
+func (fakeObjectWrites) MaxVersionAll(context.Context) (int64, int64, error) {
+	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
+	// panic would make the fake unusable for anything that calls Start.
+	return 0, 0, nil
+}
+
+func (fakeObjectWrites) Snapshot(context.Context, GroupKind) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().Snapshot")
+}
+
+func (fakeObjectWrites) SnapshotByID(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().SnapshotByID")
+}
+
+func (fakeObjectWrites) SnapshotByOwner(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().SnapshotByOwner")
+}
+
+func (fakeObjectWrites) Sweep(context.Context, int, time.Duration) (int, error) {
+	// Zero rather than a panic: write-log retention is on by default, so every
+	// Beehive whose GC sweeper ticks reaches this.
+	return 0, nil
+}
+
+// writesOverride replaces the hooks that are set and delegates the rest.
+type writesOverride struct {
+	storeapi.ObjectWrites
+	listSince       func(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error)
+	listSinceAll    func(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error)
+	maxVersion      func(context.Context, GroupKind) (int64, error)
+	maxVersionAll   func(context.Context) (int64, int64, error)
+	snapshot        func(context.Context, GroupKind) ([]*RawObject, int64, error)
+	snapshotByID    func(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error)
+	snapshotByOwner func(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error)
+	sweep           func(context.Context, int, time.Duration) (int, error)
+}
+
+func (o writesOverride) ListSince(ctx context.Context, gk GroupKind, after int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	if o.listSince != nil {
+		return o.listSince(ctx, gk, after, limit)
+	}
+	return o.ObjectWrites.ListSince(ctx, gk, after, limit)
+}
+
+func (o writesOverride) ListSinceAll(ctx context.Context, after int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	if o.listSinceAll != nil {
+		return o.listSinceAll(ctx, after, limit)
+	}
+	return o.ObjectWrites.ListSinceAll(ctx, after, limit)
+}
+
+func (o writesOverride) MaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if o.maxVersion != nil {
+		return o.maxVersion(ctx, gk)
+	}
+	return o.ObjectWrites.MaxVersion(ctx, gk)
+}
+
+func (o writesOverride) MaxVersionAll(ctx context.Context) (int64, int64, error) {
+	if o.maxVersionAll != nil {
+		return o.maxVersionAll(ctx)
+	}
+	return o.ObjectWrites.MaxVersionAll(ctx)
+}
+
+func (o writesOverride) Snapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
+	if o.snapshot != nil {
+		return o.snapshot(ctx, gk)
+	}
+	return o.ObjectWrites.Snapshot(ctx, gk)
+}
+
+func (o writesOverride) SnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
+	if o.snapshotByID != nil {
+		return o.snapshotByID(ctx, gk, id)
+	}
+	return o.ObjectWrites.SnapshotByID(ctx, gk, id)
+}
+
+func (o writesOverride) SnapshotByOwner(ctx context.Context, gk GroupKind, owner ObjectID) ([]*RawObject, int64, error) {
+	if o.snapshotByOwner != nil {
+		return o.snapshotByOwner(ctx, gk, owner)
+	}
+	return o.ObjectWrites.SnapshotByOwner(ctx, gk, owner)
+}
+
+func (o writesOverride) Sweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error) {
+	if o.sweep != nil {
+		return o.sweep(ctx, perKind, maxAge)
+	}
+	return o.ObjectWrites.Sweep(ctx, perKind, maxAge)
+}
+
 func (s *fakeStore) Conditions() storeapi.Conditions { return s.conditions }
 
 // fakeConditions is fakeStore's conditions family. A nil hook panics, which is
@@ -775,33 +887,8 @@ func (s *fakeStore) ObjectsListByIncomingEdge(context.Context, GroupKind, Object
 	return nil, nil
 }
 
-func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesListSince")
-}
-func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error) {
-	// Empty rather than a panic: Start seeds the waker, so its eager first pass
-	// scans rather than seeding, and every Beehive whose waker runs reaches this.
-	return nil, 0, nil
-}
-func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
-}
 func (s *fakeStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
 	panic("not implemented: fakeStore.ObjectsListByIDs")
-}
-func (s *fakeStore) ObjectWritesSnapshot(context.Context, GroupKind) ([]*RawObject, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesSnapshot")
-}
-func (s *fakeStore) ObjectWritesSnapshotByID(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesSnapshotByID")
-}
-func (s *fakeStore) ObjectWritesSnapshotByOwner(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesSnapshotByOwner")
-}
-func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int, error) {
-	// Zero rather than a panic: write-log retention is on by default, so every
-	// Beehive whose GC sweeper ticks reaches this.
-	return 0, nil
 }
 
 // ReclaimSpace reclaims nothing, which the contract permits. The GC sweeper
@@ -819,11 +906,6 @@ type noopDriverCursors struct{}
 
 func (noopDriverCursors) Get(context.Context, string) (int64, bool, error) { return 0, false, nil }
 func (noopDriverCursors) Set(context.Context, string, int64) error         { return nil }
-func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
-	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
-	// panic would make the fake unusable for anything that calls Start.
-	return 0, 0, nil
-}
 
 // depsStore serves a per-target dependent set from the waker's batched lookup
 // and records what it was asked, so a test can control the exact edges — and
@@ -878,7 +960,11 @@ type seedProbe struct {
 	reads   int
 }
 
-func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+func (s *seedProbe) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersionAll: s.maxVersionAllObjectWrites}
+}
+
+func (s *seedProbe) maxVersionAllObjectWrites(context.Context) (int64, int64, error) {
 	s.reads++
 	if s.onRead != nil {
 		s.onRead()
@@ -913,7 +999,11 @@ type replayStore struct {
 	healFromCall int
 }
 
-func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+func (s *replayStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.depsStore.ObjectWrites(), maxVersionAll: s.maxVersionAllObjectWrites, listSinceAll: s.listSinceAllObjectWrites}
+}
+
+func (s *replayStore) maxVersionAllObjectWrites(context.Context) (int64, int64, error) {
 	s.marks++
 	if s.seedErr != nil {
 		return 0, 0, s.seedErr
@@ -945,7 +1035,7 @@ func (s *replayStore) failing() bool {
 	return true
 }
 
-func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *replayStore) listSinceAllObjectWrites(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
 	probeSignal(s.lists)
 	if s.failing() {
@@ -1574,38 +1664,42 @@ type pollProbeStore struct {
 	metaErr           atomic.Bool
 }
 
-func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+func (s *pollProbeStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites, snapshot: s.snapshotObjectWrites, snapshotByID: s.snapshotByIDObjectWrites, listSince: s.listSinceObjectWrites}
+}
+
+func (s *pollProbeStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	probeSignal(s.polled)
 	return at, err
 }
 
 // The snapshot reads are the watch's first read, so they carry the same failure
 // injection and the same signal as the listing they replaced.
-func (s *pollProbeStore) ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
+func (s *pollProbeStore) snapshotObjectWrites(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
 	if s.listErr.Load() {
 		return nil, 0, errBoom
 	}
-	out, at, err := s.Store.ObjectWritesSnapshot(ctx, gk)
+	out, at, err := s.Store.ObjectWrites().Snapshot(ctx, gk)
 	probeSignal(s.listed)
 	return out, at, err
 }
 
-func (s *pollProbeStore) ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
+func (s *pollProbeStore) snapshotByIDObjectWrites(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
 	if s.getErr.Load() {
 		return nil, 0, errBoom
 	}
-	return s.Store.ObjectWritesSnapshotByID(ctx, gk, id)
+	return s.Store.ObjectWrites().SnapshotByID(ctx, gk, id)
 }
 
 // ObjectWritesListSince is the tail's own listing: it carries listErr and signals
 // after the read, which is the seam the cancellation tests need — past it the only
 // thing left that can observe a cancelled context is the send itself.
-func (s *pollProbeStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *pollProbeStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.listErr.Load() {
 		return nil, 0, errBoom
 	}
-	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	page, trimmed, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	if forced := s.forceTrimmed.Load(); forced > 0 {
 		trimmed = forced
 	}

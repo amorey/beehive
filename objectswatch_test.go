@@ -42,11 +42,15 @@ type flakyListStore struct {
 	failures atomic.Int64
 }
 
-func (s *flakyListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *flakyListStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *flakyListStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.failures.Add(-1) >= 0 {
 		return nil, 0, errBoom
 	}
-	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	return s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 }
 
 // A poll that fails is skipped, not fatal. Tearing the stream down would turn a
@@ -1090,8 +1094,12 @@ type imagelessStore struct {
 	Store
 }
 
-func (s *imagelessStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
-	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+func (s *imagelessStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *imagelessStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	page, trimmed, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	for i := range page {
 		page[i].Final = nil
 	}
@@ -1201,14 +1209,18 @@ type emptyPageStore struct {
 	listed chan struct{}
 }
 
-func (s *emptyPageStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
+func (s *emptyPageStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites, listSince: s.listSinceObjectWrites}
+}
+
+func (s *emptyPageStore) maxVersionObjectWrites(context.Context, GroupKind) (int64, error) {
 	// Rises on every call, so it stays above the cursor the tailer seeds from
 	// this same read. A constant would equal that cursor and gate every drain
 	// out, leaving the test asserting quiet while exercising nothing.
 	return s.gate.Add(1), nil
 }
 
-func (s *emptyPageStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]ObjectWrite, int64, error) {
+func (s *emptyPageStore) listSinceObjectWrites(context.Context, GroupKind, int64, int) ([]ObjectWrite, int64, error) {
 	probeSignal(s.listed)
 	return nil, 0, nil
 }
@@ -1590,8 +1602,12 @@ type writeDuringMaxVersionStore struct {
 	onRead func()
 }
 
-func (s *writeDuringMaxVersionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+func (s *writeDuringMaxVersionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *writeDuringMaxVersionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	s.once.Do(func() {
 		if s.onRead != nil {
 			s.onRead()
@@ -1627,9 +1643,13 @@ type countingTailStore struct {
 	positionReads atomic.Int64
 }
 
-func (s *countingTailStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *countingTailStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *countingTailStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	s.positionReads.Add(1)
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // A burst larger than one page drains on its own. The wakes collapse into one
@@ -1830,7 +1850,7 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 		mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 	}
 	// Retention overtakes the cursor, then the store recovers.
-	_, err := store.ObjectWritesSweep(ctx, 1, 0)
+	_, err := store.ObjectWrites().Sweep(ctx, 1, 0)
 	require.NoError(t, err)
 	store.failures.Store(0)
 
@@ -1940,7 +1960,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 			mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 		}
 		// Retention overtakes the cursor the tailer started from.
-		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		_, err := store.ObjectWrites().Sweep(ctx, 1, 0)
 		require.NoError(t, err)
 
 		_, _, done := tailer.pass(ctx, tailer.now(), false)
@@ -2106,9 +2126,13 @@ type slowListStore struct {
 	perPage time.Duration
 }
 
-func (s *slowListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *slowListStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *slowListStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	s.clk.advance(s.perPage)
-	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	return s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 }
 
 // The throttle floors drain *starts*. Re-arming a budget-stopped drain for a
@@ -2162,8 +2186,12 @@ type gateAheadStore struct {
 	ahead int64
 }
 
-func (s *gateAheadStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+func (s *gateAheadStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *gateAheadStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	return at + s.ahead, err
 }
 
@@ -2196,11 +2224,15 @@ type failGateStore struct {
 	built atomic.Bool
 }
 
-func (s *failGateStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *failGateStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *failGateStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if s.built.Swap(true) {
 		return 0, errBoom
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // A failed gate read costs the step and nothing else: the cursor stays where it
@@ -2331,7 +2363,7 @@ func TestWatchAfterAResetJoinsAFreshTailer(t *testing.T) {
 	for i := range 3 {
 		mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 	}
-	_, err = store.ObjectWritesSweep(ctx, 1, 0)
+	_, err = store.ObjectWrites().Sweep(ctx, 1, 0)
 	require.NoError(t, err)
 	store.failures.Store(0)
 
@@ -2759,7 +2791,7 @@ func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	_, err = client.Update(ctx, first.ID, cSpec{Val: "first3"})
 	require.NoError(t, err)
 
-	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	page, _, err := bh.store.ObjectWrites().ListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
 	changes, err := collectChanges(ctx, bh, clientTestGK, page, false)
 	require.NoError(t, err)
@@ -2783,7 +2815,7 @@ func TestOnePageResolvesCurrentOwners(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
 
-	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	page, _, err := bh.store.ObjectWrites().ListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
 	changes, err := collectChanges(ctx, bh, clientTestGK, page, true)
 	require.NoError(t, err)
@@ -2807,7 +2839,7 @@ func TestOnePageSkipsTheOwnerLookupWhenUnscoped(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
 
-	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	page, _, err := bh.store.ObjectWrites().ListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
 	before := store.relationReads.Load()
 
@@ -2892,7 +2924,7 @@ func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
 			var ch <-chan ObjectChange[cSpec, cStatus]
 			var err error
 			if tc.resume {
-				at, mErr := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+				at, mErr := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 				require.NoError(t, mErr)
 				mustCreate(t, ctx, client, "gapped", cSpec{})
 				_, ch, err = client.WatchList(ctx, WithResumeFrom(at), WithLoads(LoadOwner()))
@@ -2935,13 +2967,17 @@ func newResumeListStore(t *testing.T) *resumeListStore {
 	}
 }
 
-func (s *resumeListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *resumeListStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *resumeListStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	replay := afterRV == s.from && limit == tailPageCap
 	if replay && (s.failAll.Load() || s.fail.CompareAndSwap(true, false)) {
 		s.triedOnce.Do(func() { close(s.tried) })
 		return nil, 0, errBoom
 	}
-	page, trimmedThrough, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	page, trimmedThrough, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	if replay {
 		s.servedOnce.Do(func() { close(s.served) })
 		if s.trim.Load() {
@@ -2961,7 +2997,7 @@ func TestWatchResumeRetriesAFailedGapRead(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	store.from = at
 	missed := mustCreate(t, ctx, client, "missed", cSpec{})
@@ -2986,7 +3022,7 @@ func TestWatchResumeEndsWhenRetentionOvertakesIt(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	store.from = at
 	mustCreate(t, ctx, client, "trimmed", cSpec{})
@@ -3035,7 +3071,7 @@ func TestWatchResumeRetriesAFailedStateRead(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	missed := mustCreate(t, ctx, client, "missed", cSpec{})
 	// Set last: the tailer this watch starts reads no state of its own, so the
@@ -3059,7 +3095,7 @@ func TestWatchResumeWithNoGapGoesLiveAtOnce(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	store.from = at
 
@@ -3085,7 +3121,7 @@ func TestWatchSingleObjectResumeReplaysOnlyItsID(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 
 	_, err = client.Update(ctx, mine.ID, cSpec{Val: "b"})
@@ -3139,7 +3175,7 @@ func TestWatchResumeStopsDeliveringWhenTheCallerGivesUp(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := bh.store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	for i := range 2 {
 		mustCreate(t, ctx, client, fmt.Sprintf("gap-%d", i), cSpec{})
@@ -3196,7 +3232,7 @@ func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 			bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-			at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+			at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 			require.NoError(t, err)
 			if gap != nil {
 				gap.from = at
@@ -3302,9 +3338,13 @@ type failingPositionStore struct {
 	tried    chan struct{}
 }
 
-func (s *failingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *failingPositionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *failingPositionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if !s.armed.Load() {
-		return s.Store.ObjectWritesMaxVersion(ctx, gk)
+		return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	}
 	s.attempts.Add(1)
 	select {
@@ -3420,12 +3460,16 @@ type blockingPositionStore struct {
 	release chan struct{}
 }
 
-func (s *blockingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *blockingPositionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *blockingPositionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if gk == s.gk {
 		s.once.Do(func() { close(s.entered) })
 		<-s.release
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // Building a tailer must not hold tailMu, which is process-global, across the
@@ -3568,11 +3612,15 @@ func (s *failAfterArmStore) groupOutgoingByIDEdges(ctx context.Context, ids []Ob
 	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
-func (s *failAfterArmStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *failAfterArmStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *failAfterArmStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.failWrites && s.hit() {
 		return nil, 0, errBoom
 	}
-	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	return s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 }
 
 // A subscriber retrying a failed read must observe the tailer ending, not only
@@ -3685,12 +3733,16 @@ type blockFirstPositionStore struct {
 	release chan struct{}
 }
 
-func (s *blockFirstPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *blockFirstPositionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *blockFirstPositionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if gk == s.gk && s.blocks.CompareAndSwap(true, false) {
 		close(s.entered)
 		<-s.release
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // The build runs outside tailMu, so two first watches on one kind can both
@@ -3760,7 +3812,7 @@ func TestResumeAboveTheLogHeadFails(t *testing.T) {
 
 	// A position exactly at the head is caught up, not ahead: it is what a
 	// subscriber that read every entry checkpoints.
-	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := bh.store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	snap, live, err := client.WatchList(ctx, WithResumeFrom(at))
 	require.NoError(t, err)
@@ -3782,21 +3834,25 @@ type failHeadCheckStore struct {
 	failed chan struct{} // closed once the head check has been failed
 }
 
-func (s *failHeadCheckStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
-	page, trimmedThrough, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+func (s *failHeadCheckStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites, maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *failHeadCheckStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	page, trimmedThrough, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	if err == nil && len(page) == 0 && (s.always || !s.spent.Load()) {
 		s.armed.Store(true) // the head check is the next position read
 	}
 	return page, trimmedThrough, err
 }
 
-func (s *failHeadCheckStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *failHeadCheckStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if s.armed.CompareAndSwap(true, false) {
 		s.spent.Store(true)
 		s.once.Do(func() { close(s.failed) })
 		return 0, errBoom
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // The read that tells "caught up" from "resumed past the head" can fail, and a
@@ -3812,7 +3868,7 @@ func TestResumeRetriesAFailedHeadCheck(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 
 	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
@@ -3849,7 +3905,7 @@ func TestResumeHeadCheckRetryEndsWithTheCaller(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 
 	watchCtx, endWatch := context.WithCancel(ctx)

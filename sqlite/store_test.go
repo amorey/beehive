@@ -3528,7 +3528,7 @@ type writeProbe struct {
 // what lands after this call.
 func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 	t.Helper()
-	rv, _, err := store.ObjectWritesMaxVersionAll(context.Background())
+	rv, _, err := store.ObjectWrites().MaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return &writeProbe{t: t, store: store, rv: rv}
 }
@@ -3536,7 +3536,7 @@ func newWriteProbe(t *testing.T, store beehive.Store) *writeProbe {
 // writes returns everything above the cursor without moving it.
 func (p *writeProbe) writes() []storeapi.ObjectWrite {
 	p.t.Helper()
-	got, _, err := p.store.ObjectWritesListSinceAll(context.Background(), p.rv, 100)
+	got, _, err := p.store.ObjectWrites().ListSinceAll(context.Background(), p.rv, 100)
 	require.NoError(p.t, err)
 	return got
 }
@@ -3815,7 +3815,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
 	before, err := store.ResourceVersionsMaxIssued(ctx)
 	require.NoError(t, err)
-	writesBefore, _, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	writesBefore, _, err := store.ObjectWrites().ListSinceAll(ctx, 0, 100)
 	require.NoError(t, err)
 
 	_, err = store.ReconcileOwed().Sweep(ctx, nil)
@@ -3824,7 +3824,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	after, err := store.ResourceVersionsMaxIssued(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "the reclaim issues no resource version")
-	writesAfter, _, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
+	writesAfter, _, err := store.ObjectWrites().ListSinceAll(ctx, 0, 100)
 	require.NoError(t, err)
 	assert.Len(t, writesAfter, len(writesBefore), "the reclaim appends no write-log entry")
 }
@@ -3934,7 +3934,7 @@ func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
 
 	ageOutWriteLog(t, store)
 
-	logged, _, err := store.ObjectWritesMaxVersionAll(ctx)
+	logged, _, err := store.ObjectWrites().MaxVersionAll(ctx)
 	require.NoError(t, err)
 	require.Zero(t, logged, "the log is empty, so its max is back to 0")
 
@@ -5741,7 +5741,7 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 
 	// Everything above the first object's version, so `first` is excluded: the
 	// cursor is what the consumer already processed, not where it wants to start.
-	got, _, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 10)
+	got, _, err := store.ObjectWrites().ListSinceAll(ctx, first.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []storeapi.ObjectWrite{
 		{ID: second.ID, ResourceVersion: second.ResourceVersion,
@@ -5752,18 +5752,18 @@ func TestObjectWritesListSinceAll(t *testing.T) {
 
 	// A limit truncates from the low end, so the caller can page forward by taking
 	// the last row's version as its next cursor.
-	page, _, err := store.ObjectWritesListSinceAll(ctx, first.ResourceVersion, 1)
+	page, _, err := store.ObjectWrites().ListSinceAll(ctx, first.ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	assert.Equal(t, second.ID, page[0].ID, "the oldest missed change comes first")
 
-	next, _, err := store.ObjectWritesListSinceAll(ctx, page[0].ResourceVersion, 1)
+	next, _, err := store.ObjectWrites().ListSinceAll(ctx, page[0].ResourceVersion, 1)
 	require.NoError(t, err)
 	require.Len(t, next, 1)
 	assert.Equal(t, third.ID, next[0].ID, "paging forward from the last row's version")
 
 	// Caught up: nothing above the newest version.
-	none, _, err := store.ObjectWritesListSinceAll(ctx, third.ResourceVersion, 10)
+	none, _, err := store.ObjectWrites().ListSinceAll(ctx, third.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Empty(t, none)
 }
@@ -5784,7 +5784,7 @@ func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 	gone := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
 
-	got, _, err := store.ObjectWritesListSinceAll(ctx, base.ResourceVersion, 10)
+	got, _, err := store.ObjectWrites().ListSinceAll(ctx, base.ResourceVersion, 10)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "the create and the collection of the second object")
 	assert.Equal(t, storeapi.WriteCreate, got[0].Op)
@@ -5797,7 +5797,7 @@ func TestObjectWritesListSinceAllReportsDeletes(t *testing.T) {
 func TestObjectWritesListSinceAllDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
-	_, _, err := store.ObjectWritesListSinceAll(context.Background(), 0, 10)
+	_, _, err := store.ObjectWrites().ListSinceAll(context.Background(), 0, 10)
 	require.Error(t, err)
 }
 
@@ -5811,13 +5811,13 @@ func TestObjectWritesListSinceAllReportsTheHorizon(t *testing.T) {
 	ageOutWriteLog(t, store)
 	fresh := newRefObject(t, store)
 
-	page, trimmed, err := store.ObjectWritesListSinceAll(ctx, 0, 10)
+	page, trimmed, err := store.ObjectWrites().ListSinceAll(ctx, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 1, "only the write that survived the trim")
 	assert.Equal(t, fresh.ID, page[0].ID)
 	assert.Equal(t, old.ResourceVersion, trimmed, "and the boundary it was read above")
 
-	empty, trimmed, err := store.ObjectWritesListSinceAll(ctx, fresh.ResourceVersion, 10)
+	empty, trimmed, err := store.ObjectWrites().ListSinceAll(ctx, fresh.ResourceVersion, 10)
 	require.NoError(t, err)
 	require.Empty(t, empty)
 	assert.Zero(t, trimmed, "no rows to carry it")
@@ -5839,11 +5839,11 @@ func TestObjectWritesListSinceAllHorizonIsTheMaxAcrossKinds(t *testing.T) {
 	ageOutWriteLog(t, store)
 	newRefObject(t, store) // a live row, so the page has something to carry the horizon
 
-	_, trimmed, err := store.ObjectWritesListSinceAll(ctx, 0, 10)
+	_, trimmed, err := store.ObjectWrites().ListSinceAll(ctx, 0, 10)
 	require.NoError(t, err)
 	assert.Equal(t, deeper.ResourceVersion, trimmed, "the deeper of the two kinds")
 
-	_, markTrimmed, err := store.ObjectWritesMaxVersionAll(ctx)
+	_, markTrimmed, err := store.ObjectWrites().MaxVersionAll(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, trimmed, markTrimmed, "both reads agree")
 }
@@ -5888,7 +5888,7 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 	newRefObject(t, store)
 
 	for _, limit := range []int{0, -1} {
-		got, _, err := store.ObjectWritesListSinceAll(ctx, 0, limit)
+		got, _, err := store.ObjectWrites().ListSinceAll(ctx, 0, limit)
 		require.NoError(t, err)
 		assert.Empty(t, got, "limit %d asks for nothing, not for everything", limit)
 	}
@@ -6457,7 +6457,7 @@ func TestDriverCursorsSetKeysByName(t *testing.T) {
 // it — what a dependent records as its watermark.
 func cursorNow(t *testing.T, store beehive.Store) int64 {
 	t.Helper()
-	rv, _, err := store.ObjectWritesMaxVersionAll(context.Background())
+	rv, _, err := store.ObjectWrites().MaxVersionAll(context.Background())
 	require.NoError(t, err)
 	return rv
 }
@@ -6902,7 +6902,7 @@ func TestObjectWritesMaxVersionIgnoresEventWrites(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, before, cursorNow(t, store), "an event write is not an object write")
-	writes, _, err := store.ObjectWritesListSinceAll(ctx, before, 10)
+	writes, _, err := store.ObjectWrites().ListSinceAll(ctx, before, 10)
 	require.NoError(t, err)
 	assert.Empty(t, writes, "and the listing agrees: nothing above the mark")
 }
@@ -6939,7 +6939,7 @@ func ageOutWriteLog(t *testing.T, store *sqliteStore) {
 	t.Helper()
 	_, err := store.db.ExecContext(context.Background(), `UPDATE object_writes SET written_at = 0`)
 	require.NoError(t, err)
-	_, err = store.ObjectWritesSweep(context.Background(), 0, time.Hour)
+	_, err = store.ObjectWrites().Sweep(context.Background(), 0, time.Hour)
 	require.NoError(t, err)
 }
 
@@ -6951,14 +6951,14 @@ func TestObjectWritesMaxVersionAllReportsTheHorizon(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	at, trimmed, err := store.ObjectWritesMaxVersionAll(ctx)
+	at, trimmed, err := store.ObjectWrites().MaxVersionAll(ctx)
 	require.NoError(t, err)
 	require.Equal(t, obj.ResourceVersion, at)
 	assert.Zero(t, trimmed, "nothing has been trimmed")
 
 	ageOutWriteLog(t, store)
 
-	at, trimmed, err = store.ObjectWritesMaxVersionAll(ctx)
+	at, trimmed, err = store.ObjectWrites().MaxVersionAll(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, at, "the log is empty, so its bare max is back to 0")
 	assert.Equal(t, obj.ResourceVersion, trimmed, "the horizon is the only record of what it held")
@@ -7622,7 +7622,7 @@ func TestObjectWritesListSinceScopesToKind(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	page, trimmed, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 1, "only this kind's entries")
 	assert.Equal(t, mine.ID, page[0].ID)
@@ -7630,7 +7630,7 @@ func TestObjectWritesListSinceScopesToKind(t *testing.T) {
 	assert.Equal(t, storeapi.WriteCreate, page[0].Op)
 	assert.Zero(t, trimmed, "nothing has been trimmed")
 
-	page, _, err = store.ObjectWritesListSince(ctx, testGK, mine.ResourceVersion, 10)
+	page, _, err = store.ObjectWrites().ListSince(ctx, testGK, mine.ResourceVersion, 10)
 	require.NoError(t, err)
 	assert.Empty(t, page, "afterRV is exclusive")
 }
@@ -7642,7 +7642,7 @@ func TestObjectWritesMaxVersionScopesToKind(t *testing.T) {
 	otherGK := beehive.GroupKind{Group: "acme.com", Kind: "Widget"}
 	mine := newRefObject(t, store)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, mine.ResourceVersion, at)
 
@@ -7651,11 +7651,11 @@ func TestObjectWritesMaxVersionScopesToKind(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	again, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	again, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, at, again, "another kind's write does not move this kind's position")
 
-	empty, err := store.ObjectWritesMaxVersion(ctx, beehive.GroupKind{Kind: "Nothing"})
+	empty, err := store.ObjectWrites().MaxVersion(ctx, beehive.GroupKind{Kind: "Nothing"})
 	require.NoError(t, err)
 	assert.Zero(t, empty)
 }
@@ -7694,17 +7694,17 @@ func TestObjectWritesSweepRecordsThePerKindHorizon(t *testing.T) {
 	backdateWriteLogEntry(t, store, oldA.ResourceVersion, time.Hour)
 	backdateWriteLogEntry(t, store, oldB.ResourceVersion, time.Hour)
 
-	deleted, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	deleted, err := store.ObjectWrites().Sweep(ctx, 0, 30*time.Minute)
 	require.NoError(t, err)
 	assert.Equal(t, 3, deleted, "entries removed, not kinds touched")
 
-	pageA, trimmedA, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	pageA, trimmedA, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, pageA, 1)
 	assert.Equal(t, keptA.ResourceVersion, pageA[0].ResourceVersion)
 	assert.Equal(t, oldA.ResourceVersion, trimmedA, "the horizon is the highest version removed for this kind")
 
-	pageB, trimmedB, err := store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	pageB, trimmedB, err := store.ObjectWrites().ListSince(ctx, otherGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, pageB, 1)
 	assert.Equal(t, keptB.ResourceVersion, pageB[0].ResourceVersion)
@@ -7724,13 +7724,13 @@ func TestObjectWritesSweepCapsEachKind(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = store.ObjectWritesSweep(ctx, 2, 0)
+	_, err = store.ObjectWrites().Sweep(ctx, 2, 0)
 	require.NoError(t, err)
 
-	pageA, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	pageA, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	assert.Len(t, pageA, 2, "the busy kind is capped at its newest two")
-	pageB, _, err := store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	pageB, _, err := store.ObjectWrites().ListSince(ctx, otherGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, pageB, 1, "the quiet kind keeps its only entry")
 	assert.Equal(t, quiet.ResourceVersion, pageB[0].ResourceVersion)
@@ -7745,11 +7745,11 @@ func TestObjectWritesMaxVersionHoldsTheHorizon(t *testing.T) {
 	obj := newRefObject(t, store)
 	backdateWriteLogEntry(t, store, obj.ResourceVersion, time.Hour)
 
-	deleted, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	deleted, err := store.ObjectWrites().Sweep(ctx, 0, 30*time.Minute)
 	require.NoError(t, err)
 	require.Equal(t, 1, deleted, "precondition: the log is now empty for this kind")
 
-	at, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, obj.ResourceVersion, at)
 }
@@ -7762,10 +7762,10 @@ func TestObjectWritesSnapshotIsConsistent(t *testing.T) {
 	first := newRefObject(t, store)
 	second := newRefObject(t, store)
 
-	rows, at, err := store.ObjectWritesSnapshot(ctx, testGK)
+	rows, at, err := store.ObjectWrites().Snapshot(ctx, testGK)
 	require.NoError(t, err)
 	assert.Len(t, rows, 2)
-	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	position, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, position, at)
 	assert.GreaterOrEqual(t, at, second.ResourceVersion)
@@ -7773,7 +7773,7 @@ func TestObjectWritesSnapshotIsConsistent(t *testing.T) {
 	later := newRefObject(t, store)
 	assert.Greater(t, later.ResourceVersion, at, "a write after the listing is above its position")
 
-	page, _, err := store.ObjectWritesListSince(ctx, testGK, at, 10)
+	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, at, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 1, "the stream picks up exactly what the snapshot missed")
 	assert.Equal(t, later.ID, page[0].ID)
@@ -7788,15 +7788,15 @@ func TestObjectWritesSnapshotByIDReadsOneRow(t *testing.T) {
 	mine := newRefObject(t, store)
 	newRefObject(t, store)
 
-	rows, at, err := store.ObjectWritesSnapshotByID(ctx, testGK, mine.ID)
+	rows, at, err := store.ObjectWrites().SnapshotByID(ctx, testGK, mine.ID)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, mine.ID, rows[0].ID)
-	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	position, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, position, at, "the kind's position, not this row's version")
 
-	foreign, _, err := store.ObjectWritesSnapshotByID(ctx, beehive.GroupKind{Kind: "Other"}, mine.ID)
+	foreign, _, err := store.ObjectWrites().SnapshotByID(ctx, beehive.GroupKind{Kind: "Other"}, mine.ID)
 	require.NoError(t, err)
 	assert.Empty(t, foreign, "another kind cannot see this row")
 }
@@ -7814,15 +7814,15 @@ func TestObjectWritesSnapshotByOwnerReadsOneOwnersChildren(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, mine.ID, owner.ID, beehive.RelationOwnedBy))
 	require.NoError(t, addEdge(ctx, store, theirs.ID, other.ID, beehive.RelationOwnedBy))
 
-	rows, at, err := store.ObjectWritesSnapshotByOwner(ctx, testGK, owner.ID)
+	rows, at, err := store.ObjectWrites().SnapshotByOwner(ctx, testGK, owner.ID)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, mine.ID, rows[0].ID)
-	position, err := store.ObjectWritesMaxVersion(ctx, testGK)
+	position, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, position, at, "the kind's position, not this row's version")
 
-	foreign, _, err := store.ObjectWritesSnapshotByOwner(ctx, beehive.GroupKind{Kind: "Other"}, owner.ID)
+	foreign, _, err := store.ObjectWrites().SnapshotByOwner(ctx, beehive.GroupKind{Kind: "Other"}, owner.ID)
 	require.NoError(t, err)
 	assert.Empty(t, foreign, "another kind cannot see this row")
 }
@@ -7834,12 +7834,12 @@ func TestObjectWritesSnapshotByOwnerFoldsAbsence(t *testing.T) {
 	ctx := context.Background()
 	childless := newRefObject(t, store)
 
-	rows, at, err := store.ObjectWritesSnapshotByOwner(ctx, testGK, childless.ID)
+	rows, at, err := store.ObjectWrites().SnapshotByOwner(ctx, testGK, childless.ID)
 	require.NoError(t, err)
 	assert.Empty(t, rows)
 	assert.NotZero(t, at)
 
-	rows, _, err = store.ObjectWritesSnapshotByOwner(ctx, testGK, 404)
+	rows, _, err = store.ObjectWrites().SnapshotByOwner(ctx, testGK, 404)
 	require.NoError(t, err)
 	assert.Empty(t, rows)
 }
@@ -7882,16 +7882,16 @@ func TestObjectWritesListSinceCarriesTheHorizon(t *testing.T) {
 	old := newRefObject(t, store)
 	kept := newRefObject(t, store)
 	backdateWriteLogEntry(t, store, old.ResourceVersion, time.Hour)
-	_, err := store.ObjectWritesSweep(ctx, 0, 30*time.Minute)
+	_, err := store.ObjectWrites().Sweep(ctx, 0, 30*time.Minute)
 	require.NoError(t, err)
 
-	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	page, trimmed, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 1, "precondition: one entry survived")
 	assert.Equal(t, kept.ResourceVersion, page[0].ResourceVersion)
 	assert.Equal(t, old.ResourceVersion, trimmed, "carried by the page's statement")
 
-	empty, trimmed, err := store.ObjectWritesListSince(ctx, testGK, kept.ResourceVersion, 10)
+	empty, trimmed, err := store.ObjectWrites().ListSince(ctx, testGK, kept.ResourceVersion, 10)
 	require.NoError(t, err)
 	require.Empty(t, empty)
 	assert.Equal(t, old.ResourceVersion, trimmed, "and read on its own when the page is empty")
@@ -7910,7 +7910,7 @@ func TestObjectWritesListSinceRefusesAnImagelessDelete(t *testing.T) {
 		`UPDATE object_writes SET final = NULL WHERE op = ?`, writeOpDelete)
 	require.NoError(t, err)
 
-	_, _, err = store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	_, _, err = store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 
 	require.Error(t, err, "a delete with no image must not be returned as success")
 	assert.Contains(t, err.Error(), "row image")
@@ -7984,7 +7984,7 @@ func TestObjectWritesListSinceAttachesImages(t *testing.T) {
 	gone := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, gone.ID))
 
-	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 3, "two creates and a collection")
 	assert.Nil(t, page[0].Final, "a create carries no image")
@@ -8006,7 +8006,7 @@ func TestObjectsDeleteImageCarriesTheOwner(t *testing.T) {
 	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
 	require.NoError(t, store.ObjectsDelete(ctx, child.ID))
 
-	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	last := page[len(page)-1]
 	require.Equal(t, storeapi.WriteDelete, last.Op)
@@ -8035,7 +8035,7 @@ func TestObjectsDeleteImageLeavesAnUnownedObjectsOwnerNil(t *testing.T) {
 	obj := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
 
-	page, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	last := page[len(page)-1]
 	require.NotNil(t, last.Final)
@@ -8048,7 +8048,7 @@ func TestObjectWritesListSinceRejectsANonPositiveLimit(t *testing.T) {
 	store := newTestStore(t)
 	newRefObject(t, store)
 
-	page, trimmed, err := store.ObjectWritesListSince(context.Background(), testGK, 0, 0)
+	page, trimmed, err := store.ObjectWrites().ListSince(context.Background(), testGK, 0, 0)
 
 	require.NoError(t, err)
 	assert.Empty(t, page)
@@ -8061,23 +8061,23 @@ func TestWriteLogReadsSurfaceADBError(t *testing.T) {
 	ctx := context.Background()
 	tests := map[string]func(store *sqliteStore) error{
 		"list since": func(store *sqliteStore) error {
-			_, _, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+			_, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 			return err
 		},
 		"max version": func(store *sqliteStore) error {
-			_, err := store.ObjectWritesMaxVersion(ctx, testGK)
+			_, err := store.ObjectWrites().MaxVersion(ctx, testGK)
 			return err
 		},
 		"snapshot": func(store *sqliteStore) error {
-			_, _, err := store.ObjectWritesSnapshot(ctx, testGK)
+			_, _, err := store.ObjectWrites().Snapshot(ctx, testGK)
 			return err
 		},
 		"snapshot by id": func(store *sqliteStore) error {
-			_, _, err := store.ObjectWritesSnapshotByID(ctx, testGK, 1)
+			_, _, err := store.ObjectWrites().SnapshotByID(ctx, testGK, 1)
 			return err
 		},
 		"sweep": func(store *sqliteStore) error {
-			_, err := store.ObjectWritesSweep(ctx, 1, time.Hour)
+			_, err := store.ObjectWrites().Sweep(ctx, 1, time.Hour)
 			return err
 		},
 	}
@@ -8099,7 +8099,7 @@ func TestObjectWritesListSinceSurfacesABrokenLog(t *testing.T) {
 	newRefObject(t, store)
 	dropWriteLog(t, store)
 
-	_, _, err := store.ObjectWritesListSince(context.Background(), testGK, 0, 10)
+	_, _, err := store.ObjectWrites().ListSince(context.Background(), testGK, 0, 10)
 
 	require.Error(t, err)
 }
@@ -8111,12 +8111,12 @@ func TestObjectWritesSnapshotByIDFoldsAbsence(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	missing, at, err := store.ObjectWritesSnapshotByID(ctx, testGK, 9999)
+	missing, at, err := store.ObjectWrites().SnapshotByID(ctx, testGK, 9999)
 	require.NoError(t, err)
 	assert.Empty(t, missing)
 	assert.Equal(t, obj.ResourceVersion, at, "still the kind's position")
 
-	foreign, _, err := store.ObjectWritesSnapshotByID(ctx,
+	foreign, _, err := store.ObjectWrites().SnapshotByID(ctx,
 		beehive.GroupKind{Kind: "Other"}, obj.ID)
 	require.NoError(t, err)
 	assert.Empty(t, foreign)
@@ -8133,7 +8133,7 @@ func TestObjectWritesListSinceRefusesAnUndecodableImage(t *testing.T) {
 		`UPDATE object_writes SET final = 'not json' WHERE op = ?`, writeOpDelete)
 	require.NoError(t, err)
 
-	_, _, err = store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	_, _, err = store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "row image", "this one failed to decode, not to exist")
@@ -8172,7 +8172,7 @@ func TestObjectWritesSweepSurfacesBrokenTables(t *testing.T) {
 		newRefObject(t, store)
 		dropWriteLog(t, store)
 
-		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		_, err := store.ObjectWrites().Sweep(ctx, 1, 0)
 		require.Error(t, err)
 	})
 
@@ -8184,7 +8184,7 @@ func TestObjectWritesSweepSurfacesBrokenTables(t *testing.T) {
 		newRefObject(t, store)
 		dropWriteLog(t, store)
 
-		_, err := store.ObjectWritesSweep(ctx, 0, time.Hour)
+		_, err := store.ObjectWrites().Sweep(ctx, 0, time.Hour)
 		require.Error(t, err)
 	})
 
@@ -8195,7 +8195,7 @@ func TestObjectWritesSweepSurfacesBrokenTables(t *testing.T) {
 		_, err := store.db.ExecContext(ctx, `DROP TABLE object_writes_horizon`)
 		require.NoError(t, err)
 
-		_, err = store.ObjectWritesSweep(ctx, 1, 0)
+		_, err = store.ObjectWrites().Sweep(ctx, 1, 0)
 		require.Error(t, err, "trimming without recording the horizon would let a resume cross a hole")
 	})
 }
@@ -8207,7 +8207,7 @@ func TestObjectWritesSnapshotSurfacesAFailedListing(t *testing.T) {
 	newRefObject(t, store)
 	dropObjects(t, store)
 
-	_, _, err := store.ObjectWritesSnapshot(context.Background(), testGK)
+	_, _, err := store.ObjectWrites().Snapshot(context.Background(), testGK)
 
 	require.Error(t, err)
 }
@@ -8230,16 +8230,16 @@ func TestObjectWritesSweepCapsEachKindWithItsOwnHorizon(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	deleted, err := store.ObjectWritesSweep(ctx, 2, 0)
+	deleted, err := store.ObjectWrites().Sweep(ctx, 2, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 1, deleted, "only the busy kind's oldest entry")
 
-	page, trimmed, err := store.ObjectWritesListSince(ctx, testGK, 0, 10)
+	page, trimmed, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 2)
 	assert.Equal(t, busy[0].ResourceVersion, trimmed, "the busy kind carries its own horizon")
 
-	page, trimmed, err = store.ObjectWritesListSince(ctx, otherGK, 0, 10)
+	page, trimmed, err = store.ObjectWrites().ListSince(ctx, otherGK, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	assert.Equal(t, quiet.ResourceVersion, page[0].ResourceVersion)

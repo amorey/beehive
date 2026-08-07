@@ -180,9 +180,13 @@ type wakeCountingStore struct {
 	cursorWrites int
 }
 
-func (s *wakeCountingStore) ObjectWritesListSinceAll(ctx context.Context, after int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *wakeCountingStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSinceAll: s.listSinceAllObjectWrites}
+}
+
+func (s *wakeCountingStore) listSinceAllObjectWrites(ctx context.Context, after int64, limit int) ([]ObjectWrite, int64, error) {
 	s.reads++
-	return s.Store.ObjectWritesListSinceAll(ctx, after, limit)
+	return s.Store.ObjectWrites().ListSinceAll(ctx, after, limit)
 }
 
 func (s *wakeCountingStore) Edges() storeapi.Edges {

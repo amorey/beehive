@@ -156,11 +156,11 @@ type watchScope struct {
 func (c *clientImpl[Spec, Status]) snapshot(ctx context.Context, scope watchScope) ([]*RawObject, int64, error) {
 	switch {
 	case scope.only != nil:
-		return c.bh.store.ObjectWritesSnapshotByID(ctx, c.gk, *scope.only)
+		return c.bh.store.ObjectWrites().SnapshotByID(ctx, c.gk, *scope.only)
 	case scope.ownedBy != nil:
-		return c.bh.store.ObjectWritesSnapshotByOwner(ctx, c.gk, *scope.ownedBy)
+		return c.bh.store.ObjectWrites().SnapshotByOwner(ctx, c.gk, *scope.ownedBy)
 	}
-	return c.bh.store.ObjectWritesSnapshot(ctx, c.gk)
+	return c.bh.store.ObjectWrites().Snapshot(ctx, c.gk)
 }
 
 // kindWriteHub tells a kind's tailer that the kind moved.
@@ -390,7 +390,7 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 		pagesPerDrain: defaultTailPagesPerDrain,
 	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	at, err := bh.store.ObjectWritesMaxVersion(ctx, gk)
+	at, err := bh.store.ObjectWrites().MaxVersion(ctx, gk)
 	if err != nil {
 		t.close()
 		return nil, err
@@ -517,7 +517,7 @@ func (t *objectTailer) pass(ctx context.Context, now time.Time, backingOff bool)
 // The bool reports whether the budget stopped it with work still above the
 // cursor.
 func (t *objectTailer) drain(ctx context.Context) (more bool, err error) {
-	at, err := t.bh.store.ObjectWritesMaxVersion(ctx, t.gk)
+	at, err := t.bh.store.ObjectWrites().MaxVersion(ctx, t.gk)
 	if err != nil {
 		return false, err
 	}
@@ -543,7 +543,7 @@ func (t *objectTailer) drain(ctx context.Context) (more bool, err error) {
 // step reads one page of the kind's log above the cursor, publishes what it
 // found, and returns the page length. Its caller gates it; see drain.
 func (t *objectTailer) step(ctx context.Context) (int, error) {
-	page, trimmedThrough, err := t.bh.store.ObjectWritesListSince(ctx, t.gk, t.cursor, tailPageCap)
+	page, trimmedThrough, err := t.bh.store.ObjectWrites().ListSince(ctx, t.gk, t.cursor, tailPageCap)
 	if err != nil {
 		return 0, err
 	}
@@ -946,7 +946,7 @@ func (c *clientImpl[Spec, Status]) replay(
 	cursor := from
 	retry := c.bh.watchBackoff()
 	for {
-		page, trimmedThrough, err := c.bh.store.ObjectWritesListSince(ctx, c.gk, cursor, tailPageCap)
+		page, trimmedThrough, err := c.bh.store.ObjectWrites().ListSince(ctx, c.gk, cursor, tailPageCap)
 		if err != nil {
 			// A failed read costs a retry, not the stream: the cursor has not
 			// moved, so nothing is lost.
@@ -966,7 +966,7 @@ func (c *clientImpl[Spec, Status]) replay(
 			// the second holds floor above every later change and drops them all
 			// silently. Only a resume at or beyond the head gets this far, so no
 			// replay with real work to do pays for it.
-			at, err := c.bh.store.ObjectWritesMaxVersion(ctx, c.gk)
+			at, err := c.bh.store.ObjectWrites().MaxVersion(ctx, c.gk)
 			if err != nil {
 				if !c.pollFailed(ctx, "watch resume", err) || !retry.Wait(ctx) {
 					return 0, nil, false

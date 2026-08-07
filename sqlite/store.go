@@ -56,6 +56,10 @@ type sqliteEdges struct{ *sqliteStore }
 
 func (s *sqliteStore) Edges() storeapi.Edges { return sqliteEdges{s} }
 
+type sqliteObjectWrites struct{ *sqliteStore }
+
+func (s *sqliteStore) ObjectWrites() storeapi.ObjectWrites { return sqliteObjectWrites{s} }
+
 type sqliteDependencies struct{ *sqliteStore }
 
 func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
@@ -1157,7 +1161,7 @@ func (s *sqliteStore) ObjectsListIDs(ctx context.Context, gk storeapi.GroupKind)
 // move for a write it can never be shown. Retention is the only thing that
 // lowers it, and the horizon is what says so — one statement, since the caller
 // that compares them needs both at one instant.
-func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, int64, error) {
+func (s sqliteObjectWrites) MaxVersionAll(ctx context.Context) (int64, int64, error) {
 	var at, trimmed int64
 	err := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), `+writeLogHorizonAll).
@@ -1174,7 +1178,7 @@ func (s *sqliteStore) ObjectWritesMaxVersionAll(ctx context.Context) (int64, int
 //
 // One statement, and deliberately no transaction — this is the waker's whole
 // quiet pass, which runs per commit.
-func (s *sqliteStore) ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+func (s sqliteObjectWrites) ListSinceAll(ctx context.Context, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, 0, nil
@@ -2906,7 +2910,7 @@ func millisPtr(ms int64) *time.Time {
 //
 // The horizon still rides the page's own statement as a scalar subquery, which
 // costs nothing and keeps the empty-page case honest.
-func (s *sqliteStore) ObjectWritesListSince(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+func (s sqliteObjectWrites) ListSince(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
 	if limit <= 0 {
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, 0, nil
@@ -2949,7 +2953,7 @@ func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind)
 // log's own maximum: a kind trimmed empty would report 0 against a tail parked
 // higher and list on every tick. Folded, the position only ever rises, which is
 // why the tail gates on > rather than !=.
-func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
+func (s sqliteObjectWrites) MaxVersion(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
 	// One statement, not two: this is a watch's entire quiet-tick budget, and
 	// both halves are covering-index seeks that fold for free.
 	var at int64
@@ -2969,7 +2973,7 @@ func (s *sqliteStore) ObjectWritesMaxVersion(ctx context.Context, gk storeapi.Gr
 //
 // RETURNING, not a bare DELETE: the horizon is per kind, so the sweep has to
 // learn which kinds it touched and how far.
-func (s *sqliteStore) ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error) {
+func (s sqliteObjectWrites) Sweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error) {
 	var deleted int
 	err := s.Within(ctx, func(ctx context.Context) error {
 		if maxAge > 0 {
@@ -3075,7 +3079,7 @@ func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...an
 // ObjectWritesSnapshot lists gk and reads its log position in one transaction.
 // Separately they could straddle a write: a row listed after the position was
 // read would never reach the stream, since the stream starts above it.
-func (s *sqliteStore) ObjectWritesSnapshot(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, int64, error) {
+func (s sqliteObjectWrites) Snapshot(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, int64, error) {
 	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
 		return s.ObjectsList(ctx, gk)
 	})
@@ -3083,7 +3087,7 @@ func (s *sqliteStore) ObjectWritesSnapshot(ctx context.Context, gk storeapi.Grou
 
 // ObjectWritesSnapshotByID reads one row rather than the kind, and folds both
 // "not there" cases — missing and foreign — into an empty result.
-func (s *sqliteStore) ObjectWritesSnapshotByID(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
+func (s sqliteObjectWrites) SnapshotByID(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
 	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
 		obj, err := s.ObjectsGet(ctx, id)
 		if errors.Is(err, storeapi.ErrNotFound) {
@@ -3098,7 +3102,7 @@ func (s *sqliteStore) ObjectWritesSnapshotByID(ctx context.Context, gk storeapi.
 
 // ObjectWritesSnapshotByOwner reads one owner's children of gk. The listing is
 // already kind-scoped, so a foreign owner simply matches nothing.
-func (s *sqliteStore) ObjectWritesSnapshotByOwner(ctx context.Context, gk storeapi.GroupKind, ownerID storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
+func (s sqliteObjectWrites) SnapshotByOwner(ctx context.Context, gk storeapi.GroupKind, ownerID storeapi.ObjectID) ([]*storeapi.RawObject, int64, error) {
 	return s.snapshot(ctx, gk, func(ctx context.Context) ([]*storeapi.RawObject, error) {
 		return s.ObjectsListByIncomingEdge(ctx, gk, ownerID, storeapi.RelationOwnedBy)
 	})
@@ -3116,7 +3120,7 @@ func (s *sqliteStore) snapshot(
 		if rows, err = list(ctx); err != nil {
 			return err
 		}
-		at, err = s.ObjectWritesMaxVersion(ctx, gk)
+		at, err = s.ObjectWrites().MaxVersion(ctx, gk)
 		return err
 	})
 	if err != nil {

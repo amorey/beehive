@@ -1390,7 +1390,11 @@ type slowMarkStore struct {
 	markReads int
 }
 
-func (s *slowMarkStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+func (s *slowMarkStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.cursorStore.ObjectWrites(), maxVersionAll: s.maxVersionAll}
+}
+
+func (s *slowMarkStore) maxVersionAll(context.Context) (int64, int64, error) {
 	s.markReads++
 	s.clk.advance(s.hold)
 	return 0, 0, errBoom
