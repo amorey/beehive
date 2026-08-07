@@ -753,18 +753,12 @@ type Store interface {
 	// horizon in the same transaction that deletes that kind's entries, so a
 	// resume is never accepted against a log with a hole in it.
 	ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
-}
 
-// FreePagesReleaser is an optional Store capability: a backend that can hand
-// space freed by deleted rows back to the OS implements it, and the GC sweeper
-// calls it after collecting. Deliberately not a member of Store — a backend
-// without it is simply not drained.
-type FreePagesReleaser interface {
-	// FreePagesRelease releases up to maxPages of reclaimable space and
-	// returns how many were actually released — a report, not a guarantee; a
-	// backend may release fewer, including none. Non-positive maxPages
-	// releases nothing.
-	FreePagesRelease(ctx context.Context, maxPages int) (int, error)
+	// ReclaimSpace returns up to maxPages of space freed by deleted rows to the
+	// OS and reports how many it released — a report, not a guarantee; a
+	// backend may release fewer, including none, and one that reclaims nothing
+	// returns 0. Non-positive maxPages releases nothing.
+	ReclaimSpace(ctx context.Context, maxPages int) (int, error)
 }
 
 // DriverCursorer is an optional Store capability: persistence for a periodic

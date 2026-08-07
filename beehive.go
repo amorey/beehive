@@ -296,15 +296,11 @@ func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
 	}
 }
 
-// freePagesSweep hands space freed by the sweeps above back to the OS, for
-// a store that implements FreePagesReleaser. Best-effort: nothing is incorrect
-// while the space is unreclaimed.
+// freePagesSweep hands space freed by the sweeps above back to the OS.
+// Best-effort: nothing is incorrect while the space is unreclaimed, and a store
+// that reclaims nothing reports 0.
 func (bh *Beehive) freePagesSweep(ctx context.Context) {
-	releaser, ok := bh.store.(FreePagesReleaser)
-	if !ok {
-		return
-	}
-	released, err := releaser.FreePagesRelease(ctx, bh.gcBudget(freePagesPerSweep))
+	released, err := bh.store.ReclaimSpace(ctx, bh.gcBudget(freePagesPerSweep))
 	if err != nil {
 		bh.log().Warn("free-page release failed; retry next sweep", "err", err)
 		return

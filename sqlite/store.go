@@ -36,9 +36,8 @@ import (
 // assertion with the failure discarded, so a drifted signature would silently
 // turn the feature off rather than fail to build.
 var (
-	_ storeapi.Store             = (*sqliteStore)(nil)
-	_ storeapi.FreePagesReleaser = (*sqliteStore)(nil)
-	_ storeapi.DriverCursorer    = (*sqliteStore)(nil)
+	_ storeapi.Store          = (*sqliteStore)(nil)
+	_ storeapi.DriverCursorer = (*sqliteStore)(nil)
 )
 
 // object_writes.op. The soft delete is an ordinary update: the row is still
@@ -75,7 +74,7 @@ const (
 	freePagesFloorDivisor = 8   // ...and at least 1/8 of the file
 )
 
-// FreePagesRelease hands up to maxPages of the freelist back to the OS with
+// ReclaimSpace hands up to maxPages of the freelist back to the OS with
 // PRAGMA incremental_vacuum, reporting how many pages left the file. It releases
 // nothing, without error, under the drain floor or on an auto_vacuum=NONE
 // database. The count is advisory: a difference of two reads, logged, never
@@ -83,7 +82,7 @@ const (
 //
 // The pragma frees one page per step, so it must be Exec'd, never Query'd —
 // Query releases exactly one page and reports no error.
-func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, error) {
+func (s *sqliteStore) ReclaimSpace(ctx context.Context, maxPages int) (int, error) {
 	if maxPages <= 0 {
 		return 0, nil
 	}
@@ -95,7 +94,7 @@ func (s *sqliteStore) FreePagesRelease(ctx context.Context, maxPages int) (int, 
 	return freePagesRelease(ctx, conn, maxPages)
 }
 
-// freePagesRelease is FreePagesRelease once the connection is in hand, split out
+// freePagesRelease is ReclaimSpace once the connection is in hand, split out
 // so the arithmetic can be tested against a scripted dbtx.
 func freePagesRelease(ctx context.Context, c dbtx, maxPages int) (int, error) {
 	pages, free, err := pageCounters(ctx, c)

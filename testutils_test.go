@@ -526,6 +526,12 @@ func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int,
 	// Beehive whose GC sweeper ticks reaches this.
 	return 0, nil
 }
+
+// ReclaimSpace reclaims nothing, which the contract permits. The GC sweeper
+// calls it every tick, so a panic here would reach every Beehive.
+func (s *fakeStore) ReclaimSpace(context.Context, int) (int, error) {
+	return 0, nil
+}
 func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.

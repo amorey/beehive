@@ -100,14 +100,18 @@ space — slower than a churning store can produce it, which makes the drain
 decorative. Neither the cap nor the floor is an option: there is no measurement a
 caller could tune them against that the sweeper does not already have.
 
-### Why `FreePagesReleaser` is optional, not part of `Store`
+### Why `ReclaimSpace` is a required `Store` member
 
-Reclaiming pages is one backend's concern. Putting `FreePagesRelease` in `Store`
-would make every implementation — and every test double — answer a question only
-SQLite has. It is an optional interface the sweeper type-asserts and skips when
-absent, and the contract says an implementation may release fewer pages than asked,
-including none, since a backend is entitled to decide free space is worth more kept
-than returned.
+Reclaiming pages is one backend's concern, so this began as an optional
+`FreePagesReleaser` the sweeper type-asserted and skipped when absent. It is now a
+required member, because the contract already had a valid answer for a backend with
+nothing to reclaim: an implementation may release fewer pages than asked, **including
+none**, since a backend is entitled to decide free space is worth more kept than
+returned. A backend that never reclaims returns 0 and is within contract, so the
+optionality bought a nil check rather than any semantics. The name drops the freelist,
+which is SQLite's vocabulary and not every backend's.
+
+See [the grouped-Store spec](../specs/2026-08-07-grouped-store-api.md), D3.
 
 ## Consequences
 
@@ -115,7 +119,7 @@ than returned.
   load-bearing.** It must be `Exec`'d. Run through `Query` and closed without
   draining the rows it releases exactly **one** page and returns no error — a drain
   that looks alive and reclaims 4KB a sweep. The rule is a comment at the call site
-  as well as here, and `TestFreePagesReleaseDrainsPastTheFloor` asserts
+  as well as here, and `TestReclaimSpaceDrainsPastTheFloor` asserts
   `1 < released <= cap` specifically to catch it. The assertion is deliberately *at
   most* the cap, never *exactly*: the pragma promises up to N.
 - **In WAL mode the main file does not shrink until a checkpoint.** A drained

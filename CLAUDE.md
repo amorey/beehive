@@ -309,7 +309,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration
-  is). The sweeper drains the freelist through `FreePagesReleaser`, gated on a
+  is). The sweeper drains the freelist through `Store.ReclaimSpace`, gated on a
   floor and a fraction of the file. `PRAGMA incremental_vacuum` **must be
   `Exec`'d, never `Query`'d**. → [ADR](docs/adr/2026-07-29-auto-vacuum-incremental.md)
 - **The schema is amended in place until the first release**: `sqlite/migrations/`

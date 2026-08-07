@@ -41,10 +41,6 @@ type ObjectRef = storeapi.ObjectRef
 // adapter. See storeapi.Store for the full contract.
 type Store = storeapi.Store
 
-// FreePagesReleaser is an optional Store capability for handing freed space
-// back to the operating system. The GC sweeper uses it when present.
-type FreePagesReleaser = storeapi.FreePagesReleaser
-
 // DriverCursorer is an optional Store capability for persisting a driver's scan
 // position across restarts. The dependency waker uses it when present.
 type DriverCursorer = storeapi.DriverCursorer

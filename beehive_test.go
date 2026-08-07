@@ -75,7 +75,7 @@ type freePagesStore struct {
 	err    error
 }
 
-func (s *freePagesStore) FreePagesRelease(_ context.Context, maxPages int) (int, error) {
+func (s *freePagesStore) ReclaimSpace(_ context.Context, maxPages int) (int, error) {
 	select {
 	case s.called <- maxPages:
 	default:
@@ -103,10 +103,10 @@ func TestSweepFreePages(t *testing.T) {
 			"the sweeper should pass its own cap, not a store-chosen one")
 	})
 
-	t.Run("a store without the capability is skipped", func(t *testing.T) {
+	t.Run("a store that reclaims nothing is a no-op", func(t *testing.T) {
 		bh, err := New(&fakeStore{})
 		require.NoError(t, err)
-		bh.freePagesSweep(ctx) // must not panic: fakeStore has no FreePagesRelease
+		bh.freePagesSweep(ctx) // fakeStore reclaims 0; nothing to log, nothing to fail
 	})
 
 	t.Run("a failed drain is logged, not fatal", func(t *testing.T) {

@@ -6965,7 +6965,7 @@ func TestObjectWritesMaxVersionAllReportsTheHorizon(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// FreePagesRelease
+// ReclaimSpace
 // ---------------------------------------------------------------------------
 
 // pageCounts reads the two pragmas the drain is judged by.
@@ -7007,12 +7007,12 @@ func churnStore(t *testing.T, store *sqliteStore) {
 // up to N pages. It still pins the bug that matters — PRAGMA incremental_vacuum
 // frees one page per step, so an implementation that goes through Query and closes
 // the rows without draining them releases exactly 1.
-func TestFreePagesReleaseDrainsPastTheFloor(t *testing.T) {
+func TestReclaimSpaceDrainsPastTheFloor(t *testing.T) {
 	store := newRawStore(t)
 	churnStore(t, store)
 	before, freeBefore := pageCounts(t, store)
 
-	released, err := store.FreePagesRelease(context.Background(), 50)
+	released, err := store.ReclaimSpace(context.Background(), 50)
 	require.NoError(t, err)
 
 	after, freeAfter := pageCounts(t, store)
@@ -7025,11 +7025,11 @@ func TestFreePagesReleaseDrainsPastTheFloor(t *testing.T) {
 // Below either half of the gate the drain does nothing at all: free pages are what
 // the next insert would have reused, so releasing them just to re-grow the file is
 // work traded for nothing. A fresh store is the small-freelist case.
-func TestFreePagesReleaseSkipsASmallFreelist(t *testing.T) {
+func TestReclaimSpaceSkipsASmallFreelist(t *testing.T) {
 	store := newRawStore(t)
 	before, _ := pageCounts(t, store)
 
-	released, err := store.FreePagesRelease(context.Background(), 1000)
+	released, err := store.ReclaimSpace(context.Background(), 1000)
 	require.NoError(t, err)
 
 	after, _ := pageCounts(t, store)
@@ -7040,7 +7040,7 @@ func TestFreePagesReleaseSkipsASmallFreelist(t *testing.T) {
 // The gate is hysteresis, not a one-shot: repeated ticks walk a churned freelist
 // down until it falls back under the floor, and then stop. Without the stop the
 // sweeper would fight page reuse on every tick forever.
-func TestFreePagesReleaseStopsOnceUnderTheFloor(t *testing.T) {
+func TestReclaimSpaceStopsOnceUnderTheFloor(t *testing.T) {
 	store := newRawStore(t)
 	churnStore(t, store)
 	ctx := context.Background()
@@ -7049,7 +7049,7 @@ func TestFreePagesReleaseStopsOnceUnderTheFloor(t *testing.T) {
 	// thousand long, so a converging drain is done well inside this.
 	var last int
 	for i := 0; i < 100; i++ {
-		n, err := store.FreePagesRelease(ctx, 200)
+		n, err := store.ReclaimSpace(ctx, 200)
 		require.NoError(t, err)
 		if n == 0 {
 			last = i
@@ -7067,11 +7067,11 @@ func TestFreePagesReleaseStopsOnceUnderTheFloor(t *testing.T) {
 
 // A dead pool surfaces as an error rather than a silent zero — the sweeper logs it
 // and retries on the next tick.
-func TestFreePagesReleaseErrorsOnAClosedStore(t *testing.T) {
+func TestReclaimSpaceErrorsOnAClosedStore(t *testing.T) {
 	store := newRawStore(t)
 	require.NoError(t, store.Close())
 
-	_, err := store.FreePagesRelease(context.Background(), 100)
+	_, err := store.ReclaimSpace(context.Background(), 100)
 	assert.Error(t, err)
 }
 
@@ -7120,12 +7120,12 @@ func scripted(t *testing.T, values []int) *scriptedDBTX {
 
 // Nothing to do, and nothing read: the sweeper passes a positive cap, but a store
 // built field by field in a test need not.
-func TestFreePagesReleaseIgnoresANonPositiveCap(t *testing.T) {
+func TestReclaimSpaceIgnoresANonPositiveCap(t *testing.T) {
 	store := newRawStore(t)
 	churnStore(t, store)
 	before, _ := pageCounts(t, store)
 
-	released, err := store.FreePagesRelease(context.Background(), 0)
+	released, err := store.ReclaimSpace(context.Background(), 0)
 	require.NoError(t, err)
 
 	after, _ := pageCounts(t, store)
@@ -7136,7 +7136,7 @@ func TestFreePagesReleaseIgnoresANonPositiveCap(t *testing.T) {
 // Each of the three reads and the vacuum itself can fail mid-drain. All four are the
 // same answer — give up and report — because the sweeper's next tick retries and
 // nothing is incorrect in the meantime.
-func TestFreePagesReleaseReportsMidDrainFaults(t *testing.T) {
+func TestReclaimSpaceReportsMidDrainFaults(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("page_count read", func(t *testing.T) {
@@ -7175,7 +7175,7 @@ func TestFreePagesReleaseReportsMidDrainFaults(t *testing.T) {
 // than one connection another writer can free pages between them and leave the
 // freelist longer than it started. Report nothing rather than a negative count: the
 // number is advisory and only ever logged.
-func TestFreePagesReleaseClampsAGrowingFreelist(t *testing.T) {
+func TestReclaimSpaceClampsAGrowingFreelist(t *testing.T) {
 	c := scripted(t, []int{1000, 900, 1000, 950})
 
 	released, err := freePagesRelease(context.Background(), c, 100)
