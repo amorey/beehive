@@ -1520,6 +1520,31 @@ func TestSetObservedGenerationDropsAStaleReport(t *testing.T) {
 	assert.Equal(t, settled.ResourceVersion, reread.ResourceVersion, "dropped report writes nothing")
 }
 
+func TestSetObservedGenerationGuards(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	otherGK := beehive.GroupKind{Kind: "Other"}
+	other, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	objects := store.Objects()
+	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, created.ID, created.Generation+4),
+		beehive.ErrObservedGenerationFuture)
+	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, created.ID, 0),
+		beehive.ErrInvalidObservedGeneration)
+	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, other.ID, 1),
+		beehive.ErrWrongKind)
+	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, created.ID+9999, 1),
+		beehive.ErrNotFound)
+
+	reread, err := objects.Get(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reread.ObservedGeneration, "no rejected call may settle")
+	assert.Equal(t, created.ResourceVersion, reread.ResourceVersion)
+}
+
 // TestSchemaVersionColumnsRoundTrip verifies the opaque per-column schema
 // versions: they default to 0, ObjectsCreate persists the caller-set spec version
 // (status is nil at create, so its version stays 0), and the version args to

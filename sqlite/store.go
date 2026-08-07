@@ -1420,11 +1420,22 @@ func (s *sqliteStore) updateSpec(
 }
 
 func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) error {
+	if err := checkObservedGeneration(observedGeneration); err != nil {
+		return err
+	}
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
-		var observedGen sql.NullInt64
-		if err := s.selectScoped(ctx, gk, id, `observed_generation`, &observedGen); err != nil {
+		var (
+			generation  int64
+			observedGen sql.NullInt64
+		)
+		if err := s.selectScoped(ctx, gk, id, `generation, observed_generation`, &generation, &observedGen); err != nil {
 			return err
+		}
+		// A controller can only have observed a generation that exists.
+		if generation < observedGeneration {
+			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
+				storeapi.ErrObservedGenerationFuture, observedGeneration, generation, id)
 		}
 		// >=, not ==: with no content to re-derive, a stale report is dropped
 		// rather than rolling a converged object back to unsettled. (UpdateStatus's
