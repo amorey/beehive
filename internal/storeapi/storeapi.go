@@ -750,14 +750,14 @@ type Objects interface {
 	// controller has settled, writing no status: the handshake for a controller
 	// whose report is conditions, or nothing at all. Advancing it bumps
 	// ObservedAt and ResourceVersion, leaving UpdatedAt — which tracks content —
-	// alone. A generation at or below the recorded one writes nothing, so the
-	// call is idempotent per generation and can never roll a converged object
-	// back to unsettled.
+	// alone. A generation at or below the recorded one writes nothing and reports
+	// settled=false, so the call is idempotent per generation and can never roll
+	// a converged object back to unsettled. settled=true is what callers emit on.
 	//
 	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
 	// observedGeneration above the row's generation → ErrObservedGenerationFuture;
 	// below 1 → ErrInvalidObservedGeneration. Returns no row.
-	SetObservedGeneration(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64) error
+	SetObservedGeneration(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64) (settled bool, err error)
 
 	// UpdateSpec replaces an object's spec, bumping Generation and
 	// ResourceVersion, and stamps specVersion. Spec bytes identical to the
@@ -786,8 +786,8 @@ type Objects interface {
 	// rolling the object back to unsettled so a later pass re-derives it.
 	//
 	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
-	// Returns no row.
+	// observedGeneration above the row's generation → ErrObservedGenerationFuture;
+	// below 1 → ErrInvalidObservedGeneration. Returns no row.
 	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
 }
 

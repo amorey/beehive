@@ -1419,12 +1419,12 @@ func (s *sqliteStore) updateSpec(
 	return result, changed, err
 }
 
-func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) error {
+func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) (settled bool, err error) {
 	if err := checkObservedGeneration(observedGeneration); err != nil {
-		return err
+		return false, err
 	}
 	// Within keeps the read-compare-write atomic.
-	return s.Within(ctx, func(ctx context.Context) error {
+	err = s.Within(ctx, func(ctx context.Context) error {
 		var (
 			generation  int64
 			observedGen sql.NullInt64
@@ -1432,28 +1432,30 @@ func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.Gr
 		if err := s.selectScoped(ctx, gk, id, `generation, observed_generation`, &generation, &observedGen); err != nil {
 			return err
 		}
-		// A controller can only have observed a generation that exists.
-		if generation < observedGeneration {
-			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
-				storeapi.ErrObservedGenerationFuture, observedGeneration, generation, id)
+		if err := checkObservedNotFuture(observedGeneration, generation, id); err != nil {
+			return err
 		}
-		// >=, not ==: with no content to re-derive, a stale report is dropped
-		// rather than rolling a converged object back to unsettled. (UpdateStatus's
-		// content path deliberately does the opposite.)
-		if observedGen.Valid && observedGen.Int64 >= observedGeneration {
-			return nil
-		}
-		return s.stampObserved(ctx, s.conn(ctx), gk, id, observedGeneration)
+		// No content to re-derive, so a stale report is dropped rather than rolling
+		// a converged object back to unsettled — the opposite of what UpdateStatus's
+		// content path does.
+		settled, err = s.advanceObserved(ctx, s.conn(ctx), gk, id, observedGen, observedGeneration)
+		return err
 	})
+	return settled && err == nil, err
 }
 
-// stampObserved writes the handshake alone: observed_generation and observed_at
-// under a fresh resource_version. updated_at tracks content and stays put.
-// Callers have proved the row exists in gk and have clamped observedGeneration.
-func (s *sqliteStore) stampObserved(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) error {
+// advanceObserved writes the handshake alone — observed_generation and
+// observed_at under a fresh resource_version, leaving updated_at, which tracks
+// content — and reports whether it wrote. A report at or below the recorded
+// generation would roll a converged object back to unsettled, so it writes
+// nothing. Callers have proved the row exists in gk.
+func (s *sqliteStore) advanceObserved(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID, recorded sql.NullInt64, observedGeneration int64) (bool, error) {
+	if recorded.Valid && recorded.Int64 >= observedGeneration {
+		return false, nil
+	}
 	rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// No RETURNING: no row reported, and the caller's scoped read proved existence.
 	_, err = c.ExecContext(ctx, `
@@ -1461,11 +1463,20 @@ func (s *sqliteStore) stampObserved(ctx context.Context, c dbtx, gk storeapi.Gro
 		SET observed_generation = ?, observed_at = ?, resource_version = ?
 		WHERE id = ?`,
 		observedGeneration, now, rv, id)
-	return err
+	return err == nil, err
 }
 
-// checkObservedGeneration rejects a generation no object can hold. Cheap enough
-// to run before the transaction opens.
+// checkObservedNotFuture rejects a generation the object has not reached: a
+// controller can only have observed one that exists.
+func checkObservedNotFuture(observedGeneration, generation int64, id storeapi.ObjectID) error {
+	if generation < observedGeneration {
+		return fmt.Errorf("%w: reported %d, current is %d (object %d)",
+			storeapi.ErrObservedGenerationFuture, observedGeneration, generation, id)
+	}
+	return nil
+}
+
+// checkObservedGeneration rejects a generation no object can hold.
 func checkObservedGeneration(observedGeneration int64) error {
 	if observedGeneration < 1 {
 		return fmt.Errorf("%w: reported %d", storeapi.ErrInvalidObservedGeneration, observedGeneration)
@@ -1501,12 +1512,10 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 			&generation, &observedGen, &storedVersion, &storedStatus); err != nil {
 			return err
 		}
-		// A controller can only have observed a generation that exists; recording a
-		// future one would falsely settle the object once its spec caught up. An
-		// older value is fine (spec changed mid-reconcile).
-		if generation < observedGeneration {
-			return fmt.Errorf("%w: reported %d, current is %d (object %d)",
-				storeapi.ErrObservedGenerationFuture, observedGeneration, generation, id)
+		// A future generation would falsely settle the object once its spec caught
+		// up. An older one is fine (spec changed mid-reconcile).
+		if err := checkObservedNotFuture(observedGeneration, generation, id); err != nil {
+			return err
 		}
 		// Never downward — see stampVersion.
 		stamp, err := stampVersion(storedVersion, statusVersion)
@@ -1515,16 +1524,9 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			// Content no-op: write only the bookkeeping, and only if it would move.
-			// >=, not ==: a report at or below the recorded generation would roll
-			// observed_generation backwards, re-unsettling a converged object. (The
-			// content path below deliberately does not clamp: there the stale
-			// reporter overwrote the content, and unsettling gets it re-derived.)
-			settled := observedGen.Valid && observedGen.Int64 >= observedGeneration
-			if settled {
-				return nil
-			}
-			// The handshake advanced — watch-visible even with identical bytes.
-			return s.stampObserved(ctx, c, gk, id, observedGeneration)
+			// The handshake advancing is watch-visible even with identical bytes.
+			_, err := s.advanceObserved(ctx, c, gk, id, observedGen, observedGeneration)
+			return err
 		}
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
@@ -1532,8 +1534,8 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// observedGeneration lands verbatim, unclamped: a stale reporter just
 		// overwrote the status, and its generation marking the object unsettled is
-		// what gets that content re-derived. Not stampObserved, deliberately — that
-		// clamps, and routing through it would delete this behavior. Keyed on id
+		// what gets that content re-derived. Not advanceObserved, deliberately —
+		// that clamps, and routing through it would delete this behavior. Keyed on id
 		// alone: the kind boundary came from the scoped read in this transaction —
 		// keep the read if you move this statement.
 		_, err = c.ExecContext(ctx, `

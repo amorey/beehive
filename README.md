@@ -680,7 +680,7 @@ The generation handshake is the exception. `observedGeneration` and `ObservedAt`
 
 **If your pass reports only conditions — or nothing at all — call `SetObservedGeneration(ctx, id, obj.Generation)`.** `SetCondition` bumps `resource_version` but deliberately leaves the handshake alone, so a controller whose real output is conditions would otherwise never settle and would sit in the owed listing forever, re-queued every interval. This verb records the handshake and writes no status; compose it inside `Within` to land with a `SetConditions`. Unlike `UpdateStatus` it always clamps — a generation at or below the recorded one writes nothing, so it is idempotent per generation and can never roll a converged object back to unsettled. Neither verb accepts a generation below 1 (`ErrInvalidObservedGeneration`); no object holds one.
 
-Do **not** reach for `UpdateStatus` with the status you were handed as a way to settle. It usually works and is unsound: the no-op gate is the schema version as well as the bytes, so on a build where your status version has risen the same call takes the content path, rewrites the status, and lands the generation unclamped.
+Do **not** settle by re-passing the status you were handed to `UpdateStatus`. It usually works and is unsound — the no-op gate is the schema version as well as the bytes; the ADR below has the detail.
 
 `ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `AddEvent` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
 

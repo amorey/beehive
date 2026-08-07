@@ -49,6 +49,12 @@ generation, which is why a settle cannot sustain a dependency cycle the way a
 condition write can — in a cycle no generation moves, so the second settle writes
 nothing.
 
+The store verb reports `settled`, and the client emits only on it. A controller
+is meant to call this every pass, so the steady state is the clamped no-op, which
+appends no write-log entry — signalling it anyway would wake every tailer for the
+kind and the dependency waker, per pass, for a write that did not happen. Same
+gate as `UpdateSpec`'s `changed` and `EdgesAddResult.ReconcileOwedStamped`.
+
 Two alternatives were rejected. **An `observedGeneration` argument on
 `SetConditions`** would copy the two-axis no-op rule below into a second place,
 and would force a condition write that does not settle (`Progressing=True`

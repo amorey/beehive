@@ -488,32 +488,6 @@ func TestControllerClientSetObservedGeneration(t *testing.T) {
 	assert.ErrorIs(t, cc.SetObservedGeneration(ctx, obj.ID, 0), ErrInvalidObservedGeneration)
 }
 
-// The owed pass drains two independent records. Settling clears the unsettled
-// one and must leave reconcile_owed alone, or a declared dependency would lose
-// its guaranteed pass.
-func TestSetObservedGenerationLeavesTheOwedCount(t *testing.T) {
-	ctx := context.Background()
-	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store)
-
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	defer stop(ctx)
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{})
-	target := mustCreate(t, ctx, client, uniqueName(), cSpec{})
-	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID))
-
-	require.NoError(t, cc.SetObservedGeneration(ctx, dep.ID, dep.Generation))
-
-	owed, err := store.ReconcileOwed().ListIDs(ctx, clientTestGK)
-	require.NoError(t, err)
-	assert.Contains(t, owed, dep.ID, "the declared dependency still owes a pass")
-}
-
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

@@ -75,8 +75,8 @@ type ControllerClient[Status any] interface {
 	// all. Pass the generation of the object you were handed. A generation at or
 	// below the recorded one writes nothing; one above the object's current
 	// generation → ErrObservedGenerationFuture, below 1 →
-	// ErrInvalidObservedGeneration. Compose it inside Within to land with a
-	// SetConditions.
+	// ErrInvalidObservedGeneration — which UpdateStatus rejects too. Compose it
+	// inside Within to land with a SetConditions.
 	SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error
 	// UpdateStatus records status and the generation this reconcile observed.
 	// Status that marshals to the stored bytes writes nothing, so a controller
@@ -127,8 +127,14 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
+// Gated on settled: a controller calls this every pass, so the steady state is
+// the clamped no-op, which appends no log entry for a wake to read.
 func (c *controllerClientImpl[Status]) SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error {
-	return c.wakeAfter(ctx, c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, id, observedGeneration))
+	settled, err := c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, id, observedGeneration)
+	if err != nil || !settled {
+		return err
+	}
+	return c.wakeAfter(ctx, nil)
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {

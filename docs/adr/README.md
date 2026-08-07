@@ -13,6 +13,10 @@ One file per decision, named `YYYY-MM-DD-name.md`, opening with:
 ## Consequences   (optional; alternatives considered go here too)
 ```
 
+Records here describe code that exists. Work that is only planned goes in
+[`docs/specs`](../specs/README.md) and folds back into a record here when it
+ships.
+
 `CLAUDE.md` stays lean by holding only a one- or two-sentence summary of each
 decision plus a link here. When a design discussion grows past a couple of
 sentences in `CLAUDE.md`, move it into a new ADR and leave the summary behind.

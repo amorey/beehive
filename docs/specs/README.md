@@ -14,7 +14,5 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-## Index
-
-Empty. The last spec shipped as
+Nothing is in flight right now. The last spec shipped as
 [`SetObservedGeneration`](../adr/2026-07-27-generation-handshake-and-noop-writes.md).

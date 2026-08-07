@@ -767,7 +767,7 @@ func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, err
 	return nil, nil
 }
 
-func (fakeObjects) SetObservedGeneration(context.Context, GroupKind, ObjectID, int64) error {
+func (fakeObjects) SetObservedGeneration(context.Context, GroupKind, ObjectID, int64) (bool, error) {
 	panic("not implemented: fakeStore.Objects().SetObservedGeneration")
 }
 

@@ -1454,6 +1454,15 @@ func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
 	assert.JSONEq(t, `{"msg":"hi"}`, string(updated.Status))
 }
 
+// settle records a handshake and reports whether it wrote. Takes ctx: called
+// inside a Within frame it must use that frame's context, not a fresh one.
+func settle(t *testing.T, ctx context.Context, store beehive.Store, id beehive.ObjectID, gen int64) bool {
+	t.Helper()
+	settled, err := store.Objects().SetObservedGeneration(ctx, testGK, id, gen)
+	require.NoError(t, err)
+	return settled
+}
+
 // The handshake for a controller whose whole report is conditions: the
 // generation settles, the status column is untouched, and updated_at — which
 // tracks content — holds.
@@ -1463,7 +1472,7 @@ func TestSetObservedGenerationSettlesWithoutWritingStatus(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	settle(t, ctx, store, created.ID, created.Generation)
 
 	updated, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
@@ -1484,11 +1493,11 @@ func TestSetObservedGenerationIsIdempotentPerGeneration(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	assert.True(t, settle(t, ctx, store, created.ID, created.Generation))
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	assert.False(t, settle(t, ctx, store, created.ID, created.Generation), "the repeat wrote nothing")
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
@@ -1506,12 +1515,12 @@ func TestSetObservedGenerationDropsAStaleReport(t *testing.T) {
 	created := newRefObject(t, store)
 	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, bumped.Generation))
+	settle(t, ctx, store, created.ID, bumped.Generation)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	// A slow controller reports the generation it loaded, now stale.
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	settle(t, ctx, store, created.ID, created.Generation)
 
 	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
@@ -1525,19 +1534,24 @@ func TestSetObservedGenerationGuards(t *testing.T) {
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
-	otherGK := beehive.GroupKind{Kind: "Other"}
-	other, err := store.Objects().Create(ctx, otherGK, beehive.ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
-	require.NoError(t, err)
+	other := newKindObject(t, store, beehive.GroupKind{Kind: "Other"})
 
 	objects := store.Objects()
-	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, created.ID, created.Generation+4),
-		beehive.ErrObservedGenerationFuture)
-	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, created.ID, 0),
-		beehive.ErrInvalidObservedGeneration)
-	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, other.ID, 1),
-		beehive.ErrWrongKind)
-	assert.ErrorIs(t, objects.SetObservedGeneration(ctx, testGK, created.ID+9999, 1),
-		beehive.ErrNotFound)
+	for _, tc := range []struct {
+		name string
+		id   beehive.ObjectID
+		gen  int64
+		want error
+	}{
+		{"a generation the object has not reached", created.ID, created.Generation + 4, beehive.ErrObservedGenerationFuture},
+		{"a generation no object holds", created.ID, 0, beehive.ErrInvalidObservedGeneration},
+		{"another kind's id", other.ID, 1, beehive.ErrWrongKind},
+		{"no such id", created.ID + 9999, 1, beehive.ErrNotFound},
+	} {
+		settled, err := objects.SetObservedGeneration(ctx, testGK, tc.id, tc.gen)
+		assert.ErrorIs(t, err, tc.want, tc.name)
+		assert.False(t, settled, tc.name)
+	}
 
 	reread, err := objects.Get(ctx, created.ID)
 	require.NoError(t, err)
@@ -1555,11 +1569,32 @@ func TestSetObservedGenerationLeavesTheUnsettledListing(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, unsettled, created.ID)
 
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	settle(t, ctx, store, created.ID, created.Generation)
 
 	unsettled, err = store.Objects().ListUnsettledIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.NotContains(t, unsettled, created.ID)
+}
+
+// The owed pass drains two independent records. Settling clears the unsettled
+// one and must leave reconcile_owed alone, or a declared dependency would lose
+// its guaranteed pass.
+func TestSetObservedGenerationLeavesTheOwedCount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	dep := newRefObject(t, store)
+	target := newRefObject(t, store)
+	// Not addEdge: that drains the stamp, which is the thing under assertion.
+	res, err := store.Edges().Add(ctx, dep.ID, target.ID, "depends_on")
+	require.NoError(t, err)
+	require.True(t, res.ReconcileOwedStamped)
+
+	settle(t, ctx, store, dep.ID, dep.Generation)
+
+	owed, err := store.ReconcileOwed().ListIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.Contains(t, owed, dep.ID, "the declared dependency still owes a pass")
 }
 
 func TestSetObservedGenerationRollsBackWithItsFrame(t *testing.T) {
@@ -1570,7 +1605,7 @@ func TestSetObservedGenerationRollsBackWithItsFrame(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	err := store.Within(ctx, func(ctx context.Context) error {
-		require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+		settle(t, ctx, store, created.ID, created.Generation)
 		return sentinel
 	})
 	require.ErrorIs(t, err, sentinel)
@@ -1590,11 +1625,11 @@ func TestSetObservedGenerationWakesDependentsOncePerGeneration(t *testing.T) {
 	created := newRefObject(t, store)
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	assert.True(t, settle(t, ctx, store, created.ID, created.Generation))
 	assert.Len(t, probe.writes(), 1, "the settle is watch-visible")
 	probe.expectWrite()
 
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	assert.False(t, settle(t, ctx, store, created.ID, created.Generation))
 	assert.Empty(t, probe.writes(), "a repeat settle wakes nobody")
 }
 
@@ -1613,7 +1648,7 @@ func TestUpdateStatusReUseIsUnsoundAcrossAStatusVersionBump(t *testing.T) {
 
 	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
-	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, bumped.Generation))
+	settle(t, ctx, store, created.ID, bumped.Generation)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
