@@ -228,6 +228,13 @@ func printConditions(obj *beehive.Object[ServerSpec, ServerStatus]) {
 	}
 	fmt.Printf("rv=%d conditions:\n", obj.ResourceVersion)
 	for _, c := range obj.Conditions {
+		// A downgraded liveness condition's stamps are the pre-restart write's, so
+		// "for=" would date a status this process never established.
+		if c.Unconfirmed {
+			fmt.Printf("  %-12s %-7s for=%-6s reason=%s msg=%q\n", c.Type, "Unknown",
+				"?", "unconfirmed since restart, last known "+c.Reason, c.Message)
+			continue
+		}
 		// TransitionedAt moves only on a status flip: how long the status has held.
 		fmt.Printf("  %-12s %-7s for=%-6s reason=%s msg=%q\n", c.Type, c.Status,
 			time.Since(c.TransitionedAt).Round(10*time.Millisecond), c.Reason, c.Message)

@@ -174,6 +174,7 @@ type Condition struct {
     Liveness bool   // see below
 
     // Set by the store on read, ignored on write.
+    Unconfirmed    bool      // Status is a downgrade this process derived, not a write
     TransitionedAt time.Time // when Status last changed
     UpdatedAt      time.Time // when the condition was last written at all
 }
@@ -189,14 +190,37 @@ discarded.
 
 A liveness condition downgraded to `ConditionUnknown` on read keeps the stamps of the
 stored write: the downgrade is derived per process, not written, so `TransitionedAt`
-describes the last stored status change rather than the downgrade. `UpdatedAt` is what
-makes the downgrade legible — it predates the current process, which is the rule.
+describes the last stored status change rather than the downgrade. `Reason` and
+`Message` are the stored write's for the same reason — they say what the condition
+last *was*, not what this `Unknown` means.
+
+`Unconfirmed` is how you tell that apart from an `Unknown` a controller in this
+process wrote deliberately, having looked and been unable to say. The two are the same
+on the wire otherwise, and the rule that separates them — "written before this process
+started" — is one only the store can evaluate, so it reports the answer rather than
+its inputs. Branch on `Unconfirmed` alone; it is set only by the downgrade, so it
+already implies both `ConditionUnknown` and `Liveness`.
+
+```go
+switch {
+case cond.Unconfirmed:
+    fmt.Printf("unconfirmed since restart — last known %s\n", cond.Reason)
+case cond.Status == beehive.ConditionUnknown:
+    fmt.Printf("cannot tell: %s\n", cond.Message)
+default:
+    fmt.Printf("%s since %s\n", cond.Status, cond.TransitionedAt)
+}
+```
+
+That last branch is the trap `Unconfirmed` exists to close: a downgraded condition's
+`TransitionedAt` predates the restart, so rendering "since" against it would date a
+status this process never established.
 
 `Liveness` marks a condition that describes a live, in-process resource, and so is
 only valid inside the process that wrote it. On read, a liveness condition left by an
 earlier process is downgraded to `ConditionUnknown` ("verifying") until a controller
 confirms it again. The default, `false`, means the condition is durable and survives
-restarts.
+restarts. See [the ADR](docs/adr/2026-08-07-a-downgraded-liveness-condition-says-so.md).
 
 ### Event
 

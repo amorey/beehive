@@ -1298,11 +1298,12 @@ func TestRawToTypedMapsConditions(t *testing.T) {
 		{Type: "Ready", Status: "True", Reason: "Up", Message: "ok", Liveness: true,
 			TransitionedAt: transitioned, UpdatedAt: updated},
 		{Type: "Healthy", Status: "False"},
+		{Type: "Connected", Status: "Unknown", Reason: "Dialed", Liveness: true, Unconfirmed: true},
 	}}
 
 	obj, err := rawToTyped[tSpec, tStatus](raw, nil)
 	require.NoError(t, err)
-	require.Len(t, obj.Conditions, 2)
+	require.Len(t, obj.Conditions, 3)
 	assert.Equal(t, "Ready", obj.Conditions[0].Type)
 	assert.Equal(t, ConditionTrue, obj.Conditions[0].Status)
 	assert.Equal(t, "Up", obj.Conditions[0].Reason)
@@ -1310,7 +1311,9 @@ func TestRawToTypedMapsConditions(t *testing.T) {
 	assert.True(t, obj.Conditions[0].Liveness)
 	assert.Equal(t, transitioned, obj.Conditions[0].TransitionedAt)
 	assert.Equal(t, updated, obj.Conditions[0].UpdatedAt)
+	assert.False(t, obj.Conditions[0].Unconfirmed)
 	assert.Equal(t, ConditionFalse, obj.Conditions[1].Status)
+	assert.True(t, obj.Conditions[2].Unconfirmed, "the downgrade flag survives the mapping")
 }
 
 func TestRawToTypedStatusUnmarshalError(t *testing.T) {

@@ -125,13 +125,18 @@ const (
 
 // Condition is the untyped form of one condition row. Status is "True", "False"
 // or "Unknown". Liveness marks an in-process condition, valid only inside the
-// process that wrote it. TransitionedAt and UpdatedAt are store bookkeeping.
+// process that wrote it. Unconfirmed, TransitionedAt and UpdatedAt are store
+// bookkeeping.
 type Condition struct {
-	Type           string
-	Status         string
-	Reason         string
-	Message        string
-	Liveness       bool
+	Type     string
+	Status   string
+	Reason   string
+	Message  string
+	Liveness bool
+	// Unconfirmed marks a Status the read path synthesized rather than read: a
+	// liveness condition an earlier process wrote, downgraded to "Unknown". Set
+	// on read, ignored on write.
+	Unconfirmed    bool
 	TransitionedAt time.Time
 	UpdatedAt      time.Time
 }
