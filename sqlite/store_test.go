@@ -1545,6 +1545,41 @@ func TestSetObservedGenerationGuards(t *testing.T) {
 	assert.Equal(t, created.ResourceVersion, reread.ResourceVersion)
 }
 
+// The point of the verb: what the owed pass lists.
+func TestSetObservedGenerationLeavesTheUnsettledListing(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
+	require.NoError(t, err)
+	require.Contains(t, unsettled, created.ID)
+
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+
+	unsettled, err = store.Objects().ListUnsettledIDs(ctx, testGK)
+	require.NoError(t, err)
+	assert.NotContains(t, unsettled, created.ID)
+}
+
+func TestSetObservedGenerationRollsBackWithItsFrame(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+
+	sentinel := errors.New("boom")
+	err := store.Within(ctx, func(ctx context.Context) error {
+		require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+		return sentinel
+	})
+	require.ErrorIs(t, err, sentinel)
+
+	reread, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reread.ObservedGeneration)
+}
+
 // TestSchemaVersionColumnsRoundTrip verifies the opaque per-column schema
 // versions: they default to 0, ObjectsCreate persists the caller-set spec version
 // (status is nil at create, so its version stays 0), and the version args to
