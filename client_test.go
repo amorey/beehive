@@ -951,7 +951,7 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 			return nil
 		})
 
-		pending, listErr := store.DeletionRequestsList(ctx)
+		pending, listErr := store.DeletionRequests().List(ctx)
 		require.NoError(t, listErr)
 		if commit {
 			require.NoError(t, err)
@@ -1181,13 +1181,13 @@ func TestClientDeleteMarksForCollection(t *testing.T) {
 	obj := mustCreate(t, ctx, client, "w1", cSpec{}, WithFinalizers("test/hold"))
 
 	require.NoError(t, client.DeleteByName(ctx, "w1"))
-	pending, err := store.DeletionRequestsList(ctx)
+	pending, err := store.DeletionRequests().List(ctx)
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "the mark is the whole signal: it puts the row in the sweeper's listing")
 	assert.Equal(t, obj.ID, pending[0].ID)
 
 	require.NoError(t, client.DeleteByName(ctx, "absent"))
-	pending, err = store.DeletionRequestsList(ctx)
+	pending, err = store.DeletionRequests().List(ctx)
 	require.NoError(t, err)
 	assert.Len(t, pending, 1, "an unresolved name marks nothing")
 }
@@ -1298,7 +1298,11 @@ type requestDeletionByNameErrorStore struct {
 	fakeStore
 }
 
-func (s *requestDeletionByNameErrorStore) DeletionRequestsCreateByName(_ context.Context, _ GroupKind, _ string) (storeapi.DeletionRequestResult, error) {
+func (s *requestDeletionByNameErrorStore) DeletionRequests() storeapi.DeletionRequests {
+	return delReqOverride{DeletionRequests: s.fakeStore.DeletionRequests(), createByName: s.createByName}
+}
+
+func (s *requestDeletionByNameErrorStore) createByName(_ context.Context, _ GroupKind, _ string) (storeapi.DeletionRequestResult, error) {
 	return storeapi.DeletionRequestResult{}, errBoom
 }
 

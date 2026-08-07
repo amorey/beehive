@@ -379,9 +379,6 @@ func (s *fakeStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, erro
 func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
 
 // answers 0: the GC sweeper calls it on every tick
 
@@ -444,12 +441,55 @@ func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, in
 func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (bool, error) {
 	panic("not implemented: fakeStore.FinalizersDelete")
 }
-func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (storeapi.DeletionRequestResult, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreate")
+func (s *fakeStore) DeletionRequests() storeapi.DeletionRequests { return fakeDeletionRequests{} }
+
+// fakeDeletionRequests is fakeStore's deletion-request family. List answers
+// empty rather than panicking: the GC sweeper runs in every Beehive.
+type fakeDeletionRequests struct{}
+
+func (fakeDeletionRequests) Create(context.Context, GroupKind, ObjectID) (storeapi.DeletionRequestResult, error) {
+	panic("not implemented: fakeStore.DeletionRequests().Create")
 }
-func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
+
+func (fakeDeletionRequests) CreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
+	panic("not implemented: fakeStore.DeletionRequests().CreateByName")
 }
+
+func (fakeDeletionRequests) CreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
+	panic("not implemented: fakeStore.DeletionRequests().CreateFromOwner")
+}
+
+func (fakeDeletionRequests) List(context.Context) ([]storeapi.ObjectRef, error) { return nil, nil }
+
+// delReqOverride replaces the hooks that are set and delegates the rest.
+type delReqOverride struct {
+	storeapi.DeletionRequests
+	createByName    func(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error)
+	createFromOwner func(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error)
+	list            func(context.Context) ([]storeapi.ObjectRef, error)
+}
+
+func (o delReqOverride) CreateByName(ctx context.Context, gk GroupKind, name string) (storeapi.DeletionRequestResult, error) {
+	if o.createByName != nil {
+		return o.createByName(ctx, gk, name)
+	}
+	return o.DeletionRequests.CreateByName(ctx, gk, name)
+}
+
+func (o delReqOverride) CreateFromOwner(ctx context.Context, id ObjectID) (storeapi.DeletionCascadeResult, error) {
+	if o.createFromOwner != nil {
+		return o.createFromOwner(ctx, id)
+	}
+	return o.DeletionRequests.CreateFromOwner(ctx, id)
+}
+
+func (o delReqOverride) List(ctx context.Context) ([]storeapi.ObjectRef, error) {
+	if o.list != nil {
+		return o.list(ctx)
+	}
+	return o.DeletionRequests.List(ctx)
+}
+
 func (s *fakeStore) ReconcileOwed() storeapi.ReconcileOwed { return fakeReconcileOwed{} }
 
 // fakeReconcileOwed is fakeStore's owed-count family.
@@ -533,9 +573,6 @@ func (f fakeConditions) Delete(ctx context.Context, gk GroupKind, id ObjectID, c
 }
 func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
 	panic("not implemented: fakeStore.ObjectsDelete")
-}
-func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
 }
 func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, EventsAddInput) error {
 	panic("not implemented: fakeStore.EventsAdd")
@@ -1278,8 +1315,12 @@ func (s *listProbeStore) probeOwedListIDs(ctx context.Context, gk GroupKind) ([]
 	return ids, err
 }
 
-func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
-	rows, err := s.Store.DeletionRequestsList(ctx)
+func (s *listProbeStore) DeletionRequests() storeapi.DeletionRequests {
+	return delReqOverride{DeletionRequests: s.Store.DeletionRequests(), list: s.probeDelReqList}
+}
+
+func (s *listProbeStore) probeDelReqList(ctx context.Context) ([]storeapi.ObjectRef, error) {
+	rows, err := s.Store.DeletionRequests().List(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
 }

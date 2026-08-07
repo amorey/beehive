@@ -367,6 +367,9 @@ type Store interface {
 	// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an object is owed a pass.
 	ReconcileOwed() ReconcileOwed
 
+	// DeletionRequests is the deletion-request lifecycle over objects.deletion_requested_at.
+	DeletionRequests() DeletionRequests
+
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
@@ -416,6 +419,31 @@ type ReconcileOwed interface {
 	// nonzero row. Bumps no resource_version and appends no write-log entry.
 	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
 	Sweep(ctx context.Context, keep []GroupKind) (int, error)
+}
+
+// DeletionRequests is the deletion-request lifecycle over objects.deletion_requested_at.
+type DeletionRequests interface {
+	// Create sets DeletionRequestedAt; the row stays until finalizers
+	// clear (ObjectsDelete removes it). changed is true only when this call set
+	// the flag; repeats return false. Scoped to gk: wrong kind → ErrWrongKind,
+	// missing id → ErrNotFound.
+	Create(ctx context.Context, gk GroupKind, id ObjectID) (DeletionRequestResult, error)
+
+	// CreateByName is DeletionRequestsCreate keyed by name within gk, with
+	// resolve and mark in one statement. ErrNotFound if no object of gk holds
+	// the name (no ErrWrongKind: names are per-kind).
+	CreateByName(ctx context.Context, gk GroupKind, name string) (DeletionRequestResult, error)
+
+	// CreateFromOwner requests deletion of every object owned by
+	// ownerID and returns them all. Writes only to children not already
+	// deletion-pending, so repeating over a deleting subtree costs one read.
+	CreateFromOwner(ctx context.Context, ownerID ObjectID) (DeletionCascadeResult, error)
+
+	// List returns every deletion-pending object of every
+	// kind, each with its GroupKind, so the global GC sweeper can route
+	// registered kinds to their controller and collect client-only kinds
+	// directly.
+	List(ctx context.Context) ([]ObjectRef, error)
 }
 
 type Dependencies interface {
@@ -518,28 +546,6 @@ type unmigrated interface {
 	// cancellation and values are inherited). fn must not panic: hooks run in
 	// sequence and nothing recovers.
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
-
-	// DeletionRequestsCreate sets DeletionRequestedAt; the row stays until finalizers
-	// clear (ObjectsDelete removes it). changed is true only when this call set
-	// the flag; repeats return false. Scoped to gk: wrong kind → ErrWrongKind,
-	// missing id → ErrNotFound.
-	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (DeletionRequestResult, error)
-
-	// DeletionRequestsCreateByName is DeletionRequestsCreate keyed by name within gk, with
-	// resolve and mark in one statement. ErrNotFound if no object of gk holds
-	// the name (no ErrWrongKind: names are per-kind).
-	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (DeletionRequestResult, error)
-
-	// DeletionRequestsCreateFromOwner requests deletion of every object owned by
-	// ownerID and returns them all. Writes only to children not already
-	// deletion-pending, so repeating over a deleting subtree costs one read.
-	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) (DeletionCascadeResult, error)
-
-	// DeletionRequestsList returns every deletion-pending object of every
-	// kind, each with its GroupKind, so the global GC sweeper can route
-	// registered kinds to their controller and collect client-only kinds
-	// directly.
-	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
 
 	// EventsAdd records an observation in the (id, in.Category) timeline. If
 	// the latest run there has the same (Type, Reason) it is extended (Count

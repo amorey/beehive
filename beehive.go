@@ -313,7 +313,7 @@ func (bh *Beehive) freePagesSweep(ctx context.Context) {
 // deletionPendingSweep drives every deletion-pending object one step closer to
 // removal.
 func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
-	rows, err := bh.store.DeletionRequestsList(ctx)
+	rows, err := bh.store.DeletionRequests().List(ctx)
 	if err != nil {
 		bh.log().Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return

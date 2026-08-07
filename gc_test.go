@@ -155,7 +155,11 @@ func (s *collectFakeStore) ObjectsGetMeta(_ context.Context, id ObjectID) (*RawO
 	}
 	return &RawObject{ID: id, DeletionRequestedAt: &now, Finalizers: s.finalizers}, nil
 }
-func (s *collectFakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
+func (s *collectFakeStore) DeletionRequests() storeapi.DeletionRequests {
+	return delReqOverride{DeletionRequests: s.fakeStore.DeletionRequests(), createFromOwner: s.createFromOwner}
+}
+
+func (s *collectFakeStore) createFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
 	return storeapi.DeletionCascadeResult{}, s.markErr
 }
 func (s *collectFakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
@@ -783,7 +787,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// one. Deletion does not bump generation, so the row stays settled below.
 	err = store.ObjectsUpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
 	require.NoError(t, err)
-	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
+	_, err = store.DeletionRequests().Create(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	// A fresh Beehive with no spec-startup pass and the full pass disabled: the GC
@@ -985,7 +989,11 @@ type sweepFailStore struct {
 	rows []ObjectRef
 }
 
-func (s *sweepFailStore) DeletionRequestsList(context.Context) ([]ObjectRef, error) {
+func (s *sweepFailStore) DeletionRequests() storeapi.DeletionRequests {
+	return delReqOverride{DeletionRequests: s.collectFakeStore.DeletionRequests(), list: s.list}
+}
+
+func (s *sweepFailStore) list(context.Context) ([]ObjectRef, error) {
 	return s.rows, nil
 }
 
@@ -1186,7 +1194,7 @@ func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
 	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, target.ID))
-	_, err = store.DeletionRequestsCreate(ctx, clientTestGK, dep.ID)
+	_, err = store.DeletionRequests().Create(ctx, clientTestGK, dep.ID)
 	require.NoError(t, err)
 	waitForDeletions(t, w, target.ID)
 }
@@ -1492,7 +1500,7 @@ func TestGCSweepsOnItsOwnInterval(t *testing.T) {
 		t.Fatal("sweeper never ran its startup pass")
 	}
 
-	_, err = real.DeletionRequestsCreate(ctx, clientTestGK, raw.ID)
+	_, err = real.DeletionRequests().Create(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -1557,7 +1565,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	// Mark it deletion-pending through the store, so nothing the client's own Delete does
 	// wake isn't what drives this either.
-	_, err = real.DeletionRequestsCreate(ctx, clientTestGK, obj.ID)
+	_, err = real.DeletionRequests().Create(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)
 
 	waitForDeletions(t, w, obj.ID)
@@ -1568,7 +1576,11 @@ type listFailStore struct {
 	collectFakeStore
 }
 
-func (s *listFailStore) DeletionRequestsList(context.Context) ([]ObjectRef, error) {
+func (s *listFailStore) DeletionRequests() storeapi.DeletionRequests {
+	return delReqOverride{DeletionRequests: s.collectFakeStore.DeletionRequests(), list: s.list}
+}
+
+func (s *listFailStore) list(context.Context) ([]ObjectRef, error) {
 	return nil, errBoom
 }
 

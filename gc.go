@@ -47,7 +47,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// kind: a wide cascade would otherwise queue one commit hook per row
 		// for wakes that coalesce anyway. Ungated on Marked, unlike the push: a
 		// re-cascade's wake reads one position and finds nothing.
-		cascade, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
+		cascade, err := bh.store.DeletionRequests().CreateFromOwner(ctx, id)
 		if err != nil {
 			return err
 		}

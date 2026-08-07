@@ -44,6 +44,10 @@ type sqliteReconcileOwed struct{ *sqliteStore }
 
 func (s *sqliteStore) ReconcileOwed() storeapi.ReconcileOwed { return sqliteReconcileOwed{s} }
 
+type sqliteDeletionRequests struct{ *sqliteStore }
+
+func (s *sqliteStore) DeletionRequests() storeapi.DeletionRequests { return sqliteDeletionRequests{s} }
+
 type sqliteDependencies struct{ *sqliteStore }
 
 func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
@@ -942,7 +946,7 @@ func (s *sqliteStore) ObjectsListUnsettledIDs(ctx context.Context, gk storeapi.G
 	return scanIDs(rows)
 }
 
-func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
+func (s sqliteDeletionRequests) List(ctx context.Context) ([]storeapi.ObjectRef, error) {
 	// Kind-agnostic, so the global sweeper sees every finalizing object; the kind
 	// rides along for routing. idx_objects_deleting covers exactly this column
 	// list and order — keep them in step, or the plan silently gains a row fetch
@@ -2308,7 +2312,7 @@ func (s *sqliteStore) unblockedTargetsChunk(ctx context.Context, fromIDs []store
 
 // DeletionRequestsCreate marks id within gk. The kind is folded into the write, so a
 // foreign id matches no row and the probe reports ErrWrongKind.
-func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.DeletionRequestResult, error) {
+func (s sqliteDeletionRequests) Create(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.DeletionRequestResult, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeObjectScoped(ctx, gk, id) },
 		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
@@ -2316,7 +2320,7 @@ func (s *sqliteStore) DeletionRequestsCreate(ctx context.Context, gk storeapi.Gr
 
 // DeletionRequestsCreateByName marks the gk row holding name; the resolve and the mark
 // are one statement, which is where the returned id comes from.
-func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (storeapi.DeletionRequestResult, error) {
+func (s sqliteDeletionRequests) CreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (storeapi.DeletionRequestResult, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeDeletionByName(ctx, gk, name) },
 		`"group" = ? AND kind = ? AND name = ?`, gk.Group, gk.Kind, name)
@@ -2325,7 +2329,7 @@ func (s *sqliteStore) DeletionRequestsCreateByName(ctx context.Context, gk store
 // DeletionRequestsCreateFromOwner cascades deletion to ownerID's owned children,
 // returning every owned child, deleting or not, each flagged with whether this
 // call stamped it. A re-cascade over an already-deleting subtree is a lone SELECT.
-func (s *sqliteStore) DeletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) (storeapi.DeletionCascadeResult, error) {
+func (s sqliteDeletionRequests) CreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) (storeapi.DeletionCascadeResult, error) {
 	// Self-wrapped: several children each draw a version, and publication is in
 	// commit order only inside Within.
 	var res storeapi.DeletionCascadeResult

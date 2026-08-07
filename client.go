@@ -870,7 +870,7 @@ func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) erro
 	// DeletionRequestsCreate bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
-	res, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	res, err := c.bh.store.DeletionRequests().Create(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
@@ -901,7 +901,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	res, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	res, err := c.bh.store.DeletionRequests().CreateByName(ctx, c.gk, name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone

@@ -134,7 +134,7 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 	// the pass it claims to, so a cascade that silently stopped marking would show
 	// up as a speedup rather than a bug. The loop below revives before its first
 	// timed cascade, so this leaves the subtree marked for either variant.
-	res, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	res, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID)
 	require.NoError(b, err)
 	require.Len(b, res.Children, children)
 	for _, ch := range res.Children {
@@ -148,7 +148,7 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 			reviveChildren(b, store)
 			b.StartTimer()
 		}
-		if _, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID); err != nil {
+		if _, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID); err != nil {
 			b.Fatal(err)
 		}
 	}
