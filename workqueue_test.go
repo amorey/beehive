@@ -861,7 +861,7 @@ func pendingAlarm(in time.Duration) *alarm {
 	return &alarm{timer: time.NewTimer(in), fireAt: time.Now().Add(in)}
 }
 
-// The gauge is what SchedulesWatch reports, and the whole push design rests on
+// The gauge is what WatchSchedule reports, and the whole push design rests on
 // one property: a mutator that moves the observable schedule says so, and one
 // that does not stays quiet. These tests hold that line without a bus, a queue
 // or a stream in the way.
@@ -1006,7 +1006,7 @@ func TestGaugeAtReportsTheCurrentSchedule(t *testing.T) {
 }
 
 // Bus-boundary tests. Each holds a receiver from the hub and starts no stream on
-// it, because Peek is a single-consumer read: a live SchedulesWatch takes a
+// it, because Peek is a single-consumer read: a live WatchSchedule takes a
 // value the instant it lands, so a Peek racing it reports ErrEmpty on a
 // coin-flip and proves nothing.
 //

@@ -201,7 +201,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
-- **`OwnedObjectsListWatch` scopes a watch to one owner's children, and reads
+- **`WatchOwnedObjects` scopes a watch to one owner's children, and reads
   ownership from current state.** Never from the log: a create's entry is
   appended *before* its `owned_by` edge, in the same transaction, so a
   denormalised `owner_id` would be NULL on the write that matters most. The
@@ -217,13 +217,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   what the watch exists to learn. All of it rests on **ownership changing only
   through a logged write to the child** — true by construction, pinned
   structurally by `TestOwnedByIsWrittenInOnePlace`, and the thing a re-parent
-  verb would have to preserve. `DependentsList`/`DependenciesList` have no watch
+  verb would have to preserve. `ListDependents`/`ListDependencies` have no watch
   counterpart for the harder reason: `depends_on` edges are mutable and log
   nothing. → [ADR](docs/adr/2026-08-06-owner-scoped-watches.md)
 - **The event watch reads one object's log above a cursor, one reader per
   watch** (`eventswatch.go`). An extend re-samples `events.resource_version`, so
   "runs above the cursor" is exactly what changed and the old `seen`/`EventID`
-  diff is gone. `ControllerClient.EventsAdd`'s commit wakes it through `eventWriteHub` (keyed by
+  diff is gone. `ControllerClient.AddEvent`'s commit wakes it through `eventWriteHub` (keyed by
   id, not kind); the floor tick covers a foreign writer. Nothing is shared — the
   read is already per object and already indexed — so there is no lease
   machinery, and no merge either: the stream is unbuffered, so a consumer that
@@ -369,12 +369,16 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `deletion_requested_at` are columns on `objects` that carry four methods each and
   keep families of their own. Cardinality stays
   in the verb (`Get`/`Watch` for one, `List`/`WatchList` for many). On
-  `Client`/`ControllerClient` the receiver is already its kind, so its own CRUD
-  stays bare and its secondary nouns keep the `NounsVerb` prefix
-  (`ConditionsSet`, `EventsAdd`). List interface members alphabetically. `Err*`,
-  `With*` and external-interface methods are exempt. A watch over a change
-  stream returns `<-chan NounChange`; a watch over a gauge or a log streams the
-  value itself. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md)
+  `Client`/`ControllerClient` the method is `VerbNoun`: the receiver is already
+  its kind, so its own CRUD stays bare (`Get`, `WatchList`) and only its
+  secondary nouns are spoken — singular for one, plural for many
+  (`SetCondition`, `AddEvent`, `ListEvents`, `GetOwner`). A qualifier naming a
+  key you pass trails (`GetByName`); an adjectival one leads
+  (`GetLatestEvent`, `HasIncomingEdges`). List interface members
+  alphabetically. `Err*`, `With*` and external-interface methods are exempt, as
+  are `Object`'s relation accessors. A watch over a change stream returns
+  `<-chan NounChange`; a watch over a gauge or a log streams the value itself.
+  → [ADR](docs/adr/2026-08-07-verb-noun-on-the-client-surfaces.md)
 - **Whitebox tests**: tests go in `package beehive`, so they reach unexported
   machinery.
 - **Test files mirror source files, not features.** Shared helpers and fakes go

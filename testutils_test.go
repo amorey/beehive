@@ -109,7 +109,7 @@ func lingeringGoroutines() string {
 // nobody here can end. The goroutine doing the looking names the module too, so
 // it is excluded by the frame it is standing in.
 //
-// gobus is in the list as insurance. The SchedulesWatch stream reads its
+// gobus is in the list as insurance. The WatchSchedule stream reads its
 // receiver with RecvContext, which starts no goroutine of its own, so today
 // every frame it could leak is beehive's. A switch to Receiver.Chan would run a
 // feeder goroutine whose frames are all in gobus, and the leak this package is
@@ -1539,7 +1539,7 @@ func staleDependentIDs(t *testing.T, store Store, gk GroupKind) []ObjectID {
 // wait for this rather than assume the waker is done.
 //
 // It is keyed on (toID, relation), not on the caller — the same lookups are also
-// reached from DependentsList and the LoadDependents eager path, and nothing here
+// reached from ListDependents and the LoadDependents eager path, and nothing here
 // can tell those from the waker. So a token means "somebody looked", and a test
 // that wants "the waker looked" must resetLooked immediately before the write it
 // expects the waker to react to. Reading the target's dependents from a test's own

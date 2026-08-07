@@ -20,7 +20,7 @@
 // identical outcomes coalesce into runs, so a flapping cluster produces the
 // aggregated, newest-first timeline a panel renders:
 //
-//	Create(spec) -> prober EventsAdd×N -> Client.EventsWatch -> render, then resume
+//	Create(spec) -> prober AddEvent×N -> Client.WatchEvents -> render, then resume
 //
 // Run it with `go run ./examples/events/main.go`.
 package main
@@ -94,10 +94,10 @@ func main() {
 	exitOnErr(err)
 	fmt.Printf("created Cluster id=%d endpoint=%s\n\n", cluster.ID, cluster.Spec.Endpoint)
 
-	// Simulate a flapping connection: one EventsAdd per probe outcome.
+	// Simulate a flapping connection: one AddEvent per probe outcome.
 	probe := func(typ beehive.EventType, reason, message string, detail any, n int) {
 		for range n {
-			exitOnErr(prober.EventsAdd(ctx, cluster.ID, beehive.EventSpec{
+			exitOnErr(prober.AddEvent(ctx, cluster.ID, beehive.EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: message, Detail: detail,
 			}))
 		}
@@ -108,7 +108,7 @@ func main() {
 	probe(beehive.EventWarning, "ProbeFailed", "i/o timeout", ProbeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18)
 	probe(beehive.EventNormal, "Connected", "", nil, 4)
 
-	stream, err := client.EventsWatch(ctx, cluster.ID, beehive.WithEventCategory("connection"))
+	stream, err := client.WatchEvents(ctx, cluster.ID, beehive.WithEventCategory("connection"))
 	exitOnErr(err)
 
 	fmt.Println("connection-health panel (newest first):")
@@ -116,7 +116,7 @@ func main() {
 
 	// A panel reconnects, and resumes from what it last rendered rather than
 	// re-reading the log. The probe below arrives on its own commit.
-	resumed, err := client.EventsWatch(ctx, cluster.ID,
+	resumed, err := client.WatchEvents(ctx, cluster.ID,
 		beehive.WithEventCategory("connection"),
 		beehive.WithEventsResumeFrom(stream.ResourceVersion))
 	exitOnErr(err)

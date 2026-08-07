@@ -18,7 +18,7 @@ import (
 	"context"
 )
 
-// SchedulesWatch streams id's schedule as a gauge; a client-only kind returns
+// WatchSchedule streams id's schedule as a gauge; a client-only kind returns
 // ErrNoController. The one watch that does not poll: the work queue publishes
 // each move to a hub and this stream reads its own receiver. That is sound only
 // because the queue is unexported and process-local (the hub sees every writer
@@ -26,7 +26,7 @@ import (
 // a second writer and the poll has to come back. See
 // docs/adr/2026-07-27-schedule-watch.md. The zero Schedule is a real value and
 // is delivered like any other.
-func (c *clientImpl[Spec, Status]) SchedulesWatch(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
+func (c *clientImpl[Spec, Status]) WatchSchedule(ctx context.Context, id ObjectID) (<-chan Schedule, error) {
 	r, ok := c.bh.reconcilerFor(c.gk)
 	if !ok || r.work == nil {
 		// The nil queue is unreachable through Register; guarded so this agrees

@@ -26,7 +26,7 @@
 //	  -> GC requests deletion of every owned ClusterCache (cascade)
 //	  -> each cache flushes, clears its finalizer, and is removed
 //	  -> only once no cache references it does the Cluster close its
-//	     connection (gated on EdgesHasIncoming), clear its finalizer, and get removed
+//	     connection (gated on HasIncomingEdges), clear its finalizer, and get removed
 //
 // The Cluster's connection therefore outlives its caches: the owner is the last
 // thing collected. Run it with `go run ./examples/cascade/main.go`.
@@ -70,9 +70,9 @@ type ClusterController struct{}
 func (c *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		// Hold the connection open while any cache still has a live claim on us.
-		// EdgesHasIncoming ignores caches that are themselves finalizing, so this clears
+		// HasIncomingEdges ignores caches that are themselves finalizing, so this clears
 		// once the owned caches are gone — not merely marked for deletion.
-		referenced, err := client.EdgesHasIncoming(ctx, obj.ID)
+		referenced, err := client.HasIncomingEdges(ctx, obj.ID)
 		if err != nil {
 			return beehive.Result{}, err
 		}
@@ -81,7 +81,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 			return beehive.Result{}, nil
 		}
 		fmt.Printf("Cluster %d: closed connection; releasing finalizer\n", obj.ID)
-		return beehive.Result{}, client.FinalizersDelete(ctx, obj.ID, connectionFinalizer)
+		return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, connectionFinalizer)
 	}
 
 	if obj.Status == nil || !obj.Status.Connected {
@@ -97,7 +97,7 @@ type ClusterCacheController struct{}
 func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (beehive.Result, error) {
 	if obj.DeletionRequestedAt != nil {
 		fmt.Printf("ClusterCache %d: flushed local cache; releasing finalizer\n", obj.ID)
-		return beehive.Result{}, client.FinalizersDelete(ctx, obj.ID, cacheFlushFinalizer)
+		return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, cacheFlushFinalizer)
 	}
 
 	if obj.Status == nil {

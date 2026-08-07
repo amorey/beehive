@@ -311,12 +311,17 @@ the new ADR and `README.md`'s index, and neither should spell an old name in a
 way this grep would need to catch:
 
 ```sh
-grep -rn "EventsList\|EventsWatch\|EventsGetLatest\|OwnersGet\|OwnedList\|\
-OwnedObjectsList\|DependenciesList\|DependentsList\|SchedulesGet\|SchedulesWatch\|\
-ConditionsSet\|ConditionsDelete\|EventsAdd\|FinalizersDelete\|DependenciesAdd\|\
-DependenciesDelete\|EdgesHasIncoming" --include='*.go' --include='*.md' . \
-  | grep -v '^./sqlite/\|^./internal/storeapi/\|^./docs/adr/\|^./docs/specs/'
+grep -rnE "\b(EventsList|EventsWatch|EventsGetLatest|OwnersGet|OwnedList|\
+OwnedObjectsList|OwnedObjectsListWatch|DependenciesList|DependentsList|SchedulesGet|\
+SchedulesWatch|ConditionsSet|ConditionsDelete|EventsAdd|FinalizersDelete|\
+DependenciesAdd|DependenciesDelete|EdgesHasIncoming)\b" \
+  --include='*.go' --include='*.md' . \
+  | grep -vE '^\.?/?(sqlite|internal/storeapi|docs/adr|docs/specs)/|^\.?/?docs/TODO\.md'
 ```
+
+Anchor the exclusions with `\.?/?` — `grep -r .` emits paths without a `./`
+prefix, so `^./sqlite/` silently matches nothing and the check passes on a
+directory it never filtered.
 
 `EventsAddInput` is a deliberate survivor of that grep — it is a type, not a
 method.
