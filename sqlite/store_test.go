@@ -1580,6 +1580,24 @@ func TestSetObservedGenerationRollsBackWithItsFrame(t *testing.T) {
 	assert.Nil(t, reread.ObservedGeneration)
 }
 
+// A settle appends to the write log, so it wakes the dependency waker — but the
+// clamp bounds that to once per generation. This is what lets docs/TODO.md say
+// this write cannot sustain a dependency cycle, where no generation ever moves.
+func TestSetObservedGenerationWakesDependentsOncePerGeneration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	probe := newWriteProbe(t, store)
+
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	assert.Len(t, probe.writes(), 1, "the settle is watch-visible")
+	probe.expectWrite()
+
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	assert.Empty(t, probe.writes(), "a repeat settle wakes nobody")
+}
+
 // TestSchemaVersionColumnsRoundTrip verifies the opaque per-column schema
 // versions: they default to 0, ObjectsCreate persists the caller-set spec version
 // (status is nil at create, so its version stays 0), and the version args to
