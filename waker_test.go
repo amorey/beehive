@@ -1730,7 +1730,11 @@ func (s *staleSweepStore) listStaleSince(_ context.Context, _ []GroupKind, after
 	return page, StalePos{TargetVersion: after.TargetVersion + 1}, nil
 }
 
-func (s *staleSweepStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef) error {
+func (s *staleSweepStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.fakeStore.ReconcileOwed(), stamp: s.stamp}
+}
+
+func (s *staleSweepStore) stamp(_ context.Context, refs []ObjectRef) error {
 	if s.stampErr != nil {
 		return s.stampErr
 	}
@@ -1865,7 +1869,7 @@ func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
 
 	sd.sweep(ctx)
 
-	owed, err := store.ReconcileOwedListIDs(ctx, clientTestGK)
+	owed, err := store.ReconcileOwed().ListIDs(ctx, clientTestGK)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "the finding outlives the queue it was also put on")
 }
@@ -1925,7 +1929,7 @@ func TestStaleDependentsSweepRepairsALostFindingAfterRestart(t *testing.T) {
 	require.EqualValues(t, 1, owed.ReconcileOwed, "the sweep recorded the finding")
 
 	// Drained, then lost: the reconcile it dispatched never ran.
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, clientTestGK, dep.ID, 1))
+	require.NoError(t, store.ReconcileOwed().Decrement(ctx, clientTestGK, dep.ID, 1))
 	owed, err = store.ObjectsGet(ctx, dep.ID)
 	require.NoError(t, err)
 	require.Zero(t, owed.ReconcileOwed, "nothing durable names the dependent now")

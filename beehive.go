@@ -286,7 +286,7 @@ func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
 // loop, which nothing else drains.
 // See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
 func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
-	cleared, err := bh.store.ReconcileOwedSweep(ctx, bh.registeredKinds())
+	cleared, err := bh.store.ReconcileOwed().Sweep(ctx, bh.registeredKinds())
 	if err != nil {
 		bh.log().Warn("reconcile-owed reclaim failed; retry next sweep", "err", err)
 		return

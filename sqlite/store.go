@@ -40,6 +40,10 @@ type sqliteConditions struct{ *sqliteStore }
 
 func (s *sqliteStore) Conditions() storeapi.Conditions { return sqliteConditions{s} }
 
+type sqliteReconcileOwed struct{ *sqliteStore }
+
+func (s *sqliteStore) ReconcileOwed() storeapi.ReconcileOwed { return sqliteReconcileOwed{s} }
+
 type sqliteDependencies struct{ *sqliteStore }
 
 func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
@@ -952,7 +956,7 @@ func (s *sqliteStore) DeletionRequestsList(ctx context.Context) ([]storeapi.Obje
 	return scanObjectRefs(rows)
 }
 
-func (s *sqliteStore) ReconcileOwedListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
+func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
@@ -974,11 +978,11 @@ func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, err
 	return rv, err
 }
 
-// ReconcileOwedStamp stamps a page of findings in one statement (contract on
+// Stamp stamps a page of findings in one statement (contract on
 // storeapi.Store). A missing id matches no row, which is how a vanished
 // dependent is skipped; a repeated id matches its row once, which is the fold
 // the contract requires.
-func (s *sqliteStore) ReconcileOwedStamp(ctx context.Context, refs []storeapi.ObjectRef) error {
+func (s sqliteReconcileOwed) Stamp(ctx context.Context, refs []storeapi.ObjectRef) error {
 	if len(refs) == 0 {
 		return nil
 	}
@@ -1006,7 +1010,7 @@ func reconcileOwedSweepQuery(keep []storeapi.GroupKind) (string, []any) {
 
 // ReconcileOwedSweep zeroes the owed count outside keep in one no-emit UPDATE
 // (contract on storeapi.Store).
-func (s *sqliteStore) ReconcileOwedSweep(ctx context.Context, keep []storeapi.GroupKind) (int, error) {
+func (s sqliteReconcileOwed) Sweep(ctx context.Context, keep []storeapi.GroupKind) (int, error) {
 	q, args := reconcileOwedSweepQuery(keep)
 	res, err := s.conn(ctx).ExecContext(ctx, q, args...)
 	if err != nil {
@@ -1030,7 +1034,7 @@ func (s *sqliteStore) ReconcileOwedIncrement(ctx context.Context, id storeapi.Ob
 
 // ReconcileOwedDecrement folds the kind into the UPDATE, so a foreign id matches
 // no row; the disambiguating read is paid only when nothing was written.
-func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observed int64) error {
+func (s sqliteReconcileOwed) Decrement(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observed int64) error {
 	res, err := s.conn(ctx).ExecContext(ctx,
 		`UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0)
 		 WHERE id = ? AND "group" = ? AND kind = ?`, observed, id, gk.Group, gk.Kind)

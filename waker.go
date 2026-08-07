@@ -715,7 +715,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 		if len(page) == 0 {
 			break
 		}
-		if err := sd.bh.store.ReconcileOwedStamp(ctx, page); err != nil {
+		if err := sd.bh.store.ReconcileOwed().Stamp(ctx, page); err != nil {
 			abandon("stamping stale dependents failed; the next pass resumes from the same cursor", pos, err)
 			return
 		}

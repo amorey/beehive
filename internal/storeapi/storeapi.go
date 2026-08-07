@@ -364,6 +364,9 @@ func (r ObjectRef) GroupKind() GroupKind {
 type Store interface {
 	io.Closer
 
+	// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an object is owed a pass.
+	ReconcileOwed() ReconcileOwed
+
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
@@ -379,6 +382,42 @@ type Store interface {
 
 // Dependencies is the dependency-watermark table: what each dependent was last
 // reconciled against, and the scan that finds the ones a target has moved past.
+// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an object is owed a pass.
+type ReconcileOwed interface {
+	// Decrement subtracts observed from id's reconcile_owed,
+	// floored at 0. Callers pass the count they loaded, not 1: one pass
+	// answers every wake outstanding at its load, and increments landing after
+	// the load survive the subtraction. Bumps no resource_version. Scoped to
+	// gk: wrong kind → ErrWrongKind; a row that is simply gone is not an error.
+	Decrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error
+
+	// ListIDs returns the ids of objects of kind gk with
+	// reconcile_owed != 0, so a wake recorded before a crash is serviced on
+	// restart. Separate from ObjectsListUnsettledIDs: a settled object can still owe
+	// a wake.
+	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// Stamp increments reconcile_owed once for each DISTINCT ref, so
+	// a finding outlives the in-memory queue. Repeats inside one call fold into
+	// that single increment: a caller owed two wakes for one object must make two
+	// calls. Sound for the pass, whose listing returns a row per (target,
+	// dependent) pair, because one reconcile answers every wake outstanding at its
+	// load and ReconcileOwedDecrement subtracts the whole count it observed.
+	//
+	// An id that is gone is skipped, not reported. Empty refs writes nothing.
+	// Bumps no resource_version.
+	//
+	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
+	// store's own listing, which spans every registered kind in one page.
+	Stamp(ctx context.Context, refs []ObjectRef) error
+
+	// Sweep zeroes reconcile_owed for every object whose kind is not
+	// in keep, and returns how many rows it cleared. An empty keep clears every
+	// nonzero row. Bumps no resource_version and appends no write-log entry.
+	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
+	Sweep(ctx context.Context, keep []GroupKind) (int, error)
+}
+
 type Dependencies interface {
 	// ListStaleSince returns objects of the given kinds with a
 	// depends_on edge to a target whose resource_version is above their
@@ -693,39 +732,6 @@ type unmigrated interface {
 	// EdgesListOutgoingByRelation returns the objects fromID points at through relation,
 	// ordered by id — the inverse of EdgesListIncoming.
 	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
-
-	// ReconcileOwedDecrement subtracts observed from id's reconcile_owed,
-	// floored at 0. Callers pass the count they loaded, not 1: one pass
-	// answers every wake outstanding at its load, and increments landing after
-	// the load survive the subtraction. Bumps no resource_version. Scoped to
-	// gk: wrong kind → ErrWrongKind; a row that is simply gone is not an error.
-	ReconcileOwedDecrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error
-
-	// ReconcileOwedListIDs returns the ids of objects of kind gk with
-	// reconcile_owed != 0, so a wake recorded before a crash is serviced on
-	// restart. Separate from ObjectsListUnsettledIDs: a settled object can still owe
-	// a wake.
-	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ReconcileOwedStamp increments reconcile_owed once for each DISTINCT ref, so
-	// a finding outlives the in-memory queue. Repeats inside one call fold into
-	// that single increment: a caller owed two wakes for one object must make two
-	// calls. Sound for the pass, whose listing returns a row per (target,
-	// dependent) pair, because one reconcile answers every wake outstanding at its
-	// load and ReconcileOwedDecrement subtracts the whole count it observed.
-	//
-	// An id that is gone is skipped, not reported. Empty refs writes nothing.
-	// Bumps no resource_version.
-	//
-	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
-	// store's own listing, which spans every registered kind in one page.
-	ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error
-
-	// ReconcileOwedSweep zeroes reconcile_owed for every object whose kind is not
-	// in keep, and returns how many rows it cleared. An empty keep clears every
-	// nonzero row. Bumps no resource_version and appends no write-log entry.
-	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
-	ReconcileOwedSweep(ctx context.Context, keep []GroupKind) (int, error)
 
 	// ResourceVersionsMaxIssued returns the highest resource version issued. It
 	// reads the sequence, not a table, so retention cannot lower it. It moves

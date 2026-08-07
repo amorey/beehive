@@ -110,7 +110,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// the pass sit above the observed count and survive. A failed subtraction is
 	// left to the backstop rather than retried under backoff.
 	if reconcileErr == nil && raw.ReconcileOwed != 0 {
-		if err := t.bh.store.ReconcileOwedDecrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
+		if err := t.bh.store.ReconcileOwed().Decrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
 		}
 	}
@@ -196,7 +196,7 @@ func (r *reconciler) enqueueReconcileOwed(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "reconcile-owed", r.store.ReconcileOwedListIDs)
+	r.enqueueFrom(ctx, "reconcile-owed", r.store.ReconcileOwed().ListIDs)
 }
 
 // enqueueOwedPass drains what the store records as owed: unconverged specs and

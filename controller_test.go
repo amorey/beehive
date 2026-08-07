@@ -524,7 +524,7 @@ func (f *declareFixture) moveTarget(t *testing.T) {
 // would drain.
 func (f *declareFixture) owed(t *testing.T) []ObjectID {
 	t.Helper()
-	ids, err := f.store.ReconcileOwedListIDs(context.Background(), f.depGK)
+	ids, err := f.store.ReconcileOwed().ListIDs(context.Background(), f.depGK)
 	require.NoError(t, err)
 	return ids
 }
@@ -665,7 +665,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, objectRefIDs(refs), "the edge landed")
 
-	owed, err := real.ReconcileOwedListIDs(ctx, gk)
+	owed, err := real.ReconcileOwed().ListIDs(ctx, gk)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
 }
@@ -790,7 +790,7 @@ func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID), "an unroutable enqueue is not an error")
 
-	owed, err := store.ReconcileOwedListIDs(ctx, clientOnly)
+	owed, err := store.ReconcileOwed().ListIDs(ctx, clientOnly)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "the durable stamp still lands")
 }

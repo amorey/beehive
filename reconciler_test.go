@@ -51,7 +51,11 @@ type reconcileOwedIDsStore struct {
 	ids []ObjectID
 }
 
-func (s *reconcileOwedIDsStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *reconcileOwedIDsStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.fakeStore.ReconcileOwed(), listIDs: s.listIDs}
+}
+
+func (s *reconcileOwedIDsStore) listIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return s.ids, nil
 }
 
@@ -68,7 +72,11 @@ type tickOnlyReconcileOwedStore struct {
 	calls int
 }
 
-func (s *tickOnlyReconcileOwedStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *tickOnlyReconcileOwedStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.fakeStore.ReconcileOwed(), listIDs: s.listIDs}
+}
+
+func (s *tickOnlyReconcileOwedStore) listIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -888,7 +896,11 @@ type errReconcileOwedStore struct {
 	fakeStore
 }
 
-func (s *errReconcileOwedStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+func (s *errReconcileOwedStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.fakeStore.ReconcileOwed(), listIDs: s.listIDs}
+}
+
+func (s *errReconcileOwedStore) listIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, errBoom
 }
 
@@ -1344,7 +1356,11 @@ func (s *owedBadSpecStore) ObjectsGetForReconcile(ctx context.Context, id Object
 	return reconcileLoadOf(s.ObjectsGet(ctx, id))
 }
 
-func (s *owedBadSpecStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
+func (s *owedBadSpecStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.fakeStore.ReconcileOwed(), decrement: s.decrement}
+}
+
+func (s *owedBadSpecStore) decrement(context.Context, GroupKind, ObjectID, int64) error {
 	s.decremented = true
 	return nil
 }
@@ -1832,7 +1848,11 @@ type failDecrementReconcileOwedStore struct {
 	Store
 }
 
-func (s *failDecrementReconcileOwedStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
+func (s *failDecrementReconcileOwedStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.Store.ReconcileOwed(), decrement: s.decrement}
+}
+
+func (s *failDecrementReconcileOwedStore) decrement(context.Context, GroupKind, ObjectID, int64) error {
 	return errBoom
 }
 
@@ -3080,7 +3100,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 	got, err := h.store.ObjectsGet(ctx, h.dep)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), got.ReconcileOwed, "the mid-pass stamp outlives the load-scoped decrement")
-	owed, err := h.store.ReconcileOwedListIDs(ctx, clientTestGK)
+	owed, err := h.store.ReconcileOwed().ListIDs(ctx, clientTestGK)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{h.dep}, owed, "and the owed listing names the dependent")
 }
@@ -3234,7 +3254,7 @@ func TestALostWatermarkCostsOnlyAnObservedChange(t *testing.T) {
 
 	h.touchTarget(t, `{"val":"moved"}`)
 	sd.sweep(ctx)
-	require.NoError(t, h.store.ReconcileOwedDecrement(ctx, clientTestGK, h.dep, 1),
+	require.NoError(t, h.store.ReconcileOwed().Decrement(ctx, clientTestGK, h.dep, 1),
 		"drain the finding, as the reconcile it dispatched would")
 
 	probe.err = errBoom

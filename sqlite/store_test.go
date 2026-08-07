@@ -3673,7 +3673,7 @@ func TestReconcileOwedCount(t *testing.T) {
 
 	// A fresh object owes no wake.
 	require.Zero(t, a.ReconcileOwed)
-	ids, err := store.ReconcileOwedListIDs(ctx, testGK)
+	ids, err := store.ReconcileOwed().ListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Empty(t, ids)
 
@@ -3682,26 +3682,26 @@ func TestReconcileOwedCount(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
 	assert.Equal(t, int64(2), reconcileOwed(t, store, a.ID), "the count is read back off the row")
 
-	ids, err = store.ReconcileOwedListIDs(ctx, testGK)
+	ids, err = store.ReconcileOwed().ListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{a.ID}, ids, "only the owed row is listed (b owes nothing)")
 
 	// A pass that observed both services both: subtracting the observed count
 	// drains the row in one go, leaving nothing for the backstop to re-enqueue.
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 2))
+	require.NoError(t, store.ReconcileOwed().Decrement(ctx, testGK, a.ID, 2))
 	assert.Zero(t, reconcileOwed(t, store, a.ID), "subtracting the observed count drains the row")
-	ids, err = store.ReconcileOwedListIDs(ctx, testGK)
+	ids, err = store.ReconcileOwed().ListIDs(ctx, testGK)
 	require.NoError(t, err)
 	assert.Empty(t, ids, "drained row leaves the partial index")
 
 	// An increment beyond what a pass observed survives that pass's subtraction.
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID)) // observed by the pass
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID)) // lands during the pass
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
+	require.NoError(t, store.ReconcileOwed().Decrement(ctx, testGK, a.ID, 1))
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "the later increment stays owed")
 
 	// Subtracting more than is owed floors at 0 rather than going negative.
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 5))
+	require.NoError(t, store.ReconcileOwed().Decrement(ctx, testGK, a.ID, 5))
 	assert.Zero(t, reconcileOwed(t, store, a.ID), "subtraction floors at 0")
 }
 
@@ -3715,7 +3715,7 @@ func TestReconcileOwedDecrementIsKindScoped(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
 
 	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
-	err := store.ReconcileOwedDecrement(ctx, otherGK, a.ID, 1)
+	err := store.ReconcileOwed().Decrement(ctx, otherGK, a.ID, 1)
 
 	assert.ErrorIs(t, err, beehive.ErrWrongKind)
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "a foreign kind drains nothing")
@@ -3733,7 +3733,7 @@ func TestReconcileOwedDecrementVanishedRowIsNotAnError(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
 	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
 
-	assert.NoError(t, store.ReconcileOwedDecrement(ctx, testGK, a.ID, 1))
+	assert.NoError(t, store.ReconcileOwed().Decrement(ctx, testGK, a.ID, 1))
 }
 
 // clientOnlyGK is a kind no reconcile loop covers, so its owed count is the
@@ -3760,7 +3760,7 @@ func TestReconcileOwedSweepSkipsKeptKinds(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, kept.ID))
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, loose.ID))
 
-	_, err := store.ReconcileOwedSweep(ctx, []beehive.GroupKind{testGK})
+	_, err := store.ReconcileOwed().Sweep(ctx, []beehive.GroupKind{testGK})
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(1), reconcileOwed(t, store, kept.ID), "a kind with a reconcile loop keeps its count")
@@ -3778,11 +3778,11 @@ func TestReconcileOwedSweepCountsRowsCleared(t *testing.T) {
 	}
 	newKindObject(t, store, clientOnlyGK) // owes nothing, so it is not counted
 
-	cleared, err := store.ReconcileOwedSweep(ctx, []beehive.GroupKind{testGK})
+	cleared, err := store.ReconcileOwed().Sweep(ctx, []beehive.GroupKind{testGK})
 	require.NoError(t, err)
 	assert.Equal(t, 3, cleared)
 
-	cleared, err = store.ReconcileOwedSweep(ctx, []beehive.GroupKind{testGK})
+	cleared, err = store.ReconcileOwed().Sweep(ctx, []beehive.GroupKind{testGK})
 	require.NoError(t, err)
 	assert.Zero(t, cleared, "a second sweep finds nothing to clear")
 }
@@ -3797,7 +3797,7 @@ func TestReconcileOwedSweepWithNoKeptKinds(t *testing.T) {
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, a.ID))
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, b.ID))
 
-	cleared, err := store.ReconcileOwedSweep(ctx, nil)
+	cleared, err := store.ReconcileOwed().Sweep(ctx, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 2, cleared)
@@ -3818,7 +3818,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	writesBefore, _, err := store.ObjectWritesListSinceAll(ctx, 0, 100)
 	require.NoError(t, err)
 
-	_, err = store.ReconcileOwedSweep(ctx, nil)
+	_, err = store.ReconcileOwed().Sweep(ctx, nil)
 	require.NoError(t, err)
 
 	after, err := store.ResourceVersionsMaxIssued(ctx)
@@ -3854,7 +3854,7 @@ func TestReconcileOwedSweepQueryError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.ReconcileOwedSweep(context.Background(), nil)
+	_, err := store.ReconcileOwed().Sweep(context.Background(), nil)
 	require.Error(t, err)
 }
 
@@ -3867,19 +3867,19 @@ func TestReconcileOwedStampRecordsFindings(t *testing.T) {
 	a := newRefObject(t, store)
 	b := newRefObject(t, store)
 
-	require.NoError(t, store.ReconcileOwedStamp(ctx, nil), "no refs writes nothing")
+	require.NoError(t, store.ReconcileOwed().Stamp(ctx, nil), "no refs writes nothing")
 
 	refs := []beehive.ObjectRef{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
 	}
-	require.NoError(t, store.ReconcileOwedStamp(ctx, refs))
+	require.NoError(t, store.ReconcileOwed().Stamp(ctx, refs))
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID))
 	assert.Equal(t, int64(1), reconcileOwed(t, store, b.ID))
 
 	// Two sweeps that both found the dependent owe two wakes. One pass drains
 	// both, because the decrement subtracts the count it observed.
-	require.NoError(t, store.ReconcileOwedStamp(ctx, refs[:1]))
+	require.NoError(t, store.ReconcileOwed().Stamp(ctx, refs[:1]))
 	assert.Equal(t, int64(2), reconcileOwed(t, store, a.ID))
 }
 
@@ -3895,7 +3895,7 @@ func TestReconcileOwedStampFoldsRepeatedRefs(t *testing.T) {
 	a := newRefObject(t, store)
 	ref := beehive.ObjectRef{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind}
 
-	require.NoError(t, store.ReconcileOwedStamp(ctx, []beehive.ObjectRef{ref, ref, ref}))
+	require.NoError(t, store.ReconcileOwed().Stamp(ctx, []beehive.ObjectRef{ref, ref, ref}))
 
 	assert.Equal(t, int64(1), reconcileOwed(t, store, a.ID), "one increment, not three")
 }
@@ -3910,7 +3910,7 @@ func TestReconcileOwedStampSkipsVanishedRows(t *testing.T) {
 	b := newRefObject(t, store)
 	require.NoError(t, store.ObjectsDelete(ctx, a.ID))
 
-	err := store.ReconcileOwedStamp(ctx, []beehive.ObjectRef{
+	err := store.ReconcileOwed().Stamp(ctx, []beehive.ObjectRef{
 		{ID: a.ID, Group: testGK.Group, Kind: testGK.Kind},
 		{ID: b.ID, Group: testGK.Group, Kind: testGK.Kind},
 	})
@@ -3948,10 +3948,10 @@ func TestReconcileOwedQueryErrors(t *testing.T) {
 	store.db.Close()
 	ctx := context.Background()
 
-	_, err := store.ReconcileOwedListIDs(ctx, testGK)
+	_, err := store.ReconcileOwed().ListIDs(ctx, testGK)
 	require.Error(t, err)
 	require.Error(t, store.ReconcileOwedIncrement(ctx, 1))
-	require.Error(t, store.ReconcileOwedDecrement(ctx, testGK, 1, 1))
+	require.Error(t, store.ReconcileOwed().Decrement(ctx, testGK, 1, 1))
 }
 
 func TestObjectsUpdateSpecDBError(t *testing.T) {
@@ -4243,7 +4243,7 @@ func addEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID
 		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
 		// the source's own kind is needed here — and res.From already carries it,
 		// projected from the endpoint check EdgesAdd had to do anyway.
-		return store.ReconcileOwedDecrement(ctx, res.From, from, 1)
+		return store.ReconcileOwed().Decrement(ctx, res.From, from, 1)
 	}
 	return nil
 }

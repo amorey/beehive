@@ -174,7 +174,11 @@ type owedClearStore struct {
 	err  error
 }
 
-func (s *owedClearStore) ReconcileOwedSweep(_ context.Context, keep []GroupKind) (int, error) {
+func (s *owedClearStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.Store.ReconcileOwed(), sweep: s.sweep}
+}
+
+func (s *owedClearStore) sweep(_ context.Context, keep []GroupKind) (int, error) {
 	select {
 	case s.kept <- keep:
 	default:

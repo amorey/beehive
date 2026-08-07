@@ -383,23 +383,10 @@ func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef,
 	return nil, nil
 }
 
-func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
-
 // answers 0: the GC sweeper calls it on every tick
-func (s *fakeStore) ReconcileOwedSweep(context.Context, []GroupKind) (int, error) {
-	return 0, nil
-}
-func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
-	panic("not implemented: fakeStore.ReconcileOwedDecrement")
-}
 
 // ReconcileOwedStamp answers nil like the listings above it: the stale-dependents
 // driver stamps what it finds, so a panic would break every Start.
-func (s *fakeStore) ReconcileOwedStamp(context.Context, []storeapi.ObjectRef) error {
-	return nil
-}
 
 // ResourceVersionsMaxIssued answers 0: the stale-dependents driver reads it every
 // tick, so a panic would break every Start.
@@ -463,6 +450,64 @@ func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID)
 func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
 	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
 }
+func (s *fakeStore) ReconcileOwed() storeapi.ReconcileOwed { return fakeReconcileOwed{} }
+
+// fakeReconcileOwed is fakeStore's owed-count family.
+type fakeReconcileOwed struct{}
+
+func (fakeReconcileOwed) Decrement(context.Context, GroupKind, ObjectID, int64) error {
+	panic("not implemented: fakeStore.ReconcileOwedDecrement")
+}
+
+func (fakeReconcileOwed) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+
+func (fakeReconcileOwed) Stamp(context.Context, []storeapi.ObjectRef) error {
+	return nil
+}
+
+func (fakeReconcileOwed) Sweep(context.Context, []GroupKind) (int, error) {
+	return 0, nil
+}
+
+// owedOverride replaces the hooks that are set and delegates the rest.
+type owedOverride struct {
+	storeapi.ReconcileOwed
+	listIDs   func(context.Context, GroupKind) ([]ObjectID, error)
+	decrement func(context.Context, GroupKind, ObjectID, int64) error
+	stamp     func(context.Context, []storeapi.ObjectRef) error
+	sweep     func(context.Context, []GroupKind) (int, error)
+}
+
+func (o owedOverride) ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if o.listIDs != nil {
+		return o.listIDs(ctx, gk)
+	}
+	return o.ReconcileOwed.ListIDs(ctx, gk)
+}
+
+func (o owedOverride) Decrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error {
+	if o.decrement != nil {
+		return o.decrement(ctx, gk, id, observed)
+	}
+	return o.ReconcileOwed.Decrement(ctx, gk, id, observed)
+}
+
+func (o owedOverride) Stamp(ctx context.Context, refs []storeapi.ObjectRef) error {
+	if o.stamp != nil {
+		return o.stamp(ctx, refs)
+	}
+	return o.ReconcileOwed.Stamp(ctx, refs)
+}
+
+func (o owedOverride) Sweep(ctx context.Context, keep []GroupKind) (int, error) {
+	if o.sweep != nil {
+		return o.sweep(ctx, keep)
+	}
+	return o.ReconcileOwed.Sweep(ctx, keep)
+}
+
 func (s *fakeStore) Conditions() storeapi.Conditions { return s.conditions }
 
 // fakeConditions is fakeStore's conditions family. A nil hook panics, which is
@@ -1065,7 +1110,7 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
 		// the source's own kind is needed here — and res.From already carries it,
 		// projected from the endpoint check EdgesAdd had to do anyway.
-		return store.ReconcileOwedDecrement(ctx, res.From, from, 1)
+		return store.ReconcileOwed().Decrement(ctx, res.From, from, 1)
 	}
 	return nil
 }
@@ -1223,8 +1268,12 @@ func (s *listProbeStore) ObjectsListUnsettledIDs(ctx context.Context, gk GroupKi
 	return ids, err
 }
 
-func (s *listProbeStore) ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ReconcileOwedListIDs(ctx, gk)
+func (s *listProbeStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.Store.ReconcileOwed(), listIDs: s.probeOwedListIDs}
+}
+
+func (s *listProbeStore) probeOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ReconcileOwed().ListIDs(ctx, gk)
 	probeSignal(s.owedListed)
 	return ids, err
 }
