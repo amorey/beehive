@@ -168,14 +168,21 @@ That is the whole of what a restart guarantees.
 ## 4. The full pass is not in this document
 
 Neither `WithFullPassInterval` nor `WithStartupFullPass` is on by default. **No
-reconcile may depend on either.** Both scale with the object count, not with the
-work outstanding. A guarantee that rests on one holds only while the sweep stays
-affordable.
+reconcile may depend on the periodic one.** It scales with the object count, not
+with the work outstanding, and it repeats forever, so a guarantee that rests on it
+holds only while the sweep stays affordable.
 
 The full pass is a tool to re-confirm process-scoped state. See
 [section E](#e-not-triggers). It is not an answer to the question "how is this work
 found?". If the only answer for a path is "the full pass finds it", that path is a
 defect. Record it in [`TODO.md`](TODO.md). Do not record it as coverage here.
+
+The one exception is not a path this document can carry: a kind whose reconcile
+establishes *in-process* state — a live connection, a running worker — is owed a
+pass by the process start itself, and no durable record expresses that.
+`WithStartupFullPass` is the trigger for it, and a kind that enables it may depend
+on it. See
+[the ADR](adr/2026-08-07-the-startup-pass-may-be-depended-on.md).
 
 ---
 
@@ -742,10 +749,12 @@ Each item below looks like a trigger. None of them is one.
   off by default. Its job is the one thing no owed-work listing can express:
   re-confirming state that belongs to a *process* rather than to the store. An
   example is a liveness condition that reads "verifying" until a controller in this
-  process writes it again. The full pass does dispatch settled objects that other
-  mechanisms failed to reach. **Do not lean on that property.** It turns an open gap
-  into an intermittent gap, scaled by the object count, and hides the gap from
-  anyone reading this document. Tests: `TestDefaultConfigDoesNotFullPass`,
+  process writes it again; another is a connection the reconcile itself opens,
+  where the object is not converged until this process has reconciled it. The full
+  pass does *also* dispatch settled objects that other mechanisms failed to reach.
+  **Do not lean on that property.** It turns an open gap into an intermittent gap,
+  scaled by the object count, and hides the gap from anyone reading this document.
+  Tests: `TestDefaultConfigDoesNotFullPass`,
   `TestStartupFullPassDisabledSkipsSettled`, `TestFullPassTickReconcilesSettled`.
 - **A status or condition write does not wake that object's own controller.** The
   waker skips the self-edge on purpose. A spec write already leaves the object

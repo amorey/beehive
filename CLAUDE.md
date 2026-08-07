@@ -71,7 +71,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   on one of these, and the GC sweeper's per-sweep budgets scale with its
   interval. `Client.Requeue` is the public way to beat a cadence.
   → [ADR](docs/adr/2026-08-06-driver-cadences-are-configurable.md) **No reconcile may depend on
-  either full pass** — both scale with the object count. The schedule watch is
+  the *periodic* full pass** — its cost scales with the object count and it repeats
+  forever. The **startup** pass is O(objects) once per process, and a kind whose
+  reconcile establishes in-process state (a connection, a worker, a liveness
+  condition) may depend on it: it guarantees every object of that kind one reconcile
+  per process, which no store column can express.
+  → [ADR](docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md) The schedule watch is
   the one push exception (see below); the two watch wakes are not, because their
   floor tick stays. **The waker is the exception to the cadence, not to the
   record**: it still reads the write log, but only a commit makes it look, and

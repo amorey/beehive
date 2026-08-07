@@ -309,8 +309,10 @@ func (r *reconciler) run(ctx context.Context) {
 	// correctness hole. Deletions in progress belong to the GC sweeper.
 	r.enqueueOwedPass(ctx)
 	// The startup full pass is a choice: it re-confirms process-scoped state a
-	// restart invalidated, which no owed-work listing can see. Nothing may
-	// depend on it. The work queue collapses the overlap with the owed pass.
+	// restart invalidated, which no owed-work listing can see. A kind that
+	// enables it may depend on it — see
+	// docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md. The work queue
+	// collapses the overlap with the owed pass.
 	if r.startupFullPass {
 		r.enqueueAll(ctx)
 	}

@@ -458,15 +458,20 @@ func WithMigrator(m Migrator) Option {
 // WithStartupFullPass sets whether a controller re-dispatches *every* object
 // once at startup, converged ones included. Default false.
 //
-// The pass re-confirms process-scoped state a restart invalidated — liveness
-// conditions read as "verifying" until this process rewrites them — which no
-// owed-work listing can see. Enable it for that, and that only: no reconcile
-// may depend on it, since a pass that scales with the object count cannot be
-// what guarantees convergence. Work genuinely owed is recorded and resumed at
-// startup regardless.
+// Enable it for a kind whose reconcile establishes in-process state — a live
+// connection, a running worker, a liveness condition — which a restart
+// invalidated and no owed-work listing can see: the store reads settled,
+// because observed_generation was written by a process that is gone.
+//
+// Unlike the periodic full pass, a kind may depend on this one. It costs
+// O(objects) once per process, and for a controller whose reconcile is what
+// opens the connection or starts the worker it is the only thing that
+// reconverges the object after a restart. What it guarantees: every object of
+// a kind that enables it is reconciled at least once per process.
 //
 // Passed to New it sets the default for all controllers; passed to Register it
-// overrides that default for one.
+// overrides that default for one — prefer Register, so the declaration names
+// the kinds that actually own in-process state.
 func WithStartupFullPass(enabled bool) Option {
 	return func(target any) error {
 		switch t := target.(type) {

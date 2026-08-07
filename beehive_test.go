@@ -280,7 +280,7 @@ func TestNewAppliesDefaults(t *testing.T) {
 	// full passes off — so changing one should be a deliberate edit here.
 	assert.Equal(t, 30*time.Second, bh.owedPassInterval, "owed work drains by default")
 	assert.Equal(t, time.Duration(0), bh.fullPassInterval, "the periodic full pass is opt-in")
-	assert.False(t, bh.startupFullPass, "the startup full pass is opt-in too; no reconcile may depend on it")
+	assert.False(t, bh.startupFullPass, "the startup full pass is opt-in too; a kind that needs it says so")
 	assert.Equal(t, 30*time.Second, bh.gcInterval, "dead rows are collected by default")
 	assert.NotNil(t, bh.reconcilers)
 }
