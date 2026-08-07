@@ -6047,6 +6047,37 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 }
 
 // An empty candidate set must not draw: a re-cascade over an already-deleting
+// A candidate set the guard rejects entirely stamps nothing, so the batch append
+// has nothing to write — and must say so rather than emit a VALUES list with no
+// rows, which is not valid SQL. The draw still happened, so the whole range is a
+// gap.
+func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	var pending []storeapi.ObjectID
+	for range 2 {
+		id := newEventObject(t, store)
+		_, err := store.DeletionRequestsCreate(ctx, testGK, id)
+		require.NoError(t, err)
+		pending = append(pending, id)
+	}
+
+	before := seqValue(t, store)
+	probe := newWriteProbe(t, store)
+
+	var marked map[storeapi.ObjectID]bool
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		var err error
+		marked, err = store.markManyForDeletion(ctx, pending)
+		return err
+	}))
+
+	assert.Empty(t, marked, "the guard rejected every candidate")
+	assert.Equal(t, before+2, seqValue(t, store), "the range was drawn before the guard ran")
+	assert.Empty(t, probe.writes(), "nothing stamped, nothing logged")
+}
+
 // subtree is the steady state a controller re-runs every reconcile, and a draw
 // there is a counter write to stamp nothing.
 func TestMarkManyForDeletionDrawsNothingForNoCandidates(t *testing.T) {

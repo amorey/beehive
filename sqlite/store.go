@@ -2192,17 +2192,13 @@ func (s *sqliteStore) markManyForDeletionChunk(
 	args = append(args, now, now)
 	// RETURNING, not RowsAffected: the log entries need each row's identity and
 	// the version it actually took.
-	rows, err := c.QueryContext(ctx,
+	// Drained and closed before the insert below, which needs the single conn.
+	stamped, err := scanLoggedWrites(c.QueryContext(ctx,
 		`WITH assigned(mark_id, mark_rv) AS (VALUES `+tupleRows(len(ids), 2)+`)
 		UPDATE objects SET deletion_requested_at = ?, updated_at = ?, resource_version = assigned.mark_rv
 		FROM assigned
 		WHERE objects.id = assigned.mark_id AND objects.deletion_requested_at IS NULL
-		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`, args...)
-	if err != nil {
-		return err
-	}
-	// Drained and closed before the insert below, which needs the single conn.
-	stamped, err := scanLoggedWrites(rows)
+		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`, args...))
 	if err != nil {
 		return err
 	}
@@ -2689,8 +2685,13 @@ func scanObjectRefs(rows *sql.Rows) ([]storeapi.ObjectRef, error) {
 }
 
 // scanLoggedWrites scans a mutator's RETURNING rows into the shape a batched
-// write log append takes.
-func scanLoggedWrites(rows *sql.Rows) ([]loggedWrite, error) {
+// write log append takes. Takes the query's error alongside its rows: modernc
+// runs an UPDATE ... RETURNING to completion at QueryContext, so a failed stamp
+// arrives here rather than out of rows.Err().
+func scanLoggedWrites(rows *sql.Rows, err error) ([]loggedWrite, error) {
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var out []loggedWrite
 	for rows.Next() {
